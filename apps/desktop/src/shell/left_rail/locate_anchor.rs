@@ -20,8 +20,10 @@ use gpui::{AnyElement, Bounds, IntoElement, Pixels, Styled, canvas};
 const EPSILON: f32 = 0.5;
 
 /// Shared slot holding the active workspace row's bounds from the last layout
-/// pass, in the same unscrolled coordinate space as `ScrollHandle::bounds`
-/// (GPUI records child bounds before applying the scroll offset).
+/// pass. GPUI records child bounds with the scroll offset ALREADY APPLIED, so
+/// these are on-screen bounds: `row.top() - viewport.top()` is the row's
+/// distance below the viewport's top edge as painted, and it already moves
+/// when the list scrolls. Adding the handle's offset to it double-counts.
 ///
 /// `Rc<Cell<…>>` so the render tree and the rail's event handlers share one
 /// slot. `None` means the active row was not laid out in the last frame — no
@@ -53,8 +55,11 @@ pub fn locate_anchor_canvas(anchor: LocateAnchor) -> AnyElement {
 ///
 /// `current_y` is the handle's current offset and `max_offset_y` its scroll
 /// extent, so the valid range is `[-max_offset_y, 0]` (more negative = further
-/// down the list). `row` and `viewport` are both unscrolled layout bounds —
-/// a row's on-screen top is `row.top() - viewport.top() + current_y`.
+/// down the list). `row` is the row's ON-SCREEN bounds as recorded by
+/// [`locate_anchor_canvas`], so `row.top() - viewport.top()` is already where
+/// the row sits in the viewport at `current_y`; the returned offset is
+/// therefore `current_y` plus the correction needed, not an absolute position
+/// derived from unscrolled layout.
 ///
 /// A row already fully in view is left alone: the locate glow is the feedback
 /// there, and a jump under a card the user is already looking at is worse than
@@ -73,18 +78,22 @@ pub fn reveal_offset(
     if view_h <= 0.0 {
         return None;
     }
-    let row_top = f32::from(row.top() - viewport.top());
+    // Already on-screen-relative: the scroll offset is baked into these
+    // bounds, so this is where the row sits right now.
+    let visible_top = f32::from(row.top() - viewport.top());
     let row_h = f32::from(row.size.height);
     let fits = row_h <= view_h;
-    let visible_top = row_top + current_y;
     if fits && visible_top >= -EPSILON && visible_top + row_h <= view_h + EPSILON {
         return None;
     }
-    let target = if fits {
-        (view_h - row_h) / 2.0 - row_top
-    } else {
-        -row_top
-    };
+    // How far the row must travel from where it is, applied on top of the
+    // offset that put it there.
+    let target = current_y
+        + if fits {
+            (view_h - row_h) / 2.0 - visible_top
+        } else {
+            -visible_top
+        };
     // GPUI clamps the offset itself on the next prepaint; clamping here keeps
     // the "already there" comparison below honest at either extent.
     let target = target.clamp(-max_offset_y, 0.0);
@@ -102,6 +111,10 @@ mod tests {
         Bounds::new(point(px(0.), px(100.)), size(px(200.), px(300.)))
     }
 
+    /// `top` is an ON-SCREEN position: the canvas records bounds with the
+    /// scroll offset already applied, so a row painted 900px below the
+    /// viewport's top edge has `top = viewport.top() + 900` whatever the
+    /// handle's offset happens to be.
     fn row(top: f32, height: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(0.), px(top)), size(px(200.), px(height)))
     }
@@ -123,10 +136,24 @@ mod tests {
 
     #[test]
     fn a_row_above_the_fold_is_pulled_back_down() {
-        // Scrolled well past it (offset -2000) with the row at content y=1000:
-        // the same centring rule brings the list back to -770.
-        let got = reveal_offset(row(1000., 40.), viewport(), -2000.0, 4000.0).expect("scrolls");
-        assert!((got - -770.0).abs() < 0.01, "got {got}");
+        // Painted 500px ABOVE the viewport's top edge while the list sits at
+        // -1200. Centring must move it down 630px (to +130), which means an
+        // offset of -1200 + 630 = -570 — a correction applied to where the
+        // list already is, not an absolute derived from layout.
+        let got = reveal_offset(row(-400., 40.), viewport(), -1200.0, 4000.0).expect("scrolls");
+        assert!((got - -570.0).abs() < 0.01, "got {got}");
+    }
+
+    #[test]
+    fn the_correction_is_relative_to_the_current_offset() {
+        // The same row, on screen in the same place, from two different
+        // offsets: each must land the row centred, so the answers differ by
+        // exactly the difference in starting offset. This is the property the
+        // original "unscrolled bounds" reading got wrong — it returned the
+        // same absolute offset for both and so under-scrolled by `current_y`.
+        let a = reveal_offset(row(1000., 40.), viewport(), -100.0, 4000.0).expect("scrolls");
+        let b = reveal_offset(row(1000., 40.), viewport(), -900.0, 4000.0).expect("scrolls");
+        assert!((a - b - 800.0).abs() < 0.01, "a={a} b={b}");
     }
 
     #[test]
@@ -135,8 +162,10 @@ mod tests {
         // bottom extent; the clamp keeps the list from scrolling into blank.
         let got = reveal_offset(row(1090., 40.), viewport(), 0.0, 800.0).expect("scrolls");
         assert!((got - -800.0).abs() < 0.01, "got {got}");
-        // And near the start it can never go positive (blank above the list).
-        let got = reveal_offset(row(100., 40.), viewport(), -500.0, 800.0).expect("scrolls");
+        // And near the start it can never go positive (blank above the list):
+        // a row painted 80px above the top edge at offset -100 sits only 20px
+        // into the content, so centring it would want a positive offset.
+        let got = reveal_offset(row(20., 40.), viewport(), -100.0, 800.0).expect("scrolls");
         assert!((got - 0.0).abs() < 0.01, "got {got}");
     }
 

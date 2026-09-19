@@ -28,13 +28,21 @@ const VIEWPORT_HEIGHT: f32 = 300.0;
 struct RailFixture {
     scroll: ScrollHandle,
     anchor: LocateAnchor,
+    /// Which (group, row) carries the anchor — i.e. which row is "active".
+    active: (usize, usize),
 }
 
 impl RailFixture {
+    /// Active row last in the last group: the shape `scroll_to_item` fails on.
     fn new() -> Self {
+        Self::with_active(GROUPS - 1, ROWS - 1)
+    }
+
+    fn with_active(group_ix: usize, row_ix: usize) -> Self {
         Self {
             scroll: ScrollHandle::new(),
             anchor: new_anchor(),
+            active: (group_ix, row_ix),
         }
     }
 }
@@ -55,8 +63,7 @@ impl Render for RailFixture {
             let mut group = div().flex().flex_col().w_full();
             for row_ix in 0..ROWS {
                 let mut row = div().w_full().h(px(ROW_HEIGHT));
-                // The active row: last row of the last group.
-                if group_ix == GROUPS - 1 && row_ix == ROWS - 1 {
+                if (group_ix, row_ix) == self.active {
                     row = row.relative().child(locate_anchor_canvas(self.anchor.clone()));
                 }
                 group = group.child(row);
@@ -67,9 +74,13 @@ impl Render for RailFixture {
     }
 }
 
-/// On-screen top of `row` relative to the viewport's top, at `offset_y`.
-fn on_screen_top(row: Bounds<Pixels>, viewport: Bounds<Pixels>, offset_y: f32) -> f32 {
-    f32::from(row.top() - viewport.top()) + offset_y
+/// On-screen top of `row` relative to the viewport's top.
+///
+/// GPUI records child bounds with the scroll offset already applied, so this
+/// is a straight subtraction — adding the handle's offset here would count it
+/// twice, which is exactly the mistake `reveal_offset` used to make.
+fn on_screen_top(row: Bounds<Pixels>, viewport: Bounds<Pixels>) -> f32 {
+    f32::from(row.top() - viewport.top())
 }
 
 #[gpui::test]
@@ -110,7 +121,7 @@ async fn scrolling_to_the_group_leaves_the_row_off_screen(cx: &mut TestAppContex
         .update(cx, |view, _window, _cx| {
             let row = view.anchor.get().expect("bounds recorded");
             let viewport = view.scroll.bounds();
-            let top = on_screen_top(row, viewport, f32::from(view.scroll.offset().y));
+            let top = on_screen_top(row, viewport);
             assert!(
                 top >= VIEWPORT_HEIGHT,
                 "the group-index scroll should leave the row below the fold, got {top}"
@@ -144,7 +155,7 @@ async fn revealing_the_row_puts_it_inside_the_viewport(cx: &mut TestAppContext) 
         .update(cx, |view, _window, _cx| {
             let row = view.anchor.get().expect("bounds recorded");
             let viewport = view.scroll.bounds();
-            let top = on_screen_top(row, viewport, f32::from(view.scroll.offset().y));
+            let top = on_screen_top(row, viewport);
             assert!(
                 top >= -0.5 && top + ROW_HEIGHT <= VIEWPORT_HEIGHT + 0.5,
                 "the row should be fully visible, got top {top}"
@@ -158,6 +169,66 @@ async fn revealing_the_row_puts_it_inside_the_viewport(cx: &mut TestAppContext) 
                     f32::from(view.scroll.max_offset().y)
                 ),
                 None
+            );
+        })
+        .expect("window should be alive");
+}
+
+#[gpui::test]
+async fn one_press_reveals_the_row_from_an_already_scrolled_list(cx: &mut TestAppContext) {
+    // The case the affordance exists for: the user scrolled away, so the list
+    // is NOT at offset 0 when they reach for the crosshair. Because the anchor
+    // records on-screen bounds, the correction has to be applied relative to
+    // the offset the list already carries. Reading those bounds as unscrolled
+    // layout instead made the answer clamp to 0 here — one press flung the
+    // list to the very top, with the active row still nowhere in view.
+    let window = cx.add_window(|_window, _cx| RailFixture::with_active(2, 5));
+    cx.run_until_parked();
+    // Park at the bottom extent, with the active row far above the fold.
+    window
+        .update(cx, |view, _window, cx| {
+            let max = view.scroll.max_offset().y;
+            view.scroll.set_offset(gpui::point(px(0.), -max));
+            cx.notify();
+        })
+        .expect("window should be alive");
+    cx.run_until_parked();
+    let before = window
+        .update(cx, |view, _window, _cx| {
+            on_screen_top(view.anchor.get().expect("bounds recorded"), view.scroll.bounds())
+        })
+        .expect("window should be alive");
+    assert!(before < 0.0, "fixture should start with the row above the fold, got {before}");
+
+    let target = window
+        .update(cx, |view, _window, cx| {
+            let row = view.anchor.get().expect("bounds recorded");
+            let viewport = view.scroll.bounds();
+            let offset = view.scroll.offset();
+            let target = reveal_offset(
+                row,
+                viewport,
+                f32::from(offset.y),
+                f32::from(view.scroll.max_offset().y),
+            )
+            .expect("a row above the fold must scroll");
+            view.scroll.set_offset(gpui::point(offset.x, px(target)));
+            cx.notify();
+            target
+        })
+        .expect("window should be alive");
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _window, _cx| {
+            let row = view.anchor.get().expect("bounds recorded");
+            let top = on_screen_top(row, view.scroll.bounds());
+            assert!(
+                top >= -0.5 && top + ROW_HEIGHT <= VIEWPORT_HEIGHT + 0.5,
+                "one press must reveal the row, got top {top} (scrolled to {target})"
+            );
+            assert!(
+                target < -0.5,
+                "the list must not be flung to the top, got {target}"
             );
         })
         .expect("window should be alive");
