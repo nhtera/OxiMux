@@ -696,12 +696,26 @@ simplifications are known dead ends:
 | VS Code, `pinnedTabSizing: compact`/`shrink` | Yes — `position: sticky` + `left = index × 38px`/`80px`, over an opaque backdrop | Abandons the freeze wholesale (`disable-sticky-tabs`) once the remainder drops under one full tab (120px) |
 | VS Code, default (`normal`) | **No** — `getStickyTabWidth()` returns 0, so pinned tabs scroll away like any other tab | n/a; a long-standing complaint, and "Pinned Tab Anchoring" was closed as not planned |
 | Firefox | Yes — a separate `arrowscrollbox` sibling of the tab scroller | Own scroll arrows, but no width cap, and a bug trail for pinned tabs crowding out the strip |
-| Chrome | Fixed 24px icon-only pinned tabs, exempt from shrinking | — |
+| Chrome | **No.** Fixed 24px icon-only pinned tabs, exempt from shrinking, but inside the one strip — and when `#scrollable-tabstrip` was enabled they scrolled away with everything else | n/a; the flag was removed outright in Chrome 144 rather than fixed |
 | JetBrains, Windows Terminal, iTerm2, Sublime | Pinning either groups-left only (JetBrains) or does not exist | — |
 
 This strip takes Zed's structure (it is the same toolkit), VS Code's floor, and
 Firefox's "let the frozen region scroll itself" escape, which together cover
 the gap each one leaves on its own.
+
+The split in that table is not about effort, it is about order of
+construction. Zed and Firefox, the two that freeze pinned tabs correctly,
+both built the pinned tabs as their own container from the start. Chrome and
+VS Code's default both bolted scrolling onto a strip that already assumed it
+owned its full width, and in both the pinned tabs scroll away — which is the
+bug this section exists to fix. Chrome's ending is the cautionary one: rather
+than fix the interaction, the `#scrollable-tabstrip` flag was withdrawn from
+Chrome Labs in mid-2025 and removed in Chrome 144, reportedly because the
+scrolling code could not be maintained alongside newer tab-strip work. There
+is no scroll container left in `chrome/browser/ui/views/tabs/` on trunk.
+
+So do not retrofit. Anything that wants the pinned block to hold its place
+has to be a sibling of the scroll viewport, not a passenger inside it.
 
 ## Top-bar command center
 
