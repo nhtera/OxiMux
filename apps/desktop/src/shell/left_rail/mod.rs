@@ -272,8 +272,8 @@ pub struct LeftRail {
     /// animation on this so each click replays the glow exactly once.
     /// 0 = never triggered (no animation mounts).
     locate_glow_seq: u64,
-    /// The active workspace row's bounds from the last layout pass, written by
-    /// a canvas the row itself paints. `scroll_to_active` scrolls to THESE —
+    /// Where the active workspace row was painted in the last frame, written by
+    /// a canvas the row itself carries. `scroll_to_active` scrolls to THESE —
     /// the scroll handle only knows the list's direct children (project
     /// groups), which is not where the active row lives.
     locate_anchor: LocateAnchor,
@@ -1212,10 +1212,10 @@ impl Render for LeftRail {
         let density = self.density;
         let typography = self.typography.clone();
         let entity = cx.entity().clone();
-        // The anchor is rewritten by the active row's own canvas during this
-        // frame's layout. Clearing it first is what makes "no active row on
-        // screen" observable — otherwise a stale position from a list that is
-        // no longer rendered would be scrolled to as if it were current.
+        // The anchor is rewritten by the active row's own canvas as this frame
+        // paints. Clearing it first is what makes "no active row on screen"
+        // observable — otherwise a stale position from a list that is no
+        // longer rendered would be scrolled to as if it were current.
         self.locate_anchor.set(None);
 
         // The flex-1 body slot changes depending on the active nav page.

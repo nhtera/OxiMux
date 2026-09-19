@@ -67,9 +67,10 @@ impl Render for RailFixture {
     }
 }
 
-/// On-screen top of `row` relative to the viewport's top, at `offset_y`.
-fn on_screen_top(row: Bounds<Pixels>, viewport: Bounds<Pixels>, offset_y: f32) -> f32 {
-    f32::from(row.top() - viewport.top()) + offset_y
+/// On-screen top of `row` relative to the viewport's top. The anchor records
+/// the row as painted, so the scroll offset is already in these bounds.
+fn on_screen_top(row: Bounds<Pixels>, viewport: Bounds<Pixels>) -> f32 {
+    f32::from(row.top() - viewport.top())
 }
 
 #[gpui::test]
@@ -110,7 +111,7 @@ async fn scrolling_to_the_group_leaves_the_row_off_screen(cx: &mut TestAppContex
         .update(cx, |view, _window, _cx| {
             let row = view.anchor.get().expect("bounds recorded");
             let viewport = view.scroll.bounds();
-            let top = on_screen_top(row, viewport, f32::from(view.scroll.offset().y));
+            let top = on_screen_top(row, viewport);
             assert!(
                 top >= VIEWPORT_HEIGHT,
                 "the group-index scroll should leave the row below the fold, got {top}"
@@ -144,7 +145,7 @@ async fn revealing_the_row_puts_it_inside_the_viewport(cx: &mut TestAppContext) 
         .update(cx, |view, _window, _cx| {
             let row = view.anchor.get().expect("bounds recorded");
             let viewport = view.scroll.bounds();
-            let top = on_screen_top(row, viewport, f32::from(view.scroll.offset().y));
+            let top = on_screen_top(row, viewport);
             assert!(
                 top >= -0.5 && top + ROW_HEIGHT <= VIEWPORT_HEIGHT + 0.5,
                 "the row should be fully visible, got top {top}"
