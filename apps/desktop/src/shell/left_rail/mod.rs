@@ -125,6 +125,30 @@ fn same_membership(a: &[String], b: &[String]) -> bool {
     a.len() == b.len() && a.iter().collect::<HashSet<_>>() == b.iter().collect::<HashSet<_>>()
 }
 
+/// Which archived disclosure hides `workspace_id`, or `None` when no archived
+/// row carries that id — the ordinary case, where the workspace is live and
+/// there is nothing to open.
+///
+/// Free-standing because the flat/grouped split is the part that is easy to
+/// get wrong and the part worth testing: grouped mode nests one disclosure per
+/// project and keys it by project id, while flat mode pools every project's
+/// archived rows under a single cross-project key.
+fn archived_disclosure_key(
+    workspace_id: &str,
+    archived_by_project: &HashMap<String, Vec<Workspace>>,
+    group_mode: WorkspaceGroupMode,
+) -> Option<String> {
+    let owning_project = archived_by_project.iter().find_map(|(project_id, rows)| {
+        rows.iter()
+            .any(|w| w.id == workspace_id)
+            .then_some(project_id)
+    })?;
+    Some(match group_mode {
+        WorkspaceGroupMode::Project => owning_project.clone(),
+        WorkspaceGroupMode::Flat => project_group::FLAT_ARCHIVED_KEY.to_string(),
+    })
+}
+
 /// Reorder `list` so its rows follow `order` (by id); any row not named in
 /// `order` keeps its relative position at the tail. Used to apply a held
 /// settle order on top of a freshly-sorted list.
@@ -724,6 +748,15 @@ impl LeftRail {
             self.persist_collapsed();
             uncovered = true;
         }
+        // An archived active workspace sits inside a disclosure that is closed
+        // by default, and a closed one renders no rows at all — so there is no
+        // anchor to measure and the reveal would silently degrade to the group
+        // scroll, landing on the project with the row still nowhere.
+        if let Some(key) = self.archived_disclosure_key_for_active()
+            && self.expanded_archived.insert(key)
+        {
+            uncovered = true;
+        }
         if uncovered {
             cx.notify();
         }
@@ -775,6 +808,23 @@ impl LeftRail {
             cx.notify();
         }
         true
+    }
+
+    /// The [`Self::expanded_archived`] key for the disclosure hiding the
+    /// active workspace, or `None` when it is not archived — which is the
+    /// common case, and where opening one would expand a section the user
+    /// never asked to see.
+    ///
+    /// The owning project is found by search rather than read from
+    /// `active_project_id`: flat mode pools every project's archived rows
+    /// under one cross-project disclosure, so the key depends on the grouping,
+    /// not on which project the row belongs to.
+    fn archived_disclosure_key_for_active(&self) -> Option<String> {
+        archived_disclosure_key(
+            self.active_workspace_id.as_deref()?,
+            &self.archived_by_project,
+            self.group_mode,
+        )
     }
 
     /// Last-resort reveal: bring the active project's GROUP into view. Only
@@ -1862,7 +1912,10 @@ fn new_workspace_icon(has_active_project: bool, theme: Theme) -> impl IntoElemen
 
 #[cfg(test)]
 mod tests {
-    use super::{reorder_to_id_sequence, same_membership};
+    use super::{archived_disclosure_key, reorder_to_id_sequence, same_membership};
+    use super::WorkspaceGroupMode;
+    use crate::shell::left_rail::project_group::FLAT_ARCHIVED_KEY;
+    use std::collections::HashMap;
     use oximux_core::Workspace;
 
     fn ws(id: &str) -> Workspace {
@@ -1886,6 +1939,45 @@ mod tests {
             comment: String::new(),
             phase: String::new(),
         }
+    }
+
+    /// A live (non-archived) active workspace must not open anything — the
+    /// affordance would otherwise expand an Archived section on every press.
+    #[test]
+    fn a_live_workspace_opens_no_archived_disclosure() {
+        let archived: HashMap<String, Vec<Workspace>> =
+            HashMap::from([("p".to_string(), vec![ws("gone")])]);
+        assert_eq!(
+            archived_disclosure_key("still-here", &archived, WorkspaceGroupMode::Project),
+            None
+        );
+    }
+
+    /// Grouped mode nests the disclosure under the project that owns the row,
+    /// so the key is that project's id — found by search, not by assuming the
+    /// active project is the owner.
+    #[test]
+    fn an_archived_workspace_names_its_owning_project_when_grouped() {
+        let archived: HashMap<String, Vec<Workspace>> = HashMap::from([
+            ("p-other".to_string(), vec![ws("unrelated")]),
+            ("p-owner".to_string(), vec![ws("buried")]),
+        ]);
+        assert_eq!(
+            archived_disclosure_key("buried", &archived, WorkspaceGroupMode::Project),
+            Some("p-owner".to_string())
+        );
+    }
+
+    /// Flat mode has no project groups to nest under: every project's archived
+    /// rows share one disclosure, so the owning project is irrelevant.
+    #[test]
+    fn an_archived_workspace_names_the_flat_key_when_ungrouped() {
+        let archived: HashMap<String, Vec<Workspace>> =
+            HashMap::from([("p-owner".to_string(), vec![ws("buried")])]);
+        assert_eq!(
+            archived_disclosure_key("buried", &archived, WorkspaceGroupMode::Flat),
+            Some(FLAT_ARCHIVED_KEY.to_string())
+        );
     }
 
     #[test]
