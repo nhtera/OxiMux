@@ -11,6 +11,7 @@
 //! clamped on load AND save so a corrupt write can't leak past either
 //! direction.
 
+use oximux_settings::Density;
 use oximux_storage::SettingsRepo;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,44 @@ pub fn clamp_panel_width(value: f32, window_width: f32) -> f32 {
 pub fn clamp_graph_height(value: f32, window_height: f32) -> f32 {
     let ceiling = (window_height * MAX_GRAPH_HEIGHT_VH_RATIO).max(MIN_GRAPH_HEIGHT);
     value.clamp(MIN_GRAPH_HEIGHT, ceiling)
+}
+
+// ---------------------------------------------------------------------------
+// Changed-files floor
+// ---------------------------------------------------------------------------
+
+/// Extra vertical space a changed-file row carries over a plain `h_row`.
+/// Mirrors the `+ 2.0` in `git_panel::row_renderer` (`:313`), which is the
+/// single-line file-row height the panel actually paints. Kept in sync by
+/// derivation, not by memory: the floor has to be measured in the same unit
+/// the rows are.
+const FILE_ROW_EXTRA: f32 = 2.0;
+
+/// Number of file rows the floor guarantees below the section header. Two,
+/// not one: a single row plus a header reads as a rendering glitch, while two
+/// reads as a list that has been squeezed and can be scrolled.
+const FILES_FLOOR_ROWS: f32 = 2.0;
+
+/// Minimum height the changed-files section may be squeezed to: one section
+/// header plus [`FILES_FLOOR_ROWS`] file rows.
+///
+/// The SCM column's file block is the only `flex_1` child, so it absorbs the
+/// entire height deficit when the stash section and the graph are both
+/// expanded. With `min_h(0)` it collapsed to near-zero and `overflow_hidden`
+/// guillotined the CHANGES header mid-row. This floor stops the squeeze while
+/// there is still a header and a usable strip of list; past it the inner
+/// `git-panel-scroll` region scrolls instead.
+///
+/// Density-derived on purpose — a literal floor is right at 100% zoom and
+/// cramped at 150%, which is exactly the failure `source_control::style`
+/// documents. See that module for why a helper that ignores [`Density`] is
+/// not acceptable on this surface.
+///
+/// The floor only clips rather than overflowing because the SCM body column
+/// carries `overflow_hidden`; without it the floor pushes the sections below
+/// the visible panel and takes the graph's drag handle off-screen with them.
+pub fn files_floor(density: &Density) -> f32 {
+    density.h_row + FILES_FLOOR_ROWS * (density.h_row + FILE_ROW_EXTRA)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +222,7 @@ pub fn next_graph_height(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oximux_settings::{Appearance, DensityPreset, UiScale};
     use oximux_storage::open_memory;
 
     fn repo() -> SettingsRepo {
@@ -233,6 +273,53 @@ mod tests {
     #[test]
     fn clamp_graph_height_in_range_is_unchanged() {
         assert_eq!(clamp_graph_height(200.0, 900.0), 200.0);
+    }
+
+    // ----- files_floor -----
+
+    fn density_at(preset: DensityPreset, percent: u16) -> Density {
+        Density::for_appearance(Appearance {
+            density: preset,
+            scale: UiScale::from_percent(percent),
+            ..Appearance::default()
+        })
+    }
+
+    #[test]
+    fn files_floor_is_a_header_plus_two_rows() {
+        let d = Density::cockpit();
+        assert_eq!(files_floor(&d), d.h_row + 2.0 * (d.h_row + FILE_ROW_EXTRA));
+    }
+
+    #[test]
+    fn files_floor_leaves_room_for_the_header_it_protects() {
+        // The whole point of the floor: whatever else gets squeezed, a full
+        // section header still fits inside it with rows to spare.
+        let d = Density::cockpit();
+        assert!(files_floor(&d) > d.h_row);
+    }
+
+    #[test]
+    fn files_floor_grows_with_zoom() {
+        // The literal-pixel failure this function exists to avoid: right at
+        // 100%, cramped at 150%. A density-derived floor scales with the rows
+        // it is measured in.
+        let base = files_floor(&density_at(DensityPreset::Cockpit, 100));
+        let zoomed = files_floor(&density_at(DensityPreset::Cockpit, 150));
+        assert!(
+            zoomed > base,
+            "floor must follow UI scale: {base} → {zoomed}"
+        );
+    }
+
+    #[test]
+    fn files_floor_grows_with_a_roomier_preset() {
+        let cockpit = files_floor(&density_at(DensityPreset::Cockpit, 100));
+        let roomy = files_floor(&density_at(DensityPreset::Comfortable, 100));
+        assert!(
+            roomy > cockpit,
+            "floor must follow the density preset: {cockpit} → {roomy}"
+        );
     }
 
     // ----- load_panel_width -----

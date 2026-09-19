@@ -1351,12 +1351,21 @@ impl Render for SourceControlPanel {
         // because the CTAs dispatch through SourceControlPanel methods
         // (open_switch_picker, commit_area.update, select_scope) which
         // the inner GitPanel can't reach directly.
+        //
+        // `min_h` is the *floor*, not zero. This block is the column's only
+        // flexible child, so it absorbs the whole height deficit when the
+        // stash section and the graph are both expanded. At `min_h(0)` it
+        // collapsed to near-zero and its own `overflow_hidden` guillotined
+        // the CHANGES header mid-row — the reported "overlap", which was
+        // never one. The floor stops the squeeze while a header and two rows
+        // still fit; past that the inner `git-panel-scroll` region scrolls.
         let clean_tree = self.should_show_empty_state();
+        let files_floor = px(crate::scm_layout_settings::files_floor(&self.density));
         let files_block = if clean_tree {
             div()
                 .flex()
                 .flex_1()
-                .min_h(px(0.0))
+                .min_h(files_floor)
                 .flex_col()
                 .items_center()
                 .justify_center()
@@ -1366,7 +1375,7 @@ impl Render for SourceControlPanel {
             div()
                 .flex()
                 .flex_1()
-                .min_h(px(0.0))
+                .min_h(files_floor)
                 .flex_col()
                 .overflow_hidden()
                 .child(self.git_panel.clone())
@@ -1384,11 +1393,19 @@ impl Render for SourceControlPanel {
         // in the surrounding workspace chrome rather than a dedicated
         // SCM header strip — `render_branch_toolbar` owns the right-
         // anchored Settings / View-mode / Refresh icon cluster.
+        //
+        // `overflow_hidden` is what makes the floor above a floor rather than
+        // an overflow. Neither this column nor its `relative()` wrapper
+        // clipped, so a `min_h` on `files_block` pushed the stash section and
+        // the graph *below the visible panel* instead of forcing the list to
+        // scroll — taking the graph's drag handle, the escape valve a cramped
+        // window depends on, off-screen with them.
         let mut body = div()
             .flex()
             .flex_col()
             .w_full()
             .h_full()
+            .overflow_hidden()
             .bg(theme.bg_panel)
             .child(scope_tabs)
             .child(toolbar)
@@ -1401,7 +1418,18 @@ impl Render for SourceControlPanel {
             // Stash list docked above the graph (or at the very bottom
             // when the scope hides the graph). Always-mounted entity;
             // collapsed by default — see `StashPanel::is_collapsed`.
-            .child(self.stash_panel.clone());
+            //
+            // Wrapped in the same `flex_shrink_0` + top hairline the graph
+            // gets below: without a rule between them, the file list and
+            // STASHES read as one colliding surface even once they no longer
+            // collide — which is how the clip got reported as an overlap.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme.border_inactive)
+                    .child(self.stash_panel.clone()),
+            );
         if self.scope.shows_graph() {
             // Graph sits at its natural height, pinned to the bottom of the
             // panel by the `flex_1` files_block above. Top border separates

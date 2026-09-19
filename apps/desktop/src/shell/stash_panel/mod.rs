@@ -22,11 +22,13 @@ use crate::shell::stash_panel::list_render::row_label;
 use crate::ui::danger_ghost;
 use gpui::{
     App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Task, Window, div, px,
+    IntoElement, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Task,
+    Window, div, px,
 };
 use gpui_component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants},
+    scroll::ScrollableElement as _,
 };
 use oximux_core::{StashEntry, StashRef};
 use oximux_git::Repository;
@@ -38,6 +40,20 @@ use tokio::sync::oneshot;
 /// clickable (the panel has no context-menu fallback). Lifts to full on
 /// row-hover.
 const STASH_ACTION_REST_OPACITY: f32 = 0.45;
+
+/// How many stash rows the expanded body shows before it starts scrolling.
+///
+/// The section is `flex_shrink_0`, so without a cap every stash row it
+/// renders comes straight out of the changed-files block above — five rows
+/// (~170px) is what tips a 13" display into clipping the CHANGES header.
+/// The cap makes the section's appetite bounded and hands the overflow to
+/// its own scroll region instead of to its neighbour.
+///
+/// Deliberately a private const with no test: eight is an admitted guess,
+/// and Phase 5 deletes it when the section becomes drag-resizable. Promoting
+/// a soon-to-be-deleted guess into public, unit-tested settings API would be
+/// churn. If it chafes before Phase 5 lands, this is one line to raise.
+const STASH_BODY_MAX_ROWS: f32 = 8.0;
 
 #[derive(Debug)]
 pub enum StashListState {
@@ -71,6 +87,11 @@ pub struct StashPanel {
     theme: Theme,
     density: Density,
     typography: Typography,
+    /// Scroll position for the capped stash body. Wired through
+    /// `track_scroll` on the overflow region and consumed by
+    /// `vertical_scrollbar` so the thumb tracks the user's wheel/drag.
+    /// Mirrors `GitPanel::scroll_handle` (`git_panel/mod.rs:113`).
+    scroll_handle: ScrollHandle,
     _refresh_task: Option<Task<()>>,
     _op_task: Option<Task<()>>,
 }
@@ -94,6 +115,7 @@ impl StashPanel {
             theme,
             density,
             typography,
+            scroll_handle: ScrollHandle::new(),
             _refresh_task: None,
             _op_task: None,
         };
@@ -318,7 +340,33 @@ impl Render for StashPanel {
                     col.into_any_element()
                 }
             };
-            container = container.child(body);
+            // Cap the body and give the overflow its own scroll region.
+            //
+            // This section is `flex_shrink_0` and so is the graph below it,
+            // which leaves the changed-files block as the SCM column's only
+            // flexible child — it absorbs 100% of any height deficit. An
+            // uncapped stash list therefore does not push itself off-screen,
+            // it squeezes CHANGES until the header is guillotined. Bounding
+            // the section's appetite is half the fix; the floor on the file
+            // block (`files_floor`) is the other half.
+            //
+            // `.id()` is load-bearing: `overflow_y_scroll` without a stateful
+            // id silently does nothing (the GPUI trap documented at
+            // `git_panel/mod.rs:527`). `relative()` anchors the scrollbar
+            // overlay, and `track_scroll` + `vertical_scrollbar` share
+            // `scroll_handle` so the thumb mirrors the scroll position.
+            let max_h = STASH_BODY_MAX_ROWS * self.density.h_action_row;
+            container = container.child(
+                div()
+                    .id("stash-panel-scroll")
+                    .relative()
+                    .w_full()
+                    .max_h(px(max_h))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .child(body)
+                    .vertical_scrollbar(&self.scroll_handle),
+            );
         }
 
         container
