@@ -2757,6 +2757,10 @@ impl PaneGroup {
         self.bump_mru(idx);
         let changed = idx != self.active;
         self.active = idx;
+        // Bring it on screen. Every other activation signal (MRU switch,
+        // next/prev tab, the sidebar rail) reaches the strip through here, so
+        // this is the one place that has to ask.
+        self.reveal_tab(idx);
         // Land keyboard focus on the active tab's content so it's ready for
         // input — even when re-selecting the already-active tab. The focus is
         // DEFERRED to the next frame: focusing synchronously here is clobbered

@@ -863,6 +863,33 @@ impl PaneGroup {
         self.tab_strip_scroll.set_offset(Point::new(px(0.0), px(0.0)));
     }
 
+    /// Bring the tab at insertion index `idx` into view, in whichever of the
+    /// strip's two regions holds it.
+    ///
+    /// Activation had no scroll path at all before this: `set_active` bumped
+    /// MRU and moved focus, so Cmd+Tab to an offscreen tab left it offscreen
+    /// and only the append and label-change paths ever touched the strip's
+    /// scroll. The frozen pinned zone raises the stakes slightly, because a
+    /// pinned tab can now be scrolled out of its own block once the zone hits
+    /// its width cap.
+    ///
+    /// `scroll_to_item` is a minimal reveal — it moves the viewport only as
+    /// far as it must, and no-ops on a tab that is already fully visible — and
+    /// it resolves at prepaint, so a chip whose bounds are not measured yet
+    /// (a tab appended this frame) is retried on the next one rather than
+    /// resolved against nothing.
+    pub(crate) fn reveal_tab(&self, idx: usize) {
+        let Some(visible_idx) = self.tab_order.iter().position(|&i| i == idx) else {
+            return;
+        };
+        let (in_pinned_zone, child_idx) = region_child_index(visible_idx, self.pinned_count());
+        if in_pinned_zone {
+            self.pinned_tab_strip_scroll.scroll_to_item(child_idx);
+        } else {
+            self.tab_strip_scroll.scroll_to_item(child_idx);
+        }
+    }
+
     /// Returns true when the tab strip viewport is currently snapped to
     /// its rightmost extent (i.e. the user is "pinned to end"). Used by
     /// the label-change re-pin path so widening a chip after a tab is
@@ -881,6 +908,22 @@ impl PaneGroup {
             return true;
         }
         f32::from(offset.x).abs() >= max_x - 1.0
+    }
+}
+
+/// Map a visible strip index onto the region that renders it and the index
+/// within THAT region's children: `(true, i)` for the frozen pinned zone,
+/// `(false, i)` for the scrolling viewport.
+///
+/// The strip is two containers with a child list each, so a `ScrollHandle`
+/// has to be addressed in its own region's space — handing it a strip-wide
+/// index scrolls to the wrong chip, or to none at all. Pinned tabs are packed
+/// at the front of `tab_order`, so the split is just the pinned count.
+pub(crate) fn region_child_index(visible_idx: usize, pinned_count: usize) -> (bool, usize) {
+    if visible_idx < pinned_count {
+        (true, visible_idx)
+    } else {
+        (false, visible_idx - pinned_count)
     }
 }
 
@@ -935,5 +978,31 @@ mod turn_in_flight_tests {
         assert!(!turn_in_flight(&AgentStatus::Done { code: None }));
         assert!(!turn_in_flight(&AgentStatus::Failed("boom".into())));
         assert!(!turn_in_flight(&AgentStatus::Interrupted));
+    }
+}
+
+#[cfg(test)]
+mod region_child_index_tests {
+    use super::region_child_index;
+
+    /// The off-by-one that would silently scroll the wrong chip. The strip is
+    /// two containers with a child list each, so the first unpinned tab is
+    /// item 0 of the viewport — not item 2 of a strip-wide list.
+    #[test]
+    fn splits_at_the_pinned_boundary() {
+        assert_eq!(region_child_index(0, 2), (true, 0));
+        assert_eq!(region_child_index(1, 2), (true, 1));
+        assert_eq!(region_child_index(2, 2), (false, 0));
+        assert_eq!(region_child_index(5, 2), (false, 3));
+    }
+
+    /// Both degenerate strips, which is where a subtraction like this usually
+    /// goes wrong: nothing pinned (no zone rendered at all) and everything
+    /// pinned (no viewport children to index into).
+    #[test]
+    fn handles_the_degenerate_strips() {
+        assert_eq!(region_child_index(0, 0), (false, 0));
+        assert_eq!(region_child_index(3, 0), (false, 3));
+        assert_eq!(region_child_index(2, 3), (true, 2));
     }
 }
