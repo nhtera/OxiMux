@@ -106,14 +106,20 @@ fn main() {
     // precede the first thread — it writes the environment.
     oximux_app::platform::claude_session_env::scrub_inherited_claude_session_markers();
 
-    // Before the runtime, and before anything spawns: a double-clicked app
-    // inherits only launchd's four directories, and every agent CLI installs
-    // outside them. Must precede the first thread — it writes the environment.
+    // Before the runtime, and before anything spawns: a GUI launch inherits the
+    // session manager's stub PATH on every platform, and every agent CLI
+    // installs outside it. Must precede the first thread — it writes the
+    // environment.
     //
-    // Windows has no equivalent gap: a process started from Explorer gets the
-    // machine and user PATH out of the registry, the same one a console gets.
-    #[cfg(unix)]
-    oximux_app::platform::login_path::adopt_login_shell_path();
+    // Not for the two CLI subcommands below. Those are agent hooks: they run
+    // many times a second, they already inherit the PATH of the app that
+    // spawned them, and they deliberately run without a terminal — which is
+    // the very signal the module reads as "this is a GUI launch". Without this
+    // guard every hook invocation would pay for a shell it does not need.
+    let subcommand = std::env::args().nth(1);
+    if !matches!(subcommand.as_deref(), Some("notify" | "agent-status")) {
+        oximux_app::platform::login_path::adopt_login_shell_path();
+    }
 
     // Boot the tokio runtime that every git op + status poller relies on.
     // Held across `app.run` so `Handle::try_current` succeeds in callbacks.
@@ -161,7 +167,7 @@ fn main() {
     // `notify`) or scripts. Reads OXIMUX_PTY_ID from the env (injected by the
     // daemon at spawn), connects to the relay, and asks it to ring that pane.
     // Short-circuits the GUI/db boot entirely.
-    if std::env::args().nth(1).as_deref() == Some("notify") {
+    if subcommand.as_deref() == Some("notify") {
         std::process::exit(run_notify_cli(&rt));
     }
 
@@ -172,7 +178,7 @@ fn main() {
     // emit an OSC-9999 status packet on that PTY's stream. Hooks run with no
     // controlling terminal, so this relay round-trip — not a `/dev/tty` write —
     // is how status reaches the app. Short-circuits the GUI/db boot entirely.
-    if std::env::args().nth(1).as_deref() == Some("agent-status") {
+    if subcommand.as_deref() == Some("agent-status") {
         std::process::exit(run_agent_status_cli(&rt));
     }
 
@@ -192,6 +198,14 @@ fn main() {
     // approval nobody gave it. Runs after the single-instance guard so a second
     // launch that bows out cannot wipe the live instance's grants.
     oximux_app::clear_stale_screen_control_grants();
+
+    // Bring the cached shell PATH up to date for the next launch. Here and not
+    // earlier: the helper-CLI short-circuits above must never spawn a login
+    // shell, and neither should a second instance that just bowed out to the
+    // guard. It writes a file, never this process' environment — see the
+    // module for why that distinction is a soundness requirement and not a
+    // preference.
+    oximux_app::platform::login_path::refresh_cached_path_in_background();
 
     // boot: repo open is post-paint. No `Repository::open` here on purpose —
     // it spawns `git`, and on the packaged Windows (GUI-subsystem) build the

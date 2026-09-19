@@ -31,10 +31,9 @@ pub mod claude_session_env;
 // `main`.
 pub mod direct_composition;
 pub mod escape_tap;
-// Every line assumes POSIX: `:`-separated PATH, a `-lc` login shell, launchd's
-// four-directory stub. Windows inherits a real PATH from the registry, so
-// there is nothing here to port.
-#[cfg(unix)]
+// All three platforms have the same gap in different clothes: a GUI launch
+// inherits a session-manager stub instead of the PATH the user's shell builds.
+// The module keeps one probe list per platform and is separator-agnostic.
 pub mod login_path;
 pub mod menu;
 pub mod mic_permission;
