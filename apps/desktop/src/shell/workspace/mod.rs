@@ -8,6 +8,7 @@ pub mod base_choice;
 pub mod codename_ops;
 pub mod configured_locator;
 pub mod discovery;
+pub mod focus_follow;
 pub mod merge_notices;
 pub mod merge_ops;
 pub mod project_picker;
