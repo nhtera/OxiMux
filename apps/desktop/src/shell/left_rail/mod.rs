@@ -22,6 +22,7 @@
 //! `open_row_menu`), which fire on user events after render completes.
 
 pub mod dashboard_status_menu;
+pub mod locate_anchor;
 pub mod nav_section;
 pub mod open_in;
 pub mod options_menu;
@@ -63,6 +64,7 @@ use crate::shell::agent_presentation::AmbientAgent;
 use crate::shell::agents_dashboard::model::{attention_rank, needs_attention};
 use crate::shell::agents_dashboard::filter::StatusFilter;
 use crate::shell::agents_dashboard::render_agents_dashboard;
+use crate::shell::left_rail::locate_anchor::{LocateAnchor, new_anchor, reveal_offset};
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{
     build_project_group_plan, render_project_group, render_workspace_block,
@@ -78,6 +80,13 @@ const HEADER_ICON_SIZE: f32 = 14.0;
 /// How long a Smart-sorted group holds its displayed row order after a
 /// score-affecting change, so rows don't reshuffle under the cursor.
 const SMART_SETTLE: Duration = Duration::from_secs(3);
+
+/// How many deferred passes the locate affordance takes before giving up on
+/// the active row's bounds and revealing its project group instead. Two covers
+/// the worst case: next-frame callbacks run BEFORE that frame's layout, so the
+/// first pass still sees the pre-reveal bounds and the second is the one that
+/// sees the uncollapsed group (or the snapshot `WorkspaceRoot` pushed) in place.
+const REVEAL_PASSES: u8 = 2;
 
 /// Distance (px) from a list bound within which a drag triggers auto-scroll.
 const AUTOSCROLL_BAND: f32 = 24.0;
@@ -263,6 +272,11 @@ pub struct LeftRail {
     /// animation on this so each click replays the glow exactly once.
     /// 0 = never triggered (no animation mounts).
     locate_glow_seq: u64,
+    /// The active workspace row's bounds from the last layout pass, written by
+    /// a canvas the row itself paints. `scroll_to_active` scrolls to THESE —
+    /// the scroll handle only knows the list's direct children (project
+    /// groups), which is not where the active row lives.
+    locate_anchor: LocateAnchor,
     /// Agent sessions that entered an attention/terminal state while the
     /// Agents page was NOT open. Shown as a badge on the Agents nav row;
     /// zeroed when the page is opened. Lives here (not on the dashboard
@@ -346,6 +360,7 @@ impl LeftRail {
             _dashboard_filter_sub: None,
             list_scroll: ScrollHandle::new(),
             locate_glow_seq: 0,
+            locate_anchor: new_anchor(),
             agents_unread: 0,
             smart_settle: HashMap::new(),
             settle_timer_armed: false,
@@ -667,17 +682,119 @@ impl LeftRail {
         .detach();
     }
 
-    /// Scroll the workspace list so the active project's group is in view
-    /// and replay the locate glow on the active card. Reduced motion skips
-    /// the glow — the scroll landing on the (already raised) active card
-    /// is sufficient locate feedback.
-    pub(crate) fn scroll_to_active(&mut self, cx: &mut Context<Self>) {
+    /// Reveal the active workspace: bring its ROW into view and replay the
+    /// locate glow on it. Reduced motion skips the glow — the scroll landing
+    /// on the (already raised) active card is sufficient locate feedback.
+    ///
+    /// Three things have to be true before a row can be revealed, and the
+    /// affordance is responsible for all three: the rail body has to be the
+    /// workspace list (the agents page replaces it entirely), the active
+    /// project's group has to be expanded (a collapsed one renders its header
+    /// and nothing else), and the row has to have been through a layout pass
+    /// so its bounds are known. So this fixes up the first two, then waits a
+    /// frame and scrolls — which also lets a caller that just changed the
+    /// active workspace on `WorkspaceRoot` (a notification click) have its
+    /// snapshot reach the rail first, so we locate the NEW row and not the one
+    /// the user just navigated away from.
+    pub(crate) fn scroll_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_active_workspace(REVEAL_PASSES, window, cx);
+    }
+
+    /// One pass of the reveal described on [`Self::scroll_to_active`].
+    /// `passes_left` bounds the deferral so an active row that never lays out
+    /// (no active workspace at all, or one buried in a closed `Archived`
+    /// disclosure) falls back to the project group instead of waiting forever.
+    fn reveal_active_workspace(
+        &mut self,
+        passes_left: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Prerequisites first — each one hides the active row outright, and
+        // fixing one changes the layout the scroll is about to measure.
+        let mut uncovered = false;
+        if self.active_nav.is_some() {
+            self.active_nav = None;
+            uncovered = true;
+        }
+        if let Some(project_id) = self.active_project_id.clone()
+            && self.group_mode == WorkspaceGroupMode::Project
+            && self.collapsed.remove(&project_id)
+        {
+            self.persist_collapsed();
+            uncovered = true;
+        }
+        if uncovered {
+            cx.notify();
+        }
+
+        // Anything we just uncovered has stale bounds until it is laid out, so
+        // in that case skip straight to the deferred pass.
+        if !uncovered && self.scroll_active_row_into_view(cx) {
+            self.bump_locate_glow(cx);
+            return;
+        }
+        if passes_left == 0 {
+            // No row bounds to be had. Fall back to the project group, which
+            // at least puts the right part of the list on screen.
+            self.scroll_to_active_group();
+            self.bump_locate_glow(cx);
+            return;
+        }
+        let entity = cx.entity();
+        window.on_next_frame(move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.reveal_active_workspace(passes_left - 1, window, cx);
+            });
+        });
+    }
+
+    /// Scroll the list so the active row is on screen, from the bounds it
+    /// recorded during the last layout pass. `false` when there are no such
+    /// bounds (nothing to scroll to) — the caller then defers or falls back.
+    /// A row already fully in view counts as revealed and scrolls nothing.
+    fn scroll_active_row_into_view(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(row) = self.locate_anchor.get() else {
+            return false;
+        };
+        let viewport = self.list_scroll.bounds();
+        // A zero-height viewport means the list has never been laid out; the
+        // row bounds cannot be measured against it, so report "not revealed".
+        if f32::from(viewport.size.height) <= 0.0 {
+            return false;
+        }
+        let offset = self.list_scroll.offset();
+        let target = reveal_offset(
+            row,
+            viewport,
+            f32::from(offset.y),
+            f32::from(self.list_scroll.max_offset().y),
+        );
+        if let Some(y) = target {
+            self.list_scroll.set_offset(point(offset.x, px(y)));
+            cx.notify();
+        }
+        true
+    }
+
+    /// Last-resort reveal: bring the active project's GROUP into view. Only
+    /// means anything in grouped mode, where the list's direct children are
+    /// project groups.
+    fn scroll_to_active_group(&mut self) {
+        if self.group_mode != WorkspaceGroupMode::Project {
+            return;
+        }
         let Some(active_id) = self.active_project_id.as_deref() else {
             return;
         };
         if let Some(ix) = self.projects.iter().position(|p| p.id == active_id) {
             self.list_scroll.scroll_to_item(ix);
         }
+    }
+
+    /// Replay the one-shot locate glow on the active card, unless the user
+    /// asked for reduced motion.
+    fn bump_locate_glow(&mut self, cx: &mut Context<Self>) {
         if !crate::motion_settings::active(cx).reduced {
             self.locate_glow_seq += 1;
         }
@@ -1095,6 +1212,11 @@ impl Render for LeftRail {
         let density = self.density;
         let typography = self.typography.clone();
         let entity = cx.entity().clone();
+        // The anchor is rewritten by the active row's own canvas during this
+        // frame's layout. Clearing it first is what makes "no active row on
+        // screen" observable — otherwise a stale position from a list that is
+        // no longer rendered would be scrolled to as if it were current.
+        self.locate_anchor.set(None);
 
         // The flex-1 body slot changes depending on the active nav page.
         // Agents → agents dashboard; Tasks → issue/PR browser; home (None) and
@@ -1152,6 +1274,7 @@ impl Render for LeftRail {
                 self.focused_agent.clone(),
                 self.weak_root.clone(),
                 self.locate_glow_seq,
+                self.locate_anchor.clone(),
                 self.list_scroll.clone(),
                 settle_overrides,
                 renaming_id,
@@ -1178,7 +1301,8 @@ impl Render for LeftRail {
                 // shrink below its content so overflow actually engages.
                 // The scroll handle itself is tracked on the list COLUMN
                 // (inside `render_workspace_list`, children = project
-                // groups) so `scroll_to_item` indexes project groups.
+                // groups), so `scroll_to_item` indexes project groups — the
+                // active ROW is located through `locate_anchor` instead.
                 .child(div().flex_1().w_full().min_h(px(0.)).child(workspace_list))
                 .into_any_element()
         };
@@ -1273,6 +1397,7 @@ fn render_workspace_list(
     focused_agent: Option<RailAgentTarget>,
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
+    locate_anchor: LocateAnchor,
     list_scroll: ScrollHandle,
     settle_overrides: HashMap<String, Vec<String>>,
     renaming_id: Option<String>,
@@ -1295,7 +1420,9 @@ fn render_workspace_list(
 
     // The column is the scroll container: its direct children are the
     // project groups, so `ScrollHandle::scroll_to_item(project_index)`
-    // brings the active project's group into view.
+    // brings the active project's GROUP into view — coarse enough that
+    // `scroll_to_active` only uses it as a fallback, preferring the row
+    // bounds recorded in `locate_anchor`.
     let mut col = div()
         .id("left-rail-workspace-list")
         .flex()
@@ -1411,6 +1538,7 @@ fn render_workspace_list(
                 &on_row_menu,
                 false,
                 locate_glow_seq,
+                &locate_anchor,
                 renaming_id.as_deref(),
                 &rename_input,
                 compact,
@@ -1444,6 +1572,7 @@ fn render_workspace_list(
             &rail,
             &weak_root,
             &on_row_menu,
+            &locate_anchor,
             compact,
             theme,
             density,
@@ -1562,6 +1691,7 @@ fn render_workspace_list(
             on_row_menu,
             on_project_menu,
             locate_glow_seq,
+            &locate_anchor,
             renaming_id.as_deref(),
             rename_input.clone(),
             compact,

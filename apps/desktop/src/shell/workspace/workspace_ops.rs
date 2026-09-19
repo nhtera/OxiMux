@@ -1007,7 +1007,8 @@ impl WorkspaceRoot {
             self.active_workspace_id = Some(w.id.clone());
             self.record_nav(&w.project_id, &w.id);
         }
-        self.left_rail.update(cx, |rail, cx| rail.scroll_to_active(cx));
+        self.left_rail
+            .update(cx, |rail, cx| rail.scroll_to_active(window, cx));
         panes.update(cx, |p, cx| {
             p.set_active_by_tab_id(tab_id, window, cx);
         });
@@ -1064,7 +1065,8 @@ impl WorkspaceRoot {
             self.active_workspace_id = Some(w.id.clone());
             self.record_nav(&w.project_id, &w.id);
         }
-        self.left_rail.update(cx, |rail, cx| rail.scroll_to_active(cx));
+        self.left_rail
+            .update(cx, |rail, cx| rail.scroll_to_active(window, cx));
         panes.update(cx, |p, cx| {
             p.activate_terminal_session(session, window, cx);
         });

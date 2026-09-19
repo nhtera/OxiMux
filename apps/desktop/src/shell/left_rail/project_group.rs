@@ -16,6 +16,7 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::actions::OpenWorkspaceCreate;
 use crate::shell::agent_presentation::AmbientAgent;
 use crate::shell::left_rail::LeftRail;
+use crate::shell::left_rail::locate_anchor::{LocateAnchor, locate_anchor_canvas};
 use crate::shell::left_rail::project_drag::{
     ProjectDragPayload, SidebarDragPreview, insertion_side, paint_insertion_line,
 };
@@ -130,6 +131,7 @@ pub fn render_project_group(
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
     on_project_menu: impl Fn(Project, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
     locate_glow_seq: u64,
+    locate_anchor: &LocateAnchor,
     renaming_id: Option<&str>,
     rename_input: Option<Entity<InputState>>,
     compact: bool,
@@ -181,6 +183,7 @@ pub fn render_project_group(
             &on_row_menu,
             true,
             locate_glow_seq,
+            locate_anchor,
             renaming_id,
             &rename_input,
             compact,
@@ -202,6 +205,7 @@ pub fn render_project_group(
         &rail,
         &weak_root,
         &on_row_menu,
+        locate_anchor,
         compact,
         theme,
         density,
@@ -256,6 +260,7 @@ pub(crate) fn render_archived_section(
     rail: &Entity<LeftRail>,
     weak_root: &WeakEntity<WorkspaceRoot>,
     on_row_menu: &(impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static),
+    locate_anchor: &LocateAnchor,
     compact: bool,
     theme: Theme,
     density: Density,
@@ -346,8 +351,12 @@ pub(crate) fn render_archived_section(
             on_row_menu,
             // No drag-to-reorder: archived rows have no manual rank.
             false,
-            // No locate glow, and never the inline-rename target.
+            // No locate glow — archiving the active workspace leaves the row
+            // selected but it is no longer somewhere the user is working, so
+            // it does not pulse. It still records its anchor, so the locate
+            // affordance reveals it while the disclosure is open.
             0,
+            locate_anchor,
             None,
             &None,
             compact,
@@ -387,6 +396,7 @@ pub(crate) fn render_workspace_block(
     on_row_menu: &(impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static),
     allow_drag: bool,
     locate_glow_seq: u64,
+    locate_anchor: &LocateAnchor,
     renaming_id: Option<&str>,
     rename_input: &Option<Entity<InputState>>,
     compact: bool,
@@ -624,6 +634,18 @@ pub(crate) fn render_workspace_block(
                 .border_color(theme.border_active)
                 .bg(active_surface_bg)
                 .children(wrap_glow);
+        }
+
+        if is_active {
+            // Record where this row landed so the scroll-to-current affordance
+            // can reveal the ROW; the scroll handle itself only knows the
+            // list's direct children (project groups in grouped mode), which
+            // is a whole group too coarse. `relative` is taffy's default
+            // position, so asking for it changes no layout — it only makes
+            // the overlay size to this block.
+            workspace_block = workspace_block
+                .relative()
+                .child(locate_anchor_canvas(locate_anchor.clone()));
         }
 
         workspace_block
