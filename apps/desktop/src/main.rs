@@ -311,28 +311,26 @@ fn main() {
         // that skipped it would leave every `Input` and `Button` in the
         // previous theme.
         oximux_app::appearance_settings::bridge_component_theme(cx);
-        {
-            // Read the OS auto-hide preference before taking the mutable global
-            // borrow below (can't call `cx` methods while `component_theme`
-            // holds it). A user who set "Always show scrollbars" (an
-            // accessibility choice some low-vision users rely on) reports
-            // `false` here.
-            let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
-            let component_theme = gpui_component::Theme::global_mut(cx);
-            // List scrollbars stay invisible until the pointer enters the
-            // scroll region, then reveal thumb-only — quiet at rest, no
-            // persistent rail chrome. The library default (`Scrolling`) only
-            // shows the bar mid-scroll; `Hover` matches the benchmark's calmer
-            // "appears on approach" behavior. One global = every
-            // `vertical_scrollbar` call site inherits it. Skip the override
-            // when the user asked for always-visible scrollbars — leave the
-            // appearance gpui-component already synced from the system.
-            //
-            // Startup-only, unlike the bridge above: this follows an OS
-            // accessibility preference, not ours.
-            if auto_hide_scrollbars {
-                component_theme.scrollbar_show = gpui_component::scroll::ScrollbarShow::Hover;
-            }
+        // List scrollbars stay invisible until the pointer enters the scroll
+        // region, then reveal thumb-only — quiet at rest, no persistent rail
+        // chrome. The library default (`Scrolling`) only shows the bar
+        // mid-scroll; `Hover` matches the benchmark's calmer "appears on
+        // approach" behavior. One global = every `vertical_scrollbar` call site
+        // inherits it. Skip the override when the user asked for always-visible
+        // scrollbars (an accessibility choice some low-vision users rely on) —
+        // leave the appearance gpui-component already synced from the system.
+        //
+        // Startup-only, unlike the bridge above: this follows an OS
+        // accessibility preference, not ours.
+        //
+        // Set through `set_scrollbar_mode`, not by assigning the theme field:
+        // the mode is projected onto the Base scrollbar, and a bare write to
+        // the global would leave that projection on the previous value.
+        if cx.should_auto_hide_scrollbars() {
+            gpui_component::Theme::set_scrollbar_mode(
+                gpui_component::scroll::ScrollbarMode::Hover,
+                cx,
+            );
         }
         // Load user terminal settings into a global + start the live-reload
         // watcher BEFORE any window opens so the first pane reads real values.
@@ -964,18 +962,23 @@ fn run_editor_spike() {
         {
             let palette = oximux_settings::Theme::charcoal();
             let component_density = oximux_settings::Density::cockpit();
-            let component_theme = gpui_component::Theme::global_mut(cx);
-            component_theme.colors.input = palette.border_input;
-            component_theme.colors.ring = palette.focus_ring;
-            // Corner radius, bridged for the same reason the two colours above
-            // are: the library paints its own widgets and cannot see our
-            // tokens. It happens to default to 6/8 — the same scale — so this
-            // changes nothing today. It is here so the two cannot drift apart
-            // silently, which is precisely what had happened to the radii it
-            // does not own: hand-rolled chrome sat at 4 while every `Input`
-            // and `Button` beside it was already 6.
-            component_theme.radius = gpui::px(component_density.r_xs);
-            component_theme.radius_lg = gpui::px(component_density.r_card);
+            // `Theme::update`, not `global_mut` — same reason as the
+            // production bridge in `appearance_settings`: a bare write
+            // leaves the token mirror and the Base projection on their
+            // old values.
+            gpui_component::Theme::update(cx, |component_theme| {
+                component_theme.colors.input = palette.border_input;
+                component_theme.colors.ring = palette.focus_ring;
+                // Corner radius, bridged for the same reason the two colours above
+                // are: the library paints its own widgets and cannot see our
+                // tokens. It happens to default to 6/8 — the same scale — so this
+                // changes nothing today. It is here so the two cannot drift apart
+                // silently, which is precisely what had happened to the radii it
+                // does not own: hand-rolled chrome sat at 4 while every `Input`
+                // and `Button` beside it was already 6.
+                component_theme.radius = gpui::px(component_density.r_xs);
+                component_theme.radius_lg = gpui::px(component_density.r_card);
+            });
         }
         cx.activate(true);
 

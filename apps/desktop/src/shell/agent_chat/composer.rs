@@ -26,7 +26,8 @@ use gpui_component::Selectable as _;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{
-    IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
+    IndentInline, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
+    Textarea, TextareaState,
 };
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::Disableable as _;
@@ -384,7 +385,7 @@ const MAX_COMPOSER_ROWS: usize = 10;
 type DropdownPick = std::rc::Rc<dyn Fn(&mut ComposerView, String, &mut Context<ComposerView>)>;
 
 pub struct ComposerView {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -573,7 +574,7 @@ impl ComposerView {
             // content (the circular-height trap). The ↵-vs-⇧↵ split is decided at
             // the parent root `capture_action` from the live shift modifier —
             // both keys map to the same Enter action.
-            InputState::new(window, cx).auto_grow(1, MAX_COMPOSER_ROWS).placeholder(placeholder)
+            TextareaState::new(window, cx).auto_grow(1, MAX_COMPOSER_ROWS).placeholder(placeholder)
         });
         let sub = cx.subscribe(&input, |this, _input, ev: &InputEvent, cx| {
             // Repaint ONLY the composer on edits — the transcript is untouched.
@@ -3493,7 +3494,7 @@ impl Render for ComposerView {
             .gap(px(density.gap_inline))
             .child(
                 div().flex_1().min_w_0().child(
-                    Input::new(&self.input)
+                    Textarea::new(&self.input)
                         .appearance(false)
                         .text_size(px(typo.t_body_md)),
                 ),

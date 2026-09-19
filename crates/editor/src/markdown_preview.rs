@@ -32,7 +32,7 @@ use gpui_component::{
     clipboard::Clipboard,
     h_flex,
     highlighter::HighlightTheme,
-    text::{TextView, TextViewStyle},
+    text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewStyle},
 };
 
 /// Callback the host app installs so a clicked document link in the rendered
@@ -163,6 +163,14 @@ pub fn render_preview(
     let lang_tag_size = lang_tag_size * zoom_factor;
     let mut text_view = TextView::markdown(("md-preview-text", view_id), rendered)
         .style(style)
+        // YAML frontmatter is not CommonMark: with the construct off, a plan's
+        // `---` block parses as a thematic rule plus a *setext underline*, so
+        // the whole metadata header renders as one giant `<h2>`. Switching the
+        // construct on and handing the node to the upstream plugin renders it
+        // as a key/value description list instead, with a `yaml` code block as
+        // the fallback for anything the plugin will not flatten.
+        .markdown_extensions(MarkdownExtensions::default().frontmatter())
+        .plugin(FrontmatterPlugin::new())
         // Code blocks get a language tag + one-click copy, the way a
         // polished doc viewer surfaces fenced code.
         .code_block_actions(move |code_block, _window, cx| {
@@ -183,10 +191,20 @@ pub fn render_preview(
     if let (Some(opener), Some(dir)) = (opener, base_dir) {
         let base = dir.to_path_buf();
         text_view = text_view.on_link_click(move |url, _event, window, cx| {
-            match resolve_document_link(url, &base).filter(|p| p.is_file()) {
-                Some(path) => opener(path, window, cx),
-                // Not a local document (or it doesn't exist): keep the
-                // renderer's default behavior of handing it to the OS.
+            match resolve_document_link(url, &base) {
+                // A local document. Open it in-app when it is actually there;
+                // when it is not, stop here rather than falling through to the
+                // OS. Handing a schemeless relative path like `missing.md` to
+                // the opener raises a LaunchServices modal over the window
+                // ("The application can't be opened. -50"), which is a worse
+                // answer to a broken link than doing nothing at all.
+                Some(path) => {
+                    if path.is_file() {
+                        opener(path, window, cx);
+                    }
+                }
+                // Not a local document at all — `https:`, `mailto:`, a bare
+                // `#anchor`. The OS opener is the right destination for those.
                 None => cx.open_url(url),
             }
         });

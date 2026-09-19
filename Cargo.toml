@@ -122,16 +122,15 @@ oximux-proc-tree = { path = "crates/proc-tree" }
 # correctness decision on Linux and not just a courtesy.
 oximux-proc-ports = { path = "crates/proc-ports" }
 
-# GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
-# upstream `longbridge/gpui-component` workspace pins `gpui` to the default
-# branch with no rev; if we pin a rev here, cargo treats them as separate
-# sources and produces two copies of `gpui::App` in the dep graph (one of
-# v0.9's exact failure modes). The canonical pin lives in `Cargo.lock` —
-# bump via `cargo update -p gpui -p gpui_platform -p gpui_macros` and log
-# the resulting commit in `docs/gpui-pins.md`.
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui_macros = { git = "https://github.com/zed-industries/zed" }
+# GPUI — see docs/gpui-pins.md. GPUI is no longer taken from the zed git
+# repository: upstream `gpui-kit` consumes the published `gpui-pre-*` crates,
+# and GPUI's source has to be the SAME source the component library uses or
+# cargo builds two copies of `gpui::App` in one dep graph (one of v0.9's exact
+# failure modes). The package renames are cargo-side only — the crates are
+# still `use`d as `gpui`, `gpui_platform`, `gpui_macros`.
+gpui = { package = "gpui-pre", version = "0.3.5" }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui_macros = { package = "gpui-pre-macros", version = "0.3.5" }
 # Enable a broad set of tree-sitter grammars so the code editor can syntax-
 # highlight the language families a typical workspace contains. The
 # `tree-sitter-languages` meta-feature pulls in every grammar shipped by
@@ -139,13 +138,20 @@ gpui_macros = { git = "https://github.com/zed-industries/zed" }
 # php, ruby, lua, zig, scala, sql, css, html, json, markdown, yaml, toml,
 # bash, make, cmake, proto, graphql, diff, ...). Build time is a few extra
 # seconds; the runtime cost is per-file (lazy parser construction).
-# Sourced from our fork's `oximux/link-click-ccc1e76` branch: upstream rev
-# ccc1e76 plus one backported commit (upstream #2621) adding
-# `TextView::on_link_click`, which the markdown preview needs to open
-# relative document links in-app. Drop the fork and return to upstream the
-# next time the pin is bumped past upstream 3cb3cc13 (the API is identical).
-gpui-component = { git = "https://github.com/nhtera/gpui-component", rev = "8adf9846c26f354333ab5bdafb18bf2dc3328db4", features = ["tree-sitter-languages"] }
-gpui-component-assets = { git = "https://github.com/nhtera/gpui-component", rev = "8adf9846c26f354333ab5bdafb18bf2dc3328db4" }
+# Sourced from our fork's `oximux` branch, which currently tracks upstream
+# `longbridge/gpui-kit` 0.6.4 with no local patches — the two commits we used
+# to carry (`TextView::on_link_click`, and the soft-break reflow fix that made
+# every source line wrap render as a hard line break) have both landed
+# upstream. The branch exists so an OxiMux-only fix has somewhere to live
+# without repinning; the tag `pin-ccc1e76-link-click` preserves the rev used
+# before this bump so older OxiMux commits still resolve.
+#
+# Upstream renamed the project `gpui-component` -> `gpui-kit` and split it:
+# `gpui-base` (text, input core), `gpui-component` (the component library,
+# still that package name) and `gpui-kit-assets` (formerly
+# `gpui-component-assets`).
+gpui-component = { git = "https://github.com/nhtera/gpui-kit", rev = "6b8581a1e5458eace91beb842376f833beaef2ff", features = ["tree-sitter-languages"] }
+gpui-component-assets = { package = "gpui-kit-assets", git = "https://github.com/nhtera/gpui-kit", rev = "6b8581a1e5458eace91beb842376f833beaef2ff" }
 
 # Async + util
 tokio = { version = "1", features = ["full"] }

@@ -17,7 +17,7 @@ use gpui::{
 use gpui_component::{
     Disableable,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    input::{Textarea, TextareaState},
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -47,7 +47,7 @@ pub struct ReviewNotePopover {
     /// True when a note already exists at the anchor — gates the Delete
     /// button (nothing to delete on a fresh line).
     has_existing: bool,
-    input_state: Entity<InputState>,
+    input_state: Entity<TextareaState>,
     on_commit: Option<ReviewNoteCallback>,
     closed: bool,
     focus_handle: FocusHandle,
@@ -70,8 +70,7 @@ impl ReviewNotePopover {
     ) -> Self {
         let has_existing = existing_body.is_some();
         let input_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .placeholder("Write a review note for this line…")
         });
         // Apply the initial value AFTER constructing the entity — set_value
@@ -185,7 +184,7 @@ impl Render for ReviewNotePopover {
                     .text_color(theme.fg_base)
                     .child(SharedString::from(header)),
             )
-            .child(Input::new(&self.input_state))
+            .child(Textarea::new(&self.input_state))
             .child(
                 div()
                     .text_size(px(typography.t_body_sm))

@@ -82,6 +82,7 @@ pub fn paint_insertion_line(
         offset: casing_offset,
         blur_radius: px(0.0),
         spread_radius: px(0.0),
+        inset: false,
     }])
 }
 

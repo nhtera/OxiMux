@@ -849,7 +849,7 @@ impl Render for DiffView {
             // `ListState`. `Always` keeps the thumb visible at rest.
             g = g.child(
                 gpui_component::scroll::Scrollbar::vertical(&self.body_list)
-                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                    .mode(gpui_component::scroll::ScrollbarMode::Always),
             );
             Some(g)
         } else {

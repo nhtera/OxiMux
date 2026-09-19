@@ -28,7 +28,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme,
-    input::{Input, InputState, TabSize},
+    input::{Editor, EditorState, InputState, TabSize},
     resizable::{h_resizable, resizable_panel},
 };
 use oximux_settings::AutosaveSettings;
@@ -319,7 +319,7 @@ pub enum EditorContent {
 /// parser instance).
 pub struct TextContent {
     /// gpui-component editor state entity.
-    pub(crate) state: Entity<InputState>,
+    pub(crate) state: Entity<EditorState>,
     /// `true` when the buffer text differs from the last successful save.
     pub(crate) dirty: bool,
     /// Monotonic per-buffer version counter — LSP §3.17.2. didOpen sends
@@ -537,7 +537,7 @@ impl EditorView {
     /// Editor state entity — exposed so callers can install provider
     /// impls. Returns `None` for non-text content (image/binary) since
     /// there's no `InputState` to attach to.
-    pub fn state(&self) -> Option<Entity<InputState>> {
+    pub fn state(&self) -> Option<Entity<EditorState>> {
         match &self.content {
             EditorContent::Text(t) => Some(t.state.clone()),
             _ => None,
@@ -1241,9 +1241,8 @@ fn decide_content(
 
     let language = language_for_path(path);
     let state = cx.new(|cx| {
-        InputState::new(window, cx)
-            .code_editor(language)
-            .multi_line(true)
+        EditorState::new(window, cx)
+            .language(language)
             .tab_size(TabSize {
                 tab_size: 4,
                 ..Default::default()
@@ -1431,12 +1430,19 @@ impl Render for EditorView {
         let mono_base = theme.mono_font_size;
         let zoom = current_zoom(cx);
         let mono_size = zoom.effective_px(mono_base);
-        // The markdown preview zooms too, off its own base: the theme's UI
-        // font size, which is what the preview body would inherit (via the
-        // window rem size) if left alone. Headings scale by the ratio so the
-        // preview keeps its proportions.
-        let preview_body = zoom.effective_px(theme.font_size);
-        let preview_factor = f32::from(preview_body) / f32::from(theme.font_size);
+        // The markdown preview zooms too, off its own base. That base is our
+        // own largest body step, NOT the component theme's `font_size`: the
+        // library defaults that to 16px, which is the size the preview body
+        // would inherit (via the window rem size) if left alone, and 16px sits
+        // well above everything around it — the chrome runs at `t_body_sm` and
+        // the source half of the split at the 13px mono size, so the preview
+        // read as a different document. Keying it to `t_body_lg` also makes it
+        // follow the user's density and text-size settings, which a hard-coded
+        // library default never did. Headings scale by the ratio so the
+        // preview keeps its proportions at every zoom level.
+        let preview_base = px(typo.t_body_lg);
+        let preview_body = zoom.effective_px(preview_base);
+        let preview_factor = f32::from(preview_body) / f32::from(preview_base);
         let body: gpui::AnyElement = match &self.content {
             // Markdown text: branch on the active view mode. Source reuses the
             // plain editor; Preview/Split render via the GFM renderer. The
@@ -1444,7 +1450,7 @@ impl Render for EditorView {
             // `cx.observe(&state)` → `cx.notify()` already keeps it live.
             EditorContent::Text(t) if self.is_markdown => {
                 let dir = self.file_path.parent();
-                let input = Input::new(&t.state)
+                let input = Editor::new(&t.state)
                     .font_family(theme.mono_font_family.clone())
                     .text_size(mono_size)
                     .size_full();
@@ -1498,7 +1504,7 @@ impl Render for EditorView {
                     }
                 }
             }
-            EditorContent::Text(t) => Input::new(&t.state)
+            EditorContent::Text(t) => Editor::new(&t.state)
                 .font_family(theme.mono_font_family.clone())
                 .text_size(mono_size)
                 .size_full()

@@ -1,10 +1,12 @@
 # OxiMux
 
-A Rust-native, multi-agent development cockpit for macOS. Open a repo → spawn isolated worktrees → run CLI coding agents (Claude Code, Codex, Pi, omp) in parallel → review every change through a GitLens-grade Git UX.
+A Rust-native, multi-agent development cockpit for macOS and Windows. Open a repo → spawn isolated worktrees → run CLI coding agents (Claude Code, Codex, Pi, omp) in parallel → review every change through a GitLens-grade Git UX.
 
-- **Stack**: Rust 1.95 (edition 2024) + GPUI + [`longbridge/gpui-component`](https://github.com/longbridge/gpui-component) + SQLite + Tokio
+- **Stack**: Rust 1.95 (edition 2024) + GPUI + [`longbridge/gpui-kit`](https://github.com/longbridge/gpui-kit) + SQLite + Tokio
 - **Status**: Working cockpit, in active development. Dogfoodable for day-to-day repo work; pre-1.0, so expect rough edges.
-- **Platform**: macOS-only in v1 (13.0+).
+- **Platform**: macOS 13.0+ (arm64, the primary target) and Windows x64. A short
+  list of macOS-shaped features is excluded on Windows — see
+  [`docs/windows-port-exclusions.md`](docs/windows-port-exclusions.md).
 
 ![The OxiMux cockpit — projects and agents in the rail, agent chat tabs in the center, Git changes and commit graph on the right](apps/landing/src/assets/shots/cockpit.png)
 
@@ -28,8 +30,9 @@ open dist/OxiMux.app
 
 ### Building on Windows
 
-macOS is still the shipping target; the Windows port lives on `feat/windows`.
-What it leaves behind is recorded in
+macOS is the primary target, but Windows is a first-class build: releases carry
+a Windows x64 zip and installer alongside the macOS DMG. What the port leaves
+behind is recorded in
 [`docs/windows-port-exclusions.md`](docs/windows-port-exclusions.md).
 
 ```powershell
@@ -131,44 +134,70 @@ apps/
 │                 agent chat. Modules are foldered by concern
 │                 (app_settings/ agent_glue/ session_restore/ platform/
 │                 loaders/ shell/terminal/)
-└── mobile/       Expo / React Native client for pairing a phone to a
-                  desktop host. modules/oximux-core is the uniffi turbo
-                  module generated from crates/mobile-core (untracked —
-                  regenerate with `npm run bindings`)
+├── mobile/       Expo / React Native client for pairing a phone to a
+│                 desktop host. modules/oximux-core is the uniffi turbo
+│                 module generated from crates/mobile-core (untracked —
+│                 regenerate with `npm run bindings`)
+└── landing/      Astro marketing site (also the source of the screenshots
+                  above), deployed via wrangler
 crates/
+#  Domain + UI
+├── core/         domain types (Project, Workspace, Pane, AgentSession)
 ├── ui/           shared, app-agnostic GPUI widgets (FloatingSurface overlay,
 │                 button variants, confirm dialog) — depends only downward
-├── core/         domain types (Project, Workspace, Pane, AgentSession)
-├── pty/          portable-pty + alacritty_terminal backend
-├── git/          git CLI wrappers, status poller, diff parser, clone
+├── settings/     theme tokens, density, typography, TOML config
+├── editor/       gpui-component editor wrapper + LSP glue
+├── markdown/     block-level markdown for streaming agent replies
+├── syntax/       syntax highlighting as neutral kinds, not colors
+├── storage/      SQLite + migration ladder + CI guard
+#  Agents
 ├── agent-core/   portable agent-chat core (thread fold, ThreadEvent vocab,
 │                 stream-json decoder) — no gpui/pty/tokio, so it
 │                 cross-compiles for the mobile Rust core
 ├── agents/       AgentRuntime trait + provider adapters (Claude, Codex,
 │                 ACP, Pi, omp) and session import
-├── editor/       gpui-component editor wrapper + LSP glue
+├── agent-hooks/  agent status hooks: dialect table, installer, readers
+├── computer-use/ screen control for agents, via the external cua-driver
 ├── dictation/    offline voice dictation (sherpa-onnx + CoreAudio capture)
-├── storage/      SQLite + migration ladder + CI guard
-├── settings/     theme tokens, density, typography, TOML config
+#  Git
+├── git/          git CLI wrappers, status poller, diff parser, clone
+├── worktree-ops/ the worktree lifecycle, shared by every host
+#  Terminals + PTY
+├── pty/          portable-pty + alacritty_terminal backend
 ├── relay-proto/  wire protocol shared by relay daemon + client
 ├── relay/        out-of-process PTY relay daemon (survives relaunch)
 ├── relay-client/ in-app client for the relay daemon
+├── relay-supervisor/ keeps a relay daemon alive, hands back a live client
+├── relay-terminals/  remote-host's TerminalSource implemented over the relay
+├── shell-env/    what a spawned shell should be, and what its env needs
+#  Remote control
 ├── remote-proto/ remote-control wire protocol (desktop host ⇄ phone)
 ├── remote-host/  in-app remote-control host: pairing auth + RPC dispatch
 ├── remote-session/  client-side remote session (the phone's Rust core)
 ├── remote-iroh/  iroh P2P (QUIC) transport for remote control
+├── remote-local/ owner-only socket the CLI uses to reach a local host
 ├── mobile-core/  uniffi binding over remote-session for the RN app
+#  Process + platform
 ├── proc-cwd/     resolve a process's cwd from its pid
-└── proc-tree/    walk a process's descendants, to name the agent CLI a
-                  terminal is running
-xtask/            repo lint orchestrator (file-size cap etc.)
+├── proc-tree/    walk a process's descendants, to name the agent CLI a
+│                 terminal is running
+├── proc-ports/   which local TCP ports a set of processes listens on
+├── single-instance/ which process owns a per-data-directory role
+├── owner-only/   restricting a file to the account that created it
+├── auto-update/  in-app auto-update for the desktop bundle
+├── macos-trust/  code-signature verification + crash-safe bundle placement
+├── job-object/   killing a child and everything it started (Windows)
+└── no-window/    CREATE_NO_WINDOW for every spawned child (Windows)
+xtask/            repo lint orchestrator (file-size, data-dir, literal,
+                  appearance, reliability-gates, icon)
 docs/
 ├── design-guidelines.md   palette, density, typography (the contract)
 ├── system-architecture.md source map + subsystem contracts
+├── codebase-summary.md    what each crate is and why it exists
+├── cli-reference.md       generated from the parser — cannot drift
 ├── gpui-pins.md           GPUI + gpui-component SHA tuple + bump log
-├── brief.md               product vision and PRD
-└── adr/                   decision records — gitignored, local to each
-                           working copy
+├── reliability-gates.md   which gates run where, and which do not
+└── release-signing.md     how update signatures are produced + checked
 plans/            implementation plans + reports — gitignored
 ```
 
@@ -180,17 +209,22 @@ plans/            implementation plans + reports — gitignored
 - **Git / SCM** — status poller, staged/unstaged review, commit (with AI-drafted messages), commit graph, branch picker, push/pull/sync, CI badge, `gh pr create`.
 - **Diff viewer** — a custom-canvas renderer with per-line geometry, word-diff, combined-diff, and folded hunks.
 - **Navigation** — a command palette (Quick Open + commands, fuzzy match), file explorer, search panel.
+- **Editor & preview** — a code editor with LSP glue, plus rendered previews for markdown (in-app links, mermaid), PDF, and images.
+- **Automations** — cron-style schedules that fire agent runs unattended, with a first-class Automations view over the same store the ticker reads.
+- **Tasks** — a GitHub/GitLab issue and PR browser, scoped across repos.
+- **Computer use** — opt-in, per-project screen control for agents, gated by a separate driver process and an explicit consent lifetime.
+- **Voice dictation** — offline speech-to-text (sherpa-onnx) into any text field.
+- **Remote control** — pair a phone to a desktop host over an iroh P2P link; the `apps/mobile` client mirrors chats, terminals, and the Git panel.
+- **Ports** — a panel listing the local TCP ports the processes you spawned are listening on.
 - **Design system** — charcoal dark theme, cockpit density, typography scale (`oximux-settings`; see `docs/design-guidelines.md`).
-- **Guardrails** — `xtask file-size-lint` (warn > 1500 LOC / fail > 3000, with a ratchet allowlist that only shrinks), font-kit feature check, migration ladder count check, producer/consumer pre-commit hook.
-- **Decision records** — ADRs live under `docs/adr/`, which is **gitignored**: they are local to a working copy, not shipped with the repo, so the list below is the index rather than a set of links. 001 (stack), 002 (gpui-component), 003 (dogfood gate), 004 (no ACP in v1 — **superseded**; ACP adapters ship in `crates/agents/src/thread/acp/`), 005 (fresh start), 006 (Tier-1 reorg + `oximux-ui` extraction), 007 (`apps/desktop` relocation).
+- **Updates** — signature-verified in-app auto-update for the bundle, and `oximux update` for the CLI pair.
+- **Guardrails** — `xtask` lints: file size (warn > 1500 LOC / fail > 3000, with a ratchet allowlist that only shrinks), data-dir, literal, appearance, reliability-gates, icon. Plus a font-kit feature check, migration ladder count check, and a producer/consumer pre-commit hook.
 
 ## Working agreements
 
 - **Keep files small** — aim for **< 500 LOC** per file (authoring guideline, not enforced). The lint enforces **warn > 1500 / fail > 3000** non-blank LOC; any file over 3000 must sit on the `xtask/file-size-allow.txt` ratchet allowlist and may only shrink. Split before you hit the warn band. (Where things live: see `docs/system-architecture.md` → "Source map".)
 - **Snake_case** for Rust files; kebab-case for shell scripts.
 - **Edit existing files** in-place. No `*_v2.rs`, `*_new.rs`, or `*_enhanced.rs`.
-- **Dogfood before tag** (ADR-003).
-- **No code reuse** from `OxideADE-old`. Ideas only (ADR-005).
 
 ## Install pre-commit hook (optional)
 

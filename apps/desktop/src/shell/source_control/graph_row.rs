@@ -89,7 +89,7 @@ pub(super) fn render_commit_row(
     // subject column. Date and SHA stay shrink-0 because they're naturally
     // short and always need to be readable.
     let author = div()
-        .flex_shrink()
+        .flex_shrink(1.)
         .min_w(px(0.0))
         .max_w(px(88.0))
         .overflow_hidden()

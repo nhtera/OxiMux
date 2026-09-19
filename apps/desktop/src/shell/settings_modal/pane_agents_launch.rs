@@ -9,7 +9,7 @@ use gpui::{
     Styled, Window, div, prelude::FluentBuilder, px, svg,
 };
 use gpui_component::Sizable as _;
-use gpui_component::input::Input;
+use gpui_component::input::{Input, Textarea};
 use std::collections::BTreeMap;
 
 use oximux_settings::{
@@ -716,7 +716,7 @@ pub(super) fn render_env_card(
         // than trying to make a masked textarea editable — editing text you
         // cannot read is worse than a second click to reveal.
         let body: AnyElement = if modal.env_revealed {
-            Input::new(state).text_size(px(typography.t_body_sm)).into_any_element()
+            Textarea::new(state).text_size(px(typography.t_body_sm)).into_any_element()
         } else {
             let env = modal
                 .agent_launch

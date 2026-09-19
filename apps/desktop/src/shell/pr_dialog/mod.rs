@@ -18,7 +18,7 @@ use gpui::{
 use gpui_component::{
     Disableable,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -44,7 +44,7 @@ pub type PrDialogCallback = Rc<dyn Fn(PrDialogOutcome, &mut Window, &mut App) + 
 
 pub struct PrCreateDialog {
     title_state: Entity<InputState>,
-    body_state: Entity<InputState>,
+    body_state: Entity<TextareaState>,
     draft: bool,
     /// True while the host is running AI generation — disables inputs +
     /// buttons and flips the AI button label to a working state.
@@ -69,8 +69,7 @@ impl PrCreateDialog {
         let title_state =
             cx.new(|cx| InputState::new(window, cx).placeholder("Pull request title"));
         let body_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .placeholder("Describe the change (optional)…")
         });
         Self {
@@ -223,7 +222,7 @@ impl Render for PrCreateDialog {
                     .child(SharedString::from("Create pull request")),
             )
             .child(Input::new(&self.title_state))
-            .child(Input::new(&self.body_state))
+            .child(Textarea::new(&self.body_state))
             .child(
                 div()
                     .flex()
