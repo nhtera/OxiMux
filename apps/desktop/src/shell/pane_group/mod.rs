@@ -367,6 +367,12 @@ pub struct PaneGroup {
     /// to a large negative x after every tab append so the strip's paint
     /// phase clamps to the right edge (keeping new + active tabs visible).
     tab_strip_scroll: ScrollHandle,
+    /// Scroll state for the frozen pinned zone at the strip's left edge.
+    /// Separate from `tab_strip_scroll` because the two regions scroll
+    /// independently — the whole point of freezing the pinned block is
+    /// that the unpinned tabs slide under it rather than with it. Only
+    /// ever has anything to scroll once the zone has hit its width cap.
+    pinned_tab_strip_scroll: ScrollHandle,
     /// Most-recently-used tab order. `mru[0]` is the current active tab,
     /// `mru[1]` is the previously-active tab (Cmd+Tab default target),
     /// etc. Kept in sync with `tabs` via `bump_mru` / `forget_mru`;

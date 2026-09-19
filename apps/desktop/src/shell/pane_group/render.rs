@@ -15,7 +15,8 @@ use gpui::{
     AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths, InteractiveElement,
     IntoElement, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, svg,
+    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, relative,
+    svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -45,6 +46,14 @@ const CLOSE_GLYPH_PX: f32 = 9.0;
 const STRIP_GLYPH_PX: f32 = 14.0;
 /// The pin that replaces the close button on a pinned tab.
 const PIN_GLYPH_PX: f32 = 10.0;
+/// Largest share of the strip the frozen pinned zone may take while there
+/// are still unpinned tabs to show. Past it the pinned chips scroll inside
+/// their own zone rather than crowding the rest of the strip out, which is
+/// the same bargain VS Code strikes in its single-row pinned mode and
+/// Chrome strikes by shrinking pinned tabs to their favicon: the frozen
+/// region is privileged, never unbounded. Lifted entirely when every tab
+/// is pinned — there is nothing left to leave room for.
+const PINNED_ZONE_MAX_FRACTION: f32 = 0.5;
 
 /// The tokens the tab strip draws from, as one value.
 ///
@@ -353,6 +362,7 @@ pub fn build_tab_strip_for(
     let active = group.active();
     let drag_hover = group.drag_hover();
     let scroll_handle = group.tab_strip_scroll_handle();
+    let pinned_scroll_handle = group.pinned_tab_strip_scroll_handle();
     let _ = group;
     build_tab_strip_from_headers(
         entity,
@@ -365,6 +375,7 @@ pub fn build_tab_strip_for(
         tokens,
         workspace_tint,
         scroll_handle,
+        pinned_scroll_handle,
         project_panes,
     )
 }
@@ -545,6 +556,15 @@ fn attention_for(content: &crate::shell::pane_content::PaneContent, cx: &App) ->
     }
 }
 
+/// Build the strip as THREE regions on one line: a frozen pinned zone, the
+/// scrolling remainder, and the trailing `+` / `...` cluster.
+///
+/// The pinned zone sits outside the scroll viewport, so scrolling the strip
+/// slides the unpinned chips under it instead of carrying the pinned ones
+/// off the left edge. `toggle_pin` keeps pinned tabs packed at the front of
+/// the visible order, so the zone is a prefix slice of `tabs` and visible
+/// indices stay global across both containers — which is what keeps the
+/// drag insertion bar reading as one continuous strip.
 #[allow(clippy::too_many_arguments)]
 fn build_tab_strip_from_headers(
     entity: Entity<PaneGroup>,
@@ -557,6 +577,7 @@ fn build_tab_strip_from_headers(
     tokens: &TabTokens<'_>,
     workspace_tint: Option<super::TabColor>,
     scroll_handle: gpui::ScrollHandle,
+    pinned_scroll_handle: gpui::ScrollHandle,
     project_panes: Entity<ProjectPanes>,
 ) -> AnyElement {
     let theme = tokens.theme;
@@ -591,9 +612,9 @@ fn build_tab_strip_from_headers(
     // is still consumed by `.track_scroll(&scroll_handle)` below.
     let wheel_scroll_handle = scroll_handle.clone();
 
-    // Inner scroll container: ONLY the tab chips scroll. The "+" and
-    // "..." buttons sit OUTSIDE this div so they stay pinned at the
-    // right edge of the strip even when many tabs overflow. The
+    // Inner scroll container: only the UNPINNED tab chips scroll. The
+    // pinned zone, the "+" and the "..." buttons all sit OUTSIDE this div
+    // so they hold their place while the rest of the strip overflows. The
     // `track_scroll(handle)` wires this viewport to the group's
     // `ScrollHandle` so `PaneGroup::pin_tab_strip_to_end` (called on
     // every tab append) snaps the viewport to its right edge.
@@ -708,9 +729,19 @@ fn build_tab_strip_from_headers(
             let current = wheel_scroll_handle.offset();
             wheel_scroll_handle.set_offset(point(current.x - dy, current.y));
         });
-    let tab_count = tabs.len();
-    for (visible_idx, header) in tabs.iter().enumerate() {
-        let tab_idx = header.tab_idx;
+    // The strip's bottom edge is a single neutral divider separating the
+    // tab row from the content below — it never carries the accent. Focus
+    // and the active tab are signalled by the active chip's own bottom
+    // indicator (see `render_tab_chip`), so there's one localized accent
+    // cue under the active tab instead of a full-width colored line. The
+    // pinned zone's trailing edge reuses the same neutral so the seam the
+    // unpinned chips slide under matches the rest of the chrome.
+    let border_color = theme.border_inactive;
+
+    // One chip, built from its VISIBLE index — which stays global across
+    // both containers so the two-edge insertion bar keeps lining up across
+    // the pinned/unpinned seam.
+    let chip_at = |visible_idx: usize, header: &PaneGroupTabHeader| {
         // Two-edge insertion bar: this chip paints a Right bar when the
         // slot is just AFTER it, and a Left bar when the slot is at this
         // chip's position. The two adjacent edges combine into one
@@ -724,16 +755,16 @@ fn build_tab_strip_from_headers(
                 None
             }
         });
-        chips = chips.child(render_tab_chip(
+        render_tab_chip(
             entity_id.as_u64(),
             group_id,
-            tab_idx,
+            header.tab_idx,
             visible_idx,
             header.label.clone(),
             header.kind_marker,
             header.agent_status.as_ref(),
             header.attention,
-            tab_idx == active,
+            header.tab_idx == active,
             is_focused,
             drag_edge,
             header.color,
@@ -744,40 +775,101 @@ fn build_tab_strip_from_headers(
             workspace_tint,
             entity.clone(),
             project_panes.clone(),
-        ));
-    }
-    let _ = tab_count;
+        )
+    };
 
-    // Outer container holds the scroll viewport + pinned trailing
-    // cluster. `flex_row` keeps everything on one line; the inner
-    // `chips` div takes flex_1 so it absorbs all remaining width while
-    // the trailing buttons stay flex-shrink-0.
-    //
-    // The strip's bottom edge is a single neutral divider separating the
-    // tab row from the content below — it never carries the accent. Focus
-    // and the active tab are signalled by the active chip's own bottom
-    // indicator (see `render_tab_chip`), so there's one localized accent
-    // cue under the active tab instead of a full-width colored line.
-    let border_color = theme.border_inactive;
-    // Scroll-edge fade hints. Subtle 8px gradients painted absolutely
-    // over the strip's left and right edges of the SCROLLING region
-    // (right edge offset by the trailing cluster so the fade doesn't
-    // bleed onto the `+` / `...` buttons). Visibility is keyed off the
-    // scroll handle: show LEFT when the user has scrolled right (offset
-    // negative); show RIGHT when there's more content offscreen to the
-    // right. When both checks are false the strip fits exactly.
+    // Pinned tabs are packed at the front of the visible order by
+    // `toggle_pin`, so the frozen zone is a prefix slice. Counted with
+    // `take_while` rather than `filter` on purpose: if that invariant ever
+    // broke, a stray pinned tab further back renders in the scrolling
+    // remainder instead of silently teleporting to the left edge.
+    let pinned_count = tabs.iter().take_while(|h| h.pinned).count();
+    let (pinned_tabs, scrolling_tabs) = tabs.split_at(pinned_count);
+
+    for (offset, header) in scrolling_tabs.iter().enumerate() {
+        chips = chips.child(chip_at(pinned_count + offset, header));
+    }
+
+    // Frozen pinned zone. Outside the scroll viewport, so the strip's
+    // horizontal scroll slides the unpinned chips under it instead of
+    // carrying these off the left edge. `flex_shrink_0` holds its natural
+    // width; `max_w` caps that at a share of the strip and its own
+    // `overflow_x_scroll` takes over from there, so a pinned block wider
+    // than the strip scrolls WITHIN the zone rather than swallowing it.
+    // The cap is lifted when nothing is unpinned — capping then would
+    // leave half the strip empty.
+    let pinned_zone = (!pinned_tabs.is_empty()).then(|| {
+        let wheel_pinned_handle = pinned_scroll_handle.clone();
+        let mut zone = div()
+            .id(SharedString::from(format!(
+                "pane-group-pinned-tabs-{entity_id}"
+            )))
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .h_full()
+            .flex_shrink_0()
+            .overflow_x_scroll()
+            .overflow_y_hidden()
+            .track_scroll(&pinned_scroll_handle)
+            .when(!scrolling_tabs.is_empty(), |s| {
+                s.max_w(relative(PINNED_ZONE_MAX_FRACTION))
+                    .border_r_1()
+                    .border_color(border_color)
+            })
+            // Same wheel-to-horizontal remap the scrolling region uses,
+            // pointed at this zone's own handle — it only has slack once
+            // the zone is capped, and is a no-op before that.
+            .on_scroll_wheel(move |ev: &ScrollWheelEvent, _window, _cx| {
+                let pixel_delta: Point<Pixels> = ev.delta.pixel_delta(strip_height);
+                let dy = pixel_delta.y;
+                if f32::from(dy).abs() < f32::EPSILON {
+                    return;
+                }
+                let current = wheel_pinned_handle.offset();
+                wheel_pinned_handle.set_offset(point(current.x - dy, current.y));
+            });
+        for (visible_idx, header) in pinned_tabs.iter().enumerate() {
+            zone = zone.child(chip_at(visible_idx, header));
+        }
+        zone
+    });
+
+    // Scroll-edge fade hints. Subtle 8px gradients painted absolutely over
+    // the left and right edges of the SCROLLING region only — which is why
+    // they hang off this wrapper rather than the row: anchored to the row
+    // they'd need the pinned zone's measured width to know where the
+    // scrolling region starts, and the left one would paint over the
+    // pinned chips. Visibility is keyed off the scroll handle: show LEFT
+    // when the user has scrolled right (offset negative); show RIGHT when
+    // there's more content offscreen to the right. When both checks are
+    // false the region fits exactly. The left fade doubles as the cue that
+    // unpinned chips are passing UNDER the pinned zone.
     let offset_x = f32::from(scroll_handle.offset().x);
     let max_offset_x = f32::from(scroll_handle.max_offset().x);
     let show_left_fade = offset_x < -0.5;
     let show_right_fade = offset_x > -(max_offset_x - 0.5);
-    // Both trailing buttons are square on the strip, so their width is the
-    // strip's own height rather than a constant that would stop matching it
-    // the moment the density preset moved.
-    let trailing_cluster_px = if show_pane_actions {
-        density.h_tab * 2.0
-    } else {
-        density.h_tab
-    };
+    let mut scroll_zone = div()
+        .flex()
+        .flex_row()
+        .items_stretch()
+        .h_full()
+        .flex_1()
+        .min_w(px(0.0))
+        .relative()
+        .child(chips);
+    // Overlays last so they paint on top of the chips.
+    if show_left_fade {
+        scroll_zone = scroll_zone.child(scroll_fade_overlay(true, theme));
+    }
+    if show_right_fade {
+        scroll_zone = scroll_zone.child(scroll_fade_overlay(false, theme));
+    }
+
+    // Outer container holds the pinned zone + scroll viewport + trailing
+    // cluster. `flex_row` keeps everything on one line; the scroll zone
+    // takes flex_1 so it absorbs all remaining width while the pinned zone
+    // and the trailing buttons stay flex-shrink-0.
     let mut row = div()
         .flex()
         .flex_row()
@@ -788,17 +880,11 @@ fn build_tab_strip_from_headers(
         .bg(theme.bg_panel)
         .border_b_2()
         .border_color(border_color)
-        .child(chips)
+        .when_some(pinned_zone, |s, zone| s.child(zone))
+        .child(scroll_zone)
         .child(plus_button(entity_id.as_u64(), tokens));
     if show_pane_actions {
         row = row.child(pane_actions_button(entity_id.as_u64(), is_focused, tokens));
-    }
-    // Overlays last so they paint on top of the chips.
-    if show_left_fade {
-        row = row.child(scroll_fade_overlay(true, trailing_cluster_px, theme));
-    }
-    if show_right_fade {
-        row = row.child(scroll_fade_overlay(false, trailing_cluster_px, theme));
     }
     row.into_any_element()
 }
@@ -1855,17 +1941,17 @@ fn render_mru_hud(
         .into_any_element()
 }
 
-/// Thin 8-px gradient overlay painted at the strip's left or right
-/// scroll edge. Acts as a visual cue that more chips exist offscreen.
-/// Left fade reserves no trailing offset; right fade is inset by the
-/// trailing chrome cluster width so it doesn't bleed onto the `+` /
-/// `...` buttons.
+/// Thin 8-px gradient overlay painted at the left or right edge of the
+/// strip's SCROLLING region. Acts as a visual cue that more chips exist
+/// offscreen — and, on the left, that they are sliding under the frozen
+/// pinned zone. Positioned against that region's own wrapper, so neither
+/// edge needs to know the pinned zone's or the trailing cluster's width.
 ///
 /// The gradient is a single-color overlay with low opacity — gpui's
 /// linear-gradient builder isn't trivially exposed for tiny edge fades,
 /// so a solid-bg with a low alpha gives the same visual hint at a
 /// fraction of the complexity.
-fn scroll_fade_overlay(is_left: bool, trailing_cluster_px: f32, theme: Theme) -> impl IntoElement {
+fn scroll_fade_overlay(is_left: bool, theme: Theme) -> impl IntoElement {
     let mut overlay = div()
         .absolute()
         .top(px(0.0))
@@ -1879,7 +1965,7 @@ fn scroll_fade_overlay(is_left: bool, trailing_cluster_px: f32, theme: Theme) ->
     if is_left {
         overlay = overlay.left(px(0.0));
     } else {
-        overlay = overlay.right(px(trailing_cluster_px));
+        overlay = overlay.right(px(0.0));
     }
     overlay
 }

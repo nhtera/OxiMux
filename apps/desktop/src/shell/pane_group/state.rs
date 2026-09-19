@@ -30,6 +30,7 @@ impl PaneGroup {
             window_active,
             chrome_w_px: density.w_left_rail,
             tab_strip_scroll: ScrollHandle::new(),
+            pinned_tab_strip_scroll: ScrollHandle::new(),
             mru: Vec::new(),
             mru_switcher: None,
             _mru_focus_out_sub: None,
@@ -255,10 +256,18 @@ impl PaneGroup {
         // (= split, since other pinned tabs sit at [0..split)); unpin
         // → start of unpinned cluster (= split, right after the still-
         // pinned tabs).
-        let _ = now_pinned;
         let dest = self.pinned_count();
         self.tab_order.insert(dest, moved);
         debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+        // Reveal the chip in whichever region it just landed in. Pinning
+        // appends to the frozen zone, which scrolls internally once it hits
+        // its width cap; unpinning drops the tab into the FIRST unpinned
+        // slot, which is offscreen whenever the user had scrolled right.
+        if now_pinned {
+            self.pin_pinned_zone_to_end();
+        } else {
+            self.reveal_unpinned_strip_start();
+        }
         cx.notify();
     }
 
@@ -830,6 +839,28 @@ impl PaneGroup {
     pub(super) fn pin_tab_strip_to_end(&self) {
         self.tab_strip_scroll
             .set_offset(Point::new(px(-100_000.0), px(0.0)));
+    }
+
+    /// ScrollHandle for the frozen pinned zone — the block of pinned chips
+    /// the render layer parks at the strip's left edge, outside the
+    /// scrolling viewport. It only ever has slack to scroll once the zone
+    /// has hit its width cap and its own chips overflow it.
+    pub(crate) fn pinned_tab_strip_scroll_handle(&self) -> ScrollHandle {
+        self.pinned_tab_strip_scroll.clone()
+    }
+
+    /// Snap the pinned zone to its right edge. Same far-negative-offset
+    /// trick as [`Self::pin_tab_strip_to_end`] — the paint phase clamps it
+    /// once the chips are measured.
+    pub(crate) fn pin_pinned_zone_to_end(&self) {
+        self.pinned_tab_strip_scroll
+            .set_offset(Point::new(px(-100_000.0), px(0.0)));
+    }
+
+    /// Snap the unpinned region back to its left edge, so the first
+    /// unpinned slot is on screen.
+    pub(crate) fn reveal_unpinned_strip_start(&self) {
+        self.tab_strip_scroll.set_offset(Point::new(px(0.0), px(0.0)));
     }
 
     /// Returns true when the tab strip viewport is currently snapped to

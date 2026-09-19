@@ -778,6 +778,90 @@ async fn move_into_pinned_cluster_clamps_to_unpinned_zone(cx: &mut TestAppContex
     });
 }
 
+#[gpui::test]
+async fn pinning_a_middle_tab_packs_it_at_the_front(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    for _ in 0..3 {
+        window
+            .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+            .expect("window update ok")
+            .expect("PTY spawn must succeed, or the tab this test needs is missing");
+    }
+    cx.run_until_parked();
+
+    // Pin the MIDDLE tab. The render layer slices the frozen pinned zone
+    // off the front of the visible order with `take_while`, so a pinned tab
+    // that stayed in place would render inside the scrolling remainder and
+    // scroll away again — the exact bug the zone exists to fix.
+    window
+        .update(cx, |group, _win, cx| group.toggle_pin(1, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            visible_labels(group),
+            vec!["Terminal 2", "Terminal 1", "Terminal 3"],
+            "pinning packs the tab at the front of the visible order",
+        );
+        assert_eq!(
+            group.pinned_count(),
+            1,
+            "pinned prefix length is what the render layer slices on",
+        );
+    });
+}
+
+#[gpui::test]
+async fn pin_and_unpin_reveal_the_slot_the_tab_landed_in(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    for _ in 0..3 {
+        window
+            .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+            .expect("window update ok")
+            .expect("PTY spawn must succeed, or the tab this test needs is missing");
+    }
+    cx.run_until_parked();
+
+    // Pinning appends to the frozen zone, which scrolls internally once it
+    // hits its width cap — so the zone is snapped toward its right edge.
+    // (The raw offset is the far-negative sentinel the paint phase clamps;
+    // no frame is painted here, so it reads back unclamped.)
+    window
+        .update(cx, |group, _win, cx| group.toggle_pin(2, cx))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        let offset = f32::from(group.pinned_tab_strip_scroll_handle().offset().x);
+        assert!(
+            offset < -1.0,
+            "pinning must snap the pinned zone toward its end, got {offset}",
+        );
+    });
+
+    // Scroll the unpinned region away from its start, then unpin. The tab
+    // lands in the FIRST unpinned slot, which is offscreen until the region
+    // snaps back to zero.
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        group
+            .tab_strip_scroll_handle()
+            .set_offset(gpui::point(gpui::px(-400.0), gpui::px(0.0)));
+    });
+    window
+        .update(cx, |group, _win, cx| group.toggle_pin(2, cx))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            f32::from(group.tab_strip_scroll_handle().offset().x),
+            0.0,
+            "unpinning must bring the first unpinned slot back on screen",
+        );
+    });
+}
+
 // ── Preview tab: single-click reuses one tab; edit/double-click promotes ───
 
 #[gpui::test]
