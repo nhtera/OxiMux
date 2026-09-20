@@ -301,6 +301,32 @@ pub struct OpenCommitContextMenuAt {
     pub short_sha: String,
 }
 
+/// Right-click on a stash row — or on a file row inside an expanded stash —
+/// in the source control panel's stash section.
+///
+/// One action for both because they open one menu with two shapes, the same
+/// way [`OpenGitRowContextMenuAt`] covers a file, a folder and a multi-
+/// selection. `file_path` is what tells them apart: `Some` means the click
+/// landed on a file inside the stash, `None` means the stash row itself.
+///
+/// The payload carries `message` / `relative` / `branch` because Drop routes
+/// through the host's confirm dialog, whose copy names the stash — an index
+/// tells the user nothing about what is about to disappear. `index` is the
+/// address the row was PAINTED with and travels as a tiebreaker only; every
+/// op re-resolves `sha` at fire time (see `stash_panel/ops.rs`).
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenStashContextMenuAt {
+    pub x: f32,
+    pub y: f32,
+    pub sha: String,
+    pub index: usize,
+    pub message: String,
+    pub relative: String,
+    pub branch: String,
+    pub file_path: Option<String>,
+}
+
 /// Payload action carrying text up to the workspace so it can resolve "the
 /// active agent session" and stream the bytes through its CLI runtime.
 /// `text` is sent verbatim — callers decide whether to append a trailing
@@ -760,6 +786,37 @@ mod tests {
         assert_eq!(original, dup);
         assert_eq!(dup.sha.len(), 40);
         assert_eq!(dup.short_sha.len(), 8);
+    }
+
+    // `file_path` is the whole discriminant between the two menu shapes, so
+    // the default has to be the stash row — a `Some("")` default would open
+    // the file menu on a path git never named.
+    #[test]
+    fn open_stash_context_menu_defaults_to_the_stash_row() {
+        let a = OpenStashContextMenuAt::default();
+        assert_eq!(a.x, 0.0);
+        assert_eq!(a.y, 0.0);
+        assert!(a.sha.is_empty());
+        assert_eq!(a.index, 0);
+        assert!(a.file_path.is_none(), "default must not be a file row");
+    }
+
+    #[test]
+    fn open_stash_context_menu_round_trip_payload() {
+        let original = OpenStashContextMenuAt {
+            x: 120.0,
+            y: 240.5,
+            sha: "c8ff104cb8494345ff53d9eb88421d7a03a993b6".to_string(),
+            index: 2,
+            message: "wip: parser".to_string(),
+            relative: "3 hours ago".to_string(),
+            branch: "main".to_string(),
+            file_path: Some("src/parser.rs".to_string()),
+        };
+        let dup = original.clone();
+        assert_eq!(original, dup);
+        assert_eq!(dup.index, 2);
+        assert_eq!(dup.file_path.as_deref(), Some("src/parser.rs"));
     }
 
     #[test]

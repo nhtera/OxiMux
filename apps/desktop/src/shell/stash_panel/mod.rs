@@ -25,6 +25,7 @@
 //! Ops are detached instead (see `ops.rs`): cancelling a destructive op
 //! mid-subprocess loses its result.
 
+pub mod context_menu;
 pub mod file_row;
 pub mod list_render;
 pub mod ops;
@@ -386,6 +387,40 @@ impl StashPanel {
     /// This stash's files, if any have been fetched.
     pub fn files_for(&self, sha: &str) -> Option<&StashFilesState> {
         self.files.get(sha)
+    }
+
+    /// Ask the host to open one stash file's diff, resolving the file's
+    /// `origin` from the cached list.
+    ///
+    /// The context menu calls this instead of building a
+    /// [`ShowStashFileRequested`] itself. `origin` selects which revision the
+    /// file is read from and the two are not interchangeable, so it is looked
+    /// up from the same list the row was painted from rather than carried
+    /// through an action payload that could only carry it as a bool. A file
+    /// whose stash is no longer cached is a no-op: the menu can only have
+    /// been opened from a painted row, so this means the list moved under it.
+    pub fn request_file_diff(&mut self, sha: &str, path: &std::path::Path, cx: &mut Context<Self>) {
+        let Some(StashFilesState::Ready(files)) = self.files.get(sha) else {
+            return;
+        };
+        let Some(file) = files.iter().find(|f| f.path == path) else {
+            return;
+        };
+        let origin = file.origin;
+        let label = match &self.state {
+            StashListState::Ready(entries) => entries
+                .iter()
+                .find(|e| e.sha == sha)
+                .map(list_render::row_message)
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        cx.emit(ShowStashFileRequested {
+            sha: sha.to_string(),
+            path: path.to_path_buf(),
+            origin,
+            label,
+        });
     }
 
     /// How many files a stash touches — `None` until the fetch lands.

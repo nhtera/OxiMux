@@ -363,12 +363,25 @@ impl Repository {
     }
 
     /// Apply stash without removing it from the stack.
-    pub async fn stash_apply(&self, stash_ref: &StashRef) -> Result<()> {
-        GitCmd::new(self.workdir())
-            .args(["stash", "apply", "--"])
-            .arg(stash_ref.ref_string())
-            .run()
-            .await?;
+    ///
+    /// `with_index` adds `--index`, which restores the staged/unstaged split
+    /// the stash was taken with instead of dumping everything into the
+    /// worktree as unstaged. That split is real and recoverable: a stash
+    /// commit's second parent (`^2`) IS the index at push time, which is
+    /// where `--index` reads it back from. Without the flag the information
+    /// is not lost, it is simply not used — so the two are one flag, not two
+    /// code paths.
+    ///
+    /// git refuses `--index` when the index cannot be reinstated cleanly
+    /// (typically because something is already staged); the error surfaces to
+    /// the caller rather than being retried without the flag, because a
+    /// silent downgrade would restage nothing and claim success.
+    pub async fn stash_apply(&self, stash_ref: &StashRef, with_index: bool) -> Result<()> {
+        let mut cmd = GitCmd::new(self.workdir()).args(["stash", "apply"]);
+        if with_index {
+            cmd = cmd.arg("--index");
+        }
+        cmd.arg("--").arg(stash_ref.ref_string()).run().await?;
         // Applying does not change the stack, but it does change the worktree;
         // the entry itself survives, so no invalidation is needed.
         Ok(())

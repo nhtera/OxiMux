@@ -318,7 +318,7 @@ async fn merge_autostash_ref_survives_conflict_resolution() {
     write(&p.join("a.txt"), "resolved\n");
     run_git(p, &["add", "a.txt"]);
     run_git(p, &["commit", "-m", "resolve"]);
-    repo.stash_apply(&stash_ref).await.unwrap();
+    repo.stash_apply(&stash_ref, false).await.unwrap();
     assert!(p.join("scratch.txt").exists());
     // Reset for the drop step so the stash content doesn't clash on a
     // subsequent worktree op (apply leaves entry on stack — see stash_ops).

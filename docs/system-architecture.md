@@ -267,6 +267,21 @@ StashPanel (GPUI entity)
   → ShowStashFileRequested → PaneGroupTabKind::StashFile { sha, path }
                              Tracked   → range <sha>^..<sha>
                              Untracked → <sha>^3 with NO base (diff_in_rev)
+  ← row action cluster is hidden until hover; the guaranteed path to every
+    verb is the right-click menu, which is why the two shipped together
+
+StashContextMenu (GPUI entity, mounted on WorkspaceRoot)
+  ← OpenStashContextMenuAt { x, y, sha, index, message, relative, branch,
+                             file_path }
+      file_path == None → the stash row:
+        Apply / Pop / Apply with index (git stash apply --index, restores the
+        staged split from the stash commit's ^2) · Copy Message / Copy SHA ·
+        Drop… → emits DropStashRequested, the same confirm gate the row uses
+      file_path == Some → a file inside an expanded stash:
+        Open Changes (panel resolves StashFileOrigin from its own cache) ·
+        Copy Relative Path
+  ← WeakEntity<StashPanel>; dismisses silently after a workspace switch
+  ← items whose phase has not landed are omitted, never disabled
 
 SourceControlPanel::sections (the stash section + the graph)
   ← both heights persisted separately; fit_sections() splits one budget

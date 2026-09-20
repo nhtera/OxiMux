@@ -25,8 +25,8 @@ use crate::shell::file_explorer::file_icon::icon_for_name;
 use crate::shell::source_control::style::ScmStyle;
 use crate::shell::stash_panel::{ShowStashFileRequested, StashFilesState, StashPanel};
 use gpui::{
-    AnyElement, ClickEvent, Context, ElementId, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement as _, Styled, div, px, svg,
+    AnyElement, ClickEvent, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, StatefulInteractiveElement as _, Styled, div, px, svg,
 };
 use gpui_component::{Icon, IconName};
 use oximux_core::{DiffStatus, StashEntry, StashFile};
@@ -120,6 +120,19 @@ impl StashPanel {
             origin: file.origin,
             label: crate::shell::stash_panel::list_render::row_message(entry),
         };
+        // The right-click payload. Carries the parent stash's own fields as
+        // well as the path: the menu is one entity with two shapes, and the
+        // shape is chosen by `file_path` being `Some`.
+        let menu = crate::actions::OpenStashContextMenuAt {
+            x: 0.0,
+            y: 0.0,
+            sha: entry.sha.clone(),
+            index: entry.stash_ref.index,
+            message: entry.message.clone(),
+            relative: entry.relative.clone(),
+            branch: entry.branch.clone(),
+            file_path: Some(file.path.display().to_string()),
+        };
 
         div()
             .id(id)
@@ -137,6 +150,19 @@ impl StashPanel {
             .on_click(cx.listener(move |_panel, _: &ClickEvent, _window, cx| {
                 cx.emit(request.clone());
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                move |ev: &MouseDownEvent, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::actions::OpenStashContextMenuAt {
+                            x: ev.position.x.into(),
+                            y: ev.position.y.into(),
+                            ..menu.clone()
+                        }),
+                        cx,
+                    );
+                },
+            )
             .child(icon)
             .child(
                 // Name and parent share one shrinkable cluster so the path

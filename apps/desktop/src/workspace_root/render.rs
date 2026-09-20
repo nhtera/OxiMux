@@ -33,6 +33,7 @@ impl Render for WorkspaceRoot {
             || self.file_tree_context_menu.read(cx).is_open()
             || self.git_row_context_menu.read(cx).is_open()
             || self.commit_context_menu.read(cx).is_open()
+            || self.stash_context_menu.read(cx).is_open()
             || self.terminal_context_menu.read(cx).is_open()
             || self.row_menu.read(cx).is_open()
             || self.project_menu.read(cx).is_open()
@@ -1302,6 +1303,7 @@ impl Render for WorkspaceRoot {
                     this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                     this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                     this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.stash_context_menu.update(cx, |m, cx| m.close(cx));
                     this.terminal_context_menu.update(cx, |m, cx| {
                         m.open(x, y, view, group_id, tab_idx, has_selection, link, cx)
                     });
@@ -1422,6 +1424,9 @@ impl Render for WorkspaceRoot {
                     this.tab_context_menu.update(cx, |m, cx| m.close(cx));
                     this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                     this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
+                    // The stash menu is the closest peer — same panel, one
+                    // right-click apart.
+                    this.stash_context_menu.update(cx, |m, cx| m.close(cx));
 
                     // Resolve the active source-control panel's
                     // CommitArea weak handle. Bail silently if the
@@ -1447,6 +1452,50 @@ impl Render for WorkspaceRoot {
                             commit_area_weak,
                             cx,
                         );
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &OpenStashContextMenuAt, _window, cx| {
+                    // Stash-section right-click — one action for both shapes,
+                    // told apart by `file_path`. Close peer overlays first so
+                    // the menu z-band stays single-occupancy.
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+
+                    // Weak, so a menu still open across a workspace switch
+                    // dismisses instead of firing ops into a torn-down panel.
+                    let Some(panel) = this
+                        .right_sidebar
+                        .as_ref()
+                        .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+                        .map(|sc| sc.read(cx).stash_panel.downgrade())
+                    else {
+                        return;
+                    };
+
+                    let target = match &action.file_path {
+                        Some(path) => StashContextTarget::File {
+                            sha: action.sha.clone(),
+                            path: std::path::PathBuf::from(path),
+                        },
+                        // The whole `DropStashRequested` payload, so the menu's
+                        // Drop item emits exactly what the row's does and both
+                        // reach the same confirm dialog.
+                        None => StashContextTarget::Stash(DropStashRequested {
+                            stash_ref: oximux_core::StashRef { index: action.index },
+                            sha: action.sha.clone(),
+                            message: action.message.clone(),
+                            relative: action.relative.clone(),
+                            branch: action.branch.clone(),
+                        }),
+                    };
+                    this.stash_context_menu.update(cx, |m, cx| {
+                        m.open(action.x, action.y, target, panel, cx);
                     });
                 },
             ))
@@ -1817,6 +1866,7 @@ impl Render for WorkspaceRoot {
                     || this.file_tree_context_menu.read(cx).is_open()
                     || this.git_row_context_menu.read(cx).is_open()
                     || this.commit_context_menu.read(cx).is_open()
+                    || this.stash_context_menu.read(cx).is_open()
                     || this.terminal_context_menu.read(cx).is_open()
                     || this.adapter_picker.read(cx).is_open()
                     || this.row_menu.read(cx).is_open()
@@ -1832,6 +1882,7 @@ impl Render for WorkspaceRoot {
                 this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                 this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+                this.stash_context_menu.update(cx, |m, cx| m.close(cx));
                 this.terminal_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.row_menu.update(cx, |m, cx| m.close(cx));
@@ -2136,6 +2187,10 @@ impl Render for WorkspaceRoot {
             // peer context menus; mutually exclusive via close-on-open
             // in OpenCommitContextMenuAt.
             .child(self.commit_context_menu.clone())
+            // Stash-section right-click menu (stash row + file row) — same
+            // z-band as the peer context menus; mutually exclusive via
+            // close-on-open in OpenStashContextMenuAt.
+            .child(self.stash_context_menu.clone())
             // Terminal grid right-click menu — same z-band as the peer
             // context menus; mutually exclusive via close-on-open in
             // OpenTerminalContextMenuAt.

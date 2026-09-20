@@ -90,18 +90,36 @@ async fn resolve(
 
 impl StashPanel {
     /// Apply a stash without removing it from the stack.
-    pub fn apply(&mut self, sha: String, painted: usize, cx: &mut Context<Self>) {
+    ///
+    /// `with_index` is the context menu's "Apply with index": it restores the
+    /// staged/unstaged split the stash was taken with. It is not the default
+    /// because git REFUSES it whenever the index cannot be reinstated cleanly
+    /// — a routine state for anyone who stages as they work — and the refusal
+    /// aborts the whole apply. A row-level verb that fails on a normal
+    /// worktree is worse than one that flattens the split, so the plain apply
+    /// stays on the row and the exact one lives in the menu.
+    pub fn apply(
+        &mut self,
+        sha: String,
+        painted: usize,
+        with_index: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.spawn_op(
             move |repo| async move {
                 let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
                     return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
                 };
-                repo.stash_apply(&stash_ref)
+                repo.stash_apply(&stash_ref, with_index)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(None)
             },
-            "Stash apply",
+            if with_index {
+                "Stash apply with index"
+            } else {
+                "Stash apply"
+            },
             cx,
         );
     }

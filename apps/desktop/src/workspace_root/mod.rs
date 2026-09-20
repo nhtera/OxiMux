@@ -91,6 +91,7 @@ use crate::actions::{
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     CreateWorktreeWorkspaceForActiveChat,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
+    OpenStashContextMenuAt,
     NewBrowserTab, NewTab, OpenChatSession, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, RestartToUpdate, ShowWelcomeWizard,
     OpenTabContextMenuAt, OpenTerminalContextMenuAt, ResumeAgentSession,
@@ -122,6 +123,7 @@ use crate::shell::{
     },
     stash_panel::{
         DropStashRequested, PushStashRequested, ShowStashFileRequested, StashPanel,
+        context_menu::{StashContextMenu, StashContextTarget},
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
     },
     left_rail::{
@@ -256,6 +258,14 @@ pub struct WorkspaceRoot {
     /// Cherry-pick / Revert dispatches route through the existing
     /// single-flight `in_flight` flag.
     pub(crate) commit_context_menu: Entity<CommitContextMenu>,
+    /// Right-click context menu for the stash section — a stash row (Apply /
+    /// Pop / Apply with index / Copy / Drop) or a file row inside an expanded
+    /// one (Open Changes / Copy Relative Path). Same shared-entity z-band as
+    /// `commit_context_menu`; mutually exclusive via close-on-open in the
+    /// `OpenStashContextMenuAt` handler. Holds a weak handle to the active
+    /// `StashPanel`, which is also what makes the row's hover-only action
+    /// cluster safe: this is the non-hover path to every verb.
+    pub(crate) stash_context_menu: Entity<StashContextMenu>,
     /// Right-click context menu for the terminal GRID (Copy / Paste / Select
     /// All / Clear / link / send-to-agent / split / tab ops). Same shared-
     /// entity z-band + click-outside dismiss as the other context menus; holds
@@ -757,6 +767,8 @@ impl WorkspaceRoot {
             cx.new(|_| GitRowContextMenu::new(theme, density, typography.clone()));
         let commit_context_menu =
             cx.new(|_| CommitContextMenu::new(theme, density, typography.clone()));
+        let stash_context_menu =
+            cx.new(|_| StashContextMenu::new(theme, density, typography.clone()));
         let terminal_context_menu =
             cx.new(|_| TerminalContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
@@ -1338,6 +1350,7 @@ impl WorkspaceRoot {
             file_tree_context_menu,
             git_row_context_menu,
             commit_context_menu,
+            stash_context_menu,
             terminal_context_menu,
             adapter_picker,
             cli_runtime,

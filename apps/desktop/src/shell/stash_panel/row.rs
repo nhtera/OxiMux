@@ -33,35 +33,47 @@
 //! lazily on expand, so a row nobody has expanded knows nothing about its
 //! files, and a confident `0` would be a claim we have not earned.
 //!
-//! # What this row deliberately does not paint yet
+//! # Hidden until hover, because the menu now exists
 //!
-//! * **The tighter `h_row` height.** The row still carries three text buttons
-//!   — 20px for the two xsmall `Button`s, 22px for `danger_ghost`, whose
-//!   height is a literal that does not scale. `h_row` is 24px at cockpit
-//!   density and 19.2px at the 80% minimum zoom, so the tighter row would
-//!   clip a control that cannot shrink. The height moves when Phase 6
-//!   replaces the cluster with icons — and only if the icon buttons scale.
+//! The cluster used to rest at 45% opacity rather than hidden, for one
+//! documented reason: the panel had no context menu, so hiding it would have
+//! left Drop with no other way in. [`super::context_menu`] removes that
+//! premise, so the cluster takes the repo's ordinary hidden-until-hover row
+//! treatment and the row at rest is finally just a stash.
+//!
+//! The icons are NOT gpui-component `Button`s. An icon-only `.xsmall()`
+//! Button is `size_5` — a flat 20px that ignores both the density preset and
+//! the zoom — which is exactly why this row was stuck at `h_action_row`
+//! through Phase 4. [`icon_action`] sizes itself from `ScmStyle::icon`, so it
+//! fits inside `density.h_row` at every zoom and the row can finally take the
+//! tighter height.
+//!
+//! The cluster is positioned absolutely, not laid out as the row's last
+//! child — at 220px and 150% the row cannot afford it either way, so it is
+//! taken out of the width arithmetic entirely. See the cluster itself.
+//!
+//! Only the verbs that exist are painted: Apply, Pop, Drop. Branch-from-stash
+//! and Rename belong to later phases and are absent rather than present and
+//! dead — a button that does nothing is the defect Drop already shipped once.
 
 use crate::shell::stash_panel::list_render::{row_message, row_meta, row_tooltip};
 use crate::shell::stash_panel::{DropStashRequested, StashPanel};
 use crate::shell::source_control::style::ScmStyle;
-use crate::ui::danger_ghost;
 use gpui::{
-    ClickEvent, Context, ElementId, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _, px,
+    App, ClickEvent, Context, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
-use gpui_component::{
-    Icon, Sizable as _,
-    button::{Button, ButtonVariants},
-    tooltip::Tooltip,
-};
+use gpui_component::{Icon, tooltip::Tooltip};
 use oximux_core::StashEntry;
+use oximux_settings::Theme;
 
-/// Resting opacity of a stash row's Apply/Pop/Drop cluster — ghosted enough to
-/// calm the row, present enough that the actions are always discoverable and
-/// clickable (the panel has no context-menu fallback). Lifts to full on
-/// row-hover.
-const STASH_ACTION_REST_OPACITY: f32 = 0.45;
+/// Hit area of one row-action icon button, as a multiple of the glyph inside
+/// it. A ratio rather than a size: `ScmStyle::icon` already carries the zoom,
+/// so the button grows with the row instead of staying a 20px literal the way
+/// an `.xsmall()` Button does. 1.6 leaves ~4px of padding per side at the
+/// default and still clears `density.h_row` at every preset.
+const ICON_BUTTON_RATIO: f32 = 1.6;
 
 /// Shrink factors, not sizes: the message gives up width twice as fast as the
 /// metadata, down to [`MESSAGE_MIN_EMS`], because a branch name and a date are
@@ -103,6 +115,7 @@ impl StashPanel {
         let pop_sha = entry.sha.clone();
         let toggle_sha = entry.sha.clone();
         let drop_entry = entry.clone();
+        let menu_entry = entry.clone();
         // Hover scope for the progressive-disclosure cluster below, and the
         // row's own stateful id (which `.tooltip` needs).
         //
@@ -115,60 +128,85 @@ impl StashPanel {
         let group_name = format!("stash-row-{key}");
         let row_id = ElementId::Name(format!("stash-row-{key}").into());
 
-        // Apply / Pop / Drop all sit at xsmall height (20px for the two
-        // Buttons, 22px for `danger_ghost`) so the row reads as one action
-        // cluster — the destructive verb doesn't dominate by being larger
-        // than its siblings.
+        // Apply ↧ / Pop ↥ / Drop 🗑. The two arrows are mirror images on
+        // purpose: apply and pop differ only in whether the entry survives,
+        // and a user who learns one glyph has learned the other.
+        //
+        // # Out of the flex flow, on purpose
+        //
+        // The cluster is absolutely positioned against the row's right edge
+        // rather than laid out as its last child. A flex child has to be
+        // PAID FOR out of the row's width, and at the panel's 220px minimum
+        // with the UI at 150% the row cannot afford it: chrome, chevron, gaps
+        // and the message's own [`MESSAGE_MIN_EMS`] floor already come to
+        // more than 220px, so the overflow leaves the row — and the window —
+        // taking Pop and Drop with it. Measured live at exactly that
+        // combination, first with three text buttons (Phase 4) and again with
+        // these three icons, which are a third of the width and still did not
+        // fit. Shrinking the cluster was never going to be the fix.
+        //
+        // Absolute makes reachability a floor instead of an arithmetic race:
+        // whatever the width, the cluster sits inside the row's right edge,
+        // and what it costs is covering the tail of the metadata *while the
+        // pointer is on the row*. Hence the opaque `bg_panel` backing — text
+        // showing through the glyphs reads as a rendering fault — and the
+        // left padding, so the covered text ends in air rather than against
+        // the first icon.
+        //
+        // Hidden at rest, revealed on row-hover. `.invisible()` rather than
+        // dropping the children, so hover reveals rather than inserts.
         let actions = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(density.pad_panel))
             .flex()
             .flex_row()
             .items_center()
-            // Pin the action cluster: it must never shrink or clip — a narrow
-            // panel truncates the text instead (the canonical SCM-row collapse
-            // priority). Without this, a long stash message pushed the cluster
-            // off the right edge and clipped "Drop".
-            .flex_shrink_0()
-            .gap(px(density.gap_inline))
-            // Progressive disclosure: the cluster rests ghosted and lifts to
-            // full on row-hover, so a calm row at rest but every verb is one
-            // hover away. NOT fully hidden on purpose — the stash panel has no
-            // context menu, so a hidden cluster would leave Drop (destructive)
-            // with no alternative invocation path. Ghost-at-rest keeps every
-            // action reachable at all times (documented exception to the
-            // fully-hidden row-action convention used where a context-menu
-            // backup exists).
-            .opacity(STASH_ACTION_REST_OPACITY)
-            .group_hover(group_name.clone(), |s| s.opacity(1.0))
-            .child(
-                Button::new(("stash-apply", index))
-                    .ghost()
-                    .xsmall()
-                    .label("Apply")
-                    .tooltip("Apply stash (keep it in the list)")
-                    .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.apply(apply_sha.clone(), index, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new(("stash-pop", index))
-                    .ghost()
-                    .xsmall()
-                    .label("Pop")
-                    // NOT "reversible via reflog" — a pop deletes the stash's
-                    // reflog entry, leaving the commit sha as the only way back.
-                    .tooltip("Apply stash and remove it from the list")
-                    .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.pop(pop_sha.clone(), index, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(danger_ghost(
-                ("stash-drop", index),
-                "Drop",
-                &theme,
-                &density,
-                typography,
+            .pl(px(density.gap_inline))
+            .bg(theme.bg_panel)
+            .gap(px(style.icon_cluster_gap))
+            .invisible()
+            .group_hover(group_name.clone(), |s| s.visible())
+            .child(icon_action(
+                ElementId::Name(format!("stash-apply-{key}").into()),
+                "icons/arrow-down.svg",
+                "Apply stash (keep it in the list)",
+                theme.fg_muted,
+                theme,
+                style,
+                cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                    // The row applies plainly. `--index` is a menu item, not
+                    // the default — see `StashPanel::apply`.
+                    panel.apply(apply_sha.clone(), index, false, cx);
+                    cx.notify();
+                }),
+            ))
+            .child(icon_action(
+                ElementId::Name(format!("stash-pop-{key}").into()),
+                "icons/arrow-up.svg",
+                // NOT "reversible via reflog" — a pop deletes the stash's
+                // reflog entry, leaving the commit sha as the only way back.
+                "Apply stash and remove it from the list",
+                theme.fg_muted,
+                theme,
+                style,
+                cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                    panel.pop(pop_sha.clone(), index, cx);
+                    cx.notify();
+                }),
+            ))
+            .child(icon_action(
+                ElementId::Name(format!("stash-drop-{key}").into()),
+                "icons/trash.svg",
+                "Drop this stash",
+                // The one tinted glyph in the row. `danger_ghost` exists
+                // because a gpui-component Button overwrites `text_color`
+                // from its variant table; a plain svg has no such table, so
+                // the tint is just the colour we pass.
+                theme.status_error,
+                theme,
+                style,
                 cx.listener(move |_panel, _: &ClickEvent, _window, cx| {
                     // The panel never drops on its own — the host owns the
                     // confirm step and calls back into `drop_confirmed`.
@@ -210,10 +248,19 @@ impl StashPanel {
         let row = div()
             .id(row_id)
             .group(group_name)
+            // Anchors the absolutely-positioned action cluster above. Safe to
+            // add here — this element never positions itself, so there is no
+            // `.absolute()` for `.relative()` to clobber.
+            .relative()
             .flex()
             .flex_row()
             .items_center()
-            .h(px(density.h_action_row))
+            // `h_row`, not `h_action_row`. The taller height was never a
+            // design choice — it was the smallest thing that would hold a
+            // 22px `danger_ghost` and two 20px Buttons, none of which scale.
+            // With `icon_action` sized from the glyph, the row is a list row
+            // again and reads level with the file rows under it.
+            .h(px(density.h_row))
             .px(px(density.pad_panel))
             .gap(px(density.gap_inline))
             // The message floor makes this row un-compressible past a point,
@@ -229,9 +276,11 @@ impl StashPanel {
             // — verified by negative control at 220px/150%, where removing this
             // line changed no pixel by more than 2/255. It is a guard against
             // the row's own geometry, not a fix for a defect visible today, and
-            // it holds if anything is ever placed to the section's right. What
-            // IS wrong at that size is that Pop and Drop fall off the edge
-            // entirely; only Phase 6's icon cluster fixes reachability.
+            // it holds if anything is ever placed to the section's right. The
+            // reachability half of that report — Pop and Drop falling off the
+            // edge at 220px/150% — is fixed by taking the cluster OUT of this
+            // row's flex flow, not by making it narrower; three glyphs are a
+            // third of the width three labels were and still did not fit.
             .overflow_hidden()
             .border_b_1()
             .border_color(theme.border_inactive)
@@ -273,7 +322,29 @@ impl StashPanel {
                 )
             })
             .child(actions)
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            // Right-click opens the full verb list. This is the guarantee
+            // that lets the cluster above hide: every action the row offers,
+            // plus the ones no row has space for, are reachable without
+            // hovering — which is what a touch or keyboard user has.
+            .on_mouse_down(
+                MouseButton::Right,
+                move |ev: &MouseDownEvent, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::actions::OpenStashContextMenuAt {
+                            x: ev.position.x.into(),
+                            y: ev.position.y.into(),
+                            sha: menu_entry.sha.clone(),
+                            index,
+                            message: menu_entry.message.clone(),
+                            relative: menu_entry.relative.clone(),
+                            branch: menu_entry.branch.clone(),
+                            file_path: None,
+                        }),
+                        cx,
+                    );
+                },
+            );
 
         // The row and its expansion are one column so the caller's list loop
         // stays a loop over stashes rather than a loop that has to know
@@ -285,4 +356,50 @@ impl StashPanel {
             .child(row)
             .when(expanded, |col| col.child(self.render_files(&entry, cx)))
     }
+}
+
+/// One icon-only row action: a square hit area, a tinted glyph, a tooltip.
+///
+/// Deliberately not a gpui-component `Button`. Two reasons, both of which
+/// this row hit before:
+///
+/// * An icon-only `.xsmall()` Button is `size_5` — 20 flat pixels that follow
+///   neither the density preset nor the zoom. Sizing from `ScmStyle::icon`
+///   keeps the control inside `density.h_row` at 80% and at 200%.
+/// * A Button resolves `text_color` from its variant's style table at render
+///   time, so `Styled::text_color` cannot paint one in `status_error`. That
+///   is the whole reason `oximux_ui::danger_ghost` exists; a plain `svg` has
+///   no table to lose to, so Drop's red is just the colour passed in.
+///
+/// The tooltip is not decoration — it is the only label an icon-only control
+/// has, which is why every caller passes one.
+fn icon_action<H>(
+    id: ElementId,
+    icon: &'static str,
+    tooltip: &'static str,
+    color: Hsla,
+    theme: Theme,
+    style: ScmStyle,
+    on_click: H,
+) -> impl IntoElement
+where
+    H: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+{
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .size(px(style.icon * ICON_BUTTON_RATIO))
+        .rounded(px(style.corner))
+        .cursor_pointer()
+        .hover(move |s| s.bg(theme.hover_overlay))
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .on_click(on_click)
+        .child(
+            // `text_color` explicitly: an `Icon` with none inherits nothing
+            // useful and paints invisible.
+            Icon::default().path(icon).size(px(style.icon)).text_color(color),
+        )
 }

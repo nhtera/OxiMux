@@ -200,7 +200,7 @@ async fn stash_apply_leaves_entry_on_stack() {
     write(&p.join("a.txt"), "v2\n");
     let repo = Repository::open(p).await.unwrap();
     let r = repo.stash_push(None, false, &[]).await.unwrap();
-    repo.stash_apply(&r).await.unwrap();
+    repo.stash_apply(&r, false).await.unwrap();
 
     let on_disk = std::fs::read_to_string(p.join("a.txt")).unwrap();
     assert_eq!(on_disk, "v2\n", "apply should restore worktree");
@@ -1011,4 +1011,61 @@ async fn stash_branch_name_collision_changes_nothing() {
         Some("main")
     );
     assert_eq!(repo.stash_list(true).await.unwrap().len(), 1);
+}
+
+/// `--index` is the whole reason `stash_apply` takes a flag: without it git
+/// dumps everything back as unstaged, and the staged/unstaged split the user
+/// had when they stashed is silently flattened.
+///
+/// Two files so the assertion can tell "the split survived" from "everything
+/// landed on one side": `staged.txt` was in the index at push time,
+/// `unstaged.txt` was not.
+#[tokio::test]
+async fn apply_with_index_restores_the_staged_unstaged_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("staged.txt"), "v1\n");
+    write(&p.join("unstaged.txt"), "v1\n");
+    run_git(p, &["add", "."]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    write(&p.join("staged.txt"), "v2\n");
+    run_git(p, &["add", "staged.txt"]);
+    write(&p.join("unstaged.txt"), "v2\n");
+
+    let repo = Repository::open(p).await.unwrap();
+    let r = repo.stash_push(None, false, &[]).await.unwrap();
+
+    repo.stash_apply(&r, true).await.unwrap();
+    assert_eq!(
+        staged_paths(p),
+        vec!["staged.txt".to_string()],
+        "--index must restore the index exactly, not everything and not nothing"
+    );
+
+    // And the negative control: the same stash applied WITHOUT the flag
+    // leaves the index empty, which is what makes the flag worth having.
+    run_git(p, &["reset", "--hard", "HEAD"]);
+    repo.stash_apply(&r, false).await.unwrap();
+    assert!(
+        staged_paths(p).is_empty(),
+        "plain apply flattens the split — that is the behavior --index opts out of"
+    );
+}
+
+/// Paths git currently reports as staged, sorted. A test helper rather than a
+/// `Repository` method: nothing in the app needs this shape.
+fn staged_paths(cwd: &std::path::Path) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(cwd)
+        .output()
+        .expect("git not on PATH");
+    let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths
 }
