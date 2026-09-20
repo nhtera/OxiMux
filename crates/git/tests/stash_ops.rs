@@ -430,7 +430,7 @@ async fn resolve_stash_index_tracks_drift_and_absence() {
     repo.stash_push(Some("first"), false, &[]).await.unwrap();
     let first = repo.stash_list(true).await.unwrap()[0].sha.clone();
     assert_eq!(
-        repo.resolve_stash_index(&first).await.unwrap(),
+        repo.resolve_stash_index(&first, None).await.unwrap(),
         Some(oximux_core::StashRef { index: 0 })
     );
 
@@ -439,19 +439,96 @@ async fn resolve_stash_index_tracks_drift_and_absence() {
     write(&p.join("a.txt"), "v3\n");
     repo.stash_push(Some("second"), false, &[]).await.unwrap();
     assert_eq!(
-        repo.resolve_stash_index(&first).await.unwrap(),
+        repo.resolve_stash_index(&first, None).await.unwrap(),
         Some(oximux_core::StashRef { index: 1 }),
         "index must follow the sha, not be remembered"
     );
 
     // Dropped out-of-band → `None`, the only case a caller should abort on.
     run_git(p, &["stash", "drop", "stash@{1}"]);
-    assert_eq!(repo.resolve_stash_index(&first).await.unwrap(), None);
+    assert_eq!(repo.resolve_stash_index(&first, None).await.unwrap(), None);
     assert_eq!(
-        repo.resolve_stash_index("0000000000000000000000000000000000000000")
+        repo.resolve_stash_index("0000000000000000000000000000000000000000", None)
             .await
             .unwrap(),
         None
+    );
+}
+
+/// A sha is NOT unique on the stack, and the painted address is what tells
+/// two entries for one commit apart.
+///
+/// Building the collision takes an interleaved store: `git stash store` twice
+/// in a row on the same sha leaves ONE entry, because git skips the reflog
+/// append when the ref value does not change. Verified — the obvious repro
+/// does not reproduce it.
+#[tokio::test]
+async fn a_hint_disambiguates_two_entries_that_share_one_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let repo = repo_with(p, &[("a.txt", "v1\n")]).await;
+
+    write(&p.join("a.txt"), "v2\n");
+    repo.stash_push(Some("A"), false, &[]).await.unwrap();
+    let a = repo.stash_list(true).await.unwrap()[0].sha.clone();
+    write(&p.join("a.txt"), "v3\n");
+    repo.stash_push(Some("B"), false, &[]).await.unwrap();
+    let b = repo.stash_list(true).await.unwrap()[0].sha.clone();
+
+    run_git(p, &["stash", "clear"]);
+    repo.stash_store(&a, "A").await.unwrap();
+    repo.stash_store(&b, "B").await.unwrap();
+    repo.stash_store(&a, "A2").await.unwrap();
+
+    let list = repo.stash_list(true).await.unwrap();
+    assert_eq!(list.len(), 3, "interleaved store should leave three: {list:?}");
+    assert_eq!(list[0].sha, a);
+    assert_eq!(list[2].sha, a, "one commit at two addresses");
+
+    // Without the hint, both rows resolve to the FIRST match — so an op fired
+    // from stash@{2} would act on stash@{0}.
+    assert_eq!(
+        repo.resolve_stash_index(&a, None).await.unwrap(),
+        Some(oximux_core::StashRef { index: 0 })
+    );
+    // With it, each row keeps its own entry.
+    assert_eq!(
+        repo.resolve_stash_index(&a, Some(2)).await.unwrap(),
+        Some(oximux_core::StashRef { index: 2 }),
+        "the painted address should win when it still names this sha"
+    );
+    assert_eq!(
+        repo.resolve_stash_index(&a, Some(0)).await.unwrap(),
+        Some(oximux_core::StashRef { index: 0 })
+    );
+}
+
+/// The hint must never override drift-healing: an address that no longer
+/// names this sha is stale, and falling back to the live position is the
+/// whole reason ops resolve by sha in the first place.
+#[tokio::test]
+async fn a_stale_hint_falls_back_to_the_live_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let repo = repo_with(p, &[("a.txt", "v1\n")]).await;
+
+    write(&p.join("a.txt"), "v2\n");
+    repo.stash_push(Some("first"), false, &[]).await.unwrap();
+    let first = repo.stash_list(true).await.unwrap()[0].sha.clone();
+    // Something else stashes; `first` slides to index 1 while the row on
+    // screen still says stash@{0}.
+    write(&p.join("a.txt"), "v3\n");
+    repo.stash_push(Some("second"), false, &[]).await.unwrap();
+
+    assert_eq!(
+        repo.resolve_stash_index(&first, Some(0)).await.unwrap(),
+        Some(oximux_core::StashRef { index: 1 }),
+        "a stale hint must not pin the op to the wrong stash"
+    );
+    // An address past the end of the stack is stale in the same way.
+    assert_eq!(
+        repo.resolve_stash_index(&first, Some(99)).await.unwrap(),
+        Some(oximux_core::StashRef { index: 1 })
     );
 }
 
@@ -837,7 +914,7 @@ async fn stash_list_survives_messages_containing_any_printable_delimiter() {
     // the wrong stash.
     for e in &list {
         assert_eq!(
-            repo.resolve_stash_index(&e.sha).await.unwrap(),
+            repo.resolve_stash_index(&e.sha, None).await.unwrap(),
             Some(e.stash_ref.clone()),
             "parsed index disagrees with git for {:?}",
             e.message

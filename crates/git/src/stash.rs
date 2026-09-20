@@ -306,19 +306,59 @@ impl Repository {
     /// error at them. `None` — the stash genuinely no longer exists — is the
     /// only case that should abort.
     ///
+    /// # A sha does not have to be unique on the stack
+    ///
+    /// `hint` is the address the caller's row was *painted* with, and it is
+    /// what breaks the tie when it isn't.
+    ///
+    /// Two entries can point at one commit, because `git stash store` writes
+    /// a reflog entry for whatever sha it is handed and never checks whether
+    /// that commit is already on the stack. **Verified** — and not by the
+    /// obvious route: storing the same sha twice in a row leaves ONE entry,
+    /// since git skips the reflog append when the ref value does not change.
+    /// It takes an interleaved store:
+    ///
+    /// ```text
+    /// git stash store -m A $A     # refs/stash -> A
+    /// git stash store -m B $B     #            -> B
+    /// git stash store -m A2 $A    #            -> A, now at {0} AND {2}
+    /// ```
+    ///
+    /// Resolving by "first match" then silently retargets: Drop on the second
+    /// row removes the first one instead, and the sha assertion downstream
+    /// cannot tell the difference because both entries carry the same sha.
+    /// Honouring `hint` when it still names this sha keeps each row pointed
+    /// at its own entry; falling back to the first match when it does not
+    /// preserves the self-healing behaviour above, which is the common case.
+    ///
     /// Always reads the live stack; a cached list would defeat the purpose.
-    pub async fn resolve_stash_index(&self, sha: &str) -> Result<Option<StashRef>> {
+    pub async fn resolve_stash_index(
+        &self,
+        sha: &str,
+        hint: Option<usize>,
+    ) -> Result<Option<StashRef>> {
         let out = GitCmd::new(self.workdir())
             .args(["stash", "list", "--format=%H"])
             .run()
             .await?;
         let text = String::from_utf8(out.stdout)
             .map_err(|e| GitError::parse(format!("non-utf8 in `git stash list`: {e}")))?;
-        Ok(text
+        let shas: Vec<&str> = text
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .position(|l| l == sha)
+            .collect();
+        // The painted address, if it still holds this sha. Costs nothing when
+        // the sha is unique — it is the same answer — and is the whole fix
+        // when it is not.
+        if let Some(index) = hint
+            && shas.get(index).is_some_and(|s| *s == sha)
+        {
+            return Ok(Some(StashRef { index }));
+        }
+        Ok(shas
+            .iter()
+            .position(|l| *l == sha)
             .map(|index| StashRef { index }))
     }
 

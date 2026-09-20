@@ -386,15 +386,18 @@ impl Render for WorkspaceRoot {
                     },
                 ),
             )
-            // Route commit-graph height-resize drag ticks. The handle lives
-            // at the graph section's top edge inside the SCM panel; like the
-            // sidebar/rail handles its move listener has to sit on this
+            // Route SCM section height-resize drag ticks. Both handles live
+            // at their section's top edge inside the SCM panel; like the
+            // sidebar/rail handles their move listeners have to sit on this
             // full-size row so the cursor stays inside the listener's bounds
-            // for the whole drag (and so it keeps firing while the cursor
-            // travels over the graph's own commit rows — a listener nested
-            // inside the SCM panel stops firing over child entities). The
-            // window height for the clamp ceiling comes off this row's live
-            // bounds. Reaches the graph through right_sidebar → source_control.
+            // for the whole drag (and so they keep firing while the cursor
+            // travels over the section's own rows — a listener nested inside
+            // the SCM panel stops firing over child entities). The window
+            // height for the clamp ceiling comes off this row's live bounds.
+            //
+            // Two listeners because GPUI selects a drag by PAYLOAD TYPE; they
+            // converge immediately on `apply_section_drag`, which is the one
+            // place that can see both sections at once.
             .on_drag_move::<crate::shell::source_control::graph::GraphResizePayload>(
                 cx.listener(
                     |this,
@@ -403,20 +406,27 @@ impl Render for WorkspaceRoot {
                     >,
                      _window,
                      cx| {
-                        let cursor_y = f32::from(ev.event.position.y);
-                        let window_height = f32::from(ev.bounds.size.height);
-                        let Some(sidebar) = this.right_sidebar.clone() else {
-                            return;
-                        };
-                        sidebar.update(cx, |s, cx| {
-                            if let Some(panel) = s.source_control.clone() {
-                                panel.update(cx, |p, cx| {
-                                    p.commit_graph.update(cx, |g, cx| {
-                                        g.apply_graph_drag(cursor_y, window_height, cx);
-                                    });
-                                });
-                            }
-                        });
+                        this.apply_scm_section_drag(
+                            crate::shell::source_control::sections::ScmSection::Graph,
+                            f32::from(ev.event.position.y),
+                            f32::from(ev.bounds.size.height),
+                            cx,
+                        );
+                    },
+                ),
+            )
+            .on_drag_move::<crate::shell::stash_panel::resize::StashResizePayload>(
+                cx.listener(
+                    |this,
+                     ev: &DragMoveEvent<crate::shell::stash_panel::resize::StashResizePayload>,
+                     _window,
+                     cx| {
+                        this.apply_scm_section_drag(
+                            crate::shell::source_control::sections::ScmSection::Stash,
+                            f32::from(ev.event.position.y),
+                            f32::from(ev.bounds.size.height),
+                            cx,
+                        );
                     },
                 ),
             )

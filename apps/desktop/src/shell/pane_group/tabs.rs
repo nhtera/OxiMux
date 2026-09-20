@@ -2116,6 +2116,80 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open or activate a read-only diff tab for one file inside a stash.
+    /// Dedup key is `(sha, path)` — see [`PaneGroupTabKind::StashFile`].
+    ///
+    /// `base` is the diff's left side and may be **empty**, which `DiffView`
+    /// reads as "no base at all": that is how an untracked file, which lives
+    /// in the parentless `<sha>^3` and is absent from the stash commit's own
+    /// tree, renders as the whole-file addition it is. The caller picks the
+    /// pair from `StashFileOrigin`; nothing here re-derives it.
+    ///
+    /// `stash_label` names the stash in the tab title, because a bare file
+    /// name gives the user no way to tell two stashes' copies apart once both
+    /// tabs are open.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_activate_stash_file_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        sha: String,
+        base: String,
+        head: String,
+        path: PathBuf,
+        stash_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::StashFile { sha: s, path: p } if s == &sha && p == &path)
+        }) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let leaf = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("diff")
+            .to_string();
+        let title = leaf.clone();
+        let path_for_load = path.clone();
+        let view = cx.new(|cx| {
+            let mut v =
+                crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
+            v.load_range(base, head, path_for_load, title, cx);
+            v
+        });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let label = SharedString::from(format!("{leaf} · {stash_label}"));
+        let tab = PaneGroupTab {
+            label,
+            content: PaneContent::Diff(view),
+            kind: PaneGroupTabKind::StashFile { sha, path },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     /// Open or activate a combined multi-file diff tab for `scope`. Dedup
     /// key is the scope title ("All Changes" / "Staged Changes" /
     /// "Untracked" / "Branch Diff") so re-clicking the same "View all" CTA

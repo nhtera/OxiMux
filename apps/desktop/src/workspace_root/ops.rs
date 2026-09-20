@@ -577,6 +577,33 @@ impl WorkspaceRoot {
         None
     }
 
+    /// Hand one SCM section-resize drag tick to the source-control panel.
+    ///
+    /// The two handles' listeners have to live on the workspace root (a drag
+    /// listener nested inside the SCM panel stops firing once the cursor
+    /// travels over a child entity), and GPUI selects a drag by payload type,
+    /// so there is one listener per section. They both land here, and here
+    /// hands off to the single router that can see both section heights —
+    /// nothing in this file decides anything about the budget.
+    pub(crate) fn apply_scm_section_drag(
+        &mut self,
+        section: crate::shell::source_control::sections::ScmSection,
+        cursor_y: f32,
+        window_height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sidebar) = self.right_sidebar.clone() else {
+            return;
+        };
+        sidebar.update(cx, |s, cx| {
+            if let Some(panel) = s.source_control.clone() {
+                panel.update(cx, |p, cx| {
+                    p.apply_section_drag(section, cursor_y, window_height, cx);
+                });
+            }
+        });
+    }
+
     /// (Re)wire every source-control-panel event subscription against the
     /// CURRENT `right_sidebar` entities. Called from `new` AND after every
     /// `set_active_project` sidebar rebuild: that rebuild mints fresh
@@ -597,6 +624,7 @@ impl WorkspaceRoot {
             self._discard_subscription = None;
             self._push_stash_subscription = None;
             self._drop_stash_subscription = None;
+            self._show_stash_file_subscription = None;
             self._show_commit_subscription = None;
             self._show_branch_file_subscription = None;
             self._show_combined_diff_subscription = None;
@@ -637,6 +665,39 @@ impl WorkspaceRoot {
             window,
             |root, panel, ev: &DropStashRequested, window, cx| {
                 root.mount_drop_stash_dialog(panel, ev, window, cx);
+            },
+        ));
+
+        let stash_file_repo = repo.clone();
+        self._show_stash_file_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            move |root, _panel, ev: &ShowStashFileRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                // The revision pair is decided here, from `origin`, and
+                // nowhere else. A tracked file is the stash commit's own
+                // range; an untracked one is absent from that commit's tree
+                // (so the range is empty and the tab would render blank) and
+                // has to be read from the parentless `^3` with NO base —
+                // never against a hard-coded empty-tree sha, which is
+                // hash-function-specific and simply fails in a SHA-256 repo.
+                let (base, head) = match ev.origin {
+                    oximux_core::StashFileOrigin::Tracked => {
+                        (format!("{}^", ev.sha), ev.sha.clone())
+                    }
+                    oximux_core::StashFileOrigin::Untracked => {
+                        (String::new(), format!("{}^3", ev.sha))
+                    }
+                };
+                let (sha, path, label) = (ev.sha.clone(), ev.path.clone(), ev.label.clone());
+                let repo = stash_file_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_stash_file_tab(
+                        repo, sha, base, head, path, label, window, cx,
+                    );
+                });
             },
         ));
 

@@ -46,6 +46,15 @@ const FULL_FILE_CONTEXT: &str = "--unified=1000000";
 /// a no-op, so we drop the noise.
 const DIFF_BASE_ARGS: &[&str] = &["diff", "-p", "--no-color", "--no-ext-diff"];
 
+/// The single-revision counterpart to [`DIFF_BASE_ARGS`]: what one commit
+/// changed against its first parent, or — for a parentless commit — its whole
+/// tree as additions. Used by [`Repository::diff_in_rev`].
+///
+/// `--format=` drops the commit header. Verified that it leaves no blank line
+/// behind either, so the output starts at `diff --git` and feeds the same
+/// parser `git diff` does.
+const SHOW_BASE_ARGS: &[&str] = &["show", "--format=", "-p", "--no-color", "--no-ext-diff"];
+
 /// Only the first N untracked rows (status order = render order) get line
 /// counts — the panel caps collapsed sections well below this anyway.
 const UNTRACKED_COUNT_CAP: usize = 20;
@@ -432,6 +441,28 @@ impl Repository {
             .await
     }
 
+    /// Full-context diff of one path inside a **single** revision, shown
+    /// against no base at all.
+    ///
+    /// This exists for the untracked half of a stash. `git stash push -u`
+    /// parks untracked files in a third parent, `<sha>^3`, and leaves them out
+    /// of the stash commit's own tree — so the range `<sha>^..<sha>` for such
+    /// a path is **empty** (verified) and routing it like a tracked file opens
+    /// a blank tab. `^3` is parentless, so showing it alone renders exactly
+    /// the whole-file addition the user expects.
+    ///
+    /// **Not implemented as a diff against the empty tree.** The empty tree's
+    /// hash is hash-function-dependent: `4b825dc…4904` is the SHA-1 one, and
+    /// in a repo created with `--object-format=sha256` git rejects it as an
+    /// unknown revision and the command aborts (verified). Nothing in this
+    /// crate tracks a repo's object format, so a hard-coded constant would be
+    /// a hard error rather than a graceful degradation. Naming no base at all
+    /// sidesteps the question.
+    pub async fn diff_in_rev(&self, rev: &str, path: &Path) -> Result<Vec<FileDiff>> {
+        self.patch_with_args(SHOW_BASE_ARGS, &[FULL_FILE_CONTEXT, rev], Some(path))
+            .await
+    }
+
     /// Synthesize an "all-additions" diff for an untracked file by reading
     /// its content directly off disk. Git's normal `diff` ignores untracked
     /// files (they're not in the index), so a vanilla `diff_for_path` on a
@@ -699,9 +730,25 @@ impl Repository {
     }
 
     async fn diff_with_args(&self, extra: &[&str], path: Option<&Path>) -> Result<Vec<FileDiff>> {
+        self.patch_with_args(DIFF_BASE_ARGS, extra, path).await
+    }
+
+    /// Run a patch-producing git command and parse its unified diff.
+    ///
+    /// `base` selects the subcommand and its format flags — [`DIFF_BASE_ARGS`]
+    /// for the two-revision `git diff` form, [`SHOW_BASE_ARGS`] for the
+    /// single-revision `git show` form. Everything downstream of the command
+    /// is identical, which is the point: both shapes have to land in the same
+    /// `FileDiff` the diff view already knows how to paint.
+    async fn patch_with_args(
+        &self,
+        base: &[&str],
+        extra: &[&str],
+        path: Option<&Path>,
+    ) -> Result<Vec<FileDiff>> {
         let mut cmd = GitCmd::new(&self.workdir)
             .timeout(DIFF_TIMEOUT)
-            .args(DIFF_BASE_ARGS.iter().copied())
+            .args(base.iter().copied())
             .args(extra.iter().copied());
         if let Some(p) = path {
             cmd = cmd.arg("--").arg(p.as_os_str());

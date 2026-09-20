@@ -24,6 +24,9 @@ pub const KEY_SCM_PANEL_WIDTH: &str = "scm_panel_width";
 /// Settings key holding the commit-graph section height in pixels.
 pub const KEY_SCM_GRAPH_HEIGHT: &str = "scm_graph_height";
 
+/// Settings key holding the stash section's body height in pixels.
+pub const KEY_SCM_STASH_HEIGHT: &str = "scm_stash_height";
+
 // ---------------------------------------------------------------------------
 // Panel-width bounds
 // ---------------------------------------------------------------------------
@@ -59,6 +62,83 @@ pub const MIN_GRAPH_HEIGHT: f32 = 96.0;
 pub const MAX_GRAPH_HEIGHT_VH_RATIO: f32 = 0.7;
 
 // ---------------------------------------------------------------------------
+// Stash-height bounds
+// ---------------------------------------------------------------------------
+
+/// Default stash-section body height when no persisted value exists.
+///
+/// Roughly what the Phase 1 eight-row cap worked out to at cockpit density,
+/// so the section keeps the size users already know when the cap is replaced
+/// by a real drag handle.
+pub const DEFAULT_STASH_HEIGHT: f32 = 240.0;
+
+/// Minimum stash-section height — about two rows plus a scroll hint. Lower
+/// than [`MIN_GRAPH_HEIGHT`] because a stash row carries no timeline gutter
+/// to keep legible; the list still reads as a list at this size.
+pub const MIN_STASH_HEIGHT: f32 = 68.0;
+
+// ---------------------------------------------------------------------------
+// The two sections share one budget
+// ---------------------------------------------------------------------------
+
+/// Combined ceiling for the stash section and the graph, as a ratio of the
+/// window height.
+///
+/// The same 70vh the graph alone used to get, now shared: the SCM column's
+/// only flexible child is the changed-files block, so every pixel the two
+/// `flex_shrink_0` sections take comes out of it. It stops giving at
+/// [`files_floor`], after which the sections themselves are pushed past the
+/// column's `overflow_hidden` and clipped — taking the lower section's drag
+/// handle, the escape valve a cramped panel depends on, off-screen with it.
+///
+/// Deliberately not raised now that there are two sections. Two tall sections
+/// squeeze the file list exactly as hard as one did; splitting a bigger
+/// allowance between them would only move the clip further out, not remove it.
+pub const MAX_SECTIONS_VH_RATIO: f32 = MAX_GRAPH_HEIGHT_VH_RATIO;
+
+/// Divide the shared budget between the two sections, returning
+/// `(stash_ceiling, graph_ceiling)`.
+///
+/// Each argument is that section's **chosen** height — what the user dragged
+/// to — or `None` when it is showing no body at all (collapsed, or hidden by
+/// the current scope), in which case it costs its sibling nothing.
+///
+/// # Why both at once, and why from the chosen heights
+///
+/// The obvious shape — "this section's ceiling is the budget minus whatever
+/// the other one is currently painting" — **oscillates**. Each section's
+/// painted height is `min(chosen, ceiling)`, so deriving one ceiling from the
+/// other's painted height closes a loop: with two sections chosen at 500 in a
+/// 630 budget it alternates 500/500 → 130/130 → 500/500 on consecutive
+/// frames, forever, and the panel visibly flickers. (Simulated before this
+/// function was written, and pinned by `the_fit_does_not_oscillate` below.)
+///
+/// Taking the *chosen* heights breaks the loop: they are inputs the render
+/// pass never writes, so the result is the same on every frame.
+///
+/// # How the deficit is split
+///
+/// In proportion to what each section asked for, rather than by draining one
+/// first. Neither is the junior section: a user who dragged the stash list
+/// tall did so on purpose, and so did one who dragged the graph tall. Both
+/// floors are then honoured, and the pair still sums to exactly the budget.
+pub fn fit_sections(stash: Option<f32>, graph: Option<f32>, window_height: f32) -> (f32, f32) {
+    let budget = window_height * MAX_SECTIONS_VH_RATIO;
+    let (s, g) = (stash.unwrap_or(0.0), graph.unwrap_or(0.0));
+    if s + g <= budget {
+        // They fit. Each section's ceiling is the slack its sibling is not
+        // using, so either can still be dragged into the free space.
+        return ((budget - g).max(MIN_STASH_HEIGHT), (budget - s).max(MIN_GRAPH_HEIGHT));
+    }
+    // Over budget — which a window resize or a pair of heights restored from
+    // a taller monitor can do without anyone dragging anything.
+    let budget = budget.max(MIN_STASH_HEIGHT + MIN_GRAPH_HEIGHT);
+    let fitted_stash =
+        (s * budget / (s + g)).clamp(MIN_STASH_HEIGHT, budget - MIN_GRAPH_HEIGHT);
+    (fitted_stash, budget - fitted_stash)
+}
+
+// ---------------------------------------------------------------------------
 // Clamps
 // ---------------------------------------------------------------------------
 
@@ -77,6 +157,12 @@ pub fn clamp_panel_width(value: f32, window_width: f32) -> f32 {
 pub fn clamp_graph_height(value: f32, window_height: f32) -> f32 {
     let ceiling = (window_height * MAX_GRAPH_HEIGHT_VH_RATIO).max(MIN_GRAPH_HEIGHT);
     value.clamp(MIN_GRAPH_HEIGHT, ceiling)
+}
+
+/// [`clamp_graph_height`]'s counterpart for the stash section.
+pub fn clamp_stash_height(value: f32, window_height: f32) -> f32 {
+    let ceiling = (window_height * MAX_SECTIONS_VH_RATIO).max(MIN_STASH_HEIGHT);
+    value.clamp(MIN_STASH_HEIGHT, ceiling)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +267,32 @@ pub fn save_graph_height(repo: &SettingsRepo, value: f32) {
     }
 }
 
+/// [`load_graph_height`]'s counterpart for the stash section.
+pub fn load_stash_height(repo: &SettingsRepo, window_height: f32) -> f32 {
+    let raw = match repo.get(KEY_SCM_STASH_HEIGHT) {
+        Ok(Some(s)) => s,
+        _ => return clamp_stash_height(DEFAULT_STASH_HEIGHT, window_height),
+    };
+    let parsed = raw.trim().parse::<f32>().unwrap_or(DEFAULT_STASH_HEIGHT);
+    let sane = if parsed.is_finite() {
+        parsed
+    } else {
+        DEFAULT_STASH_HEIGHT
+    };
+    clamp_stash_height(sane, window_height)
+}
+
+/// Persist a stash-section height. See [`save_panel_width`] for error policy.
+pub fn save_stash_height(repo: &SettingsRepo, value: f32) {
+    let encoded = format!("{value}");
+    if let Err(err) = repo.set(KEY_SCM_STASH_HEIGHT, &encoded) {
+        tracing::warn!(
+            target: "oximux_app::scm_layout_settings",
+            "failed to persist scm_stash_height: {err}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Keyboard-resize step calculator (Phase 13)
 // ---------------------------------------------------------------------------
@@ -205,12 +317,25 @@ pub fn next_graph_height(
     shift: bool,
     window_height: f32,
 ) -> Option<f32> {
+    next_section_height(current, key, shift, MIN_GRAPH_HEIGHT, window_height)
+}
+
+/// The section-agnostic form. `min` is the section's own floor, which is what
+/// Home means; End means "as tall as the shared budget allows", left to the
+/// caller's ceiling to trim against the sibling.
+pub fn next_section_height(
+    current: f32,
+    key: &str,
+    shift: bool,
+    min: f32,
+    window_height: f32,
+) -> Option<f32> {
     let step = if shift { KEY_STEP_SHIFT_PX } else { KEY_STEP_PX };
     match key {
         "up" => Some(current + step),
         "down" => Some(current - step),
-        "home" => Some(MIN_GRAPH_HEIGHT),
-        "end" => Some(window_height * MAX_GRAPH_HEIGHT_VH_RATIO),
+        "home" => Some(min),
+        "end" => Some(window_height * MAX_SECTIONS_VH_RATIO),
         _ => None,
     }
 }
@@ -458,5 +583,155 @@ mod tests {
         .unwrap();
         let ceiling = 900.0 * MAX_GRAPH_HEIGHT_VH_RATIO;
         assert!((clamp_graph_height(too_big, 900.0) - ceiling).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------
+    // Two sections, one budget (Phase 5)
+    // -----------------------------------------------------------------
+
+    /// Painting rule the sections actually use, mirrored here so the tests
+    /// below reason about what lands on screen.
+    fn painted(chosen: Option<f32>, ceiling: f32, min: f32) -> f32 {
+        chosen.map_or(0.0, |c| c.min(ceiling).max(min))
+    }
+
+    #[test]
+    fn a_lone_section_still_gets_the_whole_budget() {
+        // The graph was the only resizable section before Phase 5, and the
+        // 70vh gesture must not silently shrink for users who never open the
+        // stash list.
+        let (_, graph) = fit_sections(None, Some(200.0), 900.0);
+        assert!((graph - 900.0 * MAX_SECTIONS_VH_RATIO).abs() < 0.001);
+        assert!((graph - 900.0 * MAX_GRAPH_HEIGHT_VH_RATIO).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_sibling_that_fits_leaves_the_rest_as_headroom() {
+        let budget = 900.0 * MAX_SECTIONS_VH_RATIO;
+        let (stash, graph) = fit_sections(Some(150.0), Some(200.0), 900.0);
+        assert!((stash - (budget - 200.0)).abs() < 0.001);
+        assert!((graph - (budget - 150.0)).abs() < 0.001);
+    }
+
+    // The failure this whole seam exists to prevent: two sections tall enough
+    // that together they push the lower one's drag handle out of the panel.
+    #[test]
+    fn two_oversized_sections_are_fitted_back_into_the_budget() {
+        let window = 900.0;
+        let budget = window * MAX_SECTIONS_VH_RATIO;
+        let (cs, cg) = fit_sections(Some(500.0), Some(500.0), window);
+        let (s, g) = (
+            painted(Some(500.0), cs, MIN_STASH_HEIGHT),
+            painted(Some(500.0), cg, MIN_GRAPH_HEIGHT),
+        );
+        assert!((s + g - budget).abs() < 0.001, "{s} + {g} != {budget}");
+        assert!(s >= MIN_STASH_HEIGHT && g >= MIN_GRAPH_HEIGHT);
+        // Equal requests, equal treatment — neither section is the junior one.
+        assert!((s - g).abs() < 0.001, "{s} vs {g}");
+    }
+
+    #[test]
+    fn the_deficit_is_split_in_proportion_to_what_each_asked_for() {
+        let window = 900.0;
+        let (cs, cg) = fit_sections(Some(600.0), Some(200.0), window);
+        let s = painted(Some(600.0), cs, MIN_STASH_HEIGHT);
+        let g = painted(Some(200.0), cg, MIN_GRAPH_HEIGHT);
+        assert!(s > g, "the section that asked for more should keep more: {s} vs {g}");
+        assert!((s + g - window * MAX_SECTIONS_VH_RATIO).abs() < 0.001);
+    }
+
+    /// The bug this function was rewritten for. Deriving each ceiling from
+    /// the sibling's *painted* height closes a feedback loop through the
+    /// render pass: 500/500 in a 630 budget alternated 500/500 → 130/130
+    /// every frame. Taking the chosen heights makes the fit a pure function
+    /// of values the render never writes, so it has to be a fixpoint.
+    #[test]
+    fn the_fit_does_not_oscillate() {
+        let window = 900.0;
+        let (chosen_s, chosen_g) = (Some(500.0), Some(500.0));
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let (cs, cg) = fit_sections(chosen_s, chosen_g, window);
+            seen.push((
+                painted(chosen_s, cs, MIN_STASH_HEIGHT),
+                painted(chosen_g, cg, MIN_GRAPH_HEIGHT),
+            ));
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "painted heights moved between frames: {seen:?}"
+        );
+    }
+
+    // On a window too short for both floors, each section keeps its minimum
+    // rather than being clamped to nothing — a section with no height has no
+    // drag handle, and no way back.
+    #[test]
+    fn a_short_window_still_leaves_both_floors() {
+        let (stash, graph) = fit_sections(Some(400.0), Some(400.0), 120.0);
+        assert!(stash >= MIN_STASH_HEIGHT, "{stash}");
+        assert!(graph >= MIN_GRAPH_HEIGHT, "{graph}");
+    }
+
+    #[test]
+    fn a_collapsed_section_costs_its_sibling_nothing() {
+        let budget = 900.0 * MAX_SECTIONS_VH_RATIO;
+        let (stash, graph) = fit_sections(None, None, 900.0);
+        assert!((stash - budget).abs() < 0.001);
+        assert!((graph - budget).abs() < 0.001);
+    }
+
+    #[test]
+    fn stash_height_round_trips_through_settings() {
+        let repo = repo();
+        save_stash_height(&repo, 184.0);
+        assert_eq!(load_stash_height(&repo, 900.0), 184.0);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_stash_height_falls_back_to_the_default() {
+        let repo = repo();
+        assert_eq!(
+            load_stash_height(&repo, 900.0),
+            clamp_stash_height(DEFAULT_STASH_HEIGHT, 900.0)
+        );
+        repo.set(KEY_SCM_STASH_HEIGHT, "not a number").unwrap();
+        assert_eq!(
+            load_stash_height(&repo, 900.0),
+            clamp_stash_height(DEFAULT_STASH_HEIGHT, 900.0)
+        );
+        // NaN parses fine as an f32 and would otherwise sail through every
+        // comparison in `clamp`, landing an un-renderable height in state.
+        repo.set(KEY_SCM_STASH_HEIGHT, "NaN").unwrap();
+        assert_eq!(
+            load_stash_height(&repo, 900.0),
+            clamp_stash_height(DEFAULT_STASH_HEIGHT, 900.0)
+        );
+    }
+
+    #[test]
+    fn a_stash_height_persisted_on_a_taller_monitor_is_clamped_on_load() {
+        let repo = repo();
+        save_stash_height(&repo, 2000.0);
+        let loaded = load_stash_height(&repo, 600.0);
+        assert!(loaded <= 600.0 * MAX_SECTIONS_VH_RATIO + 0.001, "{loaded}");
+    }
+
+    #[test]
+    fn the_section_keyboard_step_honours_each_sections_own_floor() {
+        assert_eq!(
+            next_section_height(200.0, "home", false, MIN_STASH_HEIGHT, 900.0),
+            Some(MIN_STASH_HEIGHT)
+        );
+        assert_eq!(
+            next_section_height(200.0, "home", false, MIN_GRAPH_HEIGHT, 900.0),
+            Some(MIN_GRAPH_HEIGHT)
+        );
+        // Unchanged for the graph, which now routes through the shared form.
+        assert_eq!(
+            next_graph_height(200.0, "home", false, 900.0),
+            Some(MIN_GRAPH_HEIGHT)
+        );
+        assert_eq!(next_section_height(200.0, "escape", false, 1.0, 900.0), None);
     }
 }

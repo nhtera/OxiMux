@@ -21,15 +21,20 @@
 //! cluster: flexbox splits free space EQUALLY between auto margins, so two of
 //! them would park the count halfway across the row.
 //!
+//! # The chevron and the count
+//!
+//! The chevron toggles the file list; `file_row.rs` paints what it reveals.
+//! It is the ONLY thing in the row that expands — the row body does not,
+//! because the trailing cluster is three live verbs and a mis-aimed click
+//! that silently changes the layout under the cursor is worse than a click
+//! that does nothing.
+//!
+//! The count is `Option`, rendered only when `Some`. The file list is fetched
+//! lazily on expand, so a row nobody has expanded knows nothing about its
+//! files, and a confident `0` would be a claim we have not earned.
+//!
 //! # What this row deliberately does not paint yet
 //!
-//! * **The expand chevron.** Phase 5 wires expansion; painting the affordance
-//!   a phase early would ship a control that looks live and does nothing —
-//!   the exact defect (`Drop`) this plan exists to fix.
-//! * **The file count**, until something populates it. `Option<usize>`,
-//!   rendered only when `Some`: the list is fetched lazily on expand, so a
-//!   row that has never been expanded would otherwise read a confident,
-//!   wrong `0`.
 //! * **The tighter `h_row` height.** The row still carries three text buttons
 //!   — 20px for the two xsmall `Button`s, 22px for `danger_ghost`, whose
 //!   height is a literal that does not scale. `h_row` is 24px at cockpit
@@ -46,7 +51,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Sizable as _,
+    Icon, Sizable as _,
     button::{Button, ButtonVariants},
     tooltip::Tooltip,
 };
@@ -83,9 +88,8 @@ impl StashPanel {
         let typography = &self.typography;
         let style = ScmStyle::new(density, typography);
         let index = entry.stash_ref.index;
-        // Phase 5 fills this from the lazily-fetched file list. Until then no
-        // row has a count and the slot renders nothing.
-        let file_count: Option<usize> = None;
+        let expanded = self.is_expanded(&entry.sha);
+        let file_count = self.file_count(&entry.sha);
 
         let message = row_message(&entry);
         let meta = row_meta(&entry);
@@ -97,13 +101,19 @@ impl StashPanel {
         // click lands. See `ops.rs`.
         let apply_sha = entry.sha.clone();
         let pop_sha = entry.sha.clone();
+        let toggle_sha = entry.sha.clone();
         let drop_entry = entry.clone();
         // Hover scope for the progressive-disclosure cluster below, and the
-        // row's own stateful id (which `.tooltip` needs). Keyed by sha rather
-        // than index so neither is reattached to a different stash when the
-        // stack shifts.
-        let group_name = format!("stash-row-{}", entry.sha);
-        let row_id = ElementId::Name(format!("stash-row-{}", entry.sha).into());
+        // row's own stateful id (which `.tooltip` needs).
+        //
+        // Sha FIRST so neither is reattached to a different stash when the
+        // stack shifts; index appended because a sha is not unique on the
+        // stack — `git stash store` can park one commit at two addresses, and
+        // two rows sharing an id share element state and hover as one. See
+        // `resolve_stash_index`.
+        let key = format!("{}-{index}", entry.sha);
+        let group_name = format!("stash-row-{key}");
+        let row_id = ElementId::Name(format!("stash-row-{key}").into());
 
         // Apply / Pop / Drop all sit at xsmall height (20px for the two
         // Buttons, 22px for `danger_ghost`) so the row reads as one action
@@ -136,7 +146,7 @@ impl StashPanel {
                     .label("Apply")
                     .tooltip("Apply stash (keep it in the list)")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.apply(apply_sha.clone(), cx);
+                        panel.apply(apply_sha.clone(), index, cx);
                         cx.notify();
                     })),
             )
@@ -149,7 +159,7 @@ impl StashPanel {
                     // reflog entry, leaving the commit sha as the only way back.
                     .tooltip("Apply stash and remove it from the list")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.pop(pop_sha.clone(), cx);
+                        panel.pop(pop_sha.clone(), index, cx);
                         cx.notify();
                     })),
             )
@@ -172,7 +182,32 @@ impl StashPanel {
                 }),
             ));
 
-        div()
+        // Points right when closed, down when open — the same convention the
+        // section header above and every other collapsible in the panel use.
+        let chevron = div()
+            .id(ElementId::Name(format!("stash-expand-{key}").into()))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .size(px(style.icon))
+            .cursor_pointer()
+            .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                panel.toggle_expanded(toggle_sha.clone(), cx);
+                cx.stop_propagation();
+            }))
+            .child(
+                Icon::default()
+                    .path(if expanded {
+                        "icons/chevron-down.svg"
+                    } else {
+                        "icons/chevron-right.svg"
+                    })
+                    .size(px(style.icon))
+                    .text_color(theme.fg_muted),
+            );
+
+        let row = div()
             .id(row_id)
             .group(group_name)
             .flex()
@@ -200,6 +235,7 @@ impl StashPanel {
             .overflow_hidden()
             .border_b_1()
             .border_color(theme.border_inactive)
+            .child(chevron)
             .child(
                 div()
                     .flex_shrink(MESSAGE_SHRINK)
@@ -237,6 +273,16 @@ impl StashPanel {
                 )
             })
             .child(actions)
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+
+        // The row and its expansion are one column so the caller's list loop
+        // stays a loop over stashes rather than a loop that has to know
+        // whether each one is open.
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .child(row)
+            .when(expanded, |col| col.child(self.render_files(&entry, cx)))
     }
 }

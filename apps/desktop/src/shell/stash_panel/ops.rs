@@ -14,6 +14,13 @@
 //! verify-then-abort guard would toast an error at the user every time one
 //! happened. `None` — the stash is genuinely gone — is the only abort.
 //!
+//! The rendered address is still passed along as a **hint**, because a sha is
+//! not guaranteed unique on the stack: `git stash store` will happily park one
+//! commit at two addresses, and "first match" then makes every op fired from
+//! the lower row act on the upper one. The hint is used only when it still
+//! names the same sha, so it disambiguates a duplicate without weakening the
+//! drift-healing above. See `resolve_stash_index`.
+//!
 //! # Drop closes the gap resolve-then-fire leaves open
 //!
 //! Resolving a sha and then handing git an *index* still races: something can
@@ -69,19 +76,24 @@ fn label_of(message: &str) -> &str {
     }
 }
 
-/// Current address of `sha`, or `None` when the stash is gone.
-async fn resolve(repo: &Repository, sha: &str) -> Result<Option<StashRef>, String> {
-    repo.resolve_stash_index(sha)
+/// Current address of `sha`, or `None` when the stash is gone. `painted` is
+/// the address the row was drawn with — a tiebreaker, never a target.
+async fn resolve(
+    repo: &Repository,
+    sha: &str,
+    painted: Option<usize>,
+) -> Result<Option<StashRef>, String> {
+    repo.resolve_stash_index(sha, painted)
         .await
         .map_err(|e| e.to_string())
 }
 
 impl StashPanel {
     /// Apply a stash without removing it from the stack.
-    pub fn apply(&mut self, sha: String, cx: &mut Context<Self>) {
+    pub fn apply(&mut self, sha: String, painted: usize, cx: &mut Context<Self>) {
         self.spawn_op(
             move |repo| async move {
-                let Some(stash_ref) = resolve(&repo, &sha).await? else {
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
                     return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
                 };
                 repo.stash_apply(&stash_ref)
@@ -95,10 +107,10 @@ impl StashPanel {
     }
 
     /// Apply a stash and remove it from the stack.
-    pub fn pop(&mut self, sha: String, cx: &mut Context<Self>) {
+    pub fn pop(&mut self, sha: String, painted: usize, cx: &mut Context<Self>) {
         self.spawn_op(
             move |repo| async move {
-                let Some(stash_ref) = resolve(&repo, &sha).await? else {
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
                     return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
                 };
                 repo.stash_pop(&stash_ref).await.map_err(|e| e.to_string())?;
@@ -117,7 +129,13 @@ impl StashPanel {
     /// to `None` and degrades to a toast rather than dropping whatever has
     /// since moved into that address. (`ConfirmDialog` itself `take`s its
     /// callback, so one mounted dialog fires at most once.)
-    pub fn drop_confirmed(&mut self, sha: String, message: String, cx: &mut Context<Self>) {
+    pub fn drop_confirmed(
+        &mut self,
+        sha: String,
+        painted: usize,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
         // Snapshot what the panel currently believes is on the stack. If git
         // drops a sha other than the intended one, this is what lets the
         // rollback restore it under its OWN message instead of a synthesized
@@ -133,7 +151,7 @@ impl StashPanel {
         let toast_label = label_of(&message).to_string();
         self.spawn_op(
             move |repo| async move {
-                let Some(stash_ref) = resolve(&repo, &sha).await? else {
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
                     return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
                 };
                 // Before anything destructive happens, put the recovery

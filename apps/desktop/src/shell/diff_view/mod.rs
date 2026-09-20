@@ -1262,6 +1262,15 @@ impl DiffView {
     /// section. Mirrors `load_commit`'s async machinery but fetches
     /// `diff_for_range(base, head, path)` and lands in the `Range*`
     /// states (no staging chips, since the change is already committed).
+    ///
+    /// **An empty `base` means "no base"**, not "an empty tree": the file is
+    /// read out of `head` alone via `diff_in_rev`. That is what a stash's
+    /// untracked files need — they live in the parentless `<sha>^3` and the
+    /// stash commit's own range says nothing about them. Carried as a
+    /// sentinel rather than a second state because everything downstream of
+    /// the fetch is identical, including the retry path (which re-enters here
+    /// with the same empty base) and the review-note key
+    /// (`range:..<sha>^3`, distinct and stable).
     pub fn load_range(
         &mut self,
         base: String,
@@ -1291,11 +1300,12 @@ impl DiffView {
             Ok(handle) => {
                 let (base_f, head_f, path_f) = (base.clone(), head.clone(), path.clone());
                 handle.spawn(async move {
-                    let r = repo
-                        .diff_for_range(&base_f, &head_f, &path_f)
-                        .await
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(r);
+                    let r = if base_f.is_empty() {
+                        repo.diff_in_rev(&head_f, &path_f).await
+                    } else {
+                        repo.diff_for_range(&base_f, &head_f, &path_f).await
+                    };
+                    let _ = tx.send(r.map_err(|e| e.to_string()));
                 });
             }
             Err(_) => {

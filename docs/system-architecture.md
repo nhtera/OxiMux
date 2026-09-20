@@ -260,7 +260,19 @@ ConfirmDialog (GPUI entity)
 StashPanel (GPUI entity)
   ← refresh() / force_refresh() → git stash list (15 s read-TTL)
   ← apply/pop → git stash ops, each resolving its target by sha
+                (painted stash@{N} passed as a tiebreaker: a sha is not
+                 unique on the stack)
+  ← toggle_expanded(sha) → git stash files, cached per sha until refresh
   → DropStashRequested → host confirm dialog → drop_confirmed()
+  → ShowStashFileRequested → PaneGroupTabKind::StashFile { sha, path }
+                             Tracked   → range <sha>^..<sha>
+                             Untracked → <sha>^3 with NO base (diff_in_rev)
+
+SourceControlPanel::sections (the stash section + the graph)
+  ← both heights persisted separately; fit_sections() splits one budget
+  ← sync_section_budget() on every render — the only place that sees both
+  ← each section frame is flex_shrink + min_h, so neither can be pushed
+    out of the column whatever the chrome above costs
 
 WorktreePanel (GPUI entity)
   ← refresh() → git worktree list

@@ -94,6 +94,10 @@ async fn push_shells_out_to_git_stash_push(cx: &mut TestAppContext) {
         let panel = cx.new(|cx2| {
             StashPanel::new(
                 repo.clone(),
+                // No settings repo in test wiring, so the height is the
+                // default and nothing is persisted.
+                gpui::px(oximux_app::scm_layout_settings::DEFAULT_STASH_HEIGHT),
+                None,
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -200,6 +204,10 @@ async fn drop_resolves_by_sha_after_the_stack_shifts(cx: &mut TestAppContext) {
         let panel = cx.new(|cx2| {
             StashPanel::new(
                 repo.clone(),
+                // No settings repo in test wiring, so the height is the
+                // default and nothing is persisted.
+                gpui::px(oximux_app::scm_layout_settings::DEFAULT_STASH_HEIGHT),
+                None,
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -213,7 +221,12 @@ async fn drop_resolves_by_sha_after_the_stack_shifts(cx: &mut TestAppContext) {
     window
         .update(cx, |harness, _win, cx| {
             harness.inner.update(cx, |panel, cx| {
-                panel.drop_confirmed(target.sha.clone(), target.message.clone(), cx);
+                panel.drop_confirmed(
+                    target.sha.clone(),
+                    target.stash_ref.index,
+                    target.message.clone(),
+                    cx,
+                );
             });
         })
         .expect("dispatch drop");
@@ -242,7 +255,12 @@ async fn drop_resolves_by_sha_after_the_stack_shifts(cx: &mut TestAppContext) {
     window
         .update(cx, |harness, _win, cx| {
             harness.inner.update(cx, |panel, cx| {
-                panel.drop_confirmed(target.sha.clone(), target.message.clone(), cx);
+                panel.drop_confirmed(
+                    target.sha.clone(),
+                    target.stash_ref.index,
+                    target.message.clone(),
+                    cx,
+                );
             });
         })
         .expect("dispatch repeat drop");

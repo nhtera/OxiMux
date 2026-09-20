@@ -56,6 +56,10 @@ impl WorkspaceRoot {
         // not trusted from mount time — see the module doc's guard 2.
         let project_id = self.active_project.as_ref().map(|p| p.id.clone());
         let sha = ev.sha.clone();
+        // The address the row was painted with, forwarded as a tiebreaker
+        // only — `drop_confirmed` still resolves by sha and uses this solely
+        // to tell two entries that share one commit apart. See `ops.rs`.
+        let painted = ev.stash_ref.index;
         let message = ev.message.clone();
         // Cloned per call because `ConfirmCallback` is an `Rc<dyn Fn>`. The
         // dialog itself `take`s the callback so it fires at most once, but
@@ -82,7 +86,7 @@ impl WorkspaceRoot {
                 return;
             }
             let (sha, message) = (sha.clone(), message.clone());
-            panel.update(cx, |p, cx| p.drop_confirmed(sha, message, cx));
+            panel.update(cx, |p, cx| p.drop_confirmed(sha, painted, message, cx));
         });
 
         let prompt = ConfirmPrompt {

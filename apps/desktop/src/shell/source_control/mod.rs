@@ -38,6 +38,7 @@ pub mod pr_draft;
 pub mod pr_ops;
 pub mod primary_action;
 pub mod scope;
+pub mod sections;
 pub mod settings_persistence;
 pub mod style;
 pub mod toolbar;
@@ -351,21 +352,12 @@ impl SourceControlPanel {
             area.set_rebase_base(initial_rebase_base);
             area
         });
-        // Phase 13: load persisted graph height now so the section
-        // mounts at its previous size, no flash. Clamped against the
-        // live window height so a value persisted on a taller monitor
-        // can't overflow a shorter window. `settings_repo` is the
-        // global k/v store; `None` in test wiring → defaults apply.
-        let initial_graph_height = match settings_repo.as_ref() {
-            Some(repo) => {
-                let window_height = f32::from(window.bounds().size.height);
-                gpui::px(crate::scm_layout_settings::load_graph_height(
-                    repo,
-                    window_height,
-                ))
-            }
-            None => gpui::px(crate::scm_layout_settings::DEFAULT_GRAPH_HEIGHT),
-        };
+        // Both section heights, restored before either mounts so neither
+        // snaps to size after the first paint. See `sections.rs`.
+        let (initial_stash_height, initial_graph_height) = sections::initial_heights(
+            settings_repo.as_ref(),
+            f32::from(window.bounds().size.height),
+        );
         let commit_graph_settings_repo = settings_repo.clone();
         let commit_graph = cx.new(|cx| {
             CommitGraph::new(
@@ -378,8 +370,18 @@ impl SourceControlPanel {
                 cx,
             )
         });
-        let stash_panel =
-            cx.new(|cx| StashPanel::new(repo.clone(), theme, density, typography.clone(), cx));
+        let stash_settings_repo = settings_repo.clone();
+        let stash_panel = cx.new(|cx| {
+            StashPanel::new(
+                repo.clone(),
+                initial_stash_height,
+                stash_settings_repo,
+                theme,
+                density,
+                typography.clone(),
+                cx,
+            )
+        });
 
         // "Committed on Branch" section. Seed from the initial poll
         // snapshot (if any) so the section is correct on first paint
@@ -1205,8 +1207,14 @@ impl SourceControlPanel {
 }
 
 impl Render for SourceControlPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
+        // Re-arbitrate the vertical budget the stash section and the graph
+        // share, before either paints. On the render path because that is the
+        // only thing every way of changing the budget has in common — drag,
+        // keyboard rail, window resize, collapse, scope switch, and a pair of
+        // heights restored from a taller monitor. See `sections.rs`.
+        self.sync_section_budget(f32::from(window.bounds().size.height), cx);
         let theme = self.theme;
         let style = self.style();
         let action = self.resolve_primary(cx);
@@ -1415,32 +1423,19 @@ impl Render for SourceControlPanel {
             .children(commit_area_render)
             .children(checks_row)
             .child(files_block)
-            // Stash list docked above the graph (or at the very bottom
-            // when the scope hides the graph). Always-mounted entity;
-            // collapsed by default — see `StashPanel::is_collapsed`.
-            //
-            // Wrapped in the same `flex_shrink_0` + top hairline the graph
-            // gets below: without a rule between them, the file list and
-            // STASHES read as one colliding surface even once they no longer
-            // collide — which is how the clip got reported as an overlap.
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(theme.border_inactive)
-                    .child(self.stash_panel.clone()),
-            );
+            // Stash list docked above the graph, then the graph itself when
+            // the scope shows it. Both framed by `sections::frame`.
+            .child(sections::frame(
+                self.stash_panel.clone(),
+                theme,
+                crate::scm_layout_settings::MIN_STASH_HEIGHT,
+            ));
         if self.scope.shows_graph() {
-            // Graph sits at its natural height, pinned to the bottom of the
-            // panel by the `flex_1` files_block above. Top border separates
-            // the graph from the file list visually.
-            body = body.child(
-                div()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(theme.border_inactive)
-                    .child(self.commit_graph.clone()),
-            );
+            body = body.child(sections::frame(
+                self.commit_graph.clone(),
+                theme,
+                crate::scm_layout_settings::MIN_GRAPH_HEIGHT,
+            ));
         }
         // Create-PR dialog: a centered modal overlay over the panel, mounted
         // only while open. Mirrors the diff-view review-note overlay placement.

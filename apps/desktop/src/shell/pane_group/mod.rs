@@ -102,6 +102,22 @@ pub enum PaneGroupTabKind {
     BranchFile {
         path: PathBuf,
     },
+    /// Read-only diff of one file inside a stash, opened from an expanded
+    /// stash row.
+    ///
+    /// Dedup key is `(sha, path)`. A stash commit's sha is immutable, so the
+    /// same row always reactivates its own tab, and two stashes touching the
+    /// same path get two tabs — both of which the user asked for.
+    ///
+    /// Deliberately **not** a widening of [`Self::BranchFile`]'s key. That
+    /// variant dedups on path alone on purpose; its `head` is the live HEAD
+    /// OID, which moves on every commit, amend and rebase, so keying on it
+    /// would open a fresh tab for the same file after any commit. Not
+    /// persisted, on the same terms as every other diff tab.
+    StashFile {
+        sha: String,
+        path: PathBuf,
+    },
     /// Combined multi-file diff (all-changes / staged / untracked / branch),
     /// opened from a "View all" CTA in the SCM panel. Dedup key is the
     /// scope's title so re-clicking the same CTA reactivates the tab. Not
