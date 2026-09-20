@@ -229,10 +229,12 @@ pub struct DiffView {
     /// In-flight load task. Dropping aborts; we replace on every `load()`
     /// call so a fast-switching user only sees the latest selection.
     _load_task: Option<Task<()>>,
-    /// In-flight hunk op (stage / unstage / discard). Single shared slot
-    /// mirrors `StashPanel::_op_task` — rapid back-to-back ops cancel
-    /// the prior op's gpui-side refresh, but the tokio side-effect still
-    /// completes; the next op fires its own reload.
+    /// In-flight hunk op (stage / unstage / discard). Single shared slot:
+    /// rapid back-to-back ops cancel the prior op's gpui-side refresh, but
+    /// the tokio side-effect still completes; the next op fires its own
+    /// reload. `StashPanel` used to share this shape and no longer does — it
+    /// detaches, because for a destructive op losing the completion handler
+    /// means losing the only record of what happened.
     _op_task: Option<Task<()>>,
     /// The heartbeat that keeps a working-tree diff showing the working tree.
     /// Held for the view's lifetime; dropping it stops the loop.

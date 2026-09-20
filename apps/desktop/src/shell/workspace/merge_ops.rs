@@ -598,7 +598,8 @@ impl WorkspaceRoot {
             on_cancel: None,
             secondary: None,
         };
-        self.mount_confirm_dialog(prompt, window, cx);
+        // Refusal means a live prompt is already up; nothing here to undo.
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
     }
 
     /// Write down the pointer to a stash a merge left on the stack.
@@ -712,7 +713,8 @@ impl WorkspaceRoot {
                 on_click: on_dismiss,
             }),
         };
-        self.mount_confirm_dialog(prompt, window, cx);
+        // Refusal means a live prompt is already up; nothing here to undo.
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
     }
 
     /// Pop the stash a notice points at, re-resolving it by message first.

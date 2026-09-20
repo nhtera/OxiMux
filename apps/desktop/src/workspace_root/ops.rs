@@ -596,6 +596,7 @@ impl WorkspaceRoot {
             // over from a prior git project.
             self._discard_subscription = None;
             self._push_stash_subscription = None;
+            self._drop_stash_subscription = None;
             self._show_commit_subscription = None;
             self._show_branch_file_subscription = None;
             self._show_combined_diff_subscription = None;
@@ -628,6 +629,14 @@ impl WorkspaceRoot {
             window,
             |root, panel, _ev: &PushStashRequested, window, cx| {
                 root.mount_push_stash_dialog(panel.clone(), window, cx);
+            },
+        ));
+
+        self._drop_stash_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &DropStashRequested, window, cx| {
+                root.mount_drop_stash_dialog(panel, ev, window, cx);
             },
         ));
 
@@ -936,28 +945,8 @@ impl WorkspaceRoot {
             secondary: None,
         };
 
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
-        // Cancel any in-flight observer (e.g. an SCM discard dialog) before
-        // installing this one, matching the explicit-clear pattern used at the
-        // other `confirm_dialog` mount sites.
-        self._discard_dialog_observer = None;
-        self._discard_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.confirm_dialog = None;
-                    root._discard_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-        self.confirm_dialog = Some(dialog);
-        cx.notify();
+        // Refusal means a live prompt is already up; nothing here to undo.
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
     }
 
     /// Mount a `ConfirmDialog` for the SCM panel's pending discard
@@ -1020,94 +1009,14 @@ impl WorkspaceRoot {
             secondary: None,
         };
 
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
-
-        // Drop the dialog the moment the user resolves it. Replacing
-        // `_discard_dialog_observer` cancels any previous observer
-        // that's tied to a stale dialog.
-        self._discard_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.confirm_dialog = None;
-                    root._discard_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-
-        self.confirm_dialog = Some(dialog);
-        cx.notify();
-    }
-
-    /// Mount a `PushStashDialog` for the SCM panel's stash-push
-    /// request. Wires `on_confirm` to call `StashPanel::push` with
-    /// the user-supplied message + include-untracked toggle. Installs
-    /// an observer that drops the dialog from the slot once the user
-    /// confirms or cancels.
-    ///
-    /// First-open-wins: a double-click on the header `+` button (or
-    /// any sequence that re-fires `PushStashRequested` while the
-    /// dialog is already mounted) is ignored. Replacing the slot
-    /// would silently drop a half-typed form, which is the bug Phase
-    /// 01's discard-dialog reviewer caught for the destructive flow;
-    /// applying the same guard here so the user's in-progress
-    /// message survives a stray re-click.
-    fn mount_push_stash_dialog(
-        &mut self,
-        panel: Entity<StashPanel>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.push_stash_dialog.is_some() {
-            return;
+        // First-open-wins lives in `mount_confirm_dialog`: a re-fired
+        // `DiscardRequested` must not replace a destructive confirm the user
+        // is already reading.
+        if !self.mount_confirm_dialog(prompt, window, cx) {
+            // The request was refused, so nothing will ever resolve this
+            // pending flag — clear it or the button goes dead.
+            panel.update(cx, |p, cx| p.clear_pending_discard(cx));
         }
-        let on_confirm: PushCallback = {
-            let panel = panel.clone();
-            Rc::new(move |msg, include_untracked, _window, cx| {
-                panel.update(cx, |p, cx| p.push(msg, include_untracked, cx));
-            })
-        };
-        // Cancel path is a no-op on the panel side — the dialog flips
-        // `cancelled`, the observer below drops the slot. Wired anyway
-        // so future telemetry (e.g. counting abandoned pushes) has a
-        // hook point.
-        let on_cancel: CancelCallback = Rc::new(|_window, _cx| {});
-
-        let prompt = PushStashPrompt {
-            on_confirm,
-            on_cancel: Some(on_cancel),
-        };
-
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog =
-            cx.new(|cx| PushStashDialog::new(prompt, theme, density, typography, window, cx));
-
-        // Drop the dialog the moment the user resolves it. Replacing
-        // `_push_stash_dialog_observer` cancels any previous observer
-        // tied to a stale dialog.
-        self._push_stash_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.push_stash_dialog = None;
-                    root._push_stash_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-
-        self.push_stash_dialog = Some(dialog);
-        cx.notify();
     }
 
     /// Build the on-click callback handed to the SCM panel for diff

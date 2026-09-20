@@ -131,7 +131,7 @@ confining it to its own conversation instead of the operator's full scope.
 
 | File / folder | Holds |
 |---|---|
-| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`) |
+| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`, plus `stash_dialogs` for the stash section's modals) |
 | `project_panes_factory.rs` | manifest save/load, pane-buffer load, attach-reconcile |
 | `actions.rs` / `state.rs` / `left_rail_layout.rs` | GPUI actions, app state, rail layout |
 | `agent_glue/` | app-side agent wiring (bridges `oximux-agents` ↔ views) |

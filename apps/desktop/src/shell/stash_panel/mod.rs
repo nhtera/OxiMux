@@ -1,12 +1,17 @@
 //! StashPanel — list git stash entries with per-row Apply / Pop / Drop.
 //!
-//! Drop is destructive, so the panel only sets a `pending_drop` flag; the
-//! shell host (step 14) observes the entity, opens a `ConfirmDialog`, and
-//! calls `drop_pending()` on confirm. Apply and Pop fire directly (Pop is
-//! reversible via reflog).
+//! Drop is destructive and irreversible in the UI, so the panel never fires
+//! it: the row emits [`DropStashRequested`], the shell host mounts a
+//! `ConfirmDialog`, and only its confirm callback reaches
+//! [`StashPanel::drop_confirmed`]. An event, not a flag — a flag has no
+//! subscriber, which is precisely why Drop shipped doing nothing.
+//!
+//! Apply and Pop fire directly. **Neither is undone by the reflog**: after a
+//! pop the stash's reflog entry is gone and the only way back is the commit
+//! sha, which is why every destructive path here logs one before it fires.
 //!
 //! Layout:
-//!   - Always-rendered header: chevron + "STASHES (N)" + "+" push button.
+//!   - Always-rendered header: chevron + "STASHES (N)" + refresh + "+" push.
 //!   - Body: list (or "No stashes" placeholder). Hidden when collapsed
 //!     (default). Power-user surface; eats no visual real estate when
 //!     unused.
@@ -14,8 +19,11 @@
 //! Runtime: refresh + ops use `tokio::runtime::Handle::try_current` + the
 //! same log+no-op fallback as DiffView / CommitDialog. Refresh is
 //! single-flight via `_refresh_task: Option<Task<()>>` — dropping cancels.
+//! Ops are detached instead (see `ops.rs`): cancelling a destructive op
+//! mid-subprocess loses its result.
 
 pub mod list_render;
+pub mod ops;
 pub mod push_dialog;
 
 use crate::shell::stash_panel::list_render::row_label;
@@ -70,13 +78,27 @@ pub enum StashListState {
 #[derive(Debug, Clone, Copy)]
 pub struct PushStashRequested;
 
+/// Emitted when the user clicks a row's `Drop`. The host mounts a
+/// `ConfirmDialog` and, on confirm, calls [`StashPanel::drop_confirmed`].
+///
+/// Carries everything the dialog copy needs, because an index tells the user
+/// nothing about which stash is about to disappear.
+#[derive(Debug, Clone)]
+pub struct DropStashRequested {
+    /// The `stash@{N}` address the row was PAINTED with — for display and for
+    /// the context menu, never for the git call. The op re-resolves `sha` to a
+    /// live address at fire time; see `ops.rs`.
+    pub stash_ref: StashRef,
+    /// The stash's immutable identity, and what the op actually acts on.
+    pub sha: String,
+    pub message: String,
+    pub relative: String,
+    pub branch: String,
+}
+
 pub struct StashPanel {
     repo: Repository,
     state: StashListState,
-    /// Stash entry the user just clicked "Drop" on. Host watches the
-    /// entity and mounts a ConfirmDialog when this becomes Some. Cleared
-    /// on `clear_pending_drop()` or `drop_pending()`.
-    pending_drop: Option<StashRef>,
     /// Body visibility flag. Default `true` — the stash list is a
     /// power-user surface; keeping it collapsed by default avoids
     /// burning vertical real estate in the SCM tab for users who don't
@@ -92,11 +114,23 @@ pub struct StashPanel {
     /// `vertical_scrollbar` so the thumb tracks the user's wheel/drag.
     /// Mirrors `GitPanel::scroll_handle` (`git_panel/mod.rs:113`).
     scroll_handle: ScrollHandle,
+    /// Serialises the resolve→fire window of every stash op.
+    ///
+    /// Ops are detached so they cannot cancel each other, which leaves them
+    /// free to overlap: two confirms landing within one subprocess (~25 ms)
+    /// both resolve against the pre-mutation stack, so the second fires on an
+    /// index the first has already invalidated. `stash_drop`'s sha assertion
+    /// catches that and `rollback` undoes it, but a rollback is a loud error
+    /// and a reordered stack — the wrong outcome for a legitimate pair of
+    /// clicks. Holding this across resolve-and-fire makes the race
+    /// unreachable, and leaves the assertion as the last resort it was meant
+    /// to be rather than the expected path.
+    op_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     _refresh_task: Option<Task<()>>,
-    _op_task: Option<Task<()>>,
 }
 
 impl EventEmitter<PushStashRequested> for StashPanel {}
+impl EventEmitter<DropStashRequested> for StashPanel {}
 
 impl StashPanel {
     pub fn new(
@@ -109,15 +143,14 @@ impl StashPanel {
         let mut panel = Self {
             repo,
             state: StashListState::Idle,
-            pending_drop: None,
             collapsed: true,
             focus_handle: cx.focus_handle(),
             theme,
             density,
             typography,
             scroll_handle: ScrollHandle::new(),
+            op_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             _refresh_task: None,
-            _op_task: None,
         };
         panel.refresh(cx);
         panel
@@ -125,14 +158,6 @@ impl StashPanel {
 
     pub fn state(&self) -> &StashListState {
         &self.state
-    }
-
-    pub fn pending_drop(&self) -> Option<&StashRef> {
-        self.pending_drop.as_ref()
-    }
-
-    pub fn clear_pending_drop(&mut self) {
-        self.pending_drop = None;
     }
 
     /// Whether the body is currently hidden. Header stays rendered
@@ -148,18 +173,38 @@ impl StashPanel {
         cx.notify();
     }
 
+    /// Re-read the stash list, honouring `stash_list`'s 15 s read-TTL.
+    ///
+    /// `false` is right for the render path: the TTL only ever leaves us
+    /// stale against an *external* writer, and self-heals within 15 s of the
+    /// user actually looking at the section.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.state = StashListState::Loading;
+        self.refresh_inner(false, cx);
+    }
+
+    /// Re-read ignoring the TTL. For the header button (the user is asking
+    /// precisely because they suspect the list is stale) and for the tail of
+    /// our own ops, which must never sit on a change they just made.
+    pub fn force_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_inner(true, cx);
+    }
+
+    fn refresh_inner(&mut self, force: bool, cx: &mut Context<Self>) {
+        // Keep showing the list we have while the new one loads. Every op now
+        // ends in a refresh, so blanking to "Loading stashes…" each time both
+        // flashes the section and — load-bearing — empties the sha→message
+        // snapshot `drop_confirmed` takes for its rollback, which would leave
+        // a wrongly-dropped stash restored under a synthesised label with its
+        // real message gone for good.
+        if !matches!(self.state, StashListState::Ready(_)) {
+            self.state = StashListState::Loading;
+        }
         let repo = self.repo.clone();
         let (tx, rx) = oneshot::channel::<Result<Vec<StashEntry>, String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    // `false` — the 15 s TTL is for exactly this caller: an
-                    // open panel re-rendering. Our own ops invalidate the
-                    // cache, so this is only ever stale against an external
-                    // writer, and self-heals within the TTL.
-                    let r = repo.stash_list(false).await.map_err(|e| e.to_string());
+                    let r = repo.stash_list(force).await.map_err(|e| e.to_string());
                     let _ = tx.send(r);
                 });
             }
@@ -184,116 +229,6 @@ impl StashPanel {
             });
         });
         self._refresh_task = Some(task);
-    }
-
-    pub fn apply(&mut self, stash_ref: StashRef, cx: &mut Context<Self>) {
-        self.spawn_op(
-            move |repo| async move { repo.stash_apply(&stash_ref).await },
-            "Stash apply",
-            cx,
-        );
-    }
-
-    pub fn pop(&mut self, stash_ref: StashRef, cx: &mut Context<Self>) {
-        self.spawn_op(
-            move |repo| async move { repo.stash_pop(&stash_ref).await },
-            "Stash pop",
-            cx,
-        );
-    }
-
-    pub fn request_drop(&mut self, stash_ref: StashRef) {
-        self.pending_drop = Some(stash_ref);
-    }
-
-    pub fn drop_pending(&mut self, cx: &mut Context<Self>) {
-        let Some(stash_ref) = self.pending_drop.take() else {
-            return;
-        };
-        self.spawn_op(
-            // The dropped sha is discarded HERE ONLY so this caller keeps its
-            // current behavior while the primitive gains the return value.
-            // Phase 3 owns the real wiring: resolve the index by sha, fire,
-            // then assert the sha git reports dropping. Until then this is
-            // exactly as safe (and as unsafe) as it was before.
-            move |repo| async move { repo.stash_drop(&stash_ref).await.map(|_sha| ()) },
-            "Stash drop",
-            cx,
-        );
-    }
-
-    /// Fire-and-forget `git stash push` from outside the panel
-    /// (the host's `PushStashDialog` confirm callback). Mirrors the
-    /// existing `apply` / `pop` / `drop_pending` plumbing: shells out
-    /// on tokio, refreshes on completion regardless of success so the
-    /// user sees the current state. The push-result `StashRef` is
-    /// dropped — the new entry will land at `stash@{0}` and surface
-    /// via the refreshed list rendering.
-    pub fn push(&mut self, msg: Option<String>, include_untracked: bool, cx: &mut Context<Self>) {
-        let repo = self.repo.clone();
-        let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    let r = repo
-                        .stash_push(msg.as_deref(), include_untracked, &[])
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(r);
-                });
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "oximux_app::stash_panel",
-                    "no tokio runtime; stash_push skipped"
-                );
-                return;
-            }
-        }
-        let task = cx.spawn(async move |this, cx| {
-            let result = rx.await;
-            let _ = this.update(cx, |panel, cx| {
-                if let Ok(Err(err)) = &result {
-                    crate::shell::toast::toast_op_error(cx, "Stash push", err);
-                }
-                panel.refresh(cx);
-            });
-        });
-        self._op_task = Some(task);
-    }
-
-    fn spawn_op<F, Fut>(&mut self, op: F, label: &'static str, cx: &mut Context<Self>)
-    where
-        F: FnOnce(Repository) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = oximux_git::Result<()>> + Send + 'static,
-    {
-        let repo = self.repo.clone();
-        let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    let r = op(repo).await.map_err(|e| e.to_string());
-                    let _ = tx.send(r);
-                });
-            }
-            Err(_) => {
-                tracing::warn!(target: "oximux_app::stash_panel", op = label, "no tokio runtime; op skipped");
-                return;
-            }
-        }
-        let task = cx.spawn(async move |this, cx| {
-            let result = rx.await;
-            let _ = this.update(cx, |panel, cx| {
-                if let Ok(Err(err)) = &result {
-                    crate::shell::toast::toast_op_error(cx, label, err);
-                }
-                // Always refresh after an op — even on failure the user
-                // wants to see the current state.
-                panel.refresh(cx);
-            });
-        });
-        self._op_task = Some(task);
     }
 }
 
@@ -433,6 +368,18 @@ impl StashPanel {
                     .child(format!("STASHES ({count})")),
             )
             .child(
+                Button::new("stash-refresh")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::default().path("icons/refresh-cw.svg"))
+                    .tooltip("Re-read the stash list")
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                        // Forced: the user is clicking this precisely because
+                        // they think the cached list is behind git.
+                        panel.force_refresh(cx);
+                    })),
+            )
+            .child(
                 Button::new("stash-push-new")
                     .ghost()
                     .xsmall()
@@ -450,9 +397,13 @@ impl StashPanel {
         let density = self.density;
         let typography = &self.typography;
         let index = entry.stash_ref.index;
-        let apply_ref = entry.stash_ref.clone();
-        let pop_ref = entry.stash_ref.clone();
-        let drop_ref = entry.stash_ref.clone();
+        // Ops are keyed by sha, not by the index this row is painted with:
+        // the stack is shared with every worktree and with the user's
+        // terminal, so `index` can address a different stash by the time a
+        // click lands. See `ops.rs`.
+        let apply_sha = entry.sha.clone();
+        let pop_sha = entry.sha.clone();
+        let drop_entry = entry.clone();
         // Hover scope for the progressive-disclosure cluster below.
         let group_name = format!("stash-row-{index}");
         // Apply / Pop / Drop all sit at the same xsmall (22px) height so the
@@ -485,7 +436,7 @@ impl StashPanel {
                     .label("Apply")
                     .tooltip("Apply stash (keep it in the list)")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.apply(apply_ref.clone(), cx);
+                        panel.apply(apply_sha.clone(), cx);
                         cx.notify();
                     })),
             )
@@ -494,9 +445,11 @@ impl StashPanel {
                     .ghost()
                     .xsmall()
                     .label("Pop")
-                    .tooltip("Apply stash and remove it (reversible via reflog)")
+                    // NOT "reversible via reflog" — a pop deletes the stash's
+                    // reflog entry, leaving the commit sha as the only way back.
+                    .tooltip("Apply stash and remove it from the list")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.pop(pop_ref.clone(), cx);
+                        panel.pop(pop_sha.clone(), cx);
                         cx.notify();
                     })),
             )
@@ -506,9 +459,16 @@ impl StashPanel {
                 &theme,
                 &density,
                 typography,
-                cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                    panel.request_drop(drop_ref.clone());
-                    cx.notify();
+                cx.listener(move |_panel, _: &ClickEvent, _window, cx| {
+                    // The panel never drops on its own — the host owns the
+                    // confirm step and calls back into `drop_confirmed`.
+                    cx.emit(DropStashRequested {
+                        stash_ref: drop_entry.stash_ref.clone(),
+                        sha: drop_entry.sha.clone(),
+                        message: drop_entry.message.clone(),
+                        relative: drop_entry.relative.clone(),
+                        branch: drop_entry.branch.clone(),
+                    });
                 }),
             ));
         div()

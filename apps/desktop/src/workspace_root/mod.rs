@@ -121,7 +121,7 @@ use crate::shell::{
         graph::ShowCommitRequested,
     },
     stash_panel::{
-        PushStashRequested, StashPanel,
+        DropStashRequested, PushStashRequested, StashPanel,
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
     },
     left_rail::{
@@ -389,6 +389,11 @@ pub struct WorkspaceRoot {
     /// lifetime contract as `_discard_subscription` — dropping it
     /// silently disables the `+` push affordance in the stash section.
     pub(crate) _push_stash_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::DropStashRequested`. Same
+    /// lifetime contract as `_discard_subscription` — dropping it silently
+    /// disables every row's Drop button, which is exactly the defect this
+    /// event replaced a flag to fix.
+    pub(crate) _drop_stash_subscription: Option<Subscription>,
     /// Active push-stash form modal (per-request; `None` when idle).
     /// Wired alongside `confirm_dialog` but kept in its own slot so
     /// the type-to-confirm flow stays separable from this creation
@@ -1341,6 +1346,7 @@ impl WorkspaceRoot {
             _discard_subscription: None,
             _discard_dialog_observer: None,
             _push_stash_subscription: None,
+            _drop_stash_subscription: None,
             _show_branch_file_subscription: None,
             _show_combined_diff_subscription: None,
             _show_branch_diff_all_subscription: None,
@@ -1652,3 +1658,4 @@ mod tests {
 
 mod ops;
 mod render;
+mod stash_dialogs;
