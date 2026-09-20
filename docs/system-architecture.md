@@ -258,8 +258,9 @@ ConfirmDialog (GPUI entity)
   ← optional secondary action for three-way prompts (Save / Discard / Cancel)
 
 StashPanel (GPUI entity)
-  ← refresh() → git stash list
-  ← apply/pop/request_drop → git stash ops
+  ← refresh() / force_refresh() → git stash list (15 s read-TTL)
+  ← apply/pop → git stash ops, each resolving its target by sha
+  → DropStashRequested → host confirm dialog → drop_confirmed()
 
 WorktreePanel (GPUI entity)
   ← refresh() → git worktree list

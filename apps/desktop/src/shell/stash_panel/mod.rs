@@ -16,6 +16,9 @@
 //!     (default). Power-user surface; eats no visual real estate when
 //!     unused.
 //!
+//! One row is `row.rs`; the strings it paints come from `list_render.rs`,
+//! which stays free of GPUI so the formatting is unit-testable.
+//!
 //! Runtime: refresh + ops use `tokio::runtime::Handle::try_current` + the
 //! same log+no-op fallback as DiffView / CommitDialog. Refresh is
 //! single-flight via `_refresh_task: Option<Task<()>>` — dropping cancels.
@@ -25,9 +28,8 @@
 pub mod list_render;
 pub mod ops;
 pub mod push_dialog;
+pub mod row;
 
-use crate::shell::stash_panel::list_render::row_label;
-use crate::ui::danger_ghost;
 use gpui::{
     App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Task,
@@ -43,12 +45,6 @@ use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 use tokio::sync::oneshot;
 
-/// Resting opacity of a stash row's Apply/Pop/Drop cluster — ghosted enough to
-/// calm the row, present enough that the actions are always discoverable and
-/// clickable (the panel has no context-menu fallback). Lifts to full on
-/// row-hover.
-const STASH_ACTION_REST_OPACITY: f32 = 0.45;
-
 /// How many stash rows the expanded body shows before it starts scrolling.
 ///
 /// The section is `flex_shrink_0`, so without a cap every stash row it
@@ -61,6 +57,9 @@ const STASH_ACTION_REST_OPACITY: f32 = 0.45;
 /// and Phase 5 deletes it when the section becomes drag-resizable. Promoting
 /// a soon-to-be-deleted guess into public, unit-tested settings API would be
 /// churn. If it chafes before Phase 5 lands, this is one line to raise.
+///
+/// The height it multiplies must stay the one `row.rs` gives a row. Phase 6
+/// moves that to `h_row`; this line and the pixel estimate above move with it.
 const STASH_BODY_MAX_ROWS: f32 = 8.0;
 
 #[derive(Debug)]
@@ -391,109 +390,6 @@ impl StashPanel {
             )
     }
 
-    fn render_row(&self, entry: StashEntry, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = row_label(&entry);
-        let theme = self.theme;
-        let density = self.density;
-        let typography = &self.typography;
-        let index = entry.stash_ref.index;
-        // Ops are keyed by sha, not by the index this row is painted with:
-        // the stack is shared with every worktree and with the user's
-        // terminal, so `index` can address a different stash by the time a
-        // click lands. See `ops.rs`.
-        let apply_sha = entry.sha.clone();
-        let pop_sha = entry.sha.clone();
-        let drop_entry = entry.clone();
-        // Hover scope for the progressive-disclosure cluster below.
-        let group_name = format!("stash-row-{index}");
-        // Apply / Pop / Drop all sit at the same xsmall (22px) height so the
-        // row reads as one action cluster — the destructive verb doesn't
-        // dominate by being larger than its siblings.
-        let actions = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            // Pin the action cluster: it must never shrink or clip — a narrow
-            // panel truncates the label instead (the canonical SCM-row collapse
-            // priority). Without this, a long stash message pushed the cluster
-            // off the right edge and clipped "Drop".
-            .flex_shrink_0()
-            .gap(px(density.gap_inline))
-            // Progressive disclosure: the cluster rests ghosted and lifts to
-            // full on row-hover, so a calm row at rest but every verb is one
-            // hover away. NOT fully hidden on purpose — the stash panel has no
-            // context menu, so a hidden cluster would leave Drop (destructive)
-            // with no alternative invocation path. Ghost-at-rest keeps every
-            // action reachable at all times (documented exception to the
-            // fully-hidden row-action convention used where a context-menu
-            // backup exists).
-            .opacity(STASH_ACTION_REST_OPACITY)
-            .group_hover(group_name.clone(), |s| s.opacity(1.0))
-            .child(
-                Button::new(("stash-apply", index))
-                    .ghost()
-                    .xsmall()
-                    .label("Apply")
-                    .tooltip("Apply stash (keep it in the list)")
-                    .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.apply(apply_sha.clone(), cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new(("stash-pop", index))
-                    .ghost()
-                    .xsmall()
-                    .label("Pop")
-                    // NOT "reversible via reflog" — a pop deletes the stash's
-                    // reflog entry, leaving the commit sha as the only way back.
-                    .tooltip("Apply stash and remove it from the list")
-                    .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.pop(pop_sha.clone(), cx);
-                        cx.notify();
-                    })),
-            )
-            .child(danger_ghost(
-                ("stash-drop", index),
-                "Drop",
-                &theme,
-                &density,
-                typography,
-                cx.listener(move |_panel, _: &ClickEvent, _window, cx| {
-                    // The panel never drops on its own — the host owns the
-                    // confirm step and calls back into `drop_confirmed`.
-                    cx.emit(DropStashRequested {
-                        stash_ref: drop_entry.stash_ref.clone(),
-                        sha: drop_entry.sha.clone(),
-                        message: drop_entry.message.clone(),
-                        relative: drop_entry.relative.clone(),
-                        branch: drop_entry.branch.clone(),
-                    });
-                }),
-            ));
-        div()
-            .group(group_name)
-            .flex()
-            .flex_row()
-            .items_center()
-            .h(px(density.h_action_row))
-            .px(px(density.pad_panel))
-            .gap(px(density.gap_inline))
-            .border_b_1()
-            .border_color(theme.border_inactive)
-            .child(
-                div()
-                    .flex_1()
-                    // Shrink-to-fit + ellipsis so a long stash subject collapses
-                    // gracefully instead of shoving the action cluster off-panel.
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(theme.fg_base)
-                    .child(label),
-            )
-            .child(actions)
-    }
 }
 
 fn placeholder(
