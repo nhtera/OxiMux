@@ -59,7 +59,7 @@ impl Repository {
         }
         let auto_stash = if self.is_dirty().await? {
             Some(
-                self.stash_push(Some(AUTO_STASH_MESSAGE), false)
+                self.stash_push(Some(AUTO_STASH_MESSAGE), false, &[])
                     .await?,
             )
         } else {

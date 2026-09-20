@@ -100,7 +100,7 @@ impl Fixture {
     }
 
     async fn stash_count(&self) -> usize {
-        self.repo().await.stash_list().await.expect("stash list").len()
+        self.repo().await.stash_list(true).await.expect("stash list").len()
     }
 
     async fn merge(&self) -> MergeResult {
@@ -548,7 +548,7 @@ async fn an_auto_stash_already_on_the_stack_is_not_reported_as_stranded_by_this_
     f.dirty_the_root();
     f.repo()
         .await
-        .stash_push(Some(oximux_git::AUTO_STASH_MESSAGE), false)
+        .stash_push(Some(oximux_git::AUTO_STASH_MESSAGE), false, &[])
         .await
         .expect("seed an older auto-stash");
     assert_eq!(f.stash_count().await, 1);

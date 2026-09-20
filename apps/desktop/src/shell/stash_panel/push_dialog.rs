@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 /// Callback fired when the user clicks Push with the form filled. The
 /// message is `None` when the input was left empty — the caller maps
-/// to `repo.stash_push(msg.as_deref(), include_untracked)`. `Rc` (not
+/// to `repo.stash_push(msg.as_deref(), include_untracked, &[])`. `Rc` (not
 /// `Arc`) for the same reason as `ConfirmCallback`: GPUI views run on
 /// the single foreground executor.
 pub type PushCallback = Rc<dyn Fn(Option<String>, bool, &mut Window, &mut App) + 'static>;

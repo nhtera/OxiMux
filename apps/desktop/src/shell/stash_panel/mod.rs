@@ -155,7 +155,11 @@ impl StashPanel {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let r = repo.stash_list().await.map_err(|e| e.to_string());
+                    // `false` — the 15 s TTL is for exactly this caller: an
+                    // open panel re-rendering. Our own ops invalidate the
+                    // cache, so this is only ever stale against an external
+                    // writer, and self-heals within the TTL.
+                    let r = repo.stash_list(false).await.map_err(|e| e.to_string());
                     let _ = tx.send(r);
                 });
             }
@@ -207,7 +211,12 @@ impl StashPanel {
             return;
         };
         self.spawn_op(
-            move |repo| async move { repo.stash_drop(&stash_ref).await },
+            // The dropped sha is discarded HERE ONLY so this caller keeps its
+            // current behavior while the primitive gains the return value.
+            // Phase 3 owns the real wiring: resolve the index by sha, fire,
+            // then assert the sha git reports dropping. Until then this is
+            // exactly as safe (and as unsafe) as it was before.
+            move |repo| async move { repo.stash_drop(&stash_ref).await.map(|_sha| ()) },
             "Stash drop",
             cx,
         );
@@ -227,7 +236,7 @@ impl StashPanel {
             Ok(handle) => {
                 handle.spawn(async move {
                     let r = repo
-                        .stash_push(msg.as_deref(), include_untracked)
+                        .stash_push(msg.as_deref(), include_untracked, &[])
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string());

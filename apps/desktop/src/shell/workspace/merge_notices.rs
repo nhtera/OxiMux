@@ -201,7 +201,10 @@ pub enum StashLookup {
 /// remembered `stash@{N}`: by the time a notice is acted on it may name a
 /// different entry, and popping the wrong one confidently is the worse failure.
 pub async fn resolve(repo: &Repository, notice: &StashNotice) -> StashLookup {
-    let entries = match repo.stash_list().await {
+    // `force_refresh` — this function exists to read the LIVE stack. A cached
+    // list would re-resolve a notice against a stack that may already have
+    // moved, which is the exact failure the doc comment above forbids.
+    let entries = match repo.stash_list(true).await {
         Ok(entries) => entries,
         Err(err) => return StashLookup::Failed(err.to_string()),
     };

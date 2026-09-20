@@ -33,7 +33,10 @@ pub use git_diff::{
     ChangeRegion, CombinedDiff, CombinedDiffScope, DiffHunk, DiffLine, DiffLineKind, DiffStatus,
     FileDiff, FileGroup, HUNK_CONTEXT, LARGE_DIFF_LINE_THRESHOLD, change_regions,
 };
-pub use git_ops::{BranchInfo, GitOperation, MergeOutcome, StashEntry, StashRef, WorktreeInfo};
+pub use git_ops::{
+    BranchInfo, GitOperation, MergeOutcome, StashEntry, StashFile, StashFileOrigin, StashRef,
+    WorktreeInfo,
+};
 pub use git_state::{
     BranchCommittedFile, BranchRange, CommitInfo, FileStatus, GitState, IndexStatus, RefLabel,
     RenameInfo, RenameKind, WorktreeStatus,

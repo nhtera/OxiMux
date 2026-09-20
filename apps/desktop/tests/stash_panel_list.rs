@@ -8,6 +8,9 @@ fn entry(index: usize, branch: &str, message: &str) -> StashEntry {
         stash_ref: StashRef { index },
         branch: branch.to_string(),
         message: message.to_string(),
+        sha: format!("{:040x}", index + 1),
+        created_at: 1_789_853_406,
+        relative: "2 hours ago".to_string(),
     }
 }
 

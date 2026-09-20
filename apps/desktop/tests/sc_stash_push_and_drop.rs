@@ -9,7 +9,7 @@
 //!    through tokio rather than no-op'ing the runtime check.
 //!
 //! Validation reads git's state directly via
-//! `rt.block_on(repo.stash_list())` rather than driving the panel's
+//! `rt.block_on(repo.stash_list(true))` rather than driving the panel's
 //! auto-refresh through another `cx.run_until_parked()` cycle. The
 //! chained refresh (panel.push → tokio stash_push → gpui callback →
 //! panel.refresh → tokio stash_list → gpui callback) crosses the
@@ -75,7 +75,7 @@ async fn push_shells_out_to_git_stash_push(cx: &mut TestAppContext) {
 
     // Sanity: clean stash stack to start.
     let pre = rt
-        .block_on(repo.stash_list())
+        .block_on(repo.stash_list(true))
         .expect("stash_list pre-push");
     assert!(pre.is_empty(), "fresh repo should have no stashes, got {pre:?}");
 
@@ -119,7 +119,7 @@ async fn push_shells_out_to_git_stash_push(cx: &mut TestAppContext) {
     // entirely — proves the push side-effected git, which is the
     // contract the user cares about.
     let post = rt
-        .block_on(repo.stash_list())
+        .block_on(repo.stash_list(true))
         .expect("stash_list post-push");
     assert_eq!(
         post.len(),

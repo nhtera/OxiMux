@@ -66,6 +66,16 @@ pub(crate) type RemoteBranchCache = Arc<RwLock<Option<(Instant, Vec<BranchInfo>)
 pub(crate) type UntrackedCountCache =
     Arc<RwLock<HashMap<PathBuf, (std::time::SystemTime, Option<(u32, u32)>)>>>;
 
+/// Cache slot for `stash_list`. Same shape as [`RemoteBranchCache`] — shared
+/// across cloned `Repository` handles so every panel in the window reads one
+/// warm list instead of shelling out per render.
+///
+/// A TTL (not a watcher) because `refs/stash` has two writers this process
+/// cannot observe: the user's own terminal, and OxiMux in a sibling worktree
+/// (the stack lives in the git *common* dir). There is no ref watcher in this
+/// codebase and the file-explorer watcher storm is a known past hazard here.
+pub(crate) type StashListCache = Arc<RwLock<Option<(Instant, Vec<oximux_core::StashEntry>)>>>;
+
 /// One freshly counted untracked file: (path, mtime at count time, counts).
 type CountedUntracked = (PathBuf, std::time::SystemTime, Option<(u32, u32)>);
 
@@ -88,6 +98,8 @@ pub struct Repository {
     pub(crate) lease_status_cache: crate::remote::LeaseStatusCache,
     /// Per-path line counts for untracked files (see [`UntrackedCountCache`]).
     pub(crate) untracked_count_cache: UntrackedCountCache,
+    /// Cache slot for `stash_list` (see [`StashListCache`]).
+    pub(crate) stash_list_cache: StashListCache,
 }
 
 impl Repository {
@@ -163,6 +175,7 @@ impl Repository {
             remote_branch_cache: Arc::new(RwLock::new(None)),
             lease_status_cache: Arc::new(RwLock::new(None)),
             untracked_count_cache: Arc::new(RwLock::new(HashMap::new())),
+            stash_list_cache: Arc::new(RwLock::new(None)),
         })
     }
 
