@@ -242,6 +242,21 @@ Blink suppression: unfocused `TerminalView` entities gate `cx.notify()` on `view
 GitPanel (GPUI entity)
   ← subscription on StatusPoller updates
   ← renders: staged / unstaged / untracked sections
+  → StashSelectedRequested { paths, needs_untracked, rename_pairs,
+                             untracked_count }
+      built by stash_selection::plan_stash_selection from the live GitState:
+        · a selected path absent from GitState is dropped (a pathspec git
+          does not know fails the WHOLE push, not just that path)
+        · a STAGED rename contributes its original path too, plus a pair to
+          unstage first — after `git mv`, the original is in HEAD alone and
+          no pathspec can reach it
+        · -u is forced by any untracked path OR any rename (whose target is
+          untracked once unstaged); without it git refuses the pathspec and
+          stashes nothing at all
+        · refused above ARGV_BUDGET_BYTES — a stash is one commit, so the
+          argv cannot be chunked the way stage/unstage can
+      → host mounts the push dialog scoped to those paths, then runs the op
+        on StashPanel so the stash list refreshes as part of it
 
 DiffView (GPUI entity)
   ← DiffView::load(path, staged, cx)
@@ -269,6 +284,13 @@ StashPanel (GPUI entity)
                              Untracked → <sha>^3 with NO base (diff_in_rev)
   ← row action cluster is hidden until hover; the guaranteed path to every
     verb is the right-click menu, which is why the two shipped together
+  ← push_paths(msg, -u, paths, rename_pairs, on_success) — the partial stash
+    fired from GitPanel. Runs HERE, not there, so the stash list refresh is
+    part of the op. Sequence: unstage_paths(rename_pairs) → stash_push, and
+    on failure stage_paths(rename_pairs) to put the staging back before the
+    error is toasted. on_success is deferred (the cross-entity hop out of a
+    leased entity) and only clears the file list's selection when the push
+    actually succeeded.
 
 StashContextMenu (GPUI entity, mounted on WorkspaceRoot)
   ← OpenStashContextMenuAt { x, y, sha, index, message, relative, branch,

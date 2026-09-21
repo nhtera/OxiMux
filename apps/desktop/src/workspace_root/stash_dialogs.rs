@@ -117,9 +117,6 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.push_stash_dialog.is_some() {
-            return;
-        }
         let weak = panel.downgrade();
         let on_confirm: PushCallback = Rc::new(move |msg, include_untracked, _window, cx| {
             let Some(panel) = weak.upgrade() else {
@@ -127,17 +124,124 @@ impl WorkspaceRoot {
             };
             panel.update(cx, |p, cx| p.push(msg, include_untracked, cx));
         });
-        // Cancel path is a no-op on the panel side — the dialog flips
-        // `cancelled`, the observer below drops the slot. Wired anyway
-        // so future telemetry (e.g. counting abandoned pushes) has a
-        // hook point.
-        let on_cancel: CancelCallback = Rc::new(|_window, _cx| {});
+        self.mount_push_dialog(
+            PushStashPrompt {
+                on_confirm,
+                on_cancel: Some(noop_cancel()),
+                scope: None,
+            },
+            window,
+            cx,
+        );
+    }
 
-        let prompt = PushStashPrompt {
-            on_confirm,
-            on_cancel: Some(on_cancel),
+    /// Mount the same dialog scoped to the CHANGES panel's selection.
+    ///
+    /// The stash runs on `StashPanel`, not on the panel that asked for it, so
+    /// the stash list refreshes as part of the op — see
+    /// `StashPanel::push_paths`. The host is the only place that can see both
+    /// panels, which is exactly why this fan-out lives here.
+    ///
+    /// Silently returns when the source-control surface is not mounted: the
+    /// request can only have come from the file list inside it, so that means
+    /// the sidebar was torn down between the click and this call.
+    pub(crate) fn mount_stash_selection_dialog(
+        &mut self,
+        git_panel: Entity<GitPanel>,
+        ev: &StashSelectedRequested,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stash_panel) = self
+            .right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+            .map(|sc| sc.read(cx).stash_panel.clone())
+        else {
+            return;
         };
 
+        let scope = PushStashScope {
+            paths: ev.paths.clone(),
+            untracked_count: ev.untracked_count,
+            has_rename: !ev.rename_pairs.is_empty(),
+            needs_untracked: ev.needs_untracked,
+        };
+
+        // Sidebars are cached per project, so the panels stay alive across a
+        // switch and a strong handle would happily stash in the repo the user
+        // has stopped looking at. Re-checked at FIRE time, like the drop
+        // dialog's guard 2 — see the module doc.
+        let project_id = self.active_project.as_ref().map(|p| p.id.clone());
+        let weak_root = cx.entity().downgrade();
+        let weak_stash = stash_panel.downgrade();
+        let weak_git = git_panel.downgrade();
+        let paths = ev.paths.clone();
+        let rename_pairs = ev.rename_pairs.clone();
+
+        let on_confirm: PushCallback = Rc::new(move |msg, include_untracked, _window, cx| {
+            let Some(stash_panel) = weak_stash.upgrade() else {
+                return;
+            };
+            let still_current = weak_root
+                .upgrade()
+                .map(|root| {
+                    root.read(cx).active_project.as_ref().map(|p| p.id.clone()) == project_id
+                })
+                .unwrap_or(false);
+            if !still_current {
+                tracing::warn!(
+                    target: "oximux_app::git_panel",
+                    "stash-selection confirm fired after a project switch; ignored",
+                );
+                return;
+            }
+            // Only on success: a failed push leaves every file exactly where
+            // it was, and dropping the selection would make the retry manual.
+            let on_success = {
+                let weak_git = weak_git.clone();
+                Rc::new(move |cx: &mut gpui::App| {
+                    let _ = weak_git.update(cx, |panel, cx| panel.clear_selection(cx));
+                }) as OnOpSuccess
+            };
+            let (paths, rename_pairs) = (paths.clone(), rename_pairs.clone());
+            stash_panel.update(cx, |p, cx| {
+                p.push_paths(
+                    msg,
+                    include_untracked,
+                    paths,
+                    rename_pairs,
+                    Some(on_success),
+                    cx,
+                );
+            });
+        });
+
+        self.mount_push_dialog(
+            PushStashPrompt {
+                on_confirm,
+                on_cancel: Some(noop_cancel()),
+                scope: Some(scope),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Put `prompt` in the single push-dialog slot and wire its teardown.
+    ///
+    /// First-open-wins: a double-click on the header `+` button, or a stash
+    /// request arriving while a form is already up, is ignored. Replacing the
+    /// slot would silently drop a half-typed message.
+    fn mount_push_dialog(
+        &mut self,
+        prompt: PushStashPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.push_stash_dialog.is_some() {
+            return;
+        }
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
@@ -163,6 +267,13 @@ impl WorkspaceRoot {
         self.push_stash_dialog = Some(dialog);
         cx.notify();
     }
+}
+
+/// The dialog's cancel hook. A no-op on the panel side — the dialog flips
+/// `cancelled` and the slot observer drops it — but wired anyway so future
+/// telemetry (e.g. counting abandoned pushes) has a hook point.
+fn noop_cancel() -> CancelCallback {
+    Rc::new(|_window, _cx| {})
 }
 
 /// Dialog body naming the stash about to be dropped.

@@ -5,12 +5,25 @@
 //! positioning); the scroll body gets a 6px bottom padding so the last
 //! row stays visible behind it.
 //!
-//! Layout: `N selected · + Stage (N_to_stage) · − Unstage (N_to_unstage) · ×`
+//! Layout: `N selected · +N · −N · ▣N · ×`
 //!
-//! Stage / Unstage buttons hide when their count is 0 (no-op operations
+//! Action buttons hide when their count is 0 (no-op operations
 //! shouldn't clutter the bar). While a bulk op is in flight, the count
 //! swaps for a spinner icon and the action buttons disable so a
 //! re-click can't queue a second op against stale state.
+//!
+//! # Why the verbs are in tooltips and not on the buttons
+//!
+//! They were on the buttons — `+ Stage (3)` — until a third action joined
+//! them. Measured live at the default sidebar width (212 logical px), three
+//! labelled buttons need roughly 290px: `Stash (3)` was clipped mid-word and
+//! `×` was pushed off the panel entirely, so the only way to dismiss the bar
+//! had left the screen. The bar spans the panel, so there is no wider
+//! container to spill into and nothing to absolutely-position against; the
+//! labels are simply what the width cannot afford. Icon + count keeps every
+//! number the classification produces — which is the part a label could not
+//! replace, since Stage and Unstage can legitimately differ — and moves the
+//! verb to where it costs nothing.
 
 use crate::shell::git_panel::GitPanel;
 use crate::shell::source_control::style::ScmStyle;
@@ -27,7 +40,7 @@ use oximux_settings::{Density, Theme, Typography};
 /// so the bar feels consistent with the per-row hover cluster.
 const ACTION_ICON_PX: f32 = 14.0;
 
-/// Compute the (`to_stage`, `to_unstage`) counts from the selected
+/// Compute the (`to_stage`, `to_unstage`, `to_stash`) counts from the selected
 /// path set against the current poll snapshot. A partial-stage path
 /// contributes to BOTH counts — `stage_paths` on it stages the rest,
 /// `unstage_paths` unstages the staged side, so each op makes
@@ -41,20 +54,36 @@ const ACTION_ICON_PX: f32 = 14.0;
 /// merge first. Phase 08 (`ConflictSummaryCard`) will gate this; for
 /// Slice B the bar reflects what the backend will actually do.
 ///
+/// `to_stash` counts every resolved path, staged or not: a stash takes
+/// a file whole — index side and worktree side both ride into the stash
+/// commit, and `apply --index` puts the split back — so there is no
+/// subset of the selection a stash would skip.
+///
+/// **During an unresolved merge, Stash cannot deliver what it offers.**
+/// `git stash push` refuses while ANY path in the repo is unmerged — not
+/// just a selected one: `error: could not write index / <path>: needs
+/// merge`, exit 1, nothing stashed and the worktree untouched (verified).
+/// So the count is honest about the selection but the op will fail. It
+/// fails safely and git's message names the conflicted file, so this is
+/// left ungated here and gated with Stage/Unstage in Phase 08's
+/// `ConflictSummaryCard` rather than growing a third one-off check.
+///
 /// Paths in `selected` that are absent from `git_state` (e.g. the
 /// poller hasn't caught up to an externally-modified worktree) are
 /// silently ignored — the bar counts reflect what the UI actually
 /// knows about, not stale selection ghosts.
-fn classify_selection(panel: &GitPanel) -> (usize, usize) {
+fn classify_selection(panel: &GitPanel) -> (usize, usize, usize) {
     let Some(state) = panel.git_state.as_ref() else {
-        return (0, 0);
+        return (0, 0, 0);
     };
     let mut to_stage = 0usize;
     let mut to_unstage = 0usize;
+    let mut to_stash = 0usize;
     for path in panel.selected.iter() {
         let Some(file) = state.files.iter().find(|f| &f.path == path) else {
             continue;
         };
+        to_stash += 1;
         if file.is_unstaged() {
             to_stage += 1;
         }
@@ -62,7 +91,7 @@ fn classify_selection(panel: &GitPanel) -> (usize, usize) {
             to_unstage += 1;
         }
     }
-    (to_stage, to_unstage)
+    (to_stage, to_unstage, to_stash)
 }
 
 /// Build the floating bar. Returns `None` when nothing is selected so
@@ -83,7 +112,7 @@ pub fn render_bulk_action_bar(
         return None;
     }
     let in_flight = panel.bulk_op_in_flight;
-    let (to_stage, to_unstage) = classify_selection(panel);
+    let (to_stage, to_unstage, to_stash) = classify_selection(panel);
 
     // Count slot: spinner when an op is running, otherwise the
     // "N selected" tally.
@@ -127,8 +156,8 @@ pub fn render_bulk_action_bar(
             "bulk-stage",
             "icons/plus.svg",
             theme.status_added,
-            format!("Stage ({to_stage})"),
-            "Stage selected files",
+            "Stage",
+            to_stage,
             on_click,
         ));
     }
@@ -142,8 +171,29 @@ pub fn render_bulk_action_bar(
             "bulk-unstage",
             "icons/minus.svg",
             theme.status_removed,
-            format!("Unstage ({to_unstage})"),
-            "Unstage selected files",
+            "Unstage",
+            to_unstage,
+            on_click,
+        ));
+    }
+
+    // Stash — opens the scoped push dialog rather than firing immediately: a
+    // stash takes a message, and the untracked/rename rules need somewhere to
+    // be stated. Gated on `in_flight` for the same reason Stage/Unstage are —
+    // the plan is computed from the poll snapshot, and a bulk op mid-flight is
+    // about to invalidate it.
+    if to_stash > 0 {
+        let on_click = (!in_flight).then(|| {
+            cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                panel.request_stash_selected(cx);
+            })
+        });
+        row = row.child(action_button(
+            "bulk-stash",
+            "icons/file-box.svg",
+            theme.fg_muted,
+            "Stash",
+            to_stash,
             on_click,
         ));
     }
@@ -182,21 +232,25 @@ pub fn render_bulk_action_bar(
     )
 }
 
-/// Render one action button. `on_click = None` puts the button in the
-/// `.disabled(true)` state — passing `None` instead of a guarded
-/// closure keeps GPUI from allocating a listener every render frame
-/// while the spinner is up.
+/// Render one action button: the icon, the count, and the verb in its
+/// tooltip. `on_click = None` puts the button in the `.disabled(true)`
+/// state — passing `None` instead of a guarded closure keeps GPUI from
+/// allocating a listener every render frame while the spinner is up.
 fn action_button<F>(
     id: &'static str,
     icon_path: &'static str,
     icon_color: Hsla,
-    label: String,
-    tooltip: &'static str,
+    verb: &'static str,
+    count: usize,
     on_click: Option<F>,
 ) -> AnyElement
 where
     F: Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 {
+    let tooltip = match count {
+        1 => format!("{verb} 1 selected file"),
+        n => format!("{verb} {n} selected files"),
+    };
     let mut btn = Button::new(id)
         .ghost()
         .xsmall()
@@ -206,7 +260,7 @@ where
                 .size(px(ACTION_ICON_PX))
                 .text_color(icon_color),
         )
-        .label(label)
+        .label(count.to_string())
         .tooltip(tooltip);
     match on_click {
         Some(handler) => btn = btn.on_click(handler),

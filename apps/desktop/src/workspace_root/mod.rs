@@ -113,7 +113,7 @@ use crate::shell::{
     confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
     git_panel::{
-        DiscardRequested, GitPanel, ShowCombinedDiffRequested,
+        DiscardRequested, GitPanel, ShowCombinedDiffRequested, StashSelectedRequested,
         row_context_menu::{GitRowContextMenu, GitRowContextTarget},
     },
     source_control::{
@@ -124,7 +124,10 @@ use crate::shell::{
     stash_panel::{
         DropStashRequested, PushStashRequested, ShowStashFileRequested, StashPanel,
         context_menu::{StashContextMenu, StashContextTarget},
-        push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
+        ops::OnOpSuccess,
+        push_dialog::{
+            CancelCallback, PushCallback, PushStashDialog, PushStashPrompt, PushStashScope,
+        },
     },
     left_rail::{
         LeftRail,
@@ -404,6 +407,10 @@ pub struct WorkspaceRoot {
     /// disables every row's Drop button, which is exactly the defect this
     /// event replaced a flag to fix.
     pub(crate) _drop_stash_subscription: Option<Subscription>,
+    /// Long-lived subscription on `GitPanel::StashSelectedRequested` — the
+    /// CHANGES panel asking for a partial stash. Same lifetime contract as
+    /// `_discard_subscription`.
+    pub(crate) _stash_selection_subscription: Option<Subscription>,
     /// Long-lived subscription on `StashPanel::ShowStashFileRequested`.
     /// Fired when the user clicks a file inside an expanded stash row; the
     /// handler opens a read-only diff tab for that file. Same lifetime
@@ -1365,6 +1372,7 @@ impl WorkspaceRoot {
             _discard_dialog_observer: None,
             _push_stash_subscription: None,
             _drop_stash_subscription: None,
+            _stash_selection_subscription: None,
             _show_stash_file_subscription: None,
             _show_branch_file_subscription: None,
             _show_combined_diff_subscription: None,

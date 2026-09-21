@@ -629,6 +629,7 @@ impl WorkspaceRoot {
             self._show_branch_file_subscription = None;
             self._show_combined_diff_subscription = None;
             self._show_branch_diff_all_subscription = None;
+            self._stash_selection_subscription = None;
             return;
         };
         // Clone the child entities + repo up front so the immutable read
@@ -649,6 +650,14 @@ impl WorkspaceRoot {
             window,
             |root, panel, _ev: &DiscardRequested, window, cx| {
                 root.mount_discard_dialog(panel.clone(), window, cx);
+            },
+        ));
+
+        self._stash_selection_subscription = Some(cx.subscribe_in(
+            &git_panel,
+            window,
+            |root, panel, ev: &StashSelectedRequested, window, cx| {
+                root.mount_stash_selection_dialog(panel.clone(), ev, window, cx);
             },
         ));
 

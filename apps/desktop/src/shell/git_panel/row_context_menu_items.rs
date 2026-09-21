@@ -141,7 +141,31 @@ pub(super) fn build_single_card(
         }),
     ));
 
-    // ── 5. Discard… — opens the type-to-confirm discard dialog.
+    // ── 5. Stash Changes… — opens the scoped push dialog for this one
+    //   path. Offered on the Staged side too: a stash carries the
+    //   index side into the stash commit's `^2`, so `Apply with index`
+    //   puts the staging back exactly. Unlike Discard, this is
+    //   recoverable, so it sits ABOVE the destructive divider.
+    let stash_path = path.clone();
+    let stash_panel = panel.clone();
+    card = card.child(menu_row(
+        "git-row-ctx-stash",
+        "Stash Changes\u{2026}",
+        true,
+        theme.fg_base,
+        theme,
+        density,
+        typography.clone(),
+        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+            let p = stash_path.clone();
+            this.close(cx);
+            let _ = stash_panel.update(cx, |panel, cx| {
+                panel.request_stash_paths(vec![p], cx);
+            });
+        }),
+    ));
+
+    // ── 6. Discard… — opens the type-to-confirm discard dialog.
     //   Hidden for the Staged side because discarding a staged file
     //   should go through "Unstage" first (preserves the area-discard
     //   sequence the section header already implements). The modal
@@ -152,6 +176,7 @@ pub(super) fn build_single_card(
     if !is_staged {
         let discard_path = path;
         let discard_panel = panel;
+        card = card.child(separator(theme));
         card = card.child(menu_row(
             "git-row-ctx-discard",
             "Discard\u{2026}",
@@ -217,6 +242,29 @@ pub(super) fn build_multi_card(
             });
         }),
     ));
+
+    // ── Stash N selected… — same scoped push dialog, above the
+    //   destructive divider for the same reason as the single-row item.
+    let stash_label: SharedString = format!("Stash {count} selected\u{2026}").into();
+    let stash_paths = paths.clone();
+    let stash_panel = panel.clone();
+    card = card.child(menu_row(
+        "git-row-ctx-multi-stash",
+        stash_label,
+        true,
+        theme.fg_base,
+        theme,
+        density,
+        typography.clone(),
+        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+            let ps = stash_paths.clone();
+            this.close(cx);
+            let _ = stash_panel.update(cx, |panel, cx| {
+                panel.request_stash_paths(ps, cx);
+            });
+        }),
+    ));
+    card = card.child(separator(theme));
 
     // ── Discard N selected. Routes through `discard_area` so the
     //   user gets the type-to-confirm modal. Area is inferred from

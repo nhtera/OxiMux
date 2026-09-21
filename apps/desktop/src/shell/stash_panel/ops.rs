@@ -50,14 +50,25 @@
 
 use crate::shell::chrome::toast::ToastKind;
 use crate::shell::stash_panel::{StashListState, StashPanel};
-use gpui::Context;
+use gpui::{App, Context};
 use oximux_core::StashRef;
 use oximux_git::Repository;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use tokio::sync::oneshot;
 
 /// What a finished op wants said to the user: a toast kind plus its text, or
 /// nothing at all when the refreshed list already tells the whole story.
 type OpToast = Option<(ToastKind, String)>;
+
+/// Something for the *host* to do once an op has actually succeeded.
+///
+/// Only the partial-stash path uses it, to clear the file list's selection —
+/// and only on success, because a failed push leaves the files exactly where
+/// they were and throwing the selection away would make the retry manual.
+/// `Rc`, not `Arc`: it runs on the foreground executor like every other GPUI
+/// callback.
+pub type OnOpSuccess = Rc<dyn Fn(&mut App)>;
 
 /// Shown when the sha a row was painted with is no longer on the stack.
 const STASH_GONE: &str = "That stash no longer exists. The list has been refreshed.";
@@ -222,6 +233,85 @@ impl StashPanel {
         );
     }
 
+    /// Path-scoped `git stash push` — the file list's "Stash N selected".
+    ///
+    /// Fired from the CHANGES panel, but it runs *here* so the stash list
+    /// refreshes for free: `spawn_op` ends every op with `force_refresh`, and
+    /// a stash pushed from the other panel that did not appear until something
+    /// else poked the section would read as a failure.
+    ///
+    /// # The rename sequence, and why the failure path re-stages
+    ///
+    /// `rename_pairs` is non-empty only when the selection contains a STAGED
+    /// rename, whose original side lives in HEAD alone — no index entry, no
+    /// worktree file — so no pathspec can name it and `git stash push` exits 1
+    /// with nothing stashed at all. Unstaging the pair first turns it into a
+    /// worktree deletion plus an untracked file, both matchable. See
+    /// `git_panel::stash_selection` for the verified transcript.
+    ///
+    /// An unresolved merge anywhere in the repo makes the push fail outright
+    /// (`<path>: needs merge`), even for a selection of clean paths. Nothing is
+    /// stashed and the worktree is untouched, and the rollback below puts any
+    /// unstaged rename back, so the failure is safe — it is only the message
+    /// that comes from git rather than from us.
+    ///
+    /// That leaves a window: if the unstage succeeds and the push then fails,
+    /// the user is holding an unstaged rename they never asked for and no
+    /// stash to show for it. So the failure path puts the staging back, and
+    /// says plainly when it could not — a silently half-unstaged rename is a
+    /// worse outcome than a loud error.
+    pub fn push_paths(
+        &mut self,
+        msg: Option<String>,
+        include_untracked: bool,
+        paths: Vec<PathBuf>,
+        rename_pairs: Vec<(PathBuf, PathBuf)>,
+        on_success: Option<OnOpSuccess>,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        self.spawn_op_then(
+            move |repo| async move {
+                let rename_paths: Vec<&Path> = rename_pairs
+                    .iter()
+                    .flat_map(|(orig, current)| [orig.as_path(), current.as_path()])
+                    .collect();
+                if !rename_paths.is_empty() {
+                    repo.unstage_paths(&rename_paths)
+                        .await
+                        .map_err(|e| format!("could not unstage the renamed file: {e}"))?;
+                }
+                let path_refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+                match repo
+                    .stash_push(msg.as_deref(), include_untracked, &path_refs)
+                    .await
+                {
+                    Ok(_) => Ok(Some((
+                        ToastKind::Success,
+                        match count {
+                            1 => "Stashed 1 file".to_string(),
+                            n => format!("Stashed {n} files"),
+                        },
+                    ))),
+                    Err(err) if rename_paths.is_empty() => Err(err.to_string()),
+                    Err(err) => match repo.stage_paths(&rename_paths).await {
+                        Ok(()) => Err(format!("{err} (the rename was left staged as it was)")),
+                        Err(restore) => Err(format!(
+                            "{err} — and restoring the rename's staging FAILED: {restore}. \
+                             The rename is now unstaged; re-stage it with git add.",
+                        )),
+                    },
+                }
+            },
+            "Stash selected files",
+            on_success,
+            cx,
+        );
+    }
+
     /// Run `op` on tokio, toast whatever it asks for, then re-read the list.
     ///
     /// The refresh is always forced. The 15 s read-TTL on `stash_list` exists
@@ -229,6 +319,25 @@ impl StashPanel {
     /// own mutation is not something to sit on for 15 s.
     fn spawn_op<F, Fut>(&mut self, op: F, label: &'static str, cx: &mut Context<Self>)
     where
+        F: FnOnce(Repository) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<OpToast, String>> + Send + 'static,
+    {
+        self.spawn_op_then(op, label, None, cx);
+    }
+
+    /// [`spawn_op`] plus a host callback that runs only when the op reports
+    /// success. Deferred, so the hop out of this panel's update happens after
+    /// the entity lease is released — a cross-entity callback that read back
+    /// into `StashPanel` would otherwise double-lease and abort the process.
+    ///
+    /// [`spawn_op`]: Self::spawn_op
+    fn spawn_op_then<F, Fut>(
+        &mut self,
+        op: F,
+        label: &'static str,
+        on_success: Option<OnOpSuccess>,
+        cx: &mut Context<Self>,
+    ) where
         F: FnOnce(Repository) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<OpToast, String>> + Send + 'static,
     {
@@ -259,6 +368,11 @@ impl StashPanel {
                         crate::shell::toast::toast(cx, *kind, text.clone())
                     }
                     _ => {}
+                }
+                if matches!(result, Ok(Ok(_)))
+                    && let Some(cb) = on_success
+                {
+                    cx.defer(move |cx| cb(cx));
                 }
                 // Refresh even when the op failed — the user wants to see the
                 // state git is actually in, not the one they clicked on.

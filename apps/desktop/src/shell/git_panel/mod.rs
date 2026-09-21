@@ -22,10 +22,12 @@ pub mod row_context_menu;
 pub mod row_context_menu_items;
 pub mod row_renderer;
 pub mod selection;
+pub mod stash_selection;
 pub mod tree_render;
 
 pub use changed_files::ShowCombinedDiffRequested;
 pub use discard_ops::{DiscardRequest, DiscardRequested, DiscardScope};
+pub use stash_selection::{StashSelectedRequested, plan_stash_selection};
 
 use crate::actions::{RevertFile, StageFile, UnstageFile};
 use crate::git_state_cache::GitStateCache;
