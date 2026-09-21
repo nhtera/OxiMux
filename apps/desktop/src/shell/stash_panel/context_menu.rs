@@ -19,13 +19,16 @@
 //! at the workspace root, two close-on-open lists to keep in sync, and two
 //! chances for both to be open at once.
 //!
-//! # Items whose phase has not landed are absent
+//! # Items are omitted, never disabled
 //!
-//! Branch from Stash, Rename, Open All Changes and Restore This File belong
-//! to later phases. They are omitted rather than rendered disabled: a menu
-//! item that does nothing when clicked is exactly the defect Drop shipped
-//! with in Phase 3, and a greyed row still invites the click that teaches the
-//! user the menu lies.
+//! `Restore This File…` does not appear on an untracked row, and Rename is
+//! absent until its phase lands. Neither is rendered greyed out: a menu item
+//! that does nothing when clicked is exactly the defect Drop shipped with in
+//! Phase 3, and a greyed row still invites the click that teaches the user
+//! the menu lies. Restore in particular could only ever *fail* on an
+//! untracked file — it lives in the parentless `^3`, not in the stash
+//! commit's tree — so offering it behind a scary confirm dialog would be
+//! worse than offering nothing.
 //!
 //! Mounted as a child of `WorkspaceRoot` (same pattern as
 //! `CommitContextMenu`) so close-on-outside-click and peer-overlay
@@ -62,7 +65,14 @@ const ROW_PADDING_X: f32 = 10.0;
 #[derive(Debug, Clone)]
 pub enum StashContextTarget {
     Stash(DropStashRequested),
-    File { sha: String, path: PathBuf },
+    File {
+        sha: String,
+        path: PathBuf,
+        /// From the stash's untracked `^3` rather than its own tree. Decided
+        /// by the row that painted the file and carried here because the menu
+        /// has to make the Restore item appear or not appear at render time.
+        untracked: bool,
+    },
 }
 
 /// State of the open menu — owned by `WorkspaceRoot`.
@@ -145,7 +155,11 @@ impl Render for StashContextMenu {
             .shadow_lg();
         let card = match target {
             StashContextTarget::Stash(stash) => self.stash_items(card, stash, cx),
-            StashContextTarget::File { sha, path } => self.file_items(card, sha, path, cx),
+            StashContextTarget::File {
+                sha,
+                path,
+                untracked,
+            } => self.file_items(card, sha, path, untracked, cx),
         };
 
         // Right edge hugs the cursor, matching every peer menu so the eye-line
@@ -203,7 +217,7 @@ impl StashContextMenu {
                 .child(format!("stash@{{{index}}}")),
         );
 
-        // ── 1. The three ways to bring a stash back. Apply first (leaves the
+        // ── 1. The ways to bring a stash back. Apply first (leaves the
         //   entry), Pop second (consumes it), Apply with index third — it is
         //   Apply with one more promise, so it sits under the verb it refines
         //   rather than at the top competing with it.
@@ -237,9 +251,49 @@ impl StashContextMenu {
             },
             cx,
         ));
+        //   Branch from Stash is the FOURTH way back, and it sits with the
+        //   other three rather than off on its own: it is an apply that also
+        //   names a branch. It emits to the host instead of firing, because
+        //   on success git CONSUMES the stash and the name dialog is where
+        //   that gets disclosed. Same routing as Drop, and for the same
+        //   reason.
+        let branch_panel = self.panel.clone();
+        let branch_sha = sha.clone();
+        card = card.child(menu_row(
+            "stash-ctx-branch",
+            "Branch from Stash…",
+            theme.fg_base,
+            theme,
+            density,
+            typography.clone(),
+            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                if let Some(strong) = branch_panel.as_ref().and_then(|p| p.upgrade()) {
+                    let sha = branch_sha.clone();
+                    strong.update(cx, |panel, cx| {
+                        panel.request_branch_from_stash(&sha, index, cx)
+                    });
+                }
+                this.close(cx);
+            }),
+        ));
         card = card.child(separator(theme));
 
-        // ── 2. Clipboard. Copy Message is omitted, not disabled, when the
+        // ── 2. Everything that reads a stash without changing it.
+        //
+        //   Open All Changes shows every file in one tab — including the
+        //   untracked ones a `-u` stash carries, which the expanded row also
+        //   lists and which `commit_files` alone would silently drop.
+        card = card.child(self.verb(
+            "stash-ctx-open-all",
+            "Open All Changes",
+            theme.fg_base,
+            {
+                let sha = sha.clone();
+                move |panel, cx| panel.request_stash_all(&sha, cx)
+            },
+            cx,
+        ));
+        //   Copy Message is omitted, not disabled, when the
         //   stash carries none: the row paints "(no message)" as a stand-in
         //   for empty, and putting that stand-in on the clipboard would hand
         //   the user a string git never wrote.
@@ -295,13 +349,14 @@ impl StashContextMenu {
         ))
     }
 
-    /// The file-row item set. Deliberately short: a file inside a stash is
-    /// read-only until Phase 8 lands a restore.
+    /// The file-row item set: open the diff, copy the path, and — for a
+    /// tracked file only — restore it.
     fn file_items(
         &self,
         card: gpui::Div,
         sha: String,
         path: PathBuf,
+        untracked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let theme = self.theme;
@@ -334,7 +389,7 @@ impl StashContextMenu {
         // platform. What the row paints is the same string split in two, so
         // copying reassembles what the user can see.
         let copy_path = path.to_string_lossy().replace('\\', "/");
-        card.child(menu_row(
+        let card = card.child(menu_row(
             "stash-file-ctx-copy-path",
             "Copy Relative Path",
             theme.fg_base,
@@ -345,7 +400,36 @@ impl StashContextMenu {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
                 this.close(cx);
             }),
-        ))
+        ));
+
+        // Restore is destructive — it overwrites the worktree copy and stages
+        // the result — so it sits below a rule and tinted, like Drop, and it
+        // emits rather than firing: the host owns the confirm step.
+        //
+        // Absent entirely on an untracked row. See the module doc.
+        if untracked {
+            return card;
+        }
+        let restore_panel = self.panel.clone();
+        card.child(separator(theme))
+            .child(menu_row(
+                "stash-file-ctx-restore",
+                "Restore This File…",
+                theme.status_error,
+                theme,
+                density,
+                self.typography.clone(),
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if let Some(strong) = restore_panel.as_ref().and_then(|p| p.upgrade()) {
+                        let (sha, path) = (sha.clone(), path.clone());
+                        // The panel re-checks `origin` from its own cache
+                        // before it emits — belt and braces against a payload
+                        // that says tracked when the list says otherwise.
+                        strong.update(cx, |panel, cx| panel.request_file_restore(&sha, &path, cx));
+                    }
+                    this.close(cx);
+                }),
+            ))
     }
 
     /// A row that runs one stash op through the weak panel handle and closes.
@@ -451,6 +535,7 @@ mod tests {
         let file = StashContextTarget::File {
             sha: "abc".into(),
             path: PathBuf::from("src/main.rs"),
+            untracked: false,
         };
         assert!(matches!(stash, StashContextTarget::Stash(_)));
         assert!(matches!(file, StashContextTarget::File { .. }));

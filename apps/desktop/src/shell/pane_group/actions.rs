@@ -22,6 +22,7 @@ impl PaneGroup {
             | PaneGroupTabKind::Commit { .. }
             | PaneGroupTabKind::BranchFile { .. }
             | PaneGroupTabKind::StashFile { .. }
+            | PaneGroupTabKind::StashAll { .. }
             | PaneGroupTabKind::CombinedDiff { .. }
             | PaneGroupTabKind::Browser { .. }
             | PaneGroupTabKind::Tasks

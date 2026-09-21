@@ -1,0 +1,240 @@
+//! End-to-end tests for Phase 8's two panel-level ops: `branch_from_stash`
+//! and `restore_file_confirmed`.
+//!
+//! Same tokio/GPUI trade-off as `sc_stash_push_and_drop.rs` and
+//! `sc_stash_partial_push.rs`: each op crosses the tokio boundary and comes
+//! back through a GPUI callback, so the assertions read git's state directly
+//! rather than pumping `run_until_parked` between the crossings (which trips
+//! `test_scheduler.rs::detect_non_determinism`).
+//!
+//! What the git behaviour *is* — that `stash branch` consumes the stash, that
+//! a restore stages what it writes, that a bracketed path does not drag its
+//! glob sibling along — is proved against the binary in
+//! `crates/git/tests/stash_power_verbs.rs`. What these add is that the panel
+//! refuses a bad name before anything mutating runs, and that the ops are
+//! reachable from the panel at all.
+
+use gpui::{
+    AppContext, Context, Entity, IntoElement, ParentElement, Render, TestAppContext, Window, div,
+};
+use oximux_app::shell::stash_panel::StashPanel;
+use oximux_git::Repository;
+use oximux_settings::{Density, Theme, Typography};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn git(p: &Path, args: &[&str]) {
+    Command::new("git")
+        .args(args)
+        .current_dir(p)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@oximux.dev")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@oximux.dev")
+        .status()
+        .expect("git on PATH");
+}
+
+fn git_out(p: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(p)
+        .output()
+        .expect("git on PATH");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn status(p: &Path) -> Vec<String> {
+    let mut lines: Vec<String> = git_out(p, &["status", "--porcelain=v1"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+}
+
+struct Harness {
+    inner: Entity<StashPanel>,
+}
+
+impl Render for Harness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().child(self.inner.clone())
+    }
+}
+
+fn seed(p: &Path) {
+    git(p, &["init", "-b", "main"]);
+    git(p, &["config", "user.email", "test@oximux.dev"]);
+    git(p, &["config", "user.name", "Test"]);
+    std::fs::write(p.join("alpha.txt"), "a\n").expect("write");
+    std::fs::write(p.join("keep.txt"), "k\n").expect("write");
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-m", "base"]);
+}
+
+fn mount(repo: &Repository, cx: &mut TestAppContext) -> gpui::WindowHandle<Harness> {
+    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+    cx.add_window(|_win, cx| {
+        let panel = cx.new(|cx2| {
+            StashPanel::new(
+                repo.clone(),
+                gpui::px(oximux_app::scm_layout_settings::DEFAULT_STASH_HEIGHT),
+                None,
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                cx2,
+            )
+        });
+        Harness { inner: panel }
+    })
+}
+
+/// Long enough for the `git` subprocess the op shells out to. The existing
+/// stash tests use the same figure.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[gpui::test]
+async fn branch_from_stash_creates_the_branch_and_consumes_the_stash(cx: &mut TestAppContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path();
+    seed(p);
+    std::fs::write(p.join("alpha.txt"), "a2\n").expect("write");
+
+    let repo = rt.block_on(Repository::open(p)).expect("open repo");
+    rt.block_on(repo.stash_push(Some("wip"), false, &[]))
+        .expect("stash push");
+    let sha = rt.block_on(repo.stash_list(true)).expect("list")[0]
+        .sha
+        .clone();
+
+    let window = mount(&repo, cx);
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.branch_from_stash("fix-parser".into(), sha, 0, None, cx);
+            });
+        })
+        .expect("dispatch branch_from_stash");
+    settle();
+
+    assert_eq!(git_out(p, &["rev-parse", "--abbrev-ref", "HEAD"]), "fix-parser");
+    assert!(
+        rt.block_on(repo.stash_list(true))
+            .expect("list")
+            .is_empty(),
+        "stash branch consumes the stash on success",
+    );
+}
+
+#[gpui::test]
+async fn an_invalid_branch_name_never_reaches_a_mutating_git_call(cx: &mut TestAppContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path();
+    seed(p);
+    std::fs::write(p.join("alpha.txt"), "a2\n").expect("write");
+
+    let repo = rt.block_on(Repository::open(p)).expect("open repo");
+    rt.block_on(repo.stash_push(Some("wip"), false, &[]))
+        .expect("stash push");
+    let sha = rt.block_on(repo.stash_list(true)).expect("list")[0]
+        .sha
+        .clone();
+    let head_before = git_out(p, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    // `x..y` is refused by `check-ref-format`. The op asks it FIRST, so the
+    // stash is untouched and HEAD has not moved — the user gets a toast, not
+    // a half-done branch.
+    window_dispatch(cx, &repo, sha.clone(), "x..y".into());
+    settle();
+
+    assert_eq!(git_out(p, &["rev-parse", "--abbrev-ref", "HEAD"]), head_before);
+    assert_eq!(
+        rt.block_on(repo.stash_list(true)).expect("list").len(),
+        1,
+        "an invalid name must leave the stash exactly where it was",
+    );
+    assert!(
+        git_out(p, &["branch", "--format=%(refname:short)"])
+            .lines()
+            .all(|b| b.trim() == head_before),
+        "no branch should have been created",
+    );
+}
+
+/// Mount a panel and fire `branch_from_stash` on it. Split out because the
+/// window handle has to be dropped before the assertions read git, and the
+/// closure nesting obscures that in the test body.
+fn window_dispatch(cx: &mut TestAppContext, repo: &Repository, sha: String, name: String) {
+    let window = mount(repo, cx);
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.branch_from_stash(name, sha, 0, None, cx);
+            });
+        })
+        .expect("dispatch branch_from_stash");
+}
+
+#[gpui::test]
+async fn restore_file_confirmed_writes_one_file_and_keeps_the_stash(cx: &mut TestAppContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path();
+    seed(p);
+    std::fs::write(p.join("alpha.txt"), "stashed\n").expect("write");
+    std::fs::write(p.join("keep.txt"), "stashed-keep\n").expect("write");
+
+    let repo = rt.block_on(Repository::open(p)).expect("open repo");
+    rt.block_on(repo.stash_push(Some("wip"), false, &[]))
+        .expect("stash push");
+    let sha = rt.block_on(repo.stash_list(true)).expect("list")[0]
+        .sha
+        .clone();
+    // Diverge both after the stash, so a restore of one is visible and a
+    // stray restore of the other would be too.
+    std::fs::write(p.join("alpha.txt"), "local\n").expect("write");
+    std::fs::write(p.join("keep.txt"), "local-keep\n").expect("write");
+
+    let window = mount(&repo, cx);
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.restore_file_confirmed(sha, PathBuf::from("alpha.txt"), cx);
+            });
+        })
+        .expect("dispatch restore_file_confirmed");
+    settle();
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("alpha.txt")).expect("read"),
+        "stashed\n",
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("keep.txt")).expect("read"),
+        "local-keep\n",
+        "the unnamed file must not have moved",
+    );
+    // Staged — which is why the confirm dialog says so.
+    assert!(
+        status(p).contains(&"M  alpha.txt".to_string()),
+        "restored file should be staged, got {:?}",
+        status(p),
+    );
+    assert_eq!(
+        rt.block_on(repo.stash_list(true)).expect("list").len(),
+        1,
+        "restore copies out; the stash stays",
+    );
+}

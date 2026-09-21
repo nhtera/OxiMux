@@ -385,3 +385,88 @@ async fn the_budget_reads_the_chosen_height_and_paints_the_trimmed_one(
         );
     });
 }
+
+// ── Phase 8: the restore gate ────────────────────────────────────────────
+//
+// `Restore This File…` is offered per file, and it is only legal for a
+// TRACKED one: an untracked file lives in the stash's parentless `^3`, not in
+// the stash commit's tree, so `git checkout <sha> -- <path>` can only fail on
+// it (proved in `crates/git/tests/stash_power_verbs.rs`). There are two gates
+// — the menu omits the item, and the panel refuses to emit — and this covers
+// the second, which is the one that holds when a payload and the cached list
+// disagree.
+
+/// Collect every `RestoreStashFileRequested` the panel emits during `body`.
+fn restore_requests(
+    panel: &Entity<StashPanel>,
+    cx: &mut TestAppContext,
+    body: impl FnOnce(&mut StashPanel, &mut Context<StashPanel>),
+) -> Vec<PathBuf> {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let sub = cx.update(|cx| {
+        cx.subscribe(
+            panel,
+            move |_panel, ev: &oximux_app::shell::stash_panel::RestoreStashFileRequested, _cx| {
+                sink.borrow_mut().push(ev.path.clone());
+            },
+        )
+    });
+    panel.update(cx, body);
+    drop(sub);
+    seen.borrow().clone()
+}
+
+#[gpui::test]
+async fn a_tracked_file_can_be_restored(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_repo(tmp.path());
+    let panel = mounted(tmp.path(), cx);
+    panel.update(cx, |p, cx| {
+        p.apply_list_result(Ok(two_stashes()), cx);
+        p.toggle_expanded("aaa1111".into(), cx);
+        p.apply_files_result("aaa1111", Ok(newer_files()), cx);
+    });
+
+    let asked = restore_requests(&panel, cx, |p, cx| {
+        p.request_file_restore("aaa1111", Path::new("alpha.txt"), cx);
+    });
+    assert_eq!(asked, vec![PathBuf::from("alpha.txt")]);
+}
+
+#[gpui::test]
+async fn an_untracked_file_is_refused_even_when_asked_directly(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_repo(tmp.path());
+    let panel = mounted(tmp.path(), cx);
+    panel.update(cx, |p, cx| {
+        p.apply_list_result(Ok(two_stashes()), cx);
+        p.toggle_expanded("aaa1111".into(), cx);
+        p.apply_files_result("aaa1111", Ok(newer_files()), cx);
+    });
+
+    // `fresh.txt` IS in the row's file list — that is exactly how a user
+    // reaches a row that must not offer Restore.
+    let asked = restore_requests(&panel, cx, |p, cx| {
+        p.request_file_restore("aaa1111", Path::new("fresh.txt"), cx);
+    });
+    assert!(
+        asked.is_empty(),
+        "an untracked file must not reach a confirm dialog, got {asked:?}",
+    );
+}
+
+#[gpui::test]
+async fn a_file_whose_stash_is_not_cached_asks_nothing(cx: &mut TestAppContext) {
+    // The list moved under an open menu. Silently doing nothing is right: the
+    // menu could only have been opened from a painted row.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_repo(tmp.path());
+    let panel = mounted(tmp.path(), cx);
+    panel.update(cx, |p, cx| p.apply_list_result(Ok(two_stashes()), cx));
+
+    let asked = restore_requests(&panel, cx, |p, cx| {
+        p.request_file_restore("bbb2222", Path::new("alpha.txt"), cx);
+    });
+    assert!(asked.is_empty());
+}

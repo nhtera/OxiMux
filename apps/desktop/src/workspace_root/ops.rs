@@ -625,6 +625,9 @@ impl WorkspaceRoot {
             self._push_stash_subscription = None;
             self._drop_stash_subscription = None;
             self._show_stash_file_subscription = None;
+            self._show_stash_all_subscription = None;
+            self._branch_from_stash_subscription = None;
+            self._restore_stash_file_subscription = None;
             self._show_commit_subscription = None;
             self._show_branch_file_subscription = None;
             self._show_combined_diff_subscription = None;
@@ -707,6 +710,41 @@ impl WorkspaceRoot {
                         repo, sha, base, head, path, label, window, cx,
                     );
                 });
+            },
+        ));
+
+        let stash_all_repo = repo.clone();
+        self._show_stash_all_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            move |root, _panel, ev: &ShowStashAllRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                // No revision pair to pick here: `DiffView::load_stash` fetches
+                // the tracked side AND the untracked `^3` set in one call, so
+                // the tab shows exactly what the expanded row lists.
+                let (sha, label) = (ev.sha.clone(), ev.label.clone());
+                let repo = stash_all_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_stash_all_tab(repo, sha, label, window, cx);
+                });
+            },
+        ));
+
+        self._branch_from_stash_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &BranchFromStashRequested, window, cx| {
+                root.mount_branch_from_stash_dialog(panel, ev, window, cx);
+            },
+        ));
+
+        self._restore_stash_file_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &RestoreStashFileRequested, window, cx| {
+                root.mount_restore_stash_file_dialog(panel, ev, window, cx);
             },
         ));
 

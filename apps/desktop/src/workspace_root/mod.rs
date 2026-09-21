@@ -122,7 +122,11 @@ use crate::shell::{
         graph::ShowCommitRequested,
     },
     stash_panel::{
-        DropStashRequested, PushStashRequested, ShowStashFileRequested, StashPanel,
+        BranchFromStashRequested, DropStashRequested, PushStashRequested,
+        RestoreStashFileRequested, ShowStashAllRequested, ShowStashFileRequested, StashPanel,
+        branch_dialog::{
+            BranchFromStashDialog, BranchFromStashPrompt, BranchNameCallback, suggest_branch_name,
+        },
         context_menu::{StashContextMenu, StashContextTarget},
         ops::OnOpSuccess,
         push_dialog::{
@@ -416,6 +420,24 @@ pub struct WorkspaceRoot {
     /// handler opens a read-only diff tab for that file. Same lifetime
     /// contract as `_drop_stash_subscription`.
     pub(crate) _show_stash_file_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::ShowStashAllRequested` — the
+    /// `Open All Changes` verb. Same lifetime contract as
+    /// `_show_stash_file_subscription`.
+    pub(crate) _show_stash_all_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::BranchFromStashRequested`.
+    /// Dropping it silently disables `Branch from Stash…`.
+    pub(crate) _branch_from_stash_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::RestoreStashFileRequested`.
+    /// Dropping it silently disables `Restore This File…`.
+    pub(crate) _restore_stash_file_subscription: Option<Subscription>,
+    /// Active branch-from-stash name modal (per-request; `None` when idle).
+    /// Its own slot rather than sharing `push_stash_dialog`: the two are
+    /// different forms, and a shared slot would let one silently replace a
+    /// half-typed other.
+    pub(crate) branch_from_stash_dialog: Option<Entity<BranchFromStashDialog>>,
+    /// Per-mount observer on the active `BranchFromStashDialog`. Same
+    /// lifecycle pattern as `_push_stash_dialog_observer`.
+    pub(crate) _branch_from_stash_dialog_observer: Option<Subscription>,
     /// Active push-stash form modal (per-request; `None` when idle).
     /// Wired alongside `confirm_dialog` but kept in its own slot so
     /// the type-to-confirm flow stays separable from this creation
@@ -1374,6 +1396,11 @@ impl WorkspaceRoot {
             _drop_stash_subscription: None,
             _stash_selection_subscription: None,
             _show_stash_file_subscription: None,
+            _show_stash_all_subscription: None,
+            _branch_from_stash_subscription: None,
+            _restore_stash_file_subscription: None,
+            branch_from_stash_dialog: None,
+            _branch_from_stash_dialog_observer: None,
             _show_branch_file_subscription: None,
             _show_combined_diff_subscription: None,
             _show_branch_diff_all_subscription: None,

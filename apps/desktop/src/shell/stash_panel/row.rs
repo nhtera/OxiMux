@@ -340,6 +340,7 @@ impl StashPanel {
                             relative: menu_entry.relative.clone(),
                             branch: menu_entry.branch.clone(),
                             file_path: None,
+                            file_untracked: false,
                         }),
                         cx,
                     );

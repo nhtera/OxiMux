@@ -650,6 +650,10 @@ impl WorkspaceRoot {
             self._discard_dialog_observer = None;
             self.push_stash_dialog = None;
             self._push_stash_dialog_observer = None;
+            // Same reasoning for the branch-from-stash form: it creates a
+            // branch in the active repo and consumes a stash there.
+            self.branch_from_stash_dialog = None;
+            self._branch_from_stash_dialog_observer = None;
         }
 
         // Clone window_id BEFORE any mutable borrows of self so closure

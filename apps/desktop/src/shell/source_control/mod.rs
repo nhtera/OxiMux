@@ -243,6 +243,11 @@ pub struct SourceControlPanel {
     /// `pub(crate)` so the host workspace can `cx.subscribe` to
     /// `PushStashRequested` and mount the push-stash dialog.
     pub(crate) stash_panel: Entity<StashPanel>,
+    /// The status poller feeding this panel, handed over by `RightSidebar`
+    /// after construction. Held solely so
+    /// [`SourceControlPanel::refresh_after_branch_change`] can kick it; see
+    /// `picker_wiring.rs` for why.
+    poller: Option<Arc<oximux_git::StatusPoller>>,
 
     theme: Theme,
     density: Density,
@@ -496,6 +501,7 @@ impl SourceControlPanel {
             branch_commits,
             branch_picker,
             stash_panel,
+            poller: None,
             theme,
             density,
             typography,
@@ -705,7 +711,7 @@ impl SourceControlPanel {
 
     /// Force the next poll tick to re-check PR/CI status (bypassing the 30s
     /// throttle) and drop stale checks view-state.
-    fn refresh_checks(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_checks(&mut self, cx: &mut Context<Self>) {
         self.pr_status_checked_at = None;
         // Cancel any in-flight log fetch / fix bundle so a stale dispatch can't
         // land after the user asked for a fresh check.

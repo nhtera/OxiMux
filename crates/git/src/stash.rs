@@ -26,7 +26,7 @@
 use crate::error::{GitError, Result};
 use crate::process::GitCmd;
 use crate::repository::Repository;
-use oximux_core::{StashEntry, StashFile, StashFileOrigin, StashRef};
+use oximux_core::{FileDiff, StashEntry, StashFile, StashFileOrigin, StashRef};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -229,6 +229,50 @@ impl Repository {
             origin: StashFileOrigin::Untracked,
         }));
         Ok(out)
+    }
+
+    /// Every file a stash touches, as full patch diffs — the "Open All
+    /// Changes" tab's fetch.
+    ///
+    /// **Composes [`Repository::commit_files`]; never modifies it.** That
+    /// method uses `--first-parent`, so on a stash commit it reports the
+    /// tracked side and nothing else: a `-u` stash's untracked files live in
+    /// the parentless `^3` and are invisible to it. The obvious repair —
+    /// teaching `commit_files` about `^3` — would silently change the file set
+    /// of every commit-detail tab in the app, which is why this is a sibling
+    /// and not an edit.
+    ///
+    /// `^3` is a root commit, so `git show -p` on it emits an ordinary
+    /// new-file diff per untracked path (verified, including a path with glob
+    /// metacharacters) — the same shape `parse_unified_diff` already reads.
+    /// A stash pushed without `-u` has no `^3` at all; see
+    /// [`Repository::untracked_commit_files`] for why absence is settled by
+    /// exit code rather than by error text.
+    pub async fn stash_all_files(&self, sha: &str) -> Result<Vec<FileDiff>> {
+        let untracked_rev = format!("{sha}^3");
+        // Concurrent — independent queries, matching `stash_files`.
+        let (tracked, untracked) = tokio::join!(
+            self.commit_files(sha),
+            self.untracked_commit_files(&untracked_rev),
+        );
+        let mut out = tracked?;
+        out.extend(untracked?);
+        Ok(out)
+    }
+
+    /// Patch diffs for a stash's `^3`, or an empty list when it has none.
+    ///
+    /// Same absence-is-not-failure rule as
+    /// [`Repository::untracked_name_status`]: a stash pushed without `-u` has
+    /// no third parent and `git show` hard-errors on it, but a `^3` that
+    /// exists and cannot be read is a real failure the caller must see —
+    /// otherwise the tab quietly shows the tracked half and the user believes
+    /// their untracked files were never stashed.
+    async fn untracked_commit_files(&self, rev: &str) -> Result<Vec<FileDiff>> {
+        if !self.rev_exists(rev).await {
+            return Ok(Vec::new());
+        }
+        self.commit_files(rev).await
     }
 
     /// The `^3` half of [`Repository::stash_files`]: untracked files, or an
@@ -446,6 +490,13 @@ impl Repository {
     ///
     /// The one clean refusal is a name collision — `fatal: a branch named
     /// '<x>' already exists` — which fails before touching anything.
+    ///
+    /// **It restores the staged/unstaged split**, unlike a plain
+    /// `stash_apply(_, false)`: it applies with `--index`, and it can do so
+    /// unconditionally because the branch it just created sits at the stash's
+    /// base commit, so there is never a staged change for the index to
+    /// conflict with. Verified in both directions — a change stashed unstaged
+    /// comes back unstaged, one stashed staged comes back staged.
     pub async fn stash_branch(&self, name: &str, stash_ref: &StashRef) -> Result<()> {
         if name.is_empty() {
             return Err(GitError::invalid_input("branch name is empty"));

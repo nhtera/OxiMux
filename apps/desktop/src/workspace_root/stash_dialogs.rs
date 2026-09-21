@@ -228,6 +228,171 @@ impl WorkspaceRoot {
         );
     }
 
+    /// Mount the name prompt for `Branch from Stash…`.
+    ///
+    /// The dialog's copy does the disclosure — `git stash branch` consumes
+    /// the stash — because nothing on the row says so and the verb does not
+    /// imply it.
+    ///
+    /// `on_done`, not `on_success`, drives the panel refresh: `stash branch`
+    /// can fail having already created and checked out the branch (verified),
+    /// so HEAD may have moved even on the error path. Refreshing only on
+    /// success would leave the toolbar naming a branch the user is no longer
+    /// on, which is worse than the failure it is reporting.
+    pub(crate) fn mount_branch_from_stash_dialog(
+        &mut self,
+        panel: &Entity<StashPanel>,
+        ev: &BranchFromStashRequested,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // First-open-wins, like the push form: a double-click must not drop a
+        // half-typed name.
+        if self.branch_from_stash_dialog.is_some() {
+            return;
+        }
+        let Some(sc) = self
+            .right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+        else {
+            return;
+        };
+
+        let weak = panel.downgrade();
+        let weak_sc = sc.downgrade();
+        let weak_root = cx.entity().downgrade();
+        // Re-checked at FIRE time — see the module doc's guard 2. Creating a
+        // branch and consuming a stash in a repo the user has stopped looking
+        // at is invisible until they switch back.
+        let project_id = self.active_project.as_ref().map(|p| p.id.clone());
+        let sha = ev.sha.clone();
+        let painted = ev.painted;
+
+        let on_confirm: BranchNameCallback = Rc::new(move |name, _window, cx| {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            let still_current = weak_root
+                .upgrade()
+                .map(|root| {
+                    root.read(cx).active_project.as_ref().map(|p| p.id.clone()) == project_id
+                })
+                .unwrap_or(false);
+            if !still_current {
+                tracing::warn!(
+                    target: "oximux_app::stash_panel",
+                    "branch-from-stash confirm fired after a project switch; ignored",
+                );
+                return;
+            }
+            let on_done = {
+                let weak_sc = weak_sc.clone();
+                Rc::new(move |cx: &mut gpui::App| {
+                    let _ = weak_sc.update(cx, |sc, cx| sc.refresh_after_branch_change(cx));
+                }) as OnOpSuccess
+            };
+            let sha = sha.clone();
+            panel.update(cx, |p, cx| {
+                p.branch_from_stash(name, sha, painted, Some(on_done), cx)
+            });
+        });
+
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let prompt = BranchFromStashPrompt {
+            on_confirm,
+            on_cancel: Some(noop_cancel()),
+            stash_label: ev.message.clone(),
+            // A seed, not a decision: the user edits it, and git has the final
+            // say via `check-ref-format`. An unlabelled stash seeds nothing
+            // rather than a stray separator.
+            suggested_name: suggest_branch_name(&ev.message).unwrap_or_default(),
+        };
+        let dialog = cx
+            .new(|cx| BranchFromStashDialog::new(prompt, theme, density, typography, window, cx));
+        self._branch_from_stash_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.branch_from_stash_dialog = None;
+                    root._branch_from_stash_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.branch_from_stash_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// Mount the confirm dialog for `Restore This File…`.
+    ///
+    /// Treated exactly like discard, because it is the same class of act: it
+    /// overwrites the worktree copy with no backup and nothing in git holds
+    /// the old contents. The copy says "overwritten" and "lost" in plain
+    /// words rather than softening them.
+    ///
+    /// It also says the file comes back **staged** — verified: `git checkout
+    /// <sha> -- <path>` writes the index too, so `git status` shows the path
+    /// in the index column and a user who expected only a worktree change
+    /// would commit it by accident.
+    pub(crate) fn mount_restore_stash_file_dialog(
+        &mut self,
+        panel: &Entity<StashPanel>,
+        ev: &RestoreStashFileRequested,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = panel.downgrade();
+        let weak_root = cx.entity().downgrade();
+        let project_id = self.active_project.as_ref().map(|p| p.id.clone());
+        let sha = ev.sha.clone();
+        let path = ev.path.clone();
+        let leaf = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+        let on_confirm: ConfirmCallback = Rc::new(move |_window, cx| {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            let still_current = weak_root
+                .upgrade()
+                .map(|root| {
+                    root.read(cx).active_project.as_ref().map(|p| p.id.clone()) == project_id
+                })
+                .unwrap_or(false);
+            if !still_current {
+                tracing::warn!(
+                    target: "oximux_app::stash_panel",
+                    "restore confirm fired after a project switch; ignored",
+                );
+                return;
+            }
+            let (sha, path) = (sha.clone(), path.clone());
+            panel.update(cx, |p, cx| p.restore_file_confirmed(sha, path, cx));
+        });
+
+        let prompt = ConfirmPrompt {
+            title: "Restore this file from the stash?".into(),
+            body: format!(
+                "{leaf} will be overwritten with the stashed version, and staged. \
+                 Your current changes to this file are lost. The stash itself is not \
+                 changed — this copies the file out, it does not pop."
+            )
+            .into(),
+            on_confirm,
+            confirm_label: Some("Restore".into()),
+            on_cancel: None,
+            secondary: None,
+        };
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
+    }
+
     /// Put `prompt` in the single push-dialog slot and wire its teardown.
     ///
     /// First-open-wins: a double-click on the header `+` button, or a stash

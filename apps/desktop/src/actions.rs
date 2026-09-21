@@ -325,6 +325,14 @@ pub struct OpenStashContextMenuAt {
     pub relative: String,
     pub branch: String,
     pub file_path: Option<String>,
+    /// Whether that file came from the stash's untracked `^3` rather than its
+    /// own tree. Carried in the payload because the menu has to decide at
+    /// RENDER time whether to offer `Restore This File…`, and the only side
+    /// that knows a file's origin is the row that painted it. An untracked
+    /// file is absent from the stash commit's tree, so `git checkout <sha> --
+    /// <path>` can only fail on it; the item is omitted rather than shown
+    /// disabled. Meaningless — and `false` — when `file_path` is `None`.
+    pub file_untracked: bool,
 }
 
 /// Payload action carrying text up to the workspace so it can resolve "the
@@ -799,6 +807,7 @@ mod tests {
         assert!(a.sha.is_empty());
         assert_eq!(a.index, 0);
         assert!(a.file_path.is_none(), "default must not be a file row");
+        assert!(!a.file_untracked, "a non-file default is never untracked");
     }
 
     #[test]
@@ -812,11 +821,15 @@ mod tests {
             relative: "3 hours ago".to_string(),
             branch: "main".to_string(),
             file_path: Some("src/parser.rs".to_string()),
+            file_untracked: true,
         };
         let dup = original.clone();
         assert_eq!(original, dup);
         assert_eq!(dup.index, 2);
         assert_eq!(dup.file_path.as_deref(), Some("src/parser.rs"));
+        // The origin has to survive the clone the right-click handler makes:
+        // it is what decides whether `Restore This File…` is offered at all.
+        assert!(dup.file_untracked);
     }
 
     #[test]

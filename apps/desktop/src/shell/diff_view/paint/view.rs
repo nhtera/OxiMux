@@ -320,17 +320,20 @@ impl Render for DiffView {
                 )
                 .into_any_element()
             }
+            // `commit_noun` is the one thing that distinguishes a stash's
+            // all-files tab from a commit's — see its field doc. Only these
+            // two arms name the thing out loud.
             DiffViewState::CommitLoading {
                 short_oid, subject, ..
             } => loading_state(
-                &format!("Loading commit {short_oid}: {subject}…"),
+                &format!("Loading {noun} {short_oid}: {subject}…", noun = self.commit_noun),
                 &rctx,
             )
             .into_any_element(),
             DiffViewState::CommitFailed {
                 short_oid, error, ..
             } => failed_state(
-                &format!("commit {short_oid}"),
+                &format!("{noun} {short_oid}", noun = self.commit_noun),
                 error,
                 &rctx,
                 cx,

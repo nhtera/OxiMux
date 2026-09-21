@@ -291,19 +291,55 @@ StashPanel (GPUI entity)
     error is toasted. on_success is deferred (the cross-entity hop out of a
     leased entity) and only clears the file list's selection when the push
     actually succeeded.
+  → ShowStashAllRequested → PaneGroupTabKind::StashAll { sha }
+                            DiffView::load_stash → repo.stash_all_files(sha)
+                            = commit_files(sha) ++ commit_files(sha^3)
+                            commit_files alone is --first-parent and drops the
+                            untracked half; it is composed, never modified,
+                            because it also serves every commit-detail tab
+  → BranchFromStashRequested → host name dialog → branch_from_stash()
+      is_valid_branch_name (git check-ref-format --branch, read-only) runs
+      FIRST, so a bad name never reaches a mutating call. On success
+      git stash branch CONSUMES the stash and restores the staged/unstaged
+      split (it applies with --index; the new branch is at the stash's base,
+      so there is never an index to conflict with). On failure the branch may
+      ALREADY exist and be checked out, which is why the host hook is
+      on_done, not on_success — see OpHooks in stash_panel/ops.rs.
+  → RestoreStashFileRequested → host confirm dialog → restore_file_confirmed()
+      git checkout <sha> -- <path> via run_pathspec_op (a bare pathspec makes
+      restoring a[1].rs also overwrite a1.rs). Writes the INDEX as well as the
+      worktree, so the dialog says "and staged". Tracked files only —
+      untracked ones live in ^3, not in the stash commit's tree, and the
+      checkout can only fail; the panel refuses to emit for them and the menu
+      omits the item.
 
 StashContextMenu (GPUI entity, mounted on WorkspaceRoot)
   ← OpenStashContextMenuAt { x, y, sha, index, message, relative, branch,
-                             file_path }
-      file_path == None → the stash row:
-        Apply / Pop / Apply with index (git stash apply --index, restores the
-        staged split from the stash commit's ^2) · Copy Message / Copy SHA ·
+                             file_path, file_untracked }
+      file_path == None → the stash row, in three groups:
+        ways back — Apply / Pop / Apply with index (git stash apply --index,
+          restores the staged split from the stash commit's ^2) /
+          Branch from Stash… (an apply that also names a branch, and the only
+          one that consumes the stash) → emits BranchFromStashRequested
+        read-only — Open All Changes · Copy Message / Copy SHA
         Drop… → emits DropStashRequested, the same confirm gate the row uses
       file_path == Some → a file inside an expanded stash:
         Open Changes (panel resolves StashFileOrigin from its own cache) ·
-        Copy Relative Path
+        Copy Relative Path · Restore This File… (absent when file_untracked;
+        origin has to travel in the payload because the menu decides at RENDER
+        time, and only the row that painted the file knows)
   ← WeakEntity<StashPanel>; dismisses silently after a workspace switch
   ← items whose phase has not landed are omitted, never disabled
+
+SourceControlPanel::refresh_after_branch_change (picker_wiring.rs)
+  ← called by switch_to_branch AND by the branch-from-stash on_done hook
+  ← commit_graph.refresh() — the one thing the StatusPoller never covered.
+    The branch name, the file list and "Committed on Branch" all arrive on
+    the poll channel and self-heal in one 500 ms tick; the graph's only other
+    refresh sites are a completed commit op and the two manual buttons, so it
+    kept painting the previous branch's history indefinitely. Pre-existing
+    gap, found while wiring branch-from-stash, fixed for both callers.
+  ← PR/CI state dropped (it belongs to the branch just left) + poller.kick()
 
 SourceControlPanel::sections (the stash section + the graph)
   ← both heights persisted separately; fit_sections() splits one budget

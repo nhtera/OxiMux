@@ -42,7 +42,8 @@ impl Render for WorkspaceRoot {
             || self.floating_terminal_visible
             || self.confirm_dialog.is_some()
             || self.rename_tab_dialog.is_some()
-            || self.push_stash_dialog.is_some();
+            || self.push_stash_dialog.is_some()
+            || self.branch_from_stash_dialog.is_some();
         cx.set_global(crate::shell::browser_view::WebviewSuppressed(panes_covered));
         let theme = self.theme;
         let density = self.density;
@@ -1482,6 +1483,10 @@ impl Render for WorkspaceRoot {
                         Some(path) => StashContextTarget::File {
                             sha: action.sha.clone(),
                             path: std::path::PathBuf::from(path),
+                            // Decides whether Restore is offered at all; the
+                            // row that painted the file is the only side that
+                            // knows. See the action's own field note.
+                            untracked: action.file_untracked,
                         },
                         // The whole `DropStashRequested` payload, so the menu's
                         // Drop item emits exactly what the row's does and both
@@ -2245,6 +2250,21 @@ impl Render for WorkspaceRoot {
             })
             // Push-stash form modal — same overlay pattern.
             .when_some(self.push_stash_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
+            // Branch-from-stash name modal — same overlay pattern. Its own
+            // slot, so it cannot replace a half-typed push form.
+            .when_some(self.branch_from_stash_dialog.clone(), |parent, dialog| {
                 parent.child(
                     div()
                         .absolute()

@@ -25,6 +25,7 @@
 //! Ops are detached instead (see `ops.rs`): cancelling a destructive op
 //! mid-subprocess loses its result.
 
+pub mod branch_dialog;
 pub mod context_menu;
 pub mod file_row;
 pub mod list_render;
@@ -111,6 +112,44 @@ pub struct DropStashRequested {
     pub message: String,
     pub relative: String,
     pub branch: String,
+}
+
+/// Emitted when the user picks `Open All Changes` on a stash row. The host
+/// opens one read-only tab holding every file the stash touches.
+#[derive(Debug, Clone)]
+pub struct ShowStashAllRequested {
+    pub sha: String,
+    /// What to call the stash in the tab title, resolved from the same list
+    /// the row was painted from.
+    pub label: String,
+}
+
+/// Emitted when the user picks `Branch from Stash…`. The host prompts for a
+/// name and, on confirm, calls [`StashPanel::branch_from_stash`].
+///
+/// Carries the stash's message so the dialog can offer a default name; the
+/// user is naming a branch after work they described once already.
+#[derive(Debug, Clone)]
+pub struct BranchFromStashRequested {
+    pub sha: String,
+    /// The `stash@{N}` the row was PAINTED with — a tiebreaker for the
+    /// resolve, never a target. Same contract as [`DropStashRequested`].
+    pub painted: usize,
+    pub message: String,
+}
+
+/// Emitted when the user picks `Restore This File…` on a file inside a stash.
+/// The host mounts a confirm dialog and, on confirm, calls
+/// [`StashPanel::restore_file_confirmed`].
+///
+/// Only ever emitted for a [`StashFileOrigin::Tracked`] file — an untracked
+/// one is not in the stash commit's tree and `git checkout <sha> -- <path>`
+/// can only fail on it. The menu omits the item entirely for those rows; this
+/// is the second gate, on the panel side, where the origin is actually known.
+#[derive(Debug, Clone)]
+pub struct RestoreStashFileRequested {
+    pub sha: String,
+    pub path: PathBuf,
 }
 
 pub struct StashPanel {
@@ -202,6 +241,9 @@ pub struct StashPanel {
 impl EventEmitter<PushStashRequested> for StashPanel {}
 impl EventEmitter<DropStashRequested> for StashPanel {}
 impl EventEmitter<ShowStashFileRequested> for StashPanel {}
+impl EventEmitter<ShowStashAllRequested> for StashPanel {}
+impl EventEmitter<BranchFromStashRequested> for StashPanel {}
+impl EventEmitter<RestoreStashFileRequested> for StashPanel {}
 
 impl StashPanel {
     #[allow(clippy::too_many_arguments)]
@@ -407,20 +449,82 @@ impl StashPanel {
             return;
         };
         let origin = file.origin;
-        let label = match &self.state {
-            StashListState::Ready(entries) => entries
-                .iter()
-                .find(|e| e.sha == sha)
-                .map(list_render::row_message)
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
+        let label = self.label_of_stash(sha);
         cx.emit(ShowStashFileRequested {
             sha: sha.to_string(),
             path: path.to_path_buf(),
             origin,
             label,
         });
+    }
+
+    /// Ask the host to open every file in `sha` in one tab.
+    ///
+    /// The label is resolved here, from the list the row was painted from, for
+    /// the same reason `request_file_diff` resolves `origin` here: the menu
+    /// carries an action payload and the panel owns the data.
+    pub fn request_stash_all(&mut self, sha: &str, cx: &mut Context<Self>) {
+        cx.emit(ShowStashAllRequested {
+            sha: sha.to_string(),
+            label: self.label_of_stash(sha),
+        });
+    }
+
+    /// Ask the host to prompt for a branch name for `sha`.
+    pub fn request_branch_from_stash(&mut self, sha: &str, painted: usize, cx: &mut Context<Self>) {
+        cx.emit(BranchFromStashRequested {
+            sha: sha.to_string(),
+            painted,
+            message: match &self.state {
+                StashListState::Ready(entries) => entries
+                    .iter()
+                    .find(|e| e.sha == sha)
+                    .map(|e| e.message.clone())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+        });
+    }
+
+    /// Ask the host to confirm restoring one file out of a stash.
+    ///
+    /// Refuses an untracked file rather than emitting: it lives in the
+    /// parentless `^3`, not in the stash commit's tree, so the restore could
+    /// only fail — and a destructive confirm dialog that can never succeed is
+    /// worse than no menu item at all. The menu already omits the item for
+    /// those rows; this is the gate on the side that owns `origin`.
+    pub fn request_file_restore(
+        &mut self,
+        sha: &str,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(StashFilesState::Ready(files)) = self.files.get(sha) else {
+            return;
+        };
+        let Some(file) = files.iter().find(|f| f.path == path) else {
+            return;
+        };
+        if file.origin != StashFileOrigin::Tracked {
+            return;
+        }
+        cx.emit(RestoreStashFileRequested {
+            sha: sha.to_string(),
+            path: path.to_path_buf(),
+        });
+    }
+
+    /// What to call `sha` in a tab title or a dialog — its message, or an
+    /// empty string when the list has moved on.
+    fn label_of_stash(&self, sha: &str) -> String {
+        match &self.state {
+            StashListState::Ready(entries) => entries
+                .iter()
+                .find(|e| e.sha == sha)
+                .map(list_render::row_message)
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
     }
 
     /// How many files a stash touches — `None` until the fetch lands.

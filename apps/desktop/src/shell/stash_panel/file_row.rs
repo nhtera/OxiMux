@@ -132,6 +132,9 @@ impl StashPanel {
             relative: entry.relative.clone(),
             branch: entry.branch.clone(),
             file_path: Some(file.path.display().to_string()),
+            // Decides whether the menu offers Restore at all — see the
+            // field's own note on why origin has to travel with the click.
+            file_untracked: file.origin == oximux_core::StashFileOrigin::Untracked,
         };
 
         div()

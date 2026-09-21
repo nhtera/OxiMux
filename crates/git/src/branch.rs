@@ -52,6 +52,34 @@ impl Repository {
         Ok(())
     }
 
+    /// Whether git itself would accept `name` as a branch name.
+    ///
+    /// `git check-ref-format --branch` is the authority rather than a
+    /// hand-rolled regex: the rules are long (no `..`, no `@{`, no control
+    /// characters, no component starting with `.` or ending `.lock`, …), they
+    /// have changed between git versions, and a regex that disagrees with the
+    /// installed binary is worse than no check at all — it either rejects
+    /// names git would take or lets through names the very next call refuses.
+    ///
+    /// Read-only: it resolves and validates, and touches nothing. Callers use
+    /// it to refuse a bad name **before** any mutating command runs.
+    ///
+    /// A leading `-` is rejected locally, without shelling out. Git parses it
+    /// as an option in both this check and the command being guarded, so
+    /// `--help` would "validate" (exit 0, prints help) and then make
+    /// `git stash branch --help <ref>` print help instead of branching.
+    pub async fn is_valid_branch_name(&self, name: &str) -> bool {
+        if name.is_empty() || name.starts_with('-') {
+            return false;
+        }
+        GitCmd::new(self.workdir())
+            .args(["check-ref-format", "--branch"])
+            .arg(name)
+            .run_raw()
+            .await
+            .is_ok_and(|out| out.status.success())
+    }
+
     /// Switch the working tree to `name`. Requires a clean tree — git refuses
     /// with NonZero if the switch would discard local changes. This method
     /// does NOT auto-stash; that orchestration belongs in `merge.rs` (the only

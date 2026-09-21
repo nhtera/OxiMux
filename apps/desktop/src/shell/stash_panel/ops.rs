@@ -1,6 +1,12 @@
-//! Stash mutations fired from the panel: apply, pop, drop, push.
+//! Stash mutations fired from the panel: apply, pop, drop, push, branch from,
+//! and restore one file out of.
 //!
-//! # Every op resolves its target by sha first
+//! # Every op resolves its target by sha first — except restore
+//!
+//! `restore_file_confirmed` is the exception and it is not one in spirit: it
+//! runs `git checkout <sha> -- <path>`, which takes a raw sha, and it does
+//! not touch the stack at all. Everything below is about the ops that must
+//! hand git a `stash@{N}`.
 //!
 //! A row is painted with a `stash@{N}` address, but `N` is only that entry's
 //! position in a stack shared by every worktree of the repo — and OxiMux is a
@@ -69,6 +75,23 @@ type OpToast = Option<(ToastKind, String)>;
 /// `Rc`, not `Arc`: it runs on the foreground executor like every other GPUI
 /// callback.
 pub type OnOpSuccess = Rc<dyn Fn(&mut App)>;
+
+/// Host callbacks a finished op can fire.
+///
+/// Two hooks rather than one because the two questions are different. Most
+/// ops either worked or did not, and the host's follow-up belongs on the
+/// success side only. But `git stash branch` can fail having ALREADY created
+/// and checked out the new branch (verified — a dirty worktree blocks the
+/// apply after the switch), so the UI that describes HEAD has to re-sync
+/// either way; refreshing only on success would leave the toolbar naming a
+/// branch the user is no longer on.
+#[derive(Default)]
+pub(crate) struct OpHooks {
+    /// Runs only when the op reported success.
+    pub on_success: Option<OnOpSuccess>,
+    /// Runs on every completion, success or failure.
+    pub on_done: Option<OnOpSuccess>,
+}
 
 /// Shown when the sha a row was painted with is no longer on the stack.
 const STASH_GONE: &str = "That stash no longer exists. The list has been refreshed.";
@@ -307,7 +330,102 @@ impl StashPanel {
                 }
             },
             "Stash selected files",
-            on_success,
+            OpHooks {
+                on_success,
+                on_done: None,
+            },
+            cx,
+        );
+    }
+
+    /// `git stash branch <name> <ref>` from the host's name dialog.
+    ///
+    /// # Three things this has to get right
+    ///
+    /// **The name is validated first, by git.** `is_valid_branch_name` shells
+    /// out to `check-ref-format --branch`, which is read-only; nothing
+    /// mutating runs until it passes. A regex would be cheaper and would
+    /// eventually disagree with the installed binary in one direction or the
+    /// other — see that method's own note.
+    ///
+    /// **git's own stderr is surfaced.** `stash branch` can fail partway: the
+    /// branch is created and checked out, then the apply hits a dirty worktree
+    /// or a conflict and git exits 1 with `Index was not unstashed.` The user
+    /// is now on a new branch with the stash still on the stack, and only
+    /// git's message explains which half happened — a generic "branch failed"
+    /// would describe the state as the opposite of what it is.
+    ///
+    /// **`on_done`, not `on_success`.** For exactly that reason: HEAD may have
+    /// moved even on the error path, so whatever the host refreshes has to run
+    /// either way.
+    pub fn branch_from_stash(
+        &mut self,
+        name: String,
+        sha: String,
+        painted: usize,
+        on_done: Option<OnOpSuccess>,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_op_then(
+            move |repo| async move {
+                if !repo.is_valid_branch_name(&name).await {
+                    return Err(format!("“{name}” is not a valid branch name."));
+                }
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
+                    return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
+                };
+                repo.stash_branch(&name, &stash_ref)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Some((
+                    ToastKind::Success,
+                    format!("Created “{name}” and applied the stash; it is no longer in the list."),
+                )))
+            },
+            "Branch from stash",
+            OpHooks {
+                on_success: None,
+                on_done,
+            },
+            cx,
+        );
+    }
+
+    /// `git checkout <sha> -- <path>` — copy one file out of a stash.
+    ///
+    /// Call only from the host's confirm dialog. **Destructive**: it
+    /// overwrites the worktree copy with no backup, and it writes the index
+    /// too, so the restored path comes back STAGED. The dialog says both.
+    ///
+    /// The stash is untouched — this copies out, it does not pop — so there is
+    /// no address to resolve and the raw sha is used directly (`checkout`
+    /// accepts one; `drop`/`pop` are the two that do not).
+    ///
+    /// Only valid for a tracked file. An untracked one lives in the parentless
+    /// `^3`, not in this commit's tree, and the checkout can only fail; both
+    /// the menu and `StashPanel::request_file_restore` gate on that before a
+    /// dialog is ever mounted.
+    pub fn restore_file_confirmed(
+        &mut self,
+        sha: String,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let leaf = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        self.spawn_op(
+            move |repo| async move {
+                repo.stash_restore_file(&sha, &path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Some((
+                    ToastKind::Success,
+                    format!("Restored {leaf} from the stash — it is staged."),
+                )))
+            },
+            "Restore file from stash",
             cx,
         );
     }
@@ -322,20 +440,20 @@ impl StashPanel {
         F: FnOnce(Repository) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<OpToast, String>> + Send + 'static,
     {
-        self.spawn_op_then(op, label, None, cx);
+        self.spawn_op_then(op, label, OpHooks::default(), cx);
     }
 
-    /// [`spawn_op`] plus a host callback that runs only when the op reports
-    /// success. Deferred, so the hop out of this panel's update happens after
-    /// the entity lease is released — a cross-entity callback that read back
-    /// into `StashPanel` would otherwise double-lease and abort the process.
+    /// [`spawn_op`] plus host callbacks — see [`OpHooks`]. Both are deferred,
+    /// so the hop out of this panel's update happens after the entity lease is
+    /// released; a cross-entity callback that read back into `StashPanel`
+    /// would otherwise double-lease and abort the process.
     ///
     /// [`spawn_op`]: Self::spawn_op
     fn spawn_op_then<F, Fut>(
         &mut self,
         op: F,
         label: &'static str,
-        on_success: Option<OnOpSuccess>,
+        hooks: OpHooks,
         cx: &mut Context<Self>,
     ) where
         F: FnOnce(Repository) -> Fut + Send + 'static,
@@ -370,8 +488,11 @@ impl StashPanel {
                     _ => {}
                 }
                 if matches!(result, Ok(Ok(_)))
-                    && let Some(cb) = on_success
+                    && let Some(cb) = hooks.on_success
                 {
+                    cx.defer(move |cx| cb(cx));
+                }
+                if let Some(cb) = hooks.on_done {
                     cx.defer(move |cx| cb(cx));
                 }
                 // Refresh even when the op failed — the user wants to see the

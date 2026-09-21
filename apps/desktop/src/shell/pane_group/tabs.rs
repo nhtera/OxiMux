@@ -2116,6 +2116,90 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open or activate the all-files tab for one stash — "Open All Changes".
+    ///
+    /// Dedup key is the stash's sha, in its own [`PaneGroupTabKind::StashAll`]
+    /// variant rather than [`PaneGroupTabKind::Commit`]: a stash sha is a
+    /// valid commit sha, so sharing the key would let the two collide, and
+    /// they do not show the same files — this one includes the untracked `^3`
+    /// set.
+    ///
+    /// `stash_label` names the stash in the tab title. Unlike a commit tab
+    /// there is no short subject to fall back on, so an unlabelled stash gets
+    /// its short sha instead of an empty chip.
+    pub fn open_or_activate_stash_all_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        sha: String,
+        stash_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::StashAll { sha: s } if s == &sha))
+        {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let short_oid: String = sha.chars().take(7).collect();
+        let subject = if stash_label.trim().is_empty() {
+            short_oid.clone()
+        } else {
+            stash_label.trim().to_string()
+        };
+        let sha_for_load = sha.clone();
+        let short_for_load = short_oid.clone();
+        let subject_for_load = subject.clone();
+        let view = cx.new(|cx| {
+            let mut v =
+                crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
+            v.load_stash(sha_for_load, short_for_load, subject_for_load, cx);
+            v
+        });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        // "Stash · <message>" so the strip says what kind of thing this is —
+        // a bare message is indistinguishable from a commit tab. Truncated on
+        // the same bound as a commit tab's subject.
+        let label = {
+            let trimmed: String = subject.chars().take(50).collect();
+            let suffix = if subject.chars().count() > 50 {
+                "…"
+            } else {
+                ""
+            };
+            SharedString::from(format!("Stash · {trimmed}{suffix}"))
+        };
+        let tab = PaneGroupTab {
+            label,
+            content: PaneContent::Diff(view),
+            kind: PaneGroupTabKind::StashAll { sha },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     /// Open or activate a read-only diff tab for one file inside a stash.
     /// Dedup key is `(sha, path)` — see [`PaneGroupTabKind::StashFile`].
     ///
