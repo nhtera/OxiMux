@@ -642,9 +642,11 @@ impl Repository {
     /// Two verified behaviors callers must know:
     /// - The message is written **literally** — no `On <branch>: ` prefix is
     ///   synthesized, so a stored entry parses with an empty `branch`.
-    /// - It is a **no-op when `sha` is already on the stack** (exit 0, stack
-    ///   unchanged, message untouched). It cannot be used to relabel a live
-    ///   entry; drop it first.
+    /// - It is a **no-op when `sha` is already the TOP entry** (exit 0, stack
+    ///   unchanged, message untouched), so it cannot relabel `stash@{0}` —
+    ///   drop it first. Note how narrow that is: a sha that is on the stack
+    ///   but NOT on top is stored again happily, which is exactly how one
+    ///   commit comes to sit at two addresses. Verified in both directions.
     pub async fn stash_store(&self, sha: &str, msg: &str) -> Result<()> {
         GitCmd::new(self.workdir())
             .args(["stash", "store", "-m", msg, "--"])
@@ -711,8 +713,14 @@ impl Repository {
     /// from the branch the original subject carried, to keep the list uniform.
     /// An entry that never had one (itself written by `store`) is left bare
     /// rather than given an invented branch.
-    pub async fn stash_rename(&self, sha: &str, new_message: &str) -> Result<Vec<String>> {
-        self.stash_rename_hooked(sha, new_message, || async {}).await
+    pub async fn stash_rename(
+        &self,
+        sha: &str,
+        painted: Option<usize>,
+        new_message: &str,
+    ) -> Result<Vec<String>> {
+        self.stash_rename_hooked(sha, painted, new_message, || async {})
+            .await
     }
 
     /// [`stash_rename`] with a hook fired after each drop.
@@ -727,6 +735,7 @@ impl Repository {
     pub async fn stash_rename_hooked<F, Fut>(
         &self,
         sha: &str,
+        painted: Option<usize>,
         new_message: &str,
         after_each_drop: F,
     ) -> Result<Vec<String>>
@@ -735,7 +744,19 @@ impl Repository {
         Fut: std::future::Future<Output = ()>,
     {
         let subjects = self.stash_subjects().await?;
-        let Some(target_pos) = subjects.iter().position(|(s, _)| s == sha) else {
+        // The painted address first, when it still holds this sha — the same
+        // tiebreaker [`Repository::resolve_stash_index`] applies, and for the
+        // same reason: a sha is NOT unique on the stack, because `git stash
+        // store` will park one commit at two addresses. Without it, `position`
+        // returns the topmost match, so renaming the lower of two duplicate
+        // rows renames the upper one, leaves the clicked row untouched, and
+        // still reports success.
+        //
+        // It costs nothing when the sha is unique — same answer — and it is
+        // the whole fix when it is not.
+        let hinted = painted.filter(|&i| subjects.get(i).is_some_and(|(s, _)| s == sha));
+        let Some(target_pos) = hinted.or_else(|| subjects.iter().position(|(s, _)| s == sha))
+        else {
             return Err(GitError::invalid_input(format!(
                 "stash {} is no longer on the stack",
                 short_sha(sha)

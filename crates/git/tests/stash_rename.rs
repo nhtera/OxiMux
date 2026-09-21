@@ -87,7 +87,7 @@ async fn renaming_a_mid_stack_stash_leaves_it_at_its_own_index() {
     let target = before_shas[3].clone();
 
     let repo = Repository::open(p).await.unwrap();
-    let failures = repo.stash_rename(&target, "renamed").await.unwrap();
+    let failures = repo.stash_rename(&target, None, "renamed").await.unwrap();
     assert!(failures.is_empty(), "unexpected restore failures: {failures:?}");
 
     // Same shas, same order — the whole point of the drop/store dance.
@@ -118,7 +118,7 @@ async fn renaming_the_top_of_the_stack_touches_nothing_below_it() {
 
     let before = shas(p);
     let repo = Repository::open(p).await.unwrap();
-    repo.stash_rename(&before[0], "top").await.unwrap();
+    repo.stash_rename(&before[0], None, "top").await.unwrap();
 
     assert_eq!(shas(p), before);
     assert_eq!(
@@ -140,7 +140,7 @@ async fn renaming_the_only_stash_works() {
 
     let before = shas(p);
     let repo = Repository::open(p).await.unwrap();
-    repo.stash_rename(&before[0], "solo").await.unwrap();
+    repo.stash_rename(&before[0], None, "solo").await.unwrap();
 
     assert_eq!(shas(p), before);
     assert_eq!(subjects(p), vec!["On main: solo".to_string()]);
@@ -158,7 +158,7 @@ async fn a_renamed_stash_still_applies() {
 
     let repo = Repository::open(p).await.unwrap();
     let sha = repo.stash_list(true).await.unwrap()[0].sha.clone();
-    repo.stash_rename(&sha, "still good").await.unwrap();
+    repo.stash_rename(&sha, None, "still good").await.unwrap();
 
     // Re-resolve: the address is the same here, but reading it back is the
     // point — a rename that produced an entry `stash_list` cannot parse would
@@ -193,7 +193,7 @@ async fn an_entry_written_by_store_has_no_branch_and_is_not_given_one() {
     repo.stash_store(&sha, "bare subject").await.unwrap();
     assert_eq!(subjects(p), vec!["bare subject".to_string()]);
 
-    repo.stash_rename(&sha, "still bare").await.unwrap();
+    repo.stash_rename(&sha, None, "still bare").await.unwrap();
     assert_eq!(subjects(p), vec!["still bare".to_string()]);
 
     // And it still parses: a missing prefix is data, not a parse error.
@@ -221,7 +221,7 @@ async fn a_wip_prefix_is_not_silently_rewritten_on_the_entries_around_it() {
 
     let repo = Repository::open(p).await.unwrap();
     let top = shas(p)[0].clone();
-    repo.stash_rename(&top, "renamed").await.unwrap();
+    repo.stash_rename(&top, None, "renamed").await.unwrap();
 
     let after = subjects(p);
     assert_eq!(after[0], "On main: renamed");
@@ -244,7 +244,11 @@ async fn a_stash_pushed_mid_rename_survives() {
     let repo = Repository::open(p).await.unwrap();
     let fired = std::cell::Cell::new(false);
     let failures = repo
-        .stash_rename_hooked(&target, "renamed", || async {
+        .stash_rename_hooked(
+            &target,
+            None,
+            "renamed",
+            || async {
             // Once, after the first drop — a terminal in another window.
             if fired.replace(true) {
                 return;
@@ -297,7 +301,7 @@ async fn renaming_a_sha_that_is_not_on_the_stack_is_refused_and_mutates_nothing(
 
     let repo = Repository::open(p).await.unwrap();
     let err = repo
-        .stash_rename("0000000000000000000000000000000000000000", "nope")
+        .stash_rename("0000000000000000000000000000000000000000", None, "nope")
         .await
         .expect_err("a sha that is not on the stack must be refused");
     assert!(
@@ -314,7 +318,7 @@ async fn renaming_on_an_empty_stack_is_refused() {
     seed(p);
     let repo = Repository::open(p).await.unwrap();
     assert!(
-        repo.stash_rename("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "x")
+        repo.stash_rename("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", None, "x")
             .await
             .is_err()
     );
@@ -333,7 +337,7 @@ async fn a_message_containing_shell_metacharacters_round_trips() {
 
     let nasty = r#"fix "quoted" $VAR and \back\slash"#;
     let repo = Repository::open(p).await.unwrap();
-    repo.stash_rename(&sha, nasty).await.unwrap();
+    repo.stash_rename(&sha, None, nasty).await.unwrap();
 
     let entries = repo.stash_list(true).await.unwrap();
     assert_eq!(entries[0].message, nasty);
@@ -355,7 +359,11 @@ async fn a_stash_dropped_out_from_under_the_rename_is_skipped_not_aborted() {
     let repo = Repository::open(p).await.unwrap();
     let fired = std::cell::Cell::new(false);
     let failures = repo
-        .stash_rename_hooked(&target, "renamed", || async {
+        .stash_rename_hooked(
+            &target,
+            None,
+            "renamed",
+            || async {
             // After the first drop (s2), remove s1 the way a terminal would.
             if fired.replace(true) {
                 return;
@@ -378,5 +386,79 @@ async fn a_stash_dropped_out_from_under_the_rename_is_skipped_not_aborted() {
     assert!(
         shas(p).contains(&victim),
         "the concurrently-dropped entry was not recovered: {after:?}",
+    );
+}
+
+// ── A sha is not unique on the stack ──────────────────────────────────────
+//
+// `git stash store` will park one commit at a second address, so two rows can
+// share a sha. Every other op resolves that with the painted index as a
+// tiebreaker (`resolve_stash_index`); rename took only the sha and picked the
+// topmost match, which renamed a row the user had not clicked and reported
+// success. These two pin both halves of the fix.
+
+/// Push `n` stashes, then re-store the sha at `dup_of` so it appears twice.
+/// Returns the stack's shas, top first.
+///
+/// `dup_of` must NOT be 0. `git stash store` is a no-op when the sha it is
+/// given is already the TOP entry — verified, and narrower than "already on
+/// the stack", which is what makes this duplicate reachable at all.
+fn stack_with_a_duplicate(p: &Path, n: usize, dup_of: usize) -> Vec<String> {
+    assert!(dup_of > 0, "storing the top entry again is a no-op");
+    push_stack(p, n);
+    let sha = shas(p)[dup_of].clone();
+    run_git(p, &["stash", "store", "-m", "On main: duplicate", &sha]);
+    shas(p)
+}
+
+#[tokio::test]
+async fn the_painted_address_picks_between_two_rows_that_share_a_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    seed(p);
+    // s1's commit is re-stored on top, so one sha now sits at 0 AND at 2.
+    let before = stack_with_a_duplicate(p, 3, 1);
+    assert_eq!(before[0], before[2], "fixture must have a duplicate sha");
+
+    let repo = Repository::open(p).await.unwrap();
+    // Rename the LOWER of the two. Without the hint this renames index 0 —
+    // a row the caller never addressed — and still reports success.
+    repo.stash_rename(&before[2], Some(2), "lower")
+        .await
+        .unwrap();
+
+    assert_eq!(shas(p), before, "the stack was reordered");
+    assert_eq!(
+        subjects(p),
+        vec![
+            "On main: duplicate".to_string(),
+            "On main: s2".to_string(),
+            "On main: lower".to_string(),
+            "On main: s0".to_string(),
+        ],
+        "the row the caller addressed must be the row that changed",
+    );
+}
+
+#[tokio::test]
+async fn a_stale_hint_falls_back_to_the_first_match_instead_of_refusing() {
+    // The hint is a tiebreaker, never a target: an index that no longer holds
+    // this sha (the stack moved under the menu) must not make the rename fail,
+    // for the same reason `resolve_stash_index` self-heals rather than aborts.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    seed(p);
+    push_stack(p, 2);
+    let before = shas(p);
+
+    let repo = Repository::open(p).await.unwrap();
+    repo.stash_rename(&before[1], Some(99), "healed")
+        .await
+        .unwrap();
+
+    assert_eq!(shas(p), before);
+    assert_eq!(
+        subjects(p),
+        vec!["On main: s1".to_string(), "On main: healed".to_string()],
     );
 }

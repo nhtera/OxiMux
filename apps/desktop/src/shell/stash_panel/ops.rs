@@ -498,16 +498,22 @@ impl StashPanel {
     ) {
         self.spawn_op(
             move |repo| async move {
-                // Resolved for its existence check only — `stash_rename` takes
-                // the sha and finds its own position, because it has to
-                // re-resolve on every iteration anyway. Checking here buys the
-                // user the same "that stash is gone" wording every other op
-                // gives instead of a raw git-layer refusal.
-                if resolve(&repo, &sha, Some(painted)).await?.is_none() {
+                // Resolved for two things. The existence check buys the user
+                // the same "that stash is gone" wording every other op gives,
+                // instead of a raw git-layer refusal — and the address it
+                // returns is then handed to `stash_rename` as its tiebreaker.
+                //
+                // That hand-off matters only when a sha sits at two addresses
+                // (`git stash store` allows it), and it is the difference
+                // between renaming the row the user clicked and renaming the
+                // topmost row that happens to share its commit. `resolve` has
+                // already applied the painted hint, so this passes the answer
+                // rather than the guess.
+                let Some(target) = resolve(&repo, &sha, Some(painted)).await? else {
                     return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
-                }
+                };
                 let failures = repo
-                    .stash_rename(&sha, &new_message)
+                    .stash_rename(&sha, Some(target.index), &new_message)
                     .await
                     .map_err(|e| e.to_string())?;
                 if failures.is_empty() {

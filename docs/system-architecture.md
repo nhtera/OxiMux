@@ -342,7 +342,14 @@ StashPanel (GPUI entity)
       `store` writes a reflog pointer, never a commit. `depth` is how many
       entries above the target get taken off and put back, and the dialog's
       copy names the number rather than hedging.
-      Three properties that are not optional:
+      The target is chosen with the SAME tiebreaker every other op uses: the
+      painted address when it still holds that sha, else the first match.
+      `rename_confirmed` resolves the row first and hands the ANSWER down.
+      Not decoration — `git stash store` duplicates a sha that is on the
+      stack but not on top (it is a no-op only for `stash@{0}`), so two rows
+      can share one commit, and picking the first match renamed a row the
+      user never clicked while reporting success. Found in review of #28.
+      Four properties that are not optional:
         · the FULL recovery sequence is tracing::warn!-ed BEFORE the first
           drop (sha per line; the message is a structured field, never
           interpolated into a fake command line — it legally holds quotes
