@@ -1,12 +1,12 @@
 //! Stash mutations fired from the panel: apply, pop, drop, push, branch from,
-//! rename, and restore one file out of.
+//! rename, and the two ways to bring one file out — apply it or restore it.
 //!
-//! # Every op resolves its target by sha first — except restore
+//! # Every op resolves its target by sha first — except the per-file pair
 //!
-//! `restore_file_confirmed` is the exception and it is not one in spirit: it
-//! runs `git checkout <sha> -- <path>`, which takes a raw sha, and it does
-//! not touch the stack at all. Everything below is about the ops that must
-//! hand git a `stash@{N}`.
+//! `apply_file` and `restore_file_confirmed` are the exceptions and neither
+//! is one in spirit: both hand git a raw sha (`git apply` reads its patch
+//! from one, `git checkout` takes one) and neither touches the stack at all.
+//! Everything below is about the ops that must hand git a `stash@{N}`.
 //!
 //! A row is painted with a `stash@{N}` address, but `N` is only that entry's
 //! position in a stack shared by every worktree of the repo — and OxiMux is a
@@ -55,7 +55,7 @@
 //! `git_panel/selection.rs:285`.
 
 use crate::shell::chrome::toast::ToastKind;
-use crate::shell::stash_panel::{StashListState, StashPanel};
+use crate::shell::stash_panel::{StashFilesState, StashListState, StashPanel};
 use gpui::{App, Context};
 use oximux_core::StashRef;
 use oximux_git::Repository;
@@ -99,6 +99,14 @@ const STASH_GONE: &str = "That stash no longer exists. The list has been refresh
 /// First 7 chars of a sha, for copy that has to fit in a toast.
 fn short(sha: &str) -> &str {
     &sha[..7.min(sha.len())]
+}
+
+/// The file name a toast names a path by — its leaf, or the whole path when
+/// it has none.
+fn leaf_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 /// Message to show for a stash that carries none.
@@ -391,6 +399,46 @@ impl StashPanel {
         );
     }
 
+    /// Apply ONE file's changes out of a stash into the worktree — the
+    /// non-destructive counterpart to [`restore_file_confirmed`].
+    ///
+    /// **No confirm dialog, on purpose.** `stash_apply_file` runs a plain
+    /// `git apply`, which is atomic: it writes the whole patch or it writes
+    /// nothing and says why. There is no outcome to warn about, and a
+    /// confirm step in front of an op that cannot lose work trains the user
+    /// to click through the ones that can.
+    ///
+    /// `origin` is resolved here rather than carried on the menu payload, for
+    /// the reason `request_file_diff` resolves it here: it selects which
+    /// revision the patch is read from, the panel owns the file list it comes
+    /// from, and a menu still open over a refreshed list would otherwise hand
+    /// git a revision that no longer describes the row.
+    ///
+    /// [`restore_file_confirmed`]: Self::restore_file_confirmed
+    pub fn apply_file(&mut self, sha: &str, path: &Path, cx: &mut Context<Self>) {
+        let Some(StashFilesState::Ready(files)) = self.files.get(sha) else {
+            return;
+        };
+        let Some(origin) = files.iter().find(|f| f.path == path).map(|f| f.origin) else {
+            return;
+        };
+        let leaf = leaf_of(path);
+        let (sha, path) = (sha.to_string(), path.to_path_buf());
+        self.spawn_op(
+            move |repo| async move {
+                repo.stash_apply_file(&sha, &path, origin)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Some((
+                    ToastKind::Success,
+                    format!("Applied {leaf} from the stash — it is unstaged."),
+                )))
+            },
+            "Apply file from stash",
+            cx,
+        );
+    }
+
     /// `git checkout <sha> -- <path>` — copy one file out of a stash.
     ///
     /// Call only from the host's confirm dialog. **Destructive**: it
@@ -411,10 +459,7 @@ impl StashPanel {
         path: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        let leaf = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let leaf = leaf_of(&path);
         self.spawn_op(
             move |repo| async move {
                 repo.stash_restore_file(&sha, &path)

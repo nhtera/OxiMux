@@ -212,10 +212,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/arrow-up.svg",
         include_bytes!("../assets/icons/arrow-up.svg"),
     ),
-    // Stash row actions: down = Apply (bring the stash INTO the worktree and
-    // leave it on the stack), up = Pop (the same, then lift it off). The pair
-    // only reads as a pair because the two arrows are mirror images, so they
-    // are registered together.
+    // Plain directional arrows: the pane-split menu, the tab menu's move
+    // items, and the chat composer's Send button. The stash row used the
+    // down/up pair for Apply and Pop until its cluster took the lidded-box
+    // glyphs below — a stash is not a direction.
     (
         "icons/arrow-down.svg",
         include_bytes!("../assets/icons/arrow-down.svg"),
@@ -258,6 +258,24 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     (
         "icons/trash.svg",
         include_bytes!("../assets/icons/trash.svg"),
+    ),
+    // The stash row's action cluster. A lidded box with an arrow rising out
+    // of it for Apply, the same box replaced by an × for Pop (the entry does
+    // not survive), and the two-node compare glyph for Open All Changes.
+    // Drawn to the same 24px / 2px-stroke geometry as every icon above, so
+    // the five-glyph cluster — these three plus `pencil` and `trash` — reads
+    // as one set.
+    (
+        "icons/archive-restore.svg",
+        include_bytes!("../assets/icons/archive-restore.svg"),
+    ),
+    (
+        "icons/archive-restore-x.svg",
+        include_bytes!("../assets/icons/archive-restore-x.svg"),
+    ),
+    (
+        "icons/git-compare.svg",
+        include_bytes!("../assets/icons/git-compare.svg"),
     ),
 ];
 

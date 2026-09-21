@@ -321,3 +321,164 @@ async fn rename_confirmed_on_a_vanished_stash_leaves_the_stack_alone(cx: &mut Te
         "a rename aimed at a missing stash rewrote a neighbour",
     );
 }
+
+// ── Apply one file ────────────────────────────────────────────────────────
+//
+// What `git apply` does to the worktree — that a conflicting local edit is
+// refused with nothing written, that an untracked file comes out of `^3`,
+// that a rename does not drag its old path along — is proved against the
+// binary in `crates/git/tests/stash_apply_file.rs`. What these add is the
+// panel's half: that the op reaches git at all, and that it refuses to guess
+// when the panel cannot say where the file came from.
+
+/// The panel resolves `origin` from its own cached file list, which only
+/// exists once a row has been expanded. Seeded here in one synchronous update
+/// — list, expand, result — rather than by driving the real fetch, for the
+/// same reason the rest of this file reads git directly instead of pumping the
+/// scheduler between crossings.
+///
+/// `toggle_expanded` is not decoration: `apply_files_result` lands a result
+/// only where that expansion left its `Loading` marker, so without it the
+/// injected list is dropped and the op silently does nothing — which is how
+/// this helper was wrong the first time. The real fetch it also starts is
+/// harmless; its result meets no marker and is discarded in turn.
+fn seed_file_cache(
+    window: &gpui::WindowHandle<Harness>,
+    cx: &mut TestAppContext,
+    sha: &str,
+    path: &str,
+    origin: oximux_core::StashFileOrigin,
+) {
+    let entry = oximux_core::StashEntry {
+        stash_ref: oximux_core::StashRef { index: 0 },
+        branch: "main".into(),
+        message: "wip".into(),
+        sha: sha.to_string(),
+        created_at: 1_785_767_406,
+        relative: "just now".into(),
+    };
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.apply_list_result(Ok(vec![entry]), cx);
+                panel.toggle_expanded(sha.to_string(), cx);
+                panel.apply_files_result(
+                    sha,
+                    Ok(vec![oximux_core::StashFile {
+                        path: PathBuf::from(path),
+                        status: oximux_core::DiffStatus::Modified,
+                        origin,
+                    }]),
+                    cx,
+                );
+                assert!(
+                    matches!(
+                        panel.files_for(sha),
+                        Some(oximux_app::shell::stash_panel::StashFilesState::Ready(_))
+                    ),
+                    "the cache must actually hold a list, or the op under test is a no-op",
+                );
+            });
+        })
+        .expect("seed the panel's file cache");
+}
+
+#[gpui::test]
+async fn apply_file_writes_the_worktree_and_leaves_the_index_alone(cx: &mut TestAppContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path();
+    seed(p);
+    std::fs::write(p.join("alpha.txt"), "stashed\n").expect("write");
+    std::fs::write(p.join("keep.txt"), "stashed-keep\n").expect("write");
+
+    let repo = rt.block_on(Repository::open(p)).expect("open repo");
+    rt.block_on(repo.stash_push(Some("wip"), false, &[]))
+        .expect("stash push");
+    let sha = rt.block_on(repo.stash_list(true)).expect("list")[0]
+        .sha
+        .clone();
+
+    let window = mount(&repo, cx);
+    seed_file_cache(
+        &window,
+        cx,
+        &sha,
+        "alpha.txt",
+        oximux_core::StashFileOrigin::Tracked,
+    );
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.apply_file(&sha, Path::new("alpha.txt"), cx);
+            });
+        })
+        .expect("dispatch apply_file");
+    settle();
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("alpha.txt")).expect("read"),
+        "stashed\n",
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("keep.txt")).expect("read"),
+        "k\n",
+        "the unnamed file must not have moved",
+    );
+    // The line that separates this verb from restore, which stages what it
+    // writes — and what the toast tells the user. Asserted as two plumbing
+    // queries rather than a porcelain XY column because `git_out` trims its
+    // output, which eats exactly the leading space that means "unstaged".
+    assert_eq!(
+        git_out(p, &["diff", "--cached", "--name-only"]),
+        "",
+        "apply must not touch the index",
+    );
+    assert_eq!(git_out(p, &["diff", "--name-only"]), "alpha.txt");
+    assert_eq!(
+        rt.block_on(repo.stash_list(true)).expect("list").len(),
+        1,
+        "apply copies out; the stash stays",
+    );
+}
+
+#[gpui::test]
+async fn apply_file_refuses_to_guess_an_origin_it_was_never_given(cx: &mut TestAppContext) {
+    // The file cache is deliberately NOT seeded. `origin` chooses which
+    // revision the patch is read from — the stash commit for a tracked file,
+    // the parentless `^3` for an untracked one — so a panel that cannot say
+    // which must do nothing rather than pick one and write the wrong bytes.
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path();
+    seed(p);
+    std::fs::write(p.join("alpha.txt"), "stashed\n").expect("write");
+
+    let repo = rt.block_on(Repository::open(p)).expect("open repo");
+    rt.block_on(repo.stash_push(Some("wip"), false, &[]))
+        .expect("stash push");
+    let sha = rt.block_on(repo.stash_list(true)).expect("list")[0]
+        .sha
+        .clone();
+
+    let window = mount(&repo, cx);
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.apply_file(&sha, Path::new("alpha.txt"), cx);
+            });
+        })
+        .expect("dispatch apply_file");
+    settle();
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("alpha.txt")).expect("read"),
+        "a\n",
+        "nothing should have been written",
+    );
+    assert!(status(p).is_empty(), "got {:?}", status(p));
+}

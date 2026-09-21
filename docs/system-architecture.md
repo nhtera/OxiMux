@@ -284,6 +284,14 @@ StashPanel (GPUI entity)
                              Untracked → <sha>^3 with NO base (diff_in_rev)
   ← row action cluster is hidden until hover; the guaranteed path to every
     verb is the right-click menu, which is why the two shipped together
+    Five glyphs, in the reference cockpit's order: Apply / Pop / Open All
+    Changes / Rename… / Drop. Apply and Pop are one glyph with one
+    difference — a lidded box with its contents rising out, and the same box
+    with its far wall replaced by an × — because that is the only difference
+    between the verbs. The cluster is absolutely positioned, so a glyph costs
+    coverage of the metadata on hover, never a verb pushed off a 220px panel;
+    Branch from Stash stays menu-only because it asks for a name AND consumes
+    the stash, which no one-glyph control should start
   ← push_paths(msg, -u, paths, rename_pairs, on_success) — the partial stash
     fired from GitPanel. Runs HERE, not there, so the stash list refresh is
     part of the op. Sequence: unstage_paths(rename_pairs) → stash_push, and
@@ -305,6 +313,19 @@ StashPanel (GPUI entity)
       so there is never an index to conflict with). On failure the branch may
       ALREADY exist and be checked out, which is why the host hook is
       on_done, not on_success — see OpHooks in stash_panel/ops.rs.
+  ← apply_file(sha, path) → repo.stash_apply_file — ONE file out of a stash,
+      as a patch. No confirm dialog and no event: plain `git apply` writes the
+      whole patch or nothing at all, so there is no outcome to warn about.
+      Worktree only, index untouched (the toast says "unstaged"), stash kept.
+      Patch = git show --format= --binary --no-renames [--first-parent] <rev>
+      -- :(literal)<path>, where rev is <sha> for a tracked file and <sha>^3
+      for an untracked one — so this reaches the untracked rows restore cannot.
+      NOT --3way: it would succeed more often but writes conflict markers into
+      the file on a real conflict, which is the outcome this verb exists to
+      avoid. --no-renames so the patch touches only the path the row named;
+      with detection on, a rename would also DELETE the old path. An empty
+      patch is an explicit error — `git apply` exits 0 on empty input, so the
+      "nothing happened" case would otherwise toast success
   → RestoreStashFileRequested → host confirm dialog → restore_file_confirmed()
       git checkout <sha> -- <path> via run_pathspec_op (a bare pathspec makes
       restoring a[1].rs also overwrite a1.rs). Writes the INDEX as well as the
@@ -437,10 +458,15 @@ StashContextMenu (GPUI entity, mounted on WorkspaceRoot)
         read-only — Open All Changes · Copy Message / Copy SHA
         Drop… → emits DropStashRequested, the same confirm gate the row uses
       file_path == Some → a file inside an expanded stash:
-        Open Changes (panel resolves StashFileOrigin from its own cache) ·
-        Copy Relative Path · Restore This File… (absent when file_untracked;
-        origin has to travel in the payload because the menu decides at RENDER
-        time, and only the row that painted the file knows)
+        Apply Changes (fires at once — see apply_file) · Open Changes (panel
+        resolves StashFileOrigin from its own cache) · Copy Relative Path ·
+        Restore This File… (absent when file_untracked; origin has to travel
+        in the payload because the menu decides at RENDER time, and only the
+        row that painted the file knows)
+        Apply and Restore are both "bring this file back" and are deliberately
+        two items at opposite ends of the menu: apply merges and refuses
+        rather than overwrite, restore overwrites and stages. The rule and the
+        destructive tint between them are the difference being chosen
   ← WeakEntity<StashPanel>; dismisses silently after a workspace switch
   ← an item that could only fail is omitted, never disabled
 

@@ -536,6 +536,105 @@ impl Repository {
         self.run_pathspec_op(&["checkout", sha, "--"], &[path]).await
     }
 
+    /// Apply ONE file's changes out of a stash into the worktree — as a
+    /// patch, never a checkout.
+    ///
+    /// The non-destructive sibling of [`Repository::stash_restore_file`], and
+    /// the difference is the whole point of having both:
+    ///
+    /// | | worktree copy | index | fails when |
+    /// |---|---|---|---|
+    /// | `stash_restore_file` | **overwritten** | written | almost never |
+    /// | `stash_apply_file` | merged into | untouched | the patch does not fit |
+    ///
+    /// So this one can be offered without a confirm dialog: the worst case is
+    /// that git refuses and nothing moved.
+    ///
+    /// # Plain `git apply`, not `--3way`
+    ///
+    /// `--3way` would succeed more often — it falls back to a real merge when
+    /// the context has drifted — but on a genuine conflict it writes
+    /// `<<<<<<<` markers into the file and exits non-zero, which turns "apply
+    /// failed" into "your file has been edited and the operation failed".
+    /// That is exactly the outcome a caller chooses this verb to avoid. Plain
+    /// apply is atomic: it writes everything or nothing, and its stderr names
+    /// the hunk that did not fit.
+    ///
+    /// # `--no-renames`, so the patch touches only the path asked for
+    ///
+    /// Rename detection is on by default (`diff.renames`), and with it a
+    /// renamed file arrives as a `rename from`/`rename to` pair whose
+    /// application also deletes the *old* path — a path the user never named
+    /// and cannot see in the row they right-clicked. Disabling it makes the
+    /// same stash entry arrive as a plain creation of the new path, which is
+    /// the promise the row makes.
+    ///
+    /// Works for an untracked file as well, which restore cannot: the patch is
+    /// read from the parentless `^3` instead, where `git stash push -u` parked
+    /// it. Such a patch creates the file, so git refuses cleanly (`already
+    /// exists`) when the worktree has one at that path.
+    pub async fn stash_apply_file(
+        &self,
+        sha: &str,
+        path: &Path,
+        origin: StashFileOrigin,
+    ) -> Result<()> {
+        let patch = self.stash_file_patch(sha, path, origin).await?;
+        // An empty patch is not an error git will report — `git apply` exits 0
+        // on empty input — so the "nothing happened" case has to be caught
+        // here or it reports success having done nothing.
+        if patch.is_empty() {
+            return Err(GitError::unexpected_outcome(format!(
+                "this stash records no change to {}",
+                path.display()
+            )));
+        }
+        GitCmd::new(self.workdir())
+            .args(["apply", "-"])
+            .stdin(patch)
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// The unified diff one stash file contributes, ready for `git apply`.
+    ///
+    /// `--format=` empties the commit header so the output is patch bytes and
+    /// nothing else — `^3` is a root commit, and `git show` on one otherwise
+    /// prints a log entry before the diff.
+    ///
+    /// `--binary` so a binary file carries its literal delta rather than the
+    /// `Binary files differ` placeholder, which `git apply` refuses.
+    ///
+    /// `--first-parent` for the tracked side, for the reason
+    /// [`Repository::stash_files`] spells out: without it a 2–3 parent stash
+    /// commit emits a *combined* diff, which is not an appliable patch at all.
+    /// `^3` has no parents, so it neither needs nor accepts the distinction.
+    async fn stash_file_patch(
+        &self,
+        sha: &str,
+        path: &Path,
+        origin: StashFileOrigin,
+    ) -> Result<Vec<u8>> {
+        let tracked = origin == StashFileOrigin::Tracked;
+        let rev = if tracked {
+            sha.to_string()
+        } else {
+            format!("{sha}^3")
+        };
+        let mut cmd = GitCmd::new(self.workdir()).args(["show", "--format=", "--binary", "--no-renames"]);
+        if tracked {
+            cmd = cmd.arg("--first-parent");
+        }
+        let out = cmd
+            .arg(&rev)
+            .arg("--")
+            .arg(crate::stage::literal_pathspec(path))
+            .run()
+            .await?;
+        Ok(out.stdout)
+    }
+
     /// `git stash store -m <msg> <sha>` — push an existing stash commit back
     /// onto the top of the stack. Never rewrites the commit, only the reflog
     /// pointer, so a stash dropped by sha stays recoverable.

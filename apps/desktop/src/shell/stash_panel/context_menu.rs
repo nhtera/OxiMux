@@ -344,8 +344,15 @@ impl StashContextMenu {
         ))
     }
 
-    /// The file-row item set: open the diff, copy the path, and — for a
-    /// tracked file only — restore it.
+    /// The file-row item set: apply the file, open its diff, copy its path,
+    /// and — for a tracked file only — restore it.
+    ///
+    /// Apply and Restore are both "bring this file back" and they are
+    /// deliberately not one item. Apply merges the stash's version into the
+    /// worktree and refuses rather than overwrite; Restore overwrites the
+    /// worktree copy and stages the result. They sit at opposite ends of the
+    /// menu, with the rule and the destructive tint between them, because the
+    /// difference is what the user is choosing.
     fn file_items(
         &self,
         card: gpui::Div,
@@ -358,6 +365,28 @@ impl StashContextMenu {
         let density = self.density;
         let typography = self.typography.clone();
         let panel = self.panel.clone();
+
+        // Apply first: it is the verb the row exists for. It fires straight
+        // away — `git apply` cannot lose work, so there is nothing to
+        // confirm; see `StashPanel::apply_file`. `panel` is re-cloned per
+        // item because each closure takes its own.
+        let apply_panel = self.panel.clone();
+        let apply_path = path.clone();
+        let apply_sha = sha.clone();
+        let card = card.child(MenuRow::new("stash-file-ctx-apply", "Apply Changes", theme, density, typography.clone())
+            .fg(theme.fg_base)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                if let Some(strong) = apply_panel.as_ref().and_then(|p| p.upgrade()) {
+                    let (sha, path) = (apply_sha.clone(), apply_path.clone());
+                    // Same reason Open Changes goes through the panel: the
+                    // file's `origin` decides which revision the patch is
+                    // read from, and only the panel holds the list it comes
+                    // from.
+                    strong.update(cx, |panel, cx| panel.apply_file(&sha, &path, cx));
+                }
+                this.close(cx);
+            }),
+        ));
 
         let open_path = path.clone();
         let open_sha = sha.clone();

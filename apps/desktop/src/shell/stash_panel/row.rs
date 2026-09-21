@@ -25,7 +25,7 @@
 //!
 //! The chevron toggles the file list; `file_row.rs` paints what it reveals.
 //! It is the ONLY thing in the row that expands — the row body does not,
-//! because the trailing cluster is three live verbs and a mis-aimed click
+//! because the trailing cluster is five live verbs and a mis-aimed click
 //! that silently changes the layout under the cursor is worse than a click
 //! that does nothing.
 //!
@@ -52,11 +52,20 @@
 //! child — at 220px and 150% the row cannot afford it either way, so it is
 //! taken out of the width arithmetic entirely. See the cluster itself.
 //!
-//! Only the verbs that exist are painted: Apply, Pop, Drop. Branch-from-stash
-//! and Rename are reachable from the right-click menu and are deliberately not
-//! given a fourth and fifth glyph here — the cluster already covers the row at
-//! its narrowest, and both open a dialog rather than acting, which is a poor
-//! fit for a one-glyph control with no label.
+//! # The five verbs, and the one that stays in the menu
+//!
+//! Apply, Pop, Open All Changes, Rename, Drop — the set the reference cockpit
+//! puts on a stash row, in its order. The cluster carried three for four
+//! phases on a width argument that the absolute positioning above had already
+//! answered: the icons are not paid for out of the row, so what two more cost
+//! is more of the metadata covered *while the pointer is on the row*, not a
+//! verb pushed off the edge.
+//!
+//! Branch from Stash is the one that stays menu-only. It is not a width
+//! decision either: the other four either act at once or open a diff, while
+//! branching asks for a name AND consumes the stash on success, and a
+//! one-glyph control with no label is a poor place to start something that
+//! ends with an entry gone from the list.
 
 use crate::shell::stash_panel::keyboard::StashCursor;
 use crate::shell::stash_panel::list_render::{row_message, row_meta, row_tooltip};
@@ -116,6 +125,8 @@ impl StashPanel {
         // click lands. See `ops.rs`.
         let apply_sha = entry.sha.clone();
         let pop_sha = entry.sha.clone();
+        let compare_sha = entry.sha.clone();
+        let rename_sha = entry.sha.clone();
         let toggle_sha = entry.sha.clone();
         let drop_entry = entry.clone();
         let menu_entry = entry.clone();
@@ -131,9 +142,15 @@ impl StashPanel {
         let group_name = format!("stash-row-{key}");
         let row_id = ElementId::Name(format!("stash-row-{key}").into());
 
-        // Apply ↧ / Pop ↥ / Drop 🗑. The two arrows are mirror images on
-        // purpose: apply and pop differ only in whether the entry survives,
-        // and a user who learns one glyph has learned the other.
+        // Apply / Pop / Open All Changes / Rename / Drop.
+        //
+        // The first two are one glyph with one difference: a lidded box with
+        // the contents rising out of it, and the same box with its far wall
+        // replaced by an ×. That is exactly what separates the verbs — both
+        // bring the changes back, only one leaves the entry behind — so a
+        // user who learns either has learned the other. The three that
+        // follow are the plain compare, pencil and bin the rest of the
+        // cockpit already uses for the same jobs.
         //
         // # Out of the flex flow, on purpose
         //
@@ -173,7 +190,7 @@ impl StashPanel {
             .group_hover(group_name.clone(), |s| s.visible())
             .child(icon_action(
                 ElementId::Name(format!("stash-apply-{key}").into()),
-                "icons/arrow-down.svg",
+                "icons/archive-restore.svg",
                 "Apply stash (keep it in the list)",
                 theme.fg_muted,
                 theme,
@@ -187,7 +204,7 @@ impl StashPanel {
             ))
             .child(icon_action(
                 ElementId::Name(format!("stash-pop-{key}").into()),
-                "icons/arrow-up.svg",
+                "icons/archive-restore-x.svg",
                 // NOT "reversible via reflog" — a pop deletes the stash's
                 // reflog entry, leaving the commit sha as the only way back.
                 "Apply stash and remove it from the list",
@@ -197,6 +214,36 @@ impl StashPanel {
                 cx.listener(move |panel, _: &ClickEvent, _window, cx| {
                     panel.pop(pop_sha.clone(), index, cx);
                     cx.notify();
+                }),
+            ))
+            .child(icon_action(
+                ElementId::Name(format!("stash-compare-{key}").into()),
+                "icons/git-compare.svg",
+                // Not "Compare": nothing is being diffed against anything the
+                // user chose. It opens the stash's own patch — every file it
+                // touches, including the untracked ones — in one tab.
+                "Open all changes in this stash",
+                theme.fg_muted,
+                theme,
+                style,
+                cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                    panel.request_stash_all(&compare_sha, cx);
+                }),
+            ))
+            .child(icon_action(
+                ElementId::Name(format!("stash-rename-{key}").into()),
+                "icons/pencil.svg",
+                // The cost is disclosed in the dialog, not here: a rename
+                // takes every entry above this one off the stack and puts it
+                // back. A tooltip is the wrong place to say so — it would
+                // have to be a paragraph — but the glyph must not promise
+                // that this is free either, hence "…".
+                "Rename this stash…",
+                theme.fg_muted,
+                theme,
+                style,
+                cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                    panel.request_rename_stash(&rename_sha, index, cx);
                 }),
             ))
             .child(icon_action(
