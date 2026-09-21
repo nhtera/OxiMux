@@ -133,18 +133,24 @@ mod tests {
             file("top.rs", DiffStatus::Deleted),
         ];
         let rows = rows(&files, &HashSet::new());
-        let shape: Vec<(String, NodeKind, u8)> = rows
+        // Compared as `PathBuf`, not as the rendered string. `rows` builds
+        // each path with `PathBuf::push`, which joins with the platform
+        // separator — so a string assertion here passes on unix and fails on
+        // Windows with `src\\a.rs`, which is what CI caught. Comparing
+        // `Path`s compares COMPONENTS, and Windows accepts either separator
+        // when it splits them, so one literal is correct on both.
+        let shape: Vec<(PathBuf, NodeKind, u8)> = rows
             .iter()
-            .map(|r| (r.path.to_string_lossy().into_owned(), r.kind, r.depth))
+            .map(|r| (r.path.clone(), r.kind, r.depth))
             .collect();
         assert_eq!(
             shape,
             vec![
-                ("src".into(), NodeKind::Dir, 0),
-                ("src/a.rs".into(), NodeKind::File, 1),
-                ("src/deep".into(), NodeKind::Dir, 1),
-                ("src/deep/b.rs".into(), NodeKind::File, 2),
-                ("top.rs".into(), NodeKind::File, 0),
+                (PathBuf::from("src"), NodeKind::Dir, 0),
+                (PathBuf::from("src/a.rs"), NodeKind::File, 1),
+                (PathBuf::from("src/deep"), NodeKind::Dir, 1),
+                (PathBuf::from("src/deep/b.rs"), NodeKind::File, 2),
+                (PathBuf::from("top.rs"), NodeKind::File, 0),
             ],
         );
     }
