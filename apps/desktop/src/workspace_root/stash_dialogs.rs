@@ -339,6 +339,79 @@ impl WorkspaceRoot {
     /// <sha> -- <path>` writes the index too, so `git status` shows the path
     /// in the index column and a user who expected only a worktree change
     /// would commit it by accident.
+    /// Mount the message prompt for a row's `Rename…`.
+    ///
+    /// Guarded like the branch form and for the same reason, one degree
+    /// sharper: a rename drops and re-stores every entry above the target, so
+    /// firing it against the wrong project's repo would rewrite that stack's
+    /// reflog, not just one label.
+    pub(crate) fn mount_rename_stash_dialog(
+        &mut self,
+        panel: &Entity<StashPanel>,
+        ev: &RenameStashRequested,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // First-open-wins, like the push and branch forms: a double-click must
+        // not drop a half-typed message.
+        if self.rename_stash_dialog.is_some() {
+            return;
+        }
+
+        let weak = panel.downgrade();
+        let weak_root = cx.entity().downgrade();
+        // Re-checked at FIRE time — guard 2 in the module doc.
+        let project_id = self.active_project.as_ref().map(|p| p.id.clone());
+        let sha = ev.sha.clone();
+        let painted = ev.painted;
+
+        let on_confirm: StashMessageCallback = Rc::new(move |message, _window, cx| {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            let still_current = weak_root
+                .upgrade()
+                .map(|root| {
+                    root.read(cx).active_project.as_ref().map(|p| p.id.clone()) == project_id
+                })
+                .unwrap_or(false);
+            if !still_current {
+                tracing::warn!(
+                    target: "oximux_app::stash_panel",
+                    "rename confirm fired after a project switch; ignored",
+                );
+                return;
+            }
+            let sha = sha.clone();
+            panel.update(cx, |p, cx| p.rename_confirmed(sha, painted, message, cx));
+        });
+
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let prompt = RenameStashPrompt {
+            on_confirm,
+            on_cancel: Some(noop_cancel()),
+            current_message: ev.message.clone(),
+            // The count the disclosure copy names. Resolved by the panel from
+            // the list the row was painted from, not recomputed here.
+            depth: ev.depth,
+        };
+        let dialog =
+            cx.new(|cx| RenameStashDialog::new(prompt, theme, density, typography, window, cx));
+        self._rename_stash_dialog_observer =
+            Some(cx.observe_in(&dialog, window, |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.rename_stash_dialog = None;
+                    root._rename_stash_dialog_observer = None;
+                    cx.notify();
+                }
+            }));
+        self.rename_stash_dialog = Some(dialog);
+        cx.notify();
+    }
+
     pub(crate) fn mount_restore_stash_file_dialog(
         &mut self,
         panel: &Entity<StashPanel>,

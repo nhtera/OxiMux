@@ -37,7 +37,7 @@ const ROW_ICON_PX: f32 = 15.0;
 /// pane-actions menu so the two visually align if both happen to be open.
 const ANCHOR_TOP_PX: f32 = 42.0;
 /// Horizontal padding inside each row.
-const ROW_PADDING_X: f32 = 10.0;
+use crate::ui::ROW_PADDING_X;
 /// Vertical separator thickness between the "+ New terminal" row and the
 /// adapter list.
 const SEP_HEIGHT: f32 = 1.0;

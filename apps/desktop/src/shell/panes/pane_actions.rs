@@ -28,7 +28,7 @@ const TOP_BAR_ANCHOR_TOP_PX: f32 = 42.0;
 /// Icon size inside each menu item.
 const ICON_SIZE: f32 = 14.0;
 /// Horizontal padding inside each row.
-const ROW_PADDING_X: f32 = 10.0;
+use crate::ui::ROW_PADDING_X;
 /// Gap between icon and label.
 const ROW_GAP: f32 = 10.0;
 

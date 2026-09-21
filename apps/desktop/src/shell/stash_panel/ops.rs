@@ -1,5 +1,5 @@
 //! Stash mutations fired from the panel: apply, pop, drop, push, branch from,
-//! and restore one file out of.
+//! rename, and restore one file out of.
 //!
 //! # Every op resolves its target by sha first — except restore
 //!
@@ -426,6 +426,62 @@ impl StashPanel {
                 )))
             },
             "Restore file from stash",
+            cx,
+        );
+    }
+
+    /// `git stash rename` — which git does not have, so it is composed from
+    /// drop + store. Call only from the host's rename dialog.
+    ///
+    /// **This touches every entry above the target**, taking each off and
+    /// putting it back in order. The dialog says so with the count; see
+    /// [`Repository::stash_rename`] for the sequence and the recovery
+    /// contract.
+    ///
+    /// Two outcomes are reported differently on purpose. A refusal is an
+    /// error toast and nothing moved. A rename that landed but could not put
+    /// some entries back is a **warning**, not a success: the message did
+    /// change, so calling it a failure would be wrong, but the stack is short
+    /// and the log holds the shas needed to rebuild it — which is what the
+    /// toast points at, because the user cannot recover from a toast alone.
+    pub fn rename_confirmed(
+        &mut self,
+        sha: String,
+        painted: usize,
+        new_message: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_op(
+            move |repo| async move {
+                // Resolved for its existence check only — `stash_rename` takes
+                // the sha and finds its own position, because it has to
+                // re-resolve on every iteration anyway. Checking here buys the
+                // user the same "that stash is gone" wording every other op
+                // gives instead of a raw git-layer refusal.
+                if resolve(&repo, &sha, Some(painted)).await?.is_none() {
+                    return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
+                }
+                let failures = repo
+                    .stash_rename(&sha, &new_message)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if failures.is_empty() {
+                    return Ok(Some((
+                        ToastKind::Success,
+                        format!("Renamed to “{}”.", new_message.trim()),
+                    )));
+                }
+                Ok(Some((
+                    ToastKind::Warning,
+                    format!(
+                        "Renamed, but {} entr{} could not be put back: {}.                          The log holds `git stash store <sha>` for each one.",
+                        failures.len(),
+                        if failures.len() == 1 { "y" } else { "ies" },
+                        failures.join(", "),
+                    ),
+                )))
+            },
+            "Stash rename",
             cx,
         );
     }

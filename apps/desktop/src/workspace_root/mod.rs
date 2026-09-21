@@ -122,7 +122,7 @@ use crate::shell::{
         graph::ShowCommitRequested,
     },
     stash_panel::{
-        BranchFromStashRequested, DropStashRequested, PushStashRequested,
+        BranchFromStashRequested, DropStashRequested, PushStashRequested, RenameStashRequested,
         RestoreStashFileRequested, ShowStashAllRequested, ShowStashFileRequested, StashPanel,
         branch_dialog::{
             BranchFromStashDialog, BranchFromStashPrompt, BranchNameCallback, suggest_branch_name,
@@ -132,6 +132,7 @@ use crate::shell::{
         push_dialog::{
             CancelCallback, PushCallback, PushStashDialog, PushStashPrompt, PushStashScope,
         },
+        rename_dialog::{RenameStashDialog, RenameStashPrompt, StashMessageCallback},
     },
     left_rail::{
         LeftRail,
@@ -430,6 +431,16 @@ pub struct WorkspaceRoot {
     /// Long-lived subscription on `StashPanel::RestoreStashFileRequested`.
     /// Dropping it silently disables `Restore This File…`.
     pub(crate) _restore_stash_file_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::RenameStashRequested`.
+    /// Dropping it silently disables `Rename…`.
+    pub(crate) _rename_stash_subscription: Option<Subscription>,
+    /// Active rename-stash message modal (per-request; `None` when idle). Its
+    /// own slot for the same reason as the branch form: three different forms
+    /// sharing one slot means one silently replaces a half-typed other.
+    pub(crate) rename_stash_dialog: Option<Entity<RenameStashDialog>>,
+    /// Per-mount observer on the active `RenameStashDialog`. Same lifecycle
+    /// pattern as `_push_stash_dialog_observer`.
+    pub(crate) _rename_stash_dialog_observer: Option<Subscription>,
     /// Active branch-from-stash name modal (per-request; `None` when idle).
     /// Its own slot rather than sharing `push_stash_dialog`: the two are
     /// different forms, and a shared slot would let one silently replace a
@@ -1401,6 +1412,9 @@ impl WorkspaceRoot {
             _restore_stash_file_subscription: None,
             branch_from_stash_dialog: None,
             _branch_from_stash_dialog_observer: None,
+            _rename_stash_subscription: None,
+            rename_stash_dialog: None,
+            _rename_stash_dialog_observer: None,
             _show_branch_file_subscription: None,
             _show_combined_diff_subscription: None,
             _show_branch_diff_all_subscription: None,

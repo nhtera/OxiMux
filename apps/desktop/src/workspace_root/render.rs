@@ -43,7 +43,8 @@ impl Render for WorkspaceRoot {
             || self.confirm_dialog.is_some()
             || self.rename_tab_dialog.is_some()
             || self.push_stash_dialog.is_some()
-            || self.branch_from_stash_dialog.is_some();
+            || self.branch_from_stash_dialog.is_some()
+            || self.rename_stash_dialog.is_some();
         cx.set_global(crate::shell::browser_view::WebviewSuppressed(panes_covered));
         let theme = self.theme;
         let density = self.density;
@@ -2265,6 +2266,20 @@ impl Render for WorkspaceRoot {
             // Branch-from-stash name modal — same overlay pattern. Its own
             // slot, so it cannot replace a half-typed push form.
             .when_some(self.branch_from_stash_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
+            // Rename-stash message modal — third form, third slot.
+            .when_some(self.rename_stash_dialog.clone(), |parent, dialog| {
                 parent.child(
                     div()
                         .absolute()

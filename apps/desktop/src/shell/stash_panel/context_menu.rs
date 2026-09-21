@@ -21,8 +21,8 @@
 //!
 //! # Items are omitted, never disabled
 //!
-//! `Restore This File…` does not appear on an untracked row, and Rename is
-//! absent until its phase lands. Neither is rendered greyed out: a menu item
+//! `Restore This File…` does not appear on an untracked row. It is not
+//! rendered greyed out: a menu item
 //! that does nothing when clicked is exactly the defect Drop shipped with in
 //! Phase 3, and a greyed row still invites the click that teaches the user
 //! the menu lies. Restore in particular could only ever *fail* on an
@@ -45,9 +45,7 @@ use std::path::PathBuf;
 
 use crate::shell::source_control::commit_context_menu::MENU_WIDTH;
 use crate::shell::stash_panel::{DropStashRequested, StashPanel};
-use crate::ui::FloatingSurface;
-
-const ROW_PADDING_X: f32 = 10.0;
+use crate::ui::{FloatingSurface, MenuRow, ROW_PADDING_X, separator};
 
 /// What the right-click landed on.
 ///
@@ -259,19 +257,31 @@ impl StashContextMenu {
         //   reason.
         let branch_panel = self.panel.clone();
         let branch_sha = sha.clone();
-        card = card.child(menu_row(
-            "stash-ctx-branch",
-            "Branch from Stash…",
-            theme.fg_base,
-            theme,
-            density,
-            typography.clone(),
-            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+        card = card.child(MenuRow::new("stash-ctx-branch", "Branch from Stash…", theme, density, typography.clone())
+            .fg(theme.fg_base)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(strong) = branch_panel.as_ref().and_then(|p| p.upgrade()) {
                     let sha = branch_sha.clone();
                     strong.update(cx, |panel, cx| {
                         panel.request_branch_from_stash(&sha, index, cx)
                     });
+                }
+                this.close(cx);
+            }),
+        ));
+        //   Rename sits with the ways back rather than with the read-only
+        //   items below, because it is a mutation — of the whole prefix of
+        //   the stack, not just this row. It emits to the host for the same
+        //   reason Drop and Branch do: the dialog is where the cost is
+        //   disclosed, and the panel never mutates without one.
+        let rename_panel = self.panel.clone();
+        let rename_sha = sha.clone();
+        card = card.child(MenuRow::new("stash-ctx-rename", "Rename…", theme, density, typography.clone())
+            .fg(theme.fg_base)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                if let Some(strong) = rename_panel.as_ref().and_then(|p| p.upgrade()) {
+                    let sha = rename_sha.clone();
+                    strong.update(cx, |panel, cx| panel.request_rename_stash(&sha, index, cx));
                 }
                 this.close(cx);
             }),
@@ -299,28 +309,18 @@ impl StashContextMenu {
         //   the user a string git never wrote.
         let trimmed = stash.message.trim().to_string();
         if !trimmed.is_empty() {
-            card = card.child(menu_row(
-                "stash-ctx-copy-message",
-                "Copy Message",
-                theme.fg_base,
-                theme,
-                density,
-                typography.clone(),
-                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+            card = card.child(MenuRow::new("stash-ctx-copy-message", "Copy Message", theme, density, typography.clone())
+            .fg(theme.fg_base)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(trimmed.clone()));
                     this.close(cx);
                 }),
             ));
         }
         let copy_sha = sha.clone();
-        card = card.child(menu_row(
-            "stash-ctx-copy-sha",
-            "Copy SHA",
-            theme.fg_base,
-            theme,
-            density,
-            typography.clone(),
-            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+        card = card.child(MenuRow::new("stash-ctx-copy-sha", "Copy SHA", theme, density, typography.clone())
+            .fg(theme.fg_base)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy_sha.clone()));
                 this.close(cx);
             }),
@@ -332,14 +332,9 @@ impl StashContextMenu {
         //   the host mounts the confirm dialog. Routing the menu through the
         //   same event is what keeps one confirm step for both entry points.
         let panel = self.panel.clone();
-        card.child(menu_row(
-            "stash-ctx-drop",
-            "Drop…",
-            theme.status_error,
-            theme,
-            density,
-            typography,
-            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+        card.child(MenuRow::new("stash-ctx-drop", "Drop…", theme, density, typography)
+            .fg(theme.status_error)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(strong) = panel.as_ref().and_then(|p| p.upgrade()) {
                     let ev = stash.clone();
                     strong.update(cx, |_panel, cx| cx.emit(ev));
@@ -366,14 +361,9 @@ impl StashContextMenu {
 
         let open_path = path.clone();
         let open_sha = sha.clone();
-        let card = card.child(menu_row(
-            "stash-file-ctx-open",
-            "Open Changes",
-            theme.fg_base,
-            theme,
-            density,
-            typography.clone(),
-            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+        let card = card.child(MenuRow::new("stash-file-ctx-open", "Open Changes", theme, density, typography.clone())
+            .fg(theme.fg_base)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(strong) = panel.as_ref().and_then(|p| p.upgrade()) {
                     let (sha, path) = (open_sha.clone(), open_path.clone());
                     // The panel resolves `origin` from its own cached file
@@ -389,14 +379,9 @@ impl StashContextMenu {
         // platform. What the row paints is the same string split in two, so
         // copying reassembles what the user can see.
         let copy_path = path.to_string_lossy().replace('\\', "/");
-        let card = card.child(menu_row(
-            "stash-file-ctx-copy-path",
-            "Copy Relative Path",
-            theme.fg_base,
-            theme,
-            density,
-            typography,
-            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+        let card = card.child(MenuRow::new("stash-file-ctx-copy-path", "Copy Relative Path", theme, density, typography)
+            .fg(theme.fg_base)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
                 this.close(cx);
             }),
@@ -412,14 +397,9 @@ impl StashContextMenu {
         }
         let restore_panel = self.panel.clone();
         card.child(separator(theme))
-            .child(menu_row(
-                "stash-file-ctx-restore",
-                "Restore This File…",
-                theme.status_error,
-                theme,
-                density,
-                self.typography.clone(),
-                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+            .child(MenuRow::new("stash-file-ctx-restore", "Restore This File…", theme, density, self.typography.clone())
+            .fg(theme.status_error)
+            .build(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     if let Some(strong) = restore_panel.as_ref().and_then(|p| p.upgrade()) {
                         let (sha, path) = (sha.clone(), path.clone());
                         // The panel re-checks `origin` from its own cache
@@ -450,60 +430,19 @@ impl StashContextMenu {
         F: Fn(&mut StashPanel, &mut Context<StashPanel>) + 'static,
     {
         let panel = self.panel.clone();
-        menu_row(
-            id,
-            label,
-            fg,
-            self.theme,
-            self.density,
-            self.typography.clone(),
-            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                if let Some(strong) = panel.as_ref().and_then(|p| p.upgrade()) {
-                    strong.update(cx, |panel, cx| run(panel, cx));
-                }
-                this.close(cx);
-            }),
-        )
+        MenuRow::new(id, label, self.theme, self.density, self.typography.clone())
+            .fg(fg)
+            .build(
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if let Some(strong) = panel.as_ref().and_then(|p| p.upgrade()) {
+                        strong.update(cx, |panel, cx| run(panel, cx));
+                    }
+                    this.close(cx);
+                }),
+            )
     }
 }
 
-/// Single menu row. Same shape as `CommitContextMenu::menu_row` so the menus
-/// read as one component family; `fg` is the one addition, because Drop is
-/// the first context-menu item in the cockpit that has to signal danger.
-fn menu_row<H>(
-    row_id: &'static str,
-    label: &'static str,
-    fg: Hsla,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    div()
-        .id(row_id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(density.h_overlay_item))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(density.r_xs))
-        .text_size(px(typography.t_body_md))
-        .text_color(fg)
-        .cursor_pointer()
-        // Not a red hover for Drop: a destructive tint on the hover
-        // background conflicts with the focus cursor and reads as "the button
-        // broke". Same call `oximux_ui::danger_ghost` makes.
-        .hover(move |s| s.bg(theme.hover_overlay))
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(label)
-}
-
-fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive)
-}
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,9 @@
 
 pub mod buttons;
 pub mod confirm_dialog;
+pub mod menu;
 pub mod overlay;
 
 pub use buttons::danger_ghost;
+pub use menu::{MenuRow, ROW_PADDING_X, separator};
 pub use overlay::FloatingSurface;

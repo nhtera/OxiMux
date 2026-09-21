@@ -5,16 +5,15 @@
 //! owns the per-variant item lists.
 
 use crate::shell::git_panel::GitPanel;
+use crate::ui::{MenuRow, separator};
 use crate::shell::git_panel::discard_confirm::DiscardAllArea;
 use crate::shell::git_panel::row_context_menu::GitRowContextMenu;
 use gpui::{
-    ClipboardItem, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, Styled, WeakEntity, Window, div, px,
+    ClipboardItem, Context, MouseDownEvent, ParentElement, SharedString, WeakEntity,
 };
 use oximux_settings::{Density, Theme, Typography};
 use std::path::{Path, PathBuf};
 
-pub(super) const ROW_PADDING_X: f32 = 10.0;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_single_card(
@@ -41,14 +40,16 @@ pub(super) fn build_single_card(
     //   says why it does nothing. Matches `DiffView::open_file_in_editor`,
     //   which skips the same case.
     let open_path = abs_path.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-open",
         "Open in editor",
-        exists_on_disk(&abs_path),
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(exists_on_disk(&abs_path))
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let p = open_path.clone();
             this.close(cx);
@@ -65,14 +66,16 @@ pub(super) fn build_single_card(
 
     // ── 2. Clipboard ops.
     let copy_abs = abs_path.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-copy-abs",
         "Copy absolute path",
-        true,
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 copy_abs.to_string_lossy().into_owned(),
@@ -81,14 +84,16 @@ pub(super) fn build_single_card(
         }),
     ));
     if let Some(rel) = relative_path_string(&path, workdir) {
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "git-row-ctx-copy-rel",
             "Copy relative path",
-            !rel.is_empty(),
-            theme.fg_base,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(!rel.is_empty())
+            .fg(theme.fg_base)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(rel.clone()));
                 this.close(cx);
@@ -98,14 +103,16 @@ pub(super) fn build_single_card(
 
     // ── 3. Reveal in Finder.
     let reveal_path = abs_path;
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-reveal",
         "Reveal in Finder",
-        true,
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             cx.reveal_path(&reveal_path);
             this.close(cx);
@@ -120,14 +127,16 @@ pub(super) fn build_single_card(
     let stage_path = path.clone();
     let stage_panel = panel.clone();
     let stage_is_staged = is_staged;
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-stage",
         stage_label,
-        true,
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             let p = stage_path.clone();
             this.close(cx);
@@ -148,14 +157,16 @@ pub(super) fn build_single_card(
     //   recoverable, so it sits ABOVE the destructive divider.
     let stash_path = path.clone();
     let stash_panel = panel.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-stash",
         "Stash Changes\u{2026}",
-        true,
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             let p = stash_path.clone();
             this.close(cx);
@@ -177,14 +188,16 @@ pub(super) fn build_single_card(
         let discard_path = path;
         let discard_panel = panel;
         card = card.child(separator(theme));
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "git-row-ctx-discard",
             "Discard\u{2026}",
-            true,
-            theme.status_error,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .fg(theme.status_error)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 let p = discard_path.clone();
                 this.close(cx);
@@ -222,14 +235,16 @@ pub(super) fn build_multi_card(
     let primary_paths = paths.clone();
     let primary_panel = panel.clone();
     let primary_is_unstage = all_staged;
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-multi-primary",
         primary_label,
-        true,
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             let ps = primary_paths.clone();
             this.close(cx);
@@ -248,14 +263,16 @@ pub(super) fn build_multi_card(
     let stash_label: SharedString = format!("Stash {count} selected\u{2026}").into();
     let stash_paths = paths.clone();
     let stash_panel = panel.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-multi-stash",
         stash_label,
-        true,
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             let ps = stash_paths.clone();
             this.close(cx);
@@ -281,14 +298,16 @@ pub(super) fn build_multi_card(
     let discard_label: SharedString = format!("Discard {count} selected\u{2026}").into();
     let discard_paths = paths;
     let discard_panel = panel;
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-multi-discard",
         discard_label,
-        true,
-        theme.status_error,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.status_error)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             let ps = discard_paths.clone();
             this.close(cx);
@@ -327,14 +346,16 @@ pub(super) fn build_folder_card(
     let primary_leaves = leaves.clone();
     let primary_panel = panel.clone();
     let primary_is_unstage = is_staged_section;
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-folder-primary",
         primary_label,
-        true,
-        theme.fg_base,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.fg_base)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             let ls = primary_leaves.clone();
             this.close(cx);
@@ -365,14 +386,16 @@ pub(super) fn build_folder_card(
     };
     let discard_leaves = leaves;
     let discard_panel = panel;
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "git-row-ctx-folder-discard",
         discard_label,
-        true,
-        theme.status_error,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .fg(theme.status_error)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             let ls = discard_leaves.clone();
             this.close(cx);
@@ -416,51 +439,6 @@ pub(super) fn relative_path_string(path: &Path, workdir: Option<&PathBuf>) -> Op
         .map(|p| p.to_string_lossy().into_owned())
         .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()));
     rel.filter(|s| !s.is_empty())
-}
-
-pub(super) fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive)
-}
-
-/// Single low-level menu-row factory. Card builders call this
-/// directly with `theme.fg_base` for normal items and
-/// `theme.status_error` for destructive ones; the wrapper helpers
-/// the original FileTreeContextMenu carries (menu_row /
-/// menu_row_destructive / *_dynamic) are folded into one here to
-/// stay under the 500-LOC warn cap.
-#[allow(clippy::too_many_arguments)]
-fn menu_row<H>(
-    row_id: &'static str,
-    label: impl Into<SharedString>,
-    enabled: bool,
-    fg_when_enabled: gpui::Hsla,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    let fg = if enabled { fg_when_enabled } else { theme.fg_subtle };
-    let mut row = div()
-        .id(SharedString::from(row_id))
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(density.h_overlay_item))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(density.r_xs))
-        .text_size(px(typography.t_body_md))
-        .text_color(fg)
-        .child(label.into());
-    if enabled {
-        row = row
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.hover_overlay))
-            .on_mouse_down(MouseButton::Left, on_click);
-    }
-    row
 }
 
 #[cfg(test)]

@@ -18,13 +18,11 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{CloseTab, RequestRenameTabAt, SplitSubPaneDown, SplitSubPaneRight};
 use crate::shell::terminal_view::TerminalView;
-use crate::ui::FloatingSurface;
+use crate::ui::{FloatingSurface, MenuRow};
 
 /// Width of the dropdown card. Slightly wider than the tab menu to fit the
 /// "Send Last Output to Agent" row plus its shortcut hint.
 pub const MENU_WIDTH: f32 = 248.0;
-/// Horizontal padding inside each row.
-const ROW_PADDING_X: f32 = 10.0;
 
 /// What the menu acts on: the right-clicked terminal view plus the resolved
 /// (group, tab) location (for tab-scoped rows) and the click-time selection /
@@ -140,14 +138,16 @@ impl Render for TerminalContextMenu {
 
         // --- Clipboard rows -------------------------------------------------
         let view_copy = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-copy",
             "Copy",
-            Some("⌘C"),
-            has_sel,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘C")
+            .enabled(has_sel)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(v) = view_copy.upgrade() {
                     v.update(cx, |v, cx| {
@@ -159,14 +159,16 @@ impl Render for TerminalContextMenu {
         ));
 
         let view_paste = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-paste",
             "Paste",
-            Some("⌘V"),
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘V")
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(v) = view_paste.upgrade() {
                     v.update(cx, |v, cx| v.paste_from_clipboard(cx));
@@ -176,14 +178,15 @@ impl Render for TerminalContextMenu {
         ));
 
         let view_paste_text = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-paste-text",
             "Paste Text",
-            None,
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(v) = view_paste_text.upgrade() {
                     v.update(cx, |v, cx| v.paste_text(cx));
@@ -193,14 +196,16 @@ impl Render for TerminalContextMenu {
         ));
 
         let view_select_all = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-select-all",
             "Select All",
-            Some("⌘A"),
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘A")
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(v) = view_select_all.upgrade() {
                     v.update(cx, |v, cx| v.select_all(cx));
@@ -214,14 +219,15 @@ impl Render for TerminalContextMenu {
             card = card.child(divider());
             let view_open = target.view.clone();
             let link_open = link.clone();
-            card = card.child(menu_row(
+            card = card.child(MenuRow::new(
                 "term-ctx-open-link",
                 "Open Link",
-                None,
-                true,
                 theme,
                 density,
                 typography.clone(),
+                )
+                .enabled(true)
+                .build(
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     if let Some(v) = view_open.upgrade() {
                         let s = link_open.clone();
@@ -231,14 +237,15 @@ impl Render for TerminalContextMenu {
                 }),
             ));
             let link_copy = link.clone();
-            card = card.child(menu_row(
+            card = card.child(MenuRow::new(
                 "term-ctx-copy-link",
                 "Copy Link",
-                None,
-                true,
                 theme,
                 density,
                 typography.clone(),
+                )
+                .enabled(true)
+                .build(
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(link_copy.clone()));
                     this.close(cx);
@@ -249,14 +256,16 @@ impl Render for TerminalContextMenu {
         // --- Search + send-to-agent rows ------------------------------------
         card = card.child(divider());
         let view_search = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-search",
             "Search…",
-            Some("⌘F"),
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘F")
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(v) = view_search.upgrade() {
                     v.update(cx, |v, cx| v.open_search(cx));
@@ -266,14 +275,16 @@ impl Render for TerminalContextMenu {
         ));
 
         let view_send_sel = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-send-selection",
             "Send Selection to Agent",
-            Some("⌘⇧I"),
-            has_sel,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘⇧I")
+            .enabled(has_sel)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 if let Some(v) = view_send_sel.upgrade() {
                     v.update(cx, |v, cx| v.send_selection_to_agent(window, cx));
@@ -283,14 +294,16 @@ impl Render for TerminalContextMenu {
         ));
 
         let view_send_out = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-send-output",
             "Send Last Output to Agent",
-            Some("⌘⇧O"),
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘⇧O")
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 if let Some(v) = view_send_out.upgrade() {
                     v.update(cx, |v, cx| v.send_last_output_to_agent(window, cx));
@@ -301,27 +314,31 @@ impl Render for TerminalContextMenu {
 
         // --- Split rows -----------------------------------------------------
         card = card.child(divider());
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-split-right",
             "Split Right",
-            Some("⌘D"),
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘D")
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 window.dispatch_action(Box::new(SplitSubPaneRight), cx);
                 this.close(cx);
             }),
         ));
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-split-down",
             "Split Down",
-            Some("⌘⇧D"),
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘⇧D")
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 window.dispatch_action(Box::new(SplitSubPaneDown), cx);
                 this.close(cx);
@@ -332,14 +349,15 @@ impl Render for TerminalContextMenu {
         card = card.child(divider());
         let rename_group = target.group_id;
         let rename_tab = target.tab_idx;
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-set-title",
             "Set Title…",
-            None,
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 // Close FIRST so the rename modal can take focus without the
                 // dismiss-overlay's mouse-down closing it on the next tick.
@@ -355,14 +373,15 @@ impl Render for TerminalContextMenu {
         ));
 
         let view_clear = target.view.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-clear",
             "Clear",
-            None,
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(v) = view_clear.upgrade() {
                     v.update(cx, |v, cx| v.clear_terminal(cx));
@@ -371,14 +390,16 @@ impl Render for TerminalContextMenu {
             }),
         ));
 
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "term-ctx-close-tab",
             "Close Tab",
-            Some("⌘W"),
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘W")
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 // The right-clicked grid belongs to the visible (active) tab,
                 // so `CloseTab` (focused-tab close) targets the right one.
@@ -442,56 +463,6 @@ impl Render for TerminalContextMenu {
             .child(card_container)
             .into_any_element()
     }
-}
-
-/// One menu row: a label, an optional right-aligned shortcut hint, hover +
-/// click when enabled. A disabled row renders muted and inert.
-#[allow(clippy::too_many_arguments)]
-fn menu_row<H>(
-    row_id: &'static str,
-    label: &'static str,
-    shortcut: Option<&'static str>,
-    enabled: bool,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    let fg = if enabled {
-        theme.fg_base
-    } else {
-        theme.fg_subtle
-    };
-    let mut row = div()
-        .id(row_id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .h(px(density.h_overlay_item))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(density.r_xs))
-        .text_size(px(typography.t_body_md))
-        .text_color(fg)
-        .child(div().flex_1().child(label));
-    if let Some(sc) = shortcut {
-        row = row.child(
-            div()
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_subtle)
-                .child(sc),
-        );
-    }
-    if enabled {
-        row = row
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.hover_overlay))
-            .on_mouse_down(MouseButton::Left, on_click);
-    }
-    row
 }
 
 #[cfg(test)]

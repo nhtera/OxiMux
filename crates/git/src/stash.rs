@@ -22,6 +22,14 @@
 //! The stack itself is shared: `refs/stash` lives in the git *common*
 //! directory, so every worktree of a repo sees one stack, and OxiMux is a
 //! second in-app writer alongside the user's terminal.
+//!
+//! # Rename is not a git verb
+//!
+//! There is no `git stash rename`. [`Repository::stash_rename`] composes one
+//! out of `drop` + `store`, which is why it is the only op here that mutates
+//! entries it was not asked about: every entry above the target comes off and
+//! goes back. Its docs carry the full sequence, the recovery contract, and
+//! what a concurrent push does to it.
 
 use crate::error::{GitError, Result};
 use crate::process::GitCmd;
@@ -547,6 +555,233 @@ impl Repository {
         self.invalidate_stash_list_cache();
         Ok(())
     }
+
+    /// Rename a stash entry's message **at any depth in the stack**.
+    ///
+    /// Git has no `stash rename`, so this is composed from porcelain:
+    /// everything down to and including the target is dropped, the target is
+    /// re-stored under its new message, and the entries above it are re-stored
+    /// on top of it in reverse order. Net effect: the same shas, in the same
+    /// positions, with one message changed.
+    ///
+    /// Returns the entries step 5 could **not** put back, already formatted for
+    /// display — empty on a clean run. `Ok` with a non-empty vec means the
+    /// rename landed but the stack is short; see "if a restore fails" below.
+    ///
+    /// # Why not rewrite `.git/logs/refs/stash`
+    ///
+    /// Editing the reflog directly was sandbox-verified to work and is still
+    /// wrong, four times over: it takes no `refs/stash.lock`, so a concurrent
+    /// `git stash push` landing between the read and the rename is silently
+    /// erased; in a linked worktree the reflog is under `--git-common-dir`, not
+    /// `.git/`, which is precisely this app's normal environment; under git
+    /// 2.45+'s reftable backend `.git/logs/` does not exist at all; and
+    /// rename-over-open-file plus CRLF normalisation make it hostile to the
+    /// Windows port. Porcelain costs 2N+2 subprocesses and has none of that.
+    ///
+    /// # The target is resolved by sha on EVERY iteration
+    ///
+    /// Not `git stash drop stash@{0}` repeated N+1 times. The stack is shared
+    /// with every worktree and with the user's terminal, so a push landing
+    /// mid-sequence takes index 0 and a blind second drop deletes it — an entry
+    /// that cannot even be in the recovery log below, because it did not exist
+    /// when the log was written. Re-resolving means such an intruder
+    /// **survives**. It does not keep its position: it settles below the
+    /// restored entries rather than on top. That reordering is accepted and
+    /// documented, not eliminated — the window is 2N+2 subprocesses wide and
+    /// there is no lock to close it.
+    ///
+    /// # The recovery log is written before the first drop
+    ///
+    /// Every entry this call will touch is logged with its sha before anything
+    /// mutates, because a crash mid-sequence leaves a stack that is short by
+    /// however many entries had been dropped. Stash commits are never rewritten
+    /// — `store` only writes a reflog pointer — so every one of them stays
+    /// recoverable by sha for as long as gc leaves it alone.
+    ///
+    /// # If a restore fails, the loop keeps going
+    ///
+    /// A failed `store` in step 5 is recorded and the remaining entries are
+    /// still restored. Aborting there would cost the entries below the failure
+    /// as well, turning one missing stash into several.
+    ///
+    /// # `store` writes the message literally
+    ///
+    /// Verified: `git stash store -m "x"` records `stash@{0}: x`, with no
+    /// `On <branch>: ` prefix synthesized. So the prefix is re-applied here,
+    /// from the branch the original subject carried, to keep the list uniform.
+    /// An entry that never had one (itself written by `store`) is left bare
+    /// rather than given an invented branch.
+    pub async fn stash_rename(&self, sha: &str, new_message: &str) -> Result<Vec<String>> {
+        self.stash_rename_hooked(sha, new_message, || async {}).await
+    }
+
+    /// [`stash_rename`] with a hook fired after each drop.
+    ///
+    /// Exists **only** so a test can push a stash into the middle of the loop
+    /// and prove the per-iteration sha resolution above; the claim that an
+    /// intruder survives is not one to take on faith. `stash_rename` is this
+    /// with a hook that does nothing. Not a supported API.
+    ///
+    /// [`stash_rename`]: Self::stash_rename
+    #[doc(hidden)]
+    pub async fn stash_rename_hooked<F, Fut>(
+        &self,
+        sha: &str,
+        new_message: &str,
+        after_each_drop: F,
+    ) -> Result<Vec<String>>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let subjects = self.stash_subjects().await?;
+        let Some(target_pos) = subjects.iter().position(|(s, _)| s == sha) else {
+            return Err(GitError::invalid_input(format!(
+                "stash {} is no longer on the stack",
+                short_sha(sha)
+            )));
+        };
+        // Everything from the top down to and including the target: the
+        // entries that have to come off before the target is reachable.
+        let touched = &subjects[..=target_pos];
+
+        // ── Step 2. The recovery sequence, before anything mutates.
+        //
+        // Structured fields, not an interpolated `-m <msg>`: a stash message
+        // legally contains quotes, `$` and backslashes, so a rendered command
+        // line would look copy-pasteable and not be. The sha is the part that
+        // matters — `git stash store <sha>` takes it alone. Same rule the drop
+        // path follows.
+        for (i, (s, subject)) in touched.iter().enumerate() {
+            tracing::warn!(
+                target: "oximux_git::stash",
+                sha = %s,
+                index = i,
+                subject = %subject,
+                "stash rename will drop this entry; recover with: git stash store {}",
+                s,
+            );
+        }
+
+        // ── Step 3. Drop the prefix, top first, resolving by sha each time.
+        for (s, _) in touched {
+            let Some(stash_ref) = self.resolve_stash_index(s, None).await? else {
+                // Already gone — someone else dropped it while we worked. Not
+                // an abort: the entry we were going to put back simply is not
+                // ours to put back any more.
+                tracing::warn!(
+                    target: "oximux_git::stash",
+                    sha = %s,
+                    "stash vanished mid-rename; skipping it",
+                );
+                continue;
+            };
+            let dropped = self.stash_drop(&stash_ref).await?;
+            if &dropped != s {
+                // git removed something else in the gap between resolve and
+                // fire. Put it straight back, then abort — a rename that
+                // continues from here is destroying entries it never listed.
+                let label = subjects
+                    .iter()
+                    .find(|(x, _)| *x == dropped)
+                    .map(|(_, g)| g.clone())
+                    .unwrap_or_else(|| format!("recovered stash {}", short_sha(&dropped)));
+                let restored = self.stash_store(&dropped, &label).await;
+                return Err(GitError::unexpected_outcome(match restored {
+                    Ok(()) => format!(
+                        "rename aborted: git removed {} instead of {}. It has been restored to \
+                         the TOP of the stack, so the order has changed. Nothing was lost.",
+                        short_sha(&dropped),
+                        short_sha(s),
+                    ),
+                    Err(e) => format!(
+                        "rename aborted: git removed {} instead of {}, and restoring it FAILED: \
+                         {e}. Recover it by hand: git stash store {}",
+                        short_sha(&dropped),
+                        short_sha(s),
+                        dropped,
+                    ),
+                }));
+            }
+            after_each_drop().await;
+        }
+
+        // ── Step 4. The target, under its new message, prefix restored.
+        let (branch, _) = split_branch_prefix(&touched[target_pos].1);
+        let new_subject = if branch.is_empty() {
+            new_message.to_string()
+        } else {
+            format!("On {branch}: {new_message}")
+        };
+        let target_stored = self.stash_store(sha, &new_subject).await;
+
+        // ── Step 5. Everything that was above it, back on top, in reverse.
+        let mut failures = Vec::new();
+        for (s, subject) in touched[..target_pos].iter().rev() {
+            if let Err(e) = self.stash_store(s, subject).await {
+                tracing::error!(
+                    target: "oximux_git::stash",
+                    sha = %s,
+                    %e,
+                    "could not restore a stash during rename; recover with: git stash store {}",
+                    s,
+                );
+                failures.push(format!("{}: {e}", short_sha(s)));
+            }
+        }
+
+        // Reported after step 5 ran, not instead of it: the target failing to
+        // come back is the loudest outcome, but it is not a reason to strand
+        // the entries above it as well.
+        target_stored.map_err(|e| {
+            GitError::unexpected_outcome(format!(
+                "the renamed stash could not be put back: {e}. \
+                 Recover it by hand: git stash store {sha}"
+            ))
+        })?;
+        Ok(failures)
+    }
+
+    /// `(sha, raw reflog subject)` for every entry, top first.
+    ///
+    /// The **raw** `%gs`, not [`StashEntry`]'s split `(branch, message)` pair:
+    /// step 5 puts each subject back verbatim, and reassembling one from the
+    /// split would turn `WIP on main: x` into `On main: x` — a silent rewrite
+    /// of an entry the user never asked to touch.
+    ///
+    /// Same NUL framing and the same fails-closed field count as
+    /// [`parse_stash_list`]; see its docs for why nothing printable will do.
+    async fn stash_subjects(&self) -> Result<Vec<(String, String)>> {
+        let out = GitCmd::new(self.workdir())
+            .args(["stash", "list", "-z", "--format=%H%x00%gs"])
+            .run()
+            .await?;
+        let text = String::from_utf8(out.stdout)
+            .map_err(|e| GitError::parse(format!("non-utf8 in `git stash list`: {e}")))?;
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = text.strip_suffix('\0').unwrap_or(&text);
+        let tokens: Vec<&str> = body.split('\0').collect();
+        if !tokens.len().is_multiple_of(2) {
+            return Err(GitError::parse(format!(
+                "`git stash list` returned {} fields, not a multiple of 2 — is `-z` being \
+                 honoured?",
+                tokens.len()
+            )));
+        }
+        Ok(tokens
+            .chunks_exact(2)
+            .map(|c| (c[0].trim().to_string(), c[1].to_string()))
+            .collect())
+    }
+}
+
+/// First 7 chars of a sha, for copy that has to stay readable. Slices on a
+/// char boundary by construction — a sha is ASCII hex.
+fn short_sha(sha: &str) -> &str {
+    &sha[..7.min(sha.len())]
 }
 
 /// Pull the sha out of git's drop confirmation,

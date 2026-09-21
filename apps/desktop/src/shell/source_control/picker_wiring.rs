@@ -208,6 +208,51 @@ impl SourceControlPanel {
     /// PR/CI state is dropped rather than refreshed. It belongs to the branch
     /// the user just left, and the 30 s throttle would otherwise keep showing
     /// it against the new one.
+    /// Reload the commit graph when HEAD has moved since the previous poll.
+    ///
+    /// # The other half of the same gap
+    ///
+    /// [`refresh_after_branch_change`] fixes the movers the panel performs
+    /// itself. This catches every mover it does not: a commit, amend, reset,
+    /// rebase or checkout made in the user's own terminal, or in a sibling
+    /// worktree sharing the repo. Nothing in the app fires for those, so the
+    /// graph went on painting history that no longer had HEAD at its tip —
+    /// the same defect as the branch-switch gap, a different trigger.
+    ///
+    /// The signal is free: `GitState` already carries `head_oid` and the
+    /// poller already delivers it every tick. So this is a comparison, not a
+    /// new query — no extra subprocess, and it self-heals within one tick of
+    /// whatever moved HEAD.
+    ///
+    /// **Only the graph is reloaded.** The branch name, the file list and
+    /// "Committed on Branch" all ride the same poll and have already been
+    /// updated by the time this returns. PR/CI state is deliberately left
+    /// alone: HEAD moving on the SAME branch (the common case here, a plain
+    /// commit) does not invalidate its PR, and dropping it would make every
+    /// terminal commit re-spend the forge round-trip.
+    ///
+    /// [`refresh_after_branch_change`]: Self::refresh_after_branch_change
+    pub(crate) fn refresh_graph_if_head_moved(
+        &mut self,
+        head_oid: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let head = head_oid.map(str::to_string);
+        if !self.head_oid_seen {
+            // First poll on a panel built before any state arrived. The graph
+            // loaded against whatever HEAD is now, so adopt it silently —
+            // treating this as a move would reload the graph on every boot.
+            self.head_oid_seen = true;
+            self.last_head_oid = head;
+            return;
+        }
+        if self.last_head_oid == head {
+            return;
+        }
+        self.last_head_oid = head;
+        self.commit_graph.update(cx, |g, cx| g.refresh(cx));
+    }
+
     pub(crate) fn refresh_after_branch_change(&mut self, cx: &mut Context<Self>) {
         self.commit_graph.update(cx, |g, cx| g.refresh(cx));
         self.has_open_pr = false;

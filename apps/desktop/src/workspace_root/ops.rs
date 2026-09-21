@@ -748,6 +748,14 @@ impl WorkspaceRoot {
             },
         ));
 
+        self._rename_stash_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &RenameStashRequested, window, cx| {
+                root.mount_rename_stash_dialog(panel, ev, window, cx);
+            },
+        ));
+
         let commit_repo = repo.clone();
         self._show_commit_subscription = Some(cx.subscribe_in(
             &commit_graph,

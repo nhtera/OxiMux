@@ -86,6 +86,10 @@ pub fn install(cx: &mut App) {
     // Modal-scoped Cmd+Enter (open highlighted history entry as chat) — a
     // context-scoped binding, so it can't shadow Cmd+Enter globally.
     crate::shell::session_history::register_session_history_key_bindings(cx);
+    // Stash-section cursor keys. Context-scoped for a sharper version of the
+    // same reason: these are bare arrow keys and `Enter`, which in the global
+    // keymap would shadow every list and every input in the app.
+    crate::shell::stash_panel::keyboard::register_stash_panel_key_bindings(cx);
     for warning in &warnings {
         tracing::warn!(%warning, "keybinding override problem");
     }

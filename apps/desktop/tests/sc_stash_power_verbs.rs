@@ -238,3 +238,86 @@ async fn restore_file_confirmed_writes_one_file_and_keeps_the_stash(cx: &mut Tes
         "restore copies out; the stash stays",
     );
 }
+
+// ── Phase 9: rename ───────────────────────────────────────────────────────
+//
+// The sequence itself — order preserved, dates preserved, an intruder pushed
+// mid-loop surviving — is `crates/git/tests/stash_rename.rs`. What these two
+// add is that the op is reachable from the panel and that it refuses a stash
+// that has left the stack instead of rewriting a neighbour.
+
+#[gpui::test]
+async fn rename_confirmed_changes_the_message_and_keeps_the_position(cx: &mut TestAppContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path();
+    seed(p);
+    for (file, msg) in [("alpha.txt", "first"), ("keep.txt", "second")] {
+        std::fs::write(p.join(file), "changed\n").expect("write");
+        git(p, &["stash", "push", "-m", msg]);
+    }
+
+    let repo = rt.block_on(Repository::open(p)).expect("open repo");
+    // `second` is on top, so `first` is the BOTTOM entry — the case where the
+    // rename has to take an entry off and put it back rather than just
+    // re-storing the top one.
+    let entries = rt.block_on(repo.stash_list(true)).expect("list");
+    let target = entries[1].sha.clone();
+
+    let window = mount(&repo, cx);
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.rename_confirmed(target.clone(), 1, "renamed".into(), cx);
+            });
+        })
+        .expect("dispatch rename_confirmed");
+    settle();
+
+    let after = rt.block_on(repo.stash_list(true)).expect("list");
+    assert_eq!(
+        after.iter().map(|e| e.message.as_str()).collect::<Vec<_>>(),
+        vec!["second", "renamed"],
+    );
+    assert_eq!(after[1].sha, target, "the rename rewrote the commit");
+}
+
+#[gpui::test]
+async fn rename_confirmed_on_a_vanished_stash_leaves_the_stack_alone(cx: &mut TestAppContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path();
+    seed(p);
+    std::fs::write(p.join("alpha.txt"), "a2\n").expect("write");
+    git(p, &["stash", "push", "-m", "wip"]);
+
+    let repo = rt.block_on(Repository::open(p)).expect("open repo");
+    let before = git_out(p, &["stash", "list", "--format=%gs"]);
+
+    let window = mount(&repo, cx);
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                // A sha the stack does not hold — the shape a menu click takes
+                // when something else dropped the entry first.
+                panel.rename_confirmed(
+                    "0000000000000000000000000000000000000000".into(),
+                    0,
+                    "nope".into(),
+                    cx,
+                );
+            });
+        })
+        .expect("dispatch rename_confirmed");
+    settle();
+
+    assert_eq!(
+        git_out(p, &["stash", "list", "--format=%gs"]),
+        before,
+        "a rename aimed at a missing stash rewrote a neighbour",
+    );
+}

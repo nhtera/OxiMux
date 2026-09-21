@@ -21,17 +21,13 @@
 //! anything mutating runs and the failure arrives as a toast.
 
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, div, px,
+    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, ParentElement, Render, SharedString, Window,
 };
-use gpui_component::{
-    Disableable as _,
-    button::{Button, ButtonVariants},
-    input::{Input, InputState},
-};
+use gpui_component::input::{Input, InputState};
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::ui::FloatingSurface;
+use super::form;
 use std::rc::Rc;
 
 /// Fired with the name the user typed, trimmed and known non-empty.
@@ -80,6 +76,14 @@ impl BranchFromStashDialog {
             state.set_value(suggested_name.clone(), window, cx);
             state
         });
+        // Focus the INPUT, not this dialog's own handle. A gpui-component
+        // `Input` only receives text when its own `InputState` handle is
+        // focused, and the Escape/Enter key handler below only sees a
+        // keystroke once something inside the dialog holds focus — without
+        // this the modal opens INERT: typing goes nowhere and Escape does not
+        // dismiss it until the user clicks the field. Found live on the
+        // rename dialog, then confirmed here.
+        window.focus(&name_input.read(cx).focus_handle(cx), cx);
         Self {
             name_input,
             stash_label,
@@ -162,71 +166,32 @@ impl Render for BranchFromStashDialog {
             format!("From “{}”.", self.stash_label.trim()).into()
         };
 
-        div()
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|dlg, event: &KeyDownEvent, window, cx| {
+        form::form_card(
+            &self.focus_handle,
+            &theme,
+            &density,
+            cx.listener(|dlg, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "enter" => dlg.try_confirm(window, cx),
                     "escape" => dlg.cancel(window, cx),
                     _ => {}
                 }
-            }))
-            .flex()
-            .flex_col()
-            .w(px(440.0))
-            .p(px(density.pad_panel * 2.0))
-            .floating_chrome(&theme, &density)
-            .gap(px(density.gap_inline))
-            .child(
-                div()
-                    .text_size(px(typography.t_body_md))
-                    .font_weight(typography.w_semibold)
-                    .text_color(theme.fg_base)
-                    .child("Branch from stash"),
-            )
-            .child(
-                div()
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(theme.fg_muted)
-                    .child(subtitle),
-            )
-            .child(
-                div()
-                    .text_size(px(typography.t_label_caps))
-                    .text_color(theme.fg_subtle)
-                    .child("Name"),
-            )
-            .child(Input::new(&self.name_input))
-            .child(
-                div()
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(theme.fg_subtle)
-                    .child(CONSUMPTION_NOTE),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap(px(density.gap_inline))
-                    .child(
-                        Button::new("branch-stash-cancel-button")
-                            .ghost()
-                            .label("Cancel")
-                            .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
-                                dlg.cancel(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("branch-stash-confirm-button")
-                            .primary()
-                            .label("Create branch")
-                            .disabled(empty)
-                            .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
-                                dlg.try_confirm(window, cx);
-                            })),
-                    ),
-            )
+            }),
+        )
+        .child(form::form_title("Branch from stash", &theme, typography))
+        .child(form::form_subtitle(subtitle, &theme, typography))
+        .child(form::form_field_label("Name", &theme, typography))
+        .child(Input::new(&self.name_input))
+        .child(form::form_note(CONSUMPTION_NOTE, &theme, typography))
+        .child(form::form_buttons(
+            "branch-stash-cancel-button",
+            "branch-stash-confirm-button",
+            "Create branch",
+            empty,
+            &density,
+            cx.listener(|dlg, _: &ClickEvent, window, cx| dlg.cancel(window, cx)),
+            cx.listener(|dlg, _: &ClickEvent, window, cx| dlg.try_confirm(window, cx)),
+        ))
     }
 }
 

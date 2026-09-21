@@ -15,7 +15,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::ui::FloatingSurface;
+use crate::ui::{FloatingSurface, MenuRow, ROW_PADDING_X};
 
 use crate::actions::{MoveTabToNewWindow, RequestRenameTabAt, SplitGroupAt, TogglePinTabAt};
 use crate::shell::pane_group::{PaneGroup, TabColor};
@@ -41,7 +41,6 @@ pub enum TabContextKind {
 /// Width of the dropdown card.
 pub const MENU_WIDTH: f32 = 188.0;
 /// Horizontal padding inside each row.
-const ROW_PADDING_X: f32 = 10.0;
 /// Split icon glyph size inside each split row.
 const SPLIT_ICON_SIZE: f32 = 14.0;
 /// Gap between icon and label in a split row.
@@ -197,13 +196,15 @@ impl TabContextMenu {
             .floating_chrome(&theme, &density)
             .shadow_lg();
         if available {
-            card = card.child(menu_row(
+            card = card.child(MenuRow::new(
                 "tab-view-terminal",
                 toggle_label,
-                true,
                 theme,
                 density,
                 typography.clone(),
+                )
+                .enabled(true)
+                .build(
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     if let Some(g) = group.upgrade() {
                         g.update(cx, |g, cx| g.toggle_chat_terminal_at(ix, window, cx));
@@ -383,13 +384,15 @@ impl Render for TabContextMenu {
         card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
 
         let rename_idx = target.tab_idx;
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "tab-ctx-rename",
             "Change Title…",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 // Closing FIRST so the rename modal can take focus
                 // without the menu's mouse-down-out closing it on the
@@ -411,13 +414,15 @@ impl Render for TabContextMenu {
         } else {
             "Pin Tab"
         };
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "tab-ctx-pin",
             pin_label,
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 this.close(cx);
                 window.dispatch_action(
@@ -436,13 +441,15 @@ impl Render for TabContextMenu {
         if target.can_tear_off {
             let move_group_id = target.group_id.0;
             let move_tab_idx = target.tab_idx;
-            card = card.child(menu_row(
+            card = card.child(MenuRow::new(
                 "tab-ctx-move-to-new-window",
                 "Move Tab to New Window",
-                true,
                 theme,
                 density,
                 typography.clone(),
+                )
+                .enabled(true)
+                .build(
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     this.close(cx);
                     window.dispatch_action(
@@ -458,13 +465,15 @@ impl Render for TabContextMenu {
 
         card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
 
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "tab-ctx-close",
             "Close",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 if let Some(group) = group_close.upgrade() {
                     // Route through the dirty-close guard so an unsaved editor
@@ -476,13 +485,15 @@ impl Render for TabContextMenu {
             }),
         ));
 
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "tab-ctx-close-others",
             "Close Others",
-            has_multiple,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(has_multiple)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 if let Some(group) = group_others.upgrade() {
                     group.update(cx, |g, cx| g.close_others(others_idx, window, cx));
@@ -491,13 +502,15 @@ impl Render for TabContextMenu {
             }),
         ));
 
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "tab-ctx-close-to-right",
             "Close to Right",
-            has_right,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(has_right)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 if let Some(group) = group_right.upgrade() {
                     group.update(cx, |g, cx| g.close_to_right(right_idx, window, cx));
@@ -506,13 +519,15 @@ impl Render for TabContextMenu {
             }),
         ));
 
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "tab-ctx-close-all",
             "Close All in Group",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 if let Some(group) = group_all.upgrade() {
                     group.update(cx, |g, cx| g.close_all(window, cx));
@@ -541,13 +556,15 @@ impl Render for TabContextMenu {
         if let TabContextKind::Editor { path, project_root } = &target.kind {
             card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
             let copy_path = path.clone();
-            card = card.child(menu_row(
+            card = card.child(MenuRow::new(
                 "tab-ctx-copy-path",
                 "Copy Path",
-                true,
                 theme,
                 density,
                 typography.clone(),
+                )
+                .enabled(true)
+                .build(
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(
                         copy_path.to_string_lossy().into_owned(),
@@ -568,26 +585,30 @@ impl Render for TabContextMenu {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default()
                 });
-            card = card.child(menu_row(
+            card = card.child(MenuRow::new(
                 "tab-ctx-copy-relative",
                 "Copy Relative Path",
-                !rel_string.is_empty(),
                 theme,
                 density,
                 typography.clone(),
+                )
+                .enabled(!rel_string.is_empty())
+                .build(
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(rel_string.clone()));
                     this.close(cx);
                 }),
             ));
             let reveal_path = path.clone();
-            card = card.child(menu_row(
+            card = card.child(MenuRow::new(
                 "tab-ctx-reveal-in-finder",
                 "Reveal in Finder",
-                true,
                 theme,
                 density,
                 typography.clone(),
+                )
+                .enabled(true)
+                .build(
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     // Selects the file in the platform file manager. Failure is
                     // non-fatal — gpui logs it; nothing to surface here.
@@ -702,42 +723,6 @@ fn color_palette_row(
         .into_any_element()
 }
 
-fn menu_row<H>(
-    row_id: &'static str,
-    label: &'static str,
-    enabled: bool,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    let fg = if enabled {
-        theme.fg_base
-    } else {
-        theme.fg_subtle
-    };
-    let mut row = div()
-        .id(row_id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(density.h_overlay_item))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(density.r_xs))
-        .text_size(px(typography.t_body_md))
-        .text_color(fg)
-        .child(label);
-    if enabled {
-        row = row
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.hover_overlay))
-            .on_mouse_down(MouseButton::Left, on_click);
-    }
-    row
-}
 
 #[cfg(test)]
 mod tests {

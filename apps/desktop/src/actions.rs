@@ -587,6 +587,29 @@ actions!(
         RetryDiff,
         /// Open the commit dialog modal (step 14 binds Cmd+K).
         OpenCommitDialog,
+        // ---- Stash-section keyboard cursor ----------------------------
+        //
+        // Bound to bare arrow keys, `Enter` and `Cmd+Backspace` — but ONLY
+        // inside the `StashPanel` key context, which the panel's root carries
+        // while it is focused. They are installed by
+        // `stash_panel::keyboard::register_stash_panel_key_bindings`, not by
+        // the keybindings registry: the registry builds every binding with no
+        // context, so a bare `up` there would shadow the arrow keys for the
+        // whole application. See that module's docs.
+        /// Move the stash-section cursor to the previous visible row.
+        StashCursorUp,
+        /// Move the stash-section cursor to the next visible row.
+        StashCursorDown,
+        /// Expand the stash under the cursor. No-op on a file row.
+        StashCursorExpand,
+        /// Collapse the stash under the cursor, or step from a file row up to
+        /// the stash that owns it.
+        StashCursorCollapse,
+        /// Open the diff (file row) or toggle the expansion (stash row).
+        StashCursorActivate,
+        /// Drop the stash under the cursor — through the same confirm dialog
+        /// the row's trash glyph opens, never directly.
+        StashCursorDrop,
         /// Submit the active commit dialog. Routed via dialog button click;
         /// declared here so step 14 can also bind Cmd+Enter to it.
         CommitStaged,

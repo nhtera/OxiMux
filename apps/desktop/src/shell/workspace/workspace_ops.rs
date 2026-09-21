@@ -654,6 +654,10 @@ impl WorkspaceRoot {
             // branch in the active repo and consumes a stash there.
             self.branch_from_stash_dialog = None;
             self._branch_from_stash_dialog_observer = None;
+            // And the rename form, which rewrites a whole prefix of the
+            // active repo's stash stack.
+            self.rename_stash_dialog = None;
+            self._rename_stash_dialog_observer = None;
         }
 
         // Clone window_id BEFORE any mutable borrows of self so closure

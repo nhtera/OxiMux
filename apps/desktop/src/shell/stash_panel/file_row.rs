@@ -20,21 +20,38 @@
 //! files, and a *failed* expansion that renders nothing looks exactly like a
 //! successful one — the user is told their stash is empty, which is the worst
 //! possible way to be wrong about a stash.
+//!
+//! # Two layouts, one row
+//!
+//! Tree mode adds folder rows and an indent; it does not add a second file
+//! row. [`StashPanel::render_file_row`] takes the indent as a parameter and
+//! both layouts call it, so a file cannot come to look — or behave — like a
+//! different kind of thing depending on a toggle. The tree's shape comes from
+//! [`super::tree_view`].
 
 use crate::shell::file_explorer::file_icon::icon_for_name;
 use crate::shell::source_control::style::ScmStyle;
-use crate::shell::stash_panel::{ShowStashFileRequested, StashFilesState, StashPanel};
+use crate::shell::source_control::tree::{NodeKind, RenderRow};
+use crate::shell::stash_panel::keyboard::StashCursor;
+use crate::shell::stash_panel::{
+    ShowStashFileRequested, StashFilesState, StashPanel, tree_view,
+};
 use gpui::{
     AnyElement, ClickEvent, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, StatefulInteractiveElement as _, Styled, div, px, svg,
+    MouseDownEvent, ParentElement, StatefulInteractiveElement as _, Styled, div,
+    prelude::FluentBuilder as _, px, svg,
 };
 use gpui_component::{Icon, IconName};
-use oximux_core::{DiffStatus, StashEntry, StashFile};
+use oximux_core::{DiffStatus, StashEntry, StashFile, ViewMode};
 
 /// How far a file row is inset from the stash row above it, as a multiple of
-/// the panel's own horizontal padding. One step — enough to read as "inside
-/// that stash", not so much that a nested path loses its width.
-const INDENT_STEPS: f32 = 2.0;
+/// the panel's own horizontal padding — enough to read as "inside that
+/// stash", not so much that a nested path loses its width.
+///
+/// Also the BASE of the tree layout's indent ([`tree_view::indent_steps`]),
+/// so a top-level tree row lands exactly here and flipping the toggle does
+/// not slide the block sideways.
+pub(super) const FLAT_INDENT_STEPS: f32 = 2.0;
 
 impl StashPanel {
     /// The block rendered under an expanded stash row.
@@ -54,14 +71,119 @@ impl StashPanel {
                 // rendering fault.
                 self.file_note("No files in this stash", false)
             }
-            Some(StashFilesState::Ready(files)) => {
-                let mut col = div().flex().flex_col().w_full();
-                for file in files.clone() {
-                    col = col.child(self.render_file_row(entry, file, cx));
+            Some(StashFilesState::Ready(files)) => match self.view_mode() {
+                ViewMode::Flat => {
+                    let mut col = div().flex().flex_col().w_full();
+                    for file in files.clone() {
+                        col = col.child(self.render_file_row(entry, file, FLAT_INDENT_STEPS, cx));
+                    }
+                    col.into_any_element()
                 }
-                col.into_any_element()
+                ViewMode::Tree => self.render_file_tree(entry, &files.clone(), cx),
+            },
+        }
+    }
+
+    /// The tree layout: folder rows interleaved with the same file rows the
+    /// flat list paints, each indented by its depth.
+    fn render_file_tree(
+        &self,
+        entry: &StashEntry,
+        files: &[StashFile],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut col = div().flex().flex_col().w_full();
+        for row in tree_view::rows(files, &self.collapsed_for(&entry.sha)) {
+            let indent = tree_view::indent_steps(row.depth);
+            match row.kind {
+                NodeKind::Dir => col = col.child(self.render_dir_row(entry, &row, indent, cx)),
+                // A tree row is a path; the `StashFile` behind it carries the
+                // status and the origin, and the row is skipped rather than
+                // synthesised if the two ever disagree — a file row that
+                // guessed its origin would route its diff at the wrong
+                // revision.
+                NodeKind::File => {
+                    if let Some(file) = files.iter().find(|f| f.path == row.path) {
+                        col = col.child(self.render_file_row(entry, file.clone(), indent, cx));
+                    }
+                }
             }
         }
+        col.into_any_element()
+    }
+
+    /// One folder inside a stash's tree: chevron, name, child count.
+    ///
+    /// Deliberately thinner than the CHANGES panel's folder row, which carries
+    /// a hover cluster of bulk stage/discard verbs. A stash has no bulk verb
+    /// that operates on a subtree — there is no "restore this folder" — so the
+    /// row is a disclosure triangle and nothing else. See the carried-forward
+    /// note in the phase file.
+    fn render_dir_row(
+        &self,
+        entry: &StashEntry,
+        row: &RenderRow,
+        indent_steps: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let style = ScmStyle::new(density, &self.typography);
+        let collapsed = self.is_dir_collapsed(&entry.sha, &row.path);
+        let name = row
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let sha = entry.sha.clone();
+        let dir = row.path.clone();
+        // Same keying rule as a file row: sha AND index, so one folder path
+        // open in two expanded stashes does not share element state.
+        let id = ElementId::Name(
+            format!(
+                "stash-dir-{}-{}-{}",
+                entry.sha,
+                entry.stash_ref.index,
+                row.path.display()
+            )
+            .into(),
+        );
+
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline))
+            .h(px(density.h_row))
+            .pl(px(density.pad_panel * indent_steps))
+            .pr(px(density.pad_panel))
+            .text_size(px(style.body_text))
+            .text_color(theme.fg_muted)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.hover_overlay))
+            .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                panel.toggle_dir(&sha, dir.clone(), cx);
+            }))
+            .child(
+                Icon::default()
+                    .path(if collapsed {
+                        "icons/chevron-right.svg"
+                    } else {
+                        "icons/chevron-down.svg"
+                    })
+                    .size(px(style.icon))
+                    .text_color(theme.fg_muted),
+            )
+            .child(div().flex_1().min_w(px(0.0)).truncate().child(name))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(style.graph_meta_text))
+                    .text_color(theme.fg_subtle)
+                    .child(format!("{}", row.child_count)),
+            )
     }
 
     /// One clickable file inside a stash.
@@ -69,6 +191,7 @@ impl StashPanel {
         &self,
         entry: &StashEntry,
         file: StashFile,
+        indent_steps: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
@@ -114,6 +237,13 @@ impl StashPanel {
             )
             .into(),
         );
+        let cursored = self.cursor()
+            == Some(&StashCursor::File {
+                sha: entry.sha.clone(),
+                path: file.path.clone(),
+            });
+        let cursor_sha = entry.sha.clone();
+        let cursor_path = file.path.clone();
         let request = ShowStashFileRequested {
             sha: entry.sha.clone(),
             path: file.path.clone(),
@@ -144,13 +274,30 @@ impl StashPanel {
             .items_center()
             .gap(px(density.gap_inline))
             .h(px(density.h_row))
-            .pl(px(density.pad_panel * INDENT_STEPS))
+            .pl(px(density.pad_panel * indent_steps))
             .pr(px(density.pad_panel))
             .text_size(px(style.body_text))
             .text_color(theme.fg_base)
             .cursor_pointer()
+            // The keyboard cursor, painted as a background rather than a
+            // border: a border would change the row's height and make arrowing
+            // through a list nudge everything below it.
+            .when(cursored, |row| row.bg(theme.selection))
             .hover(|s| s.bg(theme.hover_overlay))
-            .on_click(cx.listener(move |_panel, _: &ClickEvent, _window, cx| {
+            .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                // Clicking is also a cursor move, so arrowing continues from
+                // the row the user last touched rather than from the top.
+                //
+                // It does NOT try to keep keyboard focus in the panel: this
+                // click opens a diff tab, and the tab takes focus. See
+                // `keyboard.rs` on what that costs the arrow keys.
+                panel.set_cursor(
+                    StashCursor::File {
+                        sha: cursor_sha.clone(),
+                        path: cursor_path.clone(),
+                    },
+                    cx,
+                );
                 cx.emit(request.clone());
             }))
             .on_mouse_down(
@@ -210,7 +357,7 @@ impl StashPanel {
             .flex()
             .items_center()
             .h(px(density.h_row))
-            .pl(px(density.pad_panel * INDENT_STEPS))
+            .pl(px(density.pad_panel * FLAT_INDENT_STEPS))
             .pr(px(density.pad_panel))
             .text_size(px(style.graph_meta_text))
             .text_color(if is_error {

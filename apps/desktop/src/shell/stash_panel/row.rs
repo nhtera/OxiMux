@@ -53,9 +53,12 @@
 //! taken out of the width arithmetic entirely. See the cluster itself.
 //!
 //! Only the verbs that exist are painted: Apply, Pop, Drop. Branch-from-stash
-//! and Rename belong to later phases and are absent rather than present and
-//! dead — a button that does nothing is the defect Drop already shipped once.
+//! and Rename are reachable from the right-click menu and are deliberately not
+//! given a fourth and fifth glyph here — the cluster already covers the row at
+//! its narrowest, and both open a dialog rather than acting, which is a poor
+//! fit for a one-glyph control with no label.
 
+use crate::shell::stash_panel::keyboard::StashCursor;
 use crate::shell::stash_panel::list_render::{row_message, row_meta, row_tooltip};
 use crate::shell::stash_panel::{DropStashRequested, StashPanel};
 use crate::shell::source_control::style::ScmStyle;
@@ -245,6 +248,8 @@ impl StashPanel {
                     .text_color(theme.fg_muted),
             );
 
+        let cursored = self.cursor() == Some(&StashCursor::Stash(entry.sha.clone()));
+        let cursor_sha = entry.sha.clone();
         let row = div()
             .id(row_id)
             .group(group_name)
@@ -282,8 +287,22 @@ impl StashPanel {
             // row's flex flow, not by making it narrower; three glyphs are a
             // third of the width three labels were and still did not fit.
             .overflow_hidden()
+            // The keyboard cursor. A background rather than a border, so
+            // arrowing down the list does not nudge every row below it by a
+            // pixel as the border appears and disappears.
+            .when(cursored, |row| row.bg(theme.selection))
             .border_b_1()
             .border_color(theme.border_inactive)
+            // A click is also a cursor move, so the arrow keys continue from
+            // the row the user last touched. Left button only: a right-click
+            // opens the menu and must not also move the selection out from
+            // under whatever the user was looking at.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |panel, _: &MouseDownEvent, _window, cx| {
+                    panel.set_cursor(StashCursor::Stash(cursor_sha.clone()), cx);
+                }),
+            )
             .child(chevron)
             .child(
                 div()

@@ -11,6 +11,7 @@
 //! clamped on load AND save so a corrupt write can't leak past either
 //! direction.
 
+use oximux_core::ViewMode;
 use oximux_settings::Density;
 use oximux_storage::SettingsRepo;
 
@@ -26,6 +27,16 @@ pub const KEY_SCM_GRAPH_HEIGHT: &str = "scm_graph_height";
 
 /// Settings key holding the stash section's body height in pixels.
 pub const KEY_SCM_STASH_HEIGHT: &str = "scm_stash_height";
+
+/// Settings key holding the stash section's file layout — `"flat"` or
+/// `"tree"`, per [`ViewMode::as_str`].
+///
+/// **Global, not per-worktree.** The CHANGES list keeps its own layout in the
+/// V006 `worktree_settings` row, which is right for it: those files belong to
+/// one worktree. `refs/stash` lives in the git *common* directory, so every
+/// worktree of a repo shows the same stack — a per-worktree key would paint
+/// one list two different ways in two sibling windows.
+pub const KEY_SCM_STASH_VIEW_MODE: &str = "scm_stash_view_mode";
 
 // ---------------------------------------------------------------------------
 // Panel-width bounds
@@ -289,6 +300,28 @@ pub fn save_stash_height(repo: &SettingsRepo, value: f32) {
         tracing::warn!(
             target: "oximux_app::scm_layout_settings",
             "failed to persist scm_stash_height: {err}"
+        );
+    }
+}
+
+/// Read the stash section's file layout. Anything unrecognised — including a
+/// missing key and a corrupt value — decodes to `Flat`, which is
+/// [`ViewMode::from_str`]'s documented contract for a free-form store.
+pub fn load_stash_view_mode(repo: &SettingsRepo) -> ViewMode {
+    match repo.get(KEY_SCM_STASH_VIEW_MODE) {
+        Ok(Some(s)) => ViewMode::from_str(s.trim()),
+        _ => ViewMode::default(),
+    }
+}
+
+/// Persist the stash section's file layout. See [`save_panel_width`] for the
+/// error policy: a failed write costs the preference on next launch, never the
+/// interaction the user just made.
+pub fn save_stash_view_mode(repo: &SettingsRepo, mode: ViewMode) {
+    if let Err(err) = repo.set(KEY_SCM_STASH_VIEW_MODE, mode.as_str()) {
+        tracing::warn!(
+            target: "oximux_app::scm_layout_settings",
+            "failed to persist scm_stash_view_mode: {err}"
         );
     }
 }
@@ -733,5 +766,30 @@ mod tests {
             Some(MIN_GRAPH_HEIGHT)
         );
         assert_eq!(next_section_height(200.0, "escape", false, 1.0, 900.0), None);
+    }
+
+    // ---- stash layout -------------------------------------------------
+
+    #[test]
+    fn an_unset_stash_layout_is_flat() {
+        assert_eq!(load_stash_view_mode(&repo()), ViewMode::Flat);
+    }
+
+    #[test]
+    fn a_stash_layout_round_trips() {
+        let r = repo();
+        save_stash_view_mode(&r, ViewMode::Tree);
+        assert_eq!(load_stash_view_mode(&r), ViewMode::Tree);
+        save_stash_view_mode(&r, ViewMode::Flat);
+        assert_eq!(load_stash_view_mode(&r), ViewMode::Flat);
+    }
+
+    #[test]
+    fn a_corrupt_stash_layout_decodes_to_flat_rather_than_failing() {
+        // A hand-edited or half-written value must cost the preference, not
+        // the panel: there is no error path a layout toggle could take.
+        let r = repo();
+        r.set(KEY_SCM_STASH_VIEW_MODE, "treeish").unwrap();
+        assert_eq!(load_stash_view_mode(&r), ViewMode::Flat);
     }
 }

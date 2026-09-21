@@ -28,11 +28,15 @@
 pub mod branch_dialog;
 pub mod context_menu;
 pub mod file_row;
+mod form;
+pub mod keyboard;
 pub mod list_render;
 pub mod ops;
 pub mod push_dialog;
+pub mod rename_dialog;
 pub mod resize;
 pub mod row;
+pub mod tree_view;
 
 use gpui::{
     App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -44,7 +48,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     scroll::ScrollableElement as _,
 };
-use oximux_core::{StashEntry, StashFile, StashFileOrigin, StashRef};
+use oximux_core::{StashEntry, StashFile, StashFileOrigin, StashRef, ViewMode};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::{HashMap, HashSet};
@@ -152,6 +156,28 @@ pub struct RestoreStashFileRequested {
     pub path: PathBuf,
 }
 
+/// Emitted when the user picks `Rename…` on a stash row. The host prompts for
+/// a new message and, on confirm, calls [`StashPanel::rename_confirmed`].
+///
+/// Routed through the host like Drop and Branch, and for a sharper reason than
+/// either: renaming `stash@{N}` drops and re-stores every entry above it, so
+/// the dialog is where the user is told the operation is bigger than the row
+/// they clicked.
+#[derive(Debug, Clone)]
+pub struct RenameStashRequested {
+    pub sha: String,
+    /// The `stash@{N}` the row was PAINTED with — a tiebreaker for the
+    /// resolve, never a target. Same contract as [`DropStashRequested`].
+    pub painted: usize,
+    /// The message to pre-fill the field with, so a rename is an edit rather
+    /// than a retype.
+    pub message: String,
+    /// How many entries sit above this one, which is how many the sequence
+    /// will take off and put back. Shown in the dialog: a rename at the bottom
+    /// of a deep stack is not the small operation the verb suggests.
+    pub depth: usize,
+}
+
 pub struct StashPanel {
     repo: Repository,
     state: StashListState,
@@ -227,6 +253,28 @@ pub struct StashPanel {
     /// `SourceControlPanel` — the only place that can see both sections'
     /// heights. `None` before the first push.
     section_ceiling: Option<f32>,
+    /// Where the keyboard cursor is, or `None` when nothing is selected.
+    ///
+    /// **Panel state, not focus state.** A dialog takes focus away from the
+    /// panel — `Cmd+Backspace` opens one on purpose — and a cursor stored as
+    /// focus would be gone by the time the user pressed Escape. It survives
+    /// the round trip because nothing here is tied to a `FocusHandle`;
+    /// `adopt_list` is the only thing that clears it, and only when the row it
+    /// names has actually left the stack.
+    cursor: Option<keyboard::StashCursor>,
+    /// Flat or tree for the files inside an expanded stash.
+    ///
+    /// Persisted GLOBALLY — see
+    /// [`KEY_SCM_STASH_VIEW_MODE`](crate::app_settings::scm_layout_settings::KEY_SCM_STASH_VIEW_MODE)
+    /// for why a per-worktree key would be wrong for a stack every worktree
+    /// shares.
+    view_mode: ViewMode,
+    /// Collapsed folders in tree mode, keyed by the stash they belong to.
+    ///
+    /// Per-sha, because two stashes can both contain `src/` and collapsing one
+    /// must not collapse the other. Cleared wholesale by `adopt_list` along
+    /// with the file cache the paths were derived from.
+    collapsed_dirs: HashMap<String, HashSet<PathBuf>>,
     /// The resize rail's OWN focus handle.
     ///
     /// Not `focus_handle`, which the panel's root container already tracks:
@@ -244,6 +292,7 @@ impl EventEmitter<ShowStashFileRequested> for StashPanel {}
 impl EventEmitter<ShowStashAllRequested> for StashPanel {}
 impl EventEmitter<BranchFromStashRequested> for StashPanel {}
 impl EventEmitter<RestoreStashFileRequested> for StashPanel {}
+impl EventEmitter<RenameStashRequested> for StashPanel {}
 
 impl StashPanel {
     #[allow(clippy::too_many_arguments)]
@@ -256,6 +305,12 @@ impl StashPanel {
         typography: Typography,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Read before the struct is built so the first paint is already in the
+        // user's layout — flipping after mount would show one frame of flat.
+        let view_mode = settings_repo
+            .as_ref()
+            .map(crate::app_settings::scm_layout_settings::load_stash_view_mode)
+            .unwrap_or_default();
         let mut panel = Self {
             repo,
             state: StashListState::Idle,
@@ -275,6 +330,9 @@ impl StashPanel {
             resizing: false,
             drag_anchor: None,
             section_ceiling: None,
+            cursor: None,
+            view_mode,
+            collapsed_dirs: HashMap::new(),
             resize_focus: cx.focus_handle(),
         };
         panel.refresh(cx);
@@ -400,6 +458,21 @@ impl StashPanel {
         self.files.clear();
         self.fetch_tasks.clear();
         self.expanded.retain(|sha| live.contains(sha));
+        // Collapsed folders are paths inside the file cache that was just
+        // dropped; a set that outlives it would re-apply to a refetched list
+        // it was never keyed against.
+        self.collapsed_dirs.retain(|sha, _| live.contains(sha));
+        // The cursor survives a refresh — that is the whole reason it is panel
+        // state — but not the disappearance of the row it names. Dropping to
+        // the first row rather than to nothing keeps the keyboard path alive
+        // after a Drop the user just confirmed.
+        if let Some(cursor) = &self.cursor
+            && !live.contains(cursor.sha())
+        {
+            self.cursor = entries
+                .first()
+                .map(|e| keyboard::StashCursor::Stash(e.sha.clone()));
+        }
         for sha in self.expanded.iter().cloned().collect::<Vec<_>>() {
             self.fetch_files(sha, cx);
         }
@@ -408,6 +481,45 @@ impl StashPanel {
     /// Whether `sha`'s file list is showing.
     pub fn is_expanded(&self, sha: &str) -> bool {
         self.expanded.contains(sha)
+    }
+
+    /// Current file layout for expanded stashes.
+    pub fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    /// Flip flat ⇄ tree and persist the choice. Wired to the header toggle.
+    ///
+    /// The collapsed-folder set is deliberately NOT cleared: switching to flat
+    /// and back should return the tree the user left, not one re-opened at
+    /// every level.
+    pub fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
+        self.view_mode = self.view_mode.toggled();
+        if let Some(repo) = &self.settings_repo {
+            crate::app_settings::scm_layout_settings::save_stash_view_mode(repo, self.view_mode);
+        }
+        cx.notify();
+    }
+
+    /// Whether one folder inside one stash's tree is collapsed.
+    pub fn is_dir_collapsed(&self, sha: &str, dir: &std::path::Path) -> bool {
+        self.collapsed_dirs
+            .get(sha)
+            .is_some_and(|set| set.contains(dir))
+    }
+
+    /// Flip one folder's collapse state inside one stash's tree.
+    pub fn toggle_dir(&mut self, sha: &str, dir: PathBuf, cx: &mut Context<Self>) {
+        let set = self.collapsed_dirs.entry(sha.to_string()).or_default();
+        if !set.remove(&dir) {
+            set.insert(dir);
+        }
+        cx.notify();
+    }
+
+    /// The collapsed set for one stash, for the tree renderer.
+    pub(super) fn collapsed_for(&self, sha: &str) -> HashSet<PathBuf> {
+        self.collapsed_dirs.get(sha).cloned().unwrap_or_default()
     }
 
     /// Flip one stash's expansion, fetching its files the first time.
@@ -483,6 +595,29 @@ impl StashPanel {
                     .unwrap_or_default(),
                 _ => String::new(),
             },
+        });
+    }
+
+    /// Ask the host to prompt for a new message for `sha`.
+    ///
+    /// `depth` is the row's position, which is exactly how many entries above
+    /// it the rename will drop and put back. It is resolved here, from the
+    /// list the row was painted from, for the same reason `request_file_diff`
+    /// resolves `origin` here: the menu carries a payload, the panel owns the
+    /// data. A stash that has left the stack is a no-op — the menu can only
+    /// have been opened from a painted row, so this means the list moved.
+    pub fn request_rename_stash(&mut self, sha: &str, painted: usize, cx: &mut Context<Self>) {
+        let StashListState::Ready(entries) = &self.state else {
+            return;
+        };
+        let Some((depth, entry)) = entries.iter().enumerate().find(|(_, e)| e.sha == sha) else {
+            return;
+        };
+        cx.emit(RenameStashRequested {
+            sha: sha.to_string(),
+            painted,
+            message: entry.message.clone(),
+            depth,
         });
     }
 
@@ -632,7 +767,6 @@ impl Render for StashPanel {
         let header = self.render_header(count, cx);
 
         let mut container = div()
-            .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
             .flex_shrink_0()
@@ -699,9 +833,43 @@ impl Render for StashPanel {
             container = container.child(
                 div()
                     .id("stash-panel-scroll")
+                    // Focus and the cursor key context live on the LIST, not
+                    // on the section container.
+                    //
+                    // The resize rail below is a sibling with its own focus
+                    // handle and its own `on_key_down` for Arrow / Shift+Arrow
+                    // / Home / End. If the context sat on their common parent,
+                    // a focused rail would still have `StashPanel` on its
+                    // dispatch chain, the arrow keys would match the cursor
+                    // bindings, and the rail's own handler would be racing a
+                    // keymap action for the same keystroke. Scoping to the
+                    // list means each surface owns the arrows while it is the
+                    // one being driven.
+                    .track_focus(&self.focus_handle)
+                    .key_context(keyboard::STASH_PANEL_KEY_CONTEXT)
+                    .on_action(cx.listener(Self::on_cursor_up))
+                    .on_action(cx.listener(Self::on_cursor_down))
+                    .on_action(cx.listener(Self::on_cursor_expand))
+                    .on_action(cx.listener(Self::on_cursor_collapse))
+                    .on_action(cx.listener(Self::on_cursor_activate))
+                    .on_action(cx.listener(Self::on_cursor_drop))
                     .relative()
                     .w_full()
                     .h(self.painted_height())
+                    // Clicking anywhere in the list focuses the panel, which
+                    // is what puts `StashPanel` on the dispatch chain and
+                    // makes the arrow keys live. DEFERRED: focus taken
+                    // synchronously inside a mouse handler is clobbered by
+                    // GPUI's own post-click focus dispatch — the trap the rail
+                    // and the tab bar both hit — so it is handed to the next
+                    // frame instead.
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|panel, _: &gpui::MouseDownEvent, window, cx| {
+                            let handle = panel.focus_handle.clone();
+                            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+                        }),
+                    )
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .child(body)
@@ -765,6 +933,26 @@ impl StashPanel {
                             .text_color(theme.fg_muted),
                     )
                     .child(format!("STASHES ({count})")),
+            )
+            .child(
+                // Flat ⇄ tree for the files inside an expanded stash. Same
+                // icon pair and same "name the destination, not the state"
+                // tooltip wording as the CHANGES toolbar, so one control
+                // taught twice is one control.
+                Button::new("stash-view-mode")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::default().path(match self.view_mode {
+                        ViewMode::Flat => "icons/list-tree.svg",
+                        ViewMode::Tree => "icons/list-collapse.svg",
+                    }))
+                    .tooltip(match self.view_mode {
+                        ViewMode::Flat => "Switch to tree view",
+                        ViewMode::Tree => "Switch to flat view",
+                    })
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                        panel.toggle_view_mode(cx);
+                    })),
             )
             .child(
                 Button::new("stash-refresh")

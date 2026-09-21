@@ -23,7 +23,7 @@ const MENU_WIDTH: f32 = 220.0;
 /// One selectable row's height — matches the other rail popovers.
 const ROW_H: f32 = 28.0;
 /// Horizontal padding inside each row.
-const ROW_PADDING_X: f32 = 10.0;
+use crate::ui::ROW_PADDING_X;
 /// Y offset below the trigger so the menu doesn't overlap it.
 const ANCHOR_Y_OFFSET: f32 = 4.0;
 

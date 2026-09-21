@@ -22,18 +22,17 @@
 //! triggers confirm; Escape triggers cancel.
 
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, div, px,
+    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, div, px,
 };
 use gpui_component::{
     Disableable as _,
-    button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputState},
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::ui::FloatingSurface;
+use super::form;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -104,6 +103,14 @@ impl PushStashDialog {
         } = prompt;
         let message_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Message (optional)"));
+        // Focus the INPUT, not this dialog's own handle. A gpui-component
+        // `Input` only receives text when its own `InputState` handle is
+        // focused, and the Escape/Enter key handler below only sees a
+        // keystroke once something inside the dialog holds focus — without
+        // this the modal opens INERT: typing goes nowhere and Escape does not
+        // dismiss it until the user clicks the field. Found live on the
+        // rename dialog, then confirmed here.
+        window.focus(&message_input.read(cx).focus_handle(cx), cx);
         // Pre-set from the scope so the value is right even if the user hits
         // Enter without ever looking at the checkbox.
         let include_untracked = scope.as_ref().is_some_and(|s| s.needs_untracked);
@@ -212,40 +219,23 @@ impl Render for PushStashDialog {
         };
         let lock_untracked = scope.as_ref().is_some_and(|s| s.needs_untracked);
 
-        div()
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(
-                |dlg, event: &KeyDownEvent, window, cx| {
-                    // Bubble-phase: only act on the keys we care about
-                    // so text input inside the Input widget keeps
-                    // working for everything else.
-                    match event.keystroke.key.as_str() {
-                        "enter" => dlg.try_confirm(window, cx),
-                        "escape" => dlg.cancel(window, cx),
-                        _ => {}
-                    }
-                },
-            ))
-            .flex()
-            .flex_col()
-            .w(px(440.0))
-            .p(px(density.pad_panel * 2.0))
-            .floating_chrome(&theme, &density)
-            .gap(px(density.gap_inline))
-            .child(
-                div()
-                    .text_size(px(typography.t_body_md))
-                    .font_weight(typography.w_semibold)
-                    .text_color(theme.fg_base)
-                    .child(title),
-            )
+        form::form_card(
+            &self.focus_handle,
+            &theme,
+            &density,
+            cx.listener(|dlg, event: &KeyDownEvent, window, cx| {
+                // Bubble-phase: only act on the keys we care about so text
+                // input inside the Input widget keeps working for the rest.
+                match event.keystroke.key.as_str() {
+                    "enter" => dlg.try_confirm(window, cx),
+                    "escape" => dlg.cancel(window, cx),
+                    _ => {}
+                }
+            }),
+        )
+            .child(form::form_title(title, &theme, typography))
             .children(scope.as_ref().map(|s| path_list(s, theme, density, typography)))
-            .child(
-                div()
-                    .text_size(px(typography.t_label_caps))
-                    .text_color(theme.fg_subtle)
-                    .child("Message"),
-            )
+            .child(form::form_field_label("Message", &theme, typography))
             .child(Input::new(&self.message_input))
             .child(
                 Checkbox::new("push-stash-include-untracked")
@@ -270,31 +260,19 @@ impl Render for PushStashDialog {
                 scope
                     .as_ref()
                     .filter(|s| s.has_rename)
-                    .map(|_| note(RENAME_NOTE, theme, typography)),
+                    .map(|_| form::form_note(RENAME_NOTE, &theme, typography)),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap(px(density.gap_inline))
-                    .child(
-                        Button::new("push-stash-cancel-button")
-                            .ghost()
-                            .label("Cancel")
-                            .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
-                                dlg.cancel(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("push-stash-confirm-button")
-                            .primary()
-                            .label("Push stash")
-                            .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
-                                dlg.try_confirm(window, cx);
-                            })),
-                    ),
-            )
+            .child(form::form_buttons(
+                "push-stash-cancel-button",
+                "push-stash-confirm-button",
+                "Push stash",
+                // Never disabled: a stash message is optional, unlike the
+                // branch and rename forms.
+                false,
+                &density,
+                cx.listener(|dlg, _: &ClickEvent, window, cx| dlg.cancel(window, cx)),
+                cx.listener(|dlg, _: &ClickEvent, window, cx| dlg.try_confirm(window, cx)),
+            ))
     }
 }
 
@@ -344,10 +322,3 @@ fn path_list(
     list
 }
 
-/// A muted explanatory line under the form fields.
-fn note(text: &'static str, theme: Theme, typography: &Typography) -> impl IntoElement {
-    div()
-        .text_size(px(typography.t_body_sm))
-        .text_color(theme.fg_subtle)
-        .child(text)
-}
