@@ -138,6 +138,12 @@ pub struct CommitGraph {
     /// can't read the pointer), after which each tick maps the cursor delta
     /// to a height delta so the handle stays glued to the pointer.
     drag_anchor: Option<(f32, Option<f32>)>,
+    /// Tallest this section may currently be, given what the stash section
+    /// above it occupies. Pushed down once per render by
+    /// `SourceControlPanel::sync_section_budget`, the only place that can see
+    /// both. `None` before the first push, or in test wiring with no parent —
+    /// the window clamp alone then applies, which is what a lone section gets.
+    section_ceiling: Option<f32>,
 }
 
 impl CommitGraph {
@@ -168,6 +174,7 @@ impl CommitGraph {
             graph_max_lanes: 1,
             resizing: false,
             drag_anchor: None,
+            section_ceiling: None,
         };
         graph.spawn_load_initial(cx);
         graph
@@ -194,6 +201,50 @@ impl CommitGraph {
         self.graph_height
     }
 
+    /// The height the commit list is **painted** at: the user's chosen
+    /// height, trimmed to what the budget shared with the stash section above
+    /// currently allows.
+    ///
+    /// Trimming at paint rather than writing it back into `graph_height` is
+    /// deliberate — see `source_control/sections.rs`. A window that got short
+    /// or a stash section that got tall are both temporary; forgetting what
+    /// the user dragged to is not.
+    pub fn painted_height(&self) -> Pixels {
+        match self.section_ceiling {
+            Some(ceiling) => px(f32::from(self.graph_height)
+                .min(ceiling)
+                .max(scm_layout_settings::MIN_GRAPH_HEIGHT)),
+            None => self.graph_height,
+        }
+    }
+
+    /// Accept a ceiling from the parent panel. See `sections.rs`.
+    pub fn set_section_ceiling(&mut self, ceiling: f32) {
+        self.section_ceiling = Some(ceiling);
+    }
+
+    /// The height this section asks for when the budget is divided: what the
+    /// user dragged to, or `None` while collapsed, because a collapsed graph
+    /// is a header and nothing else.
+    ///
+    /// Deliberately the CHOSEN height and not [`Self::painted_height`] —
+    /// feeding a painted height back into the split makes the two sections
+    /// oscillate. See `scm_layout_settings::fit_sections`.
+    pub fn chosen_height(&self) -> Option<f32> {
+        (!self.collapsed).then(|| f32::from(self.graph_height))
+    }
+
+    /// Clamp a candidate against both the window and the shared budget.
+    fn clamp_height(&self, candidate: f32, window_height: f32) -> f32 {
+        let windowed = scm_layout_settings::clamp_graph_height(candidate, window_height);
+        match self.section_ceiling {
+            Some(ceiling) => windowed
+                .min(ceiling)
+                .max(scm_layout_settings::MIN_GRAPH_HEIGHT),
+            None => windowed,
+        }
+    }
+
     /// Apply a new graph height; clamps against the live window
     /// height, persists when a settings repo is wired, and notifies
     /// the view tree. No-op when the value would be unchanged so the
@@ -205,7 +256,7 @@ impl CommitGraph {
         cx: &mut Context<Self>,
     ) {
         let window_height = f32::from(window.bounds().size.height);
-        let clamped = scm_layout_settings::clamp_graph_height(candidate, window_height);
+        let clamped = self.clamp_height(candidate, window_height);
         let new_height = px(clamped);
         if self.graph_height == new_height {
             return;
@@ -240,7 +291,7 @@ impl CommitGraph {
             }
         };
         let candidate = start_height + (start_y - cursor_y);
-        let clamped = scm_layout_settings::clamp_graph_height(candidate, window_height);
+        let clamped = self.clamp_height(candidate, window_height);
         let new_height = px(clamped);
         if self.graph_height == new_height {
             return;
@@ -651,12 +702,13 @@ impl Render for CommitGraph {
             // height so the section doesn't pop taller when the first
             // page resolves. Refresh never enters this arm — see
             // `refresh()` for the stale-while-revalidate path that keeps
-            // the existing list painted. Reads `graph_height` (Phase 13)
-            // so a user who shrank the section before quitting doesn't
-            // see a tall placeholder on next launch.
+            // the existing list painted. Reads the painted height (Phase
+            // 13) so a user who shrank the section before quitting doesn't
+            // see a tall placeholder on next launch, and so the placeholder
+            // obeys the same shared budget the list will.
             GraphState::Loading => placeholder_sized(
                 "Loading commits…",
-                f32::from(self.graph_height),
+                f32::from(self.painted_height()),
                 theme,
                 density,
                 typography,
@@ -741,7 +793,7 @@ impl Render for CommitGraph {
                 // Phase 13: body height is state (graph_height) now,
                 // not a const. Keyboard rail below the body mutates
                 // it via Arrow / Shift+Arrow / Home / End.
-                .h(self.graph_height)
+                .h(self.painted_height())
                 .track_scroll(&self.scroll)
                 .into_any_element()
             }

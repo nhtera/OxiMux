@@ -151,7 +151,11 @@ impl Repository {
 ///   - `<X>\0<path>\0`                  for A / M / D / T
 ///   - `R<score>\0<old>\0<new>\0`       for rename (path = new, origin = old)
 ///   - `C<score>\0<old>\0<new>\0`       for copy
-fn parse_name_status_z(buf: &[u8]) -> Vec<(DiffStatus, PathBuf)> {
+///
+/// Shared with `stash::stash_files`, which parses the same `--name-status -z`
+/// stream out of `git show`. One parser, so a newline-in-path or rename record
+/// cannot be handled correctly in one place and wrongly in the other.
+pub(crate) fn parse_name_status_z(buf: &[u8]) -> Vec<(DiffStatus, PathBuf)> {
     let mut out = Vec::new();
     let mut it = buf.split(|&b| b == 0).filter(|s| !s.is_empty());
     while let Some(status_tok) = it.next() {

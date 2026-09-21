@@ -127,7 +127,7 @@ async fn merge_dirty_main_auto_stash_ff() {
     // The b.txt from feature is present (the merge landed).
     assert!(p.join("b.txt").exists());
     // Stash stack is empty (auto-stash was popped).
-    assert_eq!(repo.stash_list().await.unwrap().len(), 0);
+    assert_eq!(repo.stash_list(true).await.unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn merge_dirty_auto_stash_conflict() {
     }
     // The stash is still on the stack (NOT auto-popped on conflict).
     assert_eq!(
-        repo.stash_list().await.unwrap().len(),
+        repo.stash_list(true).await.unwrap().len(),
         1,
         "stash must survive conflict — caller resolves first"
     );
@@ -228,7 +228,7 @@ async fn merge_nonexistent_branch_errors_and_stash_is_clean() {
     let err = repo.merge_branch("does-not-exist").await.unwrap_err();
     assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
     // Stash stack is clean — the auto-stash was popped on failure.
-    assert_eq!(repo.stash_list().await.unwrap().len(), 0);
+    assert_eq!(repo.stash_list(true).await.unwrap().len(), 0);
     // The user's scratch.txt is back on disk.
     let on_disk = std::fs::read_to_string(p.join("scratch.txt")).unwrap();
     assert_eq!(on_disk, scratch);
@@ -318,12 +318,12 @@ async fn merge_autostash_ref_survives_conflict_resolution() {
     write(&p.join("a.txt"), "resolved\n");
     run_git(p, &["add", "a.txt"]);
     run_git(p, &["commit", "-m", "resolve"]);
-    repo.stash_apply(&stash_ref).await.unwrap();
+    repo.stash_apply(&stash_ref, false).await.unwrap();
     assert!(p.join("scratch.txt").exists());
     // Reset for the drop step so the stash content doesn't clash on a
     // subsequent worktree op (apply leaves entry on stack — see stash_ops).
     run_git(p, &["checkout", "--", "scratch.txt"]);
     let _ = std::fs::remove_file(p.join("scratch.txt"));
     repo.stash_drop(&stash_ref).await.unwrap();
-    assert_eq!(repo.stash_list().await.unwrap().len(), 0);
+    assert_eq!(repo.stash_list(true).await.unwrap().len(), 0);
 }

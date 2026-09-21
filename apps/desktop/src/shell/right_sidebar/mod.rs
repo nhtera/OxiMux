@@ -284,6 +284,15 @@ impl RightSidebar {
             cx.new(|cx| FileTreeView::new(tree, theme, on_open, on_query_active_path, window, cx))
         });
 
+        // Hand the poller over so the SCM panel can kick it after a branch
+        // change. Done here, after both exist, rather than through the
+        // constructor: the panel is built inside a closure that already takes
+        // nine arguments, and a test that builds it without a poller must
+        // stay able to.
+        if let (Some(panel), Some(p)) = (source_control.as_ref(), poller.as_ref()) {
+            panel.update(cx, |panel, _| panel.set_poller(p.clone()));
+        }
+
         let poll_observer = Self::start_poll_observer(bar_rx, cx);
 
         // Default to SourceControl when a repo is present; otherwise Explorer.

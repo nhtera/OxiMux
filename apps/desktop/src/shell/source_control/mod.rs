@@ -33,11 +33,13 @@ pub mod graph;
 pub mod graph_gutter;
 pub mod graph_layout;
 pub mod graph_row;
+mod state_observer;
 pub mod picker_wiring;
 pub mod pr_draft;
 pub mod pr_ops;
 pub mod primary_action;
 pub mod scope;
+pub mod sections;
 pub mod settings_persistence;
 pub mod style;
 pub mod toolbar;
@@ -242,6 +244,17 @@ pub struct SourceControlPanel {
     /// `pub(crate)` so the host workspace can `cx.subscribe` to
     /// `PushStashRequested` and mount the push-stash dialog.
     pub(crate) stash_panel: Entity<StashPanel>,
+    /// The status poller feeding this panel, handed over by `RightSidebar`
+    /// after construction. Held solely so
+    /// [`SourceControlPanel::refresh_after_branch_change`] can kick it; see
+    /// `picker_wiring.rs` for why.
+    poller: Option<Arc<oximux_git::StatusPoller>>,
+    /// HEAD as of the last poll, and whether a poll has set it yet — `None` is
+    /// a real value (a repo with no commit), so it cannot double as "unseen".
+    /// Both are read only by `refresh_graph_if_head_moved` (`picker_wiring.rs`),
+    /// which carries the reasoning.
+    last_head_oid: Option<String>,
+    head_oid_seen: bool,
 
     theme: Theme,
     density: Density,
@@ -289,6 +302,9 @@ impl SourceControlPanel {
             PollState::Ready(s) => Some(s.clone()),
             _ => None,
         };
+        // Read off before the struct literal below moves `git_state`.
+        let head_seed = git_state.as_ref().and_then(|s| s.head_oid.clone());
+        let head_seen = git_state.is_some();
         // Detect any in-progress git op at mount time so the banner
         // shows immediately if the user opens OxiMux mid-rebase
         // rather than waiting for the first poll tick.
@@ -351,21 +367,12 @@ impl SourceControlPanel {
             area.set_rebase_base(initial_rebase_base);
             area
         });
-        // Phase 13: load persisted graph height now so the section
-        // mounts at its previous size, no flash. Clamped against the
-        // live window height so a value persisted on a taller monitor
-        // can't overflow a shorter window. `settings_repo` is the
-        // global k/v store; `None` in test wiring → defaults apply.
-        let initial_graph_height = match settings_repo.as_ref() {
-            Some(repo) => {
-                let window_height = f32::from(window.bounds().size.height);
-                gpui::px(crate::scm_layout_settings::load_graph_height(
-                    repo,
-                    window_height,
-                ))
-            }
-            None => gpui::px(crate::scm_layout_settings::DEFAULT_GRAPH_HEIGHT),
-        };
+        // Both section heights, restored before either mounts so neither
+        // snaps to size after the first paint. See `sections.rs`.
+        let (initial_stash_height, initial_graph_height) = sections::initial_heights(
+            settings_repo.as_ref(),
+            f32::from(window.bounds().size.height),
+        );
         let commit_graph_settings_repo = settings_repo.clone();
         let commit_graph = cx.new(|cx| {
             CommitGraph::new(
@@ -378,8 +385,18 @@ impl SourceControlPanel {
                 cx,
             )
         });
-        let stash_panel =
-            cx.new(|cx| StashPanel::new(repo.clone(), theme, density, typography.clone(), cx));
+        let stash_settings_repo = settings_repo.clone();
+        let stash_panel = cx.new(|cx| {
+            StashPanel::new(
+                repo.clone(),
+                initial_stash_height,
+                stash_settings_repo,
+                theme,
+                density,
+                typography.clone(),
+                cx,
+            )
+        });
 
         // "Committed on Branch" section. Seed from the initial poll
         // snapshot (if any) so the section is correct on first paint
@@ -469,6 +486,10 @@ impl SourceControlPanel {
             pr_merged: false,
             pr_status_checked_at: None,
             pr_status_checked_branch: None,
+            // Seeded from the snapshot the graph was built against, so the
+            // first poll is not mistaken for a HEAD move.
+            last_head_oid: head_seed,
+            head_oid_seen: head_seen,
             ci_checks: Vec::new(),
             checks: checks_section::ChecksSectionState::default(),
             _check_log_task: None,
@@ -494,6 +515,7 @@ impl SourceControlPanel {
             branch_commits,
             branch_picker,
             stash_panel,
+            poller: None,
             theme,
             density,
             typography,
@@ -703,7 +725,7 @@ impl SourceControlPanel {
 
     /// Force the next poll tick to re-check PR/CI status (bypassing the 30s
     /// throttle) and drop stale checks view-state.
-    fn refresh_checks(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_checks(&mut self, cx: &mut Context<Self>) {
         self.pr_status_checked_at = None;
         // Cancel any in-flight log fetch / fix bundle so a stale dispatch can't
         // land after the user asked for a fresh check.
@@ -825,139 +847,6 @@ impl SourceControlPanel {
                 });
             });
         }));
-    }
-
-    fn start_state_observer(
-        mut rx: watch::Receiver<PollState>,
-        repo: Repository,
-        cx: &mut Context<Self>,
-    ) -> gpui::Task<()> {
-        cx.spawn(async move |this, cx| {
-            loop {
-                if rx.changed().await.is_err() {
-                    return;
-                }
-                let state = rx.borrow_and_update().clone();
-                // Decide whether to refresh the upstream-rewrite check
-                // BEFORE the panel-update borrow. The check only matters
-                // when local and upstream have actually diverged — pure
-                // ahead-only or behind-only states are never lease
-                // candidates, so we skip the (cached-but-still-locking)
-                // backend call.
-                let should_check_lease = matches!(
-                    &state,
-                    PollState::Ready(s)
-                        if s.upstream.is_some() && s.ahead > 0 && s.behind > 0
-                );
-                // The Create-PR rung only matters when the branch is published
-                // and fully in sync (the terminal "up to date" state). Gate the
-                // network `gh` round-trips on that — throttled to ~30s below.
-                let should_check_pr = matches!(
-                    &state,
-                    PollState::Ready(s)
-                        if s.upstream.is_some() && s.ahead == 0 && s.behind == 0
-                );
-                // The branch the (potential) PR/CI refresh would belong to —
-                // used to invalidate the throttle when the user switches to a
-                // different in-sync branch (its PR/CI differ).
-                let pr_branch = match &state {
-                    PollState::Ready(s) => s.branch.clone(),
-                    _ => None,
-                };
-                // Refresh the cached in-progress git op before the
-                // panel update so render sees the new value on the
-                // same tick. Stat-only — microsecond cost on APFS,
-                // tolerable on a poll tick (vs per-render, which
-                // would burn it on every keystroke).
-                let op = repo.current_operation();
-                if this
-                    .update(cx, |panel, cx| {
-                        if let PollState::Ready(ref s) = state {
-                            panel.git_state = Some(s.clone());
-                            // Push the staged-filtered file list into
-                            // the commit area so the sparkles button
-                            // can gate on staged-count and feed the
-                            // heuristic without re-shelling out to
-                            // git on click. Equality-guarded inside
-                            // the setter so identical snapshots
-                            // don't fire spurious notifies.
-                            let staged: Vec<oximux_core::FileStatus> = s
-                                .files
-                                .iter()
-                                .filter(|f| f.is_staged())
-                                .cloned()
-                                .collect();
-                            // Mirror the resolved rebase base in too, so the
-                            // Rebase dropdown row dispatches onto the same ref
-                            // its label shows. Computed after `git_state` is
-                            // set above so `resolve_rebase_base` sees fresh data.
-                            let rebase_base = panel.resolve_rebase_base();
-                            let commit_area = panel.commit_area.clone();
-                            commit_area.update(cx, |area, cx| {
-                                area.set_staged_snapshot(staged, cx);
-                                area.set_rebase_base(rebase_base);
-                            });
-                            // Feed the "Committed on Branch" section.
-                            let branch_commits = panel.branch_commits.clone();
-                            let bc_files = s.branch_committed.clone();
-                            let bc_range = s.branch_range.clone();
-                            branch_commits.update(cx, |p, cx| {
-                                p.set_state(bc_files, bc_range, cx)
-                            });
-                        }
-                        panel.poll_state = state;
-                        panel.current_op = op;
-                        if !should_check_lease {
-                            // Reset stale lease state immediately when we
-                            // leave the diverged window — otherwise the
-                            // dropdown would keep showing Force Push on a
-                            // freshly-pulled branch.
-                            panel.force_push_with_lease = false;
-                        }
-                        if !should_check_pr || panel.pr_status_checked_branch != pr_branch {
-                            // Left the in-sync window (new commits / a pull), or
-                            // switched to a different in-sync branch: force a
-                            // fresh PR + CI check on the next tick so stale data
-                            // from the previous branch/state isn't shown.
-                            panel.pr_status_checked_at = None;
-                            panel.pr_status_checked_branch = pr_branch.clone();
-                        }
-                        // A just-created PR sets this flag; invalidate the
-                        // throttle so the refresh below fires this tick and the
-                        // button stops offering Create PR immediately.
-                        let pr_dirty = panel
-                            .commit_area
-                            .read(cx)
-                            .pr_status_dirty;
-                        if pr_dirty {
-                            panel.pr_status_checked_at = None;
-                            panel
-                                .commit_area
-                                .update(cx, |area, _| area.pr_status_dirty = false);
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                if should_check_lease {
-                    refresh_force_push_with_lease(&repo, &this, cx).await;
-                }
-                if should_check_pr {
-                    let due = this
-                        .update(cx, |panel, _cx| {
-                            panel.pr_status_checked_at.is_none_or(|t| {
-                                t.elapsed() >= std::time::Duration::from_secs(30)
-                            })
-                        })
-                        .unwrap_or(false);
-                    if due {
-                        refresh_pr_status(&repo, &this, cx).await;
-                    }
-                }
-            }
-        })
     }
 
     /// Build the inputs snapshot consumed by both the primary-action
@@ -1205,8 +1094,14 @@ impl SourceControlPanel {
 }
 
 impl Render for SourceControlPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
+        // Re-arbitrate the vertical budget the stash section and the graph
+        // share, before either paints. On the render path because that is the
+        // only thing every way of changing the budget has in common — drag,
+        // keyboard rail, window resize, collapse, scope switch, and a pair of
+        // heights restored from a taller monitor. See `sections.rs`.
+        self.sync_section_budget(f32::from(window.bounds().size.height), cx);
         let theme = self.theme;
         let style = self.style();
         let action = self.resolve_primary(cx);
@@ -1351,12 +1246,21 @@ impl Render for SourceControlPanel {
         // because the CTAs dispatch through SourceControlPanel methods
         // (open_switch_picker, commit_area.update, select_scope) which
         // the inner GitPanel can't reach directly.
+        //
+        // `min_h` is the *floor*, not zero. This block is the column's only
+        // flexible child, so it absorbs the whole height deficit when the
+        // stash section and the graph are both expanded. At `min_h(0)` it
+        // collapsed to near-zero and its own `overflow_hidden` guillotined
+        // the CHANGES header mid-row — the reported "overlap", which was
+        // never one. The floor stops the squeeze while a header and two rows
+        // still fit; past that the inner `git-panel-scroll` region scrolls.
         let clean_tree = self.should_show_empty_state();
+        let files_floor = px(crate::scm_layout_settings::files_floor(&self.density));
         let files_block = if clean_tree {
             div()
                 .flex()
                 .flex_1()
-                .min_h(px(0.0))
+                .min_h(files_floor)
                 .flex_col()
                 .items_center()
                 .justify_center()
@@ -1366,7 +1270,7 @@ impl Render for SourceControlPanel {
             div()
                 .flex()
                 .flex_1()
-                .min_h(px(0.0))
+                .min_h(files_floor)
                 .flex_col()
                 .overflow_hidden()
                 .child(self.git_panel.clone())
@@ -1384,11 +1288,19 @@ impl Render for SourceControlPanel {
         // in the surrounding workspace chrome rather than a dedicated
         // SCM header strip — `render_branch_toolbar` owns the right-
         // anchored Settings / View-mode / Refresh icon cluster.
+        //
+        // `overflow_hidden` is what makes the floor above a floor rather than
+        // an overflow. Neither this column nor its `relative()` wrapper
+        // clipped, so a `min_h` on `files_block` pushed the stash section and
+        // the graph *below the visible panel* instead of forcing the list to
+        // scroll — taking the graph's drag handle, the escape valve a cramped
+        // window depends on, off-screen with them.
         let mut body = div()
             .flex()
             .flex_col()
             .w_full()
             .h_full()
+            .overflow_hidden()
             .bg(theme.bg_panel)
             .child(scope_tabs)
             .child(toolbar)
@@ -1398,21 +1310,19 @@ impl Render for SourceControlPanel {
             .children(commit_area_render)
             .children(checks_row)
             .child(files_block)
-            // Stash list docked above the graph (or at the very bottom
-            // when the scope hides the graph). Always-mounted entity;
-            // collapsed by default — see `StashPanel::is_collapsed`.
-            .child(self.stash_panel.clone());
+            // Stash list docked above the graph, then the graph itself when
+            // the scope shows it. Both framed by `sections::frame`.
+            .child(sections::frame(
+                self.stash_panel.clone(),
+                theme,
+                crate::scm_layout_settings::MIN_STASH_HEIGHT,
+            ));
         if self.scope.shows_graph() {
-            // Graph sits at its natural height, pinned to the bottom of the
-            // panel by the `flex_1` files_block above. Top border separates
-            // the graph from the file list visually.
-            body = body.child(
-                div()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(theme.border_inactive)
-                    .child(self.commit_graph.clone()),
-            );
+            body = body.child(sections::frame(
+                self.commit_graph.clone(),
+                theme,
+                crate::scm_layout_settings::MIN_GRAPH_HEIGHT,
+            ));
         }
         // Create-PR dialog: a centered modal overlay over the panel, mounted
         // only while open. Mirrors the diff-view review-note overlay placement.

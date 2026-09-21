@@ -40,6 +40,25 @@ pub enum GitError {
     /// git process failure.
     #[error("invalid input: {reason}")]
     InvalidInput { reason: String },
+
+    /// **git succeeded and did something other than what was asked.**
+    ///
+    /// Neither a process failure ([`GitError::NonZero`] — git exited 0), nor
+    /// unparsable output ([`GitError::Parse`] — it parsed fine), nor a caller
+    /// bug ([`GitError::InvalidInput`] — the request was well-formed). The
+    /// repository is simply not in the state the operation intended.
+    ///
+    /// The case this exists for: `git stash drop` removing a different entry
+    /// than the one resolved a moment earlier, because the stack is shared
+    /// with every worktree and with the user's terminal and something landed
+    /// in the gap. A caller that cannot tell this apart from an ordinary
+    /// failure will retry, and retrying is exactly wrong — the damage is
+    /// already done and the message carries the recovery.
+    ///
+    /// `reason` is user-facing: it says what happened and what to do, because
+    /// nothing downstream can reconstruct either.
+    #[error("{reason}")]
+    UnexpectedOutcome { reason: String },
 }
 
 impl GitError {
@@ -51,6 +70,13 @@ impl GitError {
 
     pub(crate) fn invalid_input(reason: impl Into<String>) -> Self {
         Self::InvalidInput {
+            reason: reason.into(),
+        }
+    }
+
+    /// See [`GitError::UnexpectedOutcome`].
+    pub(crate) fn unexpected_outcome(reason: impl Into<String>) -> Self {
+        Self::UnexpectedOutcome {
             reason: reason.into(),
         }
     }

@@ -1,4 +1,5 @@
-//! End-to-end regression test for the StashPanel's `push` plumbing.
+//! End-to-end regression tests for the StashPanel's `push` and `drop`
+//! plumbing.
 //! Drives a real `tokio::Runtime` + GPUI test context against a temp
 //! git repo with one dirty file:
 //!
@@ -9,7 +10,7 @@
 //!    through tokio rather than no-op'ing the runtime check.
 //!
 //! Validation reads git's state directly via
-//! `rt.block_on(repo.stash_list())` rather than driving the panel's
+//! `rt.block_on(repo.stash_list(true))` rather than driving the panel's
 //! auto-refresh through another `cx.run_until_parked()` cycle. The
 //! chained refresh (panel.push → tokio stash_push → gpui callback →
 //! panel.refresh → tokio stash_list → gpui callback) crosses the
@@ -30,6 +31,25 @@ use oximux_settings::{Density, Theme, Typography};
 use std::path::Path;
 use std::process::Command;
 
+/// Run `git` in `p`, with the identity the seeded repo needs.
+fn git(p: &Path, args: &[&str]) {
+    Command::new("git")
+        .args(args)
+        .current_dir(p)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@oximux.dev")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@oximux.dev")
+        .status()
+        .expect("git on PATH");
+}
+
+/// Dirty the tracked file and stash it under `msg`.
+fn stash(p: &Path, body: &str, msg: &str) {
+    std::fs::write(p.join("alpha.txt"), body).expect("write");
+    git(p, &["stash", "push", "-m", msg]);
+}
+
 struct Harness {
     inner: Entity<StashPanel>,
 }
@@ -41,23 +61,12 @@ impl Render for Harness {
 }
 
 fn seed_dirty_repo(p: &Path) {
-    let st = |args: &[&str]| {
-        Command::new("git")
-            .args(args)
-            .current_dir(p)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@oximux.dev")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@oximux.dev")
-            .status()
-            .expect("git on PATH");
-    };
-    st(&["init", "-b", "main"]);
-    st(&["config", "user.email", "test@oximux.dev"]);
-    st(&["config", "user.name", "Test"]);
+    git(p, &["init", "-b", "main"]);
+    git(p, &["config", "user.email", "test@oximux.dev"]);
+    git(p, &["config", "user.name", "Test"]);
     std::fs::write(p.join("alpha.txt"), "base\n").expect("write");
-    st(&["add", "alpha.txt"]);
-    st(&["commit", "-m", "base"]);
+    git(p, &["add", "alpha.txt"]);
+    git(p, &["commit", "-m", "base"]);
     // Dirty the tracked file so `git stash push` has something to save.
     std::fs::write(p.join("alpha.txt"), "dirty\n").expect("write");
 }
@@ -75,7 +84,7 @@ async fn push_shells_out_to_git_stash_push(cx: &mut TestAppContext) {
 
     // Sanity: clean stash stack to start.
     let pre = rt
-        .block_on(repo.stash_list())
+        .block_on(repo.stash_list(true))
         .expect("stash_list pre-push");
     assert!(pre.is_empty(), "fresh repo should have no stashes, got {pre:?}");
 
@@ -85,6 +94,10 @@ async fn push_shells_out_to_git_stash_push(cx: &mut TestAppContext) {
         let panel = cx.new(|cx2| {
             StashPanel::new(
                 repo.clone(),
+                // No settings repo in test wiring, so the height is the
+                // default and nothing is persisted.
+                gpui::px(oximux_app::scm_layout_settings::DEFAULT_STASH_HEIGHT),
+                None,
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -119,7 +132,7 @@ async fn push_shells_out_to_git_stash_push(cx: &mut TestAppContext) {
     // entirely — proves the push side-effected git, which is the
     // contract the user cares about.
     let post = rt
-        .block_on(repo.stash_list())
+        .block_on(repo.stash_list(true))
         .expect("stash_list post-push");
     assert_eq!(
         post.len(),
@@ -142,3 +155,122 @@ async fn push_shells_out_to_git_stash_push(cx: &mut TestAppContext) {
 // is short, branchless, and impossible to drift — code review is the
 // gate. Mirrors the same trade-off documented in
 // `sc_commit_area_auto_clear.rs` and `sc_open_all_conflicts.rs`.
+
+/// Drop must act on the stash's **sha**, not on the `stash@{N}` the row was
+/// painted with.
+///
+/// The stack lives in the git common dir, so it is shared by every worktree of
+/// the repo and the user's terminal writes to it too. Anything pushed after
+/// the panel rendered shifts every index below it by one — so a Drop that
+/// trusts the painted index destroys the user's *neighbouring* stash and
+/// reports success. This test reproduces that drift with a real out-of-band
+/// push between render and click.
+///
+/// It also fires the confirm callback a second time, because `ConfirmCallback`
+/// is an `Rc<dyn Fn>` and may run more than once: the repeat must resolve to
+/// "gone" and leave the stack alone rather than dropping whatever now sits at
+/// that address.
+#[gpui::test]
+async fn drop_resolves_by_sha_after_the_stack_shifts(cx: &mut TestAppContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = rt.enter();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_dirty_repo(tmp.path());
+    let repo = rt
+        .block_on(Repository::open(tmp.path()))
+        .expect("open repo");
+
+    stash(tmp.path(), "one\n", "first");
+    stash(tmp.path(), "two\n", "second");
+
+    // What the panel would have rendered: first at stash@{1}, second at {0}.
+    let painted = rt.block_on(repo.stash_list(true)).expect("stash_list");
+    assert_eq!(painted.len(), 2, "expected 2 stashes, got {painted:?}");
+    let target = painted
+        .iter()
+        .find(|e| e.message.contains("first"))
+        .expect("`first` in the list")
+        .clone();
+    assert_eq!(target.stash_ref.index, 1, "`first` should render at index 1");
+
+    // The user stashes again from their terminal. `first` is now at {2}; the
+    // stash sitting at the painted index {1} is `second` — the one that dies
+    // if Drop trusts the address it was rendered with.
+    stash(tmp.path(), "three\n", "third");
+
+    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+    let window = cx.add_window(|_win, cx| {
+        let panel = cx.new(|cx2| {
+            StashPanel::new(
+                repo.clone(),
+                // No settings repo in test wiring, so the height is the
+                // default and nothing is persisted.
+                gpui::px(oximux_app::scm_layout_settings::DEFAULT_STASH_HEIGHT),
+                None,
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                cx2,
+            )
+        });
+        Harness { inner: panel }
+    });
+
+    // Exactly the path the confirm dialog's callback walks.
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.drop_confirmed(
+                    target.sha.clone(),
+                    target.stash_ref.index,
+                    target.message.clone(),
+                    cx,
+                );
+            });
+        })
+        .expect("dispatch drop");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    // Read git directly rather than pumping the panel's refresh — see the
+    // module-level note on the tokio/gpui crossing.
+    let after = rt.block_on(repo.stash_list(true)).expect("stash_list");
+    let messages: Vec<&str> = after.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(after.len(), 2, "exactly one stash should be gone: {messages:?}");
+    assert!(
+        !after.iter().any(|e| e.sha == target.sha),
+        "the targeted stash survived: {messages:?}",
+    );
+    assert!(
+        after.iter().any(|e| e.message.contains("second")),
+        "`second` was dropped instead of `first` — Drop fired on a stale index: {messages:?}",
+    );
+    assert!(
+        after.iter().any(|e| e.message.contains("third")),
+        "`third` should be untouched: {messages:?}",
+    );
+
+    // Second fire of the same callback: the sha is gone, so this must degrade
+    // to a no-op rather than dropping the stash that now holds that address.
+    window
+        .update(cx, |harness, _win, cx| {
+            harness.inner.update(cx, |panel, cx| {
+                panel.drop_confirmed(
+                    target.sha.clone(),
+                    target.stash_ref.index,
+                    target.message.clone(),
+                    cx,
+                );
+            });
+        })
+        .expect("dispatch repeat drop");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let repeat = rt.block_on(repo.stash_list(true)).expect("stash_list");
+    assert_eq!(
+        repeat.len(),
+        2,
+        "a repeated confirm dropped a neighbour: {:?}",
+        repeat.iter().map(|e| &e.message).collect::<Vec<_>>(),
+    );
+}

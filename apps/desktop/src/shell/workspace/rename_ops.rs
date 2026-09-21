@@ -385,7 +385,8 @@ impl WorkspaceRoot {
             on_cancel: None,
             secondary: None,
         };
-        self.mount_confirm_dialog(prompt, window, cx);
+        // Refusal means a live prompt is already up; nothing here to undo.
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
     }
 
     /// Change only the display label, leaving branch and directory alone.

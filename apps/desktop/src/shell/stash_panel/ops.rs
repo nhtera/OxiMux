@@ -1,0 +1,648 @@
+//! Stash mutations fired from the panel: apply, pop, drop, push, branch from,
+//! rename, and the two ways to bring one file out — apply it or restore it.
+//!
+//! # Every op resolves its target by sha first — except the per-file pair
+//!
+//! `apply_file` and `restore_file_confirmed` are the exceptions and neither
+//! is one in spirit: both hand git a raw sha (`git apply` reads its patch
+//! from one, `git checkout` takes one) and neither touches the stack at all.
+//! Everything below is about the ops that must hand git a `stash@{N}`.
+//!
+//! A row is painted with a `stash@{N}` address, but `N` is only that entry's
+//! position in a stack shared by every worktree of the repo — and OxiMux is a
+//! second writer alongside the user's terminal. By the time a click lands, the
+//! index the row was rendered with may address a different stash entirely.
+//!
+//! So nothing here fires on the rendered address. Each op calls
+//! [`Repository::resolve_stash_index`] to turn the immutable sha back into the
+//! *current* address, and acts on that. This self-heals rather than refusing:
+//! an out-of-band stash push is routine here, not exceptional, and a
+//! verify-then-abort guard would toast an error at the user every time one
+//! happened. `None` — the stash is genuinely gone — is the only abort.
+//!
+//! The rendered address is still passed along as a **hint**, because a sha is
+//! not guaranteed unique on the stack: `git stash store` will happily park one
+//! commit at two addresses, and "first match" then makes every op fired from
+//! the lower row act on the upper one. The hint is used only when it still
+//! names the same sha, so it disambiguates a duplicate without weakening the
+//! drift-healing above. See `resolve_stash_index`.
+//!
+//! # Drop closes the gap resolve-then-fire leaves open
+//!
+//! Resolving a sha and then handing git an *index* still races: something can
+//! land in the gap, and git will cheerfully drop whatever now sits there. Drop
+//! therefore logs its recovery line **before** firing, then compares the sha
+//! git says it removed against the one that was intended, and restores the
+//! stash on a mismatch. Without that check the failure is silent and
+//! unrecoverable — the wrong stash is gone and the toast reports success.
+//!
+//! # Ops are detached, but serialised
+//!
+//! Detaching means a second op cannot void the first one's completion
+//! handler. It does not stop them overlapping, and two ops that both resolve
+//! before either fires reintroduce exactly the drift this module exists to
+//! prevent. `StashPanel::op_lock` is held across resolve-and-fire so the
+//! window is closed by construction; the sha assertion stays as the backstop
+//! for anything outside this process.
+//!
+//! # Why detached, never slotted
+//!
+//! Each op detaches its task instead of storing it in a single field. A shared
+//! slot means starting a second op drops the first op's completion handler
+//! while its git subprocess is still running: the stash disappears from git,
+//! stays painted in the panel, and produces no toast, no error and no log line
+//! naming its sha. Same reasoning — and the same fix — as
+//! `git_panel/selection.rs:285`.
+
+use crate::shell::chrome::toast::ToastKind;
+use crate::shell::stash_panel::{StashFilesState, StashListState, StashPanel};
+use gpui::{App, Context};
+use oximux_core::StashRef;
+use oximux_git::Repository;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use tokio::sync::oneshot;
+
+/// What a finished op wants said to the user: a toast kind plus its text, or
+/// nothing at all when the refreshed list already tells the whole story.
+type OpToast = Option<(ToastKind, String)>;
+
+/// Something for the *host* to do once an op has actually succeeded.
+///
+/// Only the partial-stash path uses it, to clear the file list's selection —
+/// and only on success, because a failed push leaves the files exactly where
+/// they were and throwing the selection away would make the retry manual.
+/// `Rc`, not `Arc`: it runs on the foreground executor like every other GPUI
+/// callback.
+pub type OnOpSuccess = Rc<dyn Fn(&mut App)>;
+
+/// Host callbacks a finished op can fire.
+///
+/// Two hooks rather than one because the two questions are different. Most
+/// ops either worked or did not, and the host's follow-up belongs on the
+/// success side only. But `git stash branch` can fail having ALREADY created
+/// and checked out the new branch (verified — a dirty worktree blocks the
+/// apply after the switch), so the UI that describes HEAD has to re-sync
+/// either way; refreshing only on success would leave the toolbar naming a
+/// branch the user is no longer on.
+#[derive(Default)]
+pub(crate) struct OpHooks {
+    /// Runs only when the op reported success.
+    pub on_success: Option<OnOpSuccess>,
+    /// Runs on every completion, success or failure.
+    pub on_done: Option<OnOpSuccess>,
+}
+
+/// Shown when the sha a row was painted with is no longer on the stack.
+const STASH_GONE: &str = "That stash no longer exists. The list has been refreshed.";
+
+/// First 7 chars of a sha, for copy that has to fit in a toast.
+fn short(sha: &str) -> &str {
+    &sha[..7.min(sha.len())]
+}
+
+/// The file name a toast names a path by — its leaf, or the whole path when
+/// it has none.
+fn leaf_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Message to show for a stash that carries none.
+fn label_of(message: &str) -> &str {
+    if message.trim().is_empty() {
+        "(no message)"
+    } else {
+        message.trim()
+    }
+}
+
+/// Current address of `sha`, or `None` when the stash is gone. `painted` is
+/// the address the row was drawn with — a tiebreaker, never a target.
+async fn resolve(
+    repo: &Repository,
+    sha: &str,
+    painted: Option<usize>,
+) -> Result<Option<StashRef>, String> {
+    repo.resolve_stash_index(sha, painted)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+impl StashPanel {
+    /// Apply a stash without removing it from the stack.
+    ///
+    /// `with_index` is the context menu's "Apply with index": it restores the
+    /// staged/unstaged split the stash was taken with. It is not the default
+    /// because git REFUSES it whenever the index cannot be reinstated cleanly
+    /// — a routine state for anyone who stages as they work — and the refusal
+    /// aborts the whole apply. A row-level verb that fails on a normal
+    /// worktree is worse than one that flattens the split, so the plain apply
+    /// stays on the row and the exact one lives in the menu.
+    pub fn apply(
+        &mut self,
+        sha: String,
+        painted: usize,
+        with_index: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_op(
+            move |repo| async move {
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
+                    return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
+                };
+                repo.stash_apply(&stash_ref, with_index)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(None)
+            },
+            if with_index {
+                "Stash apply with index"
+            } else {
+                "Stash apply"
+            },
+            cx,
+        );
+    }
+
+    /// Apply a stash and remove it from the stack.
+    pub fn pop(&mut self, sha: String, painted: usize, cx: &mut Context<Self>) {
+        self.spawn_op(
+            move |repo| async move {
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
+                    return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
+                };
+                repo.stash_pop(&stash_ref).await.map_err(|e| e.to_string())?;
+                Ok(None)
+            },
+            "Stash pop",
+            cx,
+        );
+    }
+
+    /// Remove a stash without applying it. Call only from the host's confirm
+    /// dialog — this is the destructive path and it asks nothing further.
+    ///
+    /// Safe to call twice on the same sha, which matters because the reason a
+    /// repeat happens is not a double-click: the second call resolves the sha
+    /// to `None` and degrades to a toast rather than dropping whatever has
+    /// since moved into that address. (`ConfirmDialog` itself `take`s its
+    /// callback, so one mounted dialog fires at most once.)
+    pub fn drop_confirmed(
+        &mut self,
+        sha: String,
+        painted: usize,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Snapshot what the panel currently believes is on the stack. If git
+        // drops a sha other than the intended one, this is what lets the
+        // rollback restore it under its OWN message instead of a synthesized
+        // placeholder — `git stash store -m` writes the message literally and
+        // there is no second chance to recover it once the entry is gone.
+        let known: Vec<(String, String)> = match &self.state {
+            StashListState::Ready(entries) => entries
+                .iter()
+                .map(|e| (e.sha.clone(), e.message.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let toast_label = label_of(&message).to_string();
+        self.spawn_op(
+            move |repo| async move {
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
+                    return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
+                };
+                // Before anything destructive happens, put the recovery
+                // command somewhere durable. If the process dies between here
+                // and the toast, this log line is the only record of how to
+                // get the stash back.
+                // Structured fields, not an interpolated command line: a
+                // stash message legally contains quotes, `$` and backslashes,
+                // so any attempt to render `-m <msg>` here produces a line
+                // that looks copy-pasteable and is not. The sha is the part
+                // that matters, and `git stash store <sha>` accepts it alone.
+                tracing::warn!(
+                    target: "oximux_app::stash_panel",
+                    sha = %sha,
+                    message = %toast_label,
+                    "dropping stash; recover with: git stash store {}",
+                    sha,
+                );
+                let dropped = repo
+                    .stash_drop(&stash_ref)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if dropped != sha {
+                    return Err(rollback(&repo, &known, &dropped, &sha).await);
+                }
+                Ok(Some((
+                    ToastKind::Success,
+                    format!("Dropped “{toast_label}” — recover with: git stash store {sha}"),
+                )))
+            },
+            "Stash drop",
+            cx,
+        );
+    }
+
+    /// `git stash push` from the host's push dialog.
+    ///
+    /// The returned `StashRef` is discarded: the new entry lands at
+    /// `stash@{0}` and surfaces through the refresh this op ends with.
+    pub fn push(&mut self, msg: Option<String>, include_untracked: bool, cx: &mut Context<Self>) {
+        self.spawn_op(
+            move |repo| async move {
+                repo.stash_push(msg.as_deref(), include_untracked, &[])
+                    .await
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            },
+            "Stash push",
+            cx,
+        );
+    }
+
+    /// Path-scoped `git stash push` — the file list's "Stash N selected".
+    ///
+    /// Fired from the CHANGES panel, but it runs *here* so the stash list
+    /// refreshes for free: `spawn_op` ends every op with `force_refresh`, and
+    /// a stash pushed from the other panel that did not appear until something
+    /// else poked the section would read as a failure.
+    ///
+    /// # The rename sequence, and why the failure path re-stages
+    ///
+    /// `rename_pairs` is non-empty only when the selection contains a STAGED
+    /// rename, whose original side lives in HEAD alone — no index entry, no
+    /// worktree file — so no pathspec can name it and `git stash push` exits 1
+    /// with nothing stashed at all. Unstaging the pair first turns it into a
+    /// worktree deletion plus an untracked file, both matchable. See
+    /// `git_panel::stash_selection` for the verified transcript.
+    ///
+    /// An unresolved merge anywhere in the repo makes the push fail outright
+    /// (`<path>: needs merge`), even for a selection of clean paths. Nothing is
+    /// stashed and the worktree is untouched, and the rollback below puts any
+    /// unstaged rename back, so the failure is safe — it is only the message
+    /// that comes from git rather than from us.
+    ///
+    /// That leaves a window: if the unstage succeeds and the push then fails,
+    /// the user is holding an unstaged rename they never asked for and no
+    /// stash to show for it. So the failure path puts the staging back, and
+    /// says plainly when it could not — a silently half-unstaged rename is a
+    /// worse outcome than a loud error.
+    pub fn push_paths(
+        &mut self,
+        msg: Option<String>,
+        include_untracked: bool,
+        paths: Vec<PathBuf>,
+        rename_pairs: Vec<(PathBuf, PathBuf)>,
+        on_success: Option<OnOpSuccess>,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        self.spawn_op_then(
+            move |repo| async move {
+                let rename_paths: Vec<&Path> = rename_pairs
+                    .iter()
+                    .flat_map(|(orig, current)| [orig.as_path(), current.as_path()])
+                    .collect();
+                if !rename_paths.is_empty() {
+                    repo.unstage_paths(&rename_paths)
+                        .await
+                        .map_err(|e| format!("could not unstage the renamed file: {e}"))?;
+                }
+                let path_refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+                match repo
+                    .stash_push(msg.as_deref(), include_untracked, &path_refs)
+                    .await
+                {
+                    Ok(_) => Ok(Some((
+                        ToastKind::Success,
+                        match count {
+                            1 => "Stashed 1 file".to_string(),
+                            n => format!("Stashed {n} files"),
+                        },
+                    ))),
+                    Err(err) if rename_paths.is_empty() => Err(err.to_string()),
+                    Err(err) => match repo.stage_paths(&rename_paths).await {
+                        Ok(()) => Err(format!("{err} (the rename was left staged as it was)")),
+                        Err(restore) => Err(format!(
+                            "{err} — and restoring the rename's staging FAILED: {restore}. \
+                             The rename is now unstaged; re-stage it with git add.",
+                        )),
+                    },
+                }
+            },
+            "Stash selected files",
+            OpHooks {
+                on_success,
+                on_done: None,
+            },
+            cx,
+        );
+    }
+
+    /// `git stash branch <name> <ref>` from the host's name dialog.
+    ///
+    /// # Three things this has to get right
+    ///
+    /// **The name is validated first, by git.** `is_valid_branch_name` shells
+    /// out to `check-ref-format --branch`, which is read-only; nothing
+    /// mutating runs until it passes. A regex would be cheaper and would
+    /// eventually disagree with the installed binary in one direction or the
+    /// other — see that method's own note.
+    ///
+    /// **git's own stderr is surfaced.** `stash branch` can fail partway: the
+    /// branch is created and checked out, then the apply hits a dirty worktree
+    /// or a conflict and git exits 1 with `Index was not unstashed.` The user
+    /// is now on a new branch with the stash still on the stack, and only
+    /// git's message explains which half happened — a generic "branch failed"
+    /// would describe the state as the opposite of what it is.
+    ///
+    /// **`on_done`, not `on_success`.** For exactly that reason: HEAD may have
+    /// moved even on the error path, so whatever the host refreshes has to run
+    /// either way.
+    pub fn branch_from_stash(
+        &mut self,
+        name: String,
+        sha: String,
+        painted: usize,
+        on_done: Option<OnOpSuccess>,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_op_then(
+            move |repo| async move {
+                if !repo.is_valid_branch_name(&name).await {
+                    return Err(format!("“{name}” is not a valid branch name."));
+                }
+                let Some(stash_ref) = resolve(&repo, &sha, Some(painted)).await? else {
+                    return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
+                };
+                repo.stash_branch(&name, &stash_ref)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Some((
+                    ToastKind::Success,
+                    format!("Created “{name}” and applied the stash; it is no longer in the list."),
+                )))
+            },
+            "Branch from stash",
+            OpHooks {
+                on_success: None,
+                on_done,
+            },
+            cx,
+        );
+    }
+
+    /// Apply ONE file's changes out of a stash into the worktree — the
+    /// non-destructive counterpart to [`restore_file_confirmed`].
+    ///
+    /// **No confirm dialog, on purpose.** `stash_apply_file` runs a plain
+    /// `git apply`, which is atomic: it writes the whole patch or it writes
+    /// nothing and says why. There is no outcome to warn about, and a
+    /// confirm step in front of an op that cannot lose work trains the user
+    /// to click through the ones that can.
+    ///
+    /// `origin` is resolved here rather than carried on the menu payload, for
+    /// the reason `request_file_diff` resolves it here: it selects which
+    /// revision the patch is read from, the panel owns the file list it comes
+    /// from, and a menu still open over a refreshed list would otherwise hand
+    /// git a revision that no longer describes the row.
+    ///
+    /// [`restore_file_confirmed`]: Self::restore_file_confirmed
+    pub fn apply_file(&mut self, sha: &str, path: &Path, cx: &mut Context<Self>) {
+        let Some(StashFilesState::Ready(files)) = self.files.get(sha) else {
+            return;
+        };
+        let Some(origin) = files.iter().find(|f| f.path == path).map(|f| f.origin) else {
+            return;
+        };
+        let leaf = leaf_of(path);
+        let (sha, path) = (sha.to_string(), path.to_path_buf());
+        self.spawn_op(
+            move |repo| async move {
+                repo.stash_apply_file(&sha, &path, origin)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Some((
+                    ToastKind::Success,
+                    format!("Applied {leaf} from the stash — it is unstaged."),
+                )))
+            },
+            "Apply file from stash",
+            cx,
+        );
+    }
+
+    /// `git checkout <sha> -- <path>` — copy one file out of a stash.
+    ///
+    /// Call only from the host's confirm dialog. **Destructive**: it
+    /// overwrites the worktree copy with no backup, and it writes the index
+    /// too, so the restored path comes back STAGED. The dialog says both.
+    ///
+    /// The stash is untouched — this copies out, it does not pop — so there is
+    /// no address to resolve and the raw sha is used directly (`checkout`
+    /// accepts one; `drop`/`pop` are the two that do not).
+    ///
+    /// Only valid for a tracked file. An untracked one lives in the parentless
+    /// `^3`, not in this commit's tree, and the checkout can only fail; both
+    /// the menu and `StashPanel::request_file_restore` gate on that before a
+    /// dialog is ever mounted.
+    pub fn restore_file_confirmed(
+        &mut self,
+        sha: String,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let leaf = leaf_of(&path);
+        self.spawn_op(
+            move |repo| async move {
+                repo.stash_restore_file(&sha, &path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Some((
+                    ToastKind::Success,
+                    format!("Restored {leaf} from the stash — it is staged."),
+                )))
+            },
+            "Restore file from stash",
+            cx,
+        );
+    }
+
+    /// `git stash rename` — which git does not have, so it is composed from
+    /// drop + store. Call only from the host's rename dialog.
+    ///
+    /// **This touches every entry above the target**, taking each off and
+    /// putting it back in order. The dialog says so with the count; see
+    /// [`Repository::stash_rename`] for the sequence and the recovery
+    /// contract.
+    ///
+    /// Two outcomes are reported differently on purpose. A refusal is an
+    /// error toast and nothing moved. A rename that landed but could not put
+    /// some entries back is a **warning**, not a success: the message did
+    /// change, so calling it a failure would be wrong, but the stack is short
+    /// and the log holds the shas needed to rebuild it — which is what the
+    /// toast points at, because the user cannot recover from a toast alone.
+    pub fn rename_confirmed(
+        &mut self,
+        sha: String,
+        painted: usize,
+        new_message: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_op(
+            move |repo| async move {
+                // Resolved for two things. The existence check buys the user
+                // the same "that stash is gone" wording every other op gives,
+                // instead of a raw git-layer refusal — and the address it
+                // returns is then handed to `stash_rename` as its tiebreaker.
+                //
+                // That hand-off matters only when a sha sits at two addresses
+                // (`git stash store` allows it), and it is the difference
+                // between renaming the row the user clicked and renaming the
+                // topmost row that happens to share its commit. `resolve` has
+                // already applied the painted hint, so this passes the answer
+                // rather than the guess.
+                let Some(target) = resolve(&repo, &sha, Some(painted)).await? else {
+                    return Ok(Some((ToastKind::Warning, STASH_GONE.to_string())));
+                };
+                let failures = repo
+                    .stash_rename(&sha, Some(target.index), &new_message)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if failures.is_empty() {
+                    return Ok(Some((
+                        ToastKind::Success,
+                        format!("Renamed to “{}”.", new_message.trim()),
+                    )));
+                }
+                Ok(Some((
+                    ToastKind::Warning,
+                    format!(
+                        "Renamed, but {} entr{} could not be put back: {}.                          The log holds `git stash store <sha>` for each one.",
+                        failures.len(),
+                        if failures.len() == 1 { "y" } else { "ies" },
+                        failures.join(", "),
+                    ),
+                )))
+            },
+            "Stash rename",
+            cx,
+        );
+    }
+
+    /// Run `op` on tokio, toast whatever it asks for, then re-read the list.
+    ///
+    /// The refresh is always forced. The 15 s read-TTL on `stash_list` exists
+    /// to absorb an *external* writer's churn while the panel re-renders; our
+    /// own mutation is not something to sit on for 15 s.
+    fn spawn_op<F, Fut>(&mut self, op: F, label: &'static str, cx: &mut Context<Self>)
+    where
+        F: FnOnce(Repository) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<OpToast, String>> + Send + 'static,
+    {
+        self.spawn_op_then(op, label, OpHooks::default(), cx);
+    }
+
+    /// [`spawn_op`] plus host callbacks — see [`OpHooks`]. Both are deferred,
+    /// so the hop out of this panel's update happens after the entity lease is
+    /// released; a cross-entity callback that read back into `StashPanel`
+    /// would otherwise double-lease and abort the process.
+    ///
+    /// [`spawn_op`]: Self::spawn_op
+    fn spawn_op_then<F, Fut>(
+        &mut self,
+        op: F,
+        label: &'static str,
+        hooks: OpHooks,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(Repository) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<OpToast, String>> + Send + 'static,
+    {
+        let repo = self.repo.clone();
+        let lock = self.op_lock.clone();
+        let (tx, rx) = oneshot::channel::<Result<OpToast, String>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    // Held across the whole op, so no other op can resolve an
+                    // index this one is about to invalidate. Queued, never
+                    // cancelled — both clicks still complete.
+                    let _guard = lock.lock().await;
+                    let _ = tx.send(op(repo).await);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(target: "oximux_app::stash_panel", op = label, "no tokio runtime; op skipped");
+                return;
+            }
+        }
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |panel, cx| {
+                match &result {
+                    Ok(Err(err)) => crate::shell::toast::toast_op_error(cx, label, err),
+                    Ok(Ok(Some((kind, text)))) => {
+                        crate::shell::toast::toast(cx, *kind, text.clone())
+                    }
+                    _ => {}
+                }
+                if matches!(result, Ok(Ok(_)))
+                    && let Some(cb) = hooks.on_success
+                {
+                    cx.defer(move |cx| cb(cx));
+                }
+                if let Some(cb) = hooks.on_done {
+                    cx.defer(move |cx| cb(cx));
+                }
+                // Refresh even when the op failed — the user wants to see the
+                // state git is actually in, not the one they clicked on.
+                panel.force_refresh(cx);
+            });
+        })
+        // Detached, not slotted: a second op must not void the first one's
+        // completion handler mid-subprocess. See the module doc.
+        .detach();
+    }
+}
+
+/// Put back a stash git dropped that we did not mean to drop, and describe
+/// what happened in terms the user can act on.
+///
+/// Always returns an error string: the rollback succeeding does not make the
+/// operation a success — the stack has been reordered under the user and the
+/// stash they asked to remove is still there.
+async fn rollback(
+    repo: &Repository,
+    known: &[(String, String)],
+    dropped: &str,
+    intended: &str,
+) -> String {
+    let label = known
+        .iter()
+        .find(|(sha, _)| sha == dropped)
+        .map(|(_, msg)| label_of(msg).to_string())
+        .unwrap_or_else(|| format!("recovered stash {}", short(dropped)));
+    match repo.stash_store(dropped, &label).await {
+        Ok(()) => format!(
+            "git removed {} instead of {} — it has been restored to the TOP of the stack, \
+             so the order has changed. Nothing was lost; the stash you picked is still there.",
+            short(dropped),
+            short(intended),
+        ),
+        Err(e) => format!(
+            "git removed {} instead of {} and restoring it FAILED: {e}. \
+             Recover it by hand: git stash store {}",
+            short(dropped),
+            short(intended),
+            dropped,
+        ),
+    }
+}

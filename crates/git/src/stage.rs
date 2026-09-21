@@ -26,7 +26,11 @@ const PATH_ARG_CHUNK: usize = 256;
 /// would be interpreted as a pattern and stage/discard the WRONG files (or
 /// none). Relativity is unchanged: the path stays relative to the command
 /// cwd (the repo workdir), matching the prior bare-argument behaviour.
-fn literal_pathspec(p: &Path) -> OsString {
+///
+/// `pub(crate)` for `stash::stash_push`, which needs the same wrapping but
+/// cannot use [`Repository::run_pathspec_op`] — a stash is one commit, so
+/// chunking the argv would split the stash.
+pub(crate) fn literal_pathspec(p: &Path) -> OsString {
     let mut spec = OsString::from(":(literal)");
     spec.push(p.as_os_str());
     spec
@@ -37,7 +41,12 @@ impl Repository {
     /// chunked under the argv limit with each path wrapped `:(literal)`.
     /// `leading` is the subcommand plus its `--` terminator, e.g.
     /// `["restore", "--staged", "--"]`.
-    async fn run_pathspec_op(&self, leading: &[&str], paths: &[&Path]) -> Result<()> {
+    ///
+    /// `pub(crate)` so every path-scoped op in the crate inherits the
+    /// `:(literal)` wrapping and argv chunking instead of hand-rolling a bare
+    /// pathspec. `stash::stash_push` and `stash::stash_restore_file` route
+    /// through here for exactly that reason.
+    pub(crate) async fn run_pathspec_op(&self, leading: &[&str], paths: &[&Path]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }

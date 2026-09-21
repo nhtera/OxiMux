@@ -2,16 +2,19 @@
 //! no git invocation. Lives in `oximux-core` so UI layers can hold these
 //! without depending on `oximux-git`.
 
+use crate::git_diff::DiffStatus;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Opaque reference to a stash entry. The `index` field is the `N` in
 /// `stash@{N}` at the time the ref was minted.
 ///
-/// **v1 caveat:** the index is only stable while no other process mutates the
-/// stash stack. v1 is single-user (OxiMux + the user's terminal), so concurrent
-/// stash ops are unlikely; callers that hold a `StashRef` across a long
-/// suspension should re-fetch via [`stash_list`](crate::git_ops) before use.
+/// **An index is an address, not an identity.** It shifts on every
+/// `drop`/`pop` anywhere in the repository, and `refs/stash` lives in the git
+/// *common* directory — so every worktree of a repo shares one stack and
+/// OxiMux itself is a second in-app writer alongside the user's terminal.
+/// Never hold a `StashRef` across a suspension: re-derive it from the stash's
+/// [`StashEntry::sha`] immediately before firing a destructive op.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StashRef {
     pub index: usize,
@@ -29,9 +32,52 @@ impl StashRef {
 pub struct StashEntry {
     pub stash_ref: StashRef,
     /// Branch active when the stash was created (`On <branch>:` field).
+    ///
+    /// Empty when the entry carries no branch prefix. Verified: an entry
+    /// created by `git stash store -m <msg>` records `<msg>` literally, with
+    /// no `On <branch>: ` — so an absent branch is normal data, not a
+    /// malformed record.
     pub branch: String,
     /// Message at push time, or git's default `WIP on <branch>: <sha> <subject>`.
     pub message: String,
+    /// Full SHA of the stash commit. Stable identity across index drift, and
+    /// the only safe way to name a stash across a suspension.
+    ///
+    /// Valid as a revision for `git stash apply` / `git stash branch`;
+    /// **rejected** by `drop` / `pop`, which demand a `stash@{N}` address
+    /// (verified: `error: '<sha>' is not a stash reference`).
+    pub sha: String,
+    /// Commit timestamp, unix seconds (`%ct`). Sorting + absolute-date tooltip.
+    pub created_at: i64,
+    /// Relative age pre-formatted by git (`%cr`), e.g. `"3 months ago"`.
+    /// Rendered as-is: the repo has no long-range date humanizer and the list
+    /// is re-read often enough that a stored string never goes visibly stale.
+    pub relative: String,
+}
+
+/// Which parent of the stash commit a file came from.
+///
+/// **Load-bearing, not cosmetic** — it selects how the file is diffed. A
+/// `Tracked` file is the range `<sha>^..<sha>`; an `Untracked` file is absent
+/// from the stash commit's own tree, so that range is EMPTY (verified) and it
+/// must be read from `<sha>^3` instead. Routing on the wrong one renders a
+/// blank diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StashFileOrigin {
+    /// From the stash commit's first parent — the tracked index/worktree diff.
+    Tracked,
+    /// From the third parent (`^3`), the untracked-files commit that
+    /// `git stash push -u` creates. Only present when `-u` was used.
+    Untracked,
+}
+
+/// One file inside a stash. Fetched lazily when a stash row is expanded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashFile {
+    /// New path (post-change); for renames the destination, origin in `status`.
+    pub path: PathBuf,
+    pub status: DiffStatus,
+    pub origin: StashFileOrigin,
 }
 
 /// Local branch with current/upstream metadata. v1 ignores remote-only branches.

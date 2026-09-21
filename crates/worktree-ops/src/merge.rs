@@ -360,7 +360,10 @@ fn stash_was_stranded(before: Option<usize>, after: Option<usize>) -> bool {
 /// when the list could not be read. See [`stash_was_stranded`] for why the
 /// unknown is propagated rather than flattened to zero.
 async fn count_auto_stashes(repo: &Repository) -> Option<usize> {
-    repo.stash_list()
+    // `force_refresh` — this count is compared before vs. after a merge. A
+    // cached read would return the same number twice and report "not stranded"
+    // for a stash that IS stranded, silently losing the user's work.
+    repo.stash_list(true)
         .await
         .ok()
         .map(|entries| {

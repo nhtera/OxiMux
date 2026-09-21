@@ -86,7 +86,7 @@ const MENU_WIDTH: f32 = 176.0;
 /// the divergence locally instead of bumping the global token.
 const ROW_MENU_ITEM_H: f32 = 28.0;
 /// Horizontal padding inside each row.
-const ROW_PADDING_X: f32 = 10.0;
+use crate::ui::ROW_PADDING_X;
 /// Extra left inset for a submenu's entries, so they read as children of
 /// the header above them.
 const SUBMENU_INDENT: f32 = 12.0;

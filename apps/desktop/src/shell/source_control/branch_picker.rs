@@ -43,7 +43,7 @@ const CARD_MAX_HEIGHT: f32 = 320.0;
 /// `density.h_overlay_item` without a paired UX decision.
 const ROW_HEIGHT: f32 = 28.0;
 /// Horizontal padding inside each row.
-const ROW_PADDING_X: f32 = 10.0;
+use crate::ui::ROW_PADDING_X;
 /// Vertical separator thickness between row sections.
 const SEPARATOR_HEIGHT: f32 = 1.0;
 /// Margin around separators so they don't visually touch row backgrounds.

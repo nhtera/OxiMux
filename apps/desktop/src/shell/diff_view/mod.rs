@@ -226,13 +226,25 @@ pub struct DiffView {
     theme: Theme,
     density: Density,
     typography: Typography,
+    /// What the `Commit*` states are showing, for copy alone: `"commit"` or
+    /// `"stash"`. Those three states carry no discriminant of their own
+    /// because a stash IS a commit and every downstream consumer — the row
+    /// renderer, the review-note key, the file count — is right either way.
+    /// Only the loading and failure lines name the thing out loud, and
+    /// telling a user their *commit* failed to load when they clicked Open
+    /// All Changes on a stash is the kind of small lie that costs a bug
+    /// report. A field rather than a fourth enum variant: the variant would
+    /// have to be threaded through nine match arms to change two strings.
+    commit_noun: &'static str,
     /// In-flight load task. Dropping aborts; we replace on every `load()`
     /// call so a fast-switching user only sees the latest selection.
     _load_task: Option<Task<()>>,
-    /// In-flight hunk op (stage / unstage / discard). Single shared slot
-    /// mirrors `StashPanel::_op_task` — rapid back-to-back ops cancel
-    /// the prior op's gpui-side refresh, but the tokio side-effect still
-    /// completes; the next op fires its own reload.
+    /// In-flight hunk op (stage / unstage / discard). Single shared slot:
+    /// rapid back-to-back ops cancel the prior op's gpui-side refresh, but
+    /// the tokio side-effect still completes; the next op fires its own
+    /// reload. `StashPanel` used to share this shape and no longer does — it
+    /// detaches, because for a destructive op losing the completion handler
+    /// means losing the only record of what happened.
     _op_task: Option<Task<()>>,
     /// The heartbeat that keeps a working-tree diff showing the working tree.
     /// Held for the view's lifetime; dropping it stops the loop.
@@ -457,6 +469,7 @@ impl DiffView {
             theme,
             density,
             typography,
+            commit_noun: "commit",
             _load_task: None,
             _op_task: None,
             _live_refresh_task: Some(_live_refresh_task),
@@ -1164,6 +1177,40 @@ impl DiffView {
         subject: String,
         cx: &mut Context<Self>,
     ) {
+        self.load_all_files_of(sha, short_oid, subject, false, cx);
+    }
+
+    /// The same view for a **stash**: every file it touches, in one tab.
+    ///
+    /// Differs from [`DiffView::load_commit`] in exactly one place — the
+    /// fetch. `commit_files` is `--first-parent`, so on a stash it reports the
+    /// tracked side and silently omits the untracked files a `-u` stash
+    /// carries in its parentless `^3`; `stash_all_files` composes both. See
+    /// `Repository::stash_all_files` for why that is a sibling call rather
+    /// than a fix to `commit_files`, which serves every commit-detail tab.
+    ///
+    /// Everything after the fetch is identical, because a stash IS a commit:
+    /// the rows are read-only, the review-note key (`commit:<sha>`) is unique
+    /// and stable, and the file count means the same thing.
+    pub fn load_stash(
+        &mut self,
+        sha: String,
+        short_oid: String,
+        subject: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_all_files_of(sha, short_oid, subject, true, cx);
+    }
+
+    fn load_all_files_of(
+        &mut self,
+        sha: String,
+        short_oid: String,
+        subject: String,
+        is_stash: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_noun = if is_stash { "stash" } else { "commit" };
         // Same drop-on-entry rule as `load()`: a stale post-op reload
         // from a prior file selection must not flash over the new
         // commit-detail view.
@@ -1187,17 +1234,19 @@ impl DiffView {
             Ok(handle) => {
                 let sha_for_fetch = sha.clone();
                 handle.spawn(async move {
-                    let r = repo
-                        .commit_files(&sha_for_fetch)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let r = if is_stash {
+                        repo.stash_all_files(&sha_for_fetch).await
+                    } else {
+                        repo.commit_files(&sha_for_fetch).await
+                    }
+                    .map_err(|e| e.to_string());
                     let _ = tx.send(r);
                 });
             }
             Err(_) => {
                 tracing::warn!(
                     target: "oximux_app::diff_view",
-                    "no tokio runtime entered; commit load skipped"
+                    "no tokio runtime entered; commit/stash load skipped"
                 );
                 return;
             }
@@ -1260,6 +1309,15 @@ impl DiffView {
     /// section. Mirrors `load_commit`'s async machinery but fetches
     /// `diff_for_range(base, head, path)` and lands in the `Range*`
     /// states (no staging chips, since the change is already committed).
+    ///
+    /// **An empty `base` means "no base"**, not "an empty tree": the file is
+    /// read out of `head` alone via `diff_in_rev`. That is what a stash's
+    /// untracked files need — they live in the parentless `<sha>^3` and the
+    /// stash commit's own range says nothing about them. Carried as a
+    /// sentinel rather than a second state because everything downstream of
+    /// the fetch is identical, including the retry path (which re-enters here
+    /// with the same empty base) and the review-note key
+    /// (`range:..<sha>^3`, distinct and stable).
     pub fn load_range(
         &mut self,
         base: String,
@@ -1289,11 +1347,12 @@ impl DiffView {
             Ok(handle) => {
                 let (base_f, head_f, path_f) = (base.clone(), head.clone(), path.clone());
                 handle.spawn(async move {
-                    let r = repo
-                        .diff_for_range(&base_f, &head_f, &path_f)
-                        .await
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(r);
+                    let r = if base_f.is_empty() {
+                        repo.diff_in_rev(&head_f, &path_f).await
+                    } else {
+                        repo.diff_for_range(&base_f, &head_f, &path_f).await
+                    };
+                    let _ = tx.send(r.map_err(|e| e.to_string()));
                 });
             }
             Err(_) => {

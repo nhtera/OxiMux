@@ -260,6 +260,65 @@ impl ProjectPanes {
         }))
     }
 
+    /// Mirrors `open_or_activate_branch_diff_tab` but routes through
+    /// `PaneGroup::open_or_activate_stash_file_tab` — one file inside a
+    /// stash, deduped by `(sha, path)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_activate_stash_file_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        sha: String,
+        base: String,
+        head: String,
+        path: PathBuf,
+        stash_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied())?;
+        self.set_active_group(target_id, window, cx);
+        let target = self.groups.get(&target_id)?.clone();
+        Some(target.update(cx, |g, cx| {
+            g.open_or_activate_stash_file_tab(
+                repo,
+                sha,
+                base,
+                head,
+                path,
+                stash_label,
+                window,
+                cx,
+            )
+        }))
+    }
+
+    /// Mirrors `open_or_activate_stash_file_tab` but routes through
+    /// `PaneGroup::open_or_activate_stash_all_tab` — every file in one stash,
+    /// deduped by sha.
+    pub fn open_or_activate_stash_all_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        sha: String,
+        stash_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied())?;
+        self.set_active_group(target_id, window, cx);
+        let target = self.groups.get(&target_id)?.clone();
+        Some(target.update(cx, |g, cx| {
+            g.open_or_activate_stash_all_tab(repo, sha, stash_label, window, cx)
+        }))
+    }
+
     /// Mirrors `open_or_activate_commit_tab` but routes through
     /// `PaneGroup::open_or_activate_combined_diff_tab` — a combined
     /// multi-file diff for `scope` (SCM "View all" CTAs), deduped by the
@@ -546,6 +605,8 @@ impl ProjectPanes {
                     PaneGroupTabKind::Diff { .. }
                     | PaneGroupTabKind::Commit { .. }
                     | PaneGroupTabKind::BranchFile { .. }
+                    | PaneGroupTabKind::StashFile { .. }
+                    | PaneGroupTabKind::StashAll { .. }
                     | PaneGroupTabKind::CombinedDiff { .. }
                     | PaneGroupTabKind::Tasks
                     | PaneGroupTabKind::Automations => continue,

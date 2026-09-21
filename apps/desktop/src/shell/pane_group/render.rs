@@ -504,6 +504,8 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         PaneGroupTabKind::Diff { .. }
         | PaneGroupTabKind::Commit { .. }
         | PaneGroupTabKind::BranchFile { .. }
+        | PaneGroupTabKind::StashFile { .. }
+        | PaneGroupTabKind::StashAll { .. }
         | PaneGroupTabKind::CombinedDiff { .. } => PaneTabKindMarker::Diff,
         PaneGroupTabKind::Browser { .. } => PaneTabKindMarker::Browser,
         PaneGroupTabKind::Tasks => PaneTabKindMarker::Tasks,
@@ -1797,6 +1799,8 @@ fn render_mru_hud(
             | PaneGroupTabKind::Diff { .. }
             | PaneGroupTabKind::Commit { .. }
             | PaneGroupTabKind::BranchFile { .. }
+            | PaneGroupTabKind::StashFile { .. }
+            | PaneGroupTabKind::StashAll { .. }
             | PaneGroupTabKind::CombinedDiff { .. } => "icons/file.svg",
             PaneGroupTabKind::Terminal => "icons/square-terminal.svg",
             PaneGroupTabKind::Browser { .. } => "icons/globe.svg",

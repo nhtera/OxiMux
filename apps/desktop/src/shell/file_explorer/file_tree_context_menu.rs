@@ -21,11 +21,10 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::ui::FloatingSurface;
+use crate::ui::{FloatingSurface, MenuRow, separator};
 
 /// Width of the dropdown card. Matches `TabContextMenu::MENU_WIDTH`.
 pub const MENU_WIDTH: f32 = 200.0;
-const ROW_PADDING_X: f32 = 10.0;
 
 /// What the menu is targeting at open time. `Row` covers right-clicks
 /// on a file or directory row; `Background` covers right-clicks in the
@@ -195,13 +194,15 @@ fn build_row_card(
     //   entirely — the parent's editor view doesn't make sense.
     if !is_dir {
         let open_path = path.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "file-ctx-open",
             "Open",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 let p = open_path.clone();
                 this.close(cx);
@@ -215,13 +216,15 @@ fn build_row_card(
             }),
         ));
         let side_path = path.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "file-ctx-open-side",
             "Open to the Side",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 let p = side_path.clone();
                 this.close(cx);
@@ -249,13 +252,15 @@ fn build_row_card(
             .unwrap_or_else(|| path.clone())
     };
     let new_file_parent = new_parent.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "file-ctx-new-file",
         "New File",
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let parent = new_file_parent.clone();
             this.close(cx);
@@ -268,13 +273,15 @@ fn build_row_card(
         }),
     ));
     let new_folder_parent = new_parent;
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "file-ctx-new-folder",
         "New Folder",
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let parent = new_folder_parent.clone();
             this.close(cx);
@@ -292,14 +299,16 @@ fn build_row_card(
     //   Relative Path needs a project root and is hidden when the
     //   target sits outside the workspace.
     let copy_path = path.clone();
-    card = card.child(menu_row_with_shortcut(
+    card = card.child(MenuRow::new(
         "file-ctx-copy-path",
         "Copy Path",
-        Some("⌘⌥C"),
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .shortcut("⌘⌥C")
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 copy_path.to_string_lossy().into_owned(),
@@ -308,14 +317,16 @@ fn build_row_card(
         }),
     ));
     if let Some(rel_string) = relative_path_string(&path, project_root.as_ref()) {
-        card = card.child(menu_row_with_shortcut(
+        card = card.child(MenuRow::new(
             "file-ctx-copy-relative",
             "Copy Relative Path",
-            Some("⌘⌥⇧C"),
-            !rel_string.is_empty(),
             theme,
             density,
             typography.clone(),
+            )
+            .shortcut("⌘⌥⇧C")
+            .enabled(!rel_string.is_empty())
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(rel_string.clone()));
                 this.close(cx);
@@ -326,13 +337,15 @@ fn build_row_card(
     // ── Duplicate — copy the file/folder next to itself with a collision-free
     //   " copy" name. Available for both files and directories.
     let duplicate_path_target = path.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "file-ctx-duplicate",
         "Duplicate",
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let p = duplicate_path_target.clone();
             this.close(cx);
@@ -351,13 +364,15 @@ fn build_row_card(
     //   to scope into.
     if is_dir {
         let find_path = path.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "file-ctx-find-in-folder",
             "Find in Folder",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 let p = find_path.clone();
                 this.close(cx);
@@ -373,13 +388,15 @@ fn build_row_card(
 
     // ── 5. Reveal in Finder — always available.
     let reveal_path = path.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "file-ctx-reveal-in-finder",
         "Reveal in Finder",
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
             cx.reveal_path(&reveal_path);
             this.close(cx);
@@ -391,14 +408,16 @@ fn build_row_card(
     //   input + confirm-dialog wiring lands in Phase 03 behind the
     //   same action payload.
     let rename_path = path.clone();
-    card = card.child(menu_row_with_shortcut(
+    card = card.child(MenuRow::new(
         "file-ctx-rename",
         "Rename…",
-        Some("↵"),
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .shortcut("↵")
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let p = rename_path.clone();
             this.close(cx);
@@ -411,13 +430,16 @@ fn build_row_card(
         }),
     ));
     let delete_path = path.clone();
-    card = card.child(menu_row_destructive(
+    card = card.child(MenuRow::new(
         "file-ctx-delete",
         "Delete",
-        Some("⌘⌫"),
         theme,
         density,
         typography.clone(),
+        )
+        .fg(theme.status_error)
+        .shortcut("⌘⌫")
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let p = delete_path.clone();
             this.close(cx);
@@ -441,13 +463,15 @@ fn build_background_card(
     cx: &mut Context<FileTreeContextMenu>,
 ) -> gpui::Div {
     let new_file_root = root.clone();
-    card = card.child(menu_row(
+    card = card.child(MenuRow::new(
         "file-ctx-bg-new-file",
         "New File",
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let r = new_file_root.clone();
             this.close(cx);
@@ -460,13 +484,15 @@ fn build_background_card(
         }),
     ));
     let new_folder_root = root;
-    card.child(menu_row(
+    card.child(MenuRow::new(
         "file-ctx-bg-new-folder",
         "New Folder",
-        true,
         theme,
         density,
         typography.clone(),
+        )
+        .enabled(true)
+        .build(
         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             let r = new_folder_root.clone();
             this.close(cx);
@@ -490,116 +516,6 @@ fn relative_path_string(path: &std::path::Path, project_root: Option<&PathBuf>) 
         .map(|p| p.to_string_lossy().into_owned())
         .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()));
     rel.filter(|s| !s.is_empty())
-}
-
-
-fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive)
-}
-
-fn menu_row<H>(
-    row_id: &'static str,
-    label: &'static str,
-    enabled: bool,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    menu_row_with_shortcut(row_id, label, None, enabled, theme, density, typography, on_click)
-}
-
-/// `menu_row` plus an optional right-aligned shortcut hint (e.g. `⌘⌥C`). The
-/// hint is display-only — it documents the keyboard binding handled by the
-/// file explorer's key handler; it does not itself wire a binding.
-#[allow(clippy::too_many_arguments)]
-fn menu_row_with_shortcut<H>(
-    row_id: &'static str,
-    label: &'static str,
-    shortcut: Option<&'static str>,
-    enabled: bool,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    let fg = if enabled {
-        theme.fg_base
-    } else {
-        theme.fg_subtle
-    };
-    let mut row = div()
-        .id(row_id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(density.h_overlay_item))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(density.r_xs))
-        .text_size(px(typography.t_body_md))
-        .text_color(fg)
-        .child(label);
-    if let Some(shortcut) = shortcut {
-        row = row.child(div().flex_1()).child(
-            div()
-                .text_color(theme.fg_subtle)
-                .text_size(px(typography.t_body_sm))
-                .child(shortcut),
-        );
-    }
-    if enabled {
-        row = row
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.hover_overlay))
-            .on_mouse_down(MouseButton::Left, on_click);
-    }
-    row
-}
-
-/// Same shape as `menu_row` but paints the label in `status_error` so
-/// the user has a visual brake before clicking. Used by the Delete row.
-/// Carries an optional right-aligned shortcut hint like the regular row.
-fn menu_row_destructive<H>(
-    row_id: &'static str,
-    label: &'static str,
-    shortcut: Option<&'static str>,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    let mut row = div()
-        .id(row_id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(density.h_overlay_item))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(density.r_xs))
-        .text_size(px(typography.t_body_md))
-        .text_color(theme.status_error)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.hover_overlay))
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(label);
-    if let Some(shortcut) = shortcut {
-        row = row.child(div().flex_1()).child(
-            div()
-                .text_color(theme.fg_subtle)
-                .text_size(px(typography.t_body_sm))
-                .child(shortcut),
-        );
-    }
-    row
 }
 
 #[cfg(test)]

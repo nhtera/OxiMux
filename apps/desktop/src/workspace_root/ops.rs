@@ -577,6 +577,33 @@ impl WorkspaceRoot {
         None
     }
 
+    /// Hand one SCM section-resize drag tick to the source-control panel.
+    ///
+    /// The two handles' listeners have to live on the workspace root (a drag
+    /// listener nested inside the SCM panel stops firing once the cursor
+    /// travels over a child entity), and GPUI selects a drag by payload type,
+    /// so there is one listener per section. They both land here, and here
+    /// hands off to the single router that can see both section heights —
+    /// nothing in this file decides anything about the budget.
+    pub(crate) fn apply_scm_section_drag(
+        &mut self,
+        section: crate::shell::source_control::sections::ScmSection,
+        cursor_y: f32,
+        window_height: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sidebar) = self.right_sidebar.clone() else {
+            return;
+        };
+        sidebar.update(cx, |s, cx| {
+            if let Some(panel) = s.source_control.clone() {
+                panel.update(cx, |p, cx| {
+                    p.apply_section_drag(section, cursor_y, window_height, cx);
+                });
+            }
+        });
+    }
+
     /// (Re)wire every source-control-panel event subscription against the
     /// CURRENT `right_sidebar` entities. Called from `new` AND after every
     /// `set_active_project` sidebar rebuild: that rebuild mints fresh
@@ -596,10 +623,16 @@ impl WorkspaceRoot {
             // over from a prior git project.
             self._discard_subscription = None;
             self._push_stash_subscription = None;
+            self._drop_stash_subscription = None;
+            self._show_stash_file_subscription = None;
+            self._show_stash_all_subscription = None;
+            self._branch_from_stash_subscription = None;
+            self._restore_stash_file_subscription = None;
             self._show_commit_subscription = None;
             self._show_branch_file_subscription = None;
             self._show_combined_diff_subscription = None;
             self._show_branch_diff_all_subscription = None;
+            self._stash_selection_subscription = None;
             return;
         };
         // Clone the child entities + repo up front so the immutable read
@@ -623,11 +656,103 @@ impl WorkspaceRoot {
             },
         ));
 
+        self._stash_selection_subscription = Some(cx.subscribe_in(
+            &git_panel,
+            window,
+            |root, panel, ev: &StashSelectedRequested, window, cx| {
+                root.mount_stash_selection_dialog(panel.clone(), ev, window, cx);
+            },
+        ));
+
         self._push_stash_subscription = Some(cx.subscribe_in(
             &stash_panel,
             window,
             |root, panel, _ev: &PushStashRequested, window, cx| {
                 root.mount_push_stash_dialog(panel.clone(), window, cx);
+            },
+        ));
+
+        self._drop_stash_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &DropStashRequested, window, cx| {
+                root.mount_drop_stash_dialog(panel, ev, window, cx);
+            },
+        ));
+
+        let stash_file_repo = repo.clone();
+        self._show_stash_file_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            move |root, _panel, ev: &ShowStashFileRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                // The revision pair is decided here, from `origin`, and
+                // nowhere else. A tracked file is the stash commit's own
+                // range; an untracked one is absent from that commit's tree
+                // (so the range is empty and the tab would render blank) and
+                // has to be read from the parentless `^3` with NO base —
+                // never against a hard-coded empty-tree sha, which is
+                // hash-function-specific and simply fails in a SHA-256 repo.
+                let (base, head) = match ev.origin {
+                    oximux_core::StashFileOrigin::Tracked => {
+                        (format!("{}^", ev.sha), ev.sha.clone())
+                    }
+                    oximux_core::StashFileOrigin::Untracked => {
+                        (String::new(), format!("{}^3", ev.sha))
+                    }
+                };
+                let (sha, path, label) = (ev.sha.clone(), ev.path.clone(), ev.label.clone());
+                let repo = stash_file_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_stash_file_tab(
+                        repo, sha, base, head, path, label, window, cx,
+                    );
+                });
+            },
+        ));
+
+        let stash_all_repo = repo.clone();
+        self._show_stash_all_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            move |root, _panel, ev: &ShowStashAllRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                // No revision pair to pick here: `DiffView::load_stash` fetches
+                // the tracked side AND the untracked `^3` set in one call, so
+                // the tab shows exactly what the expanded row lists.
+                let (sha, label) = (ev.sha.clone(), ev.label.clone());
+                let repo = stash_all_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_stash_all_tab(repo, sha, label, window, cx);
+                });
+            },
+        ));
+
+        self._branch_from_stash_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &BranchFromStashRequested, window, cx| {
+                root.mount_branch_from_stash_dialog(panel, ev, window, cx);
+            },
+        ));
+
+        self._restore_stash_file_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &RestoreStashFileRequested, window, cx| {
+                root.mount_restore_stash_file_dialog(panel, ev, window, cx);
+            },
+        ));
+
+        self._rename_stash_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, ev: &RenameStashRequested, window, cx| {
+                root.mount_rename_stash_dialog(panel, ev, window, cx);
             },
         ));
 
@@ -936,28 +1061,8 @@ impl WorkspaceRoot {
             secondary: None,
         };
 
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
-        // Cancel any in-flight observer (e.g. an SCM discard dialog) before
-        // installing this one, matching the explicit-clear pattern used at the
-        // other `confirm_dialog` mount sites.
-        self._discard_dialog_observer = None;
-        self._discard_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.confirm_dialog = None;
-                    root._discard_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-        self.confirm_dialog = Some(dialog);
-        cx.notify();
+        // Refusal means a live prompt is already up; nothing here to undo.
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
     }
 
     /// Mount a `ConfirmDialog` for the SCM panel's pending discard
@@ -1020,94 +1125,14 @@ impl WorkspaceRoot {
             secondary: None,
         };
 
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
-
-        // Drop the dialog the moment the user resolves it. Replacing
-        // `_discard_dialog_observer` cancels any previous observer
-        // that's tied to a stale dialog.
-        self._discard_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.confirm_dialog = None;
-                    root._discard_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-
-        self.confirm_dialog = Some(dialog);
-        cx.notify();
-    }
-
-    /// Mount a `PushStashDialog` for the SCM panel's stash-push
-    /// request. Wires `on_confirm` to call `StashPanel::push` with
-    /// the user-supplied message + include-untracked toggle. Installs
-    /// an observer that drops the dialog from the slot once the user
-    /// confirms or cancels.
-    ///
-    /// First-open-wins: a double-click on the header `+` button (or
-    /// any sequence that re-fires `PushStashRequested` while the
-    /// dialog is already mounted) is ignored. Replacing the slot
-    /// would silently drop a half-typed form, which is the bug Phase
-    /// 01's discard-dialog reviewer caught for the destructive flow;
-    /// applying the same guard here so the user's in-progress
-    /// message survives a stray re-click.
-    fn mount_push_stash_dialog(
-        &mut self,
-        panel: Entity<StashPanel>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.push_stash_dialog.is_some() {
-            return;
+        // First-open-wins lives in `mount_confirm_dialog`: a re-fired
+        // `DiscardRequested` must not replace a destructive confirm the user
+        // is already reading.
+        if !self.mount_confirm_dialog(prompt, window, cx) {
+            // The request was refused, so nothing will ever resolve this
+            // pending flag — clear it or the button goes dead.
+            panel.update(cx, |p, cx| p.clear_pending_discard(cx));
         }
-        let on_confirm: PushCallback = {
-            let panel = panel.clone();
-            Rc::new(move |msg, include_untracked, _window, cx| {
-                panel.update(cx, |p, cx| p.push(msg, include_untracked, cx));
-            })
-        };
-        // Cancel path is a no-op on the panel side — the dialog flips
-        // `cancelled`, the observer below drops the slot. Wired anyway
-        // so future telemetry (e.g. counting abandoned pushes) has a
-        // hook point.
-        let on_cancel: CancelCallback = Rc::new(|_window, _cx| {});
-
-        let prompt = PushStashPrompt {
-            on_confirm,
-            on_cancel: Some(on_cancel),
-        };
-
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog =
-            cx.new(|cx| PushStashDialog::new(prompt, theme, density, typography, window, cx));
-
-        // Drop the dialog the moment the user resolves it. Replacing
-        // `_push_stash_dialog_observer` cancels any previous observer
-        // tied to a stale dialog.
-        self._push_stash_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.push_stash_dialog = None;
-                    root._push_stash_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-
-        self.push_stash_dialog = Some(dialog);
-        cx.notify();
     }
 
     /// Build the on-click callback handed to the SCM panel for diff

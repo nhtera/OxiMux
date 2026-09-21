@@ -625,6 +625,41 @@ impl WorkspaceRoot {
         // Capture the outgoing project's pane scrollback before swapping so
         // a project-switch-then-quit-other-window flow doesn't lose data.
         // No-op when no project was previously active.
+        // A mounted dialog belongs to the project it was opened from, and
+        // its callbacks keep working across a switch: sidebars are cached per
+        // project, so the outgoing panel and its `Repository` stay alive and a
+        // captured handle still upgrades. Confirming a stash Drop after
+        // switching would drop it in the PREVIOUS project's repo while the
+        // toast lands in this window. A weak handle cannot help — the cached
+        // entity is not dead.
+        //
+        // This MUST be synchronous and here, not in `rewire_scm_subscriptions`:
+        // on a project's first activation that runs inside a `cx.spawn_in`
+        // after `Repository::open().await`, which is both far too late (the
+        // stale dialog stays clickable for the whole sidebar build) and too
+        // late in the wrong direction — it would destroy the merge
+        // stash-recovery dialog that the `window.defer` below mounts for the
+        // INCOMING project.
+        //
+        // Gated on the project actually changing so re-activating the current
+        // project does not wipe a prompt the user is mid-way through. The
+        // push-stash form goes too: it pushes to the active repo, so carrying
+        // a half-typed message across a switch would stash it in the wrong one.
+        if self.active_project.as_ref().is_some_and(|p| p.id != project.id) {
+            self.confirm_dialog = None;
+            self._discard_dialog_observer = None;
+            self.push_stash_dialog = None;
+            self._push_stash_dialog_observer = None;
+            // Same reasoning for the branch-from-stash form: it creates a
+            // branch in the active repo and consumes a stash there.
+            self.branch_from_stash_dialog = None;
+            self._branch_from_stash_dialog_observer = None;
+            // And the rename form, which rewrites a whole prefix of the
+            // active repo's stash stack.
+            self.rename_stash_dialog = None;
+            self._rename_stash_dialog_observer = None;
+        }
+
         // Clone window_id BEFORE any mutable borrows of self so closure
         // captures and borrow checker are both satisfied.
         let window_id = self.window_id.clone();
@@ -2220,12 +2255,43 @@ impl WorkspaceRoot {
     /// that forgets leaves a dialog the user cannot dismiss, and every
     /// resolution path (confirm, secondary, Escape, click-outside) passes
     /// through the entity's own state.
+    ///
+    /// **First open wins — but only against a dialog the user is still
+    /// reading.** `confirm_dialog` is ONE slot shared by every confirm in the
+    /// window: SCM discard, stash drop, file delete, workspace delete,
+    /// project remove, merge offers. Assigning into it while a prompt is up
+    /// does not stack them, it silently replaces the one on screen, so a user
+    /// reading "Drop this stash?" can have it swapped for an unrelated prompt
+    /// and confirm the wrong destructive act. Every mount goes through here
+    /// so the guard covers the slot itself rather than each caller's own
+    /// field.
+    ///
+    /// The guard tests *pending*, not *occupied*. A resolved dialog sits in
+    /// the slot until its observer runs, and dialogs legitimately chain:
+    /// `offer_delete_after_merge` confirms, then defers a mount of the audited
+    /// delete confirmation. Refusing on `is_some()` alone would drop that
+    /// second prompt whenever the defer beat the observer — a shipped flow
+    /// dead-ending silently. A confirmed or cancelled dialog is a corpse
+    /// awaiting teardown, not something anyone is looking at, so it is fair
+    /// game to replace.
+    ///
+    /// Returns `false` when the request was refused because a live prompt was
+    /// already up. Callers with no pending state of their own can ignore it;
+    /// a caller that set a "pending request" flag MUST clear it, or its
+    /// button goes dead forever.
+    #[must_use]
     pub(crate) fn mount_confirm_dialog(
         &mut self,
         prompt: ConfirmPrompt,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        if let Some(open) = self.confirm_dialog.as_ref() {
+            let d = open.read(cx);
+            if !d.is_confirmed() && !d.is_cancelled() {
+                return false;
+            }
+        }
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
@@ -2245,6 +2311,7 @@ impl WorkspaceRoot {
         ));
         self.confirm_dialog = Some(dialog);
         cx.notify();
+        true
     }
 
     /// Restore an archived workspace to its project's active group.
@@ -2523,30 +2590,9 @@ impl WorkspaceRoot {
                 secondary: None,
             }
         };
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
-        // Drop any per-mount observer the SCM discard path installed before
-        // reusing the confirm_dialog slot, then watch THIS dialog so both
-        // confirm AND cancel free the slot. The on-confirm callback drops the
-        // dialog on its own path, but Cancel only flips the dialog's `cancelled`
-        // flag — without this observer nothing would remove it from the overlay.
-        self._discard_dialog_observer = None;
-        self._discard_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.confirm_dialog = None;
-                    root._discard_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-        self.confirm_dialog = Some(dialog);
-        cx.notify();
+        // Nothing pending to clear: if a live prompt is already up, the user
+        // is answering that one and this offer is simply not made.
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
     }
 
     /// Open the project's root directory in the system file manager.
@@ -2755,28 +2801,9 @@ impl WorkspaceRoot {
             on_cancel: None,
             secondary: None,
         };
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog =
-            cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
-        // Drop the dialog the moment the user confirms or cancels. Reusing
-        // `_discard_dialog_observer` cancels any stale observer first; the
-        // SCM discard / workspace-delete paths share the same slot.
-        self._discard_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.confirm_dialog = None;
-                    root._discard_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-        self.confirm_dialog = Some(dialog);
-        cx.notify();
+        // Nothing pending to clear: if a live prompt is already up, the user
+        // is answering that one and this offer is simply not made.
+        let _ = self.mount_confirm_dialog(prompt, window, cx);
     }
 }
 

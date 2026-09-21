@@ -14,12 +14,20 @@
 //! [`write_branch_op_status`] helper, which guards against clobbering
 //! an in-flight commit/push/pull/sync status owned by `commit_ops`.
 //!
+//! [`refresh_after_branch_change`] lives here too, beside the two callers
+//! that move HEAD. It is the fan-out this panel never had: the poller covers
+//! the branch name, the file list and "Committed on Branch", but nothing
+//! covered the commit graph, which kept painting the previous branch's
+//! history until something else poked it.
+//!
 //! [`switch_to_branch`]: SourceControlPanel::switch_to_branch
+//! [`refresh_after_branch_change`]: SourceControlPanel::refresh_after_branch_change
 //! [`create_branch_and_switch`]: SourceControlPanel::create_branch_and_switch
 //! [`set_base_ref`]: SourceControlPanel::set_base_ref
 //! [`merge_base_ref_into_settings`]: super::settings_persistence::merge_base_ref_into_settings
 
 use gpui::{Context, Window};
+use std::sync::Arc;
 
 use crate::shell::source_control::SourceControlPanel;
 use crate::shell::source_control::branch_picker::{PickerMode, PickerOutcome};
@@ -173,19 +181,114 @@ impl SourceControlPanel {
         .detach();
     }
 
-    /// Dispatch `repo.switch_branch(name)`. Success leaves status
-    /// unchanged (the StatusPoller's next tick reflects the new branch).
-    /// Failure surfaces via `CommitStatus::Failed("switch", err)` so the
-    /// existing status row in the commit area shows the error without
-    /// needing a separate toast surface.
+    /// Hand over the status poller. Called by `RightSidebar` right after it
+    /// builds this panel; see the field's note.
+    pub(crate) fn set_poller(&mut self, poller: Arc<oximux_git::StatusPoller>) {
+        self.poller = Some(poller);
+    }
+
+    /// Re-sync everything that describes HEAD after the branch has changed
+    /// under the panel.
+    ///
+    /// # This did not exist, and its absence was a live bug
+    ///
+    /// The plan for this phase first said to "route through the path a branch
+    /// switch already uses". There is no such path. `switch_to_branch` spawns
+    /// the git call and writes a status string; its own doc notes that the
+    /// poller's next tick reflects the change. That is true of the branch
+    /// name, the file list and the "Committed on Branch" section, which all
+    /// arrive on the poll channel — but **not** of the commit graph, whose
+    /// only two refresh sites are a completed commit op and the two manual
+    /// refresh buttons. Neither fires on a branch switch, so the graph kept
+    /// painting the previous branch's history indefinitely.
+    ///
+    /// So this is built here and called from both sites: branch-from-stash,
+    /// and the plain branch switch that had the same gap all along.
+    ///
+    /// PR/CI state is dropped rather than refreshed. It belongs to the branch
+    /// the user just left, and the 30 s throttle would otherwise keep showing
+    /// it against the new one.
+    /// Reload the commit graph when HEAD has moved since the previous poll.
+    ///
+    /// # The other half of the same gap
+    ///
+    /// [`refresh_after_branch_change`] fixes the movers the panel performs
+    /// itself. This catches every mover it does not: a commit, amend, reset,
+    /// rebase or checkout made in the user's own terminal, or in a sibling
+    /// worktree sharing the repo. Nothing in the app fires for those, so the
+    /// graph went on painting history that no longer had HEAD at its tip —
+    /// the same defect as the branch-switch gap, a different trigger.
+    ///
+    /// The signal is free: `GitState` already carries `head_oid` and the
+    /// poller already delivers it every tick. So this is a comparison, not a
+    /// new query — no extra subprocess, and it self-heals within one tick of
+    /// whatever moved HEAD.
+    ///
+    /// **Only the graph is reloaded.** The branch name, the file list and
+    /// "Committed on Branch" all ride the same poll and have already been
+    /// updated by the time this returns. PR/CI state is deliberately left
+    /// alone: HEAD moving on the SAME branch (the common case here, a plain
+    /// commit) does not invalidate its PR, and dropping it would make every
+    /// terminal commit re-spend the forge round-trip.
+    ///
+    /// [`refresh_after_branch_change`]: Self::refresh_after_branch_change
+    pub(crate) fn refresh_graph_if_head_moved(
+        &mut self,
+        head_oid: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let head = head_oid.map(str::to_string);
+        if !self.head_oid_seen {
+            // First poll on a panel built before any state arrived. The graph
+            // loaded against whatever HEAD is now, so adopt it silently —
+            // treating this as a move would reload the graph on every boot.
+            self.head_oid_seen = true;
+            self.last_head_oid = head;
+            return;
+        }
+        if self.last_head_oid == head {
+            return;
+        }
+        self.last_head_oid = head;
+        self.commit_graph.update(cx, |g, cx| g.refresh(cx));
+    }
+
+    pub(crate) fn refresh_after_branch_change(&mut self, cx: &mut Context<Self>) {
+        self.commit_graph.update(cx, |g, cx| g.refresh(cx));
+        self.has_open_pr = false;
+        self.pr_merged = false;
+        self.ci_checks.clear();
+        self.pr_status_checked_branch = None;
+        self.refresh_checks(cx);
+        if let Some(poller) = &self.poller {
+            poller.kick();
+        }
+        cx.notify();
+    }
+
+    /// Dispatch `repo.switch_branch(name)`. Failure surfaces via
+    /// `CommitStatus::Failed("switch", err)` so the existing status row in the
+    /// commit area shows the error without needing a separate toast surface.
+    ///
+    /// On success, `refresh_after_branch_change` runs. The poller's next tick
+    /// does cover the branch name, the file list and the "Committed on
+    /// Branch" section — but it has never covered the **commit graph**, which
+    /// went on painting the previous branch's history until something else
+    /// poked it. That was a pre-existing gap, found while wiring
+    /// branch-from-stash; the fix belongs on both callers, not just the new
+    /// one.
     pub(super) fn switch_to_branch(&mut self, name: String, cx: &mut Context<Self>) {
         let repo = self.repo.clone();
         let commit_area = self.commit_area.clone();
-        cx.spawn(async move |_panel_weak, cx| {
+        cx.spawn(async move |panel_weak, cx| {
             let result = repo.switch_branch(&name).await;
+            let switched = result.is_ok();
             commit_area.update(cx, |area, cx| {
                 write_branch_op_status(area, "switch", &name, result, cx);
             });
+            if switched {
+                let _ = panel_weak.update(cx, |panel, cx| panel.refresh_after_branch_change(cx));
+            }
         })
         .detach();
     }

@@ -19,7 +19,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::ui::FloatingSurface;
+use crate::ui::{FloatingSurface, MenuRow, separator};
 
 use crate::shell::source_control::commit_area::CommitArea;
 use crate::shell::source_control::commit_ops::{CommitVerb, run_commit_verb};
@@ -27,7 +27,6 @@ use crate::shell::source_control::commit_ops::{CommitVerb, run_commit_verb};
 /// Width of the dropdown card. Matches `FileTreeContextMenu::MENU_WIDTH`
 /// so the visual weight reads consistently across the cockpit.
 pub const MENU_WIDTH: f32 = 200.0;
-const ROW_PADDING_X: f32 = 10.0;
 
 /// State of the open menu — owned by `WorkspaceRoot`. `commit_area` is a
 /// weak handle so the menu can survive panel rebuilds (the source
@@ -122,13 +121,15 @@ impl Render for CommitContextMenu {
         //   click and dispatch.
         let pick_sha = full_sha.clone();
         let pick_area = commit_area.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "sc-commit-ctx-cherry-pick",
             "Cherry-pick",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(ref area) = pick_area
                     && let Some(strong) = area.upgrade()
@@ -143,13 +144,15 @@ impl Render for CommitContextMenu {
         ));
         let revert_sha = full_sha.clone();
         let revert_area = commit_area.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "sc-commit-ctx-revert",
             "Revert",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if let Some(ref area) = revert_area
                     && let Some(strong) = area.upgrade()
@@ -168,26 +171,30 @@ impl Render for CommitContextMenu {
         //   `git rev-parse HEAD` returns); short SHA second (matches
         //   `git log --oneline` and the row's own SHA column).
         let copy_full = full_sha.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "sc-commit-ctx-copy-sha",
             "Copy SHA",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy_full.clone()));
                 this.close(cx);
             }),
         ));
         let copy_short = short_sha.clone();
-        card = card.child(menu_row(
+        card = card.child(MenuRow::new(
             "sc-commit-ctx-copy-short-sha",
             "Copy short SHA",
-            true,
             theme,
             density,
             typography.clone(),
+            )
+            .enabled(true)
+            .build(
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy_short.clone()));
                 this.close(cx);
@@ -229,49 +236,6 @@ impl Render for CommitContextMenu {
             .child(card_container)
             .into_any_element()
     }
-}
-
-/// Single menu row. Matches `FileTreeContextMenu::menu_row`'s shape so
-/// the two menus feel like one component family at glance.
-fn menu_row<H>(
-    row_id: &'static str,
-    label: &'static str,
-    enabled: bool,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    on_click: H,
-) -> impl IntoElement
-where
-    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-{
-    let fg = if enabled {
-        theme.fg_base
-    } else {
-        theme.fg_subtle
-    };
-    let mut row = div()
-        .id(row_id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(density.h_overlay_item))
-        .px(px(ROW_PADDING_X))
-        .rounded(px(density.r_xs))
-        .text_size(px(typography.t_body_md))
-        .text_color(fg)
-        .child(label);
-    if enabled {
-        row = row
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.hover_overlay))
-            .on_mouse_down(MouseButton::Left, on_click);
-    }
-    row
-}
-
-fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive)
 }
 
 #[cfg(test)]

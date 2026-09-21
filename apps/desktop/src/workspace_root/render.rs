@@ -33,6 +33,7 @@ impl Render for WorkspaceRoot {
             || self.file_tree_context_menu.read(cx).is_open()
             || self.git_row_context_menu.read(cx).is_open()
             || self.commit_context_menu.read(cx).is_open()
+            || self.stash_context_menu.read(cx).is_open()
             || self.terminal_context_menu.read(cx).is_open()
             || self.row_menu.read(cx).is_open()
             || self.project_menu.read(cx).is_open()
@@ -41,7 +42,9 @@ impl Render for WorkspaceRoot {
             || self.floating_terminal_visible
             || self.confirm_dialog.is_some()
             || self.rename_tab_dialog.is_some()
-            || self.push_stash_dialog.is_some();
+            || self.push_stash_dialog.is_some()
+            || self.branch_from_stash_dialog.is_some()
+            || self.rename_stash_dialog.is_some();
         cx.set_global(crate::shell::browser_view::WebviewSuppressed(panes_covered));
         let theme = self.theme;
         let density = self.density;
@@ -386,15 +389,18 @@ impl Render for WorkspaceRoot {
                     },
                 ),
             )
-            // Route commit-graph height-resize drag ticks. The handle lives
-            // at the graph section's top edge inside the SCM panel; like the
-            // sidebar/rail handles its move listener has to sit on this
+            // Route SCM section height-resize drag ticks. Both handles live
+            // at their section's top edge inside the SCM panel; like the
+            // sidebar/rail handles their move listeners have to sit on this
             // full-size row so the cursor stays inside the listener's bounds
-            // for the whole drag (and so it keeps firing while the cursor
-            // travels over the graph's own commit rows — a listener nested
-            // inside the SCM panel stops firing over child entities). The
-            // window height for the clamp ceiling comes off this row's live
-            // bounds. Reaches the graph through right_sidebar → source_control.
+            // for the whole drag (and so they keep firing while the cursor
+            // travels over the section's own rows — a listener nested inside
+            // the SCM panel stops firing over child entities). The window
+            // height for the clamp ceiling comes off this row's live bounds.
+            //
+            // Two listeners because GPUI selects a drag by PAYLOAD TYPE; they
+            // converge immediately on `apply_section_drag`, which is the one
+            // place that can see both sections at once.
             .on_drag_move::<crate::shell::source_control::graph::GraphResizePayload>(
                 cx.listener(
                     |this,
@@ -403,20 +409,27 @@ impl Render for WorkspaceRoot {
                     >,
                      _window,
                      cx| {
-                        let cursor_y = f32::from(ev.event.position.y);
-                        let window_height = f32::from(ev.bounds.size.height);
-                        let Some(sidebar) = this.right_sidebar.clone() else {
-                            return;
-                        };
-                        sidebar.update(cx, |s, cx| {
-                            if let Some(panel) = s.source_control.clone() {
-                                panel.update(cx, |p, cx| {
-                                    p.commit_graph.update(cx, |g, cx| {
-                                        g.apply_graph_drag(cursor_y, window_height, cx);
-                                    });
-                                });
-                            }
-                        });
+                        this.apply_scm_section_drag(
+                            crate::shell::source_control::sections::ScmSection::Graph,
+                            f32::from(ev.event.position.y),
+                            f32::from(ev.bounds.size.height),
+                            cx,
+                        );
+                    },
+                ),
+            )
+            .on_drag_move::<crate::shell::stash_panel::resize::StashResizePayload>(
+                cx.listener(
+                    |this,
+                     ev: &DragMoveEvent<crate::shell::stash_panel::resize::StashResizePayload>,
+                     _window,
+                     cx| {
+                        this.apply_scm_section_drag(
+                            crate::shell::source_control::sections::ScmSection::Stash,
+                            f32::from(ev.event.position.y),
+                            f32::from(ev.bounds.size.height),
+                            cx,
+                        );
                     },
                 ),
             )
@@ -1292,6 +1305,7 @@ impl Render for WorkspaceRoot {
                     this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                     this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                     this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.stash_context_menu.update(cx, |m, cx| m.close(cx));
                     this.terminal_context_menu.update(cx, |m, cx| {
                         m.open(x, y, view, group_id, tab_idx, has_selection, link, cx)
                     });
@@ -1412,6 +1426,9 @@ impl Render for WorkspaceRoot {
                     this.tab_context_menu.update(cx, |m, cx| m.close(cx));
                     this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                     this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
+                    // The stash menu is the closest peer — same panel, one
+                    // right-click apart.
+                    this.stash_context_menu.update(cx, |m, cx| m.close(cx));
 
                     // Resolve the active source-control panel's
                     // CommitArea weak handle. Bail silently if the
@@ -1437,6 +1454,54 @@ impl Render for WorkspaceRoot {
                             commit_area_weak,
                             cx,
                         );
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &OpenStashContextMenuAt, _window, cx| {
+                    // Stash-section right-click — one action for both shapes,
+                    // told apart by `file_path`. Close peer overlays first so
+                    // the menu z-band stays single-occupancy.
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+
+                    // Weak, so a menu still open across a workspace switch
+                    // dismisses instead of firing ops into a torn-down panel.
+                    let Some(panel) = this
+                        .right_sidebar
+                        .as_ref()
+                        .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+                        .map(|sc| sc.read(cx).stash_panel.downgrade())
+                    else {
+                        return;
+                    };
+
+                    let target = match &action.file_path {
+                        Some(path) => StashContextTarget::File {
+                            sha: action.sha.clone(),
+                            path: std::path::PathBuf::from(path),
+                            // Decides whether Restore is offered at all; the
+                            // row that painted the file is the only side that
+                            // knows. See the action's own field note.
+                            untracked: action.file_untracked,
+                        },
+                        // The whole `DropStashRequested` payload, so the menu's
+                        // Drop item emits exactly what the row's does and both
+                        // reach the same confirm dialog.
+                        None => StashContextTarget::Stash(DropStashRequested {
+                            stash_ref: oximux_core::StashRef { index: action.index },
+                            sha: action.sha.clone(),
+                            message: action.message.clone(),
+                            relative: action.relative.clone(),
+                            branch: action.branch.clone(),
+                        }),
+                    };
+                    this.stash_context_menu.update(cx, |m, cx| {
+                        m.open(action.x, action.y, target, panel, cx);
                     });
                 },
             ))
@@ -1807,6 +1872,7 @@ impl Render for WorkspaceRoot {
                     || this.file_tree_context_menu.read(cx).is_open()
                     || this.git_row_context_menu.read(cx).is_open()
                     || this.commit_context_menu.read(cx).is_open()
+                    || this.stash_context_menu.read(cx).is_open()
                     || this.terminal_context_menu.read(cx).is_open()
                     || this.adapter_picker.read(cx).is_open()
                     || this.row_menu.read(cx).is_open()
@@ -1822,6 +1888,7 @@ impl Render for WorkspaceRoot {
                 this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                 this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+                this.stash_context_menu.update(cx, |m, cx| m.close(cx));
                 this.terminal_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.row_menu.update(cx, |m, cx| m.close(cx));
@@ -2126,6 +2193,10 @@ impl Render for WorkspaceRoot {
             // peer context menus; mutually exclusive via close-on-open
             // in OpenCommitContextMenuAt.
             .child(self.commit_context_menu.clone())
+            // Stash-section right-click menu (stash row + file row) — same
+            // z-band as the peer context menus; mutually exclusive via
+            // close-on-open in OpenStashContextMenuAt.
+            .child(self.stash_context_menu.clone())
             // Terminal grid right-click menu — same z-band as the peer
             // context menus; mutually exclusive via close-on-open in
             // OpenTerminalContextMenuAt.
@@ -2180,6 +2251,35 @@ impl Render for WorkspaceRoot {
             })
             // Push-stash form modal — same overlay pattern.
             .when_some(self.push_stash_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
+            // Branch-from-stash name modal — same overlay pattern. Its own
+            // slot, so it cannot replace a half-typed push form.
+            .when_some(self.branch_from_stash_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
+            // Rename-stash message modal — third form, third slot.
+            .when_some(self.rename_stash_dialog.clone(), |parent, dialog| {
                 parent.child(
                     div()
                         .absolute()

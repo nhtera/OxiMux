@@ -91,6 +91,7 @@ use crate::actions::{
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     CreateWorktreeWorkspaceForActiveChat,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
+    OpenStashContextMenuAt,
     NewBrowserTab, NewTab, OpenChatSession, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, RestartToUpdate, ShowWelcomeWizard,
     OpenTabContextMenuAt, OpenTerminalContextMenuAt, ResumeAgentSession,
@@ -112,7 +113,7 @@ use crate::shell::{
     confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
     git_panel::{
-        DiscardRequested, GitPanel, ShowCombinedDiffRequested,
+        DiscardRequested, GitPanel, ShowCombinedDiffRequested, StashSelectedRequested,
         row_context_menu::{GitRowContextMenu, GitRowContextTarget},
     },
     source_control::{
@@ -121,8 +122,17 @@ use crate::shell::{
         graph::ShowCommitRequested,
     },
     stash_panel::{
-        PushStashRequested, StashPanel,
-        push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
+        BranchFromStashRequested, DropStashRequested, PushStashRequested, RenameStashRequested,
+        RestoreStashFileRequested, ShowStashAllRequested, ShowStashFileRequested, StashPanel,
+        branch_dialog::{
+            BranchFromStashDialog, BranchFromStashPrompt, BranchNameCallback, suggest_branch_name,
+        },
+        context_menu::{StashContextMenu, StashContextTarget},
+        ops::OnOpSuccess,
+        push_dialog::{
+            CancelCallback, PushCallback, PushStashDialog, PushStashPrompt, PushStashScope,
+        },
+        rename_dialog::{RenameStashDialog, RenameStashPrompt, StashMessageCallback},
     },
     left_rail::{
         LeftRail,
@@ -256,6 +266,14 @@ pub struct WorkspaceRoot {
     /// Cherry-pick / Revert dispatches route through the existing
     /// single-flight `in_flight` flag.
     pub(crate) commit_context_menu: Entity<CommitContextMenu>,
+    /// Right-click context menu for the stash section — a stash row (Apply /
+    /// Pop / Apply with index / Copy / Drop) or a file row inside an expanded
+    /// one (Open Changes / Copy Relative Path). Same shared-entity z-band as
+    /// `commit_context_menu`; mutually exclusive via close-on-open in the
+    /// `OpenStashContextMenuAt` handler. Holds a weak handle to the active
+    /// `StashPanel`, which is also what makes the row's hover-only action
+    /// cluster safe: this is the non-hover path to every verb.
+    pub(crate) stash_context_menu: Entity<StashContextMenu>,
     /// Right-click context menu for the terminal GRID (Copy / Paste / Select
     /// All / Clear / link / send-to-agent / split / tab ops). Same shared-
     /// entity z-band + click-outside dismiss as the other context menus; holds
@@ -389,6 +407,48 @@ pub struct WorkspaceRoot {
     /// lifetime contract as `_discard_subscription` — dropping it
     /// silently disables the `+` push affordance in the stash section.
     pub(crate) _push_stash_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::DropStashRequested`. Same
+    /// lifetime contract as `_discard_subscription` — dropping it silently
+    /// disables every row's Drop button, which is exactly the defect this
+    /// event replaced a flag to fix.
+    pub(crate) _drop_stash_subscription: Option<Subscription>,
+    /// Long-lived subscription on `GitPanel::StashSelectedRequested` — the
+    /// CHANGES panel asking for a partial stash. Same lifetime contract as
+    /// `_discard_subscription`.
+    pub(crate) _stash_selection_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::ShowStashFileRequested`.
+    /// Fired when the user clicks a file inside an expanded stash row; the
+    /// handler opens a read-only diff tab for that file. Same lifetime
+    /// contract as `_drop_stash_subscription`.
+    pub(crate) _show_stash_file_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::ShowStashAllRequested` — the
+    /// `Open All Changes` verb. Same lifetime contract as
+    /// `_show_stash_file_subscription`.
+    pub(crate) _show_stash_all_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::BranchFromStashRequested`.
+    /// Dropping it silently disables `Branch from Stash…`.
+    pub(crate) _branch_from_stash_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::RestoreStashFileRequested`.
+    /// Dropping it silently disables `Restore This File…`.
+    pub(crate) _restore_stash_file_subscription: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::RenameStashRequested`.
+    /// Dropping it silently disables `Rename…`.
+    pub(crate) _rename_stash_subscription: Option<Subscription>,
+    /// Active rename-stash message modal (per-request; `None` when idle). Its
+    /// own slot for the same reason as the branch form: three different forms
+    /// sharing one slot means one silently replaces a half-typed other.
+    pub(crate) rename_stash_dialog: Option<Entity<RenameStashDialog>>,
+    /// Per-mount observer on the active `RenameStashDialog`. Same lifecycle
+    /// pattern as `_push_stash_dialog_observer`.
+    pub(crate) _rename_stash_dialog_observer: Option<Subscription>,
+    /// Active branch-from-stash name modal (per-request; `None` when idle).
+    /// Its own slot rather than sharing `push_stash_dialog`: the two are
+    /// different forms, and a shared slot would let one silently replace a
+    /// half-typed other.
+    pub(crate) branch_from_stash_dialog: Option<Entity<BranchFromStashDialog>>,
+    /// Per-mount observer on the active `BranchFromStashDialog`. Same
+    /// lifecycle pattern as `_push_stash_dialog_observer`.
+    pub(crate) _branch_from_stash_dialog_observer: Option<Subscription>,
     /// Active push-stash form modal (per-request; `None` when idle).
     /// Wired alongside `confirm_dialog` but kept in its own slot so
     /// the type-to-confirm flow stays separable from this creation
@@ -747,6 +807,8 @@ impl WorkspaceRoot {
             cx.new(|_| GitRowContextMenu::new(theme, density, typography.clone()));
         let commit_context_menu =
             cx.new(|_| CommitContextMenu::new(theme, density, typography.clone()));
+        let stash_context_menu =
+            cx.new(|_| StashContextMenu::new(theme, density, typography.clone()));
         let terminal_context_menu =
             cx.new(|_| TerminalContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
@@ -1328,6 +1390,7 @@ impl WorkspaceRoot {
             file_tree_context_menu,
             git_row_context_menu,
             commit_context_menu,
+            stash_context_menu,
             terminal_context_menu,
             adapter_picker,
             cli_runtime,
@@ -1341,6 +1404,17 @@ impl WorkspaceRoot {
             _discard_subscription: None,
             _discard_dialog_observer: None,
             _push_stash_subscription: None,
+            _drop_stash_subscription: None,
+            _stash_selection_subscription: None,
+            _show_stash_file_subscription: None,
+            _show_stash_all_subscription: None,
+            _branch_from_stash_subscription: None,
+            _restore_stash_file_subscription: None,
+            branch_from_stash_dialog: None,
+            _branch_from_stash_dialog_observer: None,
+            _rename_stash_subscription: None,
+            rename_stash_dialog: None,
+            _rename_stash_dialog_observer: None,
             _show_branch_file_subscription: None,
             _show_combined_diff_subscription: None,
             _show_branch_diff_all_subscription: None,
@@ -1652,3 +1726,4 @@ mod tests {
 
 mod ops;
 mod render;
+mod stash_dialogs;

@@ -131,7 +131,7 @@ confining it to its own conversation instead of the operator's full scope.
 
 | File / folder | Holds |
 |---|---|
-| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`) |
+| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`, plus `stash_dialogs` for the stash section's modals) |
 | `project_panes_factory.rs` | manifest save/load, pane-buffer load, attach-reconcile |
 | `actions.rs` / `state.rs` / `left_rail_layout.rs` | GPUI actions, app state, rail layout |
 | `agent_glue/` | app-side agent wiring (bridges `oximux-agents` ↔ views) |
@@ -242,6 +242,21 @@ Blink suppression: unfocused `TerminalView` entities gate `cx.notify()` on `view
 GitPanel (GPUI entity)
   ← subscription on StatusPoller updates
   ← renders: staged / unstaged / untracked sections
+  → StashSelectedRequested { paths, needs_untracked, rename_pairs,
+                             untracked_count }
+      built by stash_selection::plan_stash_selection from the live GitState:
+        · a selected path absent from GitState is dropped (a pathspec git
+          does not know fails the WHOLE push, not just that path)
+        · a STAGED rename contributes its original path too, plus a pair to
+          unstage first — after `git mv`, the original is in HEAD alone and
+          no pathspec can reach it
+        · -u is forced by any untracked path OR any rename (whose target is
+          untracked once unstaged); without it git refuses the pathspec and
+          stashes nothing at all
+        · refused above ARGV_BUDGET_BYTES — a stash is one commit, so the
+          argv cannot be chunked the way stage/unstage can
+      → host mounts the push dialog scoped to those paths, then runs the op
+        on StashPanel so the stash list refreshes as part of it
 
 DiffView (GPUI entity)
   ← DiffView::load(path, staged, cx)
@@ -258,8 +273,248 @@ ConfirmDialog (GPUI entity)
   ← optional secondary action for three-way prompts (Save / Discard / Cancel)
 
 StashPanel (GPUI entity)
-  ← refresh() → git stash list
-  ← apply/pop/request_drop → git stash ops
+  ← refresh() / force_refresh() → git stash list (15 s read-TTL)
+  ← apply/pop → git stash ops, each resolving its target by sha
+                (painted stash@{N} passed as a tiebreaker: a sha is not
+                 unique on the stack)
+  ← toggle_expanded(sha) → git stash files, cached per sha until refresh
+  → DropStashRequested → host confirm dialog → drop_confirmed()
+  → ShowStashFileRequested → PaneGroupTabKind::StashFile { sha, path }
+                             Tracked   → range <sha>^..<sha>
+                             Untracked → <sha>^3 with NO base (diff_in_rev)
+  ← row action cluster is hidden until hover; the guaranteed path to every
+    verb is the right-click menu, which is why the two shipped together
+    Five glyphs, in the reference cockpit's order: Apply / Pop / Open All
+    Changes / Rename… / Drop. Apply and Pop are one glyph with one
+    difference — a lidded box with its contents rising out, and the same box
+    with its far wall replaced by an × — because that is the only difference
+    between the verbs. The cluster is absolutely positioned, so a glyph costs
+    coverage of the metadata on hover, never a verb pushed off a 220px panel;
+    Branch from Stash stays menu-only because it asks for a name AND consumes
+    the stash, which no one-glyph control should start
+  ← push_paths(msg, -u, paths, rename_pairs, on_success) — the partial stash
+    fired from GitPanel. Runs HERE, not there, so the stash list refresh is
+    part of the op. Sequence: unstage_paths(rename_pairs) → stash_push, and
+    on failure stage_paths(rename_pairs) to put the staging back before the
+    error is toasted. on_success is deferred (the cross-entity hop out of a
+    leased entity) and only clears the file list's selection when the push
+    actually succeeded.
+  → ShowStashAllRequested → PaneGroupTabKind::StashAll { sha }
+                            DiffView::load_stash → repo.stash_all_files(sha)
+                            = commit_files(sha) ++ commit_files(sha^3)
+                            commit_files alone is --first-parent and drops the
+                            untracked half; it is composed, never modified,
+                            because it also serves every commit-detail tab
+  → BranchFromStashRequested → host name dialog → branch_from_stash()
+      is_valid_branch_name (git check-ref-format --branch, read-only) runs
+      FIRST, so a bad name never reaches a mutating call. On success
+      git stash branch CONSUMES the stash and restores the staged/unstaged
+      split (it applies with --index; the new branch is at the stash's base,
+      so there is never an index to conflict with). On failure the branch may
+      ALREADY exist and be checked out, which is why the host hook is
+      on_done, not on_success — see OpHooks in stash_panel/ops.rs.
+  ← apply_file(sha, path) → repo.stash_apply_file — ONE file out of a stash,
+      as a patch. No confirm dialog and no event: plain `git apply` writes the
+      whole patch or nothing at all, so there is no outcome to warn about.
+      Worktree only, index untouched (the toast says "unstaged"), stash kept.
+      Patch = git show --format= --binary --no-renames [--first-parent] <rev>
+      -- :(literal)<path>, where rev is <sha> for a tracked file and <sha>^3
+      for an untracked one — so this reaches the untracked rows restore cannot.
+      NOT --3way: it would succeed more often but writes conflict markers into
+      the file on a real conflict, which is the outcome this verb exists to
+      avoid. --no-renames so the patch touches only the path the row named;
+      with detection on, a rename would also DELETE the old path. An empty
+      patch is an explicit error — `git apply` exits 0 on empty input, so the
+      "nothing happened" case would otherwise toast success
+  → RestoreStashFileRequested → host confirm dialog → restore_file_confirmed()
+      git checkout <sha> -- <path> via run_pathspec_op (a bare pathspec makes
+      restoring a[1].rs also overwrite a1.rs). Writes the INDEX as well as the
+      worktree, so the dialog says "and staged". Tracked files only —
+      untracked ones live in ^3, not in the stash commit's tree, and the
+      checkout can only fail; the panel refuses to emit for them and the menu
+      omits the item.
+  → RenameStashRequested { sha, painted, message, depth } → host message
+      dialog → rename_confirmed()
+      Git has NO `stash rename`. Repository::stash_rename composes one out of
+      drop + store: everything from the top down to and including the target
+      comes off, the target is re-stored under its new message, and the rest
+      go back in reverse order. Same shas, same positions, same dates —
+      `store` writes a reflog pointer, never a commit. `depth` is how many
+      entries above the target get taken off and put back, and the dialog's
+      copy names the number rather than hedging.
+      The target is chosen with the SAME tiebreaker every other op uses: the
+      painted address when it still holds that sha, else the first match.
+      `rename_confirmed` resolves the row first and hands the ANSWER down.
+      Not decoration — `git stash store` duplicates a sha that is on the
+      stack but not on top (it is a no-op only for `stash@{0}`), so two rows
+      can share one commit, and picking the first match renamed a row the
+      user never clicked while reporting success. Found in review of #28.
+      Four properties that are not optional:
+        · the FULL recovery sequence is tracing::warn!-ed BEFORE the first
+          drop (sha per line; the message is a structured field, never
+          interpolated into a fake command line — it legally holds quotes
+          and `$`)
+        · step 3 re-resolves the index BY SHA on every iteration, so a
+          `git stash push` landing mid-loop from a terminal or a sibling
+          worktree SURVIVES. It is reordered (it settles below the restored
+          entries), not deleted. Documented, not eliminated — there is no
+          lock around a 2N+2-subprocess sequence
+        · a failed `store` in step 5 is recorded and the loop CONTINUES;
+          aborting there would strand the entries below the failure too.
+          The op reports that as a Warning toast, not a success
+      The `.git/logs/refs/stash` rewrite was considered and rejected: no
+      refs/stash.lock, wrong path in a linked worktree (--git-common-dir),
+      absent under git 2.45+'s reftable backend, hostile to the Windows port.
+
+StashPanel keyboard cursor (stash_panel/keyboard.rs)
+  ← cursor: Option<StashCursor> — PANEL state, keyed by sha, never focus
+    state: Cmd+Backspace opens a dialog that takes focus away, and a
+    focus-backed cursor would be gone by the time Escape came back.
+    Cleared only when the row it names leaves the stack (falls back to the
+    first row, so the keyboard path does not die with a dropped stash).
+  ← visible_rows() derives the walk from list + expansion + file cache +
+    collapsed folders on demand; folder rows are NOT cursor targets
+  ← painted_index() is a SECOND walk that counts folder rows and the one-line
+    loading/failed/empty notes too, because those occupy vertical space. It
+    feeds scroll_cursor_into_view(), without which the arrow keys are unusable
+    past the first screenful — the body is bounded, so the cursor simply walks
+    off the bottom. Arithmetic, not ScrollHandle::scroll_to_item (that sees
+    only the container's direct children — one wrapper column here), and exact
+    only because EVERY row this body paints is density.h_row tall
+  ← ↑/↓ move (clamped, never wrapping) · → expand · ← collapse, or climb
+    from a file row to its stash · Enter opens the diff / toggles ·
+    Cmd+Backspace emits DropStashRequested — the same confirm gate
+  ← bindings are CONTEXT-SCOPED (key_context "StashPanel"), installed from
+    keybindings_settings::install alongside the terminal's and the session
+    history modal's. NOT registry entries: keymap_registry builds every
+    binding with no context, so a registry row for bare `up` would shadow
+    the arrow keys application-wide. Cost: these five are not rebindable
+    from the settings pane. Keymap actions rather than on_key_down because
+    macOS delivers Cmd-modified keys via performKeyEquivalent:, which
+    bypasses element key listeners.
+  ← a left-click on a row also sets the cursor; the list takes focus on a
+    DEFERRED window.focus from the scroll body's mouse-down (sync focus inside
+    a mouse handler is clobbered)
+  ← OPENING A DIFF HANDS FOCUS TO THE TAB, so the arrow keys go quiet until
+    the panel is focused again. Intended (it is what opening a tab means
+    everywhere), but it looks exactly like a broken binding from the outside —
+    `↑` "works" from a stash row and "fails" from a file row purely because
+    the file row just opened a tab
+  ← the context + the focus handle sit on the LIST element, not on the
+    section container: the keyboard resize rail is a focusable sibling whose
+    own on_key_down owns Arrow/Shift+Arrow/Home/End, and a shared parent
+    context would have one arrow keystroke matching a cursor binding AND
+    reaching the rail
+
+StashPanel list/tree layout (stash_panel/tree_view.rs)
+  ← header toggle, list-tree.svg ⇄ list-collapse.svg, same pair and wording
+    as the CHANGES toolbar
+  ← persisted GLOBALLY (scm_layout_settings::KEY_SCM_STASH_VIEW_MODE), not
+    in the per-worktree V006 row: refs/stash lives in the git common dir, so
+    every worktree shows one stack and a per-worktree key would paint it two
+    different ways in sibling windows
+  ← a SHIM maps StashFile → FileStatus and reuses TreeSection::Staged, which
+    is being used as a carrier for "read the index column". No
+    TreeSection::Stash variant — the three existing ones are claims about
+    the index, and a stash has no index to be on one side of
+  ← collapsed folders are per-sha (two stashes can both hold src/) and
+    survive a flat⇄tree round trip; adopt_list drops them with the file
+    cache they were derived from
+
+oximux_ui::menu — MenuRow + separator + ROW_PADDING_X
+  ← ONE row builder for every context menu (stash, commit, tab, terminal,
+    file tree, git-panel row). They painted identically — same height,
+    padding, radius, type size, hover — but had drifted into four call
+    shapes: explicit `fg` for a destructive tint, `enabled`-derived fg, a
+    trailing shortcut column, and `impl Into<SharedString>` labels
+  ← builder, so a caller asks only for what it varies: .fg() .shortcut()
+    .enabled(), then .build(handler). Handler is mouse-DOWN, not click — an
+    overlay that closes on outside-mouse-down would race its items on mouse-up
+  ← SHORTCUT_GAP is a literal 12.0, NOT density.gap_inline (6.0): that is what
+    the terminal menu used, and a refactor must not move pixels
+  ← ROW_PADDING_X was a private const in THIRTEEN files, all 10.0
+  ← the menu CARD stays per-menu — width, cursor/chip anchoring, scrim and
+    close-on-outside-click genuinely differ
+  ← NOT folded in: status_bar's divider (takes typography), the schedules
+    dropdown row (carries selected state), branch_picker's separator_row
+    (returns AnyElement). They look alike and are not
+
+stash_panel/form.rs — the three stash modals' shared chrome
+  ← PIECES, not a body builder: form_card / form_title / form_subtitle /
+    form_field_label / form_note / form_buttons. The push form's body carries
+    a dynamic title, a path list, a checkbox with forced-and-disabled logic
+    and a conditional note, so a fixed-order builder would have been forked
+    immediately. Each dialog writes its own body
+  ← form_subtitle is fg_muted, form_note is fg_subtle, and the split is
+    load-bearing: a subtitle names the SUBJECT and must read at a glance, a
+    note explains the CONSEQUENCE and should recede
+  ← confirm_disabled is passed, not derived — true for branch/rename, false
+    for push (its message is optional), and each dialog's `try_confirm` has
+    to agree with what it passes
+
+StashContextMenu (GPUI entity, mounted on WorkspaceRoot)
+  ← OpenStashContextMenuAt { x, y, sha, index, message, relative, branch,
+                             file_path, file_untracked }
+      file_path == None → the stash row, in three groups:
+        ways back — Apply / Pop / Apply with index (git stash apply --index,
+          restores the staged split from the stash commit's ^2) /
+          Branch from Stash… (an apply that also names a branch, and the only
+          one that consumes the stash) → emits BranchFromStashRequested
+          Rename… (a mutation of the whole prefix of the stack, so it sits
+          with the mutations) → emits RenameStashRequested
+        read-only — Open All Changes · Copy Message / Copy SHA
+        Drop… → emits DropStashRequested, the same confirm gate the row uses
+      file_path == Some → a file inside an expanded stash:
+        Apply Changes (fires at once — see apply_file) · Open Changes (panel
+        resolves StashFileOrigin from its own cache) · Copy Relative Path ·
+        Restore This File… (absent when file_untracked; origin has to travel
+        in the payload because the menu decides at RENDER time, and only the
+        row that painted the file knows)
+        Apply and Restore are both "bring this file back" and are deliberately
+        two items at opposite ends of the menu: apply merges and refuses
+        rather than overwrite, restore overwrites and stages. The rule and the
+        destructive tint between them are the difference being chosen
+  ← WeakEntity<StashPanel>; dismisses silently after a workspace switch
+  ← an item that could only fail is omitted, never disabled
+
+SourceControlPanel::refresh_graph_if_head_moved (picker_wiring.rs)
+  ← called from the poll observer on EVERY tick, before git_state is replaced
+  ← the other half of refresh_after_branch_change: that one covers the HEAD
+    movers the panel performs itself, this one covers every mover it does not —
+    a commit, amend, reset, rebase or checkout from the user's terminal or a
+    sibling worktree. Those fire nothing in the app, so the graph kept painting
+    history that no longer had HEAD at its tip
+  ← free: GitState already carries head_oid and the poller already delivers it,
+    so this is a comparison, not a query. Self-heals within one tick
+  ← `head_oid_seen` distinguishes "HEAD is genuinely None" (a repo with no
+    commit) from "we have not looked yet", so boot is not read as a move
+  ← ONLY the graph reloads. PR/CI is left alone — HEAD moving on the same
+    branch does not invalidate its PR, and dropping it would make every
+    terminal commit re-spend the forge round-trip
+
+SourceControlPanel state observer (source_control/state_observer.rs)
+  ← everything that happens BECAUSE a poll arrived, in order: graph-if-HEAD-
+    moved, git_state, the commit area's staged snapshot, the rebase base, the
+    in-progress-op banner, and (throttled) forge PR/CI
+  ← split out of mod.rs, which sits on the file-size warn line and had already
+    been trimmed once for it (Phase 8 moved set_poller + refresh_after_branch_
+    change to picker_wiring.rs)
+
+SourceControlPanel::refresh_after_branch_change (picker_wiring.rs)
+  ← called by switch_to_branch AND by the branch-from-stash on_done hook
+  ← commit_graph.refresh() — the one thing the StatusPoller never covered.
+    The branch name, the file list and "Committed on Branch" all arrive on
+    the poll channel and self-heal in one 500 ms tick; the graph's only other
+    refresh sites are a completed commit op and the two manual buttons, so it
+    kept painting the previous branch's history indefinitely. Pre-existing
+    gap, found while wiring branch-from-stash, fixed for both callers.
+  ← PR/CI state dropped (it belongs to the branch just left) + poller.kick()
+
+SourceControlPanel::sections (the stash section + the graph)
+  ← both heights persisted separately; fit_sections() splits one budget
+  ← sync_section_budget() on every render — the only place that sees both
+  ← each section frame is flex_shrink + min_h, so neither can be pushed
+    out of the column whatever the chrome above costs
 
 WorktreePanel (GPUI entity)
   ← refresh() → git worktree list
