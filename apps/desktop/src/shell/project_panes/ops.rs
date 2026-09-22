@@ -993,25 +993,6 @@ impl ProjectPanes {
         });
     }
 
-    /// Arm (`true`) or disarm the status watcher of the restored agent tab
-    /// holding `session` — see `PaneGroup::set_agent_status_watch`.
-    pub fn set_restored_agent_status_watch(
-        &mut self,
-        target_group: Option<PaneGroupId>,
-        session: AgentSessionId,
-        armed: bool,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let group = match target_group {
-            Some(id) => self.groups.get(&id).cloned(),
-            None => self.active_group(),
-        };
-        let Some(group) = group else {
-            return false;
-        };
-        group.update(cx, |g, cx| g.set_agent_status_watch(session, armed, cx))
-    }
-
     /// The cockpit resume fallback: swap the CLI session behind the restored
     /// agent tab holding `old` (in `target_group`, or the active group for a
     /// legacy single-group restore) for the fresh session `new`. Returns

@@ -23,59 +23,6 @@ impl PaneGroup {
         }
     }
 
-    /// Arm or disarm the status watcher of the agent tab holding `session`.
-    /// A cold-restored tab spawned on a resumed conversation is mounted with
-    /// its watcher disarmed for the 5 s verdict window: a CLI that rejects the
-    /// id exits failed, and the watcher would toast "failed" and post an OS
-    /// banner a beat before the fallback swaps a fresh session in. Re-armed
-    /// once the resume is known to have taken; the swap arms its own. The tab
-    /// chip reads the status stream directly, so the badge stays live either
-    /// way. Returns `false` when no tab holds `session`.
-    pub(crate) fn set_agent_status_watch(
-        &mut self,
-        session: AgentSessionId,
-        armed: bool,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(idx) = self.tabs.iter().position(|t| {
-            matches!(&t.kind, PaneGroupTabKind::Agent { session_id, .. } if *session_id == session)
-        }) else {
-            return false;
-        };
-        let notifier = self.notifier.clone();
-        let window_active = self.window_active.clone();
-        let tab = &mut self.tabs[idx];
-        if !armed {
-            tab._status_task = None;
-            return true;
-        }
-        let PaneGroupTabKind::Agent {
-            status_rx,
-            worktree_path,
-            ..
-        } = &tab.kind
-        else {
-            return false;
-        };
-        let PaneContent::Terminal(tree) = &tab.content else {
-            return false;
-        };
-        let Some(view) = tree.active_view() else {
-            return false;
-        };
-        tab._status_task = Some(spawn_status_task(
-            status_rx.clone(),
-            notifier,
-            window_active,
-            TabId::from(session),
-            tab.label.clone(),
-            worktree_path.to_string_lossy().into_owned(),
-            view.downgrade(),
-            cx,
-        ));
-        true
-    }
-
     /// Swap the CLI session behind the agent tab holding `old` for `new`: the
     /// resume fallback, when a restored tab's CLI rejected the persisted
     /// conversation id and a fresh CLI was spawned in its place. The tab keeps
@@ -127,8 +74,9 @@ impl PaneGroup {
         let workspace_key = worktree_path.to_string_lossy().into_owned();
         let label = tab.label.clone();
         let weak_view = view.downgrade();
-        // Dropping the old task ends the watcher on the rejected session's
-        // stream; the new one carries the tab's badge and notifications.
+        // The restore path hands the same proxy stream back (see
+        // `restore_agent_tab`); respawning the watcher re-keys its toasts and
+        // banners to the fresh session's tab id.
         tab._status_task = Some(spawn_status_task(
             new_status_rx,
             notifier,

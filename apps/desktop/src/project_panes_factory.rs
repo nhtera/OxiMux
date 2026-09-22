@@ -906,11 +906,17 @@ fn restore_agent_tab(
         // Re-adopt the pre-restart agent_sessions row (the boot sweep marked it
         // Interrupted): `restoring = true` flips that same row back to live and
         // keeps its persisted title, instead of orphaning it and inserting a
-        // duplicate "Claude Code" row. On a cold RESUME this waits for the
-        // watchdog's verdict below: a rejected resume must not stamp its
-        // failed exit onto the claimed row, and the fresh session must claim
-        // that same row rather than insert a second one.
+        // duplicate "Claude Code" row. On a cold RESUME the claim waits for the
+        // watchdog's verdict (at most `ROW_CLAIM_GRACE`), so a quickly refused
+        // resume lets the fresh session claim the row directly.
         let cold_resume = !warm && attempted_resume;
+        // On a cold resume every reader — the tab, its watcher, the rail row —
+        // reads a proxy of the session's stream rather than the stream itself.
+        // The watchdog forwards into it and holds back only a refused resume's
+        // failed exit, so nothing ever shows the refusal as a failure, and the
+        // fallback carries on the same proxy with the fresh session.
+        let (proxy_tx, proxy_rx) = tokio::sync::watch::channel(status_rx.borrow().clone());
+        let tab_rx = if cold_resume { proxy_rx.clone() } else { status_rx.clone() };
         let claim_row = |root: &WeakEntity<WorkspaceRoot>,
                          cx: &mut AsyncWindowContext,
                          session_id: AgentSessionId,
@@ -941,6 +947,12 @@ fn restore_agent_tab(
                 RestoreMarker::StartedFresh
             })
         });
+        // Fetched before the mount so no early return below can leave a
+        // mounted tab reading a proxy nobody feeds.
+        let Ok(executor) = cx.update(|_, cx| cx.background_executor().clone()) else {
+            let _ = cli_runtime.cancel(session_id).await;
+            return;
+        };
         let mount = panes.update_in(cx, |p, window, cx| {
             match target_group {
             Some(group_id) => p.push_restored_agent_tab_in(
@@ -949,7 +961,7 @@ fn restore_agent_tab(
                 adapter_id,
                 label,
                 session_id,
-                status_rx.clone(),
+                tab_rx.clone(),
                 backend,
                 term_id,
                 meta,
@@ -962,7 +974,7 @@ fn restore_agent_tab(
                 adapter_id,
                 label,
                 session_id,
-                status_rx.clone(),
+                tab_rx.clone(),
                 backend,
                 term_id,
                 meta,
@@ -970,11 +982,6 @@ fn restore_agent_tab(
                 window,
                 cx,
             ),
-            }
-            // Muted for the verdict window: a rejected resume exits failed,
-            // and the watcher would toast it a beat before the fallback swap.
-            if cold_resume {
-                p.set_restored_agent_status_watch(target_group, session_id, false, cx);
             }
         });
         if mount.is_err() {
@@ -1000,17 +1007,36 @@ fn restore_agent_tab(
             return;
         }
         // Resume watchdog: a CLI handed an id it has no transcript for exits
-        // non-zero within a second or two. Respawn fresh exactly once under
-        // the honest marker; silence never triggers (decided in the plan).
-        let Ok(executor) = cx.update(|_, cx| cx.background_executor().clone()) else {
-            return;
+        // non-zero before it reports anything — within a second or two, or
+        // only once the user dismisses a startup menu the CLI painted first.
+        // Respawn fresh exactly once under the honest marker; silence never
+        // triggers (see `agent_resume::should_fallback`).
+        use crate::session_restore::agent_resume::{
+            ROW_CLAIM_GRACE, RESUME_VERDICT_CEILING, ResumeVerdict, forward, verdict_within,
         };
-        let rejected =
-            crate::session_restore::agent_resume::resume_rejected(&status_rx, &executor).await;
-        let (session_id, status_rx) = if rejected {
+        let mut inner = status_rx;
+        let mut claimed = false;
+        let mut verdict =
+            verdict_within(&mut inner, &proxy_tx, &executor, ROW_CLAIM_GRACE).await;
+        if verdict.is_none() {
+            claim_row(&root, cx, session_id, proxy_rx.clone());
+            claimed = true;
+            verdict = verdict_within(
+                &mut inner,
+                &proxy_tx,
+                &executor,
+                RESUME_VERDICT_CEILING - ROW_CLAIM_GRACE,
+            )
+            .await;
+        }
+        let rejected = matches!(verdict, Some(ResumeVerdict::Rejected(_)));
+        let session_id = if let Some(ResumeVerdict::Rejected(refusal)) = verdict {
             tracing::warn!(adapter = adapter_id, "agent restore: CLI rejected the persisted session; starting fresh");
             let _ = cli_runtime.cancel(session_id).await;
             let Some(fresh) = start_fresh_agent_session(&cli_runtime, fresh_cfg, adapter_id).await else {
+                // No fresh session to show instead: publish the refusal after
+                // all, so the tab and row read failed rather than frozen.
+                proxy_tx.send_replace(refusal);
                 return;
             };
             let (fresh_id, fresh_backend, fresh_term, fresh_rx) = fresh;
@@ -1019,7 +1045,7 @@ fn restore_agent_tab(
                     target_group,
                     session_id,
                     fresh_id,
-                    fresh_rx.clone(),
+                    proxy_rx.clone(),
                     fresh_backend,
                     fresh_term,
                     marker(RestoreMarker::StartedFresh),
@@ -1031,16 +1057,22 @@ fn restore_agent_tab(
                 let _ = cli_runtime.cancel(fresh_id).await;
                 return;
             }
-            (fresh_id, fresh_rx)
+            // A late refusal (behind a startup menu) lands after the row was
+            // claimed; point it at the fresh session so a rail click still
+            // finds the tab (parked if the claim has not registered yet).
+            if claimed {
+                let _ = root.update(cx, |this, cx| this.repoint_live_agent(session_id, fresh_id, cx));
+            }
+            inner = fresh_rx;
+            fresh_id
         } else {
-            // The resume took: arm the watcher that was muted at mount.
-            let _ = panes.update(cx, |p, cx| {
-                p.set_restored_agent_status_watch(target_group, session_id, true, cx)
-            });
-            (session_id, status_rx)
+            session_id
         };
-        claim_row(&root, cx, session_id, status_rx);
+        if !claimed {
+            claim_row(&root, cx, session_id, proxy_rx);
+        }
         tracing::info!(adapter = adapter_id, warm, resumed = !rejected, fallback = rejected, "agent restore");
+        forward(inner, &proxy_tx).await;
     })
     .detach();
 }

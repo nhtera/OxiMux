@@ -48,9 +48,12 @@ impl WorkspaceRoot {
     pub(crate) fn register_live_agent(
         &mut self,
         db_session_id: String,
-        entry: LiveAgentEntry,
+        mut entry: LiveAgentEntry,
         cx: &mut Context<Self>,
     ) {
+        if let Some(new) = self.live_agent_repoints.remove(&entry.session_id) {
+            entry.session_id = new;
+        }
         self.live_agents.insert(db_session_id, entry);
         self.mark_rail_dirty(cx);
     }
@@ -60,6 +63,30 @@ impl WorkspaceRoot {
     pub(crate) fn remove_live_agent(&mut self, db_session_id: &str, cx: &mut Context<Self>) {
         if self.live_agents.remove(db_session_id).is_some() {
             self.mark_rail_dirty(cx);
+        }
+    }
+
+    /// Point the live entry registered for runtime session `old` at `new`:
+    /// the resume fallback swapped a fresh CLI in behind a restored tab after
+    /// its rail row was claimed, and a rail click resolves the tab by runtime
+    /// session. The row itself (id, title, status stream) is unchanged. The
+    /// claim registers its entry only after two DB round-trips, so a fallback
+    /// can land first: the repoint is then parked for `register_live_agent`.
+    pub(crate) fn repoint_live_agent(
+        &mut self,
+        old: AgentSessionId,
+        new: AgentSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let mut moved = false;
+        for entry in self.live_agents.values_mut().filter(|e| e.session_id == old) {
+            entry.session_id = new;
+            moved = true;
+        }
+        if moved {
+            self.mark_rail_dirty(cx);
+        } else {
+            self.live_agent_repoints.insert(old, new);
         }
     }
 

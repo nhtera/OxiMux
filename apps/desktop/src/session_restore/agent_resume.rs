@@ -79,19 +79,28 @@ pub fn resume_shell_line(agent_label: &str, session_id: &str) -> Option<String> 
     })
 }
 
-/// How long after spawn a resumed CLI's failure still counts as "the resume
-/// was rejected" rather than "the agent ran and then died". A CLI handed an id
-/// it has no transcript for exits within a second or two; a genuine session
-/// that fails five seconds in is the user's to see, not ours to restart.
-pub const RESUME_FALLBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a resumed tab waits for its verdict before it claims its rail row
+/// anyway. A CLI handed an id it has no transcript for normally exits within a
+/// second or two, so the common rejection is settled before the row is ever
+/// claimed and the fresh session claims it directly; a later rejection repoints
+/// the claimed row instead (see `WorkspaceRoot::repoint_live_agent`).
+pub const ROW_CLAIM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// True when a status observed during the resume window means the CLI
-/// rejected the id, so the tab should respawn fresh — exactly once. Only a
-/// failed exit counts: a clean exit is the user quitting, and silence (a slow
-/// start, a CLI that errors but keeps running) never triggers, so a slow
-/// machine is never killed mid-start. The window is the watcher's, not this
-/// predicate's: a failure that happened early but was only noticed late (a
-/// stalled background timer) still counts, because the exit itself was early.
+/// How long a resumed CLI may stay silent before its exit stops counting as a
+/// rejection. The verdict normally settles on the first hook event; this
+/// ceiling only matters when no hook ever arrives (status hooks turned off), so
+/// that an hour-old session that crashes is shown as failed, not quietly
+/// replaced by a fresh one.
+pub const RESUME_VERDICT_CEILING: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+// The restore path waits `CEILING - GRACE` after the claim: it must not underflow.
+const _: () = assert!(RESUME_VERDICT_CEILING.as_secs() > ROW_CLAIM_GRACE.as_secs());
+
+/// True when a status observed before the resumed CLI has reported anything
+/// means it rejected the id, so the tab should respawn fresh — exactly once.
+/// Only a failed exit counts: a clean exit is the user quitting, and silence
+/// (a slow start, a CLI parked on its own startup prompt) never triggers, so a
+/// slow machine is never killed mid-start.
 pub fn should_fallback(status: &AgentStatus) -> bool {
     match status {
         AgentStatus::Failed(_) => true,
@@ -100,28 +109,80 @@ pub fn should_fallback(status: &AgentStatus) -> bool {
     }
 }
 
-/// Watch a freshly resumed session for a rejected id: `true` when a failed
-/// exit is observed before the watcher gives up (see [`should_fallback`]),
-/// `false` once the CLI is clearly running past [`RESUME_FALLBACK_WINDOW`],
-/// or exited in a way that is not a rejection. Polls the watch channel on a
-/// short timer rather than awaiting `changed()`, so the deadline needs no
-/// select and a channel that never changes (a CLI that prints nothing) still
-/// returns at the window. The failure check runs before the deadline check,
-/// so a timer that stalled past the window still acts on an early exit.
-pub async fn resume_rejected(
-    status_rx: &oximux_agents::AgentStatusStream,
-    executor: &gpui::BackgroundExecutor,
-) -> bool {
-    let started = std::time::Instant::now();
+/// True once a hook event proves the resumed CLI is past its startup: it
+/// reported a prompt, a tool, or a reply. Output alone never counts — a CLI
+/// can paint a startup menu (an update notice, a trust prompt) before it even
+/// looks at the id, and only rejects it once that menu is dismissed. The
+/// session id alone does not count either: a resumed session is seeded with
+/// the id it was spawned on, before any hook has fired.
+pub fn agent_has_reported(snapshot: &AgentSnapshot) -> bool {
+    snapshot.detail.as_ref().is_some_and(|d| {
+        d.prompt.is_some() || d.tool_name.is_some() || d.last_message.is_some()
+    })
+}
+
+/// How a resumed CLI's startup ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeVerdict {
+    /// It exited failed before reporting anything: the id was refused. Carries
+    /// the withheld exit, for the caller to publish if the fallback itself
+    /// cannot start — a failure must never be swallowed.
+    Rejected(AgentSnapshot),
+    /// It reported a hook event, or ended in a way that is not a rejection.
+    Settled,
+}
+
+/// Forward the resumed session's snapshots from `inner` to `proxy` until the
+/// verdict is known. The rejecting exit itself is never forwarded, so nothing
+/// reading `proxy` — the tab's watcher, the rail row — ever sees a refused
+/// resume as a failure; the fallback carries on the same proxy with the fresh
+/// session. Cancel-safe: the only await is `changed()`, and every pass
+/// re-sends the current value, so a dropped call resumes cleanly.
+pub async fn forward_until_verdict(
+    inner: &mut oximux_agents::AgentStatusStream,
+    proxy: &tokio::sync::watch::Sender<AgentSnapshot>,
+) -> ResumeVerdict {
     loop {
-        let status = status_rx.borrow().status.clone();
-        if should_fallback(&status) {
-            return true;
+        let snapshot = inner.borrow_and_update().clone();
+        if should_fallback(&snapshot.status) {
+            return ResumeVerdict::Rejected(snapshot);
         }
-        if status.is_terminal() || started.elapsed() >= RESUME_FALLBACK_WINDOW {
-            return false;
+        let settled = agent_has_reported(&snapshot) || snapshot.status.is_terminal();
+        proxy.send_replace(snapshot);
+        if settled || inner.changed().await.is_err() {
+            return ResumeVerdict::Settled;
         }
-        executor.timer(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// [`forward_until_verdict`] bounded by `limit`: `None` when it is still
+/// undecided at the deadline.
+pub async fn verdict_within(
+    inner: &mut oximux_agents::AgentStatusStream,
+    proxy: &tokio::sync::watch::Sender<AgentSnapshot>,
+    executor: &gpui::BackgroundExecutor,
+    limit: std::time::Duration,
+) -> Option<ResumeVerdict> {
+    let verdict = std::pin::pin!(forward_until_verdict(inner, proxy));
+    let deadline = std::pin::pin!(executor.timer(limit));
+    match futures::future::select(verdict, deadline).await {
+        futures::future::Either::Left((verdict, _)) => Some(verdict),
+        futures::future::Either::Right(_) => None,
+    }
+}
+
+/// Forward every snapshot from `inner` to `proxy` until the session's sender
+/// is gone. The proxy's own sender drops with the caller afterwards, which is
+/// what ends the readers' loops, exactly as the direct stream would have.
+pub async fn forward(
+    mut inner: oximux_agents::AgentStatusStream,
+    proxy: &tokio::sync::watch::Sender<AgentSnapshot>,
+) {
+    loop {
+        proxy.send_replace(inner.borrow_and_update().clone());
+        if inner.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -129,7 +190,6 @@ pub async fn resume_rejected(
 mod tests {
     use super::*;
     use oximux_core::SidebandDetail;
-    use std::time::Duration;
 
     const UUID: &str = "019f650c-a70a-77c4-8fa4-f81e6e6ad1f3";
 
@@ -219,6 +279,66 @@ mod tests {
         assert!(!should_fallback(&AgentStatus::Running));
         assert!(!should_fallback(&AgentStatus::Idle));
         assert!(!should_fallback(&AgentStatus::Interrupted));
-        assert!(RESUME_FALLBACK_WINDOW >= Duration::from_secs(5));
     }
+
+    fn reported(prompt: Option<&str>, tool: Option<&str>, message: Option<&str>) -> AgentSnapshot {
+        AgentSnapshot {
+            status: AgentStatus::Running,
+            detail: Some(SidebandDetail {
+                session_id: Some(UUID.into()),
+                prompt: prompt.map(str::to_owned),
+                tool_name: tool.map(str::to_owned),
+                last_message: message.map(str::to_owned),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn only_a_hook_event_counts_as_the_agent_reporting() {
+        assert!(agent_has_reported(&reported(Some("hi"), None, None)));
+        assert!(agent_has_reported(&reported(None, Some("Edit"), None)));
+        assert!(agent_has_reported(&reported(None, None, Some("done"))));
+        // The seeded id, or output with no detail at all, is not a report.
+        assert!(!agent_has_reported(&snap(Some(UUID))));
+        assert!(!agent_has_reported(&AgentSnapshot::from_status(AgentStatus::Running)));
+    }
+
+    #[test]
+    fn a_rejection_behind_a_startup_menu_is_caught_and_never_forwarded() {
+        // The CLI paints a menu (output, no hook), sits there, then exits
+        // failed once the menu is dismissed — however long that took.
+        let (tx, mut inner) = tokio::sync::watch::channel(snap(Some(UUID)));
+        let (proxy, proxy_rx) = tokio::sync::watch::channel(snap(Some(UUID)));
+        tx.send_replace(AgentSnapshot::from_status(AgentStatus::Running));
+        tx.send_replace(AgentSnapshot::from_status(AgentStatus::Failed("exit 1".into())));
+        let verdict = futures::executor::block_on(forward_until_verdict(&mut inner, &proxy));
+        assert!(matches!(verdict, ResumeVerdict::Rejected(ref s) if should_fallback(&s.status)));
+        assert!(!should_fallback(&proxy_rx.borrow().status), "the refusal must not reach readers");
+    }
+
+    #[test]
+    fn a_failed_exit_after_the_first_hook_is_the_users_to_see() {
+        let (tx, mut inner) = tokio::sync::watch::channel(reported(Some("hi"), None, None));
+        let (proxy, proxy_rx) = tokio::sync::watch::channel(snap(Some(UUID)));
+        let verdict = futures::executor::block_on(forward_until_verdict(&mut inner, &proxy));
+        assert_eq!(verdict, ResumeVerdict::Settled);
+        assert_eq!(proxy_rx.borrow().detail.as_ref().unwrap().prompt.as_deref(), Some("hi"));
+        // From here everything is forwarded, a failure included.
+        tx.send_replace(AgentSnapshot::from_status(AgentStatus::Failed("exit 1".into())));
+        drop(tx);
+        futures::executor::block_on(forward(inner, &proxy));
+        assert!(should_fallback(&proxy_rx.borrow().status));
+    }
+
+    #[test]
+    fn a_clean_exit_before_any_hook_settles_without_a_fallback() {
+        let (tx, mut inner) = tokio::sync::watch::channel(snap(Some(UUID)));
+        let (proxy, proxy_rx) = tokio::sync::watch::channel(snap(Some(UUID)));
+        tx.send_replace(AgentSnapshot::from_status(AgentStatus::Done { code: Some(0) }));
+        let verdict = futures::executor::block_on(forward_until_verdict(&mut inner, &proxy));
+        assert_eq!(verdict, ResumeVerdict::Settled);
+        assert_eq!(proxy_rx.borrow().status, AgentStatus::Done { code: Some(0) });
+    }
+
 }
