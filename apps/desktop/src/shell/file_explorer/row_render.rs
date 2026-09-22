@@ -27,20 +27,31 @@ pub struct RowPlan {
     /// Badge to display at the right edge: `(status, single-letter label)`.
     pub badge: Option<(BadgeStatus, &'static str)>,
     pub selected: bool,
-    /// `true` for `Ignored` entries — render italic + dim.
+    /// `true` for `Ignored` entries and everything beneath them — render
+    /// italic + dim.
     pub italic_dim: bool,
+    /// `true` only for the entry git itself named as ignored — it earns the
+    /// circle-slash glyph, the way a tracked entry earns a letter badge.
+    /// Descendants dim without repeating the mark on every row.
+    pub ignored_mark: bool,
 }
 
 /// Build the display plan for one tree row.
 ///
 /// `file_status` and `folder_status` are looked up from the status maps before
 /// calling here so this function stays pure and side-effect-free.
+///
+/// `under_ignored` is `true` when the row lives beneath a directory that git
+/// reported as ignored. `--ignored=matching` names such a directory once and
+/// leaves its children unreported, so the descendants carry no status of their
+/// own and would otherwise paint as tracked entries.
 pub fn build_row_plan(
     node: &TreeNode,
     expanded: bool,
     selected: bool,
     file_status: Option<BadgeStatus>,
     folder_status: Option<BadgeStatus>,
+    under_ignored: bool,
 ) -> RowPlan {
     let icon = if node.is_directory {
         if expanded {
@@ -53,14 +64,20 @@ pub fn build_row_plan(
     };
 
     // Pick the relevant status: folders use folder_status, files use file_status.
+    // A directory git named as ignored carries that verdict in the FILE map
+    // (it is one `!` record like any other path) and never in the folder map,
+    // which propagates only the statuses of tracked children. Falling back to
+    // it — for `Ignored` alone, so a per-file badge never leaks onto a folder
+    // — is what gives an ignored folder the same dim treatment as a file.
     let status = if node.is_directory {
-        folder_status
+        folder_status.or(file_status.filter(|s| *s == BadgeStatus::Ignored))
     } else {
         file_status
     };
 
     // M2: Ignored entries show italic+dim but NO badge label.
-    let italic_dim = matches!(status, Some(BadgeStatus::Ignored));
+    let ignored_mark = matches!(status, Some(BadgeStatus::Ignored));
+    let italic_dim = under_ignored || ignored_mark;
     let badge = match status {
         Some(s) if s != BadgeStatus::Ignored => Some((s, label_for(s))),
         _ => None,
@@ -74,6 +91,7 @@ pub fn build_row_plan(
         badge,
         selected,
         italic_dim,
+        ignored_mark,
     }
 }
 
@@ -106,7 +124,7 @@ mod tests {
     #[test]
     fn file_no_badge() {
         let node = file_node("lib.rs", 0);
-        let plan = build_row_plan(&node, false, false, None, None);
+        let plan = build_row_plan(&node, false, false, None, None, false);
         assert_eq!(plan.icon, NodeIcon::File);
         assert_eq!(plan.badge, None);
         assert!(!plan.selected);
@@ -117,7 +135,7 @@ mod tests {
     #[test]
     fn file_with_modified_badge() {
         let node = file_node("main.rs", 1);
-        let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Modified), None);
+        let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Modified), None, false);
         assert_eq!(plan.badge, Some((BadgeStatus::Modified, "M")));
         assert!(!plan.italic_dim);
     }
@@ -125,7 +143,7 @@ mod tests {
     #[test]
     fn file_ignored_sets_italic_dim_and_no_badge() {
         let node = file_node("ignored.log", 0);
-        let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Ignored), None);
+        let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Ignored), None, false);
         assert!(plan.italic_dim, "ignored file must be italic_dim");
         assert!(plan.badge.is_none(), "ignored file must have no badge (M2)");
     }
@@ -133,7 +151,7 @@ mod tests {
     #[test]
     fn folder_closed_when_not_expanded() {
         let node = dir_node("src", 0);
-        let plan = build_row_plan(&node, false, false, None, None);
+        let plan = build_row_plan(&node, false, false, None, None, false);
         assert_eq!(plan.icon, NodeIcon::FolderClosed);
         assert_eq!(plan.badge, None);
     }
@@ -141,7 +159,7 @@ mod tests {
     #[test]
     fn folder_open_when_expanded() {
         let node = dir_node("src", 0);
-        let plan = build_row_plan(&node, true, false, None, Some(BadgeStatus::Modified));
+        let plan = build_row_plan(&node, true, false, None, Some(BadgeStatus::Modified), false);
         assert_eq!(plan.icon, NodeIcon::FolderOpen);
         assert_eq!(plan.badge, Some((BadgeStatus::Modified, "M")));
     }
@@ -149,7 +167,7 @@ mod tests {
     #[test]
     fn selected_flag_propagated() {
         let node = file_node("main.rs", 0);
-        let plan = build_row_plan(&node, false, true, None, None);
+        let plan = build_row_plan(&node, false, true, None, None, false);
         assert!(plan.selected);
     }
 
@@ -163,7 +181,59 @@ mod tests {
             false,
             Some(BadgeStatus::Deleted), // file_status — should be ignored
             Some(BadgeStatus::Added),   // folder_status — should be used
+            false,
         );
         assert_eq!(plan.badge, Some((BadgeStatus::Added, "A")));
+    }
+
+    #[test]
+    fn folder_ignored_sets_italic_dim_and_no_badge() {
+        // git reports an ignored directory as a plain `!` record, so its
+        // verdict lands in the FILE map even though the node is a directory.
+        let node = dir_node(".claude", 0);
+        let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Ignored), None, false);
+        assert!(plan.italic_dim, "ignored folder must be italic_dim");
+        assert!(plan.ignored_mark, "the named folder carries the slash glyph");
+        assert!(plan.badge.is_none(), "ignored folder must have no badge");
+    }
+
+    #[test]
+    fn folder_ignored_keeps_open_close_icon() {
+        let node = dir_node("target", 0);
+        let closed = build_row_plan(&node, false, false, Some(BadgeStatus::Ignored), None, false);
+        let open = build_row_plan(&node, true, false, Some(BadgeStatus::Ignored), None, false);
+        assert_eq!(closed.icon, NodeIcon::FolderClosed);
+        assert_eq!(open.icon, NodeIcon::FolderOpen);
+    }
+
+    #[test]
+    fn folder_status_wins_over_an_ignored_file_record() {
+        // A tracked folder that also happens to hold an ignored-path record
+        // keeps its propagated badge rather than dimming.
+        let node = dir_node("crates", 0);
+        let plan = build_row_plan(
+            &node,
+            false,
+            false,
+            Some(BadgeStatus::Ignored),
+            Some(BadgeStatus::Modified),
+            false,
+        );
+        assert_eq!(plan.badge, Some((BadgeStatus::Modified, "M")));
+        assert!(!plan.italic_dim);
+    }
+
+    #[test]
+    fn row_under_an_ignored_folder_is_italic_dim_without_its_own_status() {
+        // `--ignored=matching` never reports children of an ignored tree, so
+        // the flag is the only signal a descendant row has.
+        let node = file_node("settings.json", 1);
+        let plan = build_row_plan(&node, false, false, None, None, true);
+        assert!(plan.italic_dim, "descendant of an ignored folder must dim");
+        assert!(
+            !plan.ignored_mark,
+            "only the named entry gets the glyph — not every row beneath it"
+        );
+        assert!(plan.badge.is_none());
     }
 }
