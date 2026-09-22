@@ -28,7 +28,7 @@ fn dir_node(name: &str, depth: usize) -> TreeNode {
 #[test]
 fn file_no_badge_returns_file_icon_no_badge() {
     let node = file_node("lib.rs", 0);
-    let plan = build_row_plan(&node, false, false, None, None);
+    let plan = build_row_plan(&node, false, false, None, None, false);
     assert_eq!(plan.icon, NodeIcon::File);
     assert_eq!(plan.badge, None);
     assert!(!plan.selected);
@@ -40,7 +40,7 @@ fn file_no_badge_returns_file_icon_no_badge() {
 #[test]
 fn file_with_modified_badge() {
     let node = file_node("main.rs", 1);
-    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Modified), None);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Modified), None, false);
     assert_eq!(plan.icon, NodeIcon::File);
     assert_eq!(plan.badge, Some((BadgeStatus::Modified, "M")));
     assert!(!plan.italic_dim);
@@ -49,14 +49,14 @@ fn file_with_modified_badge() {
 #[test]
 fn file_with_added_badge() {
     let node = file_node("new.rs", 0);
-    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Added), None);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Added), None, false);
     assert_eq!(plan.badge, Some((BadgeStatus::Added, "A")));
 }
 
 #[test]
 fn file_with_deleted_badge() {
     let node = file_node("gone.rs", 0);
-    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Deleted), None);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Deleted), None, false);
     assert_eq!(plan.badge, Some((BadgeStatus::Deleted, "D")));
 }
 
@@ -64,7 +64,7 @@ fn file_with_deleted_badge() {
 fn file_ignored_sets_italic_dim_and_no_badge() {
     // M2: ignored files are italic+dim with NO badge label.
     let node = file_node("ignored.log", 0);
-    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Ignored), None);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Ignored), None, false);
     assert!(plan.italic_dim, "ignored file should be italic_dim");
     assert!(
         plan.badge.is_none(),
@@ -75,7 +75,7 @@ fn file_ignored_sets_italic_dim_and_no_badge() {
 #[test]
 fn folder_closed_when_not_expanded() {
     let node = dir_node("src", 0);
-    let plan = build_row_plan(&node, false, false, None, None);
+    let plan = build_row_plan(&node, false, false, None, None, false);
     assert_eq!(plan.icon, NodeIcon::FolderClosed);
     assert_eq!(plan.badge, None);
     assert!(!plan.italic_dim);
@@ -84,7 +84,7 @@ fn folder_closed_when_not_expanded() {
 #[test]
 fn folder_open_when_expanded() {
     let node = dir_node("src", 0);
-    let plan = build_row_plan(&node, true, false, None, Some(BadgeStatus::Modified));
+    let plan = build_row_plan(&node, true, false, None, Some(BadgeStatus::Modified), false);
     assert_eq!(plan.icon, NodeIcon::FolderOpen);
     assert_eq!(plan.badge, Some((BadgeStatus::Modified, "M")));
 }
@@ -98,6 +98,7 @@ fn folder_uses_folder_status_ignores_file_status() {
         false,
         Some(BadgeStatus::Deleted), // file_status — must be ignored for dirs
         Some(BadgeStatus::Added),   // folder_status — must be used
+        false,
     );
     assert_eq!(plan.badge, Some((BadgeStatus::Added, "A")));
 }
@@ -105,42 +106,84 @@ fn folder_uses_folder_status_ignores_file_status() {
 #[test]
 fn selected_flag_propagated_to_plan() {
     let node = file_node("main.rs", 0);
-    let plan = build_row_plan(&node, false, true, None, None);
+    let plan = build_row_plan(&node, false, true, None, None, false);
     assert!(plan.selected);
 }
 
 #[test]
 fn depth_propagated_from_node() {
     let node = file_node("deep.rs", 3);
-    let plan = build_row_plan(&node, false, false, None, None);
+    let plan = build_row_plan(&node, false, false, None, None, false);
     assert_eq!(plan.depth, 3);
 }
 
 #[test]
 fn plan_equality_check() {
     let node = file_node("a.rs", 0);
-    let p1 = build_row_plan(&node, false, false, None, None);
-    let p2 = build_row_plan(&node, false, false, None, None);
+    let p1 = build_row_plan(&node, false, false, None, None, false);
+    let p2 = build_row_plan(&node, false, false, None, None, false);
     assert_eq!(p1, p2);
 }
 
 #[test]
 fn renamed_badge_label_is_r() {
     let node = file_node("moved.rs", 0);
-    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Renamed), None);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Renamed), None, false);
     assert_eq!(plan.badge, Some((BadgeStatus::Renamed, "R")));
 }
 
 #[test]
 fn untracked_badge_label_is_u() {
     let node = file_node("new_file.rs", 0);
-    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Untracked), None);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Untracked), None, false);
     assert_eq!(plan.badge, Some((BadgeStatus::Untracked, "U")));
 }
 
 #[test]
 fn copied_badge_label_is_c() {
     let node = file_node("copy.rs", 0);
-    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Copied), None);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Copied), None, false);
     assert_eq!(plan.badge, Some((BadgeStatus::Copied, "C")));
+}
+
+#[test]
+fn folder_ignored_sets_italic_dim_and_no_badge() {
+    // An ignored DIRECTORY is reported by git as an ordinary `!` record, so
+    // its verdict arrives in the file-status map. Folders must honour it or
+    // they paint like tracked directories once the eye toggle reveals them.
+    let node = dir_node("dist", 0);
+    let plan = build_row_plan(&node, false, false, Some(BadgeStatus::Ignored), None, false);
+    assert!(plan.italic_dim, "ignored folder should be italic_dim");
+    assert!(plan.ignored_mark, "the named folder carries the slash glyph");
+    assert!(plan.badge.is_none(), "ignored folder must not have a badge");
+    assert_eq!(plan.icon, NodeIcon::FolderClosed);
+}
+
+#[test]
+fn descendant_of_an_ignored_folder_is_italic_dim() {
+    // `--ignored=matching` stops at the directory, so children arrive with no
+    // status at all; the caller's ancestor test is the only signal.
+    let node = file_node("chunk.js", 1);
+    let plan = build_row_plan(&node, false, false, None, None, true);
+    assert!(plan.italic_dim);
+    assert!(
+        !plan.ignored_mark,
+        "a descendant dims but does not repeat the glyph"
+    );
+    assert!(plan.badge.is_none());
+}
+
+#[test]
+fn a_folder_badge_still_wins_over_an_ignored_file_record() {
+    let node = dir_node("crates", 0);
+    let plan = build_row_plan(
+        &node,
+        false,
+        false,
+        Some(BadgeStatus::Ignored),
+        Some(BadgeStatus::Modified),
+        false,
+    );
+    assert_eq!(plan.badge, Some((BadgeStatus::Modified, "M")));
+    assert!(!plan.italic_dim);
 }

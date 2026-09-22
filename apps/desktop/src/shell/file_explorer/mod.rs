@@ -23,10 +23,10 @@ use crate::shell::file_explorer::header_render::render_header;
 use crate::shell::file_explorer::paint::{PaintCtx, paint_row};
 use crate::shell::file_explorer::row_render::build_row_plan;
 use crate::shell::file_explorer::status_display::{
-    BadgeStatus, build_folder_status_map, build_status_map,
+    BadgeStatus, build_folder_status_map, build_status_map, collect_ignored,
 };
 use crate::shell::file_explorer::tree_state::{
-    DirCache, TreeNode, ancestor_dirs, filter_visible, flatten,
+    DirCache, TreeNode, ancestor_dirs, filter_visible, flatten, is_ignored_row,
 };
 use crate::shell::file_tree_view::OnOpenFile;
 use gpui::{
@@ -57,6 +57,11 @@ pub struct FileExplorer {
     rows: Vec<TreeNode>,
     status_map: HashMap<PathBuf, BadgeStatus>,
     folder_status_map: HashMap<PathBuf, BadgeStatus>,
+    /// Relative paths git reported as ignored, derived from `status_map`.
+    /// Cached because both the hide filter and every painted row ask the same
+    /// question ("is this row at or beneath an ignored path?"), and the row
+    /// loop runs on each frame while the answer only changes on a poll.
+    ignored_paths: Vec<PathBuf>,
     list_scroll: UniformListScrollHandle,
     theme: Theme,
     density: Density,
@@ -175,6 +180,14 @@ impl FileExplorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Seed from whatever the channel already holds, the way `GitPanel`
+        // does. The poller is spawned SEEDED with the cached `GitState` and
+        // then publishes through `send_if_modified`, so on a relaunch where
+        // the repo has not changed the first poll matches the seed, sends
+        // nothing, and a receiver that only awaits `changed()` would sit on an
+        // empty status map until the user edited a file — no badges, no eye
+        // toggle, every ignored entry visible.
+        let seed = state_rx.borrow().clone();
         let poll_observer = Self::start_poll_observer(state_rx, cx);
 
         // Subscribe to window-activation so focus regain triggers a refresh of
@@ -216,6 +229,7 @@ impl FileExplorer {
             rows: Vec::new(),
             status_map: HashMap::new(),
             folder_status_map: HashMap::new(),
+            ignored_paths: Vec::new(),
             list_scroll: UniformListScrollHandle::new(),
             theme,
             density,
@@ -238,6 +252,9 @@ impl FileExplorer {
             focus_handle: cx.focus_handle(),
         };
 
+        explorer.adopt_status(&seed);
+        explorer.poll_state = Some(seed);
+
         // Kick off root directory load on mount.
         let task = explorer.spawn_load_dir(repo_root.clone(), repo_root, true, cx);
         explorer._load_tasks.push(task);
@@ -248,23 +265,44 @@ impl FileExplorer {
     /// Skips the rebuild if the files slice is identical to the previous poll
     /// (avoids redundant work on no-op status polls — M5).
     fn set_poll_state(&mut self, state: PollState, cx: &mut Context<Self>) {
-        if let PollState::Ready(ref git_state) = state {
-            if git_state.files != self.prev_files {
-                self.status_map = build_status_map(&git_state.files);
-                self.folder_status_map = build_folder_status_map(&git_state.files);
-                self.prev_files = git_state.files.clone();
-                // Status map drives the ignored-row filter; rebuild rows so the
-                // hide/show state stays in sync with fresh poll output.
-                self.recompute_rows();
-            }
-        } else {
-            self.status_map.clear();
-            self.folder_status_map.clear();
-            self.prev_files.clear();
+        if self.adopt_status(&state) {
+            // Status map drives the ignored-row filter; rebuild rows so the
+            // hide/show state stays in sync with fresh poll output.
             self.recompute_rows();
         }
         self.poll_state = Some(state);
         cx.notify();
+    }
+
+    /// Rebuild the status maps from one `PollState`. Returns `true` when
+    /// anything changed, which is the caller's cue to rebuild the row list.
+    ///
+    /// Shared by the constructor's seed and the poll observer so a seeded
+    /// explorer is indistinguishable from one that received the same sample
+    /// over the channel. Takes no `Context` — the constructor has no entity to
+    /// notify yet, and a poll caller notifies once for the whole update.
+    fn adopt_status(&mut self, state: &PollState) -> bool {
+        match state {
+            PollState::Ready(git_state) => {
+                if git_state.files == self.prev_files {
+                    return false;
+                }
+                self.status_map = build_status_map(&git_state.files);
+                self.folder_status_map = build_folder_status_map(&git_state.files);
+                self.ignored_paths = collect_ignored(&self.status_map);
+                self.prev_files = git_state.files.clone();
+                true
+            }
+            _ => {
+                // `Loading` / `Failed` clear the decorations rather than
+                // freezing stale ones onto rows that may no longer exist.
+                self.status_map.clear();
+                self.folder_status_map.clear();
+                self.ignored_paths.clear();
+                self.prev_files.clear();
+                true
+            }
+        }
     }
 
     /// Rebuild the flat row list from current cache + expanded set, applying
@@ -273,13 +311,7 @@ impl FileExplorer {
     /// independently unit-testable.
     fn recompute_rows(&mut self) {
         let all = flatten(&self.repo_root, &self.cache, &self.expanded);
-        let ignored: Vec<PathBuf> = self
-            .status_map
-            .iter()
-            .filter(|(_, s)| **s == BadgeStatus::Ignored)
-            .map(|(p, _)| p.clone())
-            .collect();
-        self.rows = filter_visible(all, &ignored, self.show_ignored);
+        self.rows = filter_visible(all, &self.ignored_paths, self.show_ignored);
         self.inject_create_placeholder();
     }
 
@@ -580,6 +612,7 @@ impl Render for FileExplorer {
                     let selected = me.selected.clone();
                     let status_map = me.status_map.clone();
                     let folder_status_map = me.folder_status_map.clone();
+                    let ignored_paths = me.ignored_paths.clone();
                     let typography = me.typography.clone();
                     let cache = me.cache.clone();
                     let pctx = PaintCtx {
@@ -608,6 +641,11 @@ impl Render for FileExplorer {
                             let rel = &node.relative_path;
                             let file_status = status_map.get(rel).copied();
                             let folder_status = folder_status_map.get(rel).copied();
+                            // Children of an ignored directory carry no status
+                            // of their own (`--ignored=matching` stops at the
+                            // directory), so the dim style has to come from the
+                            // ancestor test rather than the maps.
+                            let under_ignored = is_ignored_row(rel, &ignored_paths);
                             let is_loading =
                                 cache.get(&node.path).map(|c| c.loading).unwrap_or(false);
                             let plan = build_row_plan(
@@ -616,6 +654,7 @@ impl Render for FileExplorer {
                                 is_selected,
                                 file_status,
                                 folder_status,
+                                under_ignored,
                             );
                             let path = node.path.clone();
                             let is_dir = node.is_directory;

@@ -132,6 +132,19 @@ pub fn build_folder_status_map(files: &[FileStatus]) -> HashMap<PathBuf, BadgeSt
         .collect()
 }
 
+/// Every path in `status_map` that git reported as ignored.
+///
+/// Directories appear here just like files — `--ignored=matching` emits one
+/// record per path that matches a rule, whether it names a file or a whole
+/// tree — which is what lets the caller test a row against ignored ancestors.
+pub fn collect_ignored(status_map: &HashMap<PathBuf, BadgeStatus>) -> Vec<PathBuf> {
+    status_map
+        .iter()
+        .filter(|(_, s)| **s == BadgeStatus::Ignored)
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
 /// Look up the label string for a `BadgeStatus`.
 pub fn label_for(s: BadgeStatus) -> &'static str {
     STATUS_LABELS
@@ -185,6 +198,19 @@ mod tests {
     #[test]
     fn should_propagate_deleted_is_false() {
         assert!(!should_propagate(BadgeStatus::Deleted));
+    }
+
+    #[test]
+    fn collect_ignored_returns_directory_records_too() {
+        let files = vec![
+            fs(".DS_Store", IndexStatus::Unmodified, WorktreeStatus::Ignored),
+            fs("dist/", IndexStatus::Unmodified, WorktreeStatus::Ignored),
+            fs("src/main.rs", IndexStatus::Unmodified, WorktreeStatus::Modified),
+        ];
+        let map = build_status_map(&files);
+        let mut out = collect_ignored(&map);
+        out.sort();
+        assert_eq!(out, vec![PathBuf::from(".DS_Store"), PathBuf::from("dist/")]);
     }
 
     #[test]

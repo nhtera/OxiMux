@@ -133,3 +133,73 @@ async fn file_explorer_renders_without_panic_before_dir_load(cx: &mut TestAppCon
 
     drop(tmp);
 }
+
+#[gpui::test]
+async fn a_seeded_channel_populates_the_status_map_without_a_second_send(
+    cx: &mut TestAppContext,
+) {
+    // Regression: the poller is spawned SEEDED with the cached `GitState` and
+    // publishes through `send_if_modified`, so on a relaunch against an
+    // unchanged repo the first poll matches the seed and sends nothing. An
+    // explorer that only awaited `changed()` stayed blank — no badges, no eye
+    // toggle, every ignored entry visible — until the user happened to edit a
+    // file. Construction must adopt whatever the channel already holds.
+    let (rt, tmp, _repo) = setup();
+    let _guard = rt.enter();
+
+    cx.update(gpui_component::init);
+
+    let git_state = GitState {
+        branch: Some("main".into()),
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        head_oid: None,
+        files: vec![
+            FileStatus::with_status(
+                std::path::PathBuf::from("README.md"),
+                IndexStatus::Unmodified,
+                WorktreeStatus::Modified,
+            ),
+            FileStatus::with_status(
+                std::path::PathBuf::from("dist/"),
+                IndexStatus::Unmodified,
+                WorktreeStatus::Ignored,
+            ),
+        ],
+        ..Default::default()
+    };
+    // The channel carries the sample BEFORE the explorer subscribes, and
+    // nothing is ever sent afterwards — exactly the seeded-poller case.
+    let (_tx, rx) = watch::channel(PollState::Ready(git_state));
+
+    let window = cx.add_window(|win, cx| {
+        FileExplorer::new_unwatched(
+            tmp.path().to_path_buf(),
+            rx,
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            None,
+            win,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+
+    cx.read(|app| {
+        let explorer = window.read(app).expect("FileExplorer root view alive");
+        assert!(
+            explorer
+                .status_map()
+                .contains_key(&std::path::PathBuf::from("README.md")),
+            "the seeded sample must populate status_map with no second send"
+        );
+        assert!(
+            explorer.has_ignored_entries(),
+            "the eye toggle must appear from the seeded sample alone"
+        );
+    });
+
+    drop(tmp);
+}

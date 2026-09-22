@@ -91,12 +91,19 @@ pub fn filter_visible(
         return rows;
     }
     rows.into_iter()
-        .filter(|n| {
-            !ignored
-                .iter()
-                .any(|i| n.relative_path == *i || n.relative_path.starts_with(i))
-        })
+        .filter(|n| !is_ignored_row(&n.relative_path, ignored))
         .collect()
+}
+
+/// `true` when `rel` is one of the `ignored` paths or descends from one.
+///
+/// Shared by the hide filter above and the row painter: a row hidden when the
+/// eye is off must be the same row drawn dim when the eye is on, otherwise an
+/// ignored folder reappears styled like a tracked one. `--ignored=matching`
+/// reports a directory once (`target/`) and none of its children, so the
+/// descendant test is what carries the style into an expanded ignored tree.
+pub fn is_ignored_row(rel: &Path, ignored: &[PathBuf]) -> bool {
+    ignored.iter().any(|i| rel == i || rel.starts_with(i))
 }
 
 fn flatten_children(
@@ -352,6 +359,20 @@ mod tests {
             is_directory: is_dir,
             depth: 0,
         }
+    }
+
+    #[test]
+    fn is_ignored_row_matches_a_git_directory_record_with_its_trailing_slash() {
+        // git prints an ignored directory as `target/`; tree rows carry
+        // `target`. `Path` compares by component, so the two are equal — the
+        // whole dim/hide story for folders rests on that.
+        let ignored = vec![PathBuf::from("target/")];
+        assert!(is_ignored_row(Path::new("target"), &ignored));
+        assert!(is_ignored_row(Path::new("target/debug/app"), &ignored));
+        assert!(
+            !is_ignored_row(Path::new("target_test/app"), &ignored),
+            "a name that merely shares a prefix must not dim"
+        );
     }
 
     #[test]

@@ -69,12 +69,15 @@ pub fn paint_row(
     // transparent so the highlight pill (drawn inset by 4px) gives the
     // selected/hover state rounded edges instead of edge-to-edge fill.
     let indent_px = plan.depth as f32 * 12.0 + 6.0;
-    let fg = if plan.italic_dim {
-        ctx.theme.fg_subtle
+    let (fg, icon_color) = if plan.italic_dim {
+        // An ignored row dims as a whole — chevron and folder/file glyph
+        // included. Dimming only the label leaves a full-strength folder icon
+        // that reads as a tracked directory (the very thing the dim says it
+        // is not).
+        (ctx.theme.fg_subtle, ctx.theme.fg_subtle)
     } else {
-        ctx.theme.fg_base
+        (ctx.theme.fg_base, ctx.theme.fg_muted)
     };
-    let icon_color = ctx.theme.fg_muted;
 
     // Lucide chevron — `chevron-right` for closed dirs, `chevron-down` for open.
     // Files get an empty 12px spacer so names line up.
@@ -302,9 +305,11 @@ pub fn paint_row(
                 .font_weight(ctx.typography.w_semibold)
                 .child(label),
         );
-    } else if plan.italic_dim {
+    } else if plan.ignored_mark {
         // Ignored entry — show a circle-slash glyph at the right edge instead
         // of a letter badge, mirroring the worktree-decoration treatment.
+        // Only the entry git named gets it; an expanded ignored tree would
+        // otherwise repeat the same mark down every one of its rows.
         row = row.child(
             div().ml_auto().flex_shrink_0().pl(px(8.0)).child(
                 svg()
