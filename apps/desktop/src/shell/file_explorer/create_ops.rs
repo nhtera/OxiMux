@@ -12,6 +12,7 @@
 //! New File / New Folder) → `FileExplorer::start_create`.
 
 use crate::shell::file_explorer::FileExplorer;
+use crate::shell::file_explorer::tree_state::TreeNode;
 use gpui::{AppContext, Context, Entity, Subscription, Window};
 use gpui_component::input::{InputEvent, InputState};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,28 @@ pub struct CreateState {
 /// matches on it to mount the create input.
 pub fn create_sentinel(parent: &Path) -> PathBuf {
     parent.join("\u{0}__oximux_new__")
+}
+
+/// Build the placeholder row for a create under `parent`.
+///
+/// `parent_row` is the parent's row in the flat list, or `None` when creating
+/// at the repo root — whose row is never shown, and which is never ignored.
+///
+/// The placeholder takes its relative path from the parent's, sentinel
+/// component included. An empty path descends from no ignored ancestor, which
+/// left a row being created inside a revealed ignored tree at full strength
+/// among dim siblings; the sentinel component keeps it from colliding with a
+/// real status-map key while it inherits the dimming.
+pub fn placeholder_row(parent: &Path, parent_row: Option<&TreeNode>, is_dir: bool) -> TreeNode {
+    TreeNode {
+        name: String::new(),
+        path: create_sentinel(parent),
+        relative_path: parent_row
+            .map(|n| create_sentinel(&n.relative_path))
+            .unwrap_or_default(),
+        is_directory: is_dir,
+        depth: parent_row.map(|n| n.depth + 1).unwrap_or(0),
+    }
 }
 
 impl FileExplorer {
@@ -164,6 +187,61 @@ impl FileExplorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::shell::file_explorer::tree_state::is_ignored_row;
+
+    fn dir_row(rel: &str, depth: usize) -> TreeNode {
+        TreeNode {
+            name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            path: PathBuf::from("/repo").join(rel),
+            relative_path: PathBuf::from(rel),
+            is_directory: true,
+            depth,
+        }
+    }
+
+    #[test]
+    fn placeholder_sits_one_level_under_its_parent() {
+        let parent = dir_row("src/ui", 1);
+        let row = placeholder_row(&parent.path, Some(&parent), false);
+        assert_eq!(row.depth, 2);
+        assert_eq!(row.path, create_sentinel(&parent.path));
+        assert!(row.name.is_empty());
+        assert!(!row.is_directory);
+    }
+
+    #[test]
+    fn placeholder_inside_an_ignored_tree_reads_as_ignored() {
+        // The row is created while the ignored tree is revealed; it must dim
+        // with its siblings instead of painting at full strength.
+        let parent = dir_row("dist/assets", 1);
+        let row = placeholder_row(&parent.path, Some(&parent), false);
+        let ignored = vec![PathBuf::from("dist/")];
+        assert!(
+            is_ignored_row(&row.relative_path, &ignored),
+            "placeholder must descend from the ignored ancestor"
+        );
+    }
+
+    #[test]
+    fn placeholder_relative_path_cannot_collide_with_a_real_entry() {
+        let parent = dir_row("src", 0);
+        let row = placeholder_row(&parent.path, Some(&parent), false);
+        assert_ne!(row.relative_path, parent.relative_path);
+        assert_ne!(row.relative_path, PathBuf::from("src/main.rs"));
+        assert!(row.relative_path.to_string_lossy().contains('\u{0}'));
+    }
+
+    #[test]
+    fn placeholder_at_the_repo_root_has_no_parent_row() {
+        // The root row is never shown, so there is nothing to inherit — and
+        // the root itself is never an ignored path.
+        let row = placeholder_row(&PathBuf::from("/repo"), None, true);
+        assert_eq!(row.depth, 0);
+        assert_eq!(row.relative_path, PathBuf::new());
+        assert!(row.is_directory);
+        assert!(!is_ignored_row(&row.relative_path, &[PathBuf::from("dist/")]));
+    }
 
     #[test]
     fn sentinel_is_stable_and_collision_proof() {

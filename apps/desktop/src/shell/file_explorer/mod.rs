@@ -324,20 +324,12 @@ impl FileExplorer {
         let Some(create) = self.creating.as_ref() else {
             return;
         };
-        let parent_depth = self
-            .rows
-            .iter()
-            .find(|n| n.path == create.parent)
-            .map(|n| n.depth);
-        let node = TreeNode {
-            name: String::new(),
-            path: create_ops::create_sentinel(&create.parent),
-            relative_path: PathBuf::new(),
-            is_directory: create.is_dir,
-            depth: parent_depth.map(|d| d + 1).unwrap_or(0),
-        };
-        match self.rows.iter().position(|n| n.path == create.parent) {
-            Some(idx) => self.rows.insert(idx + 1, node),
+        let parent = create.parent.clone();
+        let is_dir = create.is_dir;
+        let idx = self.rows.iter().position(|n| n.path == parent);
+        let node = create_ops::placeholder_row(&parent, idx.map(|i| &self.rows[i]), is_dir);
+        match idx {
+            Some(i) => self.rows.insert(i + 1, node),
             None => self.rows.push(node),
         }
     }
