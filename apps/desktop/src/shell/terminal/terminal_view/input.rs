@@ -797,6 +797,21 @@ impl TerminalView {
                 cx.notify();
                 return;
             }
+            SearchKeyOutcome::PasteRequested => {
+                // The find box owns the paste chord while it is open. Read
+                // the clipboard here (the state machine is clipboard-blind)
+                // and never let the chord reach `paste_from_clipboard` below,
+                // which would inject the text into the shell instead.
+                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                if let Some(text) = text
+                    && self.search.paste(&text)
+                {
+                    self.schedule_debounced_search(cx);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
         }
 
         let ks = &event.keystroke;

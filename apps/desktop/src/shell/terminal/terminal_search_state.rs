@@ -37,6 +37,12 @@ pub enum SearchKeyOutcome {
     /// Cycled to next/prev match (Enter / Shift+Enter / Up / Down). Host
     /// only needs to repaint — no grid refetch.
     CurrentChanged,
+    /// The paste chord (Cmd+V, or Ctrl+Shift+V) landed while the overlay
+    /// was open. The state machine has no clipboard access, so the host
+    /// reads it and feeds the text through [`SearchState::paste`]. Without
+    /// this the chord fell through to the terminal's own paste path and the
+    /// clipboard went to the shell instead of the find box.
+    PasteRequested,
 }
 
 /// Which highlight style applies to a match cell run. `Current` is the
@@ -203,6 +209,22 @@ impl SearchState {
         self.current_index = Some(prev);
     }
 
+    /// Append clipboard text to the query. Returns whether the query
+    /// changed, so the host knows whether a re-scan is due.
+    ///
+    /// Only the first line is taken: the scan is row-major, so a needle
+    /// containing a line break can never match, and a multi-line paste into
+    /// a single-line find box conventionally keeps the first line. Any other
+    /// control byte (tabs, stray C0 bytes) is dropped for the same reason
+    /// `handle_key` rejects control characters — the grid never holds them.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let first_line = text.split(['\n', '\r']).next().unwrap_or("");
+        let before = self.query.len();
+        self.query
+            .extend(first_line.chars().filter(|c| !c.is_control()));
+        self.query.len() != before
+    }
+
     /// Format the count badge for the overlay: empty when no query, else
     /// `i of N` (`- of 0` when no matches).
     pub fn count_badge(&self) -> String {
@@ -227,6 +249,7 @@ impl SearchState {
     /// - Up           → prev match
     /// - Down         → next match
     /// - Backspace    → pop char (re-runs scan)
+    /// - Cmd+V / Ctrl+Shift+V → paste into the query (host reads clipboard)
     /// - Printable    → append (re-runs scan)
     /// - Other        → swallow (no repaint)
     pub fn handle_key(&mut self, event: &KeyDownEvent) -> SearchKeyOutcome {
@@ -234,6 +257,9 @@ impl SearchState {
             return SearchKeyOutcome::Pass;
         }
         let ks = &event.keystroke;
+        if is_paste_chord(&ks.modifiers, &ks.key) {
+            return SearchKeyOutcome::PasteRequested;
+        }
         if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt {
             return SearchKeyOutcome::Pass;
         }
@@ -348,9 +374,73 @@ impl SearchState {
     }
 }
 
+/// The paste chord the overlay claims for itself: Cmd+V (the terminal's own
+/// paste binding, so the two never disagree about what ⌘V means) and the
+/// Ctrl+Shift+V convention Linux/Windows terminals use, since plain Ctrl+V
+/// is a control byte the shell may want. Every other modifier combination
+/// still passes through to the regular key path.
+fn is_paste_chord(mods: &gpui::Modifiers, key: &str) -> bool {
+    if key != "v" {
+        return false;
+    }
+    let cmd_v = mods.platform && !mods.control && !mods.alt && !mods.shift;
+    let ctrl_shift_v = mods.control && mods.shift && !mods.platform && !mods.alt;
+    cmd_v || ctrl_shift_v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Keystroke;
+
+    fn key(chord: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke::parse(chord).expect("valid chord"),
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    #[test]
+    fn paste_chord_is_claimed_only_while_open() {
+        let mut s = SearchState::new();
+        assert!(matches!(s.handle_key(&key("cmd-v")), SearchKeyOutcome::Pass));
+
+        s.open();
+        assert!(matches!(
+            s.handle_key(&key("cmd-v")),
+            SearchKeyOutcome::PasteRequested
+        ));
+        assert!(matches!(
+            s.handle_key(&key("ctrl-shift-v")),
+            SearchKeyOutcome::PasteRequested
+        ));
+        // Other Cmd chords (copy, select-all) still belong to the terminal.
+        assert!(matches!(s.handle_key(&key("cmd-c")), SearchKeyOutcome::Pass));
+        assert!(matches!(s.handle_key(&key("cmd-shift-v")), SearchKeyOutcome::Pass));
+        assert!(matches!(s.handle_key(&key("ctrl-v")), SearchKeyOutcome::Pass));
+        // The chord never leaks into the query.
+        assert!(s.query.is_empty());
+    }
+
+    #[test]
+    fn paste_appends_first_line_without_control_bytes() {
+        let mut s = SearchState::new();
+        s.open();
+        s.query.push_str("nmk");
+        assert!(s.paste("-copilot\tx\nsecond line"));
+        assert_eq!(s.query, "nmk-copilotx");
+
+        // CRLF clipboard text stops at the CR too.
+        assert!(s.paste("!\r\nignored"));
+        assert_eq!(s.query, "nmk-copilotx!");
+
+        // Nothing printable → no change, so the host skips the re-scan.
+        assert!(!s.paste(""));
+        assert!(!s.paste("\x1b\x07"));
+        assert!(!s.paste("\r\nonly a second line"));
+        assert_eq!(s.query, "nmk-copilotx!");
+    }
 
     fn hit(row: usize) -> MatchRange {
         MatchRange {

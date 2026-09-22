@@ -4,6 +4,17 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-22 — Paste lands in the terminal find box (`claude/terminal-search-paste-fix`)
+
+- **⌘V pastes into the search overlay, not the shell.** With the find box
+  open, the paste chord used to fall through to the terminal's own paste
+  path, so the clipboard was typed at the prompt while the query stayed
+  empty. The overlay now claims ⌘V (and Ctrl+Shift+V, the Linux/Windows
+  terminal convention) while it is open and appends the clipboard's first
+  line to the query, re-scanning as if it had been typed. Line breaks and
+  other control bytes are dropped, since the row-major scan can never match
+  them. Other ⌘ chords (copy, select-all) still reach the terminal.
+
 ### 2026-09-14 — The create dialog remembers your agent (`feat/worktree-agent-default-and-retirement`)
 
 - **New workspaces start with the agent you used last.** The create
