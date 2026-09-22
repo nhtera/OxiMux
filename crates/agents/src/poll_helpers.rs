@@ -66,8 +66,8 @@ pub fn process_poll_events(
                 let scan = scanner.feed(&bytes);
                 // Regex path on the OSC-9999-stripped bytes only.
                 if let Some(t) = machine.feed(scan.cleaned.as_ref(), now) {
-                    let prev_msg = prev_last_message(status_tx);
-                    let _ = status_tx.send(status_snapshot(t.to, last_prompt, prev_msg));
+                    let carried = carried_detail(status_tx);
+                    let _ = status_tx.send(status_snapshot(t.to, last_prompt, carried));
                 }
                 // Sideband path: force the reported state, then publish the
                 // machine's current status with the structured detail. Skip
@@ -101,6 +101,18 @@ pub fn process_poll_events(
                             .as_ref()
                             .and_then(|d| d.last_message.clone());
                     }
+                    // Likewise the agent's own session id: Claude sends it on
+                    // every hook, but an agent that names it only on some
+                    // events must not blank it on the others — a cold restore
+                    // resumes by whatever this snapshot holds at capture time.
+                    // A newer id replaces it (`/clear` mints a new session).
+                    if sb.detail.session_id.is_none() {
+                        sb.detail.session_id = status_tx
+                            .borrow()
+                            .detail
+                            .as_ref()
+                            .and_then(|d| d.session_id.clone());
+                    }
                     let tool = sb.detail.tool_name.clone();
                     machine.feed_sideband(sb.state, tool);
                     if !machine.current().is_terminal() {
@@ -124,8 +136,8 @@ pub fn process_poll_events(
                     machine.note_exit(code)
                 };
                 if let Some(t) = transition {
-                    let prev_msg = prev_last_message(status_tx);
-                    let _ = status_tx.send(status_snapshot(t.to, last_prompt, prev_msg));
+                    let carried = carried_detail(status_tx);
+                    let _ = status_tx.send(status_snapshot(t.to, last_prompt, carried));
                 }
                 saw_exit = true;
             }
@@ -133,40 +145,48 @@ pub fn process_poll_events(
         }
     }
     if let Some(t) = machine.tick(now) {
-        let prev_msg = prev_last_message(status_tx);
-        let _ = status_tx.send(status_snapshot(t.to, last_prompt, prev_msg));
+        let carried = carried_detail(status_tx);
+        let _ = status_tx.send(status_snapshot(t.to, last_prompt, carried));
     }
     saw_exit
 }
 
-/// The last assistant reply on the currently-published snapshot, if any. Read
-/// before building a detail-less status edge so the message survives the
-/// transition instead of being blanked. The `watch` borrow is dropped before
-/// the caller's `send`, so it never contends with the publish.
-fn prev_last_message(status_tx: &watch::Sender<AgentSnapshot>) -> Option<String> {
-    status_tx
-        .borrow()
-        .detail
-        .as_ref()
-        .and_then(|d| d.last_message.clone())
+/// The parts of the currently-published detail that outlive a status edge:
+/// the last assistant reply and the agent's own session id. Read before
+/// building a detail-less snapshot so neither is blanked by the transition.
+/// The `watch` borrow is dropped before the caller's `send`, so it never
+/// contends with the publish.
+struct CarriedDetail {
+    last_message: Option<String>,
+    session_id: Option<String>,
+}
+
+fn carried_detail(status_tx: &watch::Sender<AgentSnapshot>) -> CarriedDetail {
+    let snap = status_tx.borrow();
+    let detail = snap.detail.as_ref();
+    CarriedDetail {
+        last_message: detail.and_then(|d| d.last_message.clone()),
+        session_id: detail.and_then(|d| d.session_id.clone()),
+    }
 }
 
 /// Build a snapshot for a path with no sideband detail of its own (regex
 /// transition, exit, idle decay). The volatile tool fields are dropped, but the
-/// cached prompt (the agent's title) and the last assistant reply are
-/// re-attached so a plain status edge never blanks the row's label or its
-/// finished-turn message.
+/// cached prompt (the agent's title), the last assistant reply and the session
+/// id are re-attached so a plain status edge never blanks the row's label, its
+/// finished-turn message, or the id a cold restore resumes by.
 fn status_snapshot(
     status: AgentStatus,
     last_prompt: &Option<String>,
-    last_message: Option<String>,
+    carried: CarriedDetail,
 ) -> AgentSnapshot {
-    if last_prompt.is_some() || last_message.is_some() {
+    if last_prompt.is_some() || carried.last_message.is_some() || carried.session_id.is_some() {
         AgentSnapshot {
             status,
             detail: Some(SidebandDetail {
                 prompt: last_prompt.clone(),
-                last_message,
+                last_message: carried.last_message,
+                session_id: carried.session_id,
                 ..Default::default()
             }),
         }
@@ -319,6 +339,61 @@ mod tests {
             rx.borrow().detail.clone().and_then(|d| d.last_message).as_deref(),
             Some("Refactor complete.")
         );
+    }
+
+    #[test]
+    fn session_id_is_carried_across_events_and_replaced_by_a_newer_one() {
+        // The id a cold restore resumes by. Claude names it on every hook,
+        // but the cache must not depend on that: a tool step, an idle and a
+        // regex/exit edge without the key all keep the last one seen.
+        let mut machine = approval_pattern_machine();
+        let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
+        let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
+        let cancel = AtomicBool::new(false);
+        let sid = |rx: &watch::Receiver<AgentSnapshot>| {
+            rx.borrow().detail.clone().and_then(|d| d.session_id)
+        };
+        let mut feed = |events: Vec<TerminalEvent>| {
+            process_poll_events(
+                events,
+                TERM,
+                &mut machine,
+                &mut scanner,
+                &tx,
+                &mut last_prompt,
+                &cancel,
+                Instant::now(),
+            )
+        };
+        let out = |bytes: Vec<u8>| vec![TerminalEvent::Output { id: TERM, bytes }];
+
+        feed(out(osc(r#"{"v":1,"state":"working","prompt":"go","session_id":"s"}"#)));
+        assert_eq!(sid(&rx).as_deref(), Some("s"));
+
+        // Tool step without the key.
+        feed(out(osc(r#"{"v":1,"state":"working","tool":"Bash"}"#)));
+        let d = rx.borrow().detail.clone().expect("detail");
+        assert_eq!(d.session_id.as_deref(), Some("s"));
+        assert_eq!(d.tool_name.as_deref(), Some("Bash"));
+
+        // Idle without the key.
+        feed(out(osc(r#"{"v":1,"state":"idle"}"#)));
+        assert_eq!(sid(&rx).as_deref(), Some("s"));
+
+        // A regex edge (no sideband detail at all) still carries it.
+        feed(out(b"Approval needed".to_vec()));
+        assert_eq!(rx.borrow().status, AgentStatus::NeedsApproval("x".into()));
+        assert_eq!(sid(&rx).as_deref(), Some("s"));
+
+        // A newer id replaces it (`/clear` minted a new conversation).
+        feed(out(osc(r#"{"v":1,"state":"working","session_id":"t"}"#)));
+        assert_eq!(sid(&rx).as_deref(), Some("t"));
+
+        // The exit edge keeps the last id: the snapshot a quit-time capture
+        // reads must still name the conversation to resume.
+        feed(vec![TerminalEvent::Exit { id: TERM, code: Some(0) }]);
+        assert_eq!(sid(&rx).as_deref(), Some("t"));
     }
 
     #[test]

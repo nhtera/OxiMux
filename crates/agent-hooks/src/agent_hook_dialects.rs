@@ -560,6 +560,23 @@ pub fn prompt(stdin_json: &str) -> Option<String> {
     )
 }
 
+/// The agent's own session id from any hook payload.
+///
+/// This is the id the CLI itself resumes by (`claude --resume <id>`,
+/// `codex resume <id>`, …), distinct from OxiMux's runtime session id and
+/// from the relay's PTY id. Claude Code, Droid and the Pi/omp extension spell
+/// it `session_id`; the other spellings are accepted for the same reason
+/// `prompt` accepts several — a missed id costs the tab its resume after a
+/// reboot. Only explicit "id" spellings are read (a bare `session` key could
+/// name anything), and the reader validates the value's charset before it is
+/// stored or handed to a CLI.
+pub fn session_id(stdin_json: &str) -> Option<String> {
+    read_str(
+        &parse(stdin_json)?,
+        &["session_id", "sessionId", "conversation_id", "conversationId"],
+    )
+}
+
 fn parse(stdin_json: &str) -> Option<Value> {
     serde_json::from_str(stdin_json).ok()
 }

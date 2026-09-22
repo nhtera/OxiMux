@@ -359,12 +359,16 @@ fn assistant_text_from_content(content: Option<&Value>) -> Option<String> {
 /// relay wraps and the scanner decodes. Serialized via `serde_json` so control
 /// characters in `tool`/`prompt`/`msg` are escaped — the relay treats the
 /// result as opaque. `prompt` is present only on `UserPromptSubmit`; `msg` (the
-/// last assistant reply) only on `Stop`.
+/// last assistant reply) only on `Stop`. `session_id` — the agent's OWN
+/// conversation id, the one it resumes by — rides every event that carries it,
+/// so the poll loop can hold it for the tab and a cold restore can resume the
+/// same conversation instead of starting a fresh one under the old title.
 pub fn build_status_payload(
     state: &str,
     tool: Option<&str>,
     prompt: Option<&str>,
     message: Option<&str>,
+    session_id: Option<&str>,
 ) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("v".into(), json!(1));
@@ -377,6 +381,9 @@ pub fn build_status_payload(
     }
     if let Some(m) = message {
         obj.insert("msg".into(), json!(m));
+    }
+    if let Some(s) = session_id {
+        obj.insert("session_id".into(), json!(s));
     }
     Value::Object(obj).to_string()
 }
@@ -529,7 +536,7 @@ mod tests {
     /// what the Phase-1 scanner decodes.
     #[test]
     fn payload_round_trips_through_scanner() {
-        let payload = build_status_payload("working", Some("Bash"), None, None);
+        let payload = build_status_payload("working", Some("Bash"), None, None, None);
         // Relay envelope: ESC ] 9999 ; <payload> BEL.
         let mut bytes = b"\x1b]9999;".to_vec();
         bytes.extend_from_slice(payload.as_bytes());
@@ -551,7 +558,7 @@ mod tests {
         let prompt = prompt_from_hook_json(
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"refactor the auth module"}"#,
         );
-        let payload = build_status_payload("working", None, prompt.as_deref(), None);
+        let payload = build_status_payload("working", None, prompt.as_deref(), None, None);
         let mut bytes = b"\x1b]9999;".to_vec();
         bytes.extend_from_slice(payload.as_bytes());
         bytes.push(0x07);
@@ -564,12 +571,36 @@ mod tests {
 
     #[test]
     fn idle_payload_has_no_tool() {
-        let payload = build_status_payload("idle", None, None, None);
+        let payload = build_status_payload("idle", None, None, None, None);
         let v: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["state"], "idle");
         assert!(v.get("tool").is_none());
         assert!(v.get("prompt").is_none());
         assert!(v.get("msg").is_none());
+    }
+
+    /// The agent's own session id rides the payload and survives the OSC
+    /// envelope + scanner round trip — the hop that a cold restore resumes by.
+    #[test]
+    fn session_id_rides_the_payload_and_round_trips_through_scanner() {
+        let payload = build_status_payload("working", Some("Edit"), None, None, Some("abc-123"));
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["session_id"], "abc-123");
+        // Absent → no key at all (the scanner then leaves the cached id alone).
+        let bare = build_status_payload("working", None, None, None, None);
+        let v: Value = serde_json::from_str(&bare).unwrap();
+        assert!(v.get("session_id").is_none());
+        // Control characters are escaped by serde, never raw in the OSC body.
+        let hostile = build_status_payload("idle", None, None, None, Some("x\u{7}y"));
+        assert!(!hostile.as_bytes().contains(&0x07));
+
+        let mut bytes = b"\x1b]9999;".to_vec();
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.push(0x07);
+        let mut scanner = AgentOscScanner::new();
+        let ev = scanner.feed(&bytes).event.expect("scanner decoded event");
+        assert_eq!(ev.detail.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(ev.detail.tool_name.as_deref(), Some("Edit"));
     }
 
     #[test]
@@ -595,7 +626,7 @@ mod tests {
 
     #[test]
     fn payload_carries_prompt_when_present() {
-        let payload = build_status_payload("working", None, Some("hello there"), None);
+        let payload = build_status_payload("working", None, Some("hello there"), None, None);
         let v: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["state"], "working");
         assert_eq!(v["prompt"], "hello there");
@@ -603,7 +634,7 @@ mod tests {
 
     #[test]
     fn stop_payload_carries_last_assistant_message_as_msg() {
-        let payload = build_status_payload("idle", None, None, Some("All set — tests pass."));
+        let payload = build_status_payload("idle", None, None, Some("All set — tests pass."), None);
         let v: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["state"], "idle");
         assert_eq!(v["msg"], "All set — tests pass.");

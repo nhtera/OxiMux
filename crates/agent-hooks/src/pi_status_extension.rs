@@ -29,6 +29,12 @@
 //!   and both `agent_end` and `session_shutdown` to end it. Subscribing to
 //!   only one of each pair would be a bet on a version; subscribing to both
 //!   and dropping the repeat is not.
+//!
+//! Every report also carries the session id Pi resumes by (`pi --session
+//! <id>`, `omp --resume <id>`), read from `ctx.sessionManager.getSessionId()`
+//! on the extension context each handler receives. A cold restore after a
+//! reboot resumes the tab's conversation by it; a Pi build whose context has
+//! no session manager simply reports without one.
 
 use std::path::Path;
 
@@ -121,6 +127,18 @@ export default function (pi: any) {{
     }}
   }};
 
+  // The id this {name} session resumes by, read from the extension context
+  // every handler receives. Guarded end to end: an older {name} whose context
+  // has no session manager reports without it rather than failing the hook.
+  const sessionIdOf = (ctx: any): string | undefined => {{
+    try {{
+      const id = ctx?.sessionManager?.getSessionId?.();
+      return typeof id === "string" && id.length > 0 ? id : undefined;
+    }} catch {{
+      return undefined;
+    }}
+  }};
+
   // The text parts of a message, joined — the same shape Claude uses, so the
   // reader on the other side is the same one.
   const textOf = (message: any): string | undefined => {{
@@ -145,23 +163,26 @@ export default function (pi: any) {{
   // Turn start. Both spellings are subscribed because which one a given {name}
   // dispatches has moved between versions.
   for (const event of ["before_agent_start", "agent_start"]) {{
-    on(event, () => {{
+    on(event, (_event: any, ctx: any) => {{
       lastMessage = undefined;
-      report("working");
+      report("working", {{ session_id: sessionIdOf(ctx) }});
     }});
   }}
 
-  on("tool_execution_start", (event: any) => {{
-    report("working", {{ tool_name: event?.tool_name ?? event?.toolName }});
+  on("tool_execution_start", (event: any, ctx: any) => {{
+    report("working", {{
+      tool_name: event?.tool_name ?? event?.toolName,
+      session_id: sessionIdOf(ctx),
+    }});
   }});
 
-  on("message_end", (event: any) => {{
+  on("message_end", (event: any, ctx: any) => {{
     const message = event?.message;
     const text = textOf(message);
     if (!text) return;
     // The user's own message is the row's title; the agent's is what it said.
     if (message?.role === "user") {{
-      report("working", {{ prompt: text }});
+      report("working", {{ prompt: text, session_id: sessionIdOf(ctx) }});
     }} else if (message?.role === "assistant") {{
       lastMessage = text;
     }}
@@ -171,8 +192,11 @@ export default function (pi: any) {{
   // `session_shutdown` covers Ctrl+C, /quit and a reload, any of which would
   // otherwise leave the row stuck on working forever.
   for (const event of ["agent_end", "session_shutdown"]) {{
-    on(event, () => {{
-      report("idle", lastMessage ? {{ last_assistant_message: lastMessage }} : {{}});
+    on(event, (_event: any, ctx: any) => {{
+      report("idle", {{
+        ...(lastMessage ? {{ last_assistant_message: lastMessage }} : {{}}),
+        session_id: sessionIdOf(ctx),
+      }});
     }});
   }}
 }}
@@ -193,6 +217,16 @@ mod tests {
         let src = rendered();
         assert!(src.contains("/Applications/OxiMux.app/Contents/MacOS/oximux"));
         assert!(src.contains(r#""agent-status", "--state", state, "--format", "pi""#));
+    }
+
+    #[test]
+    fn every_report_carries_the_session_id_the_agent_resumes_by() {
+        // The accessor is the one Pi's extension context exposes; each of the
+        // four report sites passes it, so a cold restore has an id to resume
+        // by whichever event last fired.
+        let src = rendered();
+        assert!(src.contains("ctx?.sessionManager?.getSessionId?.()"));
+        assert_eq!(src.matches("session_id: sessionIdOf(ctx)").count(), 4);
     }
 
     #[test]
