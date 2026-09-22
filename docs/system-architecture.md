@@ -956,6 +956,29 @@ The same meta carries the shell child's **OS pid** (seeded at spawn). Because th
 
 This path is distinct from routine restore, which stays replay-free (the no-grid-replay invariant above is unchanged): cold restore trades reflow perfection for not losing the scrollback entirely, and the marker makes clear the content is history, not live state. `prefill_grid` ends with `clear_collected`, so query auto-replies recorded in the crashed session can't reach the new shell's stdin.
 
+### Agent resume on cold restore
+
+No process survives a reboot; what differs is what gets resumed. A cockpit agent tab respawned with `SessionResumption::None` would be a brand-new conversation under the old title, so restore carries one field end to end: the agent's **own** session id (what `claude --resume <id>` / `codex resume <id>` / `pi --session <id>` / `omp --resume <id>` take), distinct from the relay PTY id and from OxiMux's `AgentSessionId`.
+
+```
+CLI hook stdin {session_id,…} ──oximux agent-status──▶ OSC 9999 {"v":1,"state":..,"session_id":..}
+  (agent_hook_dialects::session_id; Pi/omp extension reads ctx.sessionManager.getSessionId())
+  ──▶ AgentOscScanner ──▶ poll_helpers: carried across every snapshot like `last_message`
+  ──▶ AgentSnapshot.detail.session_id on the tab's status_rx
+  ──▶ snapshot: PersistedAgentTab.provider_session (validated [A-Za-z0-9_.-]{1,64}; serde-default)
+        ── reboot / relay death ──
+  ──▶ restore_agent_tab: warm re-attach unchanged; cold spawn uses
+        agent_resume::restore_resumption(adapter, id) → Resume{id} | None
+```
+
+**Three markers, one style** (`relay_cold_restore::RestoreMarker`, dim, CRLF-framed): `--- session restored ---` (plain terminal scrollback, byte-identical to before), `--- resuming previous session ---` (cockpit tab spawned on the persisted id), `--- previous session unavailable, started fresh ---` (no id, `Custom` adapter, or fallback). A warm re-attach prints nothing. The marker is prefilled inside the same update closure that mounts the tab, as early as the mount allows (the grid takes bytes as the backend pumps them; a CLI's first frame is normally hundreds of milliseconds out).
+
+**Fallback rule** (`agent_resume::should_fallback`): if a resumed CLI's non-zero exit (`Failed(_)` / `Done{code≠0}`) is observed within 5 s of spawn (the failure check runs before the deadline check, so a stalled timer still acts on an early exit), the runtime cancels it, spawns once with `None`, and `PaneGroup::replace_agent_session` swaps the session behind the same tab (slot, label, colour, pin kept; `TerminalView::replace_live_session` re-arms the drain) under the "started fresh" marker. Silence never triggers, and a clean exit is the user quitting. The tab's status watcher (toast + OS banner) is muted for the verdict window so a rejected resume never reads as "failed" a beat before the swap. On the resume path the `agent_sessions` row claim (`spawn_for_session(.., restoring = true)`) waits for that verdict, so a rejected resume never stamps its failed exit onto the claimed row and the fresh session claims the same row — no duplicate rail row. Codex resumes with `resume`, never `fork`.
+
+**Hand-typed agents in a plain terminal** have no cockpit tab, but the per-PTY ambient record (`ambient_agent:<pty_id>`) carries the process-scan label and the hooks' `session_id`. The record is readable for the rail for 30 min (unchanged) and for a resume offer for **7 days** (`ambient_state::load_for_resume`, matching checkpoint GC). On a cold spawn whose dead PTY had such a record, the pane prefills a dim hint under the restored marker and pre-types the resume line (`agent_resume::resume_shell_line`) at the fresh prompt via `TerminalView::queue_input_on_first_output` — delivered once the shell has produced output and then stayed quiet for 400 ms (so it lands at the prompt, not inside rc-file chatter), or after 3 s for a shell that prints nothing; never with a newline; dropped by any earlier keystroke. The record is dropped when the process scan sees the agent leave the shell, and the hook reading is reset when the scan sees a different agent, so a label and an id from two different agents are never paired. The record is forgotten once the offer is delivered, like the checkpoint.
+
+Every restored agent tab logs `agent restore` with `warm`, `resumed` and `fallback` flags. Resume does not depend on the relay's shutdown: the id lives in the app's persisted layout, not in a relay checkpoint. The relay's final checkpoint pass on SIGTERM (`server.rs`, best-effort) only freshens the scrollback shown above the marker; a relay killed before it runs still restores from the last 5 s periodic checkpoint.
+
 ---
 
 ## Shell context env — SurfaceIds (mux-P4)
