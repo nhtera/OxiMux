@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-22 — Ignored folders look ignored, and the tree knows it at launch (`fix/explorer-ignored-folder-style`)
+
+- **A git-ignored folder now dims like an ignored file.** Revealing ignored
+  entries with the eye toggle used to show folders at full strength —
+  indistinguishable from tracked ones — because a directory's style was read
+  from the propagated folder status, which deliberately never carries
+  `Ignored`. Git reports an ignored directory as an ordinary record, so the
+  verdict was sitting in the file map all along. Folders read it now, their
+  icon and chevron dim with the label, and everything inside an expanded
+  ignored tree dims too. The circle-slash mark stays on the entry git named
+  rather than repeating on every row beneath it.
+- **The tree no longer starts with no git status at all.** After a relaunch
+  the Explorer came up with no badges, no eye toggle and every ignored entry
+  visible, and only woke up once you edited a file. The status channel is
+  pre-loaded with the last known state and stays quiet when a poll matches
+  it, so a panel that waited for a change waited forever. The Explorer now
+  adopts what the channel already holds when it is built, the way the source
+  control panel always has.
+
 ### 2026-09-22 — Paste lands in the terminal find box (`claude/terminal-search-paste-fix`)
 
 - **⌘V pastes into the search overlay, not the shell.** With the find box
