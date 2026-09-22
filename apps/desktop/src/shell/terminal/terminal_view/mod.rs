@@ -679,6 +679,26 @@ pub struct TerminalView {
     /// signal that holds while an agent sits idle. Read by
     /// [`agent_process`](Self::agent_process).
     proc_scan: crate::shell::agent_process_scan::AgentProcessScan,
+    /// Process-scan label written alongside the last ambient reading, so a
+    /// late identification (the tree names the agent after its first hook
+    /// already fired) still re-writes the record — that label is what a cold
+    /// restore after a reboot builds the resume command from.
+    last_persisted_agent: Option<&'static str>,
+    /// Bytes to type at the shell the first time it produces output after a
+    /// cold restore (its prompt): the resume command for a hand-typed agent
+    /// that ran in the dead PTY, pre-filled for the user to confirm — never
+    /// sent with a newline. Dropped by the first keystroke that lands before
+    /// the drain, and on exit. See
+    /// [`queue_input_on_first_output`](Self::queue_input_on_first_output).
+    queued_first_output_input: Option<Vec<u8>>,
+    /// When the shell last produced output while the queue above was armed.
+    /// The bytes go out only after a short quiet gap, so they land at the
+    /// prompt rather than interleaved with the shell's start-up chatter
+    /// (`.zshrc` warnings, banner lines) that precedes it.
+    queued_input_last_output: Option<std::time::Instant>,
+    /// Fallback for the queue above: some prompts print nothing until a key
+    /// arrives, so the bytes are delivered after a short wait regardless.
+    _queued_input_timer: Option<Task<()>>,
 }
 
 mod input;

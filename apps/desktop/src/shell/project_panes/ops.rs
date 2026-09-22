@@ -707,11 +707,20 @@ impl ProjectPanes {
                         model,
                         effort,
                         profile,
+                        status_rx,
                         ..
                     } => {
                         if matches!(adapter, AgentAdapter::Custom) {
                             continue;
                         }
+                        // The agent's own conversation id, from its latest hook
+                        // sideband. A cold restore resumes by it; `None` until
+                        // the first hook fires (nothing to resume yet). Read
+                        // off the watch channel — no daemon round-trip.
+                        let provider_session =
+                            crate::session_restore::agent_resume::provider_session_from_snapshot(
+                                &status_rx.borrow(),
+                            );
                         // Capture the live daemon PTY id (if the agent ran
                         // through the relay) so restore can re-attach to the
                         // still-running CLI instead of respawning it. Paired
@@ -741,6 +750,7 @@ impl ProjectPanes {
                                 relay_external_id,
                                 relay_session,
                                 profile: profile.clone(),
+                                provider_session,
                             }),
                             PersistedTabKind::Terminal,
                         )
@@ -935,7 +945,10 @@ impl ProjectPanes {
     }
 
     /// Append a restored agent tab to the active group. Builds the view
-    /// internally so the call shape mirrors the legacy strip.
+    /// internally so the call shape mirrors the legacy strip. `marker` is the
+    /// cold-restore marker to prefill (`None` on a warm re-attach, whose live
+    /// PTY still holds the conversation); it lands inside this same update,
+    /// as early as the mount allows.
     #[allow(clippy::too_many_arguments)]
     pub fn push_restored_agent_tab(
         &mut self,
@@ -947,6 +960,7 @@ impl ProjectPanes {
         backend: SharedBackend,
         term_id: TerminalSessionId,
         meta: RestoredTabMeta,
+        marker: Option<&[u8]>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -969,11 +983,61 @@ impl ProjectPanes {
                 window,
                 cx,
             );
+            if let Some(bytes) = marker {
+                g.prefill_agent_tab(idx, bytes, cx);
+            }
             // Agent tabs mount async — after the persisted `tab_order` was
             // already applied — so this re-settles the tab into its saved
             // visual slot (and restores its color/title/pin/preview state).
             g.place_restored_tab(idx, meta, cx);
         });
+    }
+
+    /// Arm (`true`) or disarm the status watcher of the restored agent tab
+    /// holding `session` — see `PaneGroup::set_agent_status_watch`.
+    pub fn set_restored_agent_status_watch(
+        &mut self,
+        target_group: Option<PaneGroupId>,
+        session: AgentSessionId,
+        armed: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let group = match target_group {
+            Some(id) => self.groups.get(&id).cloned(),
+            None => self.active_group(),
+        };
+        let Some(group) = group else {
+            return false;
+        };
+        group.update(cx, |g, cx| g.set_agent_status_watch(session, armed, cx))
+    }
+
+    /// The cockpit resume fallback: swap the CLI session behind the restored
+    /// agent tab holding `old` (in `target_group`, or the active group for a
+    /// legacy single-group restore) for the fresh session `new`. Returns
+    /// `false` when the tab is gone — the caller then cancels `new`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_restored_agent_session(
+        &mut self,
+        target_group: Option<PaneGroupId>,
+        old: AgentSessionId,
+        new: AgentSessionId,
+        status_rx: AgentStatusStream,
+        backend: SharedBackend,
+        term_id: TerminalSessionId,
+        marker: &[u8],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let group = match target_group {
+            Some(id) => self.groups.get(&id).cloned(),
+            None => self.active_group(),
+        };
+        let Some(group) = group else {
+            return false;
+        };
+        group.update(cx, |g, cx| {
+            g.replace_agent_session(old, new, status_rx, backend, term_id, marker, cx)
+        })
     }
 
     /// Finalize a restore: re-apply the saved visual `tab_order`,
@@ -1186,6 +1250,7 @@ impl ProjectPanes {
         backend: SharedBackend,
         term_id: TerminalSessionId,
         meta: RestoredTabMeta,
+        marker: Option<&[u8]>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1208,6 +1273,9 @@ impl ProjectPanes {
                 window,
                 cx,
             );
+            if let Some(bytes) = marker {
+                g.prefill_agent_tab(idx, bytes, cx);
+            }
             g.place_restored_tab(idx, meta, cx);
         });
     }

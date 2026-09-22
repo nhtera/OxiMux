@@ -36,6 +36,7 @@ fn agent_tab(worktree: &str) -> PersistedAgentTab {
         relay_external_id: None,
         relay_session: None,
         profile: None,
+        provider_session: None,
     }
 }
 

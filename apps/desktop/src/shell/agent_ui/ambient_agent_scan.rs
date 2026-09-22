@@ -72,6 +72,14 @@ impl AmbientAgentScan {
         }
     }
 
+    /// Drop the current reading. Called when the process tree shows the agent
+    /// that produced it is gone or has been replaced by another: the status,
+    /// prompt and session id belonged to that process, and a reading carried
+    /// across would attribute one agent's conversation to the next.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     /// Feed one PTY output chunk. The scanner runs only when a sideband marker
     /// is present (or a prior sequence is still mid-parse), so a plain shell's
     /// output costs one substring scan and no allocation.

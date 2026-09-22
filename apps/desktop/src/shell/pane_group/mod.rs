@@ -16,6 +16,7 @@ pub mod tab_drag_zones;
 #[cfg(test)]
 mod e2e_tests;
 mod actions;
+mod agent_restore;
 mod state;
 mod tabs;
 

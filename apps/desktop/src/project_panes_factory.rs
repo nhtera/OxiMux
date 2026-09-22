@@ -16,13 +16,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AppContext, Context, Entity, SharedString, WeakEntity, Window};
-use oximux_agents::{AgentRuntime, AgentSessionConfig, CliRuntime};
-use oximux_core::AgentAdapter;
+use gpui::{AppContext, AsyncWindowContext, Context, Entity, SharedString, WeakEntity, Window};
+use oximux_agents::{AgentRuntime, AgentSessionConfig, AgentStatusStream, CliRuntime, SharedBackend};
+use oximux_core::{AgentAdapter, AgentSessionId};
+use oximux_pty::TerminalSessionId;
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::{PaneBufferRepo, SettingsRepo};
 
 use crate::notifier::Notifier;
+use crate::relay_cold_restore::{RestoreMarker, marker};
 use crate::persisted_terminals::{
     PersistedAgentTab, PersistedAxis, PersistedSubPane, PersistedTab, PersistedTabKind,
     PersistedTabs, PersistedTree, WINDOWS_MANIFEST_KEY, WindowsManifest, legacy_settings_key,
@@ -779,6 +781,15 @@ fn restore_agent_tab(
             )
         })
         .unwrap_or_default();
+    // Cold spawn resumes the agent's OWN conversation when the snapshot
+    // captured its id and the adapter can (`claude --resume`, `codex resume`,
+    // …). Only the cold path reads this: a warm re-attach adopts the live
+    // process, whose conversation never went anywhere.
+    let resumption = crate::session_restore::agent_resume::restore_resumption(
+        persisted.adapter,
+        persisted.provider_session.as_deref(),
+    );
+    let attempted_resume = !matches!(resumption, oximux_core::SessionResumption::None);
     let cfg = AgentSessionConfig {
         adapter: persisted.adapter,
         worktree_path: PathBuf::from(&persisted.worktree_path),
@@ -790,7 +801,7 @@ fn restore_agent_tab(
         cols: DEFAULT_AGENT_COLS,
         rows: DEFAULT_AGENT_ROWS,
         custom_command: None,
-        resumption: oximux_core::SessionResumption::None,
+        resumption,
     };
     let persisted_clone = persisted.clone();
     cx.spawn_in(window, async move |root, cx| {
@@ -844,6 +855,13 @@ fn restore_agent_tab(
             None
         };
 
+        let warm = attached.is_some();
+        // The fresh-start config, kept for the resume fallback below: a CLI
+        // that rejects the persisted id is respawned once with this.
+        let fresh_cfg = AgentSessionConfig {
+            resumption: oximux_core::SessionResumption::None,
+            ..cfg.clone()
+        };
         let (session_id, backend, term_id, status_rx) = match attached {
             Some(t) => t,
             None => {
@@ -888,31 +906,54 @@ fn restore_agent_tab(
         // Re-adopt the pre-restart agent_sessions row (the boot sweep marked it
         // Interrupted): `restoring = true` flips that same row back to live and
         // keeps its persisted title, instead of orphaning it and inserting a
-        // duplicate "Claude Code" row.
-        let _ = root.update(cx, |this, cx| {
-            crate::shell::agent_session_persistence::spawn_for_session(
-                this,
-                persisted_clone.worktree_path.clone(),
-                adapter_id,
-                persisted_clone.model.clone(),
-                persisted_clone.effort.clone(),
-                session_id,
-                status_rx.clone(),
-                true,
-                cx,
-            );
+        // duplicate "Claude Code" row. On a cold RESUME this waits for the
+        // watchdog's verdict below: a rejected resume must not stamp its
+        // failed exit onto the claimed row, and the fresh session must claim
+        // that same row rather than insert a second one.
+        let cold_resume = !warm && attempted_resume;
+        let claim_row = |root: &WeakEntity<WorkspaceRoot>,
+                         cx: &mut AsyncWindowContext,
+                         session_id: AgentSessionId,
+                         status_rx: AgentStatusStream| {
+            let _ = root.update(cx, |this, cx| {
+                crate::shell::agent_session_persistence::spawn_for_session(
+                    this,
+                    persisted_clone.worktree_path.clone(),
+                    adapter_id,
+                    persisted_clone.model.clone(),
+                    persisted_clone.effort.clone(),
+                    session_id,
+                    status_rx,
+                    true,
+                    cx,
+                );
+            });
+        };
+        if !cold_resume {
+            claim_row(&root, cx, session_id, status_rx.clone());
+        }
+        // A warm re-attach prints nothing (the live PTY holds the
+        // conversation); a cold spawn says which of the two things happened.
+        let mount_marker = (!warm).then(|| {
+            marker(if attempted_resume {
+                RestoreMarker::Resumed
+            } else {
+                RestoreMarker::StartedFresh
+            })
         });
-        let mount = panes.update_in(cx, |p, window, cx| match target_group {
+        let mount = panes.update_in(cx, |p, window, cx| {
+            match target_group {
             Some(group_id) => p.push_restored_agent_tab_in(
                 group_id,
                 &persisted_clone,
                 adapter_id,
                 label,
                 session_id,
-                status_rx,
+                status_rx.clone(),
                 backend,
                 term_id,
                 meta,
+                mount_marker,
                 window,
                 cx,
             ),
@@ -921,13 +962,20 @@ fn restore_agent_tab(
                 adapter_id,
                 label,
                 session_id,
-                status_rx,
+                status_rx.clone(),
                 backend,
                 term_id,
                 meta,
+                mount_marker,
                 window,
                 cx,
             ),
+            }
+            // Muted for the verdict window: a rejected resume exits failed,
+            // and the watcher would toast it a beat before the fallback swap.
+            if cold_resume {
+                p.set_restored_agent_status_watch(target_group, session_id, false, cx);
+            }
         });
         if mount.is_err() {
             tracing::warn!(
@@ -935,9 +983,97 @@ fn restore_agent_tab(
                 "agent restore: workspace dropped mid-spawn; cancelling orphan"
             );
             let _ = cli_runtime.cancel(session_id).await;
+            return;
         }
+        // The dead PTY's ambient reading can never be re-seeded (a cockpit tab
+        // never cold-restores through the plain-terminal offer path), so drop
+        // it rather than leave it for the 7-day retention to collect.
+        if !warm && let Some(dead_pty) = persisted_clone.relay_external_id.clone() {
+            let _ = cx.update(|_, cx| {
+                cx.background_executor()
+                    .spawn(async move { crate::shell::ambient_state::forget(&dead_pty) })
+                    .detach();
+            });
+        }
+        if !cold_resume {
+            tracing::info!(adapter = adapter_id, warm, resumed = false, fallback = false, "agent restore");
+            return;
+        }
+        // Resume watchdog: a CLI handed an id it has no transcript for exits
+        // non-zero within a second or two. Respawn fresh exactly once under
+        // the honest marker; silence never triggers (decided in the plan).
+        let Ok(executor) = cx.update(|_, cx| cx.background_executor().clone()) else {
+            return;
+        };
+        let rejected =
+            crate::session_restore::agent_resume::resume_rejected(&status_rx, &executor).await;
+        let (session_id, status_rx) = if rejected {
+            tracing::warn!(adapter = adapter_id, "agent restore: CLI rejected the persisted session; starting fresh");
+            let _ = cli_runtime.cancel(session_id).await;
+            let Some(fresh) = start_fresh_agent_session(&cli_runtime, fresh_cfg, adapter_id).await else {
+                return;
+            };
+            let (fresh_id, fresh_backend, fresh_term, fresh_rx) = fresh;
+            let swapped = panes.update(cx, |p, cx| {
+                p.replace_restored_agent_session(
+                    target_group,
+                    session_id,
+                    fresh_id,
+                    fresh_rx.clone(),
+                    fresh_backend,
+                    fresh_term,
+                    marker(RestoreMarker::StartedFresh),
+                    cx,
+                )
+            });
+            if !matches!(swapped, Ok(true)) {
+                tracing::warn!(?fresh_id, "agent restore: tab gone before fallback; cancelling orphan");
+                let _ = cli_runtime.cancel(fresh_id).await;
+                return;
+            }
+            (fresh_id, fresh_rx)
+        } else {
+            // The resume took: arm the watcher that was muted at mount.
+            let _ = panes.update(cx, |p, cx| {
+                p.set_restored_agent_status_watch(target_group, session_id, true, cx)
+            });
+            (session_id, status_rx)
+        };
+        claim_row(&root, cx, session_id, status_rx);
+        tracing::info!(adapter = adapter_id, warm, resumed = !rejected, fallback = rejected, "agent restore");
     })
     .detach();
+}
+
+/// Spawn a fresh (non-resumed) agent session and subscribe to it: the resume
+/// fallback's spawn, mirroring the cold-spawn arm of `restore_agent_tab`.
+/// `None` when any step fails (logged); a session that was started is
+/// cancelled before returning so nothing is orphaned.
+async fn start_fresh_agent_session(
+    cli_runtime: &Arc<CliRuntime>,
+    cfg: AgentSessionConfig,
+    adapter_id: &'static str,
+) -> Option<(AgentSessionId, SharedBackend, TerminalSessionId, AgentStatusStream)> {
+    let session_id = match cli_runtime.start_session(cfg).await {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(?err, adapter = adapter_id, "agent restore: fallback start_session failed");
+            return None;
+        }
+    };
+    let wired = cli_runtime.backend_for(session_id).and_then(|backend| {
+        let term_id = cli_runtime.terminal_session_id(session_id)?;
+        let status_rx = cli_runtime.subscribe_status(session_id)?;
+        Ok((session_id, backend, term_id, status_rx))
+    });
+    match wired {
+        Ok(t) => Some(t),
+        Err(err) => {
+            tracing::warn!(?err, adapter = adapter_id, "agent restore: fallback wiring failed");
+            let _ = cli_runtime.cancel(session_id).await;
+            None
+        }
+    }
 }
 
 /// Spawn one fresh PTY + TerminalView per leaf in `tab.sub_panes`, then
@@ -1285,6 +1421,7 @@ pub(crate) fn spawn_attach_reconcile(
             let cwd = entry.cwd;
             let env = entry.env;
             let ckpt_dir = checkpoints_dir.clone();
+            let dead_pty = raw_hint.clone();
             let result = executor
                 .spawn(async move {
                     // Warm re-attach first; a failed attach (PTY died between
@@ -1292,7 +1429,7 @@ pub(crate) fn spawn_attach_reconcile(
                     // itself falls back to an in-process PTY when the relay
                     // is unreachable.
                     if let Some(live) = hint.as_deref().and_then(attach_pty_existing) {
-                        return Some((live, None));
+                        return Some((live, None, None));
                     }
                     // Cold spawn means the daemon lost this PTY. If it died
                     // uncleanly it left a disk checkpoint — recover the
@@ -1304,6 +1441,12 @@ pub(crate) fn spawn_attach_reconcile(
                         }
                         _ => None,
                     };
+                    // A hand-typed agent in the dead PTY left its label and
+                    // conversation id in the ambient record: the fresh shell
+                    // then gets the resume command pre-typed at its prompt.
+                    let offer = raw_hint
+                        .as_deref()
+                        .and_then(crate::shell::ambient_state::load_for_resume);
                     // The checkpoint's cwd is the dead shell's LIVE working
                     // directory (kernel-resolved by the daemon each tick) —
                     // fresher than the persisted layout cwd, so the revived
@@ -1316,13 +1459,17 @@ pub(crate) fn spawn_attach_reconcile(
                         .unwrap_or(cwd);
                     let spawn_dims = cold.as_ref().and_then(|(restore, _)| restore.dims);
                     crate::shell::terminal_view::spawn_local_pty_sized(spawn_cwd, env, spawn_dims)
-                        .map(|session| (session, cold))
+                        .map(|session| (session, cold, offer))
                 })
                 .await;
-            let Some(((backend, session_id), cold)) = result else {
+            let Some(((backend, session_id), cold, offer)) = result else {
                 tracing::warn!("attach reconcile: spawn failed; pane stays empty");
                 continue;
             };
+            let resume_line = offer.as_ref().and_then(|o| {
+                crate::session_restore::agent_resume::resume_shell_line(&o.agent_label, &o.session_id)
+                    .map(|line| (o.agent_label.clone(), line))
+            });
             let delivered = entry.view.update(cx, |view, cx| {
                 let adopted = view.adopt_live_session(backend.clone(), session_id, cx);
                 if adopted {
@@ -1335,6 +1482,12 @@ pub(crate) fn spawn_attach_reconcile(
                         // A cwd-only restore (no replayable scrollback) skips
                         // this — blank grid, recovered spawn dir.
                         view.prefill_grid(&restore.bytes);
+                    }
+                    // Under the marker: a dim hint, then the resume command
+                    // pre-typed at the prompt once the shell has drawn it.
+                    if let Some((agent_label, line)) = &resume_line {
+                        view.prefill_grid(&crate::relay_cold_restore::resume_hint(agent_label));
+                        view.queue_input_on_first_output(line.clone().into_bytes(), cx);
                     }
                     // A warm re-attach reuses the surviving daemon PTY, so a
                     // hand-typed agent still running in it can be re-listed from
@@ -1383,6 +1536,14 @@ pub(crate) fn spawn_attach_reconcile(
                                 // must not be re-seeded onto an unrelated PTY.
                                 crate::shell::ambient_state::forget(&pty_id);
                             })
+                            .detach();
+                    } else if resume_line.is_some()
+                        && let Some(pty_id) = dead_pty
+                    {
+                        // No checkpoint to consume, but the resume offer was
+                        // delivered: one-shot, like the checkpoint.
+                        executor
+                            .spawn(async move { crate::shell::ambient_state::forget(&pty_id) })
                             .detach();
                     }
                 }

@@ -769,6 +769,10 @@ impl TerminalView {
 
     pub(super) fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         input_trace(&format!("key_down key={}", event.keystroke.key));
+        // The user typed before a cold restore's pre-filled resume command
+        // was delivered: their keystrokes win, the offer is dropped rather
+        // than appended after them.
+        self.queued_first_output_input = None;
         // Anything the search overlay took belongs to the overlay, so claim it
         // — that is what keeps a character typed into the search box out of the
         // shell. Without the claim the same key still reaches the platform
