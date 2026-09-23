@@ -164,8 +164,10 @@ pub fn maybe_inject(settings_enabled: bool, extra_args: &mut Vec<String>) {
     if !(settings_enabled || env_forced()) {
         return;
     }
+    // The shim, as the global install writes it: the command strings must be
+    // byte-identical for Claude's dedup to fire each hook once.
     let binary_path = match std::env::current_exe() {
-        Ok(p) => p,
+        Ok(p) => crate::hook_shim::hook_program(&p),
         Err(err) => {
             tracing::warn!(%err, "status-hooks: enabled but current_exe failed; skipping injection");
             return;

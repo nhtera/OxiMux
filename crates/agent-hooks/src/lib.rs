@@ -19,13 +19,16 @@
 //! the extraction moved no code at all. The desktop re-exports all four under
 //! their historical `oximux_app::…` paths for the same reason.
 //!
-//! **No gpui, no platform cfgs.** The whole crate is `std`, paths, and JSON —
+//! **No gpui, and one platform cfg** (the hook shim's executable bit, Unix
+//! only). The whole crate is otherwise `std`, paths, and JSON —
 //! which is what made it extractable, and what lets `oximux agent hooks` work
 //! on a headless host with no app running.
 
 pub mod agent_hook_dialects;
 pub mod agent_hooks_global;
 pub mod agent_status_hooks;
+/// The stable file installed hooks run, which picks the binary at run time.
+pub mod hook_shim;
 pub mod pi_status_extension;
 /// What is installed right now, read back off disk.
 pub mod inspect;

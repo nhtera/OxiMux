@@ -42,14 +42,18 @@ fn selected(agent: Option<&str>) -> Result<Vec<&'static HookDialect>, Failure> {
 /// an app bundle is replaced wholesale by every update, which is why the app
 /// refreshes these paths on each boot. On a headless host there is no bundle to
 /// find at all, and this is the only binary there is.
+///
+/// Named through the hook shim, as the app does, so a CLI run from a build
+/// tree never leaves every agent on the machine calling a build output.
 fn hook_binary() -> Result<PathBuf, Failure> {
-    std::env::current_exe().map_err(|err| {
+    let exe = std::env::current_exe().map_err(|err| {
         Failure::new(
             "io",
             exit::ERROR,
             format!("cannot resolve this binary's own path, so no hook can call back into it: {err}"),
         )
-    })
+    })?;
+    Ok(oximux_agent_hooks::hook_shim::hook_program(&exe))
 }
 
 /// `agent hooks status`.
