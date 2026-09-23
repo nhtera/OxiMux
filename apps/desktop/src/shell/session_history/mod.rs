@@ -18,9 +18,13 @@
 pub mod picker;
 
 use gpui::{
-    Animation, AnimationExt, App, Context, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Task, Window, div, hsla, prelude::FluentBuilder, px,
+    AnyElement, Animation, AnimationExt, App, AppContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
+    hsla, prelude::FluentBuilder, px,
+};
+use gpui_component::input::{
+    Enter as InputEnter, Escape as InputEscape, Input, InputEvent, InputState, MoveDown, MoveUp,
 };
 use gpui_component::{Icon, IconName};
 use oximux_settings::{Density, Theme, Typography};
@@ -34,6 +38,7 @@ use oximux_agents::session_log::{
 
 use crate::actions::{
     CycleSessionTypeFilter, OpenChatSession, OpenHistoryEntryAsChat, ResumeAgentSession,
+    ToggleSessionHistoryScope,
 };
 use crate::shell::agent_ui::agent_presentation::adapter_icon_path;
 use crate::shell::session_history::picker::{AGENT_TYPE_FILTERS, AgentTypeFilter, LaunchKind};
@@ -44,27 +49,34 @@ use crate::ui::FloatingSurface;
 /// focused (mirrors the terminal's context-scoped shadow bindings).
 const SESSION_HISTORY_KEY_CONTEXT: &str = "SessionHistoryModal";
 
-/// Install the modal-scoped `Cmd+Enter` → [`OpenHistoryEntryAsChat`] binding.
-/// Context-scoped so it never shadows `Cmd+Enter` elsewhere. Called once at
-/// boot alongside the global keymap. It must be a keymap action (not an
-/// `on_key_down` case) because macOS delivers Cmd-modified keys via
-/// `performKeyEquivalent:`, bypassing element key listeners.
+/// The same context narrowed to the modal's focused search `Input`. The
+/// input binds `Tab`, `Cmd+Enter` and `Ctrl+A` itself, and GPUI ranks a
+/// binding by the depth its context matches at — so a plain
+/// `SessionHistoryModal` binding loses to the input's. Matching at the
+/// input's own depth ties it, and the later registration (ours, after
+/// `gpui_component::init`) wins the tie.
+const SESSION_HISTORY_INPUT_KEY_CONTEXT: &str = "SessionHistoryModal > Input";
+
+/// Install the modal-scoped bindings: `Cmd+Enter` → [`OpenHistoryEntryAsChat`],
+/// `Tab` → [`CycleSessionTypeFilter`], `Ctrl+A` → [`ToggleSessionHistoryScope`].
+/// Context-scoped so they never shadow those chords elsewhere. Called once at
+/// boot alongside the global keymap. They must be keymap actions (not
+/// `on_key_down` cases): macOS delivers Cmd-modified keys via
+/// `performKeyEquivalent:`, GPUI consumes `Tab` for focus-navigation, and the
+/// focused search input claims all three before element key listeners run.
+/// Each is bound twice — for the modal root and for the search input inside it.
 pub fn register_session_history_key_bindings(cx: &mut App) {
-    cx.bind_keys([
-        gpui::KeyBinding::new(
+    let mut bindings = Vec::new();
+    for context in [SESSION_HISTORY_KEY_CONTEXT, SESSION_HISTORY_INPUT_KEY_CONTEXT] {
+        bindings.push(gpui::KeyBinding::new(
             "secondary-enter",
             OpenHistoryEntryAsChat,
-            Some(SESSION_HISTORY_KEY_CONTEXT),
-        ),
-        // `Tab` cycles the agent-type filter. A context-scoped binding, not an
-        // `on_key_down` case: GPUI consumes `Tab` for focus-navigation before it
-        // reaches element key listeners, so it must be a keymap action.
-        gpui::KeyBinding::new(
-            "tab",
-            CycleSessionTypeFilter,
-            Some(SESSION_HISTORY_KEY_CONTEXT),
-        ),
-    ]);
+            Some(context),
+        ));
+        bindings.push(gpui::KeyBinding::new("tab", CycleSessionTypeFilter, Some(context)));
+        bindings.push(gpui::KeyBinding::new("ctrl-a", ToggleSessionHistoryScope, Some(context)));
+    }
+    cx.bind_keys(bindings);
 }
 
 const MODAL_WIDTH: f32 = 940.0;
@@ -108,10 +120,12 @@ pub struct SessionHistoryModal {
     /// Bumped per preview load so a slow read can't clobber a newer selection.
     preview_gen: u64,
     _preview_task: Option<Task<()>>,
-    /// Blinking-caret phase for the search field (true = caret drawn) so it
-    /// reads as a live input. Toggled by `_caret_blink`.
-    caret_on: bool,
-    _caret_blink: Task<()>,
+    /// The search field — a real text input, so paste, IME composition and
+    /// caret movement work. Created lazily on first `open` (the constructor
+    /// runs without a `&mut Window`, which `InputState` needs). `query`
+    /// mirrors its value via `_query_sub`.
+    query_input: Option<Entity<InputState>>,
+    _query_sub: Option<Subscription>,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -136,45 +150,14 @@ impl SessionHistoryModal {
             preview_loading: false,
             preview_gen: 0,
             _preview_task: None,
-            caret_on: true,
-            _caret_blink: Self::start_caret_blink(cx),
+            query_input: None,
+            _query_sub: None,
             focus_handle: cx.focus_handle(),
             theme,
             density,
             typography,
             _load_task: None,
         }
-    }
-
-    /// Period of the query-caret blink. Matches the common text-cursor cadence.
-    const CARET_BLINK_MS: u64 = 530;
-
-    /// Toggle the caret on a fixed cadence so the search field reads as an
-    /// editable input. Runs for the entity's lifetime; only flips state +
-    /// repaints while the modal is open.
-    fn start_caret_blink(cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            loop {
-                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
-                else {
-                    return;
-                };
-                executor
-                    .timer(std::time::Duration::from_millis(Self::CARET_BLINK_MS))
-                    .await;
-                if this
-                    .update(cx, |m, cx| {
-                        if m.open {
-                            m.caret_on = !m.caret_on;
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
     }
 
     /// Open the modal, focus its query field, and scan past sessions.
@@ -186,15 +169,60 @@ impl SessionHistoryModal {
         self.open = true;
         self.query.clear();
         self.selected_idx = 0;
-        // Solid caret on open; the blink task takes over from here.
-        self.caret_on = true;
         self.now_ms = now_unix_ms();
         self.scope_paths = scope_paths;
         self.show_all = self.scope_paths.is_empty();
         self.type_filter = AgentTypeFilter::All;
-        window.focus(&self.focus_handle, cx);
+        let input = self.ensure_query_input(window, cx);
+        input.update(cx, |s, cx| s.set_value("", window, cx));
+        self.focus_query(window, cx);
         self.rescan(cx);
         cx.notify();
+    }
+
+    /// The search input, created on first use and mirrored into `query` on
+    /// every edit (typing, paste, IME commit, delete).
+    fn ensure_query_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some(input) = &self.query_input {
+            return input.clone();
+        }
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search past sessions…"));
+        let sub = cx.subscribe_in(&input, window, |this, input, ev: &InputEvent, _window, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.query = input.read(cx).value().to_string();
+                this.selected_idx = 0;
+                this.refresh_preview(cx);
+                cx.notify();
+            }
+        });
+        self.query_input = Some(input.clone());
+        self._query_sub = Some(sub);
+        input
+    }
+
+    /// Put keyboard focus in the search input (falls back to the modal root
+    /// before the input exists). Typing and paste must land in the field;
+    /// nav keys still reach the modal through its capture-phase handlers.
+    fn focus_query(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.query_input {
+            Some(input) => {
+                let handle = input.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            None => window.focus(&self.focus_handle, cx),
+        }
+    }
+
+    /// `Enter` in any of its forms: plain ↵ imports on the session's
+    /// configured surface (chat when its open mode is Chat + chat-capable,
+    /// else a terminal resume); ⇧↵ forks into a terminal.
+    fn confirm(&mut self, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if shift {
+            self.launch(self.selected_idx, LaunchKind::Fork, window, cx);
+        } else {
+            self.import_selected(self.selected_idx, window, cx);
+        }
     }
 
     /// Set the agent-type segment (chip click), reset the selection, and
@@ -714,6 +742,16 @@ impl Render for SessionHistoryModal {
             .child(div().w(px(1.)).h_full().bg(theme.border_inactive))
             .child(preview);
 
+        // Borderless so it reads as part of the header row, not a boxed
+        // control inside it.
+        let query_field = match &self.query_input {
+            Some(input) => Input::new(input)
+                .appearance(false)
+                .text_size(px(typography.t_body_md))
+                .into_any_element(),
+            None => div().into_any_element(),
+        };
+
         let dismiss_entity = entity.clone();
         let card = div()
             .flex()
@@ -724,9 +762,8 @@ impl Render for SessionHistoryModal {
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_e, _window, cx| cx.stop_propagation())
             .child(header_row(
-                &self.query,
+                query_field,
                 &self.scope_label(),
-                self.caret_on,
                 theme,
                 density,
                 &typography,
@@ -766,54 +803,47 @@ impl Render for SessionHistoryModal {
             .on_action(cx.listener(|this, _: &CycleSessionTypeFilter, _window, cx| {
                 this.cycle_type_filter(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleSessionHistoryScope, _window, cx| {
+                this.toggle_show_all(cx);
+            }))
+            // The focused search `Input` turns Esc / ↵ / ↑ / ↓ into its own
+            // actions before raw key listeners on ancestors run, so they are
+            // intercepted at the CAPTURE phase (same contract as
+            // `BranchPicker`). ⌘↵ never arrives here as `Enter` — the
+            // `SESSION_HISTORY_INPUT_KEY_CONTEXT` binding outranks the input's.
+            // Known trade-off: capturing Escape preempts the input's IME-unmark
+            // path, so Escape mid-composition closes the modal.
+            .capture_action(cx.listener(|this, _: &InputEscape, _window, cx| {
+                cx.stop_propagation();
+                this.close(cx);
+            }))
+            .capture_action(cx.listener(|this, ev: &InputEnter, window, cx| {
+                cx.stop_propagation();
+                if ev.secondary {
+                    this.open_as_chat(this.selected_idx, window, cx);
+                } else {
+                    this.confirm(ev.shift, window, cx);
+                }
+            }))
+            .capture_action(cx.listener(move |this, _: &MoveUp, _window, cx| {
+                cx.stop_propagation();
+                let n = this.filtered().len();
+                this.move_selection(-1, n, cx);
+            }))
+            .capture_action(cx.listener(move |this, _: &MoveDown, _window, cx| {
+                cx.stop_propagation();
+                let n = this.filtered().len();
+                this.move_selection(1, n, cx);
+            }))
+            // Fallback for when focus sits on the modal root rather than the
+            // input (e.g. before the input exists).
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.as_str();
-                match key {
+                match event.keystroke.key.as_str() {
                     "escape" => this.close(cx),
                     "up" => this.move_selection(-1, row_count, cx),
                     "down" => this.move_selection(1, row_count, cx),
-                    "enter" => {
-                        // Plain ↵ imports on the session's configured surface
-                        // (chat when its open mode is Chat + chat-capable, else a
-                        // terminal resume); ⇧↵ forks into a terminal. ⌘↵ (force
-                        // open as chat) can't be handled here: macOS routes
-                        // Cmd-modified keys through `performKeyEquivalent:`, so
-                        // they never reach `on_key_down`. It's a modal-scoped
-                        // action instead (`OpenHistoryEntryAsChat`).
-                        if event.keystroke.modifiers.shift {
-                            this.launch(this.selected_idx, LaunchKind::Fork, window, cx);
-                        } else {
-                            this.import_selected(this.selected_idx, window, cx);
-                        }
-                    }
-                    "backspace" => {
-                        this.query.pop();
-                        this.selected_idx = 0;
-                        this.refresh_preview(cx);
-                        cx.notify();
-                    }
-                    _ => {
-                        // ⌃A toggles this-project ⇄ all-projects scope (matches
-                        // the agent CLI's resume picker). Checked before the
-                        // modifier early-return below.
-                        if event.keystroke.modifiers.control && key == "a" {
-                            this.toggle_show_all(cx);
-                            return;
-                        }
-                        if event.keystroke.modifiers.control
-                            || event.keystroke.modifiers.platform
-                            || event.keystroke.modifiers.alt
-                            || event.keystroke.modifiers.function
-                        {
-                            return;
-                        }
-                        if key.chars().count() == 1 {
-                            this.query.push_str(key);
-                            this.selected_idx = 0;
-                            this.refresh_preview(cx);
-                            cx.notify();
-                        }
-                    }
+                    "enter" => this.confirm(event.keystroke.modifiers.shift, window, cx),
+                    _ => {}
                 }
             }))
             .child(card.with_animation(
@@ -826,44 +856,12 @@ impl Render for SessionHistoryModal {
 }
 
 fn header_row(
-    query: &str,
+    query_field: AnyElement,
     scope: &str,
-    caret_on: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
-    // Blinking text caret — fixed width whether on or off so the toggle never
-    // nudges the text; transparent on the off phase. The strongest signal that
-    // the field is focused and accepting input.
-    let caret_color = if caret_on {
-        theme.fg_base
-    } else {
-        hsla(0.0, 0.0, 0.0, 0.0)
-    };
-    let caret = div().w(px(1.5)).h(px(16.)).rounded_full().bg(caret_color);
-
-    // Query area reads as a live input: typed text then the caret, or the caret
-    // then greyed placeholder when empty.
-    let query_area = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .flex_1()
-        .gap(px(1.))
-        .text_size(px(typography.t_body_md))
-        .when(!query.is_empty(), |d| {
-            d.child(div().text_color(theme.fg_base).child(query.to_string()))
-        })
-        .child(caret)
-        .when(query.is_empty(), |d| {
-            d.child(
-                div()
-                    .text_color(theme.fg_subtle)
-                    .child("Search past sessions…"),
-            )
-        });
-
     div()
         .flex()
         .flex_row()
@@ -896,7 +894,7 @@ fn header_row(
                 .text_color(theme.fg_subtle)
                 .child(scope.to_string()),
         )
-        .child(query_area)
+        .child(div().flex_1().min_w_0().child(query_field))
 }
 
 /// The agent-type segment chips (`All | Claude | Codex | OpenCode`). The active
@@ -942,7 +940,10 @@ fn type_filter_chips(
                     // clobber pattern).
                     let handle = ent.update(cx, |m, cx| {
                         m.set_type_filter(filter, cx);
-                        m.focus_handle.clone()
+                        match &m.query_input {
+                            Some(input) => input.read(cx).focus_handle(cx),
+                            None => m.focus_handle.clone(),
+                        }
                     });
                     window.defer(cx, move |window, cx| window.focus(&handle, cx));
                 })

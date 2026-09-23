@@ -4,8 +4,11 @@
 //! is written. Deliberately a data table, so it may exceed the usual file
 //! LOC cap.
 //!
-//! Clipboard shortcuts (⌘C/⌘V/⌘X) are intentionally absent: the terminal
-//! owns them, and a global binding would shadow it.
+//! The macOS clipboard chords (⌘C/⌘V/⌘X/⌘A) are bound to the Edit menu's
+//! actions, which no pane handles: GPUI lets an unhandled action fall
+//! through to key-down listeners, so the terminal still owns them, and text
+//! inputs bind their own at a deeper context. The binding exists so the menu
+//! item carries the key equivalent — see the `copy` entry below.
 
 use gpui::KeyBinding;
 
@@ -27,7 +30,7 @@ use crate::actions::{
 };
 // The AppKit application menu's actions, bound only where that menu exists.
 #[cfg(target_os = "macos")]
-use crate::menu::{Copy, HideApp, HideOthers, Minimize, Quit};
+use crate::menu::{Copy, Cut, HideApp, HideOthers, Minimize, Paste, Quit, SelectAll};
 use oximux_editor::{EditorZoomIn, EditorZoomOut, EditorZoomReset, SaveFile};
 
 /// Shorthand for the per-entry bind fn — each closure is non-capturing so
@@ -157,6 +160,19 @@ pub const ACTIONS: &[ActionSpec] = &[
     // is a transcript selection and otherwise lets it through.
     #[cfg(target_os = "macos")]
     entry!("copy", "Copy", Global, "cmd-c", Copy),
+    // Paste / Cut / Select All are bound for the menu's sake alone. GPUI takes
+    // a menu item's key equivalent from the keymap, so with no binding the
+    // Edit menu's items had none — and native panels OxiMux opens (the
+    // Add Project folder picker, its ⌘⇧G "Go to Folder" field) only receive
+    // ⌘V/⌘X/⌘A through those menu key equivalents. Pasting a path there
+    // silently did nothing. No pane handles these actions, so inside OxiMux
+    // the keystroke falls through to the same listeners as before.
+    #[cfg(target_os = "macos")]
+    entry!("paste", "Paste", Global, "cmd-v", Paste),
+    #[cfg(target_os = "macos")]
+    entry!("cut", "Cut", Global, "cmd-x", Cut),
+    #[cfg(target_os = "macos")]
+    entry!("select_all", "Select all", Global, "cmd-a", SelectAll),
     // ---- Tabs -------------------------------------------------------
     entry!("new_tab", "New tab", Tabs, "secondary-t", NewTab),
     entry!("new_browser_tab", "New browser tab", Tabs, "secondary-shift-b", NewBrowserTab),

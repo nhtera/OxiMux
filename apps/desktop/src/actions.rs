@@ -478,6 +478,12 @@ actions!(
         /// because GPUI consumes `Tab` for focus-navigation before it reaches
         /// element key listeners.
         CycleSessionTypeFilter,
+        /// Flip the session-history modal between this-project and
+        /// all-projects scope. Dispatched by a modal-scoped `Ctrl+A` binding
+        /// — an action rather than an `on_key_down` case, because the focused
+        /// search input binds `Ctrl+A` itself (line start on macOS, select
+        /// all elsewhere) and would consume the key first.
+        ToggleSessionHistoryScope,
         /// Split the focused pane horizontally — new pane on the right.
         /// Alias of `SplitRight`. Kept for legacy callers; the Cmd+D
         /// keybinding now drives `SplitSubPaneRight` instead so it
