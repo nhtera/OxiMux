@@ -8,13 +8,6 @@ impl TerminalView {
         // nothing, so a check that only ran on output would never notice one
         // arriving — and, having noticed, would never notice it leave.
         self.poll_agent_process(cx);
-        // A pre-typed resume command goes out once the shell has been quiet
-        // for a moment after its first output — i.e. at the prompt, not in
-        // the middle of its start-up lines. Checked ahead of the early
-        // return: the quiet tick is by definition one with no events.
-        if queued_input_ready(self.queued_input_last_output, std::time::Instant::now()) {
-            self.flush_queued_input();
-        }
         // Likewise ahead of the early return: the search a resize scheduled
         // falls due on a quiet tick.
         if self.recheck_restore_notice() {
@@ -26,6 +19,14 @@ impl TerminalView {
         let session_id_for_drain = self.session_id;
         let events = self.with_backend(|be| be.drain_events_for(session_id_for_drain));
         if events.is_empty() {
+            // A pre-typed resume command goes out once the shell has been
+            // quiet for a moment after its first output — at the prompt, not
+            // in the middle of its start-up lines. Decided only on a tick that
+            // drained nothing: output already waiting in the backend would
+            // otherwise count as silence until it was read.
+            if queued_input_ready(self.queued_input_last_output, std::time::Instant::now()) {
+                self.flush_queued_input();
+            }
             return;
         }
         let settings = terminal_settings(cx);
@@ -172,9 +173,10 @@ impl TerminalView {
                     && let Some(pty) = self.external_id()
                 {
                     let (status, detail) = (sb.status.clone(), sb.detail.clone());
+                    let ticket = crate::shell::ambient_state::ticket();
                     cx.background_executor()
                         .spawn(async move {
-                            crate::shell::ambient_state::persist(&pty, &status, &detail, agent);
+                            crate::shell::ambient_state::persist(&pty, &status, &detail, agent, ticket);
                         })
                         .detach();
                 }
@@ -350,8 +352,9 @@ impl TerminalView {
                 self.last_persisted_ambient = None;
                 self.last_persisted_agent = None;
                 if let Some(pty) = self.external_id() {
+                    let ticket = crate::shell::ambient_state::ticket();
                     cx.background_executor()
-                        .spawn(async move { crate::shell::ambient_state::forget(&pty) })
+                        .spawn(async move { crate::shell::ambient_state::forget(&pty, ticket) })
                         .detach();
                 }
             }

@@ -997,8 +997,9 @@ fn restore_agent_tab(
         // it rather than leave it for the 7-day retention to collect.
         if !warm && let Some(dead_pty) = persisted_clone.relay_external_id.clone() {
             let _ = cx.update(|_, cx| {
+                let ticket = crate::shell::ambient_state::ticket();
                 cx.background_executor()
-                    .spawn(async move { crate::shell::ambient_state::forget(&dead_pty) })
+                    .spawn(async move { crate::shell::ambient_state::forget(&dead_pty, ticket) })
                     .detach();
             });
         }
@@ -1560,13 +1561,14 @@ pub(crate) fn spawn_attach_reconcile(
                         }
                         let dir = dir.clone();
                         let pty_id = pty_id.clone();
+                        let ticket = crate::shell::ambient_state::ticket();
                         executor
                             .spawn(async move {
                                 crate::relay_cold_restore::consume_checkpoint(&dir, &pty_id);
                                 // The dead PTY can never re-attach, so drop any
                                 // ambient reading persisted under its id — it
                                 // must not be re-seeded onto an unrelated PTY.
-                                crate::shell::ambient_state::forget(&pty_id);
+                                crate::shell::ambient_state::forget(&pty_id, ticket);
                             })
                             .detach();
                     } else if resume_line.is_some()
@@ -1574,8 +1576,9 @@ pub(crate) fn spawn_attach_reconcile(
                     {
                         // No checkpoint to consume, but the resume offer was
                         // delivered: one-shot, like the checkpoint.
+                        let ticket = crate::shell::ambient_state::ticket();
                         executor
-                            .spawn(async move { crate::shell::ambient_state::forget(&pty_id) })
+                            .spawn(async move { crate::shell::ambient_state::forget(&pty_id, ticket) })
                             .detach();
                     }
                 }

@@ -24,7 +24,9 @@
 //! ([`load_for_resume`]). Callers that run before [`init`] (pure unit tests)
 //! read `None` and persist nothing.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use oximux_core::{AgentStatus, SidebandDetail};
@@ -42,6 +44,35 @@ const RESUME_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 static REPO: OnceLock<SettingsRepo> = OnceLock::new();
 
+/// Writes are decided on the UI thread and applied on a thread pool, which
+/// promises no order: a delayed save could resurrect a record just deleted,
+/// or a delete could remove its replacement. Each write therefore carries a
+/// ticket taken where it was decided ([`ticket`]); applying one is skipped if
+/// a later ticket for the same PTY has already been applied, and writes are
+/// serialized while they apply. Entries are never dropped — dropping one
+/// would let a stale save through — and there is one small entry per PTY.
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+static APPLIED: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+/// Order stamp for one ambient write, taken where the write is decided
+/// (before handing it to a background task).
+pub fn ticket() -> u64 {
+    NEXT_TICKET.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Run `op` for `pty_id` unless a later-ticketed write has already applied.
+fn apply_in_order(pty_id: &str, ticket: u64, op: impl FnOnce()) {
+    let mut applied = APPLIED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if applied.get(pty_id).is_some_and(|&last| last > ticket) {
+        return;
+    }
+    op();
+    applied.insert(pty_id.to_string(), ticket);
+}
+
 /// Install the settings repo used for ambient-agent persistence. Called once
 /// from `state::hydrate`; later calls are ignored (first install wins).
 pub fn init(repo: SettingsRepo) {
@@ -51,12 +82,21 @@ pub fn init(repo: SettingsRepo) {
 /// Persist the latest reading for `pty_id`, with the process-scan label of
 /// the agent running there (`"Claude Code"`, `"Codex"`, …; `None` when the
 /// tree names no agent yet). Best-effort; failures are logged, never
-/// propagated. No-op before [`init`].
-pub fn persist(pty_id: &str, status: &AgentStatus, detail: &SidebandDetail, agent_label: Option<&str>) {
+/// propagated. No-op before [`init`]. `ticket` orders it against the PTY's
+/// other writes ([`ticket`]).
+pub fn persist(
+    pty_id: &str,
+    status: &AgentStatus,
+    detail: &SidebandDetail,
+    agent_label: Option<&str>,
+    ticket: u64,
+) {
     let Some(repo) = REPO.get() else { return };
-    if let Err(err) = persist_with(repo, pty_id, status, detail, agent_label, now_ms()) {
-        tracing::warn!(?err, pty_id, "ambient_state: persist failed");
-    }
+    apply_in_order(pty_id, ticket, || {
+        if let Err(err) = persist_with(repo, pty_id, status, detail, agent_label, now_ms()) {
+            tracing::warn!(?err, pty_id, "ambient_state: persist failed");
+        }
+    });
 }
 
 /// Load a fresh reading for `pty_id`, or `None` when absent / stale / pre-init.
@@ -84,10 +124,13 @@ pub fn load_for_resume(pty_id: &str) -> Option<ResumeOffer> {
 }
 
 /// Drop the reading for `pty_id` — its PTY died, was cold-restored, or its tab
-/// closed. No-op before [`init`].
-pub fn forget(pty_id: &str) {
+/// closed. No-op before [`init`]. `ticket` orders it against the PTY's other
+/// writes ([`ticket`]).
+pub fn forget(pty_id: &str, ticket: u64) {
     if let Some(repo) = REPO.get() {
-        let _ = repo.delete(&key(pty_id));
+        apply_in_order(pty_id, ticket, || {
+            let _ = repo.delete(&key(pty_id));
+        });
     }
 }
 
@@ -281,5 +324,18 @@ mod tests {
     #[test]
     fn missing_pty_loads_none() {
         assert!(load_with(&repo(), "absent", 1_000).is_none());
+    }
+
+    #[test]
+    fn a_write_that_lands_after_a_later_one_is_skipped() {
+        // A delayed save must not resurrect a record a later delete removed.
+        let pty = "ticket-order-test-pty";
+        let (save, delete) = (ticket(), ticket());
+        let mut ran = Vec::new();
+        apply_in_order(pty, delete, || ran.push("delete"));
+        apply_in_order(pty, save, || ran.push("stale save"));
+        let replacement = ticket();
+        apply_in_order(pty, replacement, || ran.push("replacement save"));
+        assert_eq!(ran, ["delete", "replacement save"]);
     }
 }
