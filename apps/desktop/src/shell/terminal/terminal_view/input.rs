@@ -967,6 +967,11 @@ impl TerminalView {
             // the body without the closure / focus event.
             self.wake_dormant_inline(cx);
         }
+        // Any input the user sends — keys, paste, drop, mouse reports —
+        // retires the restore notice; PTY query replies never come here.
+        if self.dismiss_restore_notice() {
+            cx.notify();
+        }
         let session_id = self.session_id;
         // Typing snaps the viewport back to the live tail so the user sees
         // their input even if they had scrolled up into history. No-op when

@@ -3,6 +3,7 @@
 //! and kept to the two operations the restore path needs.
 
 use super::*;
+use crate::relay_cold_restore::{RestoreMarker, marker};
 
 impl PaneGroup {
     /// Prefill the agent tab at insertion index `idx` with a restore marker.
@@ -12,14 +13,19 @@ impl PaneGroup {
     /// the marker inside its first frame until its next repaint; in practice
     /// the spawn-to-mount gap is milliseconds and a CLI's first frame is
     /// hundreds of milliseconds out.
-    pub(crate) fn prefill_agent_tab(&self, idx: usize, bytes: &[u8], cx: &App) {
+    /// The pane also arms the marker's off-grid notice, for a CLI that wipes
+    /// the scrollback on start-up (see `terminal_view::restore_notice`).
+    pub(crate) fn prefill_agent_tab(&self, idx: usize, kind: RestoreMarker, cx: &mut App) {
         let Some(tab) = self.tabs.get(idx) else {
             return;
         };
         if let PaneContent::Terminal(tree) = &tab.content
             && let Some(view) = tree.active_view()
         {
-            view.read(cx).prefill_grid(bytes);
+            view.update(cx, |v, _| {
+                v.prefill_grid(marker(kind));
+                v.arm_restore_notice(kind.label());
+            });
         }
     }
 
@@ -39,7 +45,7 @@ impl PaneGroup {
         new_status_rx: AgentStatusStream,
         backend: SharedBackend,
         term_id: TerminalSessionId,
-        marker: &[u8],
+        kind: RestoreMarker,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(idx) = self.tabs.iter().position(|t| {
@@ -58,7 +64,8 @@ impl PaneGroup {
         };
         view.update(cx, |v, cx| {
             v.replace_live_session(backend, term_id, cx);
-            v.prefill_grid(marker);
+            v.prefill_grid(marker(kind));
+            v.arm_restore_notice(kind.label());
         });
         let PaneGroupTabKind::Agent {
             session_id,

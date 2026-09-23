@@ -15,6 +15,11 @@ impl TerminalView {
         if queued_input_ready(self.queued_input_last_output, std::time::Instant::now()) {
             self.flush_queued_input();
         }
+        // Likewise ahead of the early return: the search a resize scheduled
+        // falls due on a quiet tick.
+        if self.recheck_restore_notice() {
+            cx.notify();
+        }
         // Use the per-session drain so panes can't steal each other's
         // events from a shared backend (e.g., the relay). The global
         // `drain_events` is reserved for tests + cleanup paths.
@@ -73,7 +78,12 @@ impl TerminalView {
                         });
                     }
                 }
-                TerminalEvent::Resize { .. } => needs_snapshot = true,
+                TerminalEvent::Resize { .. } => {
+                    needs_snapshot = true;
+                    // A CLI repaints on resize, and may erase the restore
+                    // marker doing it (see `restore_notice`).
+                    self.note_erase_risk_for_notice();
+                }
                 TerminalEvent::TitleChange { title, .. } => {
                     latest_title = Some(title.clone());
                 }
@@ -103,7 +113,10 @@ impl TerminalView {
                 // marks as the bytes were, so a prompt mark later in the same
                 // batch — the shell's `precmd` once `clear` returns — is
                 // applied after the drop and keeps its badge.
-                TerminalEvent::ScrollbackReset { .. } => self.drop_command_marks(),
+                TerminalEvent::ScrollbackReset { .. } => {
+                    self.drop_command_marks();
+                    self.note_erase_risk_for_notice();
+                }
                 // OSC 9;4 progress. state 0 clears; error/warning raises
                 // attention on an unfocused pane like a bell.
                 TerminalEvent::Progress { state, value, .. } => {

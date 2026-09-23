@@ -960,7 +960,7 @@ impl ProjectPanes {
         backend: SharedBackend,
         term_id: TerminalSessionId,
         meta: RestoredTabMeta,
-        marker: Option<&[u8]>,
+        marker: Option<crate::relay_cold_restore::RestoreMarker>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -983,8 +983,8 @@ impl ProjectPanes {
                 window,
                 cx,
             );
-            if let Some(bytes) = marker {
-                g.prefill_agent_tab(idx, bytes, cx);
+            if let Some(kind) = marker {
+                g.prefill_agent_tab(idx, kind, cx);
             }
             // Agent tabs mount async — after the persisted `tab_order` was
             // already applied — so this re-settles the tab into its saved
@@ -1006,7 +1006,7 @@ impl ProjectPanes {
         status_rx: AgentStatusStream,
         backend: SharedBackend,
         term_id: TerminalSessionId,
-        marker: &[u8],
+        marker: crate::relay_cold_restore::RestoreMarker,
         cx: &mut Context<Self>,
     ) -> bool {
         let group = match target_group {
@@ -1231,7 +1231,7 @@ impl ProjectPanes {
         backend: SharedBackend,
         term_id: TerminalSessionId,
         meta: RestoredTabMeta,
-        marker: Option<&[u8]>,
+        marker: Option<crate::relay_cold_restore::RestoreMarker>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1254,8 +1254,8 @@ impl ProjectPanes {
                 window,
                 cx,
             );
-            if let Some(bytes) = marker {
-                g.prefill_agent_tab(idx, bytes, cx);
+            if let Some(kind) = marker {
+                g.prefill_agent_tab(idx, kind, cx);
             }
             g.place_restored_tab(idx, meta, cx);
         });

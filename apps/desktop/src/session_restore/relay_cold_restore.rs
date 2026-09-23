@@ -47,6 +47,18 @@ const RESUMED_MARKER: &[u8] = b"\r\n\x1b[2m--- resuming previous session ---\x1b
 const STARTED_FRESH_MARKER: &[u8] =
     b"\r\n\x1b[2m--- previous session unavailable, started fresh ---\x1b[0m\r\n\r\n";
 
+impl RestoreMarker {
+    /// The marker's words without its framing or styling, for surfaces other
+    /// than the grid (the pane's off-grid notice when a CLI wipes the grid).
+    pub fn label(self) -> &'static str {
+        match self {
+            RestoreMarker::Restored => "session restored",
+            RestoreMarker::Resumed => "resuming previous session",
+            RestoreMarker::StartedFresh => "previous session unavailable, started fresh",
+        }
+    }
+}
+
 /// The bytes for one marker, ready to prefill into a pane grid.
 pub fn marker(kind: RestoreMarker) -> &'static [u8] {
     match kind {
@@ -586,5 +598,13 @@ mod tests {
         // No cut happened — even a leading partial line is real content.
         let sb = b"no-newline-here".to_vec();
         assert_eq!(tail_at_line_boundary(&sb), sb.as_slice());
+    }
+
+    #[test]
+    fn each_marker_label_is_the_text_its_grid_bytes_print() {
+        for kind in [RestoreMarker::Restored, RestoreMarker::Resumed, RestoreMarker::StartedFresh] {
+            let bytes = String::from_utf8_lossy(marker(kind)).into_owned();
+            assert!(bytes.contains(&format!("--- {} ---", kind.label())), "{kind:?}");
+        }
     }
 }

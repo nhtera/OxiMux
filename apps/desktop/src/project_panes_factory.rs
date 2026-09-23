@@ -24,7 +24,7 @@ use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::{PaneBufferRepo, SettingsRepo};
 
 use crate::notifier::Notifier;
-use crate::relay_cold_restore::{RestoreMarker, marker};
+use crate::relay_cold_restore::RestoreMarker;
 use crate::persisted_terminals::{
     PersistedAgentTab, PersistedAxis, PersistedSubPane, PersistedTab, PersistedTabKind,
     PersistedTabs, PersistedTree, WINDOWS_MANIFEST_KEY, WindowsManifest, legacy_settings_key,
@@ -940,12 +940,10 @@ fn restore_agent_tab(
         }
         // A warm re-attach prints nothing (the live PTY holds the
         // conversation); a cold spawn says which of the two things happened.
-        let mount_marker = (!warm).then(|| {
-            marker(if attempted_resume {
-                RestoreMarker::Resumed
-            } else {
-                RestoreMarker::StartedFresh
-            })
+        let mount_marker = (!warm).then_some(if attempted_resume {
+            RestoreMarker::Resumed
+        } else {
+            RestoreMarker::StartedFresh
         });
         // Fetched before the mount so no early return below can leave a
         // mounted tab reading a proxy nobody feeds.
@@ -1048,7 +1046,7 @@ fn restore_agent_tab(
                     proxy_rx.clone(),
                     fresh_backend,
                     fresh_term,
-                    marker(RestoreMarker::StartedFresh),
+                    RestoreMarker::StartedFresh,
                     cx,
                 )
             });

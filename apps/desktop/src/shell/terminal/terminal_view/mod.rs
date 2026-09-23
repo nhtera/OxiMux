@@ -696,6 +696,10 @@ pub struct TerminalView {
     /// prompt rather than interleaved with the shell's start-up chatter
     /// (`.zshrc` warnings, banner lines) that precedes it.
     queued_input_last_output: Option<std::time::Instant>,
+    /// The restore marker's words, armed when a cold restore prefills the
+    /// marker and shown off-grid if the CLI wipes the scrollback on start-up
+    /// (see `restore_notice`).
+    restore_notice: Option<restore_notice::RestoreNotice>,
     /// Fallback for the queue above: some prompts print nothing until a key
     /// arrives, so the bytes are delivered after a short wait regardless.
     _queued_input_timer: Option<Task<()>>,
@@ -704,6 +708,7 @@ pub struct TerminalView {
 mod input;
 mod lifecycle;
 mod render;
+mod restore_notice;
 mod state;
 
 impl Drop for TerminalView {

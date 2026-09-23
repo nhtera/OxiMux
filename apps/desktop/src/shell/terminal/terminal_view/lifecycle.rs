@@ -170,6 +170,7 @@ impl TerminalView {
             last_persisted_agent: None,
             queued_first_output_input: None,
             queued_input_last_output: None,
+            restore_notice: None,
             _queued_input_timer: None,
         }
     }
@@ -267,6 +268,9 @@ impl TerminalView {
         // exit banner so a swap (e.g. post-attach reconcile) never leaves the
         // "process exited" marker over a now-running shell.
         self.exited = None;
+        // A notice about the previous session's grid means nothing on the
+        // new one; a restore swap re-arms its own right after.
+        self.restore_notice = None;
         // The pid the scan was rooted at belongs to the previous session; drop
         // it so the next poll walks the new shell instead of waiting out the
         // old root's liveness check.
@@ -420,6 +424,7 @@ impl TerminalView {
             last_persisted_agent: None,
             queued_first_output_input: None,
             queued_input_last_output: None,
+            restore_notice: None,
             _queued_input_timer: None,
         }
     }
