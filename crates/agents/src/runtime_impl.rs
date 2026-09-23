@@ -126,11 +126,18 @@ impl CliRuntime {
     /// the restore path to reconnect a tab to its still-running CLI. Errors
     /// when no adapter is registered for `adapter_key` (needed for status
     /// patterns).
+    ///
+    /// `known_session` is the provider session id the tab persisted for the
+    /// conversation running in that PTY. It seeds the first snapshot exactly
+    /// as a resumed spawn's id does: a re-attached agent idle at its prompt
+    /// fires no hook, and without the seed the next layout autosave would
+    /// persist `None` over the id and a later reboot could not resume.
     pub fn adopt_session(
         &self,
         adapter_key: AgentAdapter,
         backend: SharedBackend,
         term_id: TerminalSessionId,
+        known_session: Option<String>,
     ) -> Result<AgentSessionId> {
         let adapter = {
             let inner = lock_recover(&self.inner, "CliRuntime sessions");
@@ -140,7 +147,7 @@ impl CliRuntime {
                 .cloned()
                 .ok_or_else(|| anyhow!("no adapter registered for {:?}", adapter_key))?
         };
-        self.register_session(adapter, backend, term_id, None)
+        self.register_session(adapter, backend, term_id, known_session)
     }
 
     /// Wire up the status machine + poll task for a ready `(backend,

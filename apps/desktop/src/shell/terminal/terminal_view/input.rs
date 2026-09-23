@@ -769,10 +769,6 @@ impl TerminalView {
 
     pub(super) fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         input_trace(&format!("key_down key={}", event.keystroke.key));
-        // The user typed before a cold restore's pre-filled resume command
-        // was delivered: their keystrokes win, the offer is dropped rather
-        // than appended after them.
-        self.queued_first_output_input = None;
         // Anything the search overlay took belongs to the overlay, so claim it
         // — that is what keeps a character typed into the search box out of the
         // shell. Without the claim the same key still reaches the platform
@@ -967,8 +963,11 @@ impl TerminalView {
             // the body without the closure / focus event.
             self.wake_dormant_inline(cx);
         }
-        // Any input the user sends — keys, paste, drop, mouse reports —
-        // retires the restore notice; PTY query replies never come here.
+        // Any input the user sends — keys, paste, IME, dictation, drop, mouse
+        // reports — wins over a cold restore's pre-typed resume command (the
+        // offer is dropped rather than appended after it) and retires the
+        // restore notice. PTY query replies never come through here.
+        self.queued_first_output_input = None;
         if self.dismiss_restore_notice() {
             cx.notify();
         }

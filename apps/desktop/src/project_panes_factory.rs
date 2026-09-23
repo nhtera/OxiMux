@@ -783,13 +783,15 @@ fn restore_agent_tab(
         .unwrap_or_default();
     // Cold spawn resumes the agent's OWN conversation when the snapshot
     // captured its id and the adapter can (`claude --resume`, `codex resume`,
-    // …). Only the cold path reads this: a warm re-attach adopts the live
-    // process, whose conversation never went anywhere.
+    // …). The cold path spawns with it; a warm re-attach adopts the live
+    // process, whose conversation never went anywhere, and only seeds its
+    // status with the id so an idle agent keeps naming it.
     let resumption = crate::session_restore::agent_resume::restore_resumption(
         persisted.adapter,
         persisted.provider_session.as_deref(),
     );
     let attempted_resume = !matches!(resumption, oximux_core::SessionResumption::None);
+    let known_session = resumption.source_id().map(str::to_owned);
     let cfg = AgentSessionConfig {
         adapter: persisted.adapter,
         worktree_path: PathBuf::from(&persisted.worktree_path),
@@ -837,7 +839,7 @@ fn restore_agent_tab(
         };
 
         let attached = if let Some((backend, term_id)) = reattached {
-            match cli_runtime.adopt_session(persisted_clone.adapter, backend.clone(), term_id) {
+            match cli_runtime.adopt_session(persisted_clone.adapter, backend.clone(), term_id, known_session) {
                 Ok(session_id) => match cli_runtime.subscribe_status(session_id) {
                     Ok(status_rx) => Some((session_id, backend, term_id, status_rx)),
                     Err(err) => {

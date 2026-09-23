@@ -339,17 +339,17 @@ impl TerminalView {
             );
             // The hook reading belonged to the process that just left (or was
             // replaced): drop it so a later record cannot pair one agent's
-            // conversation id with another's label. An agent that left also
-            // leaves nothing to resume from this shell, so its persisted record
-            // goes too — otherwise a reboot days later would still pre-type
-            // its resume command.
+            // conversation id with another's label. Its persisted record goes
+            // too, whether the agent left or was replaced by another: a
+            // replacement that has not fired a hook yet would otherwise leave
+            // the first agent's label and id on disk, and a reboot would
+            // pre-type the wrong agent's resume command. The newcomer writes
+            // its own record on its first hook.
             if before.is_some() {
                 self.agent_scan.reset();
                 self.last_persisted_ambient = None;
                 self.last_persisted_agent = None;
-                if self.proc_scan.current().is_none()
-                    && let Some(pty) = self.external_id()
-                {
+                if let Some(pty) = self.external_id() {
                     cx.background_executor()
                         .spawn(async move { crate::shell::ambient_state::forget(&pty) })
                         .detach();

@@ -21,9 +21,12 @@ const MAX_ID_LEN: usize = 64;
 /// True for an id that is safe to persist and to pass straight to a CLI:
 /// 1–64 bytes of `[A-Za-z0-9_.-]`. Every real id (UUIDs, Codex thread ids,
 /// Pi/omp session ids) fits; anything with a slash, a space or a control
-/// byte is refused rather than escaped.
+/// byte is refused rather than escaped. A leading `-` is refused too: the id
+/// is the argument after `--resume` / `resume` / `--session`, where it would
+/// otherwise read as a flag.
 pub fn is_valid_provider_session(id: &str) -> bool {
     !id.is_empty()
+        && !id.starts_with('-')
         && id.len() <= MAX_ID_LEN
         && id
             .bytes()
@@ -213,6 +216,8 @@ mod tests {
         assert!(!is_valid_provider_session("a b"));
         assert!(!is_valid_provider_session("a;rm"));
         assert!(!is_valid_provider_session("x\u{7}y"));
+        assert!(!is_valid_provider_session("--dangerously-skip-permissions"));
+        assert!(!is_valid_provider_session("-x"));
         assert!(is_valid_provider_session(&"a".repeat(MAX_ID_LEN)));
         assert!(!is_valid_provider_session(&"a".repeat(MAX_ID_LEN + 1)));
     }
