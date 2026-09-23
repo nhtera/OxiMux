@@ -25,7 +25,10 @@ use gpui::{
 use gpui_component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
-    input::{Enter as InputEnter, Input, InputEvent, InputState, MoveDown, MoveUp},
+    input::{
+        Backspace, Delete, Enter as InputEnter, Input, InputEvent, InputState, MoveDown, MoveUp,
+        Paste,
+    },
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
 };
 
@@ -180,10 +183,11 @@ impl SessionHistoryPanel {
 
     /// Type-to-search from anywhere in the panel: a printable key that lands
     /// on the panel root (e.g. after clicking a card moved focus off the
-    /// field) moves focus into the search input and inserts the character
-    /// there. Returns whether the key was consumed. No-op while the input
-    /// itself is focused — it receives the text through its own input
-    /// handler, and inserting here too would double it.
+    /// field) moves focus into the search input and types the character
+    /// there, over any selection the query still holds. Returns whether the
+    /// key was consumed. No-op while the input itself is focused — it
+    /// receives the text through its own input handler, and inserting here
+    /// too would double it.
     fn redirect_typing(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let m = &ev.keystroke.modifiers;
         if m.control || m.platform || m.alt || m.function {
@@ -204,13 +208,42 @@ impl SessionHistoryPanel {
         let text = text.to_string();
         self.query_input.update(cx, |s, cx| {
             s.focus(window, cx);
-            s.insert(text, window, cx);
+            // `replace`, not `insert`: the input keeps its selection after
+            // focus leaves it, and typed text must overwrite that selection.
+            s.replace(text, window, cx);
         });
-        // `insert` is a programmatic edit and emits no `Change`, so mirror
+        // `replace` is a programmatic edit and emits no `Change`, so mirror
         // the value here.
         self.query = self.query_input.read(cx).value().to_string();
         self.selected_idx = 0;
         cx.notify();
+        true
+    }
+
+    /// Editing keys that land on the panel root (Backspace, Delete, paste):
+    /// focus the search input and hand it the matching input action, so the
+    /// query stays editable after a card click took focus off the field. The
+    /// input's own handler does the edit and emits `Change`, which `query_sub`
+    /// mirrors. Returns whether the key was consumed; no-op while the input is
+    /// focused, since it already receives these keys itself.
+    fn redirect_edit_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = &ev.keystroke.modifiers;
+        let plain = !(m.control || m.platform || m.alt || m.function || m.shift);
+        let action: Box<dyn gpui::Action> = match ev.keystroke.key.as_str() {
+            "backspace" if plain => Box::new(Backspace),
+            "delete" if plain => Box::new(Delete),
+            // ⌘V on macOS, Ctrl+V elsewhere.
+            "v" if m.secondary() && !m.alt && !m.shift => Box::new(Paste),
+            _ => return false,
+        };
+        let handle = self.query_input.read(cx).focus_handle(cx);
+        if handle.is_focused(window) {
+            return false;
+        }
+        self.query_input.update(cx, |s, cx| s.focus(window, cx));
+        // Deferred so the input's handler runs after this key event finishes
+        // dispatching, rather than re-entering dispatch from inside it.
+        window.defer(cx, move |window, cx| handle.dispatch_action(action.as_ref(), window, cx));
         true
     }
 
@@ -705,15 +738,17 @@ impl Render for SessionHistoryPanel {
                 this.move_selection(1, n, cx);
             }))
             // Fallback for when focus sits on the panel root rather than the
-            // input (e.g. after a card click): nav keys still work, and typing
-            // jumps back into the search field.
+            // input (e.g. after a card click): nav keys still work, and typing,
+            // Backspace/Delete and paste jump back into the search field.
             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
                 match ev.keystroke.key.as_str() {
                     "up" => this.move_selection(-1, row_count, cx),
                     "down" => this.move_selection(1, row_count, cx),
                     "enter" => this.open(this.selected_idx, window, cx),
                     _ => {
-                        if this.redirect_typing(ev, window, cx) {
+                        if this.redirect_edit_key(ev, window, cx)
+                            || this.redirect_typing(ev, window, cx)
+                        {
                             cx.stop_propagation();
                         }
                     }
