@@ -156,6 +156,10 @@ impl Default for PortablePtyBackend {
 
 impl TerminalBackend for PortablePtyBackend {
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId> {
+        self.spawn_prefilled(cfg, &[])
+    }
+
+    fn spawn_prefilled(&mut self, cfg: SpawnConfig, prefill: &[u8]) -> Result<TerminalSessionId> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -207,11 +211,13 @@ impl TerminalBackend for PortablePtyBackend {
                 .entry(id)
                 .or_default();
         }
-        let state = Arc::new(Mutex::new(TerminalState::new(
-            cfg.cols,
-            cfg.rows,
-            cfg.scrollback,
-        )));
+        // Restored history goes in before the reader can feed the grid,
+        // so none of the child's output can land ahead of it.
+        let mut fresh = TerminalState::new(cfg.cols, cfg.rows, cfg.scrollback);
+        if !prefill.is_empty() {
+            fresh.prefill(prefill);
+        }
+        let state = Arc::new(Mutex::new(fresh));
         let cwd_hint: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let tx = self.event_tx.clone();
         let watcher_state = Arc::clone(&state);
@@ -506,28 +512,7 @@ impl TerminalBackend for PortablePtyBackend {
             .get(&id)
             .with_context(|| format!("unknown session {id:?}"))?;
         if let Ok(mut state) = session.state.lock() {
-            // New-format captures carry their grid dims as a 9-byte
-            // header; resize the dormant Term to match BEFORE feeding
-            // the body so absolute-position CSI sequences land in the
-            // right cells. Legacy (pre-header) blobs replay against the
-            // current grid as before.
-            if let Some((cols, rows, payload)) = crate::grid_serializer::parse_capture_header(bytes)
-            {
-                // Defensive clamp: caps match the rest of the codebase
-                // (DEFAULT_COLS/ROWS pattern in app/src/shell/terminal_view.rs
-                // is 100×32; we accept up to 1024×512 for ultrawide users)
-                // and prevent a corrupted header from triggering a huge
-                // allocation inside alacritty's grid.
-                let cols = cols.clamp(1, 1024);
-                let rows = rows.clamp(1, 512);
-                state.resize(cols, rows);
-                state.advance(payload);
-            } else {
-                state.advance(bytes);
-            }
-            // Replay is historical: drop any title/clipboard/bell/color events
-            // it fired so they don't leak into the live session's first frame.
-            state.clear_collected();
+            state.prefill(bytes);
         }
         Ok(())
     }

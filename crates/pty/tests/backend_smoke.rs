@@ -285,6 +285,59 @@ fn status_exit_survives_renderer_backpressure() {
     backend.close(id).expect("close high-output shell");
 }
 
+/// A cold-restored pane's history opens with a screen clear. Handed to the
+/// spawn, it is in the grid before the reader thread starts, so the child's
+/// first output (a fast shell's prompt) lands BELOW it however early it comes.
+/// Prefilled after `spawn` returned, that output could land first and the
+/// clear erase it — the restored terminal then showed no prompt.
+#[test]
+fn spawn_prefilled_keeps_the_childs_first_output_below_the_history() {
+    const HISTORY: &str = "OXIMUX_HISTORY_ROW";
+    const LIVE: &str = "OXIMUX_LIVE_ROW";
+    let mut backend = PortablePtyBackend::new();
+    let cfg = SpawnConfig {
+        shell: test_shell(),
+        args: run_script(&[&format!("echo {LIVE}")]),
+        cwd: test_cwd(),
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+        scrollback: 5000,
+        capture_status_events: false,
+    };
+    let prefill = format!("\x1b[2J\x1b[3J\x1b[H{HISTORY}\r\n");
+    let id = backend
+        .spawn_prefilled(cfg, prefill.as_bytes())
+        .expect("spawn shell prefilled");
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut saw_exit = false;
+    while Instant::now() < deadline && !saw_exit {
+        saw_exit = backend
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, TerminalEvent::Exit { id: eid, .. } if *eid == id));
+        if !saw_exit {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+    let snap = backend.snapshot(id).expect("snapshot");
+    backend.close(id).expect("close session");
+
+    let rows: Vec<String> = snap
+        .cells
+        .iter()
+        .map(|row| row.iter().map(|c| c.ch).collect())
+        .collect();
+    let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
+    let (history, live) = (row_of(HISTORY), row_of(LIVE));
+    assert!(saw_exit, "child never exited: {rows:#?}");
+    assert!(
+        matches!((history, live), (Some(h), Some(l)) if h < l),
+        "history must stay on screen with the live output below it: {rows:#?}"
+    );
+}
+
 /// F3.4 slice 2: spawn a dormant session, prefill scrollback bytes,
 /// snapshot the grid → the prefilled cells must be visible. Then
 /// promote-to-live + drain events → the live shell's stdout follows the

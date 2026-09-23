@@ -103,6 +103,23 @@ pub trait TerminalBackend: Send + 'static {
     /// Spawn a new session. Returns a fresh `TerminalSessionId`.
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId>;
 
+    /// Spawn with `prefill` (restored scrollback) already in the new grid.
+    ///
+    /// Not the same as `spawn` then [`prefill_grid`](Self::prefill_grid): a
+    /// backend whose reader feeds the grid as bytes arrive can take the child's
+    /// first output (a fast shell's prompt) before a later prefill lands, and a
+    /// prefill that opens with a screen clear then erases it. Backends with such
+    /// a reader override this to prefill before the reader starts. The default
+    /// suits a backend whose grid only changes when the caller drains it; its
+    /// `prefill_grid` fails only on an unknown id, which a just-spawned one is not.
+    fn spawn_prefilled(&mut self, cfg: SpawnConfig, prefill: &[u8]) -> Result<TerminalSessionId> {
+        let id = self.spawn(cfg)?;
+        if !prefill.is_empty() {
+            let _ = self.prefill_grid(id, prefill);
+        }
+        Ok(id)
+    }
+
     /// F3.4: register a session that has a grid emulator but NO live
     /// PTY child yet. The caller usually follows up with `prefill_grid`
     /// to populate restored scrollback and renders the snapshot. Until

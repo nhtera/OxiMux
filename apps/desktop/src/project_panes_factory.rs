@@ -1491,35 +1491,44 @@ pub(crate) fn spawn_attach_reconcile(
                         .and_then(|(restore, _)| restore.cwd.clone())
                         .unwrap_or(cwd);
                     let spawn_dims = cold.as_ref().and_then(|(restore, _)| restore.dims);
-                    crate::shell::terminal_view::spawn_local_pty_sized(spawn_cwd, env, spawn_dims)
-                        .map(|session| (session, cold, offer))
+                    let resume_line = offer.as_ref().and_then(|o| {
+                        crate::session_restore::agent_resume::resume_shell_line(
+                            &o.agent_label,
+                            &o.session_id,
+                        )
+                        .map(|line| (o.agent_label.clone(), line))
+                    });
+                    // What the grid holds before the fresh shell writes a byte:
+                    // the recovered history (a cwd-only restore has none), then
+                    // under the marker a dim hint when the resume command will
+                    // be pre-typed at the prompt. Handed to the spawn, not
+                    // prefilled after it: the backend's reader feeds the grid
+                    // as output arrives, so a fast shell's first prompt could
+                    // land first and the history's screen clear erase it.
+                    let mut prefill = cold
+                        .as_ref()
+                        .map(|(restore, _)| restore.bytes.clone())
+                        .unwrap_or_default();
+                    if let Some((agent_label, _)) = &resume_line {
+                        prefill.extend(crate::relay_cold_restore::resume_hint(agent_label));
+                    }
+                    crate::shell::terminal_view::spawn_local_pty_sized(
+                        spawn_cwd, env, spawn_dims, &prefill,
+                    )
+                    .map(|session| (session, cold, resume_line))
                 })
                 .await;
-            let Some(((backend, session_id), cold, offer)) = result else {
+            let Some(((backend, session_id), cold, resume_line)) = result else {
                 tracing::warn!("attach reconcile: spawn failed; pane stays empty");
                 continue;
             };
-            let resume_line = offer.as_ref().and_then(|o| {
-                crate::session_restore::agent_resume::resume_shell_line(&o.agent_label, &o.session_id)
-                    .map(|line| (o.agent_label.clone(), line))
-            });
             let delivered = entry.view.update(cx, |view, cx| {
                 let adopted = view.adopt_live_session(backend.clone(), session_id, cx);
                 if adopted {
-                    if let Some((restore, _)) = &cold
-                        && !restore.bytes.is_empty()
-                    {
-                        // Prefill BEFORE the first poll tick drains the fresh
-                        // shell's prompt: recovered history paints first, the
-                        // live prompt then appends below the restored marker.
-                        // A cwd-only restore (no replayable scrollback) skips
-                        // this — blank grid, recovered spawn dir.
-                        view.prefill_grid(&restore.bytes);
-                    }
-                    // Under the marker: a dim hint, then the resume command
-                    // pre-typed at the prompt once the shell has drawn it.
-                    if let Some((agent_label, line)) = &resume_line {
-                        view.prefill_grid(&crate::relay_cold_restore::resume_hint(agent_label));
+                    // The history and hint are already in the grid (spawned
+                    // prefilled); the resume command is pre-typed at the
+                    // prompt once the shell has drawn it.
+                    if let Some((_, line)) = &resume_line {
                         view.queue_input_on_first_output(line.clone().into_bytes(), cx);
                     }
                     // A warm re-attach reuses the surviving daemon PTY, so a

@@ -274,7 +274,7 @@ pub fn spawn_local_pty(
     cwd: PathBuf,
     env: Vec<(String, String)>,
 ) -> Option<(SharedBackend, TerminalSessionId)> {
-    spawn_local_pty_sized(cwd, env, None)
+    spawn_local_pty_sized(cwd, env, None, &[])
 }
 
 /// `spawn_local_pty` with explicit initial PTY dimensions. The cold
@@ -282,10 +282,16 @@ pub fn spawn_local_pty(
 /// replacement shell's first paint wraps for the size the restored
 /// content used — the pane's normal resize takes over right after
 /// adopt, so this only matters for that first prompt.
+///
+/// `prefill` (the recovered scrollback and its marker; empty for none) is in
+/// the grid before any of the shell's output, so the first prompt appends
+/// below it. Prefilling after this returns races the backend's reader: a fast
+/// shell's prompt could land first and the prefill's screen clear erase it.
 pub fn spawn_local_pty_sized(
     cwd: PathBuf,
     env: Vec<(String, String)>,
     dims: Option<(u16, u16)>,
+    prefill: &[u8],
 ) -> Option<(SharedBackend, TerminalSessionId)> {
     let (cols, rows) = dims.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
     // Relay-backed path: one shared backend across the whole app.
@@ -298,7 +304,7 @@ pub fn spawn_local_pty_sized(
         // wedge mid-request.
         let _nap = crate::app_nap::prevent("relay spawn");
         let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        match guard.spawn(cfg) {
+        match guard.spawn_prefilled(cfg, prefill) {
             Ok(session_id) => {
                 drop(guard);
                 return Some((Arc::clone(shared), session_id));
@@ -310,18 +316,19 @@ pub fn spawn_local_pty_sized(
             }
         }
     }
-    spawn_fallback_portable(cwd, env, (cols, rows))
+    spawn_fallback_portable(cwd, env, (cols, rows), prefill)
 }
 
 fn spawn_fallback_portable(
     cwd: PathBuf,
     env: Vec<(String, String)>,
     (cols, rows): (u16, u16),
+    prefill: &[u8],
 ) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
     let mut cfg = shell_spawn_config(cwd, env, cols, rows);
     super::shell_integration::augment_spawn_config(&mut cfg);
-    let session_id = match backend.spawn(cfg) {
+    let session_id = match backend.spawn_prefilled(cfg, prefill) {
         Ok(id) => id,
         Err(err) => {
             tracing::warn!(?err, "pty spawn failed");
