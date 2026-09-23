@@ -17,13 +17,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    Anchor, App, ClipboardItem, Context, FocusHandle, Focusable, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, div, hsla, prelude::FluentBuilder, px, svg,
+    Anchor, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window,
+    div, prelude::FluentBuilder, px, svg,
 };
 use gpui_component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
+    input::{
+        Backspace, Delete, Enter as InputEnter, Input, InputEvent, InputState, MoveDown, MoveUp,
+        Paste,
+    },
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
 };
 
@@ -43,7 +48,6 @@ use crate::shell::session_history::picker::{
     entry_slug, filter_sessions, session_row_subtitle, session_row_title,
 };
 
-const CARET_BLINK_MS: u64 = 530;
 /// Opening turns pulled into an expanded card's inline preview.
 const PREVIEW_MAX_MESSAGES: usize = 6;
 
@@ -61,8 +65,11 @@ pub struct SessionHistoryPanel {
 
     /// `true` = show every project's sessions; `false` = this project only.
     show_all: bool,
+    /// Mirrors `query_input`'s value (kept in sync by `_query_sub`).
     query: String,
-    caret_on: bool,
+    /// The search field — a real text input, so paste, IME composition and
+    /// caret movement work.
+    query_input: Entity<InputState>,
     loading: bool,
     entries: Vec<SessionEntry>,
     selected_idx: usize,
@@ -78,7 +85,7 @@ pub struct SessionHistoryPanel {
 
     _load_task: Option<Task<()>>,
     _preview_task: Option<Task<()>>,
-    _caret_task: Task<()>,
+    _query_sub: Subscription,
 }
 
 impl SessionHistoryPanel {
@@ -87,9 +94,22 @@ impl SessionHistoryPanel {
         theme: Theme,
         density: Density,
         typography: Typography,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let query_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions…"));
+        let query_sub = cx.subscribe_in(
+            &query_input,
+            window,
+            |this, input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.query = input.read(cx).value().to_string();
+                    this.selected_idx = 0;
+                    cx.notify();
+                }
+            },
+        );
         let mut this = Self {
             theme,
             density,
@@ -100,7 +120,7 @@ impl SessionHistoryPanel {
             home: dirs::home_dir().map(|h| h.to_string_lossy().into_owned()),
             show_all: false,
             query: String::new(),
-            caret_on: true,
+            query_input,
             loading: true,
             entries: Vec::new(),
             selected_idx: 0,
@@ -110,7 +130,7 @@ impl SessionHistoryPanel {
             preview_loading: HashSet::new(),
             _load_task: None,
             _preview_task: None,
-            _caret_task: Self::start_caret_blink(cx),
+            _query_sub: query_sub,
         };
         this.rescan(cx);
         this
@@ -155,29 +175,76 @@ impl SessionHistoryPanel {
         self._load_task = Some(task);
     }
 
-    fn start_caret_blink(cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| loop {
-            let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone()) else {
-                return;
-            };
-            executor
-                .timer(std::time::Duration::from_millis(CARET_BLINK_MS))
-                .await;
-            if this
-                .update(cx, |m, cx| {
-                    m.caret_on = !m.caret_on;
-                    cx.notify();
-                })
-                .is_err()
-            {
-                return;
-            }
-        })
-    }
-
     /// Focus the panel's search field (called when the tab is selected).
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle, cx);
+        let handle = self.query_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    }
+
+    /// Type-to-search from anywhere in the panel: a printable key that lands
+    /// on the panel root (e.g. after clicking a card moved focus off the
+    /// field) moves focus into the search input and types the character
+    /// there, over any selection the query still holds. Returns whether the
+    /// key was consumed. No-op while the input itself is focused — it
+    /// receives the text through its own input handler, and inserting here
+    /// too would double it.
+    fn redirect_typing(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = &ev.keystroke.modifiers;
+        if m.control || m.platform || m.alt || m.function {
+            return false;
+        }
+        let Some(text) = ev
+            .keystroke
+            .key_char
+            .as_deref()
+            .filter(|s| !s.is_empty() && s.chars().all(|c| !c.is_control()))
+        else {
+            return false;
+        };
+        let handle = self.query_input.read(cx).focus_handle(cx);
+        if handle.is_focused(window) {
+            return false;
+        }
+        let text = text.to_string();
+        self.query_input.update(cx, |s, cx| {
+            s.focus(window, cx);
+            // `replace`, not `insert`: the input keeps its selection after
+            // focus leaves it, and typed text must overwrite that selection.
+            s.replace(text, window, cx);
+        });
+        // `replace` is a programmatic edit and emits no `Change`, so mirror
+        // the value here.
+        self.query = self.query_input.read(cx).value().to_string();
+        self.selected_idx = 0;
+        cx.notify();
+        true
+    }
+
+    /// Editing keys that land on the panel root (Backspace, Delete, paste):
+    /// focus the search input and hand it the matching input action, so the
+    /// query stays editable after a card click took focus off the field. The
+    /// input's own handler does the edit and emits `Change`, which `query_sub`
+    /// mirrors. Returns whether the key was consumed; no-op while the input is
+    /// focused, since it already receives these keys itself.
+    fn redirect_edit_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = &ev.keystroke.modifiers;
+        let plain = !(m.control || m.platform || m.alt || m.function || m.shift);
+        let action: Box<dyn gpui::Action> = match ev.keystroke.key.as_str() {
+            "backspace" if plain => Box::new(Backspace),
+            "delete" if plain => Box::new(Delete),
+            // ⌘V on macOS, Ctrl+V elsewhere.
+            "v" if m.secondary() && !m.alt && !m.shift => Box::new(Paste),
+            _ => return false,
+        };
+        let handle = self.query_input.read(cx).focus_handle(cx);
+        if handle.is_focused(window) {
+            return false;
+        }
+        self.query_input.update(cx, |s, cx| s.focus(window, cx));
+        // Deferred so the input's handler runs after this key event finishes
+        // dispatching, rather than re-entering dispatch from inside it.
+        window.defer(cx, move |window, cx| handle.dispatch_action(action.as_ref(), window, cx));
+        true
     }
 
     fn filtered(&self) -> Vec<usize> {
@@ -449,34 +516,24 @@ impl SessionHistoryPanel {
         let t = &self.theme;
         let density = self.density;
         let typo = &self.typography;
-        let caret_color = if self.caret_on { t.fg_base } else { hsla(0.0, 0.0, 0.0, 0.0) };
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
             .px(px(8.0))
-            .py(px(5.0))
             .rounded(px(density.r_xs))
             .bg(t.bg_base)
             .border_1()
             .border_color(t.border_inactive)
             .child(svg().path("icons/search.svg").size(px(12.0)).text_color(t.fg_subtle))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .flex_1()
-                    .gap(px(1.0))
-                    .text_size(px(typo.t_body_sm))
-                    .when(!self.query.is_empty(), |d| {
-                        d.child(div().text_color(t.fg_base).child(self.query.clone()))
-                    })
-                    .child(div().w(px(1.5)).h(px(14.0)).rounded_full().bg(caret_color))
-                    .when(self.query.is_empty(), |d| {
-                        d.child(div().text_color(t.fg_subtle).child("Search sessions…"))
-                    }),
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.query_input)
+                        .appearance(false)
+                        .small()
+                        .text_size(px(typo.t_body_sm)),
+                ),
             )
     }
 }
@@ -553,7 +610,7 @@ impl Render for SessionHistoryPanel {
                     let header = div()
                         // Stateful id: hover styles only repaint on hover change
                         // for id'd elements; without it the highlight waits for
-                        // the next unrelated notify (the caret blink).
+                        // the next unrelated notify.
                         .id(SharedString::from(format!("hist-row-{sid}")))
                         .flex()
                         .flex_row()
@@ -661,29 +718,38 @@ impl Render for SessionHistoryPanel {
             .min_h(px(0.0))
             .gap(px(8.0))
             .p(px(10.0))
+            // The focused search `Input` turns ↵ / ↑ / ↓ into its own actions
+            // before raw key listeners on ancestors run, so they are
+            // intercepted at the CAPTURE phase (same contract as
+            // `BranchPicker`). Everything else — typing, paste, IME, caret
+            // movement — is the input's.
+            .capture_action(cx.listener(|this, _: &InputEnter, window, cx| {
+                cx.stop_propagation();
+                this.open(this.selected_idx, window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &MoveUp, _window, cx| {
+                cx.stop_propagation();
+                let n = this.filtered().len();
+                this.move_selection(-1, n, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, _window, cx| {
+                cx.stop_propagation();
+                let n = this.filtered().len();
+                this.move_selection(1, n, cx);
+            }))
+            // Fallback for when focus sits on the panel root rather than the
+            // input (e.g. after a card click): nav keys still work, and typing,
+            // Backspace/Delete and paste jump back into the search field.
             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
-                let key = ev.keystroke.key.as_str();
-                match key {
+                match ev.keystroke.key.as_str() {
                     "up" => this.move_selection(-1, row_count, cx),
                     "down" => this.move_selection(1, row_count, cx),
                     "enter" => this.open(this.selected_idx, window, cx),
-                    "backspace" => {
-                        this.query.pop();
-                        this.selected_idx = 0;
-                        cx.notify();
-                    }
                     _ => {
-                        if ev.keystroke.modifiers.control
-                            || ev.keystroke.modifiers.platform
-                            || ev.keystroke.modifiers.alt
-                            || ev.keystroke.modifiers.function
+                        if this.redirect_edit_key(ev, window, cx)
+                            || this.redirect_typing(ev, window, cx)
                         {
-                            return;
-                        }
-                        if key.chars().count() == 1 {
-                            this.query.push_str(key);
-                            this.selected_idx = 0;
-                            cx.notify();
+                            cx.stop_propagation();
                         }
                     }
                 }

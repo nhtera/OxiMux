@@ -83,8 +83,11 @@ pub fn install(cx: &mut App) {
     // global keymap they shadow, so the two can never desync (e.g. a second
     // window/host that installs the keymap but forgets the shadow).
     crate::shell::terminal_view::register_terminal_key_bindings(cx);
-    // Modal-scoped Cmd+Enter (open highlighted history entry as chat) — a
-    // context-scoped binding, so it can't shadow Cmd+Enter globally.
+    // Session-history modal chords (Cmd+Enter open as chat, Tab cycle filter,
+    // Ctrl+A toggle scope) — context-scoped so they can't shadow those chords
+    // globally. Must run after `gpui_component::init`: the copies scoped to
+    // the modal's search input win their tie with the input's own bindings
+    // only by being registered later.
     crate::shell::session_history::register_session_history_key_bindings(cx);
     // Stash-section cursor keys. Context-scoped for a sharper version of the
     // same reason: these are bare arrow keys and `Enter`, which in the global

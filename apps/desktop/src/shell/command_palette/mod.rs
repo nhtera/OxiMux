@@ -11,11 +11,13 @@ pub mod row_render;
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, Render, Task, Window, div,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, Render, Styled, Subscription, Task, Window, div,
+};
+use gpui_component::input::{
+    Enter as InputEnter, Escape as InputEscape, Input, InputEvent, InputState, MoveDown, MoveUp,
 };
 use oximux_settings::{CustomCommand, Density, Theme, Typography};
 use tokio::sync::oneshot;
@@ -60,12 +62,13 @@ pub struct PaletteModal {
     index_error: Option<String>,
     /// Owns the in-flight scan-result bridge task; dropped on reuse/teardown.
     _index_task: Option<Task<()>>,
-    /// Blinking caret phase for the query field — toggled by `_caret_blink`.
-    /// Makes the header read as a live text input rather than a static label.
-    caret_on: bool,
-    /// Drives the caret blink. Runs for the entity's lifetime; only repaints
-    /// while the palette is open (idle when closed).
-    _caret_blink: Task<()>,
+    /// The query field. A real text input (not a hand-rolled key-down
+    /// buffer) so paste, IME composition, shifted characters, and caret
+    /// movement all work. Created lazily on first `open` — the constructor
+    /// runs without a `&mut Window`, which `InputState` needs. `query`
+    /// mirrors its value via `_query_sub`.
+    query_input: Option<Entity<InputState>>,
+    _query_sub: Option<Subscription>,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -137,45 +140,13 @@ impl PaletteModal {
             workspace_items: Vec::new(),
             index_error: None,
             _index_task: None,
-            caret_on: true,
-            _caret_blink: Self::start_caret_blink(cx),
+            query_input: None,
+            _query_sub: None,
             focus_handle: cx.focus_handle(),
             theme,
             density,
             typography,
         }
-    }
-
-    /// Period of the query-caret blink. Matches the common text-cursor cadence.
-    const CARET_BLINK_MS: u64 = 530;
-
-    /// Toggle the caret on a fixed cadence so the query field reads as an
-    /// editable input. Runs for the entity's lifetime; only flips state +
-    /// repaints while the palette is open, so a closed palette costs nothing
-    /// but a bare timer tick.
-    fn start_caret_blink(cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            loop {
-                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
-                else {
-                    return;
-                };
-                executor
-                    .timer(Duration::from_millis(Self::CARET_BLINK_MS))
-                    .await;
-                if this
-                    .update(cx, |p, cx| {
-                        if p.open {
-                            p.caret_on = !p.caret_on;
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
     }
 
     pub fn is_open(&self) -> bool {
@@ -355,10 +326,36 @@ impl PaletteModal {
         self.open = true;
         self.query.clear();
         self.selected_idx = 0;
-        // Show the caret solid on open; the blink task takes over from here.
-        self.caret_on = true;
-        window.focus(&self.focus_handle, cx);
+        let input = self.ensure_query_input(window, cx);
+        input.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.set_placeholder(placeholder_for(mode), window, cx);
+        });
+        // Focus the INPUT, not the modal root: typing and paste must land in
+        // the text field. Nav keys still reach the modal through the
+        // capture-phase action handlers in `render`.
+        let input_focus = input.read(cx).focus_handle(cx);
+        window.focus(&input_focus, cx);
         cx.notify();
+    }
+
+    /// The query input, created on first use and mirrored into `query` on
+    /// every edit (typing, paste, IME commit, delete).
+    fn ensure_query_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some(input) = &self.query_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx));
+        let sub = cx.subscribe_in(&input, window, |this, input, ev: &InputEvent, _window, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.query = input.read(cx).value().to_string();
+                this.selected_idx = 0;
+                cx.notify();
+            }
+        });
+        self.query_input = Some(input.clone());
+        self._query_sub = Some(sub);
+        input
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
@@ -390,6 +387,35 @@ impl PaletteModal {
             row_count,
         );
         cx.notify();
+    }
+
+    /// Number of ACTIONABLE rows in the current mode, computed from live
+    /// state (a query edit and a nav key can land in one event batch, so a
+    /// render-time capture may be stale). Status/hint rows count as 0.
+    fn row_count(&self) -> usize {
+        match self.mode {
+            PaletteMode::Commands => self.filtered_items().len(),
+            PaletteMode::QuickOpen => self.quick_open_matches().len(),
+            PaletteMode::WorkspaceJump => self.workspace_jump_ranked().len(),
+        }
+    }
+
+    fn nav(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.row_count();
+        self.move_selection(delta, n, cx);
+    }
+
+    /// Activate the selected row in the current mode (keyboard Enter).
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let idx = self.selected_idx;
+        match self.mode {
+            PaletteMode::Commands => {
+                let items = self.filtered_items();
+                self.activate_item(idx, &items, window, cx);
+            }
+            PaletteMode::QuickOpen => self.activate_file(idx, window, cx),
+            PaletteMode::WorkspaceJump => self.activate_workspace_jump(idx, window, cx),
+        }
     }
 
     /// Build the current filtered item list (Commands mode only). Returns
@@ -445,6 +471,15 @@ impl Focusable for PaletteModal {
     }
 }
 
+/// Query-field placeholder per mode.
+fn placeholder_for(mode: PaletteMode) -> &'static str {
+    match mode {
+        PaletteMode::QuickOpen => "Search files…",
+        PaletteMode::Commands => "Search commands…",
+        PaletteMode::WorkspaceJump => "Jump to workspace…",
+    }
+}
+
 impl Render for PaletteModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
@@ -458,19 +493,16 @@ impl Render for PaletteModal {
         let mode = self.mode;
         let query = self.query.clone();
         let selected_idx = self.selected_idx;
-        let caret_on = self.caret_on;
 
-        // Row clicks activate through the same path as keyboard Enter
-        // (`activate_item` dispatches AND closes the modal), so a mouse click
-        // can't leave the palette open. The entity is captured so the pure
-        // render helper needs no direct access to private methods.
-        let entity = cx.entity();
-        let on_activate: row_render::ActivateFn = std::rc::Rc::new(move |idx, window, cx| {
-            entity.update(cx, |p, cx| {
-                let items = p.filtered_items();
-                p.activate_item(idx, &items, window, cx);
-            });
-        });
+        // Borderless so it reads as part of the header row (search icon +
+        // mode chip + field), not a boxed control inside it.
+        let query_field = match &self.query_input {
+            Some(input) => Input::new(input)
+                .appearance(false)
+                .text_size(gpui::px(typography.t_body_md))
+                .into_any_element(),
+            None => div().into_any_element(),
+        };
 
         // Backdrop click-outside dismiss — same close path as Esc.
         let dismiss_entity = cx.entity();
@@ -478,218 +510,118 @@ impl Render for PaletteModal {
             dismiss_entity.update(cx, |p, cx| p.close(cx));
         });
 
-        match mode {
-            PaletteMode::Commands => {
-                let filtered = self.filtered_items();
-                let row_count = filtered.len();
+        // Row clicks activate through the same path as keyboard Enter (the
+        // activate helpers dispatch AND close the modal), so a mouse click
+        // can't leave the palette open. The entity is captured so the pure
+        // render helper needs no direct access to private methods.
+        let entity = cx.entity();
+        let on_activate: row_render::ActivateFn = match mode {
+            PaletteMode::Commands => Rc::new(move |idx, window, cx| {
+                entity.update(cx, |p, cx| {
+                    let items = p.filtered_items();
+                    p.activate_item(idx, &items, window, cx);
+                });
+            }),
+            PaletteMode::QuickOpen => Rc::new(move |idx, window, cx| {
+                entity.update(cx, |p, cx| p.activate_file(idx, window, cx));
+            }),
+            PaletteMode::WorkspaceJump => Rc::new(move |idx, window, cx| {
+                entity.update(cx, |p, cx| p.activate_workspace_jump(idx, window, cx));
+            }),
+        };
 
-                build_modal_layout(ModalRenderInput {
-                    mode,
-                    query: &query,
-                    selected_idx,
-                    palette_items: &filtered,
-                    file_rows: Vec::new(),
-                    row_count,
-                    caret_on,
-                    on_activate: on_activate.clone(),
-                    on_dismiss: on_dismiss.clone(),
-                    theme,
-                    density,
-                    typography: &typography,
-                    motion,
-                })
-                .track_focus(&self.focus_handle)
-                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                    let key = event.keystroke.key.as_str();
-                    match key {
-                        "escape" => this.close(cx),
-                        "up" => this.move_selection(-1, row_count, cx),
-                        "down" => this.move_selection(1, row_count, cx),
-                        "enter" => {
-                            let items = this.filtered_items();
-                            let idx = this.selected_idx;
-                            this.activate_item(idx, &items, window, cx);
-                        }
-                        "backspace" => {
-                            this.query.pop();
-                            this.selected_idx = 0;
-                            cx.notify();
-                        }
-                        _ => {
-                            // Append printable single characters. Skip when a
-                            // non-Shift modifier is held (Cmd/Ctrl/Alt/Fn) so
-                            // shortcut combos still bubble up as actions and
-                            // Option+letter doesn't leak into the query.
-                            if event.keystroke.modifiers.control
-                                || event.keystroke.modifiers.platform
-                                || event.keystroke.modifiers.alt
-                                || event.keystroke.modifiers.function
-                            {
-                                return;
-                            }
-                            if key.chars().count() == 1 {
-                                this.query.push_str(key);
-                                this.selected_idx = 0;
-                                cx.notify();
-                            }
-                        }
-                    }
-                }))
-                .into_any_element()
-            }
+        // Row sources per mode. An empty QuickOpen / WorkspaceJump result
+        // renders a single non-actionable status/hint row (row_count stays 0
+        // so nav + Enter are inert).
+        let palette_items: Vec<PaletteItem> = match mode {
+            PaletteMode::Commands => self.filtered_items(),
+            PaletteMode::QuickOpen | PaletteMode::WorkspaceJump => Vec::new(),
+        };
+        let file_row_strings: Vec<String> = match mode {
+            PaletteMode::Commands => Vec::new(),
+            PaletteMode::QuickOpen => self.quick_open_matches(),
+            PaletteMode::WorkspaceJump => self.workspace_jump_rows(),
+        };
+        let (file_rows, row_count): (Vec<&str>, usize) = match mode {
+            PaletteMode::Commands => (Vec::new(), palette_items.len()),
+            PaletteMode::QuickOpen | PaletteMode::WorkspaceJump if !file_row_strings.is_empty() => (
+                file_row_strings.iter().map(String::as_str).collect(),
+                file_row_strings.len(),
+            ),
             PaletteMode::QuickOpen => {
-                let matches = self.quick_open_matches();
-                // Empty result → a single non-actionable status/hint row
-                // (row_count stays 0 so nav + Enter are inert).
-                let (file_rows, row_count): (Vec<&str>, usize) = if matches.is_empty() {
-                    let hint = if let Some(err) = self.index_error.as_deref() {
-                        err
-                    } else if self.scanning {
-                        "Indexing project files…"
-                    } else if !self.index_loaded {
-                        "Open a project to search files"
-                    } else {
-                        "No matching files"
-                    };
-                    (vec![hint], 0)
+                let hint = if let Some(err) = self.index_error.as_deref() {
+                    err
+                } else if self.scanning {
+                    "Indexing project files…"
+                } else if !self.index_loaded {
+                    "Open a project to search files"
                 } else {
-                    (matches.iter().map(String::as_str).collect(), matches.len())
+                    "No matching files"
                 };
-
-                let entity = cx.entity();
-                let on_activate_file: row_render::ActivateFn =
-                    Rc::new(move |idx, window, cx| {
-                        entity.update(cx, |p, cx| p.activate_file(idx, window, cx));
-                    });
-
-                build_modal_layout(ModalRenderInput {
-                    mode,
-                    query: &query,
-                    selected_idx,
-                    palette_items: &[],
-                    file_rows,
-                    row_count,
-                    caret_on,
-                    on_activate: on_activate_file,
-                    on_dismiss: on_dismiss.clone(),
-                    theme,
-                    density,
-                    typography: &typography,
-                    motion,
-                })
-                .track_focus(&self.focus_handle)
-                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                    let key = event.keystroke.key.as_str();
-                    match key {
-                        "escape" => this.close(cx),
-                        "up" => this.move_selection(-1, row_count, cx),
-                        "down" => this.move_selection(1, row_count, cx),
-                        "enter" => {
-                            let idx = this.selected_idx;
-                            this.activate_file(idx, window, cx);
-                        }
-                        "backspace" => {
-                            this.query.pop();
-                            this.selected_idx = 0;
-                            cx.notify();
-                        }
-                        _ => {
-                            if event.keystroke.modifiers.control
-                                || event.keystroke.modifiers.platform
-                                || event.keystroke.modifiers.alt
-                                || event.keystroke.modifiers.function
-                            {
-                                return;
-                            }
-                            if key.chars().count() == 1 {
-                                this.query.push_str(key);
-                                this.selected_idx = 0;
-                                cx.notify();
-                            }
-                        }
-                    }
-                }))
-                .into_any_element()
+                (vec![hint], 0)
             }
             PaletteMode::WorkspaceJump => {
-                let rows = self.workspace_jump_rows();
-                // Empty → a single non-actionable hint (row_count 0 keeps
-                // nav + Enter inert), mirroring QuickOpen.
-                let (file_rows, row_count): (Vec<&str>, usize) = if rows.is_empty() {
-                    let hint = if self.workspace_items.is_empty() {
-                        "No workspaces yet"
-                    } else {
-                        "No matching workspaces"
-                    };
-                    (vec![hint], 0)
+                let hint = if self.workspace_items.is_empty() {
+                    "No workspaces yet"
                 } else {
-                    (rows.iter().map(String::as_str).collect(), rows.len())
+                    "No matching workspaces"
                 };
-
-                let entity = cx.entity();
-                let on_activate_ws: row_render::ActivateFn = Rc::new(move |idx, window, cx| {
-                    entity.update(cx, |p, cx| p.activate_workspace_jump(idx, window, cx));
-                });
-
-                build_modal_layout(ModalRenderInput {
-                    mode,
-                    query: &query,
-                    selected_idx,
-                    palette_items: &[],
-                    file_rows,
-                    row_count,
-                    caret_on,
-                    on_activate: on_activate_ws,
-                    on_dismiss: on_dismiss.clone(),
-                    theme,
-                    density,
-                    typography: &typography,
-                    motion,
-                })
-                .track_focus(&self.focus_handle)
-                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                    let key = event.keystroke.key.as_str();
-                    match key {
-                        "escape" => this.close(cx),
-                        // Recompute the row count from live state: a query
-                        // keystroke + nav can arrive in one event batch, so the
-                        // render-time `row_count` capture may be stale.
-                        "up" => {
-                            let n = this.workspace_jump_ranked().len();
-                            this.move_selection(-1, n, cx);
-                        }
-                        "down" => {
-                            let n = this.workspace_jump_ranked().len();
-                            this.move_selection(1, n, cx);
-                        }
-                        "enter" => {
-                            let idx = this.selected_idx;
-                            this.activate_workspace_jump(idx, window, cx);
-                        }
-                        "backspace" => {
-                            this.query.pop();
-                            this.selected_idx = 0;
-                            cx.notify();
-                        }
-                        _ => {
-                            if event.keystroke.modifiers.control
-                                || event.keystroke.modifiers.platform
-                                || event.keystroke.modifiers.alt
-                                || event.keystroke.modifiers.function
-                            {
-                                return;
-                            }
-                            if key.chars().count() == 1 {
-                                this.query.push_str(key);
-                                this.selected_idx = 0;
-                                cx.notify();
-                            }
-                        }
-                    }
-                }))
-                .into_any_element()
+                (vec![hint], 0)
             }
-        }
+        };
+
+        build_modal_layout(ModalRenderInput {
+            mode,
+            query: &query,
+            query_field,
+            selected_idx,
+            palette_items: &palette_items,
+            file_rows,
+            row_count,
+            on_activate,
+            on_dismiss,
+            theme,
+            density,
+            typography: &typography,
+            motion,
+        })
+        .track_focus(&self.focus_handle)
+        // Keyboard plumbing (same contract as `BranchPicker`). The focused
+        // `Input` turns nav keys into its own ACTIONS before raw key
+        // listeners on ancestors run, so they are intercepted at the
+        // CAPTURE phase and stopped there. Everything else — typing, paste
+        // (⌘V / Ctrl+V), IME, caret movement — is the input's.
+        // Known trade-off (shared with `BranchPicker`): capturing Escape
+        // preempts the input's IME-unmark path, so Escape mid-composition
+        // closes the palette instead of cancelling the composition.
+        .capture_action(cx.listener(|this, _: &InputEscape, _window, cx| {
+            cx.stop_propagation();
+            this.close(cx);
+        }))
+        .capture_action(cx.listener(|this, _: &InputEnter, window, cx| {
+            cx.stop_propagation();
+            this.confirm(window, cx);
+        }))
+        .capture_action(cx.listener(|this, _: &MoveUp, _window, cx| {
+            cx.stop_propagation();
+            this.nav(-1, cx);
+        }))
+        .capture_action(cx.listener(|this, _: &MoveDown, _window, cx| {
+            cx.stop_propagation();
+            this.nav(1, cx);
+        }))
+        // Fallback for when focus sits on the modal root rather than the
+        // input (e.g. the input entity was not yet created).
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            match event.keystroke.key.as_str() {
+                "escape" => this.close(cx),
+                "up" => this.nav(-1, cx),
+                "down" => this.nav(1, cx),
+                "enter" => this.confirm(window, cx),
+                _ => {}
+            }
+        }))
+        .into_any_element()
     }
 }
 

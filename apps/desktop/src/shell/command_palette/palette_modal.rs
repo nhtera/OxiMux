@@ -6,9 +6,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    Animation, AnimationExt, App, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, hsla, prelude::FluentBuilder,
-    px,
+    AnyElement, Animation, AnimationExt, App, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, StatefulInteractiveElement, Styled, Window, div, hsla, px,
 };
 use gpui_component::{Icon, IconName};
 use oximux_settings::{Density, Motion, Theme, Typography};
@@ -37,7 +36,11 @@ const SCRIM_ALPHA: f32 = 0.20;
 
 pub struct ModalRenderInput<'a> {
     pub mode: PaletteMode,
+    /// Current query text — used for match highlighting in the rows.
     pub query: &'a str,
+    /// The live query input element (a `gpui_component` `Input`), owned and
+    /// built by the caller; this layout only places it in the header.
+    pub query_field: AnyElement,
     pub selected_idx: usize,
     /// Resolved palette items (Commands mode). Empty for QuickOpen mode.
     pub palette_items: &'a [PaletteItem],
@@ -47,8 +50,6 @@ pub struct ModalRenderInput<'a> {
     /// holds a single non-actionable status/hint line — so the hint renders
     /// without a hover/click affordance.
     pub row_count: usize,
-    /// Blinking-caret phase for the query field (true = caret drawn).
-    pub caret_on: bool,
     /// Activates the row at the given filtered-list index — dispatches the
     /// action AND closes the modal. Shared by click and keyboard.
     pub on_activate: ActivateFn,
@@ -63,9 +64,10 @@ pub struct ModalRenderInput<'a> {
 /// Build the full modal: a dimmed backdrop that dismisses on click-outside,
 /// centering a floating card. The caller chains `.track_focus` and
 /// `.on_key_down` on the returned element.
-pub fn build_modal_layout(input: ModalRenderInput<'_>) -> gpui::Div {
+pub fn build_modal_layout(mut input: ModalRenderInput<'_>) -> gpui::Div {
     let dismiss = input.on_dismiss.clone();
     let motion = input.motion;
+    let query_field = std::mem::replace(&mut input.query_field, div().into_any_element());
 
     let card = card_container(input.theme, input.density)
         // Stop presses inside the card from reaching the backdrop's
@@ -75,8 +77,7 @@ pub fn build_modal_layout(input: ModalRenderInput<'_>) -> gpui::Div {
         .on_mouse_down(MouseButton::Left, |_event, _window, cx| cx.stop_propagation())
         .child(header_row(
             input.mode,
-            input.query,
-            input.caret_on,
+            query_field,
             input.theme,
             input.density,
             input.typography,
@@ -129,8 +130,7 @@ fn card_container(theme: Theme, density: Density) -> gpui::Div {
 
 fn header_row(
     mode: PaletteMode,
-    query: &str,
-    caret_on: bool,
+    query_field: AnyElement,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -140,41 +140,6 @@ fn header_row(
         PaletteMode::Commands => "Commands",
         PaletteMode::WorkspaceJump => "Workspaces",
     };
-    let placeholder = match mode {
-        PaletteMode::QuickOpen => "Search files…",
-        PaletteMode::Commands => "Search commands…",
-        PaletteMode::WorkspaceJump => "Jump to workspace…",
-    };
-
-    // Blinking text caret. Fixed width whether on or off so the toggle never
-    // nudges the text; transparent (alpha 0) on the off phase.
-    let caret_color = if caret_on {
-        theme.fg_base
-    } else {
-        hsla(0.0, 0.0, 0.0, 0.0)
-    };
-    let caret = div().w(px(1.5)).h(px(16.)).rounded_full().bg(caret_color);
-
-    // Query area reads as a live input: typed text followed by the caret, or
-    // the caret followed by greyed placeholder text when empty.
-    let query_area = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .flex_1()
-        .gap(px(1.))
-        .text_size(px(typography.t_body_md))
-        .when(!query.is_empty(), |d| {
-            d.child(div().text_color(theme.fg_base).child(query.to_string()))
-        })
-        .child(caret)
-        .when(query.is_empty(), |d| {
-            d.child(
-                div()
-                    .text_color(theme.fg_subtle)
-                    .child(placeholder.to_string()),
-            )
-        });
 
     div()
         .flex()
@@ -198,7 +163,7 @@ fn header_row(
                 .text_color(theme.fg_muted)
                 .child(mode_label),
         )
-        .child(query_area)
+        .child(div().flex_1().min_w_0().child(query_field))
 }
 
 fn divider(theme: Theme) -> impl IntoElement {
