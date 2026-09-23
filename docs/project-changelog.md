@@ -4,6 +4,56 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-24 — Agents and shells survive a reboot (`feat/session-resume-after-reboot`)
+
+- **Agent tabs resume their conversation after a reboot.** The status hooks
+  now carry the agent's own session id (`a9ee0ddf`), and OxiMux saves it with
+  the tab. On a cold restore an agent tab OxiMux launched is started again on
+  that conversation (`claude --resume`, `codex resume`, …) instead of fresh,
+  under a dim "resuming previous session" marker (`ec3575b7`). If the CLI
+  refuses the id, the tab falls back to a fresh start and says so ("previous
+  session unavailable, started fresh"). A refusal counts until the agent's
+  first hook event, so it is still caught when a CLI shows a startup menu
+  first, as Codex does with "Update available" (`1a8ef8c9`).
+- **An agent you typed yourself is offered back.** A terminal where you ran
+  `claude` or `codex` comes back with the resume command already typed at
+  the prompt, under "previous … session found: press Enter to resume, or
+  edit the command". Nothing runs until you press Enter, and any input
+  (typing, paste, dictation, drop) drops the offer. Records older than 7 days
+  are not offered. Replacing the agent in that terminal with a different one
+  forgets the first record, so a reboot never offers the wrong agent
+  (`ec3575b7`, `0b07ce3a`, `b55fea8f`).
+- **The marker stays readable when the CLI clears the screen.** Claude Code,
+  omp and Pi erase the screen or scrollback as they start, which took the
+  restore marker with it. When that happens the marker's words now show as a
+  strip over the pane until your first input (`01ad9ba9`).
+- **Up recalls what you ran before the reboot.** macOS's `/etc/zshrc` pointed
+  OxiMux shells at a private history file, and zsh writes history only on
+  exit, so a shell killed by a reboot lost its commands. OxiMux shells now
+  write to your real `~/.zsh_history` after every command (a `HISTFILE` you
+  set yourself still wins), and history left in the old private file is
+  carried over once (`08730008`).
+- **A restored terminal no longer shows a bare cursor.** A shell that started
+  quickly could draw its first prompt before the restored history arrived,
+  and the history's screen clear then erased it. The history now goes in
+  before the shell's output is read, so the prompt always lands below it
+  (`8009fc28`, `8d35d3f4`).
+- **Agent hooks run through a stable shim.** Hooks are global: every agent on
+  the machine runs them, inside OxiMux or not. They named whichever OxiMux
+  binary started last, so a dev build under `target/` became what every agent
+  called. It could not start outside cargo, and each failed start left a
+  stuck process; 1490 built up in two days. Hooks now run
+  `~/.oximux/agent-hooks/oximux-agent-status`, which prefers the installed
+  app over a build output and always exits 0. Old entries are replaced on the
+  next launch, and Codex asks once to trust the changed hooks. Windows still
+  names the binary (`a0120d69`, `8d35d3f4`).
+- **Verified with a real reboot.** After rebooting, Claude and Codex both
+  resumed their earlier conversation and recalled their last reply. The
+  shell kept its output and its history, and no hook processes were left
+  stuck. Not yet drilled across a reboot: an agent tab that OxiMux launched
+  itself. On Windows the restored history is cleared by ConPTY's first
+  repaint, so the first-prompt fix does not apply there.
+
 ### 2026-09-22 — Ignored folders look ignored, and the tree knows it at launch (`fix/explorer-ignored-folder-style`)
 
 - **A git-ignored folder now dims like an ignored file.** Revealing ignored
