@@ -42,14 +42,20 @@ fn selected(agent: Option<&str>) -> Result<Vec<&'static HookDialect>, Failure> {
 /// an app bundle is replaced wholesale by every update, which is why the app
 /// refreshes these paths on each boot. On a headless host there is no bundle to
 /// find at all, and this is the only binary there is.
-fn hook_binary() -> Result<PathBuf, Failure> {
-    std::env::current_exe().map_err(|err| {
+///
+/// Named through the hook shim, as the app does, so a CLI run from a build
+/// tree never leaves every agent on the machine calling a build output. Only
+/// an install rewrites the shim: `off` for one agent must not repoint the shim
+/// every other agent still runs at this (possibly temporary) binary.
+fn hook_binary(on: bool) -> Result<PathBuf, Failure> {
+    let exe = std::env::current_exe().map_err(|err| {
         Failure::new(
             "io",
             exit::ERROR,
             format!("cannot resolve this binary's own path, so no hook can call back into it: {err}"),
         )
-    })
+    })?;
+    Ok(if on { oximux_agent_hooks::hook_shim::hook_program(&exe) } else { exe })
 }
 
 /// `agent hooks status`.
@@ -118,7 +124,7 @@ fn describe(state: &HookState) -> String {
 /// happens not to have Gemini installed is not an error.
 pub fn set(on: bool, agent: Option<&str>) -> Result<(Value, String), Failure> {
     let dialects = selected(agent)?;
-    let exe = hook_binary()?;
+    let exe = hook_binary(on)?;
 
     let mut results = Vec::new();
     for dialect in dialects {

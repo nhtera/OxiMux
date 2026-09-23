@@ -533,3 +533,13 @@ fn powershell_quoting_neutralizes_interpolation_and_backslashes() {
     // The one character that does need care is the quote itself.
     assert_eq!(shell_quote("don't"), "'don''t'");
 }
+
+#[test]
+fn a_resumed_session_names_its_conversation_before_any_hook_fires() {
+    // A restored cockpit tab's first layout snapshot may land before any hook
+    // fires; the seeded id is what keeps `provider_session` from being lost.
+    let snap = super::initial_snapshot(Some("abc".into()));
+    assert_eq!(snap.status, oximux_core::AgentStatus::Idle);
+    assert_eq!(snap.detail.and_then(|d| d.session_id).as_deref(), Some("abc"));
+    assert!(super::initial_snapshot(None).detail.is_none());
+}

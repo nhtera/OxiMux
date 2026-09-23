@@ -8,12 +8,25 @@ impl TerminalView {
         // nothing, so a check that only ran on output would never notice one
         // arriving — and, having noticed, would never notice it leave.
         self.poll_agent_process(cx);
+        // Likewise ahead of the early return: the search a resize scheduled
+        // falls due on a quiet tick.
+        if self.recheck_restore_notice() {
+            cx.notify();
+        }
         // Use the per-session drain so panes can't steal each other's
         // events from a shared backend (e.g., the relay). The global
         // `drain_events` is reserved for tests + cleanup paths.
         let session_id_for_drain = self.session_id;
         let events = self.with_backend(|be| be.drain_events_for(session_id_for_drain));
         if events.is_empty() {
+            // A pre-typed resume command goes out once the shell has been
+            // quiet for a moment after its first output — at the prompt, not
+            // in the middle of its start-up lines. Decided only on a tick that
+            // drained nothing: output already waiting in the backend would
+            // otherwise count as silence until it was read.
+            if queued_input_ready(self.queued_input_last_output, std::time::Instant::now()) {
+                self.flush_queued_input();
+            }
             return;
         }
         let settings = terminal_settings(cx);
@@ -58,13 +71,20 @@ impl TerminalView {
                     let code = code.unwrap_or(-1);
                     self.exited = Some(code);
                     exit_changed = true;
+                    // Nothing to type at a dead shell.
+                    self.queued_first_output_input = None;
                     if code == 0 {
                         cx.emit(TerminalViewEvent::CleanExit {
                             session_id: self.session_id,
                         });
                     }
                 }
-                TerminalEvent::Resize { .. } => needs_snapshot = true,
+                TerminalEvent::Resize { .. } => {
+                    needs_snapshot = true;
+                    // A CLI repaints on resize, and may erase the restore
+                    // marker doing it (see `restore_notice`).
+                    self.note_erase_risk_for_notice();
+                }
                 TerminalEvent::TitleChange { title, .. } => {
                     latest_title = Some(title.clone());
                 }
@@ -94,7 +114,10 @@ impl TerminalView {
                 // marks as the bytes were, so a prompt mark later in the same
                 // batch — the shell's `precmd` once `clear` returns — is
                 // applied after the drop and keeps its badge.
-                TerminalEvent::ScrollbackReset { .. } => self.drop_command_marks(),
+                TerminalEvent::ScrollbackReset { .. } => {
+                    self.drop_command_marks();
+                    self.note_erase_risk_for_notice();
+                }
                 // OSC 9;4 progress. state 0 clears; error/warning raises
                 // attention on an unfocused pane like a bell.
                 TerminalEvent::Progress { state, value, .. } => {
@@ -131,24 +154,34 @@ impl TerminalView {
         }
         if had_output {
             self.cursor_visible = true;
+            // The shell has spoken: note when, so the pre-typed resume
+            // command (if any) goes out after the next quiet gap.
+            if self.queued_first_output_input.is_some() {
+                self.queued_input_last_output = Some(std::time::Instant::now());
+            }
             // Persist the ambient-agent reading (keyed by this pane's PTY id)
             // whenever it changes, so a warm re-attach after a quit re-seeds it
             // and the rail lists the still-running agent immediately. Written
             // only on change → no SQLite churn on a steady output stream; a
-            // plain shell never produces a reading, so it never writes.
+            // plain shell never produces a reading, so it never writes. The
+            // process-scan label rides along (and counts as a change) so a
+            // reboot can rebuild the resume command from the record.
             let reading = self.agent_scan.current(std::time::Instant::now());
-            if reading != self.last_persisted_ambient {
+            let agent = self.proc_scan.current();
+            if reading != self.last_persisted_ambient || agent != self.last_persisted_agent {
                 if let Some(sb) = &reading
                     && let Some(pty) = self.external_id()
                 {
                     let (status, detail) = (sb.status.clone(), sb.detail.clone());
+                    let ticket = crate::shell::ambient_state::ticket();
                     cx.background_executor()
                         .spawn(async move {
-                            crate::shell::ambient_state::persist(&pty, &status, &detail);
+                            crate::shell::ambient_state::persist(&pty, &status, &detail, agent, ticket);
                         })
                         .detach();
                 }
                 self.last_persisted_ambient = reading;
+                self.last_persisted_agent = agent;
             }
         }
         if let Some(title) = latest_title {
@@ -306,6 +339,25 @@ impl TerminalView {
                 agent = ?self.proc_scan.current(),
                 "terminal agent presence changed"
             );
+            // The hook reading belonged to the process that just left (or was
+            // replaced): drop it so a later record cannot pair one agent's
+            // conversation id with another's label. Its persisted record goes
+            // too, whether the agent left or was replaced by another: a
+            // replacement that has not fired a hook yet would otherwise leave
+            // the first agent's label and id on disk, and a reboot would
+            // pre-type the wrong agent's resume command. The newcomer writes
+            // its own record on its first hook.
+            if before.is_some() {
+                self.agent_scan.reset();
+                self.last_persisted_ambient = None;
+                self.last_persisted_agent = None;
+                if let Some(pty) = self.external_id() {
+                    let ticket = crate::shell::ambient_state::ticket();
+                    cx.background_executor()
+                        .spawn(async move { crate::shell::ambient_state::forget(&pty, ticket) })
+                        .detach();
+                }
+            }
             cx.notify();
         }
     }
@@ -346,6 +398,39 @@ impl TerminalView {
                 .seed(status, detail, std::time::Instant::now());
             self.last_persisted_ambient = self.agent_scan.current(std::time::Instant::now());
             tracing::debug!(pty_id = %pty, "seeded ambient agent from persisted reading");
+        }
+    }
+
+    /// Type `bytes` at the shell once it has produced output and then gone
+    /// quiet for a moment (its prompt, on a cold restore), or after a short
+    /// wait if it prints nothing at all (a prompt that only draws on a key).
+    /// Pre-fills a command for the user to confirm; the newline is theirs to
+    /// send. Dropped by any keystroke that lands before the drain (their
+    /// input wins), and on exit.
+    pub fn queue_input_on_first_output(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        const FALLBACK_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+        self.queued_first_output_input = Some(bytes);
+        self._queued_input_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FALLBACK_AFTER).await;
+            // Only a shell that has printed nothing needs the timer; one that
+            // is still chattering (a slow rc file) gets the quiet-gap drain.
+            let _ = this.update(cx, |view, _cx| {
+                if view.queued_input_last_output.is_none() {
+                    view.flush_queued_input();
+                }
+            });
+        }));
+    }
+
+    /// Deliver the queued pre-typed input, if any is still pending.
+    fn flush_queued_input(&mut self) {
+        let Some(bytes) = self.queued_first_output_input.take() else {
+            return;
+        };
+        self.queued_input_last_output = None;
+        let session_id = self.session_id;
+        if let Err(err) = self.with_backend(|be| be.write(session_id, &bytes)) {
+            tracing::warn!(?err, "queued resume input write failed");
         }
     }
 
@@ -415,5 +500,33 @@ impl TerminalView {
     /// full-screen TUIs render their absolute-positioned UI scrambled.
     pub(super) fn pull_canvas_grid(&mut self) {
         self.target_grid = self.canvas_grid.get();
+    }
+}
+
+/// How long the shell must stay quiet after output before a queued resume
+/// command is typed at it. Start-up lines arrive in bursts a few tens of
+/// milliseconds apart; the prompt then waits for input.
+const QUEUED_INPUT_QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// True when queued input should go out now: the shell produced output at
+/// `last_output` and has been quiet since for at least the gap. `None`
+/// (no output yet) is never ready — the 3 s fallback timer covers a shell
+/// that prints nothing.
+fn queued_input_ready(last_output: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_output.is_some_and(|t| now.saturating_duration_since(t) >= QUEUED_INPUT_QUIET)
+}
+
+#[cfg(test)]
+mod queued_input_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn queued_input_waits_for_a_quiet_gap_after_output() {
+        let t0 = Instant::now();
+        assert!(!queued_input_ready(None, t0), "no output yet: the timer, not the tick, delivers");
+        assert!(!queued_input_ready(Some(t0), t0), "output just landed: still chattering");
+        assert!(!queued_input_ready(Some(t0), t0 + QUEUED_INPUT_QUIET - Duration::from_millis(1)));
+        assert!(queued_input_ready(Some(t0), t0 + QUEUED_INPUT_QUIET));
     }
 }

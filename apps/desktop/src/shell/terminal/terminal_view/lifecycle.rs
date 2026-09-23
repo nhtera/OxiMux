@@ -167,6 +167,11 @@ impl TerminalView {
             agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
             last_persisted_ambient: None,
             proc_scan: crate::shell::agent_process_scan::AgentProcessScan::new(),
+            last_persisted_agent: None,
+            queued_first_output_input: None,
+            queued_input_last_output: None,
+            restore_notice: None,
+            _queued_input_timer: None,
         }
     }
 
@@ -230,10 +235,42 @@ impl TerminalView {
         }
         self.pending_attach = false;
         self.pending_relay_hint = None;
-        // A fresh live session is replacing the placeholder — drop any stale
+        self.swap_session(backend, session_id, cx);
+        true
+    }
+
+    /// Replace the LIVE session behind this view with another one. The one
+    /// caller is the cockpit resume fallback: a restored agent tab whose CLI
+    /// rejected the persisted conversation id gets a fresh CLI in the same
+    /// pane, keeping the tab (its slot, label, colour and rail row) instead of
+    /// leaving a dead pane. The rejected session must already be cancelled by
+    /// the runtime; its backend handle is closed here as well (idempotent).
+    pub fn replace_live_session(
+        &mut self,
+        backend: SharedBackend,
+        session_id: TerminalSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.swap_session(backend, session_id, cx);
+    }
+
+    /// Shared body of [`adopt_live_session`](Self::adopt_live_session) and
+    /// [`replace_live_session`](Self::replace_live_session): point the view at
+    /// `session_id` on `backend`, drop every piece of state that belonged to
+    /// the previous grid, and re-arm the drain tasks.
+    fn swap_session(
+        &mut self,
+        backend: SharedBackend,
+        session_id: TerminalSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        // A fresh live session is replacing the previous one — drop any stale
         // exit banner so a swap (e.g. post-attach reconcile) never leaves the
         // "process exited" marker over a now-running shell.
         self.exited = None;
+        // A notice about the previous session's grid means nothing on the
+        // new one; a restore swap re-arms its own right after.
+        self.restore_notice = None;
         // The pid the scan was rooted at belongs to the previous session; drop
         // it so the next poll walks the new shell instead of waiting out the
         // old root's liveness check.
@@ -247,9 +284,10 @@ impl TerminalView {
         self.scrollbar_drag = None;
         let old_backend = std::mem::replace(&mut self.backend, backend);
         let old_id = std::mem::replace(&mut self.session_id, session_id);
-        // The placeholder owns no child process, but close it anyway so the
-        // in-process backend's session map doesn't accumulate dead entries.
-        // Detached thread mirrors `Drop` — close may briefly block.
+        // A placeholder owns no child process, and a replaced live session was
+        // already cancelled by its runtime — close either anyway so the
+        // backend's session map doesn't accumulate dead entries (close is
+        // idempotent). Detached thread mirrors `Drop` — close may briefly block.
         std::thread::spawn(move || {
             if let Ok(mut be) = old_backend.lock() {
                 let _ = be.close(old_id);
@@ -271,7 +309,6 @@ impl TerminalView {
         // renders on arrival — the responsive path for a reattached terminal.
         self._output_drain_task = Self::start_output_drain_task(&self.backend, session_id, cx);
         cx.notify();
-        true
     }
 
     /// F3.4: build a view backed by a DORMANT session — grid emulator
@@ -384,6 +421,11 @@ impl TerminalView {
             agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
             last_persisted_ambient: None,
             proc_scan: crate::shell::agent_process_scan::AgentProcessScan::new(),
+            last_persisted_agent: None,
+            queued_first_output_input: None,
+            queued_input_last_output: None,
+            restore_notice: None,
+            _queued_input_timer: None,
         }
     }
 

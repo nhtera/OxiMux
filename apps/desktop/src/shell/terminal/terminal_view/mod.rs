@@ -274,7 +274,7 @@ pub fn spawn_local_pty(
     cwd: PathBuf,
     env: Vec<(String, String)>,
 ) -> Option<(SharedBackend, TerminalSessionId)> {
-    spawn_local_pty_sized(cwd, env, None)
+    spawn_local_pty_sized(cwd, env, None, &[])
 }
 
 /// `spawn_local_pty` with explicit initial PTY dimensions. The cold
@@ -282,10 +282,16 @@ pub fn spawn_local_pty(
 /// replacement shell's first paint wraps for the size the restored
 /// content used — the pane's normal resize takes over right after
 /// adopt, so this only matters for that first prompt.
+///
+/// `prefill` (the recovered scrollback and its marker; empty for none) is in
+/// the grid before any of the shell's output, so the first prompt appends
+/// below it. Prefilling after this returns races the backend's reader: a fast
+/// shell's prompt could land first and the prefill's screen clear erase it.
 pub fn spawn_local_pty_sized(
     cwd: PathBuf,
     env: Vec<(String, String)>,
     dims: Option<(u16, u16)>,
+    prefill: &[u8],
 ) -> Option<(SharedBackend, TerminalSessionId)> {
     let (cols, rows) = dims.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
     // Relay-backed path: one shared backend across the whole app.
@@ -298,7 +304,7 @@ pub fn spawn_local_pty_sized(
         // wedge mid-request.
         let _nap = crate::app_nap::prevent("relay spawn");
         let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        match guard.spawn(cfg) {
+        match guard.spawn_prefilled(cfg, prefill) {
             Ok(session_id) => {
                 drop(guard);
                 return Some((Arc::clone(shared), session_id));
@@ -310,18 +316,19 @@ pub fn spawn_local_pty_sized(
             }
         }
     }
-    spawn_fallback_portable(cwd, env, (cols, rows))
+    spawn_fallback_portable(cwd, env, (cols, rows), prefill)
 }
 
 fn spawn_fallback_portable(
     cwd: PathBuf,
     env: Vec<(String, String)>,
     (cols, rows): (u16, u16),
+    prefill: &[u8],
 ) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
     let mut cfg = shell_spawn_config(cwd, env, cols, rows);
     super::shell_integration::augment_spawn_config(&mut cfg);
-    let session_id = match backend.spawn(cfg) {
+    let session_id = match backend.spawn_prefilled(cfg, prefill) {
         Ok(id) => id,
         Err(err) => {
             tracing::warn!(?err, "pty spawn failed");
@@ -679,11 +686,36 @@ pub struct TerminalView {
     /// signal that holds while an agent sits idle. Read by
     /// [`agent_process`](Self::agent_process).
     proc_scan: crate::shell::agent_process_scan::AgentProcessScan,
+    /// Process-scan label written alongside the last ambient reading, so a
+    /// late identification (the tree names the agent after its first hook
+    /// already fired) still re-writes the record — that label is what a cold
+    /// restore after a reboot builds the resume command from.
+    last_persisted_agent: Option<&'static str>,
+    /// Bytes to type at the shell the first time it produces output after a
+    /// cold restore (its prompt): the resume command for a hand-typed agent
+    /// that ran in the dead PTY, pre-filled for the user to confirm — never
+    /// sent with a newline. Dropped by the first keystroke that lands before
+    /// the drain, and on exit. See
+    /// [`queue_input_on_first_output`](Self::queue_input_on_first_output).
+    queued_first_output_input: Option<Vec<u8>>,
+    /// When the shell last produced output while the queue above was armed.
+    /// The bytes go out only after a short quiet gap, so they land at the
+    /// prompt rather than interleaved with the shell's start-up chatter
+    /// (`.zshrc` warnings, banner lines) that precedes it.
+    queued_input_last_output: Option<std::time::Instant>,
+    /// The restore marker's words, armed when a cold restore prefills the
+    /// marker and shown off-grid if the CLI wipes the scrollback on start-up
+    /// (see `restore_notice`).
+    restore_notice: Option<restore_notice::RestoreNotice>,
+    /// Fallback for the queue above: some prompts print nothing until a key
+    /// arrives, so the bytes are delivered after a short wait regardless.
+    _queued_input_timer: Option<Task<()>>,
 }
 
 mod input;
 mod lifecycle;
 mod render;
+mod restore_notice;
 mod state;
 
 impl Drop for TerminalView {

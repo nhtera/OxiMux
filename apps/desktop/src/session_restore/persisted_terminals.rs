@@ -318,6 +318,16 @@ pub struct PersistedAgentTab {
     /// `#[serde(default)]` keeps pre-existing blobs (no field) readable.
     #[serde(default)]
     pub profile: Option<String>,
+    /// The agent's OWN conversation id — what `claude --resume <id>` /
+    /// `codex resume <id>` / `pi --session <id>` / `omp --resume <id>` take.
+    /// Distinct from `relay_external_id` (the daemon's PTY) and from OxiMux's
+    /// `AgentSessionId` (the runtime handle). Captured from the tab's latest
+    /// hook sideband at snapshot time; `None` until the agent's first hook
+    /// fires. On a cold restore (reboot, relay death) the tab resumes this
+    /// conversation instead of starting a fresh one under the old title.
+    /// `#[serde(default)]` keeps pre-existing blobs (no field) readable.
+    #[serde(default)]
+    pub provider_session: Option<String>,
 }
 
 /// Mirrors `PaneTree` but without GPUI-side `PaneId`s (regenerated on
@@ -566,6 +576,7 @@ mod tests {
                     relay_external_id: None,
                     relay_session: None,
                     profile: None,
+                    provider_session: Some("019f650c-a70a-77c4-8fa4-f81e6e6ad1f3".into()),
                 }),
                 kind: PersistedTabKind::Terminal,
                 ..PersistedTab::default()
@@ -583,6 +594,23 @@ mod tests {
         assert_eq!(agent.worktree_path, "/tmp/proj");
         assert_eq!(agent.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(agent.effort.as_deref(), Some("high"));
+        assert_eq!(
+            agent.provider_session.as_deref(),
+            Some("019f650c-a70a-77c4-8fa4-f81e6e6ad1f3")
+        );
+    }
+
+    #[test]
+    fn legacy_agent_blob_without_provider_session_still_parses() {
+        // Blobs written before the cockpit tab learned its agent's own
+        // conversation id have no `provider_session`; they must load with
+        // `None` (the tab then restores fresh, which is all they ever did).
+        let legacy = r#"{"tabs":[{"label":"Claude Code 1","tree":"Leaf","agent":{"adapter":"ClaudeCode","adapter_id":"claude-code","worktree_path":"/tmp/proj","model":null,"effort":null}}],"active":0,"next_label_n":2}"#;
+        let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
+        let agent = parsed.tabs[0].agent.as_ref().expect("agent tab");
+        assert!(agent.provider_session.is_none());
+        assert!(agent.relay_external_id.is_none());
+        assert!(agent.profile.is_none());
     }
 
     #[test]
@@ -1146,6 +1174,7 @@ mod repoint_tests {
             relay_external_id: None,
             relay_session: None,
             profile: None,
+            provider_session: None,
         }
     }
 

@@ -17,7 +17,7 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use oximux_core::{AgentAdapter, AgentSessionId, AgentSnapshot, AgentStatus};
+use oximux_core::{AgentAdapter, AgentSessionId, AgentSnapshot, AgentStatus, SidebandDetail};
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalSessionId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,11 +126,18 @@ impl CliRuntime {
     /// the restore path to reconnect a tab to its still-running CLI. Errors
     /// when no adapter is registered for `adapter_key` (needed for status
     /// patterns).
+    ///
+    /// `known_session` is the provider session id the tab persisted for the
+    /// conversation running in that PTY. It seeds the first snapshot exactly
+    /// as a resumed spawn's id does: a re-attached agent idle at its prompt
+    /// fires no hook, and without the seed the next layout autosave would
+    /// persist `None` over the id and a later reboot could not resume.
     pub fn adopt_session(
         &self,
         adapter_key: AgentAdapter,
         backend: SharedBackend,
         term_id: TerminalSessionId,
+        known_session: Option<String>,
     ) -> Result<AgentSessionId> {
         let adapter = {
             let inner = lock_recover(&self.inner, "CliRuntime sessions");
@@ -140,17 +147,24 @@ impl CliRuntime {
                 .cloned()
                 .ok_or_else(|| anyhow!("no adapter registered for {:?}", adapter_key))?
         };
-        self.register_session(adapter, backend, term_id)
+        self.register_session(adapter, backend, term_id, known_session)
     }
 
     /// Wire up the status machine + poll task for a ready `(backend,
     /// term_id)` and record the session. Shared by the spawn path
     /// (`start_session`) and the re-attach path (`adopt_session`).
+    ///
+    /// `resumed_from` is the provider session id this spawn continues
+    /// (`--resume <id>`), if any: it seeds the first status snapshot so a
+    /// restored tab that has not yet fired a hook still names the
+    /// conversation it is in. Without it, the next layout snapshot would
+    /// persist `None` and the id would be lost on the following restore.
     fn register_session(
         &self,
         adapter: Arc<dyn CliAgentAdapter>,
         backend: SharedBackend,
         term_id: TerminalSessionId,
+        resumed_from: Option<String>,
     ) -> Result<AgentSessionId> {
         {
             let mut be = lock_recover(&backend, "terminal backend");
@@ -158,7 +172,7 @@ impl CliRuntime {
         }
         let patterns: Arc<[_]> = adapter.status_patterns().to_vec().into();
         let machine = StatusMachine::new(patterns);
-        let (status_tx, status_rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
+        let (status_tx, status_rx) = watch::channel(initial_snapshot(resumed_from));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let poll_handle = tokio::spawn(poll_loop(
             backend.clone(),
@@ -275,6 +289,7 @@ impl AgentRuntime for CliRuntime {
         };
 
         let spec = adapter.build_command(&cfg)?;
+        let resumed_from = cfg.resumption.source_id().map(str::to_owned);
 
         // Merge session env onto adapter env. Adapter env wins (per-CLI
         // hardening like `*_DISABLE_TELEMETRY` should not be overridden by
@@ -383,7 +398,7 @@ impl AgentRuntime for CliRuntime {
             (Arc::new(Mutex::new(backend_box)), term_id)
         };
 
-        self.register_session(adapter, backend, term_id)
+        self.register_session(adapter, backend, term_id, resumed_from)
     }
 
     async fn send_message(&self, id: AgentSessionId, msg: &str) -> Result<()> {
@@ -569,6 +584,23 @@ fn shell_quote(s: &str) -> String {
 /// `send` returns Err once the last receiver is gone — but we also hold
 /// one Receiver in `SessionEntry` so that case only fires after the
 /// session has been removed from the table).
+/// The snapshot a session's watch channel starts on. A resumed session names
+/// the provider conversation it continues from the first tick, so a restore
+/// snapshot taken before any hook fires still carries the id; a fresh one
+/// starts bare and learns its id from the first hook.
+pub(crate) fn initial_snapshot(resumed_from: Option<String>) -> AgentSnapshot {
+    match resumed_from {
+        Some(id) => AgentSnapshot {
+            status: AgentStatus::Idle,
+            detail: Some(SidebandDetail {
+                session_id: Some(id),
+                ..Default::default()
+            }),
+        },
+        None => AgentSnapshot::from_status(AgentStatus::Idle),
+    }
+}
+
 async fn poll_loop(
     backend: SharedBackend,
     term_id: TerminalSessionId,

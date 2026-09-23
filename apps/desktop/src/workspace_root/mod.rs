@@ -549,6 +549,10 @@ pub struct WorkspaceRoot {
     /// EVERY open agent so the rail can list multiple agents per workspace.
     /// Entries live only while the session is non-terminal (its tab is open).
     pub(crate) live_agents: crate::shell::session_live_store::LiveAgentMap,
+    /// Runtime-session repoints that arrived before their live entry was
+    /// registered (a resume fallback racing its row claim); applied and
+    /// dropped by `register_live_agent`.
+    pub(crate) live_agent_repoints: HashMap<oximux_core::AgentSessionId, oximux_core::AgentSessionId>,
     /// Latest usage-meter sample: one row per configured agent account.
     /// Empty before the first sample lands, and again if no account is set up.
     pub(crate) usage: Vec<oximux_agents::session_log::usage::ProviderUsage>,
@@ -1468,6 +1472,7 @@ impl WorkspaceRoot {
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
             live_agents: HashMap::new(),
+            live_agent_repoints: HashMap::new(),
             usage: Vec::new(),
             usage_popover_open: false,
             whats_new_open: false,

@@ -60,24 +60,28 @@ use crate::agent_hook_dialects::{DIALECTS, EntryShape, HookDialect, Install, hoo
 /// approves it in that agent's own prompt; until they do, the rail behaves
 /// exactly as it did before.
 pub fn sync_global_status_hooks(on: bool) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            tracing::warn!(%err, "global hooks: current_exe failed; not syncing");
+            return;
+        }
+    };
+    // Hooks run the shim, never this binary: these files are read by every
+    // agent on the machine, and a build output named here is what every one of
+    // them would call. Only an install needs the shim written.
+    let program = if on { crate::hook_shim::hook_program(&exe) } else { exe };
     for dialect in DIALECTS {
-        sync_dialect(on, dialect);
+        sync_dialect(on, dialect, &program);
     }
 }
 
 /// Install (`on`) or remove OxiMux's managed hooks in one agent's hooks file.
 /// Best-effort throughout: a hook that cannot be written costs a row its
 /// detail, and must never cost the user an error they did not ask for.
-fn sync_dialect(on: bool, dialect: &HookDialect) {
+fn sync_dialect(on: bool, dialect: &HookDialect, program: &Path) {
     let agent = dialect.agent;
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            tracing::warn!(%err, agent, "global hooks: current_exe failed; not installing");
-            return;
-        }
-    };
-    match apply(on, dialect, &exe) {
+    match apply(on, dialect, program) {
         Applied::Changed => tracing::info!(on, agent, "global status hooks synced"),
         Applied::Removed => tracing::info!(on, agent, "global status hooks removed"),
         // Already in the desired state, or an agent that is not here: no write,

@@ -476,6 +476,13 @@ impl Render for TerminalView {
         // exited = spawned and died).
         if let Some(code) = self.exited {
             root = root.child(build_exit_banner(&theme, code, self.density, &self.typography));
+        } else if let Some(label) = self.visible_restore_notice() {
+            root = root.child(super::restore_notice::build_restore_notice(
+                &theme,
+                label,
+                self.density,
+                &self.typography,
+            ));
         }
         // Scrolled-up indicator: a faint chip while the viewport is off the
         // live tail, so the user knows new output is landing below the fold

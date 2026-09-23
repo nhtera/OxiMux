@@ -119,11 +119,16 @@ impl StatusArgs {
         let message = (self.state == "idle")
             .then(|| agent_hook_dialects::last_message(self.dialect, stdin_json))
             .flatten();
+        // The agent's own conversation id, on every event that names one: the
+        // one hop that a cold restore after a reboot resumes by. Read off the
+        // same JSON; absent for agents whose hooks do not carry it.
+        let session_id = agent_hook_dialects::session_id(stdin_json);
         Some(agent_status_hooks::build_status_payload(
             &self.state,
             tool.as_deref(),
             prompt.as_deref(),
             message.as_deref(),
+            session_id.as_deref(),
         ))
     }
 }
@@ -211,6 +216,21 @@ mod tests {
             decode(&working.payload(body).unwrap()).get("msg").is_none(),
             "a working event must not chase the reply"
         );
+    }
+
+    #[test]
+    fn the_session_id_rides_every_event_that_names_one() {
+        // Claude hands its own conversation id on every hook; it must reach
+        // the payload on a tool event as well as on the prompt, because the
+        // poll loop caches whatever it last saw and a restore resumes by it.
+        let working = StatusArgs::parse(args(&["--state", "working"])).expect("parses");
+        let tool = r#"{"hook_event_name":"PreToolUse","session_id":"abc","tool_name":"Edit"}"#;
+        let v = decode(&working.payload(tool).unwrap());
+        assert_eq!(v["session_id"], "abc");
+        assert_eq!(v["tool"], "Edit");
+        // Without the key there is no key — the reader keeps its cached id.
+        let bare = r#"{"hook_event_name":"PreToolUse","tool_name":"Edit"}"#;
+        assert!(decode(&working.payload(bare).unwrap()).get("session_id").is_none());
     }
 
     #[test]

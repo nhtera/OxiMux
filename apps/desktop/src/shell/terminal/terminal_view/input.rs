@@ -963,6 +963,14 @@ impl TerminalView {
             // the body without the closure / focus event.
             self.wake_dormant_inline(cx);
         }
+        // Any input the user sends — keys, paste, IME, dictation, drop, mouse
+        // reports — wins over a cold restore's pre-typed resume command (the
+        // offer is dropped rather than appended after it) and retires the
+        // restore notice. PTY query replies never come through here.
+        self.queued_first_output_input = None;
+        if self.dismiss_restore_notice() {
+            cx.notify();
+        }
         let session_id = self.session_id;
         // Typing snaps the viewport back to the live tail so the user sees
         // their input even if they had scrolled up into history. No-op when

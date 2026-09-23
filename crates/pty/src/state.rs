@@ -172,6 +172,24 @@ impl TerminalState {
         self.parser.advance(&mut self.term, bytes);
     }
 
+    /// Replay captured bytes as history, not live output. A capture that
+    /// carries its grid dims (the 9-byte header `serialize_term_capped_with_dims`
+    /// writes) resizes the grid to match BEFORE the body is fed, so absolute
+    /// cursor moves land in the right cells; a headerless blob replays against
+    /// the current grid. The title/clipboard/bell/colour events the replay
+    /// raised are dropped, so none leaks into the live session's first frame.
+    pub fn prefill(&mut self, bytes: &[u8]) {
+        if let Some((cols, rows, payload)) = crate::grid_serializer::parse_capture_header(bytes) {
+            // Defensive clamp: up to 1024x512 for ultrawide panes, and no
+            // huge allocation inside alacritty's grid from a corrupted header.
+            self.resize(cols.clamp(1, 1024), rows.clamp(1, 512));
+            self.advance(payload);
+        } else {
+            self.advance(bytes);
+        }
+        self.clear_collected();
+    }
+
     /// Feed live PTY bytes and return everything that warrants a backend
     /// `TerminalEvent`: bell, OSC 7 cwd, OSC 133/633 command marks, OSC 9;4
     /// progress, OSC 0/2 title, OSC 52 clipboard, and device/color replies the

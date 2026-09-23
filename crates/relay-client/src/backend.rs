@@ -486,6 +486,10 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId> {
+        self.spawn_prefilled(cfg, &[])
+    }
+
+    fn spawn_prefilled(&mut self, cfg: SpawnConfig, prefill: &[u8]) -> Result<TerminalSessionId> {
         // The daemon spawns the child but has no idea what the window looks
         // like — it is a detached process with no theme of its own. So the
         // polarity has to ride the wire in the environment the app sends
@@ -509,11 +513,20 @@ impl TerminalBackend for RelayBackend {
             other => bail!("unexpected spawn response: {other:?}"),
         };
 
-        let state = Arc::new(Mutex::new(TerminalState::new(
-            cfg.cols,
-            cfg.rows,
-            cfg.scrollback,
-        )));
+        // Subscribe first: spawn auto-attaches, so the child's output is already
+        // on its way, and a notification that arrives before the subscription
+        // exists is dropped. The channel queues what arrives meanwhile.
+        let (sub_id, notif_rx) = self.client.subscribe_pty(&relay_pty_id);
+        // Spawn auto-attaches, so this session owns an attachment from the
+        // start — address its subscription the same way `attach_relay_pty` does.
+        self.client.bind_attachment(&relay_pty_id, sub_id, attachment_id);
+        // Restored history goes in before the pump starts draining that queue,
+        // so none of the child's output can land ahead of it.
+        let mut fresh = TerminalState::new(cfg.cols, cfg.rows, cfg.scrollback);
+        if !prefill.is_empty() {
+            fresh.prefill(prefill);
+        }
+        let state = Arc::new(Mutex::new(fresh));
         let id = self.mint_id();
         if cfg.capture_status_events {
             lock_recover(&self.event_queues, "event queues")
@@ -522,10 +535,6 @@ impl TerminalBackend for RelayBackend {
                 .or_default();
         }
         let generation = Arc::new(AtomicU64::new(1));
-        let (sub_id, notif_rx) = self.client.subscribe_pty(&relay_pty_id);
-        // Spawn auto-attaches, so this session owns an attachment from the
-        // start — address its subscription the same way `attach_relay_pty` does.
-        self.client.bind_attachment(&relay_pty_id, sub_id, attachment_id);
         let pump = self.spawn_pump(
             id,
             relay_pty_id.to_owned(),
@@ -726,18 +735,7 @@ impl TerminalBackend for RelayBackend {
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
         if let Ok(mut state) = session.state.lock() {
-            // Match the portable backend: parse the dim header if
-            // present, resize the dormant Term to match, then advance
-            // the body. Legacy blobs (no header) replay as before.
-            if let Some((cols, rows, payload)) = oximux_pty::parse_capture_header(bytes) {
-                let cols = cols.clamp(1, 1024);
-                let rows = rows.clamp(1, 512);
-                state.resize(cols, rows);
-                state.advance(payload);
-            } else {
-                state.advance(bytes);
-            }
-            state.clear_collected();
+            state.prefill(bytes);
         }
         Ok(())
     }

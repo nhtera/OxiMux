@@ -27,7 +27,59 @@ use serde::Deserialize;
 const COLD_RESTORE_MAX_BYTES: usize = 512 * 1024;
 
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
+
+/// Which of the three cold-restore outcomes a pane is telling the user about.
+/// All three share one style (dim, framed by CRLF) so a restored pane reads
+/// the same whether it holds a shell's scrollback or an agent's conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMarker {
+    /// A plain terminal's recovered scrollback: the content above is history.
+    Restored,
+    /// A cockpit agent tab is spawning its CLI on the persisted conversation.
+    Resumed,
+    /// A cockpit agent tab had no conversation to resume, its adapter cannot
+    /// resume, or the CLI rejected the id: it started a fresh session.
+    StartedFresh,
+}
+
 const RESTORED_MARKER: &[u8] = b"\r\n\x1b[2m--- session restored ---\x1b[0m\r\n\r\n";
+const RESUMED_MARKER: &[u8] = b"\r\n\x1b[2m--- resuming previous session ---\x1b[0m\r\n\r\n";
+const STARTED_FRESH_MARKER: &[u8] =
+    b"\r\n\x1b[2m--- previous session unavailable, started fresh ---\x1b[0m\r\n\r\n";
+
+impl RestoreMarker {
+    /// The marker's words without its framing or styling, for surfaces other
+    /// than the grid (the pane's off-grid notice when a CLI wipes the grid).
+    pub fn label(self) -> &'static str {
+        match self {
+            RestoreMarker::Restored => "session restored",
+            RestoreMarker::Resumed => "resuming previous session",
+            RestoreMarker::StartedFresh => "previous session unavailable, started fresh",
+        }
+    }
+}
+
+/// The bytes for one marker, ready to prefill into a pane grid.
+pub fn marker(kind: RestoreMarker) -> &'static [u8] {
+    match kind {
+        RestoreMarker::Restored => RESTORED_MARKER,
+        RestoreMarker::Resumed => RESUMED_MARKER,
+        RestoreMarker::StartedFresh => STARTED_FRESH_MARKER,
+    }
+}
+
+/// The hint a cold-restored PLAIN terminal prints under its restored marker
+/// when a hand-typed agent was running in the dead PTY: the resume command is
+/// pre-typed at the fresh prompt (never sent), so Enter resumes and any other
+/// key edits it. `agent_label` is the process-scan label (`"Claude Code"`).
+pub fn resume_hint(agent_label: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96 + agent_label.len());
+    out.extend_from_slice(b"\x1b[2m--- previous ");
+    // The label is our own table's string, but keep the line one line.
+    out.extend(agent_label.bytes().filter(|b| !b.is_ascii_control()));
+    out.extend_from_slice(b" session found: press Enter to resume, or edit the command ---\x1b[0m\r\n\r\n");
+    out
+}
 // The recovered scrollback can carry mode-setting bytes from a TUI that
 // died with the daemon (cursor style, progressive keyboard enhancement
 // stack, mouse tracking, focus reporting, bracketed paste). No live
@@ -130,11 +182,12 @@ pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRes
             dims,
         });
     }
+    let restored = marker(RestoreMarker::Restored);
     let mut out =
-        Vec::with_capacity(CLEAR_SCREEN.len() + usable.len() + RESTORED_MARKER.len() + MODE_RESET.len());
+        Vec::with_capacity(CLEAR_SCREEN.len() + usable.len() + restored.len() + MODE_RESET.len());
     out.extend_from_slice(CLEAR_SCREEN);
     out.extend_from_slice(usable);
-    out.extend_from_slice(RESTORED_MARKER);
+    out.extend_from_slice(restored);
     out.extend_from_slice(MODE_RESET);
     Some(ColdRestore {
         bytes: out,
@@ -318,6 +371,53 @@ mod tests {
         assert!(is_safe_pty_id("0a1b2c3d-4e5f-6789-abcd-ef0123456789"));
     }
 
+    /// Pinned bytes: the plain-terminal composition must be byte-identical
+    /// to what it produced before the markers were tabled (so a restored shell
+    /// looks exactly as it always has), and the two agent markers share the
+    /// same dim CRLF framing.
+    #[test]
+    fn markers_share_one_style_and_the_plain_composition_is_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("checkpoints");
+        let dir = base.join("pty-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
+        std::fs::write(dir.join("scrollback.bin"), b"line one\r\n").unwrap();
+        let restore = read_cold_restore(&base, "pty-1").expect("restorable");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"\x1b[2J\x1b[3J\x1b[H");
+        expected.extend_from_slice(b"line one\r\n");
+        expected.extend_from_slice(b"\r\n\x1b[2m--- session restored ---\x1b[0m\r\n\r\n");
+        expected.extend_from_slice(MODE_RESET);
+        assert_eq!(restore.bytes, expected, "plain composition is byte-identical");
+
+        for kind in [RestoreMarker::Restored, RestoreMarker::Resumed, RestoreMarker::StartedFresh] {
+            let m = marker(kind);
+            assert!(m.starts_with(b"\r\n\x1b[2m--- "), "{kind:?} opens dim on a fresh line");
+            assert!(m.ends_with(b" ---\x1b[0m\r\n\r\n"), "{kind:?} resets and leaves a blank line");
+        }
+        assert_eq!(
+            marker(RestoreMarker::Resumed),
+            b"\r\n\x1b[2m--- resuming previous session ---\x1b[0m\r\n\r\n"
+        );
+        assert_eq!(
+            marker(RestoreMarker::StartedFresh),
+            b"\r\n\x1b[2m--- previous session unavailable, started fresh ---\x1b[0m\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn resume_hint_names_the_agent_on_one_dim_line() {
+        let hint = resume_hint("Claude Code");
+        assert_eq!(
+            hint,
+            b"\x1b[2m--- previous Claude Code session found: press Enter to resume, or edit the command ---\x1b[0m\r\n\r\n"
+        );
+        // A control byte in the label can never break the line.
+        let hint = resume_hint("Co\ndex");
+        assert!(String::from_utf8_lossy(&hint).contains("previous Codex session"));
+    }
+
     #[test]
     fn cold_restore_roundtrip_and_consume() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -498,5 +598,13 @@ mod tests {
         // No cut happened — even a leading partial line is real content.
         let sb = b"no-newline-here".to_vec();
         assert_eq!(tail_at_line_boundary(&sb), sb.as_slice());
+    }
+
+    #[test]
+    fn each_marker_label_is_the_text_its_grid_bytes_print() {
+        for kind in [RestoreMarker::Restored, RestoreMarker::Resumed, RestoreMarker::StartedFresh] {
+            let bytes = String::from_utf8_lossy(marker(kind)).into_owned();
+            assert!(bytes.contains(&format!("--- {} ---", kind.label())), "{kind:?}");
+        }
     }
 }

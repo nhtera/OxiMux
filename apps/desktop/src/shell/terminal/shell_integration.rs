@@ -10,8 +10,13 @@
 //! - **zsh** has no "extra rcfile" flag, so we point `ZDOTDIR` at an overlay
 //!   dir whose startup files `source` the user's real ones (resolved from
 //!   `OXIMUX_ORIG_ZDOTDIR`, defaulting to `$HOME`) and then arm `precmd` /
-//!   `preexec` hooks. `ZDOTDIR` is restored to the user's value afterward so
-//!   child shells and tools see the real one.
+//!   `preexec` hooks. `ZDOTDIR` is restored to the user's value before their
+//!   `.zshrc` runs, so it, child shells and tools all see the real one. The
+//!   overlay also undoes the one thing macOS's `/etc/zshrc` derives from the
+//!   overlay `ZDOTDIR` before our `.zshrc` gets a say — `HISTFILE` — and saves
+//!   each command as it runs, so a shell that dies with the app (a reboot, a
+//!   relay death) still leaves its commands for the restored terminal's Up
+//!   arrow. See [`migrate_zsh_overlay`] for state earlier versions left behind.
 //! - **bash** takes `--rcfile`, whose script sources `~/.bashrc` then arms a
 //!   `PROMPT_COMMAND` + `DEBUG`-trap pair.
 //! - **fish** takes an `--init-command` that registers `fish_prompt` /
@@ -157,6 +162,7 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
     match kind {
         ShellKind::Zsh => {
             let dir = base.join("zsh");
+            migrate_zsh_overlay(&dir, &zsh_home(orig));
             write_if_changed(&dir.join(".zshenv"), scripts::ZSH_ZSHENV)?;
             write_if_changed(&dir.join(".zprofile"), scripts::ZSH_ZPROFILE)?;
             write_if_changed(&dir.join(".zshrc"), scripts::ZSH_ZSHRC)?;
@@ -201,6 +207,60 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
                     dot_source,
                 ],
             })
+        }
+    }
+}
+
+/// The directory zsh keeps the user's startup files and history in: their
+/// own `ZDOTDIR` when the app inherited one, `$HOME` otherwise — what the
+/// overlay scripts resolve `OXIMUX_ORIG_ZDOTDIR` to at runtime.
+fn zsh_home(orig: Option<&str>) -> PathBuf {
+    orig.map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_default()
+}
+
+/// Move out what earlier overlay versions left in the overlay dir. Before
+/// `ZDOTDIR` was restored ahead of the user's `.zshrc` (and `HISTFILE` pointed
+/// back), every OxiMux zsh kept its history in `<overlay>/.zsh_history`,
+/// apart from the user's real one, and completion caches (`.zcompdump*`,
+/// one per shell pid for some setups) piled up beside it. The history is
+/// appended to `<zsh_home>/.zsh_history` — where the fixed overlay now writes
+/// — and removed; the caches are dropped (zsh regenerates them in the real
+/// dir). Best-effort: a failure leaves the files for the next spawn to retry.
+/// A shell started before the fix still writes to the old path until it
+/// exits; the next spawn after that carries those lines over too.
+fn migrate_zsh_overlay(dir: &Path, zsh_home: &Path) {
+    let stranded = dir.join(".zsh_history");
+    if let Ok(history) = fs::read(&stranded)
+        && !zsh_home.as_os_str().is_empty()
+    {
+        let target = zsh_home.join(".zsh_history");
+        let appended = (|| -> io::Result<()> {
+            use std::io::Write;
+            let mut out = fs::OpenOptions::new().create(true).append(true).open(&target)?;
+            // A file that does not end in a newline would glue its last entry
+            // to the first carried-over one.
+            if fs::metadata(&target)?.len() > 0 && !history.is_empty() {
+                let tail = fs::read(&target)?;
+                if tail.last() != Some(&b'\n') {
+                    out.write_all(b"\n")?;
+                }
+            }
+            out.write_all(&history)
+        })();
+        match appended {
+            Ok(()) => {
+                let _ = fs::remove_file(&stranded);
+            }
+            Err(err) => tracing::warn!(?err, ?target, "zsh history carry-over failed; will retry"),
+        }
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".zcompdump") {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -251,16 +311,28 @@ OXIMUX_ORIG_ZDOTDIR=\"${OXIMUX_ORIG_ZDOTDIR:-$HOME}\"
 [[ -f \"$OXIMUX_ORIG_ZDOTDIR/.zlogin\" ]] && builtin source \"$OXIMUX_ORIG_ZDOTDIR/.zlogin\"
 ";
 
-    /// zsh `.zshrc` — interactive. Source the user's rc, restore `ZDOTDIR`, then
-    /// arm the OSC 133 command-mark hooks: `precmd` closes the previous command
-    /// with its exit (`D;$?`) and opens the next prompt (`A`); `preexec` marks
-    /// output start (`C`).
+    /// zsh `.zshrc` — interactive. Restore `ZDOTDIR` and `HISTFILE`, source the
+    /// user's rc, save history per command, then arm the OSC 133 command-mark
+    /// hooks: `precmd` closes the previous command with its exit (`D;$?`) and
+    /// opens the next prompt (`A`); `preexec` marks output start (`C`).
     pub const ZSH_ZSHRC: &str = "\
 # OxiMux shell integration overlay.
 OXIMUX_ORIG_ZDOTDIR=\"${OXIMUX_ORIG_ZDOTDIR:-$HOME}\"
-[[ -f \"$OXIMUX_ORIG_ZDOTDIR/.zshrc\" ]] && builtin source \"$OXIMUX_ORIG_ZDOTDIR/.zshrc\"
-# Restore ZDOTDIR so child shells and tools resolve your real startup dir.
+# Restore ZDOTDIR before your rc runs, so it (compinit's cache, plugin paths),
+# child shells and tools all resolve your real startup dir, not this overlay.
+__oximux_overlay=\"$ZDOTDIR\"
 ZDOTDIR=\"$OXIMUX_ORIG_ZDOTDIR\"
+# macOS's /etc/zshrc ran before this file and set HISTFILE from the overlay
+# ZDOTDIR; point it back at your real history. Your own rc runs next and wins.
+[[ \"${HISTFILE:-}\" == \"$__oximux_overlay/.zsh_history\" ]] && HISTFILE=\"$OXIMUX_ORIG_ZDOTDIR/.zsh_history\"
+unset __oximux_overlay
+[[ -f \"$OXIMUX_ORIG_ZDOTDIR/.zshrc\" ]] && builtin source \"$OXIMUX_ORIG_ZDOTDIR/.zshrc\"
+# Save each command as it runs, so a shell that dies with the app (a reboot, a
+# relay death) still leaves its history for the restored terminal's Up arrow.
+# Skipped when you already chose an incremental mode it would conflict with.
+if [[ ! -o share_history && ! -o inc_append_history_time ]]; then
+  setopt inc_append_history
+fi
 # Defer to an existing integration: if any registered prompt/pre-exec hook
 # already emits an OSC 133 mark, a second emitter would double the marks and
 # break the output band, so skip ours entirely.
@@ -597,6 +669,53 @@ mod tests {
         assert!(rc.contains("133;C"));
         assert!(rc.contains("133;D;%s"));
         assert!(rc.contains("__oximux_shell_integration"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn zsh_rc_restores_zdotdir_and_history_before_the_users_rc() {
+        let rc = scripts::ZSH_ZSHRC;
+        let restore = rc.find("ZDOTDIR=\"$OXIMUX_ORIG_ZDOTDIR\"").expect("restores ZDOTDIR");
+        let histfile = rc.find("HISTFILE=\"$OXIMUX_ORIG_ZDOTDIR/.zsh_history\"").expect("repoints HISTFILE");
+        let user_rc = rc.find("builtin source \"$OXIMUX_ORIG_ZDOTDIR/.zshrc\"").expect("sources user rc");
+        assert!(restore < user_rc && histfile < user_rc, "the user's rc must see, and may override, both");
+        // Only the overlay-derived path is rewritten; a HISTFILE the user set
+        // in .zshenv is left alone.
+        assert!(rc.contains("== \"$__oximux_overlay/.zsh_history\" ]]"));
+        assert!(rc.contains("setopt inc_append_history"));
+        assert!(rc.contains("! -o share_history && ! -o inc_append_history_time"));
+    }
+
+    #[test]
+    fn stranded_overlay_history_is_carried_over_and_caches_dropped() {
+        let base = temp_base("zsh-migrate");
+        let overlay = base.join("overlay");
+        let home = base.join("home");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(overlay.join(".zsh_history"), "ls -la\ngit status\n").unwrap();
+        fs::write(overlay.join(".zcompdump"), "cache").unwrap();
+        fs::write(overlay.join(".zcompdump.host.1234"), "cache").unwrap();
+        fs::write(overlay.join(".zshrc"), "overlay rc").unwrap();
+        // An existing history whose last line has no newline.
+        fs::write(home.join(".zsh_history"), "echo old").unwrap();
+
+        migrate_zsh_overlay(&overlay, &home);
+
+        assert_eq!(
+            fs::read_to_string(home.join(".zsh_history")).unwrap(),
+            "echo old\nls -la\ngit status\n"
+        );
+        assert!(!overlay.join(".zsh_history").exists());
+        assert!(!overlay.join(".zcompdump").exists());
+        assert!(!overlay.join(".zcompdump.host.1234").exists());
+        assert!(overlay.join(".zshrc").exists(), "the overlay's own files stay");
+        // Nothing left to carry: a second run changes nothing.
+        migrate_zsh_overlay(&overlay, &home);
+        assert_eq!(
+            fs::read_to_string(home.join(".zsh_history")).unwrap(),
+            "echo old\nls -la\ngit status\n"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
