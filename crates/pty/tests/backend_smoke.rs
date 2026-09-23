@@ -290,6 +290,11 @@ fn status_exit_survives_renderer_backpressure() {
 /// first output (a fast shell's prompt) lands BELOW it however early it comes.
 /// Prefilled after `spawn` returned, that output could land first and the
 /// clear erase it — the restored terminal then showed no prompt.
+///
+/// Unix only: ConPTY repaints its whole screen when the child starts, so on
+/// Windows the history is cleared by the pseudo-terminal itself, prefill order
+/// or not (measured on the Windows CI runner: only the live row remained).
+#[cfg(unix)]
 #[test]
 fn spawn_prefilled_keeps_the_childs_first_output_below_the_history() {
     const HISTORY: &str = "OXIMUX_HISTORY_ROW";

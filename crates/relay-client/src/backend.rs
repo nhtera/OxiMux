@@ -513,7 +513,14 @@ impl TerminalBackend for RelayBackend {
             other => bail!("unexpected spawn response: {other:?}"),
         };
 
-        // Restored history goes in before the reader can feed the grid,
+        // Subscribe first: spawn auto-attaches, so the child's output is already
+        // on its way, and a notification that arrives before the subscription
+        // exists is dropped. The channel queues what arrives meanwhile.
+        let (sub_id, notif_rx) = self.client.subscribe_pty(&relay_pty_id);
+        // Spawn auto-attaches, so this session owns an attachment from the
+        // start — address its subscription the same way `attach_relay_pty` does.
+        self.client.bind_attachment(&relay_pty_id, sub_id, attachment_id);
+        // Restored history goes in before the pump starts draining that queue,
         // so none of the child's output can land ahead of it.
         let mut fresh = TerminalState::new(cfg.cols, cfg.rows, cfg.scrollback);
         if !prefill.is_empty() {
@@ -528,10 +535,6 @@ impl TerminalBackend for RelayBackend {
                 .or_default();
         }
         let generation = Arc::new(AtomicU64::new(1));
-        let (sub_id, notif_rx) = self.client.subscribe_pty(&relay_pty_id);
-        // Spawn auto-attaches, so this session owns an attachment from the
-        // start — address its subscription the same way `attach_relay_pty` does.
-        self.client.bind_attachment(&relay_pty_id, sub_id, attachment_id);
         let pump = self.spawn_pump(
             id,
             relay_pty_id.to_owned(),

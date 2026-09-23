@@ -65,6 +65,9 @@ fn candidates(writer: &Path, dev_first: bool) -> Vec<String> {
     if cfg!(target_os = "macos") {
         words.push(sh_quote("/Applications/OxiMux.app/Contents/MacOS/oximux"));
         words.push("\"$HOME/Applications/OxiMux.app/Contents/MacOS/oximux\"".to_owned());
+    } else {
+        // Where `scripts/install-cli.sh` puts the CLI by default.
+        words.push("\"$HOME/.local/bin/oximux\"".to_owned());
     }
     // Last resort, not dropped: on a machine with no installed app the build
     // output is the only OxiMux there is.
@@ -118,7 +121,10 @@ exit 0
 }
 
 /// Write the shim only when it differs, executable, via temp + rename: an
-/// agent may run it at any moment and must never see half a file.
+/// agent may run it at any moment and must never see half a file. The temp
+/// name is unique per call — the app's boot sync, a CLI run and a per-spawn
+/// `--settings` build can all write at once, and a shared temp file would let
+/// one rename another's half-written copy into place.
 #[cfg(unix)]
 fn install(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -129,10 +135,16 @@ fn install(path: &Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("oximux-tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&tmp, path)
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{seq}.oximux-tmp", std::process::id()));
+    let written = std::fs::write(&tmp, contents)
+        .and_then(|()| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(all(test, unix))]
@@ -183,7 +195,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("fake-oximux");
         let seen = dir.path().join("seen");
-        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > '{}'\ncat >> '{}'\nexit 3\n", seen.display(), seen.display())).unwrap();
+        let seen_word = sh_quote(&seen.display().to_string());
+        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {seen_word}\ncat >> {seen_word}\nexit 3\n")).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
