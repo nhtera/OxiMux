@@ -4,6 +4,27 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-24 — Paste works in search fields and the folder picker (`fix/dialog-search-paste`)
+
+- **⌘V pastes into Quick Open, Commands and both session-history searches.**
+  These fields built their query key by key and dropped anything with ⌘ or
+  Ctrl held, so a paste did nothing. The same path also lost IME input
+  (Telex, CJK, dead keys) and typed ⇧-letters in lowercase. The palette, the
+  ⌘⇧H history modal and the sidebar history panel now use a real text input;
+  arrow keys, Enter and the modal's Tab / ⌘↵ / ⌃A shortcuts work as before
+  (`0603eba2`).
+- **⌘V pastes a path into the Add Project folder picker.** The native picker's
+  fields, including ⌘⇧G "Go to Folder", only receive ⌘V/⌘X/⌘A through the
+  Edit menu, and those menu items had no shortcut. Paste, Cut and Select All
+  now carry theirs (macOS). Terminals and text inputs handle these keys as
+  before (`0603eba2`).
+- **The sidebar history search stays editable after clicking a session.**
+  Backspace, Delete and ⌘V now go back to the search field, and typing
+  replaces a selected query instead of appending to it (`c8907044`).
+- Not changed: Escape during an unfinished IME composition still closes the
+  palette, and on Windows Ctrl+A in the history modal switches scope rather
+  than selecting the query.
+
 ### 2026-09-24 — Agents and shells survive a reboot (`feat/session-resume-after-reboot`)
 
 - **Agent tabs resume their conversation after a reboot.** The status hooks
