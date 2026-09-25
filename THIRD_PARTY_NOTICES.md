@@ -30,3 +30,15 @@ The upstream project is named in this work's phase plan rather than here, and th
 licence text is not reproduced because that project is not vendored and was never
 read directly. If it is ever vendored, replace this section with its verbatim
 notice and copyright line.
+
+## iOS Simulator helper: Apache-2.0, prebuilt from our fork
+
+`oximux-sim-helper` is the binary that streams and drives the iOS Simulator. It is built from [serve-sim](https://github.com/EvanBacon/serve-sim), Copyright Evan Bacon, licensed under the Apache License, Version 2.0.
+
+None of its source is in this repository. It is built and released by our fork, [nhtera/serve-sim](https://github.com/nhtera/serve-sim), on the `oximux` branch. `scripts/fetch-sim-helper.sh` downloads a pinned release and checks it against a sha256 pinned in the script.
+
+The shipped binary is a modified version of upstream:
+- **Our code:** `oximux/Sources/oximux-sim-helper/` in the fork. It replaces upstream's Node-API bindings and network server with a stdin/stdout protocol.
+- **Changes to upstream files:** two small patches, listed in the fork's `oximux/PATCHES.md`. One adds a capture rate limit and pause; the other stops spawned tools from inheriting the helper's stdin.
+
+The release archive carries the licence text. The macOS app bundle ships it as `Contents/Resources/licenses/serve-sim-LICENSE`.

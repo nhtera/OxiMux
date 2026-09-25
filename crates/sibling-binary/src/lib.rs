@@ -3,8 +3,9 @@
 //! The packaged app carries its helpers — the PTY relay, `rg`, the simulator
 //! helper — as siblings of the main executable: `Contents/MacOS/` in the macOS
 //! bundle, the install directory on Windows. Dev builds get the same layout for
-//! free, because cargo (and `scripts/build-sim-helper.sh`) put every binary in
-//! `target/<profile>/`.
+//! cargo-built helpers, because cargo puts every binary in `target/<profile>/`;
+//! fetched third-party tools (`rg`, the simulator helper) are found by the
+//! caller's own dev policy or an env override.
 //!
 //! # Why a crate
 //!

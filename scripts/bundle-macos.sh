@@ -72,6 +72,14 @@
 # decides an agent's screen-control calls, spawned once per tool call by
 # the agent's own CLI. Missing from the bundle, the hook command fails to
 # run and the chat drives the screen with nothing enforcing it.
+#
+# oximux-sim-helper streams and drives the iOS Simulator for the Simulator
+# panel over stdin/stdout. It is NOT built here: scripts/fetch-sim-helper.sh
+# fetches a pinned, sha256-verified release from our serve-sim fork
+# (nhtera/serve-sim, Apache-2.0). It is re-signed with the hardened runtime
+# and NO entitlements: it needs none (it only dlopens Apple-signed simulator
+# frameworks), and the app's entitlements must not leak onto a binary that
+# runs private-framework code.
 
 set -euo pipefail
 
@@ -161,6 +169,16 @@ sign_bundle() {
     for dylib in "$APP_DIR/Contents/MacOS"/*.dylib; do
         [[ -f "$dylib" && ! -L "$dylib" ]] && codesign "${opts[@]}" "$dylib"
     done
+    # The simulator helper gets the hardened runtime but no entitlements —
+    # see the header note. Guarded like rg: a --debug-fast refresh of an
+    # older bundle may not have it.
+    if [[ -f "$APP_DIR/Contents/MacOS/oximux-sim-helper" ]]; then
+        local helper_opts=(--force -s "$sign_id")
+        if [[ "$HARDENED" -eq 1 ]]; then
+            helper_opts+=(--options runtime --timestamp)
+        fi
+        codesign "${helper_opts[@]}" "$APP_DIR/Contents/MacOS/oximux-sim-helper"
+    fi
     # Bundled third-party tools (rg) sign like our own helper binaries —
     # nested-first, before the bundle seal. Guarded: an older bundle refreshed
     # via --debug-fast may predate the tool.
@@ -333,6 +351,23 @@ bundle_rg() {
     echo "==> Bundled rg"
 }
 
+# Bundle the pinned iOS Simulator helper (released by our serve-sim fork) plus
+# its Apache-2.0 licence. Same cache-aware, fail-hard contract as bundle_rg.
+bundle_sim_helper() {
+    ./scripts/fetch-sim-helper.sh
+    # The fetch skips (with a warning) on non-arm64 hosts; the bundle then
+    # simply has no helper and the Simulator panel reports it unavailable.
+    if [[ ! -f "target/bundle-tools/oximux-sim-helper" ]]; then
+        echo "==> No oximux-sim-helper for this host; Simulator panel will be unavailable"
+        return 0
+    fi
+    cp -f "target/bundle-tools/oximux-sim-helper" "$APP_DIR/Contents/MacOS/oximux-sim-helper"
+    mkdir -p "$APP_DIR/Contents/Resources/licenses"
+    cp -f "target/bundle-tools/oximux-sim-helper.LICENSE" \
+        "$APP_DIR/Contents/Resources/licenses/serve-sim-LICENSE"
+    echo "==> Bundled oximux-sim-helper"
+}
+
 # Fast path: refresh the bundled binary in place. Fail loudly if there
 # is no existing bundle to refresh — implicit `mkdir` would mask a
 # missing full-bundle step and surface as a launch failure later.
@@ -369,6 +404,10 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
     # leaves the existing (or absent) bundled rg alone.
     if [[ -f "target/bundle-tools/rg" ]]; then
         cp -f "target/bundle-tools/rg" "$APP_DIR/Contents/MacOS/rg"
+    fi
+    # Same for the simulator helper: cache only, never the network.
+    if [[ -f "target/bundle-tools/oximux-sim-helper" ]]; then
+        cp -f "target/bundle-tools/oximux-sim-helper" "$APP_DIR/Contents/MacOS/oximux-sim-helper"
     fi
     # The fresh binary carries no rpath, so re-copy the dylibs + re-add it.
     bundle_dylibs debug
@@ -431,6 +470,9 @@ bundle_dylibs "$TARGET_SUBDIR"
 
 # Pinned ripgrep for the search panel + Quick Open.
 bundle_rg
+
+# Pinned iOS Simulator helper for the Simulator panel.
+bundle_sim_helper
 
 sign_bundle
 

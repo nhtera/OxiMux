@@ -88,12 +88,26 @@ a key under the cert).
 
 ## Gatekeeper facts worth remembering
 
-- Sign inside-out, never `--deep`: dylibs → `oximux-relay` → `oximux-screen-gate`
-  → `oximux` → the bundle. `bundle-macos.sh` encodes this order.
-- Hardened runtime (`--options runtime`) + secure timestamp + entitlements
-  (`assets/OxiMux.entitlements`, currently mic-only) are notarization requirements.
+- Sign inside-out, never `--deep`: dylibs → `oximux-sim-helper` → `rg` →
+  `oximux-relay` → `oximux-screen-gate` → `oximux` → the bundle.
+  `bundle-macos.sh` encodes this order.
+- Hardened runtime (`--options runtime`) and a secure timestamp are notarization requirements for every binary.
+  - Our own binaries also get `assets/OxiMux.entitlements`, which is currently mic-only.
+  - `oximux-sim-helper` deliberately gets **no** entitlements. It only dlopens Apple-signed simulator frameworks, and the app's grants must not extend to private-framework code.
 - "Apple Development" certs sign locally but are REJECTED at notarization;
   only "Developer ID Application" works. Both scripts check this up front.
 - Notary wait is usually 1–15 min; occasionally much longer. The service keeps
   processing past a client timeout — check `xcrun notarytool history` before
   resubmitting.
+
+## iOS Simulator helper (`oximux-sim-helper`)
+
+The helper isn't built in this repo. Our fork [nhtera/serve-sim](https://github.com/nhtera/serve-sim), branch `oximux`, builds and releases it. `scripts/fetch-sim-helper.sh` downloads a pinned release into `target/bundle-tools/` and checks it against the sha256 pinned in the script, and `bundle-macos.sh` bundles it.
+
+To ship a new helper version:
+1. In the fork: `git fetch upstream && git rebase upstream/main oximux`, then update `oximux/upstream-base`.
+2. Still in the fork: bump `helperVersion` in `oximux/Sources/oximux-sim-helper/Version.swift`, run `swift test`, and push.
+3. Push the tag `helper-v<version>`. The tag must be on `oximux`. CI publishes an immutable release with a `.sha256` and a build-provenance attestation. Check it with `gh attestation verify <tarball> --repo nhtera/serve-sim`.
+4. In OxiMux: set `SIM_HELPER_VERSION` and `SIM_HELPER_SHA256` in `scripts/fetch-sim-helper.sh`, and compute the sha yourself from the downloaded asset. If the stdio protocol changed, update `crates/simulator` in the same PR.
+
+To test against a locally built fork without a release, set `OXIMUX_SIM_HELPER` to the helper's path.

@@ -821,6 +821,9 @@ src/
 - `scripts/fetch-ripgrep.sh` — downloads pinned ripgrep 15.2.0, sha256-verifies vs the
   release's own `.sha256` asset, arch-matched (lipo for universal) + stamp-file cached;
   `bundle-macos.sh` copies the result to `Contents/MacOS/rg` and signs it nested-first
+- `scripts/fetch-sim-helper.sh`: downloads the pinned `oximux-sim-helper` release from the fork `nhtera/serve-sim` (branch `oximux`, Apache-2.0).
+  - It checks the sha256 **pinned in the script**, not the release's own asset. It never executes the fetched binary. arm64 only (it skips on other hosts); stamp-file cached.
+  - `bundle-macos.sh` copies it to `Contents/MacOS/oximux-sim-helper` and signs it with the hardened runtime and **no entitlements**. The licence goes to `Contents/Resources/licenses/serve-sim-LICENSE`.
 
 ---
 
