@@ -17,6 +17,7 @@ impl Render for WorkspaceRoot {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Push sidebar data down before LeftRail::render runs in the tree.
         self.refresh_left_rail(cx);
+        self.sync_simulator_visibility(window, cx);
 
         // Tell the panes whether a modal/overlay is covering them this frame,
         // so any embedded browser webview (a native view above the GPU canvas)
@@ -1931,6 +1932,12 @@ impl Render for WorkspaceRoot {
                     }
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::actions::SelectSimulatorTab, window, cx| {
+                this.select_simulator_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ToggleSimulatorMaximized, window, cx| {
+                this.toggle_simulator_maximized(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SelectHistoryTab, window, cx| {
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |s, cx| {

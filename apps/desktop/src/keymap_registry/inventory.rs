@@ -21,6 +21,7 @@ use crate::actions::{
     OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
     ReloadCustomCommands, RevealActiveWorkspace, Search, SelectExplorerTab, SelectHistoryTab,
+    SelectSimulatorTab,
     SelectSearchTab,
     SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
@@ -314,6 +315,9 @@ pub const ACTIONS: &[ActionSpec] = &[
     entry!("select_explorer_tab", "Explorer tab", Navigation, "secondary-shift-e", SelectExplorerTab),
     entry!("select_search_tab", "Search tab", Navigation, "secondary-shift-f", SelectSearchTab),
     entry!("select_history_tab", "Session History tab", Navigation, "secondary-shift-y", SelectHistoryTab),
+    // Unbound by default: every free chord near the other tab chords is taken,
+    // and the palette entry is how most people will find it.
+    entry!("select_simulator_tab", "Show iOS Simulator", Navigation, "", SelectSimulatorTab),
     // Browser-style steps through this window's workspace-activation history.
     entry!(
         "nav_workspace_back",

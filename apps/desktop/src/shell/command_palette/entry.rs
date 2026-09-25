@@ -154,6 +154,11 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         make_action: || Box::new(SelectSourceControlTab),
     },
     CommandEntry {
+        name: "Show iOS Simulator",
+        action_id: Some("select_simulator_tab"),
+        make_action: || Box::new(crate::actions::SelectSimulatorTab),
+    },
+    CommandEntry {
         name: "Search Pane",
         action_id: Some("search_scrollback"),
         make_action: || Box::new(Search),
@@ -305,11 +310,11 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_twenty_one_entries() {
+    fn palette_commands_has_twenty_two_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
-        // + "Reveal Active Workspace".
-        assert_eq!(PALETTE_COMMANDS.len(), 21);
+        // + "Reveal Active Workspace" + "Show iOS Simulator".
+        assert_eq!(PALETTE_COMMANDS.len(), 22);
     }
 
     #[test]

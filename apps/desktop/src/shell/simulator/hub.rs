@@ -17,15 +17,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use gpui::{App, AppContext, Context, Entity, EventEmitter, Global};
+use gpui::{App, Context, Entity, EventEmitter, Global};
 use oximux_simulator::availability::{self, Availability, HelperStatus};
-use oximux_simulator::boot_watch::{self, BootWatch, WatchGate};
-use oximux_simulator::child_ledger::{self, Ledger};
+use oximux_simulator::boot_watch::{BootWatch, WatchGate};
+use oximux_simulator::child_ledger::Ledger;
 use oximux_simulator::helper::HelperOptions;
 use oximux_simulator::registry::{self, BootResult, Effect, Generation, Phase, Registry, WorktreeKey};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::{SessionEvent, StreamSession};
-use oximux_simulator::{DeviceId, DeviceState, SimError, simctl};
+use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, SimError, simctl};
 use oximux_storage::SettingsRepo;
 
 use crate::app_settings::sim_state_keys;
@@ -46,6 +46,8 @@ pub enum HubEvent {
     Session(DeviceId, SessionEvent),
     /// The availability check finished (or was refreshed).
     Availability,
+    /// The device list (for the device menu) was refreshed.
+    Devices,
     /// An attach for this worktree found no device to use (the panel leaves
     /// its "Attaching…" state and shows why).
     AttachFailed(PathBuf, String),
@@ -66,9 +68,18 @@ pub struct SimulatorHub {
     /// listing lands later must not win over a newer one.
     attach_seq: HashMap<WorktreeKey, u64>,
     next_attach: u64,
+    /// Last device listing, for the device menu.
+    devices: Vec<DeviceInfo>,
+    devices_listed: bool,
+    availability_in_flight: bool,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
+
+mod lifecycle;
+
+pub use lifecycle::{install, on_quit};
+pub(crate) use lifecycle::simulator_dir;
 
 /// The global handle to the one hub.
 pub struct SimulatorService(pub Entity<SimulatorHub>);
@@ -78,121 +89,6 @@ impl Global for SimulatorService {}
 /// The hub, when installed (it is not in `oximux serve`, which has no UI).
 pub fn hub(cx: &App) -> Option<Entity<SimulatorHub>> {
     cx.try_global::<SimulatorService>().map(|s| s.0.clone())
-}
-
-fn simulator_dir() -> PathBuf {
-    crate::app_paths::data_dir().unwrap_or_else(std::env::temp_dir).join("simulator")
-}
-
-/// Create the hub, reap a previous run's orphans in the background, and start
-/// the idle-shutdown tick and the (gated) device watcher. Call once at startup.
-pub fn install(cx: &mut App, repo: SettingsRepo) {
-    let ledger = Ledger::open(simulator_dir().join("children.json"))
-        .map(Arc::new)
-        .inspect_err(|e| tracing::warn!("simulator child ledger unavailable: {e}"))
-        .ok();
-    let reaped = Arc::new((Mutex::new(false), Condvar::new()));
-    {
-        let (ledger, reaped) = (ledger.clone(), reaped.clone());
-        cx.background_executor()
-            .spawn(async move {
-                // Open the gate however this ends (a panic included), or every
-                // session start would wait forever.
-                let _open = OpenOnDrop(reaped);
-                if let Some(ledger) = ledger {
-                    let report = child_ledger::reap_stale(&ledger);
-                    if !report.killed.is_empty() {
-                        tracing::info!(killed = ?report.killed, "reaped orphaned simulator children");
-                    }
-                }
-            })
-            .detach();
-    }
-    let snapshot = sim_state_keys::load_snapshot(&repo);
-    let feature_used = sim_state_keys::feature_used(&repo);
-    let hub = cx.new(|_| SimulatorHub {
-        registry: Registry::restore(snapshot, Instant::now()),
-        repo,
-        runner: Arc::new(SystemRunner),
-        ledger,
-        reaped,
-        watch: Arc::new(Mutex::new(BootWatch::default())),
-        availability: None,
-        feature_used,
-        attach_seq: HashMap::new(),
-        next_attach: 0,
-    });
-    cx.set_global(SimulatorService(hub.clone()));
-    if feature_used {
-        hub.update(cx, |hub, cx| hub.refresh_availability(cx));
-    }
-    spawn_tick(cx, hub.downgrade());
-    spawn_watch(cx, hub.downgrade());
-}
-
-struct OpenOnDrop(Arc<(Mutex<bool>, Condvar)>);
-
-impl Drop for OpenOnDrop {
-    fn drop(&mut self) {
-        let (done, cvar) = &*self.0;
-        *done.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        cvar.notify_all();
-    }
-}
-
-/// App quit (bounded by GPUI's shutdown grace): close every helper's stdin
-/// and hand the owned devices to a detached `simctl shutdown` that runs after
-/// we are gone. Never waits.
-pub fn on_quit(cx: &mut App) {
-    let Some(hub) = hub(cx) else { return };
-    hub.update(cx, |hub, _| {
-        let (sessions, owned) = hub.registry.quit();
-        for session in sessions {
-            session.shutdown();
-        }
-        // `quit` already released ownership of what the script shuts down.
-        sim_state_keys::save_snapshot(&hub.repo, &hub.registry.snapshot());
-        spawn_detached_shutdown(&owned);
-    });
-}
-
-/// `sleep 1; xcrun simctl shutdown …` in its own process group, so it
-/// outlives the app and never holds quit up. A relaunch within that second
-/// sees the device "Shutting Down", which the registry treats as not booted.
-fn spawn_detached_shutdown(owned: &[DeviceId]) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        if owned.is_empty() {
-            return;
-        }
-        // Positional arguments, never interpolation: these ids come back from
-        // the settings DB, and only well-formed UUIDs are passed at all.
-        let udids: Vec<&str> = owned.iter().map(DeviceId::as_str).filter(|u| is_udid(u)).collect();
-        if udids.is_empty() {
-            return;
-        }
-        let spawned = std::process::Command::new("/bin/sh")
-            .args(["-c", r#"sleep 1; for u in "$@"; do xcrun simctl shutdown "$u"; done"#, "sh"])
-            .args(&udids)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn();
-        if let Err(e) = spawned {
-            tracing::warn!("could not schedule shutdown of owned simulators: {e}");
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = owned;
-}
-
-/// A simulator UDID: 8-4-4-4-12 hex digits.
-fn is_udid(s: &str) -> bool {
-    let groups: Vec<&str> = s.split('-').collect();
-    groups.len() == 5
-        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 impl SimulatorHub {
@@ -213,19 +109,80 @@ impl SimulatorHub {
         self.registry.session(udid).cloned()
     }
 
-    /// The panel was opened: from now on the device watcher may poll.
-    pub fn mark_used(&mut self, cx: &mut Context<Self>) {
-        if !self.feature_used {
-            self.feature_used = true;
-            sim_state_keys::mark_feature_used(&self.repo);
-            self.refresh_availability(cx);
+    /// The last device listing (see [`Self::refresh_devices`]).
+    pub fn devices(&self) -> &[DeviceInfo] {
+        &self.devices
+    }
+
+    /// The device attached to `worktree`, with its listing when known.
+    pub fn attached_info(&self, worktree: &Path) -> Option<(DeviceId, Option<DeviceInfo>)> {
+        let udid = self.device_for(worktree)?;
+        let info = self.devices.iter().find(|d| d.udid == udid).cloned();
+        Some((udid, info))
+    }
+
+    /// Re-list devices in the background (never on the UI thread; never
+    /// without a resolvable Xcode, which would pop the tools dialog).
+    pub fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+        if !self.watch_gate().xcode_ok {
+            return;
         }
+        let runner = self.runner.clone();
+        cx.spawn(async move |this, cx| {
+            let listed = cx.background_executor().spawn(async move { simctl::list_devices(runner.as_ref(), SIMCTL_TIMEOUT) }).await;
+            let _ = this.update(cx, |hub, cx| match listed {
+                Ok(devices) => {
+                    hub.devices = devices;
+                    hub.devices_listed = true;
+                    cx.emit(HubEvent::Devices);
+                }
+                Err(e) => tracing::debug!("simulator device listing failed: {e}"),
+            });
+        })
+        .detach();
+    }
+
+    /// Apply stream settings to `udid`'s live session, in the background
+    /// (`configure` waits for the helper's reply).
+    pub fn configure_stream(&self, udid: &DeviceId, scale: f64, fps: f64, cx: &mut Context<Self>) {
+        let Some(session) = self.session(udid) else { return };
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = session.configure(Some(scale), Some(fps), None, Duration::from_secs(5)) {
+                    tracing::debug!("simulator stream configure failed: {e}");
+                }
+            })
+            .detach();
+    }
+
+    /// The panel was opened: from now on the device watcher may poll.
+    /// Returns whether this was the first use (which also ran the first
+    /// availability check).
+    pub fn mark_used(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.feature_used {
+            return false;
+        }
+        self.feature_used = true;
+        sim_state_keys::mark_feature_used(&self.repo);
+        self.refresh_availability(cx);
+        true
+    }
+
+    /// Whether a device listing has landed yet (so "none booted" means it).
+    pub fn devices_listed(&self) -> bool {
+        self.devices_listed
     }
 
     /// Re-check Xcode, the runtime and the helper in the background. A changed
     /// developer dir restarts every helper: they loaded the old Xcode's
     /// private frameworks.
     pub fn refresh_availability(&mut self, cx: &mut Context<Self>) {
+        // One check at a time: a slow `xcodebuild` must not stack up polls
+        // that then land out of order.
+        if self.availability_in_flight {
+            return;
+        }
+        self.availability_in_flight = true;
         let runner = self.runner.clone();
         cx.spawn(async move |this, cx| {
             let fresh = cx
@@ -233,6 +190,7 @@ impl SimulatorHub {
                 .spawn(async move { availability::check(runner.as_ref(), SIMCTL_TIMEOUT, &availability::default_helper_probe) })
                 .await;
             let _ = this.update(cx, |hub, cx| {
+                hub.availability_in_flight = false;
                 let old = hub.availability.as_ref().map(|a| a.xcode.clone());
                 let changed = old.is_some_and(|old| old != fresh.xcode);
                 hub.availability = Some(fresh);
@@ -271,6 +229,9 @@ impl SimulatorHub {
                     Ok(devices) => devices,
                     Err(e) => return fail(cx, format!("could not list simulators: {e}")),
                 };
+                hub.devices = devices.clone();
+                hub.devices_listed = true;
+                cx.emit(HubEvent::Devices);
                 let pick = match &device {
                     Some(udid) => devices.iter().find(|d| &d.udid == udid).map(|d| (d, d.state == DeviceState::Booted)),
                     None => registry::auto_pick(&devices, preferred.as_ref()),
@@ -373,7 +334,13 @@ impl SimulatorHub {
                 HelperStatus::Missing(why) => Err(why),
             },
         };
+        let stream = cx
+            .try_global::<crate::app_settings::simulator_settings::SimulatorSettings>()
+            .map(|s| s.stream)
+            .unwrap_or_default();
         let opts = HelperOptions {
+            scale: f64::from(stream.effective_scale()),
+            fps: f64::from(stream.fps),
             log_path: Some(simulator_dir().join("logs").join(format!("helper-{udid}.log"))),
             ledger: self.ledger.clone(),
             ..HelperOptions::default()
@@ -464,79 +431,3 @@ impl SimulatorHub {
     }
 }
 
-fn spawn_tick(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor().timer(TICK).await;
-            let alive = hub.update(cx, |hub, cx| {
-                let effects = hub.registry.tick(Instant::now());
-                hub.run(effects, cx);
-            });
-            if alive.is_err() {
-                return;
-            }
-        }
-    })
-    .detach();
-}
-
-fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor().timer(boot_watch::POLL_INTERVAL).await;
-            let gate = hub.update(cx, |hub, _| {
-                hub.watch_gate().should_poll().then(|| (hub.runner.clone(), hub.registry.generation()))
-            });
-            let (runner, listed_at) = match gate {
-                Ok(Some(gate)) => gate,
-                Ok(None) => continue,
-                Err(_) => return, // the hub is gone
-            };
-            // The `simctl list` runs with no lock held: the UI thread reads
-            // the watch state (reconnect, helper exit) and must never wait on
-            // CoreSimulator.
-            let listed = cx.background_executor().spawn(async move { boot_watch::list_booted(runner.as_ref()) }).await;
-            let booted = match listed {
-                Ok(booted) => booted,
-                Err(e) => {
-                    tracing::debug!("simulator device watch: {e}");
-                    continue;
-                }
-            };
-            let alive = hub.update(cx, |hub, cx| {
-                hub.watch.lock().unwrap().observe(booted.clone());
-                // A boot or start finished while we were listing: the set may
-                // predate it and read a fresh boot as a shutdown. Skip; the
-                // next poll is three seconds away.
-                if hub.registry.generation() != listed_at {
-                    return;
-                }
-                let changed = hub.registry.attached_devices();
-                let effects = hub.registry.reconcile_booted(&booted);
-                if !effects.is_empty() {
-                    hub.run(effects, cx);
-                    for udid in changed {
-                        cx.emit(HubEvent::Changed(udid));
-                    }
-                }
-            });
-            if alive.is_err() {
-                return;
-            }
-        }
-    })
-    .detach();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_udid;
-
-    #[test]
-    fn only_well_formed_udids_reach_the_shutdown_script() {
-        assert!(is_udid("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3"));
-        for bad in ["", "U", "81CE1BE8-E38A-4BA8-8AAB-5DACA07576B", "x; rm -rf ~", "81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3 extra", "ZZZZZZZZ-E38A-4BA8-8AAB-5DACA07576B3"] {
-            assert!(!is_udid(bad), "{bad}");
-        }
-    }
-}

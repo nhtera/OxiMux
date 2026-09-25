@@ -772,7 +772,11 @@ impl WorkspaceRoot {
             // panel existed (or one restored into a different window) would
             // otherwise render the Ports tab empty forever.
             let ports_panel = self.ports_panel.clone();
-            cached.update(cx, |s, cx| s.set_ports_panel(ports_panel, cx));
+            let simulator_panel = self.simulator.panel();
+            cached.update(cx, |s, cx| {
+                s.set_ports_panel(ports_panel, cx);
+                s.set_simulator_panel(simulator_panel, cx);
+            });
             self.right_sidebar = Some(cached);
             self.rewire_scm_subscriptions(window, cx);
             // RT-3: forward the new project to any open Tasks tab so the list
@@ -863,7 +867,11 @@ impl WorkspaceRoot {
                 // this project reuses it (fast path above) instead of
                 // rebuilding from scratch.
                 let ports_panel = this.ports_panel.clone();
-                built.update(cx, |s, cx| s.set_ports_panel(ports_panel, cx));
+                let simulator_panel = this.simulator.panel();
+                built.update(cx, |s, cx| {
+                    s.set_ports_panel(ports_panel, cx);
+                    s.set_simulator_panel(simulator_panel, cx);
+                });
                 this.right_sidebar_by_project
                     .insert(project_id_for_cache, built.clone());
                 this.right_sidebar = Some(built);

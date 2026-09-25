@@ -105,6 +105,9 @@ pub struct RightSidebar {
     // owns the single panel and hands the same entity to every sidebar it
     // builds. `None` only before that handoff (and in tests).
     pub(crate) ports_panel: Option<Entity<crate::shell::ports_panel::PortsPanel>>,
+    /// The window's iOS Simulator panel, when this Mac supports it — shared
+    /// like `ports_panel`. Its presence is what shows the Simulator tab.
+    pub(crate) simulator_panel: Option<Entity<crate::shell::simulator::SimulatorPanel>>,
 
     // Poll state mirrored for the status bar (avoids borrowing through entity tree).
     pub latest_poll_state: PollState,
@@ -322,6 +325,7 @@ impl RightSidebar {
             // Handed over by `WorkspaceRoot` after construction — see the
             // field's own note on why it is not built here.
             ports_panel: None,
+            simulator_panel: None,
             latest_poll_state: initial,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -478,6 +482,7 @@ impl RightSidebar {
             session_history,
             file_tree_view: None,
             ports_panel: None,
+            simulator_panel: None,
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -532,6 +537,7 @@ impl RightSidebar {
     pub fn visible_tabs(&self) -> Vec<RightTab> {
         visible_tabs(TabVisibility {
             has_repo: self._poller.is_some(),
+            simulator: self.simulator_panel.is_some(),
         })
     }
 
@@ -549,6 +555,35 @@ impl RightSidebar {
         cx.notify();
     }
 
+    /// Adopt (or, with `None`, drop) the window's simulator panel. Same
+    /// every-sidebar contract as [`Self::set_ports_panel`].
+    pub fn set_simulator_panel(
+        &mut self,
+        panel: Option<Entity<crate::shell::simulator::SimulatorPanel>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.simulator_panel = panel;
+        cx.notify();
+    }
+
+    /// Set the width without persisting it: the simulator tab's first-select
+    /// bump and its maximize are transient, so a user's drag stays the one
+    /// persisted width that "restore" returns to.
+    pub fn set_panel_width_transient(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.panel_width != width {
+            self.panel_width = width;
+            cx.notify();
+        }
+    }
+
+    /// The last width a user drag persisted (what "restore" returns to),
+    /// clamped for `window_width`.
+    pub fn persisted_panel_width(&self, window_width: f32) -> Option<Pixels> {
+        self.settings_repo
+            .as_ref()
+            .map(|repo| px(scm_layout_settings::load_panel_width(repo, window_width)))
+    }
+
     /// Switch the active tab and notify GPUI to re-render.
     ///
     /// Falls back to `Explorer` if `tab` is not in the current `visible_tabs` set
@@ -556,6 +591,7 @@ impl RightSidebar {
     pub fn select_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
         let tabs = visible_tabs(TabVisibility {
             has_repo: self._poller.is_some(),
+            simulator: self.simulator_panel.is_some(),
         });
         self.active_tab = if tabs.contains(&tab) {
             tab
@@ -740,6 +776,16 @@ impl Render for RightSidebar {
                         .child(self.session_history.clone()),
                 )
                 .into_any_element(),
+            RightTab::Simulator => match self.simulator_panel.clone() {
+                Some(panel) => div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(panel)
+                    .into_any_element(),
+                None => div().flex_1().into_any_element(),
+            },
             RightTab::Ports => {
                 let body_div = div()
                     .flex_1()

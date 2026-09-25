@@ -11,12 +11,17 @@ pub enum RightTab {
     History,
     /// Local ports the window's terminals are listening on.
     Ports,
+    /// The iOS Simulator panel (Apple silicon only; see `TabVisibility`).
+    Simulator,
 }
 
 /// Inputs that determine which tabs are visible.
 pub struct TabVisibility {
     /// Whether a git repository is open in the current workspace.
     pub has_repo: bool,
+    /// Whether this window has a simulator panel: Apple silicon macOS with
+    /// the feature enabled (the window only builds one then).
+    pub simulator: bool,
 }
 
 /// Returns the ordered list of tabs that should be visible given `v`.
@@ -35,10 +40,20 @@ pub struct TabVisibility {
 /// Source Control is hidden when there is no repository — avoids showing a
 /// broken panel before Phase 04 adds graceful no-repo handling.
 pub fn visible_tabs(v: TabVisibility) -> Vec<RightTab> {
+    let mut tabs = repo_tabs(v.has_repo);
+    // Last: the simulator is the one tab that is a device, not a view of the
+    // repo, and it only exists on some Macs.
+    if v.simulator {
+        tabs.push(RightTab::Simulator);
+    }
+    tabs
+}
+
+fn repo_tabs(has_repo: bool) -> Vec<RightTab> {
     // History and Ports are both repo-independent — past sessions exist, and
     // a dev server listens, whether or not the current workspace is a git
     // repo — so they show in both cases.
-    if v.has_repo {
+    if has_repo {
         vec![
             RightTab::Explorer,
             RightTab::Search,
@@ -72,6 +87,7 @@ impl RightTab {
             // two surfaces sharing a glyph is how an activity bar stops being
             // scannable.
             RightTab::Ports => "icons/network.svg",
+            RightTab::Simulator => "icons/smartphone.svg",
         }
     }
 
@@ -84,6 +100,7 @@ impl RightTab {
             RightTab::SourceControl => "G",
             RightTab::History => "H",
             RightTab::Ports => "P",
+            RightTab::Simulator => "I",
         }
     }
 
@@ -96,6 +113,7 @@ impl RightTab {
             RightTab::SourceControl => "Source Control",
             RightTab::History => "Session History",
             RightTab::Ports => "Ports",
+            RightTab::Simulator => "iOS Simulator",
         }
     }
 }

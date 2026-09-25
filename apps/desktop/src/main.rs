@@ -404,6 +404,7 @@ fn main() {
         // first used: it reaps a crashed run's orphaned helpers in the
         // background, and its device watcher stays off until then (a Mac
         // without Xcode never runs `xcrun` because of it).
+        oximux_app::simulator_settings::install(cx);
         oximux_app::shell::simulator::install(cx, app_state.settings_repo().clone());
         // Process-wide last-known-`GitState` cache. (Appearance is installed
         // further up, before the gpui-component bridge that reads it.) Registered before any

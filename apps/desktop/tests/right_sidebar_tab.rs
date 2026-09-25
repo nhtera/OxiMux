@@ -9,7 +9,7 @@ fn a_repo_project_shows_the_full_tab_row_in_order() {
     // editor-crate FileTree model + watcher stay reachable; the surface
     // re-appears here once LSP-aware affordances justify a second file
     // tab under a non-"Files" label.
-    let tabs = visible_tabs(TabVisibility { has_repo: true });
+    let tabs = visible_tabs(TabVisibility { has_repo: true, simulator: false });
     assert_eq!(
         tabs,
         vec![
@@ -25,7 +25,7 @@ fn a_repo_project_shows_the_full_tab_row_in_order() {
 
 #[test]
 fn only_source_control_drops_when_there_is_no_repo() {
-    let tabs = visible_tabs(TabVisibility { has_repo: false });
+    let tabs = visible_tabs(TabVisibility { has_repo: false, simulator: false });
     assert_eq!(
         tabs,
         vec![
@@ -45,7 +45,7 @@ fn ports_is_visible_whether_or_not_the_project_is_a_repo() {
     // most likely to be a scratch directory with a server in it.
     for has_repo in [true, false] {
         assert!(
-            visible_tabs(TabVisibility { has_repo }).contains(&RightTab::Ports),
+            visible_tabs(TabVisibility { has_repo, simulator: false }).contains(&RightTab::Ports),
             "Ports must survive has_repo = {has_repo}"
         );
     }
@@ -55,8 +55,8 @@ fn ports_is_visible_whether_or_not_the_project_is_a_repo() {
 fn files_tab_hidden_from_visible_in_both_repo_states() {
     // Guard against accidentally re-exposing Files before the LSP-aware
     // re-launch lands. Flip the assertion when intentionally reintroducing.
-    let with_repo = visible_tabs(TabVisibility { has_repo: true });
-    let without_repo = visible_tabs(TabVisibility { has_repo: false });
+    let with_repo = visible_tabs(TabVisibility { has_repo: true, simulator: false });
+    let without_repo = visible_tabs(TabVisibility { has_repo: false, simulator: false });
     assert!(!with_repo.contains(&RightTab::Files));
     assert!(!without_repo.contains(&RightTab::Files));
 }
@@ -81,4 +81,19 @@ fn files_tab_metadata_still_present_for_future_reintroduction() {
     assert_eq!(RightTab::Files.icon_path(), "icons/folder.svg");
     assert_ne!(RightTab::Files.label(), RightTab::Explorer.label());
     assert_ne!(RightTab::Files.icon_path(), RightTab::Explorer.icon_path());
+}
+
+#[test]
+fn the_simulator_tab_trails_the_row_only_when_the_window_has_a_panel() {
+    // The window builds a simulator panel only on Apple silicon macOS with the
+    // feature on; without one the tab must not exist at all.
+    for has_repo in [true, false] {
+        let without = visible_tabs(TabVisibility { has_repo, simulator: false });
+        assert!(!without.contains(&RightTab::Simulator));
+        let with = visible_tabs(TabVisibility { has_repo, simulator: true });
+        assert_eq!(with.last(), Some(&RightTab::Simulator));
+        assert_eq!(with.len(), without.len() + 1);
+    }
+    assert_eq!(RightTab::Simulator.title(), "iOS Simulator");
+    assert_eq!(RightTab::Simulator.icon_path(), "icons/smartphone.svg");
 }

@@ -616,6 +616,9 @@ pub struct WorkspaceRoot {
     /// project itself. Every `RightSidebar` this root builds is handed this
     /// same entity.
     pub(crate) ports_panel: Entity<crate::shell::ports_panel::PortsPanel>,
+    /// The window's iOS Simulator panel and its bookkeeping (absent where the
+    /// feature is unsupported). See `shell::simulator::root_glue`.
+    pub(crate) simulator: crate::shell::simulator::RootSimulator,
     /// Guards against overlapping port scans — the socket read runs on the
     /// background executor, and a slow one must not have a second stacked
     /// behind it.
@@ -1380,6 +1383,8 @@ impl WorkspaceRoot {
         // `set_active_project` sidebar rebuild, since that mints fresh panel
         // entities the original subscriptions would otherwise orphan.
 
+        // The window's simulator panel (only on Macs that support it).
+        let simulator = crate::shell::simulator::RootSimulator::new(theme, density, typography.clone(), cx);
         let mut this = Self {
             drop_epoch: 0,
             theme,
@@ -1494,6 +1499,7 @@ impl WorkspaceRoot {
             _agent_activity_task: agent_activity_task,
             _usage_meter_task: usage_meter_task,
             ports_panel,
+            simulator,
             port_scan_in_flight: false,
             port_meta_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::shell::ports_panel::scan::PidMetaCache::default(),
@@ -1505,6 +1511,7 @@ impl WorkspaceRoot {
         // first meaningful paint.
         this.mark_rail_dirty(cx);
         this.rewire_scm_subscriptions(window, cx);
+        this.simulator.follow_active_worktree(cx);
         // Load global custom commands on startup. No active project yet so
         // only the global `commands.toml` is checked; project commands are
         // loaded (and re-merged) on the first `set_active_project` call.

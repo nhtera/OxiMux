@@ -50,7 +50,7 @@ pub use app_settings::{
     commit_message_ai_settings,
     computer_use_settings, dictation_settings, font_settings, git_settings, keybindings_settings,
     motion_settings,
-    port_label_settings, scm_layout_settings, terminal_settings,
+    port_label_settings, scm_layout_settings, simulator_settings, terminal_settings,
 };
 #[doc(inline)]
 pub use loaders::{

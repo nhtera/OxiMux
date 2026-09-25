@@ -277,6 +277,46 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/git-compare.svg",
         include_bytes!("../assets/icons/git-compare.svg"),
     ),
+    // iOS Simulator panel: tab glyph, device-menu house-runtime icon are not
+    // used, so this set is header/toolbar controls (maximize/minimize,
+    // power, rotate, booted-device dot, detach) plus the empty-state glyph.
+    // Lucide, ISC — see THIRD_PARTY_NOTICES.md.
+    (
+        "icons/smartphone.svg",
+        include_bytes!("../assets/icons/smartphone.svg"),
+    ),
+    (
+        "icons/house.svg",
+        include_bytes!("../assets/icons/house.svg"),
+    ),
+    (
+        "icons/power.svg",
+        include_bytes!("../assets/icons/power.svg"),
+    ),
+    (
+        "icons/rotate-cw.svg",
+        include_bytes!("../assets/icons/rotate-cw.svg"),
+    ),
+    (
+        "icons/circle-dot.svg",
+        include_bytes!("../assets/icons/circle-dot.svg"),
+    ),
+    (
+        "icons/unplug.svg",
+        include_bytes!("../assets/icons/unplug.svg"),
+    ),
+    (
+        "icons/list.svg",
+        include_bytes!("../assets/icons/list.svg"),
+    ),
+    (
+        "icons/maximize-2.svg",
+        include_bytes!("../assets/icons/maximize-2.svg"),
+    ),
+    (
+        "icons/minimize-2.svg",
+        include_bytes!("../assets/icons/minimize-2.svg"),
+    ),
 ];
 
 /// Lilex, bundled so a monospace face is always present. OFL-1.1; the license

@@ -42,3 +42,22 @@ The shipped binary is a modified version of upstream:
 - **Changes to upstream files:** two small patches, listed in the fork's `oximux/PATCHES.md`. One adds a capture rate limit and pause; the other stops spawned tools from inheriting the helper's stdin.
 
 The release archive carries the licence text. The macOS app bundle ships it as `Contents/Resources/licenses/serve-sim-LICENSE`.
+
+## Local icon SVGs — Lucide, ISC
+
+Several files under `apps/desktop/assets/icons/` (e.g. `smartphone.svg`, `house.svg`,
+`power.svg`, `rotate-cw.svg`, `circle-dot.svg`, `unplug.svg`, `list.svg`,
+`maximize-2.svg`, `minimize-2.svg`, `lock.svg`, `x.svg`, `check.svg`, and others
+sharing the same 24×24 / 2px-stroke geometry) are the [Lucide](https://lucide.dev)
+icon set or minor edits of it, Copyright 2024 Lucide Contributors, ISC License.
+They are embedded via `include_bytes!` and registered in `apps/desktop/src/assets.rs`
+rather than pulled in as a Cargo dependency, so `cargo about` does not see them.
+
+> ISC License — Copyright (c) for portions are held by contributors. Permission
+> to use, copy, modify, and/or distribute this software for any purpose with or
+> without fee is hereby granted, provided that the above copyright notice and
+> this permission notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS"
+> AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE.
+
+Full licence: [lucide-static on npm](https://www.npmjs.com/package/lucide-static),
+[upstream LICENSE](https://github.com/lucide-icons/lucide/blob/main/LICENSE).

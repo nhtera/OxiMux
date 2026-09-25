@@ -125,7 +125,7 @@ fn render_tab_button(
 /// obvious mnemonic, `secondary-shift-p`, is the command palette.
 fn shortcut_hint(tab: RightTab) -> String {
     let id = match tab {
-        RightTab::Files | RightTab::Ports => return String::new(),
+        RightTab::Files | RightTab::Ports | RightTab::Simulator => return String::new(),
         RightTab::Explorer => "select_explorer_tab",
         RightTab::Search => "select_search_tab",
         RightTab::SourceControl => "select_source_control_tab",
