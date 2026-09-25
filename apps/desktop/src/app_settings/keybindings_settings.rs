@@ -73,12 +73,12 @@ pub fn take_boot_warnings() -> Vec<String> {
     }
 }
 
-/// Boot wiring: load overrides, install the effective keymap, stash any
-/// problems for the first window to toast. Must run before `set_menus`
-/// (GPUI reads the keymap once when building menu-item glyphs).
-pub fn install(cx: &mut App) {
-    let (overrides, mut warnings) = load_overrides();
-    warnings.extend(keymap_registry::install(cx, &overrides));
+/// The context-scoped binding sets (terminal, session history, stash panel,
+/// simulator screen). They must be registered *after* the registry's
+/// context-free bindings: gpui ranks a context-free binding at the deepest
+/// depth, so on a tie the later registration wins. A live rebind appends new
+/// context-free bindings, so it has to run this again afterwards.
+pub fn install_scoped(cx: &mut App) {
     // Co-install the terminal's Tab/Shift+Tab shadow bindings alongside the
     // global keymap they shadow, so the two can never desync (e.g. a second
     // window/host that installs the keymap but forgets the shadow).
@@ -95,6 +95,15 @@ pub fn install(cx: &mut App) {
     crate::shell::stash_panel::keyboard::register_stash_panel_key_bindings(cx);
     // The simulator screen forwards Tab / Shift-Tab to the device.
     crate::shell::simulator::register_screen_key_bindings(cx);
+}
+
+/// Boot wiring: load overrides, install the effective keymap, stash any
+/// problems for the first window to toast. Must run before `set_menus`
+/// (GPUI reads the keymap once when building menu-item glyphs).
+pub fn install(cx: &mut App) {
+    let (overrides, mut warnings) = load_overrides();
+    warnings.extend(keymap_registry::install(cx, &overrides));
+    install_scoped(cx);
     for warning in &warnings {
         tracing::warn!(%warning, "keybinding override problem");
     }

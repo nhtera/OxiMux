@@ -29,6 +29,11 @@ impl SimulatorPanel {
     pub(super) fn render_body(&mut self, state: &PanelState, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let density = self.density;
         let device = self.outline_device(cx);
+        if !matches!(state, PanelState::Streaming) {
+            // The stream went away under an annotation or a question.
+            self.annotate = None;
+            self.confirm_shutdown &= self.device(cx).is_some();
+        }
         if !matches!(state, PanelState::Streaming)
             && let Some(screen) = self.screen.clone()
         {
@@ -44,6 +49,9 @@ impl SimulatorPanel {
             PanelState::Attaching => self.centered_line("Finding a simulator…"),
             PanelState::Booting => self.centered_line(&format!("Booting {}…", self.device_name(cx))),
             PanelState::Connecting => self.centered_line("Starting stream…"),
+            PanelState::Streaming if self.annotate.is_some() => {
+                self.annotate.clone().map(IntoElement::into_any_element).unwrap_or_else(|| self.centered_line(""))
+            }
             PanelState::Streaming => {
                 let radius = self.area.get().and_then(|a| fit(a, &device)).map_or(0.0, |l| l.screen_radius);
                 let binding = Binding { device: self.device(cx), visible: self.visible && self.window_visible, radius };
@@ -67,7 +75,7 @@ impl SimulatorPanel {
             .pt(px(density.pad_panel * 2.0))
             .pb(px(density.pad_panel))
             .child(phone(self.theme, &device, &self.area, cx.weak_entity(), screen))
-            .child(self.render_toolbar(state, cx))
+            .child(if self.annotate.is_some() { self.render_annotate_controls(cx) } else { self.render_toolbar(state, cx) })
             .into_any_element()
     }
 
@@ -85,7 +93,7 @@ impl SimulatorPanel {
         Device { display: (shown.w as f32, shown.h as f32), kind, orientation }
     }
 
-    fn device_name(&self, cx: &App) -> String {
+    pub(super) fn device_name(&self, cx: &App) -> String {
         let Some(udid) = self.device(cx) else { return "the simulator".into() };
         self.devices(cx).into_iter().find(|d| d.udid == udid).map(|d| d.name).unwrap_or_else(|| "the simulator".into())
     }

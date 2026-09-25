@@ -15,7 +15,9 @@ use oximux_simulator::keyboard::{self, KeyEvent};
 use oximux_simulator::protocol::{Command, KeyPhase};
 
 use super::{SIMULATOR_SCREEN_KEY_CONTEXT, ScreenView};
-use crate::actions::DismissOverlay;
+use crate::actions::{
+    DismissOverlay, SimHome, SimLock, SimRotateCcw, SimRotateCw, SimScreenshot, SimToggleRecord,
+};
 use crate::platform::menu::Paste;
 
 /// How long the capture hint stays up.
@@ -27,10 +29,23 @@ const USAGE_LEFT_SHIFT: u32 = 0xe1;
 /// Shadow the focus-cycling Tab / Shift-Tab bindings while the screen has the
 /// keyboard (the terminal's pattern): with no action to run, the keystroke
 /// falls through to `on_key_down` and reaches the device. Call once at boot.
+///
+/// The simulator's own chords live here too, and only here: they shadow the
+/// app's ⌘⇧H (session history), ⌘L (sidebar), ⌘S (save), ⌘R (refresh) and
+/// ⌘←/⌘→ **only while the keyboard is captured**; everywhere else the app's
+/// bindings are untouched. Every other ⌘ / ⌃ chord stays with the app, and
+/// every other key goes to the device (`on_key_down`).
 pub fn register_screen_key_bindings(cx: &mut App) {
+    let ctx = Some(SIMULATOR_SCREEN_KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new("tab", NoAction, Some(SIMULATOR_SCREEN_KEY_CONTEXT)),
-        KeyBinding::new("shift-tab", NoAction, Some(SIMULATOR_SCREEN_KEY_CONTEXT)),
+        KeyBinding::new("tab", NoAction, ctx),
+        KeyBinding::new("shift-tab", NoAction, ctx),
+        KeyBinding::new("cmd-shift-h", SimHome, ctx),
+        KeyBinding::new("cmd-l", SimLock, ctx),
+        KeyBinding::new("cmd-right", SimRotateCw, ctx),
+        KeyBinding::new("cmd-left", SimRotateCcw, ctx),
+        KeyBinding::new("cmd-s", SimScreenshot, ctx),
+        KeyBinding::new("cmd-r", SimToggleRecord, ctx),
     ]);
 }
 
@@ -72,6 +87,16 @@ impl ScreenView {
             cx.background_executor().timer(HINT).await;
             let _ = this.update(cx, |_, cx| cx.notify());
         }));
+    }
+
+    /// The keyboard toggle: take the keyboard, or give it back.
+    pub(crate) fn toggle_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus.is_focused(window) {
+            window.blur(cx);
+            cx.notify();
+        } else {
+            self.capture_keyboard(window, cx);
+        }
     }
 
     pub(super) fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -118,6 +143,70 @@ mod tests {
         events.iter().map(|k| (k.usage, k.down)).collect()
     }
 
+    /// The simulator's chords take over only while the keyboard is captured
+    /// (their context is on the stack); otherwise the app's own bindings
+    /// resolve exactly as before.
+    #[gpui::test]
+    fn simulator_chords_win_only_while_captured(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::keymap_registry::install(cx, &Default::default());
+            register_screen_key_bindings(cx);
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let root = gpui::KeyContext::parse("Workspace").unwrap();
+            let captured = [root.clone(), gpui::KeyContext::parse(SIMULATOR_SCREEN_KEY_CONTEXT).unwrap()];
+            let resolve = |chord: &str, stack: &[gpui::KeyContext]| {
+                let (bindings, _) = keymap.bindings_for_input(&[gpui::Keystroke::parse(chord).unwrap()], stack);
+                bindings.first().map(|b| b.action().name().to_owned())
+            };
+            for (chord, sim) in [
+                ("cmd-l", "SimLock"),
+                ("cmd-s", "SimScreenshot"),
+                ("cmd-r", "SimToggleRecord"),
+                ("cmd-shift-h", "SimHome"),
+                ("cmd-right", "SimRotateCw"),
+            ] {
+                let while_captured = resolve(chord, &captured).unwrap_or_default();
+                assert!(while_captured.ends_with(sim), "{chord} while captured → {while_captured}");
+                let elsewhere = resolve(chord, std::slice::from_ref(&root));
+                assert!(!elsewhere.as_deref().unwrap_or("").contains("Sim"), "{chord} elsewhere → {elsewhere:?}");
+            }
+            // The app's own meanings survive outside the screen.
+            assert!(resolve("cmd-l", std::slice::from_ref(&root)).unwrap().ends_with("ToggleRightSidebar"));
+        });
+    }
+
+    /// Review M7: a live rebind (Settings → Keybindings) appends context-free
+    /// bindings, which would out-rank the scoped chords on a tie; re-running
+    /// the scoped registration keeps the simulator's chords on top.
+    #[gpui::test]
+    fn a_live_rebind_keeps_the_captured_chords(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::keymap_registry::install(cx, &Default::default());
+            crate::app_settings::keybindings_settings::install_scoped(cx);
+            // Start from the defaults: the registry's effective map is
+            // process-global and other tests rebind too.
+            crate::keymap_registry::apply_live(cx, &std::collections::BTreeMap::new());
+            let captured = [
+                gpui::KeyContext::parse("Workspace").unwrap(),
+                gpui::KeyContext::parse(SIMULATOR_SCREEN_KEY_CONTEXT).unwrap(),
+            ];
+            let first = |cx: &mut gpui::App| {
+                let keymap = cx.key_bindings();
+                let keymap = keymap.borrow();
+                let (bindings, _) = keymap.bindings_for_input(&[gpui::Keystroke::parse("cmd-l").unwrap()], &captured);
+                bindings.first().map(|b| b.action().name().to_owned()).unwrap_or_default()
+            };
+            // A user binds ⌘L to something new: appended without a context.
+            let overrides = std::collections::BTreeMap::from([("select_simulator_tab".to_owned(), "cmd-l".to_owned())]);
+            crate::keymap_registry::apply_live(cx, &overrides);
+            assert!(!first(cx).ends_with("SimLock"), "the rebind out-ranks the scoped chord ({})", first(cx));
+            crate::app_settings::keybindings_settings::install_scoped(cx);
+            assert!(first(cx).ends_with("SimLock"), "{}", first(cx));
+            crate::keymap_registry::apply_live(cx, &std::collections::BTreeMap::new());
+        });
+    }
+
     #[test]
     fn named_keys_press_and_release_with_shift_around_them() {
         assert_eq!(usages(&key_events("enter", None, false).unwrap()), [(0x28, true), (0x28, false)]);
@@ -135,5 +224,18 @@ mod tests {
         assert_eq!(usages(&key_events("space", Some(" "), false).unwrap()), [(0x2c, true), (0x2c, false)]);
         assert!(key_events("a", Some("å"), false).is_none(), "non-ASCII goes through paste");
         assert!(key_events("f5", None, false).is_none());
+    }
+
+    #[test]
+    fn key_events_with_unknown_key_and_no_char_returns_none() {
+        assert!(key_events("unknown", None, false).is_none());
+        assert!(key_events("shift", None, true).is_none());
+    }
+
+    #[test]
+    fn unnamed_key_with_printable_char_goes_through_keyboard_text_map() {
+        // A key that's not in the named_key table, but has a printable char
+        let events = key_events("unknown_key", Some("x"), false).unwrap();
+        assert!(!events.is_empty(), "printable chars are translated via keyboard map");
     }
 }

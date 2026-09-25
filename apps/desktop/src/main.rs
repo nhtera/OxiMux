@@ -760,8 +760,9 @@ fn install_app_lifecycle(cx: &mut gpui::App, app_state: oximux_app::state::AppSt
             elapsed_ms = capture_started.elapsed().as_millis() as u64,
             "quit: session capture"
         );
-        // Close every simulator helper's stdin (they exit on EOF) and hand
-        // devices we booted to a detached `simctl shutdown`. Never waits.
+        // Finalize simulator screen recordings (waits only while one runs,
+        // ≤ 5 s), close every helper's stdin (they exit on EOF) and hand
+        // devices we booted to a detached `simctl shutdown`.
         oximux_app::shell::simulator::on_quit(cx);
         // Persist the last-known git states so the next launch seeds from
         // them instead of flashing "loading git…". Best-effort: a write

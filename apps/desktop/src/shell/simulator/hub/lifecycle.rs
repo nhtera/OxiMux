@@ -61,6 +61,10 @@ pub fn install(cx: &mut App, repo: SettingsRepo) {
         devices: Vec::new(),
         devices_listed: false,
         availability_in_flight: false,
+        recordings: HashMap::new(),
+        recording_starts: Default::default(),
+        simctl: None,
+        paste_lock: Default::default(),
     });
     cx.set_global(SimulatorService(hub.clone()));
     if feature_used {
@@ -80,12 +84,16 @@ impl Drop for OpenOnDrop {
     }
 }
 
-/// App quit (bounded by GPUI's shutdown grace): close every helper's stdin
-/// and hand the owned devices to a detached `simctl shutdown` that runs after
-/// we are gone. Never waits.
+/// App quit (bounded by GPUI's shutdown grace): finalize screen recordings
+/// (the only wait: at most `record::FINALIZE_GRACE`, all in parallel, and
+/// only while one is running), close every helper's stdin, and hand the
+/// owned devices to a detached `simctl shutdown` that runs after we are gone.
 pub fn on_quit(cx: &mut App) {
     let Some(hub) = hub(cx) else { return };
     hub.update(cx, |hub, _| {
+        // Movies first: a recording killed by the device shutdown below would
+        // be unplayable.
+        hub.stop_recordings_blocking();
         let (sessions, owned) = hub.registry.quit();
         for session in sessions {
             session.shutdown();
@@ -129,7 +137,7 @@ fn spawn_detached_shutdown(owned: &[DeviceId]) {
 }
 
 /// A simulator UDID: 8-4-4-4-12 hex digits.
-fn is_udid(s: &str) -> bool {
+pub(crate) fn is_udid(s: &str) -> bool {
     let groups: Vec<&str> = s.split('-').collect();
     groups.len() == 5
         && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
@@ -142,6 +150,7 @@ fn spawn_tick(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
             let alive = hub.update(cx, |hub, cx| {
                 let effects = hub.registry.tick(Instant::now());
                 hub.run(effects, cx);
+                hub.reap_recordings(cx);
             });
             if alive.is_err() {
                 return;

@@ -20,21 +20,25 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, Subscription, Task, Window};
+use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task, Window};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_simulator::DeviceId;
 use oximux_simulator::registry::Phase;
 
 use oximux_simulator::session::SessionEvent;
 
-use super::hub::{HubEvent, SimulatorHub, hub};
+use super::annotate::AnnotateView;
+use super::hub::{HubEvent, NoticeKind, SimulatorHub, hub};
 use super::screen::ScreenView;
 use super::state::{self, Inputs, PanelState};
 
 pub(crate) use stream_row::settings;
+pub(crate) use commands::{Outcome, SimCommand};
 
+mod annotating;
 mod bezel;
 mod body;
+mod commands;
 mod header;
 mod toolbar;
 mod stream_row;
@@ -61,6 +65,14 @@ pub struct SimulatorPanel {
     screen: Option<Entity<ScreenView>>,
     /// The phone's measured space (see `bezel::phone`).
     area: Rc<Cell<Option<(f32, f32)>>>,
+    /// The toolbar is asking "Shut down …?".
+    confirm_shutdown: bool,
+    /// Annotate mode: the frozen screenshot being marked up.
+    annotate: Option<Entity<AnnotateView>>,
+    /// Re-renders once a second while a recording's timer shows.
+    _record_tick: Option<Task<()>>,
+    /// Runs a toolbar command through the window root (see `root_glue`).
+    command_sink: Option<CommandSink>,
     /// An attach this panel asked for is in flight.
     attaching: bool,
     /// The sidebar is maximized for the simulator (the ⤢ button's state).
@@ -102,6 +114,10 @@ impl SimulatorPanel {
             _window_visibility: None,
             screen: None,
             area: Rc::default(),
+            confirm_shutdown: false,
+            annotate: None,
+            _record_tick: None,
+            command_sink: None,
             attaching: false,
             maximized: false,
             attach_error: None,
@@ -125,6 +141,11 @@ impl SimulatorPanel {
                     self.attach_error = None;
                 }
                 cx.notify();
+            }
+            HubEvent::Notice(udid, kind, text) => {
+                if self.device(cx).as_ref() == Some(udid) {
+                    cx.emit(PanelEvent::Notice(*kind, text.clone()));
+                }
             }
             HubEvent::AttachFailed(path, why) => {
                 if self.worktree.as_ref() == Some(path) {
@@ -166,6 +187,9 @@ impl SimulatorPanel {
         self.shown = shown;
         self._hide = None;
         self.worktree = worktree;
+        // Both were about the old worktree's device.
+        self.confirm_shutdown = false;
+        self.annotate = None;
         self.attaching = false;
         self.attach_error = None;
         cx.notify();
@@ -346,11 +370,66 @@ impl SimulatorPanel {
     }
 }
 
+/// What the panel asks of the window root from a click or a finished task:
+/// with nothing focused, a dispatched action would never reach the root.
+pub(crate) enum RootRequest {
+    /// Run a command the way its action would.
+    Run(SimCommand),
+    /// Stage an annotated screenshot in the active agent.
+    SendToAgent(crate::actions::SendPickToActiveChat),
+}
+
+/// Carries [`RootRequest`]s to the root. Never call it from inside an update
+/// of the panel: the root updates the panel in turn.
+pub(crate) type CommandSink = Rc<dyn Fn(RootRequest, &mut Window, &mut gpui::App)>;
+
+impl SimulatorPanel {
+    pub(crate) fn set_command_sink(&mut self, sink: CommandSink) {
+        self.command_sink = Some(sink);
+    }
+}
+
+/// What the window hears from the panel.
+#[derive(Clone, Debug)]
+pub enum PanelEvent {
+    /// Show this as a toast.
+    Notice(NoticeKind, String),
+}
+
+impl EventEmitter<PanelEvent> for SimulatorPanel {}
+
+impl SimulatorPanel {
+    /// The screen's corner radius for the current layout (0 before the
+    /// first measurement).
+    pub(super) fn screen_radius(&self) -> f32 {
+        self.area.get().and_then(|a| bezel::fit(a, &bezel::Device::PLACEHOLDER)).map_or(0.0, |l| l.screen_radius)
+    }
+
+    /// Keep a recording's timer ticking while it shows.
+    fn tick_recording(&mut self, cx: &mut Context<Self>) {
+        let on = self.recording_since(cx).is_some();
+        if on == self._record_tick.is_some() {
+            return;
+        }
+        self._record_tick = on.then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            })
+        });
+    }
+}
+
 impl gpui::Render for SimulatorPanel {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         use gpui::{ParentElement as _, Styled as _, div};
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         self.observe_window(window, cx);
+        self.tick_recording(cx);
         let state = self.state(cx);
         div()
             .flex()

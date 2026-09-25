@@ -11,6 +11,8 @@
 //!   verbs share.
 //! - [`simctl`] / [`availability`]: device discovery and lifecycle via
 //!   `xcrun simctl`, gated so a Mac without Xcode never runs `xcrun`.
+//! - [`record`]: screen recordings (`simctl io recordVideo`, stopped with
+//!   `SIGINT` so the movie is finalized).
 //! - [`child_ledger`]: a crash-safe record of the children we spawned, so a
 //!   killed app does not leave helpers or recordings behind.
 //! - [`geometry`], [`keyboard`], [`gesture`], [`ax`], [`classify`]: pure math
@@ -32,6 +34,7 @@ pub mod gesture;
 pub mod helper;
 pub mod keyboard;
 pub mod protocol;
+pub mod record;
 pub mod registry;
 pub mod runner;
 pub mod session;

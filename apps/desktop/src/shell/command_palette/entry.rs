@@ -158,6 +158,48 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         action_id: Some("select_simulator_tab"),
         make_action: || Box::new(crate::actions::SelectSimulatorTab),
     },
+    // Simulator actions have no registry binding (their shortcuts are scoped
+    // to a captured simulator screen), hence no `action_id`.
+    CommandEntry {
+        name: "Simulator: Screenshot",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimScreenshot),
+    },
+    CommandEntry {
+        name: "Simulator: Start/Stop Recording",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimToggleRecord),
+    },
+    CommandEntry {
+        name: "Simulator: Annotate for Agent",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimAnnotate),
+    },
+    CommandEntry {
+        name: "Simulator: Rotate",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimRotateCw),
+    },
+    CommandEntry {
+        name: "Simulator: Home",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimHome),
+    },
+    CommandEntry {
+        name: "Simulator: Lock",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimLock),
+    },
+    CommandEntry {
+        name: "Simulator: Toggle Keyboard Capture",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimToggleKeyboard),
+    },
+    CommandEntry {
+        name: "Simulator: Show Device Logs",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimOpenLogs),
+    },
     CommandEntry {
         name: "Search Pane",
         action_id: Some("search_scrollback"),
@@ -314,7 +356,7 @@ mod tests {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
         // + "Reveal Active Workspace" + "Show iOS Simulator".
-        assert_eq!(PALETTE_COMMANDS.len(), 22);
+        assert_eq!(PALETTE_COMMANDS.len(), 30);
     }
 
     #[test]

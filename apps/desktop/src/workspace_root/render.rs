@@ -510,66 +510,7 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
-                |this, action: &SendPickToActiveChat, _window, cx| {
-                    // An element picked in the embedded browser. Prefer a chat
-                    // composer: only it can stage the crop alongside the text,
-                    // and the capture sits there as chips so the user adds the
-                    // actual question before sending.
-                    let Some(panes) = this.active_project_panes() else {
-                        tracing::debug!("send-pick: no active project");
-                        return;
-                    };
-                    if let Some(target) = panes.read(cx).target_agent_chat_view(cx) {
-                        let (selector, markdown, png) =
-                            (action.selector.clone(), action.markdown.clone(), action.png.clone());
-                        let had_crop = !png.is_empty();
-                        target.view.update(cx, |chat, cx| {
-                            chat.stage_browser_pick(&selector, markdown, png, cx)
-                        });
-                        // Say where it went. The destination is usually a tab
-                        // the user is not looking at — they picked in the
-                        // browser — so without this a delivered pick is
-                        // indistinguishable from one that was dropped.
-                        //
-                        // Drawn in the page, not as a host toast: the webview is
-                        // a native view layered over the GPU canvas, so a host
-                        // toast is occluded exactly while a browser tab is
-                        // active, which is always when a pick happens.
-                        let what = if had_crop { "Element + screenshot" } else { "Element" };
-                        let note = format!("{what} → {}", target.name);
-                        if let Some(browser) =
-                            panes.read(cx).active_group().and_then(|g| g.read(cx).active_browser_view())
-                        {
-                            browser.read(cx).confirm_pick_sent(&note);
-                        } else {
-                            this.push_toast(ToastKind::Info, note, cx);
-                        }
-                        return;
-                    }
-                    // No chat tab open. Fall back to the pre-existing behavior —
-                    // a bracketed paste of the text into an agent terminal — so
-                    // a terminal-only workspace keeps working. The crop is
-                    // dropped: a PTY has nowhere to put an image.
-                    let Some(session_id) = panes.read(cx).target_agent_session(cx) else {
-                        tracing::debug!("send-pick: no agent session available");
-                        return;
-                    };
-                    let runtime = this.cli_runtime.clone();
-                    let text = action.markdown.clone();
-                    // Same reactor requirement as the `SendTextToActiveAgent`
-                    // arm above: `send_agent_paste` offloads the PTY write via
-                    // `spawn_blocking`, which aborts without a live Tokio
-                    // runtime, so this must not use `background_spawn`.
-                    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                        tracing::warn!(?session_id, "no tokio runtime; send-pick dropped");
-                        return;
-                    };
-                    handle.spawn(async move {
-                        if let Err(err) = runtime.send_agent_paste(session_id, &text).await {
-                            tracing::warn!(?session_id, %err, "send-pick to terminal failed");
-                        }
-                    });
-                },
+                |this, action: &SendPickToActiveChat, _window, cx| this.send_pick_to_active_chat(action, cx),
             ))
             .on_action(cx.listener(
                 |this, action: &crate::actions::OpenProvisioningTranscript, window, cx| {
@@ -1943,6 +1884,7 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &crate::actions::ToggleSimulatorMaximized, window, cx| {
                 this.toggle_simulator_maximized(window, cx);
             }))
+            .map(|el| crate::shell::simulator::simulator_actions(el, cx))
             .on_action(cx.listener(|this, _: &SelectHistoryTab, window, cx| {
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |s, cx| {

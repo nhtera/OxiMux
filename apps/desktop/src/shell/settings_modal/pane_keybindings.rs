@@ -132,6 +132,8 @@ impl SettingsModal {
             crate::shell::toast::toast_op_error(cx, "Save keybindings", &err.to_string());
         }
         let warnings = keymap_registry::apply_live(cx, &self.keybind_overrides);
+        // Keep the scoped sets on top of what the rebind just appended.
+        crate::app_settings::keybindings_settings::install_scoped(cx);
         for warning in warnings {
             tracing::warn!(%warning, "keybinding override problem");
         }

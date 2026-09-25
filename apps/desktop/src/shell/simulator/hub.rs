@@ -10,7 +10,7 @@
 //! [`HubEvent::Frame`] / [`HubEvent::Session`]. Viewers read frames with
 //! `StreamSession::latest_frame`, which any number of them can call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -53,6 +53,9 @@ pub enum HubEvent {
     /// An attach for this worktree found no device to use (the panel leaves
     /// its "Attaching…" state and shows why).
     AttachFailed(PathBuf, String),
+    /// Something the user should hear about for this device (a saved
+    /// screenshot, a failed paste): the window shows it as a toast.
+    Notice(DeviceId, NoticeKind, String),
 }
 
 pub struct SimulatorHub {
@@ -74,14 +77,25 @@ pub struct SimulatorHub {
     devices: Vec<DeviceInfo>,
     devices_listed: bool,
     availability_in_flight: bool,
+    /// Screen recordings in progress, one per device.
+    recordings: HashMap<DeviceId, oximux_simulator::record::Recording>,
+    /// Devices whose recording is starting (a second click is ignored).
+    recording_starts: HashSet<DeviceId>,
+    /// `simctl`'s path, once resolved (recordings spawn it directly).
+    simctl: Option<PathBuf>,
+    paste_lock: capture::PasteLock,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
 
+mod capture;
 mod lifecycle;
 
+pub use capture::NoticeKind;
+pub(crate) use capture::{CaptureKind, capture_dir, capture_path, stamp};
+
 pub use lifecycle::{install, on_quit};
-pub(crate) use lifecycle::simulator_dir;
+pub(crate) use lifecycle::{is_udid, simulator_dir};
 
 /// The global handle to the one hub.
 pub struct SimulatorService(pub Entity<SimulatorHub>);
@@ -157,46 +171,56 @@ impl SimulatorHub {
             .detach();
     }
 
-    /// Press a hardware button on `udid`'s live session (fire-and-forget).
-    pub fn press_button(&self, udid: &DeviceId, button: oximux_simulator::Button) {
-        if let Some(session) = self.session(udid) {
-            let _ = session.send(&oximux_simulator::protocol::Command::Button { name: button });
-        }
-    }
-
     /// Paste `text` into `udid`, in the background: onto the device's
     /// clipboard with `simctl pbcopy`, then a HID ⌘V (the spike's verified
     /// route for any Unicode). If `pbcopy` fails, short ASCII is typed out
-    /// instead; anything else is dropped with a log line.
+    /// instead; anything else is reported as a notice. Pastes run one at a
+    /// time, in order.
     pub fn paste(&self, udid: &DeviceId, text: String, cx: &mut Context<Self>) {
         let Some(session) = self.session(udid) else { return };
         if text.is_empty() || !self.watch_gate().xcode_ok {
             return;
         }
-        let (runner, udid) = (self.runner.clone(), udid.clone());
-        cx.background_executor()
-            .spawn(async move {
-                let keys = match simctl::pbcopy(runner.as_ref(), udid.as_str(), &text, SIMCTL_TIMEOUT) {
-                    Ok(()) => keyboard::paste_chord(),
-                    Err(e) if !keyboard::needs_paste(&text) => {
-                        tracing::debug!(%udid, "simulator pbcopy failed ({e}); typing instead");
-                        keyboard::text_to_key_events(&text).unwrap_or_default()
+        let (runner, target, lock) = (self.runner.clone(), udid.clone(), self.paste_lock.clone());
+        let udid = udid.clone();
+        cx.spawn(async move |this, cx| {
+            let failed = cx
+                .background_executor()
+                .spawn(async move {
+                    // One paste at a time: the clipboard is shared, so a second
+                    // ⌘V must not overwrite it before the first chord lands.
+                    let _turn = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let keys = match simctl::pbcopy(runner.as_ref(), target.as_str(), &text, SIMCTL_TIMEOUT) {
+                        Ok(()) => keyboard::paste_chord(),
+                        Err(e) if !keyboard::needs_paste(&text) => {
+                            tracing::debug!(%target, "simulator pbcopy failed ({e}); typing instead");
+                            keyboard::text_to_key_events(&text).unwrap_or_default()
+                        }
+                        Err(e) => return Some(e.to_string()),
+                    };
+                    for key in keys {
+                        let phase = if key.down { KeyPhase::Down } else { KeyPhase::Up };
+                        let _ = session.send(&Command::Key { phase, usage: key.usage });
                     }
-                    Err(e) => return tracing::warn!(%udid, "simulator paste failed: {e}"),
-                };
-                for key in keys {
-                    let phase = if key.down { KeyPhase::Down } else { KeyPhase::Up };
-                    let _ = session.send(&Command::Key { phase, usage: key.usage });
-                }
-            })
-            .detach();
+                    None
+                })
+                .await;
+            if let Some(e) = failed {
+                let _ = this.update(cx, |_, cx| {
+                    cx.emit(HubEvent::Notice(udid, NoticeKind::Error, format!("Paste into the simulator failed: {e}")));
+                });
+            }
+        })
+        .detach();
     }
 
-    /// Rotate `udid` a quarter turn clockwise (Simulator.app's "Rotate
-    /// Right"), in the background: the helper replies once the device turned.
-    pub fn rotate(&self, udid: &DeviceId, cx: &mut Context<Self>) {
-        let Some(session) = self.session(udid) else { return };
-        let next = session.orientation().rotated_right();
+    /// Rotate `udid` a quarter turn (Simulator.app's "Rotate Right" when
+    /// `clockwise`, else "Rotate Left"), in the background: the helper replies
+    /// once the device turned. False without a live stream.
+    pub fn rotate(&self, udid: &DeviceId, clockwise: bool, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.session(udid) else { return false };
+        let now = session.orientation();
+        let next = if clockwise { now.rotated_right() } else { now.rotated_left() };
         cx.background_executor()
             .spawn(async move {
                 if let Err(e) = session.configure(None, None, Some(next), Duration::from_secs(5)) {
@@ -204,6 +228,7 @@ impl SimulatorHub {
                 }
             })
             .detach();
+        true
     }
 
     /// Shut `udid` down (the toolbar's power button). The device watcher then
@@ -268,6 +293,7 @@ impl SimulatorHub {
                     hub.refresh_devices(cx);
                 }
                 if changed {
+                    hub.simctl = None; // inside the old Xcode
                     for udid in hub.registry.attached_devices() {
                         let effects = hub.registry.reconnect(&udid, true);
                         hub.run(effects, cx);
@@ -315,6 +341,8 @@ impl SimulatorHub {
                 let udid = info.udid.clone();
                 let effects = hub.registry.attach(key, udid.clone(), booted, Instant::now());
                 hub.run(effects, cx);
+                // Switching device may have left the old one unattached.
+                hub.stop_unattached_recordings(cx);
                 cx.emit(HubEvent::Changed(udid));
             });
         })
@@ -327,6 +355,8 @@ impl SimulatorHub {
         let udid = self.registry.device_for(&key).cloned();
         let effects = self.registry.detach(&key, Instant::now());
         self.run(effects, cx);
+        // A recording belongs to the device: it ends with its last attachment.
+        self.stop_unattached_recordings(cx);
         if let Some(udid) = udid {
             cx.emit(HubEvent::Changed(udid));
         }
@@ -427,16 +457,28 @@ impl SimulatorHub {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let path = helper?;
+                    let path = helper.map_err(|e| (e, false))?;
                     let (done, cvar) = &*reaped;
                     let _unused = cvar.wait_while(done.lock().unwrap(), |done| !*done).unwrap();
-                    StreamSession::start(&path, &target, &opts).map_err(|e| e.to_string())
+                    StreamSession::start(&path, &target, &opts).map_err(|e| {
+                        // Shut down between the watcher's polls (e.g. while
+                        // parked): that is a disconnect, not a failure.
+                        let gone = matches!(e, SimError::DeviceNotBooted);
+                        (e.to_string(), gone)
+                    })
                 })
                 .await;
             let _ = this.update(cx, |hub, cx| {
                 if let Ok(session) = &result {
                     hub.listen(udid.clone(), generation, session, cx);
                 }
+                // Only for the attempt still current: a late answer must not
+                // stop a newer session or clear ownership.
+                if matches!(result, Err((_, true))) && hub.registry.phase(&udid) == (Phase::Starting { generation }) {
+                    let effects = hub.registry.device_shutdown(&udid);
+                    hub.run(effects, cx);
+                }
+                let result = result.map_err(|(e, _)| e);
                 let effects = hub.registry.session_started(&udid, generation, result);
                 hub.run(effects, cx);
                 cx.emit(HubEvent::Changed(udid));

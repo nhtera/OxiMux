@@ -658,6 +658,29 @@ actions!(
         SelectSimulatorTab,
         /// Widen the right sidebar for the simulator, or restore its width.
         ToggleSimulatorMaximized,
+        /// Simulator: go home (the home gesture, or the home button on devices
+        /// that have one). ⌘⇧H while typing into the simulator.
+        SimHome,
+        /// Simulator: press the side (lock) button. ⌘L while typing into it.
+        SimLock,
+        /// Simulator: rotate a quarter turn clockwise (⌘→ while typing into it).
+        SimRotateCw,
+        /// Simulator: rotate a quarter turn counter-clockwise (⌘←).
+        SimRotateCcw,
+        /// Simulator: save a screenshot to the Desktop and the clipboard (⌘S).
+        SimScreenshot,
+        /// Simulator: start or stop a screen recording (⌘R).
+        SimToggleRecord,
+        /// Simulator: freeze the screen and mark it up for an agent.
+        SimAnnotate,
+        /// Simulator: send typing to the simulator, or give the keyboard back.
+        SimToggleKeyboard,
+        /// Simulator: stream the device log in a terminal tab.
+        SimOpenLogs,
+        /// Simulator: shut the device down (asks first).
+        SimShutdown,
+        /// Simulator: detach this worktree from its simulator.
+        SimDetach,
         /// Open the file/worktree Quick Open palette (Cmd+P). Phase 05 shell;
         /// backend file index lands in a later plan.
         OpenQuickOpen,

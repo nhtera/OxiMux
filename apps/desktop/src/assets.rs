@@ -144,6 +144,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/circle.svg", include_bytes!("../assets/icons/circle.svg")),
     ("icons/video.svg", include_bytes!("../assets/icons/video.svg")),
     ("icons/log-out.svg", include_bytes!("../assets/icons/log-out.svg")),
+    ("icons/arrow-up-right.svg", include_bytes!("../assets/icons/arrow-up-right.svg")),
+    ("icons/square.svg", include_bytes!("../assets/icons/square.svg")),
+    ("icons/undo-2.svg", include_bytes!("../assets/icons/undo-2.svg")),
+    ("icons/download.svg", include_bytes!("../assets/icons/download.svg")),
     (
         "icons/image.svg",
         include_bytes!("../assets/icons/image.svg"),
