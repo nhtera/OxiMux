@@ -104,6 +104,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The pinned simulator helper (a release of our serve-sim fork). The
+      # simulator crate's conformance tests drive this exact binary, and fail
+      # under CI when it is missing rather than skipping.
+      - name: Fetch the simulator helper
+        run: ./scripts/fetch-sim-helper.sh
+
       - name: cargo test
         run: cargo test --workspace --all-targets
 
