@@ -400,6 +400,11 @@ fn main() {
         // global before any window opens, so the first animated surface reads
         // the right durations.
         oximux_app::motion_settings::install(cx);
+        // iOS Simulator device registry. Cheap and silent until the panel is
+        // first used: it reaps a crashed run's orphaned helpers in the
+        // background, and its device watcher stays off until then (a Mac
+        // without Xcode never runs `xcrun` because of it).
+        oximux_app::shell::simulator::install(cx, app_state.settings_repo().clone());
         // Process-wide last-known-`GitState` cache. (Appearance is installed
         // further up, before the gpui-component bridge that reads it.) Registered before any
         // window opens so the first SCM panel can seed from it (no-op on a
@@ -754,6 +759,9 @@ fn install_app_lifecycle(cx: &mut gpui::App, app_state: oximux_app::state::AppSt
             elapsed_ms = capture_started.elapsed().as_millis() as u64,
             "quit: session capture"
         );
+        // Close every simulator helper's stdin (they exit on EOF) and hand
+        // devices we booted to a detached `simctl shutdown`. Never waits.
+        oximux_app::shell::simulator::on_quit(cx);
         // Persist the last-known git states so the next launch seeds from
         // them instead of flashing "loading git…". Best-effort: a write
         // error only costs one Loading flash next time.

@@ -85,12 +85,22 @@ pub fn list_runtimes(runner: &dyn Runner, timeout: Duration) -> Result<Vec<Runti
         .collect())
 }
 
+/// What [`boot`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootOutcome {
+    /// We booted it: ours to shut down later.
+    Booted,
+    /// It was already booted (by the user, Xcode, an agent): never ours.
+    AlreadyBooted,
+}
+
 /// Boots `udid`, tolerating "already booted", then polls up to
 /// [`BOOT_POLL_TIMEOUT`] for the device to report `Booted`. Checks `cancel`
 /// before every poll, so a UI-driven boot can be abandoned without leaving the
 /// caller blocked for the full 30 s.
-pub fn boot(runner: &dyn Runner, udid: &str, cmd_timeout: Duration, cancel: &AtomicBool) -> Result<()> {
+pub fn boot(runner: &dyn Runner, udid: &str, cmd_timeout: Duration, cancel: &AtomicBool) -> Result<BootOutcome> {
     let out = run(runner, &["simctl", "boot", udid], cmd_timeout)?;
+    let mut outcome = BootOutcome::Booted;
     if !out.success() {
         let stderr = stderr_of(&out);
         // `simctl boot` on an already-booted device is not success we can
@@ -99,6 +109,7 @@ pub fn boot(runner: &dyn Runner, udid: &str, cmd_timeout: Duration, cancel: &Ato
         if !stderr.contains("Unable to boot device in current state: Booted") {
             return Err(classify_failure("simctl boot", udid, out.status, stderr));
         }
+        outcome = BootOutcome::AlreadyBooted;
     }
     let deadline = Instant::now() + BOOT_POLL_TIMEOUT;
     loop {
@@ -108,7 +119,7 @@ pub fn boot(runner: &dyn Runner, udid: &str, cmd_timeout: Duration, cancel: &Ato
         let devices = list_devices(runner, cmd_timeout)?;
         let device = devices.iter().find(|d| d.udid.as_str() == udid);
         match device {
-            Some(d) if d.state == DeviceState::Booted => return Ok(()),
+            Some(d) if d.state == DeviceState::Booted => return Ok(outcome),
             Some(_) => {}
             None => return Err(SimError::DeviceNotFound(udid.to_owned())),
         }
@@ -387,7 +398,7 @@ mod tests {
                 CmdOutput::ok(booted_device_json("ABCD")),
             );
         let cancel = AtomicBool::new(false);
-        boot(&runner, "ABCD", T, &cancel).unwrap();
+        assert_eq!(boot(&runner, "ABCD", T, &cancel).unwrap(), BootOutcome::AlreadyBooted);
     }
 
     #[test]
@@ -397,7 +408,7 @@ mod tests {
             .expect("xcrun simctl list devices -j", CmdOutput::ok(booting_device_json("ABCD")))
             .expect("xcrun simctl list devices -j", CmdOutput::ok(booted_device_json("ABCD")));
         let cancel = AtomicBool::new(false);
-        boot(&runner, "ABCD", T, &cancel).unwrap();
+        assert_eq!(boot(&runner, "ABCD", T, &cancel).unwrap(), BootOutcome::Booted);
     }
 
     #[test]

@@ -1563,6 +1563,7 @@ impl WorkspaceRoot {
         // Before the snapshot is read: let the rail's selection follow the
         // focused pane group when focus has moved since the last refresh.
         self.sync_rail_selection_to_focus(cx);
+        self.track_active_worktree(cx);
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
         let active_workspace_id = self.active_workspace_id.clone();

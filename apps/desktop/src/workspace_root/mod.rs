@@ -359,6 +359,9 @@ pub struct WorkspaceRoot {
     /// and re-deriving the selection every refresh would snap it straight back
     /// to the focused group's workspace.
     pub(crate) last_focused_group: Option<(String, String)>,
+    /// The active tab's worktree as of the last refresh; a change emits
+    /// [`crate::shell::workspace::focus_follow::ActiveWorktreeChanged`].
+    pub(crate) active_worktree: Option<std::path::PathBuf>,
     /// Browser-style back/forward history of workspace activations for this
     /// window (Cmd+Alt+←/→). Entries are `(project_id, workspace_id)` refs
     /// re-resolved on navigation so a deleted workspace fails gracefully.
@@ -1446,6 +1449,7 @@ impl WorkspaceRoot {
             active_project: None,
             active_workspace_id: None,
             last_focused_group: None,
+            active_worktree: None,
             nav_history: Vec::new(),
             nav_cursor: 0,
             nav_replaying: false,

@@ -7,7 +7,7 @@
 //! This module reconciles the two: the selection follows focus when focus
 //! moves, and a deliberate selection survives until it does.
 
-use gpui::{Context, Window};
+use gpui::{Context, EventEmitter, Window};
 use oximux_core::Workspace;
 
 use crate::workspace_root::WorkspaceRoot;
@@ -40,7 +40,32 @@ fn focus_follow_target<'a>(
         .map(|w| w.id.as_str())
 }
 
+/// The worktree the user is looking at changed: the active tab of the focused
+/// pane group now belongs to another worktree (a tab switch, a group focus
+/// change, or a project switch). Per-worktree surfaces — the simulator panel,
+/// which shows the device attached to the active worktree — follow it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveWorktreeChanged(pub Option<std::path::PathBuf>);
+
+impl EventEmitter<ActiveWorktreeChanged> for WorkspaceRoot {}
+
 impl WorkspaceRoot {
+    /// Emit [`ActiveWorktreeChanged`] when the active tab's worktree differs
+    /// from the last check. Runs from `refresh_left_rail`, which every
+    /// `WorkspaceRoot` render calls, so it also catches changes no single
+    /// setter reports (a project switch, a closed tab). The cost is one path
+    /// clone and compare; the emit is queued, so it is not lost mid-render.
+    pub(crate) fn track_active_worktree(&mut self, cx: &mut Context<Self>) {
+        let current = self
+            .active_project_panes()
+            .and_then(|panes| panes.read(cx).active_group())
+            .map(|group| group.read(cx).active_tab_worktree());
+        if current != self.active_worktree {
+            self.active_worktree = current.clone();
+            cx.emit(ActiveWorktreeChanged(current));
+        }
+    }
+
     /// Select the workspace an agents-dashboard card belongs to and reveal it
     /// in the rail.
     ///

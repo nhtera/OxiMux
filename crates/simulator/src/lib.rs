@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod availability;
 pub mod ax;
+pub mod boot_watch;
 pub mod child_ledger;
 pub mod classify;
 pub mod geometry;
@@ -31,6 +32,7 @@ pub mod gesture;
 pub mod helper;
 pub mod keyboard;
 pub mod protocol;
+pub mod registry;
 pub mod runner;
 pub mod session;
 pub mod simctl;

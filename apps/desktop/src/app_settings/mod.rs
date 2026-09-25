@@ -21,4 +21,5 @@ pub mod last_agent;
 pub mod motion_settings;
 pub mod port_label_settings;
 pub mod scm_layout_settings;
+pub mod sim_state_keys;
 pub mod terminal_settings;

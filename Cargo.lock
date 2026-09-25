@@ -8187,6 +8187,7 @@ dependencies = [
  "oximux-settings",
  "oximux-shell-env",
  "oximux-sibling-binary",
+ "oximux-simulator",
  "oximux-single-instance",
  "oximux-storage",
  "oximux-syntax",

@@ -31,6 +31,7 @@ pub mod right_sidebar;
 pub mod search_panel;
 pub mod session_history;
 pub mod settings_modal;
+pub mod simulator;
 pub mod source_control;
 pub mod stash_panel;
 pub mod tasks_view;
