@@ -16,7 +16,9 @@
 //!   generation; a result for any other generation is discarded, and a late
 //!   session is stopped rather than installed.
 //! - **Visibility is refcounted per device**: the helper is paused only when
-//!   no attached worktree shows it.
+//!   no attached worktree shows it, and a device hidden for [`PARK_AFTER`] is
+//!   **parked** — its helper stopped, its attachments kept — until a viewer
+//!   shows it again.
 //!
 //! The session type is generic (`S`) so tests use a plain token; the app uses
 //! `StreamSession`.
@@ -33,6 +35,10 @@ use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState};
 
 /// An owned device is shut down this long after its last detach.
 pub const IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// A device no viewer has shown for this long has its helper stopped (a
+/// paused helper still holds the capture session and its memory).
+pub const PARK_AFTER: Duration = Duration::from_secs(60);
 
 /// A worktree, by canonical path, so `/tmp/x` and `/private/tmp/x` (or a
 /// symlinked checkout) name the same key. The CLI and the desktop both build
@@ -70,6 +76,9 @@ pub enum Phase {
     Starting { generation: Generation },
     /// Streaming.
     Live { generation: Generation },
+    /// Booted and attached, but hidden for [`PARK_AFTER`]: the helper was
+    /// stopped. Showing it again starts a fresh one.
+    Parked,
     /// Was live; the helper exited or the device shut down. Not frozen on
     /// "Streaming": the panel offers Reconnect.
     Disconnected { reason: String },
@@ -136,6 +145,9 @@ struct Device<S> {
     restarts: u32,
     /// Whether the helper is currently paused (all viewers hidden).
     paused: bool,
+    /// When the helper was paused, for parking; filled by the next
+    /// [`Registry::tick`] when the pause had no clock at hand.
+    hidden_since: Option<Instant>,
 }
 
 impl<S> Device<S> {
@@ -150,6 +162,7 @@ impl<S> Device<S> {
             idle_since: None,
             restarts: 0,
             paused: false,
+            hidden_since: None,
         }
     }
 }
@@ -255,10 +268,14 @@ impl<S: Clone> Registry<S> {
         device.attached.insert(worktree);
         device.idle_since = None;
         match device.phase {
-            // Already coming up or up: join it.
-            Phase::Booting { .. } | Phase::Starting { .. } | Phase::Live { .. } => {}
-            Phase::Idle | Phase::Disconnected { .. } | Phase::Failed { .. } => {
+            // Already coming up or up: join it — and resume it if this
+            // viewer is the first to show it (a paused device would park).
+            Phase::Booting { .. } | Phase::Starting { .. } | Phase::Live { .. } => {
+                effects.extend(pause_if_hidden(device, Some(now)));
+            }
+            Phase::Idle | Phase::Parked | Phase::Disconnected { .. } | Phase::Failed { .. } => {
                 device.restarts = 0;
+                device.paused = false;
                 effects.push(start_or_boot(device, &udid, booted, generation));
             }
         }
@@ -283,31 +300,41 @@ impl<S: Clone> Registry<S> {
             }
             device.phase = Phase::Idle;
             device.paused = false;
+            device.hidden_since = None;
             if device.owned {
                 device.idle_since = Some(now);
             }
         } else if was_visible {
-            effects.extend(pause_if_hidden(device));
+            effects.extend(pause_if_hidden(device, Some(now)));
         }
         effects.push(Effect::Persist);
         effects
     }
 
-    /// The panel for `worktree` became visible or hidden.
-    pub fn set_visible(&mut self, worktree: &WorktreeKey, visible: bool) -> Vec<Effect<S>> {
+    /// The panel for `worktree` became visible or hidden. Showing a parked
+    /// device starts a fresh helper for it.
+    pub fn set_visible(&mut self, worktree: &WorktreeKey, visible: bool, now: Instant) -> Vec<Effect<S>> {
         if visible {
             self.visible.insert(worktree.clone());
         } else {
             self.visible.remove(worktree);
         }
         let Some(udid) = self.attachments.get(worktree).cloned() else { return Vec::new() };
+        let unpark = visible && self.devices.get(&udid).is_some_and(|d| d.phase == Phase::Parked);
+        // Only a restart moves the generation (the watcher keys on it).
+        let generation = if unpark { self.bump() } else { self.next_generation };
         let device = self.device_mut(&udid);
         if visible {
             device.visible.insert(worktree.clone());
         } else {
             device.visible.remove(worktree);
         }
-        pause_if_hidden(device).into_iter().collect()
+        if unpark {
+            device.restarts = 0;
+            device.phase = Phase::Starting { generation };
+            return vec![Effect::StartSession { udid, generation }];
+        }
+        pause_if_hidden(device, Some(now)).into_iter().collect()
     }
 
     /// A [`Effect::Boot`] finished.
@@ -367,7 +394,8 @@ impl<S: Clone> Registry<S> {
                 device
             }
         };
-        pause_if_hidden(device).into_iter().collect()
+        // No clock here: a hidden start's parking clock starts at the next tick.
+        pause_if_hidden(device, None).into_iter().collect()
     }
 
     /// The session for `generation` ended (helper exited). One automatic
@@ -412,6 +440,7 @@ impl<S: Clone> Registry<S> {
             .collect();
         device.restarts = 0;
         device.paused = false;
+        device.hidden_since = None;
         effects.push(start_or_boot(device, udid, booted, generation));
         if !booted {
             effects.push(Effect::Persist); // now an owned boot
@@ -436,7 +465,7 @@ impl<S: Clone> Registry<S> {
         if let Some(session) = device.session.take() {
             effects.push(Effect::StopSession { udid: udid.clone(), session });
         }
-        if matches!(device.phase, Phase::Live { .. } | Phase::Starting { .. }) {
+        if matches!(device.phase, Phase::Live { .. } | Phase::Starting { .. } | Phase::Parked) {
             device.phase = Phase::Disconnected { reason: "The device shut down.".into() };
         }
         if was_owned {
@@ -460,16 +489,31 @@ impl<S: Clone> Registry<S> {
             .filter(|(udid, d)| {
                 !booted.contains(*udid)
                     && !matches!(d.phase, Phase::Booting { .. })
-                    && (d.owned || matches!(d.phase, Phase::Live { .. } | Phase::Starting { .. }))
+                    && (d.owned || matches!(d.phase, Phase::Live { .. } | Phase::Starting { .. } | Phase::Parked))
             })
             .map(|(u, _)| u.clone())
             .collect();
         gone.iter().flat_map(|udid| self.device_shutdown(udid)).collect()
     }
 
-    /// Periodic housekeeping: shut down owned devices idle for
-    /// [`IDLE_SHUTDOWN`].
+    /// Periodic housekeeping: park devices hidden for [`PARK_AFTER`], and
+    /// shut down owned devices idle for [`IDLE_SHUTDOWN`].
     pub fn tick(&mut self, now: Instant) -> Vec<Effect<S>> {
+        let mut effects = Vec::new();
+        for (udid, device) in &mut self.devices {
+            if !device.paused || !matches!(device.phase, Phase::Live { .. }) {
+                continue;
+            }
+            let since = *device.hidden_since.get_or_insert(now);
+            if now.duration_since(since) >= PARK_AFTER
+                && let Some(session) = device.session.take()
+            {
+                device.phase = Phase::Parked;
+                device.paused = false;
+                device.hidden_since = None;
+                effects.push(Effect::StopSession { udid: udid.clone(), session });
+            }
+        }
         let due: Vec<DeviceId> = self
             .devices
             .iter()
@@ -478,12 +522,11 @@ impl<S: Clone> Registry<S> {
             })
             .map(|(u, _)| u.clone())
             .collect();
-        let mut effects = Vec::new();
-        for udid in due {
-            self.devices.remove(&udid);
-            effects.push(Effect::ShutdownDevice { udid });
+        for udid in &due {
+            self.devices.remove(udid);
+            effects.push(Effect::ShutdownDevice { udid: udid.clone() });
         }
-        if !effects.is_empty() {
+        if !due.is_empty() {
             effects.push(Effect::Persist);
         }
         effects
@@ -538,13 +581,15 @@ fn start_or_boot<S>(device: &mut Device<S>, udid: &DeviceId, booted: bool, gener
 }
 
 /// Pause when no attached worktree shows the device; resume when one does.
-fn pause_if_hidden<S: Clone>(device: &mut Device<S>) -> Option<Effect<S>> {
+/// `now` starts the parking clock (`None`: the next tick starts it).
+fn pause_if_hidden<S: Clone>(device: &mut Device<S>, now: Option<Instant>) -> Option<Effect<S>> {
     let session = device.session.clone()?;
     let hidden = device.visible.is_empty();
     if hidden == device.paused {
         return None;
     }
     device.paused = hidden;
+    device.hidden_since = if hidden { now } else { None };
     Some(if hidden { Effect::Pause(session) } else { Effect::Resume(session) })
 }
 

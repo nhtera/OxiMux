@@ -78,6 +78,95 @@ pub fn long_press(x: f64, y: f64, ms: u64) -> Vec<TouchStep> {
     ]
 }
 
+/// Keep a wheel-driven finger this far inside the screen: nearer the edge
+/// it lifts and starts again at the anchor (upstream `scrollEdgeMargin`).
+pub const WHEEL_EDGE_MARGIN: f64 = 0.08;
+
+/// Wheel travel (display-normalized) before a finger goes down: a finger
+/// that lands and lifts within iOS's tap slop (~10 pt) would be a tap.
+pub const WHEEL_SLOP: f64 = 0.015;
+
+/// Wheel / trackpad scrolling as a one-finger drag — what upstream's native
+/// `SimHID.scroll` does (`HIDInjector.swift` `sendScroll`), done here because
+/// helper v0.2.0 drops `scroll` (it passes a zero screen size, which
+/// upstream's guard rejects).
+///
+/// Once the deltas add up to [`WHEEL_SLOP`], a finger goes down under the
+/// cursor (so iOS hit-tests the scroll view there), each delta moves it, and
+/// [`WheelDrag::finish`] lifts
+/// it once the wheel goes idle. A finger that would leave the margin lifts
+/// and starts again at the anchor, so a long scroll keeps going. Points and
+/// deltas are **display**-normalized, in the finger's direction of travel
+/// (content follows the finger); the caller maps each point to portrait.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WheelDrag {
+    /// `(anchor, finger)` while a finger is down.
+    down: Option<((f64, f64), (f64, f64))>,
+    /// Travel so far, before a finger is down.
+    pending: (f64, f64),
+}
+
+impl WheelDrag {
+    pub fn is_active(&self) -> bool {
+        self.down.is_some()
+    }
+
+    /// Steps for one wheel delta at `cursor`. Delays are 0: the caller sends
+    /// them as the deltas arrive.
+    pub fn scroll(&mut self, cursor: (f64, f64), delta: (f64, f64)) -> Vec<TouchStep> {
+        let step = |phase, (x, y): (f64, f64)| TouchStep { phase, x, y, delay_ms: 0 };
+        let mut out = Vec::new();
+        let (anchor, finger, delta) = match self.down {
+            Some((anchor, finger)) => (anchor, finger, delta),
+            None => {
+                let travel = (self.pending.0 + delta.0, self.pending.1 + delta.1);
+                if travel.0.hypot(travel.1) < WHEEL_SLOP {
+                    self.pending = travel;
+                    return out;
+                }
+                self.pending = (0.0, 0.0);
+                let anchor = inside(cursor);
+                out.push(step(TouchPhase::Begin, anchor));
+                (anchor, anchor, travel)
+            }
+        };
+        let mut next = (finger.0 + delta.0, finger.1 + delta.1);
+        if !within_margin(next) {
+            out.push(step(TouchPhase::End, finger));
+            out.push(step(TouchPhase::Begin, anchor));
+            next = (anchor.0 + delta.0, anchor.1 + delta.1);
+        }
+        let next = inside(next);
+        out.push(step(TouchPhase::Move, next));
+        self.down = Some((anchor, next));
+        out
+    }
+
+    /// Lift the finger (the wheel went idle, or a click took over). Travel
+    /// that never reached the slop is forgotten.
+    pub fn finish(&mut self) -> Option<TouchStep> {
+        self.pending = (0.0, 0.0);
+        let (_, (x, y)) = self.down.take()?;
+        Some(TouchStep { phase: TouchPhase::End, x, y, delay_ms: 0 })
+    }
+}
+
+fn within_margin((x, y): (f64, f64)) -> bool {
+    let ok = |v: f64| (WHEEL_EDGE_MARGIN..=1.0 - WHEEL_EDGE_MARGIN).contains(&v);
+    ok(x) && ok(y)
+}
+
+fn inside((x, y): (f64, f64)) -> (f64, f64) {
+    let c = |v: f64| v.clamp(WHEEL_EDGE_MARGIN, 1.0 - WHEEL_EDGE_MARGIN);
+    (c(x), c(y))
+}
+
+/// The second finger of an Option-drag pinch: `p` mirrored through `center`,
+/// clamped to the screen.
+pub fn mirror(p: (f64, f64), center: (f64, f64)) -> (f64, f64) {
+    clamp(2.0 * center.0 - p.0, 2.0 * center.1 - p.1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +225,64 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0], TouchStep { phase: TouchPhase::Begin, x: 0.2, y: 0.8, delay_ms: 0 });
         assert_eq!(steps[1], TouchStep { phase: TouchPhase::End, x: 0.2, y: 0.8, delay_ms: 750 });
+    }
+
+    fn phases(steps: &[TouchStep]) -> Vec<TouchPhase> {
+        steps.iter().map(|s| s.phase).collect()
+    }
+
+    #[test]
+    fn wheel_drag_puts_a_finger_down_under_the_cursor_then_moves_it() {
+        let mut drag = WheelDrag::default();
+        let steps = drag.scroll((0.5, 0.5), (0.0, -0.1));
+        assert_eq!(phases(&steps), [TouchPhase::Begin, TouchPhase::Move]);
+        assert_eq!((steps[0].x, steps[0].y), (0.5, 0.5));
+        assert!((steps[1].y - 0.4).abs() < 1e-9);
+        // Later deltas only move the finger that is already down.
+        let steps = drag.scroll((0.9, 0.9), (0.0, -0.1));
+        assert_eq!(phases(&steps), [TouchPhase::Move]);
+        assert!((steps[0].y - 0.3).abs() < 1e-9 && steps[0].x == 0.5);
+        let end = drag.finish().unwrap();
+        assert_eq!(end.phase, TouchPhase::End);
+        assert!((end.y - 0.3).abs() < 1e-9);
+        assert!(drag.finish().is_none() && !drag.is_active());
+    }
+
+    #[test]
+    fn wheel_drag_reanchors_before_leaving_the_margin() {
+        let mut drag = WheelDrag::default();
+        drag.scroll((0.5, 0.5), (0.0, -0.3));
+        let steps = drag.scroll((0.5, 0.5), (0.0, -0.3));
+        assert_eq!(phases(&steps), [TouchPhase::End, TouchPhase::Begin, TouchPhase::Move]);
+        assert_eq!((steps[1].x, steps[1].y), (0.5, 0.5), "starts again at the anchor");
+        assert!((steps[2].y - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wheel_drag_keeps_its_finger_inside_the_margin() {
+        let mut drag = WheelDrag::default();
+        let steps = drag.scroll((0.0, 1.0), (0.0, -0.05));
+        assert_eq!((steps[0].x, steps[0].y), (WHEEL_EDGE_MARGIN, 1.0 - WHEEL_EDGE_MARGIN));
+        // A delta bigger than the whole screen still lands inside.
+        let steps = drag.scroll((0.5, 0.5), (5.0, 0.0));
+        let last = steps.last().unwrap();
+        assert!(last.x <= 1.0 - WHEEL_EDGE_MARGIN && last.x >= WHEEL_EDGE_MARGIN);
+    }
+
+    #[test]
+    fn wheel_drag_waits_for_the_slop_so_a_nudge_is_never_a_tap() {
+        let mut drag = WheelDrag::default();
+        assert!(drag.scroll((0.5, 0.5), (0.0, 0.005)).is_empty());
+        assert!(drag.finish().is_none(), "nothing went down");
+        assert!(drag.scroll((0.5, 0.5), (0.0, 0.01)).is_empty());
+        let steps = drag.scroll((0.5, 0.5), (0.0, 0.01));
+        assert_eq!(phases(&steps), [TouchPhase::Begin, TouchPhase::Move]);
+        assert!((steps[1].y - 0.52).abs() < 1e-9, "the held-back travel is applied");
+    }
+
+    #[test]
+    fn mirror_reflects_through_the_center_and_clamps() {
+        assert_eq!(mirror((0.3, 0.4), (0.5, 0.5)), (0.7, 0.6));
+        assert_eq!(mirror((0.1, 0.5), (0.8, 0.5)), (1.0, 0.5));
     }
 }

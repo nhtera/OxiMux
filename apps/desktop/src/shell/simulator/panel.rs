@@ -6,21 +6,29 @@
 //! **active tab's worktree**; `WorkspaceRoot` pushes worktree changes
 //! ([`SimulatorPanel::set_worktree`]) and visibility
 //! ([`SimulatorPanel::set_visible`]) — a hidden entity never renders, so it
-//! cannot infer either itself.
+//! cannot infer either itself. The panel adds its window's own visibility
+//! (minimized, covered, on another Space): the hub hears "shown" only while
+//! both hold, and "hidden" only after [`HIDE_DEBOUNCE`], so flipping tabs
+//! does not pause and resume the helper.
 //!
 //! All device state lives in the app-wide [`SimulatorHub`]; the panel keeps
 //! only per-view bookkeeping (a pending attach, its last error) and derives
 //! its body through [`super::state::derive`].
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{Context, Entity, Subscription, Task};
+use gpui::{AppContext as _, Context, Entity, Subscription, Task, Window};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_simulator::DeviceId;
 use oximux_simulator::registry::Phase;
 
+use oximux_simulator::session::SessionEvent;
+
 use super::hub::{HubEvent, SimulatorHub, hub};
+use super::screen::ScreenView;
 use super::state::{self, Inputs, PanelState};
 
 pub(crate) use stream_row::settings;
@@ -35,11 +43,24 @@ mod tests;
 
 /// How often the setup checklist re-checks while it is on screen.
 const SETUP_RECHECK: Duration = Duration::from_secs(3);
+/// A hide must last this long before the helper is paused.
+const HIDE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub struct SimulatorPanel {
     hub: Option<Entity<SimulatorHub>>,
     worktree: Option<PathBuf>,
+    /// Sidebar open on this tab (pushed by the root).
     visible: bool,
+    /// The window is on screen (not minimized, covered or on another Space).
+    window_visible: bool,
+    /// What the hub was last told for `worktree`.
+    shown: bool,
+    _hide: Option<Task<()>>,
+    _window_visibility: Option<Subscription>,
+    /// The live screen, made on first stream (it needs a window).
+    screen: Option<Entity<ScreenView>>,
+    /// The phone's measured space (see `bezel::phone`).
+    area: Rc<Cell<Option<(f32, f32)>>>,
     /// An attach this panel asked for is in flight.
     attaching: bool,
     /// The sidebar is maximized for the simulator (the ⤢ button's state).
@@ -65,7 +86,7 @@ impl SimulatorPanel {
         // keeps the app alive after the last window closes).
         cx.on_release(|panel: &mut Self, cx| {
             if let (Some(hub), Some(worktree)) = (panel.hub.clone(), panel.worktree.clone())
-                && panel.visible
+                && panel.shown
             {
                 hub.update(cx, |hub, cx| hub.set_visible(&worktree, false, cx));
             }
@@ -75,6 +96,12 @@ impl SimulatorPanel {
             hub,
             worktree: None,
             visible: false,
+            window_visible: true,
+            shown: false,
+            _hide: None,
+            _window_visibility: None,
+            screen: None,
+            area: Rc::default(),
             attaching: false,
             maximized: false,
             attach_error: None,
@@ -107,7 +134,13 @@ impl SimulatorPanel {
                 }
             }
             HubEvent::Availability | HubEvent::Devices => cx.notify(),
-            // Frames repaint the screen view (P6), not the whole panel.
+            // The phone outline follows the stream's size and orientation.
+            HubEvent::Session(udid, SessionEvent::Size { .. } | SessionEvent::Orientation(_)) => {
+                if self.device(cx).as_ref() == Some(udid) {
+                    cx.notify();
+                }
+            }
+            // Frames repaint the screen view, not the whole panel.
             HubEvent::Frame(_) | HubEvent::Session(..) => {}
         }
     }
@@ -117,17 +150,21 @@ impl SimulatorPanel {
         if self.worktree == worktree {
             return;
         }
-        let visible = self.visible;
+        let shown = self.visible && self.window_visible;
         if let Some(hub) = self.hub.clone() {
+            // Show the new one first: two worktrees on one device then never
+            // see a pause-resume blip.
             hub.update(cx, |hub, cx| {
-                if let Some(old) = &self.worktree {
-                    hub.set_visible(old, false, cx);
+                if let Some(new) = worktree.as_ref().filter(|_| shown) {
+                    hub.set_visible(new, true, cx);
                 }
-                if let Some(new) = &worktree {
-                    hub.set_visible(new, visible, cx);
+                if let Some(old) = self.worktree.as_ref().filter(|_| self.shown) {
+                    hub.set_visible(old, false, cx);
                 }
             });
         }
+        self.shown = shown;
+        self._hide = None;
         self.worktree = worktree;
         self.attaching = false;
         self.attach_error = None;
@@ -140,11 +177,9 @@ impl SimulatorPanel {
             return;
         }
         self.visible = visible;
+        self.push_shown(cx);
         let Some(hub) = self.hub.clone() else { return };
         hub.update(cx, |hub, cx| {
-            if let Some(worktree) = &self.worktree {
-                hub.set_visible(worktree, visible, cx);
-            }
             if visible {
                 // `mark_used` runs the first availability check itself.
                 if !hub.mark_used(cx) {
@@ -171,6 +206,67 @@ impl SimulatorPanel {
             })
         });
         cx.notify();
+    }
+
+    /// Tell the hub whether the panel can be seen: at once when it can, after
+    /// [`HIDE_DEBOUNCE`] when it cannot.
+    fn push_shown(&mut self, cx: &mut Context<Self>) {
+        let shown = self.visible && self.window_visible;
+        if !shown && let Some(screen) = self.screen.clone() {
+            // Decoding stops at once; only the helper's pause is debounced.
+            screen.update(cx, |screen, cx| screen.hide(cx));
+        }
+        if shown {
+            self._hide = None;
+            self.set_shown(true, cx);
+        } else if self.shown && self._hide.is_none() {
+            self._hide = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(HIDE_DEBOUNCE).await;
+                let _ = this.update(cx, |panel, cx| {
+                    panel._hide = None;
+                    if !(panel.visible && panel.window_visible) {
+                        panel.set_shown(false, cx);
+                    }
+                });
+            }));
+        }
+    }
+
+    fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if self.shown == shown {
+            return;
+        }
+        self.shown = shown;
+        if let (Some(hub), Some(worktree)) = (self.hub.clone(), self.worktree.clone()) {
+            hub.update(cx, |hub, cx| hub.set_visible(&worktree, shown, cx));
+        }
+    }
+
+    /// Follow the window's own visibility; registered on first render, the
+    /// first point with a window at hand.
+    fn observe_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._window_visibility.is_some() {
+            return;
+        }
+        self.window_visible = window.visibility().is_visible();
+        self._window_visibility = Some(cx.observe_window_visibility(window, |panel, visibility, _window, cx| {
+            panel.window_visible = visibility.is_visible();
+            panel.push_shown(cx);
+            // Back on screen: render, so the screen view takes a fresh frame.
+            cx.notify();
+        }));
+    }
+
+    /// The live screen, bound to `device` for this render.
+    fn live_screen(&mut self, binding: super::screen::Binding, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<ScreenView>> {
+        let hub = self.hub.clone()?;
+        let (theme, typography) = (self.theme, self.typography.clone());
+        let screen = self
+            .screen
+            .get_or_insert_with(|| cx.new(|cx| ScreenView::new(hub, theme, typography.clone(), window, cx)))
+            .clone();
+        screen.update(cx, |screen, cx| screen.bind(binding, theme, &typography, window, cx));
+        Some(screen)
     }
 
     pub fn set_maximized(&mut self, maximized: bool, cx: &mut Context<Self>) {
@@ -251,9 +347,10 @@ impl SimulatorPanel {
 }
 
 impl gpui::Render for SimulatorPanel {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         use gpui::{ParentElement as _, Styled as _, div};
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
+        self.observe_window(window, cx);
         let state = self.state(cx);
         div()
             .flex()
@@ -261,6 +358,6 @@ impl gpui::Render for SimulatorPanel {
             .size_full()
             .bg(self.theme.bg_panel)
             .child(self.render_header(&state, cx))
-            .child(self.render_body(&state, cx))
+            .child(self.render_body(&state, window, cx))
     }
 }

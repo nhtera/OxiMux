@@ -93,6 +93,8 @@ pub fn install(cx: &mut App) {
     // same reason: these are bare arrow keys and `Enter`, which in the global
     // keymap would shadow every list and every input in the app.
     crate::shell::stash_panel::keyboard::register_stash_panel_key_bindings(cx);
+    // The simulator screen forwards Tab / Shift-Tab to the device.
+    crate::shell::simulator::register_screen_key_bindings(cx);
     for warning in &warnings {
         tracing::warn!(%warning, "keybinding override problem");
     }

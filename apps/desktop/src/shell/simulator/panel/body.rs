@@ -5,18 +5,20 @@
 //! full-width split Attach button at the bottom.
 
 use gpui::{
-    AnyElement, App, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
+    AnyElement, App, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::menu::DropdownMenu as _;
 use gpui_component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
-use oximux_simulator::DeviceState;
 use oximux_simulator::availability::{Availability, HelperStatus, Xcode};
+use oximux_simulator::geometry::{Size, display_size};
+use oximux_simulator::{DeviceKind, DeviceState};
 
 use super::SimulatorPanel;
-use super::bezel::phone;
+use super::bezel::{Device, fit, phone};
+use crate::shell::simulator::screen::Binding;
 use super::header::device_menu;
 use crate::shell::simulator::state::PanelState;
 
@@ -24,8 +26,17 @@ use crate::shell::simulator::state::PanelState;
 const TRADEMARK: &str = "Xcode is a trademark of Apple Inc., registered in the U.S. and other countries.";
 
 impl SimulatorPanel {
-    pub(super) fn render_body(&self, state: &PanelState, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_body(&mut self, state: &PanelState, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let density = self.density;
+        let device = self.outline_device(cx);
+        if !matches!(state, PanelState::Streaming)
+            && let Some(screen) = self.screen.clone()
+        {
+            // Off screen: free the last frame and lift any finger.
+            let binding = Binding { device: None, visible: false, radius: 0.0 };
+            let (theme, typography) = (self.theme, self.typography.clone());
+            screen.update(cx, |screen, cx| screen.bind(binding, theme, &typography, window, cx));
+        }
         let screen: AnyElement = match state {
             PanelState::Checking => self.centered_line("Checking for Xcode and the simulator runtime…"),
             PanelState::Setup(availability) => self.render_setup(availability),
@@ -33,8 +44,14 @@ impl SimulatorPanel {
             PanelState::Attaching => self.centered_line("Finding a simulator…"),
             PanelState::Booting => self.centered_line(&format!("Booting {}…", self.device_name(cx))),
             PanelState::Connecting => self.centered_line("Starting stream…"),
-            // P6 replaces this with the live screen.
-            PanelState::Streaming => self.centered_line(&format!("{} is connected.", self.device_name(cx))),
+            PanelState::Streaming => {
+                let radius = self.area.get().and_then(|a| fit(a, &device)).map_or(0.0, |l| l.screen_radius);
+                let binding = Binding { device: self.device(cx), visible: self.visible && self.window_visible, radius };
+                match self.live_screen(binding, window, cx) {
+                    Some(screen) => screen.into_any_element(),
+                    None => self.centered_line("Starting stream…"),
+                }
+            }
             PanelState::Disconnected { reason } => self.render_stopped(reason, "Reconnect", false, cx),
             PanelState::Error { message, xcode_hint } => self.render_stopped(message, "Retry", *xcode_hint, cx),
         };
@@ -49,9 +66,23 @@ impl SimulatorPanel {
             .px(px(density.pad_panel))
             .pt(px(density.pad_panel * 2.0))
             .pb(px(density.pad_panel))
-            .child(phone(self.theme, screen))
+            .child(phone(self.theme, &device, &self.area, cx.weak_entity(), screen))
             .child(self.render_toolbar(state, cx))
             .into_any_element()
+    }
+
+    /// What the outline depicts: the streamed device at its current size and
+    /// orientation, else the placeholder phone.
+    fn outline_device(&self, cx: &App) -> Device {
+        let Some(udid) = self.device(cx) else { return Device::PLACEHOLDER };
+        let Some(hub) = self.hub.as_ref() else { return Device::PLACEHOLDER };
+        let hub = hub.read(cx);
+        let kind = hub.devices().iter().find(|d| d.udid == udid).map_or(DeviceKind::Phone, |d| d.kind);
+        let Some(session) = hub.session(&udid) else { return Device { kind, ..Device::PLACEHOLDER } };
+        let Some((w, h)) = session.framebuffer_size() else { return Device { kind, ..Device::PLACEHOLDER } };
+        let orientation = session.orientation();
+        let shown = display_size(orientation, Size::new(f64::from(w), f64::from(h)));
+        Device { display: (shown.w as f32, shown.h as f32), kind, orientation }
     }
 
     fn device_name(&self, cx: &App) -> String {

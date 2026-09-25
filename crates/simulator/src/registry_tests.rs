@@ -37,7 +37,7 @@ fn start_gen(effects: &[Effect<&'static str>]) -> Generation {
 fn live(reg: &mut Reg, w: &WorktreeKey, u: &DeviceId, session: &'static str, now: Instant) -> Generation {
     let fx = reg.attach(w.clone(), u.clone(), true, now);
     let g = start_gen(&fx);
-    reg.set_visible(w, true);
+    reg.set_visible(w, true, now);
     reg.session_started(u, g, Ok(session));
     assert_eq!(reg.phase(u), Phase::Live { generation: g });
     g
@@ -132,7 +132,7 @@ fn a_late_session_from_an_old_generation_is_stopped_not_installed() {
     let second = start_gen(&reg.attach(wt("b"), u.clone(), true, now));
     assert_ne!(first, second);
     assert_eq!(kinds(&reg.session_started(&u, first, Ok("stale"))), ["stop U stale"]);
-    reg.set_visible(&wt("b"), true);
+    reg.set_visible(&wt("b"), true, now);
     assert!(reg.session_started(&u, second, Ok("fresh")).is_empty());
     assert_eq!(reg.session(&u), Some(&"fresh"));
 }
@@ -146,11 +146,11 @@ fn two_worktrees_share_one_session_and_refcount_visibility() {
     // The second worktree joins the live session: no new start.
     let fx = reg.attach(wt("b"), u.clone(), true, now);
     assert_eq!(kinds(&fx), ["persist"]);
-    reg.set_visible(&wt("b"), true);
+    reg.set_visible(&wt("b"), true, now);
     // Hiding one viewer must not pause the other's stream.
-    assert!(reg.set_visible(&wt("a"), false).is_empty());
-    assert_eq!(kinds(&reg.set_visible(&wt("b"), false)), ["pause s"]);
-    assert_eq!(kinds(&reg.set_visible(&wt("a"), true)), ["resume s"]);
+    assert!(reg.set_visible(&wt("a"), false, now).is_empty());
+    assert_eq!(kinds(&reg.set_visible(&wt("b"), false, now)), ["pause s"]);
+    assert_eq!(kinds(&reg.set_visible(&wt("a"), true, now)), ["resume s"]);
     // Detaching one keeps the session; detaching the last stops it.
     assert_eq!(kinds(&reg.detach(&wt("a"), now)), ["pause s", "persist"]);
     assert_eq!(kinds(&reg.detach(&wt("b"), now)), ["stop U s", "persist"]);
@@ -398,11 +398,11 @@ fn visibility_set_before_attach_carries_over() {
     let now = Instant::now();
     let mut reg = Reg::default();
     let (w, u) = (wt("a"), dev("U"));
-    assert!(reg.set_visible(&w, true).is_empty());
+    assert!(reg.set_visible(&w, true, now).is_empty());
     let g = start_gen(&reg.attach(w.clone(), u.clone(), true, now));
     assert!(reg.session_started(&u, g, Ok("s")).is_empty(), "not paused");
     // Hidden, detached, re-attached while still hidden: starts paused.
-    reg.set_visible(&w, false);
+    reg.set_visible(&w, false, now);
     reg.detach(&w, now);
     let g = start_gen(&reg.attach(w, u.clone(), true, now));
     assert_eq!(kinds(&reg.session_started(&u, g, Ok("s2"))), ["pause s2"]);
@@ -426,4 +426,100 @@ fn a_booted_result_reasserts_ownership_and_bumps_the_generation() {
     reg.devices.get_mut(&dev("V")).unwrap().owned = false;
     assert_eq!(kinds(&reg.boot_finished(&dev("V"), start_gen(&fx), BootResult::Booted)), ["persist", "start V"]);
     assert!(reg.is_owned(&dev("V")));
+}
+
+/// A device hidden for `PARK_AFTER` has its helper stopped but stays
+/// attached; showing it again starts a fresh helper, and the stopped one's
+/// late exit is ignored.
+#[test]
+fn a_long_hidden_device_is_parked_and_restarts_when_shown() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    let g = live(&mut reg, &w, &u, "s", now);
+    assert_eq!(kinds(&reg.set_visible(&w, false, now)), ["pause s"]);
+    assert!(reg.tick(now + PARK_AFTER - Duration::from_secs(1)).is_empty());
+    assert_eq!(kinds(&reg.tick(now + PARK_AFTER)), ["stop U s"]);
+    assert_eq!(reg.phase(&u), Phase::Parked);
+    assert_eq!(reg.device_for(&w), Some(&u), "still attached");
+    assert!(reg.session_exited(&u, g, true, "closed".into()).is_empty(), "stale exit");
+    let generation = reg.generation();
+    let fx = reg.set_visible(&w, true, now + PARK_AFTER * 2);
+    assert_eq!(kinds(&fx), ["start U"]);
+    assert_ne!(reg.generation(), generation);
+    let g2 = start_gen(&fx);
+    assert!(reg.session_started(&u, g2, Ok("s2")).is_empty(), "shown, so not paused");
+    assert_eq!(reg.phase(&u), Phase::Live { generation: g2 });
+}
+
+/// A session that starts hidden gets its parking clock from the first tick.
+#[test]
+fn a_hidden_start_parks_one_period_after_the_first_tick() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    let g = start_gen(&reg.attach(w.clone(), u.clone(), true, now));
+    assert_eq!(kinds(&reg.session_started(&u, g, Ok("s"))), ["pause s"]);
+    assert!(reg.tick(now).is_empty(), "starts the clock");
+    assert!(reg.tick(now + PARK_AFTER - Duration::from_secs(1)).is_empty());
+    assert_eq!(kinds(&reg.tick(now + PARK_AFTER)), ["stop U s"]);
+    // Hiding without a visible change never moves the generation.
+    let generation = reg.generation();
+    reg.set_visible(&w, false, now);
+    assert_eq!(reg.generation(), generation);
+}
+
+/// A parked device that is shut down externally transitions to Disconnected.
+#[test]
+fn a_parked_device_shut_down_externally_becomes_disconnected() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    let _g = live(&mut reg, &w, &u, "s", now);
+    assert_eq!(kinds(&reg.set_visible(&w, false, now)), ["pause s"]);
+    assert_eq!(kinds(&reg.tick(now + PARK_AFTER)), ["stop U s"]);
+    assert_eq!(reg.phase(&u), Phase::Parked);
+    // Device is shut down externally while parked.
+    let fx = reg.device_shutdown(&u);
+    assert_eq!(kinds(&fx), Vec::<String>::new());  // No effects (not owned, no session to stop)
+    assert_eq!(reg.phase(&u), Phase::Disconnected { reason: "The device shut down.".into() });
+    assert_eq!(reg.device_for(&w), Some(&u), "attachment is preserved");
+}
+
+/// An owned parked device that is shut down externally triggers persist.
+#[test]
+fn an_owned_parked_device_shut_down_externally_persists() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    let fx = reg.attach(w.clone(), u.clone(), false, now);
+    let g = start_gen(&fx);
+    let fx = reg.boot_finished(&u, g, BootResult::Booted);
+    let g2 = start_gen(&fx);
+    reg.set_visible(&w, true, now);
+    reg.session_started(&u, g2, Ok("s"));
+    assert_eq!(reg.phase(&u), Phase::Live { generation: g2 });
+    assert!(reg.is_owned(&u));
+    // Hide and park the device.
+    assert_eq!(kinds(&reg.set_visible(&w, false, now)), ["pause s"]);
+    assert_eq!(kinds(&reg.tick(now + PARK_AFTER)), ["stop U s"]);
+    assert_eq!(reg.phase(&u), Phase::Parked);
+    // Owned device shut down externally.
+    let fx = reg.device_shutdown(&u);
+    assert_eq!(kinds(&fx), ["persist"]);
+    assert!(!reg.is_owned(&u));
+}
+
+/// Review H1: a shown worktree joining a paused device resumes it, so the
+/// device is never parked while someone is looking at it.
+#[test]
+fn a_shown_worktree_joining_a_paused_device_resumes_it() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let u = dev("U");
+    live(&mut reg, &wt("a"), &u, "s", now);
+    assert_eq!(kinds(&reg.set_visible(&wt("a"), false, now)), ["pause s"]);
+    reg.set_visible(&wt("b"), true, now);
+    assert_eq!(kinds(&reg.attach(wt("b"), u.clone(), true, now)), ["resume s", "persist"]);
+    assert!(reg.tick(now + PARK_AFTER * 2).is_empty(), "not parked while shown");
 }

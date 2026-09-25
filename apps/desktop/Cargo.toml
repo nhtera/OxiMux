@@ -88,6 +88,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+# iOS Simulator panel: decodes the helper's JPEG frames.
+zune-core = { workspace = true }
+zune-jpeg = { workspace = true }
 
 # Browser cookie import (read installed browsers' cookie SQLite DBs → inject
 # into the active webview profile's WKWebsiteDataStore). rusqlite reads the

@@ -8216,6 +8216,8 @@ dependencies = [
  "widestring",
  "windows-sys 0.61.2",
  "wry",
+ "zune-core 0.5.1",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

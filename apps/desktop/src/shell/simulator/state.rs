@@ -64,7 +64,8 @@ pub fn derive(i: Inputs<'_>) -> PanelState {
         Phase::Idle if i.attaching => PanelState::Attaching,
         Phase::Idle => PanelState::Empty { error: i.attach_error.map(str::to_owned) },
         Phase::Booting { .. } => PanelState::Booting,
-        Phase::Starting { .. } => PanelState::Connecting,
+        // Parked restarts as soon as the panel shows it.
+        Phase::Starting { .. } | Phase::Parked => PanelState::Connecting,
         Phase::Live { .. } => PanelState::Streaming,
         Phase::Disconnected { reason } => PanelState::Disconnected { reason: reason.clone() },
         Phase::Failed { error } => PanelState::Error {

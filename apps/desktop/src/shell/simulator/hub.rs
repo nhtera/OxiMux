@@ -25,15 +25,17 @@ use oximux_simulator::helper::HelperOptions;
 use oximux_simulator::registry::{self, BootResult, Effect, Generation, Phase, Registry, WorktreeKey};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::{SessionEvent, StreamSession};
-use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, SimError, simctl};
+use oximux_simulator::protocol::{Command, KeyPhase};
+use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, SimError, keyboard, simctl};
 use oximux_storage::SettingsRepo;
 
 use crate::app_settings::sim_state_keys;
 
 /// `simctl` call timeouts (boot has its own bounded poll inside).
 const SIMCTL_TIMEOUT: Duration = Duration::from_secs(30);
-/// How often owned devices are checked for the idle shutdown.
-const TICK: Duration = Duration::from_secs(30);
+/// How often devices are checked for parking and the idle shutdown (so a
+/// hidden device parks 60–75 s after it was hidden).
+const TICK: Duration = Duration::from_secs(15);
 
 /// What panels hear about.
 #[derive(Clone, Debug, PartialEq)]
@@ -160,6 +162,34 @@ impl SimulatorHub {
         if let Some(session) = self.session(udid) {
             let _ = session.send(&oximux_simulator::protocol::Command::Button { name: button });
         }
+    }
+
+    /// Paste `text` into `udid`, in the background: onto the device's
+    /// clipboard with `simctl pbcopy`, then a HID ⌘V (the spike's verified
+    /// route for any Unicode). If `pbcopy` fails, short ASCII is typed out
+    /// instead; anything else is dropped with a log line.
+    pub fn paste(&self, udid: &DeviceId, text: String, cx: &mut Context<Self>) {
+        let Some(session) = self.session(udid) else { return };
+        if text.is_empty() || !self.watch_gate().xcode_ok {
+            return;
+        }
+        let (runner, udid) = (self.runner.clone(), udid.clone());
+        cx.background_executor()
+            .spawn(async move {
+                let keys = match simctl::pbcopy(runner.as_ref(), udid.as_str(), &text, SIMCTL_TIMEOUT) {
+                    Ok(()) => keyboard::paste_chord(),
+                    Err(e) if !keyboard::needs_paste(&text) => {
+                        tracing::debug!(%udid, "simulator pbcopy failed ({e}); typing instead");
+                        keyboard::text_to_key_events(&text).unwrap_or_default()
+                    }
+                    Err(e) => return tracing::warn!(%udid, "simulator paste failed: {e}"),
+                };
+                for key in keys {
+                    let phase = if key.down { KeyPhase::Down } else { KeyPhase::Up };
+                    let _ = session.send(&Command::Key { phase, usage: key.usage });
+                }
+            })
+            .detach();
     }
 
     /// Rotate `udid` a quarter turn clockwise (Simulator.app's "Rotate
@@ -305,7 +335,7 @@ impl SimulatorHub {
     /// A worktree's panel was shown or hidden (pauses the helper when no
     /// viewer of its device is visible).
     pub fn set_visible(&mut self, worktree: &Path, visible: bool, cx: &mut Context<Self>) {
-        let effects = self.registry.set_visible(&WorktreeKey::from_path(worktree), visible);
+        let effects = self.registry.set_visible(&WorktreeKey::from_path(worktree), visible, Instant::now());
         self.run(effects, cx);
     }
 

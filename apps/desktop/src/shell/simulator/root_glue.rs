@@ -69,9 +69,8 @@ impl WorkspaceRoot {
     /// inherit the maximized one. Both are transient — a user's drag stays the
     /// one persisted width.
     ///
-    /// Known gap: GPUI exposes no "minimized" state and a minimized window
-    /// stops rendering, so minimize does not pause the helper here (P6's
-    /// screen view can pause when its frames stop being painted).
+    /// Minimize / occlusion is the panel's own business: it observes its
+    /// window's visibility (see `SimulatorPanel`).
     pub(crate) fn sync_simulator_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.simulator.panel.clone() else { return };
         let Some(rs) = self.right_sidebar.clone() else { return };
