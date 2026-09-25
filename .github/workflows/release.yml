@@ -5,6 +5,15 @@
 # the manual path exists because Apple's notary service occasionally stalls
 # past any sane timeout; a re-run should not require re-tagging.
 #
+# A manual run is a DRY RUN by default (`dry_run`, default true). Only the
+# macOS job runs: it builds, signs and notarizes, smoke-tests the signed
+# simulator helper against a booted simulator, and keeps the notarized DMG as
+# a workflow artifact. It uploads nothing to any release, and the Windows,
+# CLI and manifest jobs are skipped. Uncheck `dry_run` for a real re-run.
+# This exists because a manual run on a branch resolves its tag from
+# Cargo.toml, and would otherwise `--clobber` the published release's assets
+# with a branch build.
+#
 # The workflow produces a DRAFT release with both assets attached, so release
 # notes can be curated before publishing. Re-runs re-upload with --clobber.
 #
@@ -34,6 +43,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: macOS only; build, sign, notarize and smoke-test, but upload nothing"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -47,7 +61,10 @@ env:
 jobs:
   release-macos:
     name: macOS arm64 DMG
-    runs-on: macos-14
+    # macos-15: macos-14 is deprecated (removed 2026-11-02), and it has no
+    # Xcode 26 for the simulator-helper smoke test. The CLI matrix below still
+    # uses macos-14 and needs the same move before then.
+    runs-on: macos-15
     # Cold-cache release build of the whole workspace plus notarization wait;
     # generous on purpose — a timeout here wastes a full expensive build.
     timeout-minutes: 120
@@ -150,6 +167,49 @@ jobs:
       - name: Build and sign OxiMux.app
         run: ./scripts/bundle-macos.sh --hardened --sign "$MACOS_SIGN_IDENTITY"
 
+      # Dry run only: prove the Developer-ID-signed, hardened-runtime helper
+      # passes library validation when it dlopens Xcode's simulator
+      # frameworks, by streaming real frames from a booted simulator.
+      - name: Smoke-test the signed simulator helper (dry run)
+        if: ${{ inputs.dry_run }}
+        run: |
+          helper=dist/OxiMux.app/Contents/MacOS/oximux-sim-helper
+          # The helper supports Xcode 26. Point this step (only) at the newest
+          # Xcode 26.x via DEVELOPER_DIR, which xcrun, simctl and the helper's
+          # own `xcode-select -p` lookup all honour.
+          shopt -s nullglob
+          xcodes=(/Applications/Xcode_26*.app)
+          if (( ${#xcodes[@]} == 0 )); then
+            echo "no Xcode 26.x on this runner" >&2; printf '%s\n' /Applications/Xcode*.app; exit 1
+          fi
+          DEVELOPER_DIR="$(printf '%s\n' "${xcodes[@]}" | sort -V | tail -1)/Contents/Developer"
+          export DEVELOPER_DIR
+          sw_vers; xcodebuild -version
+          codesign --verify --strict "$helper"
+          if codesign -d --entitlements - "$helper" 2>/dev/null | grep -q .; then
+            echo "helper must carry no entitlements" >&2; exit 1
+          fi
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          print(next(x["udid"] for k, v in d.items() if "iOS" in k for x in v if "iPhone" in x["name"]))')
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b >/dev/null
+          (sleep 20) | "$helper" --udid "$udid" --scale 0.5 --fps 30 > "$RUNNER_TEMP/frames.bin" || true
+          xcrun simctl shutdown "$udid" || true
+          python3 - "$RUNNER_TEMP/frames.bin" <<'PY'
+          import struct, sys
+          b = open(sys.argv[1], "rb").read()
+          i = frames = 0
+          while i + 5 <= len(b):
+              kind = b[i]; n = struct.unpack("<I", b[i + 1:i + 5])[0]
+              if kind == 2:  # JSON event: ready / size / error — the only diagnostics
+                  print("event:", b[i + 5:i + 5 + n].decode(errors="replace"))
+              frames += kind == 1; i += 5 + n
+          print(f"helper streamed {frames} frames ({len(b)} bytes)")
+          sys.exit(0 if frames > 0 else 1)
+          PY
+
       - name: Package, notarize, and staple the DMG
         env:
           NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
@@ -163,7 +223,18 @@ jobs:
 
       # make-dmg.sh --notarize already hard-fails on stapler validate and the
       # spctl Gatekeeper assessment — nothing un-notarized reaches this step.
+      - name: Keep the notarized DMG as a workflow artifact (dry run)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-dmg-macos-arm64
+          path: dist/OxiMux-*-macos-arm64.dmg
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload DMG to the release
+        # `inputs.dry_run` is empty on a tag push, so tag releases always upload.
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -213,6 +284,8 @@ jobs:
   # is; a self-signed binary would look signed and warn anyway.
   release-windows:
     name: Windows x64 zip + installer
+    # A dry run proves the macOS signing path only; skip everything else.
+    if: ${{ !inputs.dry_run }}
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -369,6 +442,7 @@ jobs:
   # leaves an installation that cannot talk to itself.
   release-cli:
     name: CLI ${{ matrix.target }}
+    if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -591,6 +665,7 @@ jobs:
     # Windows user that their platform has no app build — see `app_for` in
     # crates/auto-update/src/release/manifest.rs.
     needs: [release-cli, release-windows]
+    if: ${{ !inputs.dry_run }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
