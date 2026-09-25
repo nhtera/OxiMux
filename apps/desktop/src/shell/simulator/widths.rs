@@ -1,43 +1,51 @@
 //! Right-sidebar widths for the simulator tab.
 //!
-//! A phone needs more room than the sidebar's 360 default, so the first time
-//! the tab is shown the width bumps to [`FIRST_SELECT_WIDTH`], and ⤢ widens it
-//! to everything but the centre panes' reserve. Both are *transient*: only a
-//! user's drag persists a width, so there is one width source of truth and
-//! "restore" returns to it. Every value goes through `clamp_panel_width`, so a
-//! narrow window never squeezes the centre panes below their floor.
+//! Normal ("Split"): wide enough for a phone at full height beside the centre
+//! panes — applied the first time the tab shows, never narrower than the
+//! sidebar already is. "Fill" does not use a width: the sidebar takes the
+//! centre's place (see `RightSidebar::fill`). Both are transient; only a
+//! user's drag persists a width. Every width goes through
+//! `clamp_panel_width`, so a narrow window keeps the centre's floor.
 
-use crate::app_settings::scm_layout_settings::{MAX_PANEL_WIDTH_RESERVE, clamp_panel_width};
+use crate::app_settings::scm_layout_settings::clamp_panel_width;
 
-/// Width the sidebar grows to (at least) when the simulator tab first opens.
-pub const FIRST_SELECT_WIDTH: f32 = 440.0;
+/// Vertical space the sidebar spends on things other than the phone: the tab
+/// strip, the panel header, the toolbar pill and paddings.
+const CHROME_H: f32 = 180.0;
+/// Horizontal room around the phone (paddings, side buttons).
+const MARGIN_W: f32 = 72.0;
+/// Width ÷ height of the phone outline (screen plus bezel).
+pub const PHONE_ASPECT: f32 = 0.49;
+/// Never bump below this, even in a short window.
+const MIN_SPLIT_WIDTH: f32 = 440.0;
 
-/// The width for the first select: never narrower than it already is.
-pub fn first_select_width(current: f32, window_width: f32) -> f32 {
-    clamp_panel_width(current.max(FIRST_SELECT_WIDTH), window_width)
+/// The width that fits a full-height phone in a window of this size.
+pub fn split_width(window_w: f32, window_h: f32) -> f32 {
+    let phone_w = (window_h - CHROME_H).max(0.0) * PHONE_ASPECT;
+    clamp_panel_width((phone_w + MARGIN_W).max(MIN_SPLIT_WIDTH), window_w)
 }
 
-/// The maximized width: the window minus the centre panes' reserve.
-pub fn maximized_width(window_width: f32) -> f32 {
-    clamp_panel_width(window_width - MAX_PANEL_WIDTH_RESERVE, window_width)
+/// The first-show width: fit the phone, but never shrink a wider sidebar.
+pub fn first_select_width(current: f32, window_w: f32, window_h: f32) -> f32 {
+    clamp_panel_width(current.max(split_width(window_w, window_h)), window_w)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_settings::scm_layout_settings::MIN_PANEL_WIDTH;
+    use crate::app_settings::scm_layout_settings::MAX_PANEL_WIDTH_RESERVE;
 
     #[test]
-    fn first_select_bumps_but_never_shrinks_and_respects_the_window() {
-        assert_eq!(first_select_width(360.0, 1600.0), FIRST_SELECT_WIDTH);
-        assert_eq!(first_select_width(600.0, 1600.0), 600.0);
-        // A narrow window caps it at its ceiling.
-        assert_eq!(first_select_width(360.0, 700.0), 700.0 - MAX_PANEL_WIDTH_RESERVE);
+    fn split_fits_a_full_height_phone() {
+        let w = split_width(3000.0, 1000.0);
+        assert_eq!(w, (1000.0 - CHROME_H) * PHONE_ASPECT + MARGIN_W);
+        // A short window never goes below the floor.
+        assert_eq!(split_width(3000.0, 400.0), MIN_SPLIT_WIDTH);
     }
 
     #[test]
-    fn maximize_leaves_the_centre_reserve_and_never_goes_below_the_floor() {
-        assert_eq!(maximized_width(1600.0), 1600.0 - MAX_PANEL_WIDTH_RESERVE);
-        assert_eq!(maximized_width(400.0), MIN_PANEL_WIDTH);
+    fn first_select_never_shrinks_and_respects_the_window() {
+        assert_eq!(first_select_width(900.0, 3000.0, 1000.0), 900.0);
+        assert_eq!(first_select_width(0.0, 700.0, 1000.0), 700.0 - MAX_PANEL_WIDTH_RESERVE);
     }
 }

@@ -155,6 +155,43 @@ impl SimulatorHub {
             .detach();
     }
 
+    /// Press a hardware button on `udid`'s live session (fire-and-forget).
+    pub fn press_button(&self, udid: &DeviceId, button: oximux_simulator::Button) {
+        if let Some(session) = self.session(udid) {
+            let _ = session.send(&oximux_simulator::protocol::Command::Button { name: button });
+        }
+    }
+
+    /// Rotate `udid` a quarter turn clockwise (Simulator.app's "Rotate
+    /// Right"), in the background: the helper replies once the device turned.
+    pub fn rotate(&self, udid: &DeviceId, cx: &mut Context<Self>) {
+        let Some(session) = self.session(udid) else { return };
+        let next = session.orientation().rotated_right();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = session.configure(None, None, Some(next), Duration::from_secs(5)) {
+                    tracing::debug!("simulator rotate failed: {e}");
+                }
+            })
+            .detach();
+    }
+
+    /// Shut `udid` down (the toolbar's power button). The device watcher then
+    /// sees it go and the panel shows Disconnected with Reconnect.
+    pub fn shutdown_device(&self, udid: &DeviceId, cx: &mut Context<Self>) {
+        if !self.watch_gate().xcode_ok {
+            return;
+        }
+        let (runner, udid) = (self.runner.clone(), udid.clone());
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = simctl::shutdown(runner.as_ref(), udid.as_str(), SIMCTL_TIMEOUT) {
+                    tracing::warn!(%udid, "simulator shutdown failed: {e}");
+                }
+            })
+            .detach();
+    }
+
     /// The panel was opened: from now on the device watcher may poll.
     /// Returns whether this was the first use (which also ran the first
     /// availability check).
@@ -324,6 +361,9 @@ impl SimulatorHub {
             let _ = this.update(cx, |hub, cx| {
                 let effects = hub.registry.boot_finished(&udid, generation, result);
                 hub.run(effects, cx);
+                // The device menu's state dots come from the listing: refresh
+                // it so the booted device stops showing as shut down.
+                hub.refresh_devices(cx);
                 cx.emit(HubEvent::Changed(udid));
             });
         })

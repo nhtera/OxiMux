@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
-    Styled, Task, Window, div, px,
+    Styled, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use oximux_git::{PollState, Repository, StatusPoller};
 use oximux_settings::{Density, Theme, Typography};
@@ -108,6 +108,9 @@ pub struct RightSidebar {
     /// The window's iOS Simulator panel, when this Mac supports it — shared
     /// like `ports_panel`. Its presence is what shows the Simulator tab.
     pub(crate) simulator_panel: Option<Entity<crate::shell::simulator::SimulatorPanel>>,
+    /// Fill the whole content area (the simulator's "Fill"): the root skips
+    /// the centre column and this column takes its width instead.
+    pub(crate) fill: bool,
 
     // Poll state mirrored for the status bar (avoids borrowing through entity tree).
     pub latest_poll_state: PollState,
@@ -326,6 +329,7 @@ impl RightSidebar {
             // field's own note on why it is not built here.
             ports_panel: None,
             simulator_panel: None,
+            fill: false,
             latest_poll_state: initial,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -483,6 +487,7 @@ impl RightSidebar {
             file_tree_view: None,
             ports_panel: None,
             simulator_panel: None,
+            fill: false,
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -572,6 +577,14 @@ impl RightSidebar {
     pub fn set_panel_width_transient(&mut self, width: Pixels, cx: &mut Context<Self>) {
         if self.panel_width != width {
             self.panel_width = width;
+            cx.notify();
+        }
+    }
+
+    /// Fill the whole content area (see the `fill` field).
+    pub fn set_fill(&mut self, fill: bool, cx: &mut Context<Self>) {
+        if self.fill != fill {
+            self.fill = fill;
             cx.notify();
         }
     }
@@ -830,9 +843,10 @@ impl Render for RightSidebar {
             .flex()
             .flex_row()
             .h_full()
-            .w(self.panel_width)
+            .when(self.fill, |d| d.flex_1().min_w(px(0.)))
+            .when(!self.fill, |d| d.w(self.panel_width))
             .bg(theme.bg_panel)
-            .child(resize::build_handle(window_width, self.resizing, theme))
+            .when(!self.fill, |d| d.child(resize::build_handle(window_width, self.resizing, theme)))
             .child(
                 div()
                     .flex()

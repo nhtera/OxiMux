@@ -1,7 +1,8 @@
-//! The panel body for each [`PanelState`]. Everything but the setup checklist
-//! sits inside a phone outline (the "bezel"), matching the reference design:
-//! the empty state is the bezel with no stream, and P6's live screen fills
-//! the same frame.
+//! The panel body: the phone (see [`super::bezel`]) with each
+//! [`PanelState`]'s content on its screen, and the toolbar pill under it —
+//! the reference design's layout: heading and disclosure at the top of the
+//! screen, the checklist in rounded cards, the trademark line and a
+//! full-width split Attach button at the bottom.
 
 use gpui::{
     AnyElement, App, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
@@ -11,43 +12,31 @@ use gpui_component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
-use oximux_simulator::availability::{Availability, HelperStatus, Xcode};
 use oximux_simulator::DeviceState;
+use oximux_simulator::availability::{Availability, HelperStatus, Xcode};
 
 use super::SimulatorPanel;
+use super::bezel::phone;
 use super::header::device_menu;
 use crate::shell::simulator::state::PanelState;
 
-/// Widest the bezel gets; the panel letterboxes around it.
-const BEZEL_MAX_W: f32 = 320.0;
-/// The empty state's device glyph.
-const EMPTY_ICON: f32 = 48.0;
-/// Corner radius of the phone outline.
-const BEZEL_RADIUS: f32 = 36.0;
-/// Frame thickness of the phone outline.
-const BEZEL_FRAME: f32 = 6.0;
+/// The full trademark notice, as the platform owner asks it to be written.
+const TRADEMARK: &str = "Xcode is a trademark of Apple Inc., registered in the U.S. and other countries.";
 
 impl SimulatorPanel {
     pub(super) fn render_body(&self, state: &PanelState, cx: &mut Context<Self>) -> AnyElement {
         let density = self.density;
-        let content: AnyElement = match state {
-            PanelState::Checking => self.status_line("Checking for Xcode and the simulator runtime…"),
-            PanelState::Setup(availability) => return self.render_setup(availability),
+        let screen: AnyElement = match state {
+            PanelState::Checking => self.centered_line("Checking for Xcode and the simulator runtime…"),
+            PanelState::Setup(availability) => self.render_setup(availability),
             PanelState::Empty { error } => self.render_empty(error.as_deref(), cx),
-            PanelState::Attaching => self.status_line("Finding a simulator…"),
-            PanelState::Booting => self.status_line(&format!("Booting {}…", self.device_name(cx))),
-            PanelState::Connecting => self.status_line("Starting stream…"),
+            PanelState::Attaching => self.centered_line("Finding a simulator…"),
+            PanelState::Booting => self.centered_line(&format!("Booting {}…", self.device_name(cx))),
+            PanelState::Connecting => self.centered_line("Starting stream…"),
             // P6 replaces this with the live screen.
-            PanelState::Streaming => self.status_line(&format!("{} is connected.", self.device_name(cx))),
-            PanelState::Disconnected { reason } => self.render_stopped(reason, "Reconnect", cx),
-            PanelState::Error { message, xcode_hint } => {
-                let body = self.render_stopped(message, "Retry", cx);
-                if *xcode_hint {
-                    div().flex().flex_col().gap(px(density.gap_inline)).child(body).child(self.xcode_hint()).into_any_element()
-                } else {
-                    body
-                }
-            }
+            PanelState::Streaming => self.centered_line(&format!("{} is connected.", self.device_name(cx))),
+            PanelState::Disconnected { reason } => self.render_stopped(reason, "Reconnect", false, cx),
+            PanelState::Error { message, xcode_hint } => self.render_stopped(message, "Retry", *xcode_hint, cx),
         };
         div()
             .flex()
@@ -56,28 +45,13 @@ impl SimulatorPanel {
             .min_h(px(0.))
             .w_full()
             .items_center()
-            .p(px(density.pad_panel))
-            .child(self.bezel().child(content))
+            .gap(px(density.pad_panel))
+            .px(px(density.pad_panel))
+            .pt(px(density.pad_panel * 2.0))
+            .pb(px(density.pad_panel))
+            .child(phone(self.theme, screen))
+            .child(self.render_toolbar(state, cx))
             .into_any_element()
-    }
-
-    fn bezel(&self) -> Div {
-        let theme = self.theme;
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(self.density.pad_panel))
-            .w_full()
-            .max_w(px(BEZEL_MAX_W))
-            .flex_1()
-            .min_h(px(0.))
-            .p(px(self.density.pad_panel * 2.0))
-            .rounded(px(BEZEL_RADIUS))
-            .border(px(BEZEL_FRAME))
-            .border_color(theme.border_active)
-            .bg(theme.bg_base)
     }
 
     fn device_name(&self, cx: &App) -> String {
@@ -89,68 +63,87 @@ impl SimulatorPanel {
         div().w_full().text_center().text_size(px(size)).text_color(color).child(s.into())
     }
 
-    fn status_line(&self, s: &str) -> AnyElement {
-        self.text(s.to_owned(), self.typography.t_body_sm, self.theme.fg_muted).into_any_element()
+    /// Screen padding and the top/bottom split every screen shares.
+    fn screen(&self) -> Div {
+        let pad = self.density.pad_panel * 2.0;
+        div().flex().flex_col().size_full().px(px(pad)).pt(px(pad * 2.0)).pb(px(pad))
+    }
+
+    fn centered_line(&self, s: &str) -> AnyElement {
+        self.screen()
+            .items_center()
+            .justify_center()
+            .child(self.text(s.to_owned(), self.typography.t_body_md, self.theme.fg_muted))
+            .into_any_element()
+    }
+
+    fn heading(&self, s: &'static str) -> Div {
+        let ty = &self.typography;
+        self.text(s, ty.t_display, self.theme.fg_base).font_weight(ty.w_semibold)
     }
 
     fn render_empty(&self, error: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
-        let (theme, ty) = (self.theme, self.typography.clone());
+        let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
         let devices = self.devices(cx);
         // Only once a listing has landed does "none booted" mean it.
         let listed = self.hub.as_ref().is_some_and(|h| h.read(cx).devices_listed());
         let none_booted = listed && !devices.iter().any(|d| d.state == DeviceState::Booted);
-        let mut col = div()
+        let mut top = div()
             .flex()
             .flex_col()
-            .items_center()
-            .gap(px(self.density.gap_inline))
+            .gap(px(density.gap_inline))
             .w_full()
-            .child(Icon::default().path("icons/smartphone.svg").size(px(EMPTY_ICON)).text_color(theme.fg_subtle))
-            .child(
-                self.text("Attach a simulator so agents can see your app", ty.t_body_lg, theme.fg_base)
-                    .font_weight(ty.w_semibold),
-            )
+            .child(self.heading("Attach a simulator so agents can see your app"))
             .child(self.text(
                 "Agents will control this simulator and take screenshots of its entire screen.",
-                ty.t_body_sm,
+                ty.t_body_md,
                 theme.fg_muted,
             ))
-            .child(self.text("Shut-down devices boot automatically.", ty.t_body_sm, theme.fg_muted));
+            .child(self.text("Shut-down devices boot automatically.", ty.t_body_md, theme.fg_muted))
+            .child(div().h(px(density.pad_panel)))
+            .child(self.check_card(true, "Xcode and Simulator installed", None));
         if none_booted {
-            col = col.child(self.text(
+            top = top.child(self.text(
                 "No booted simulator found. Boot one with `xcrun simctl boot <device>`.",
-                ty.t_sub_label,
+                ty.t_body_sm,
                 theme.fg_subtle,
             ));
         }
-        col = col.child(self.check_row(true, "Xcode and Simulator installed", None));
         if let Some(error) = error {
-            col = col.child(self.text(error.to_owned(), ty.t_body_sm, theme.status_error));
+            top = top.child(self.text(error.to_owned(), ty.t_body_sm, theme.status_error));
         }
-        col.child(self.text("Xcode is a trademark of Apple Inc.", ty.t_sub_label, theme.fg_subtle))
+        self.screen()
+            .child(top)
+            .child(div().flex_1())
+            .child(self.text(TRADEMARK, ty.t_sub_label, theme.fg_subtle))
+            .child(div().h(px(density.pad_panel)))
             .child(self.attach_split_button(devices, cx))
             .into_any_element()
     }
 
-    /// Primary "Attach simulator" (the automatic pick) + a chevron opening
-    /// the device menu.
+    /// Full width: primary "Attach simulator" (the automatic pick) + a
+    /// chevron segment opening the device menu.
     fn attach_split_button(&self, devices: Vec<oximux_simulator::DeviceInfo>, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
         div()
             .flex()
             .flex_row()
+            .w_full()
             .gap(px(1.0))
             .child(
-                Button::new("sim-attach")
-                    .primary()
-                    .small()
-                    .label("Attach simulator")
-                    .on_click(cx.listener(|this, _, _window, cx| this.attach(None, cx))),
+                div().flex_1().child(
+                    Button::new("sim-attach")
+                        .primary()
+                        .large()
+                        .w_full()
+                        .label("Attach simulator")
+                        .on_click(cx.listener(|this, _, _window, cx| this.attach(None, cx))),
+                ),
             )
             .child(
                 Button::new("sim-attach-pick")
                     .primary()
-                    .small()
+                    .large()
                     .icon(Icon::default().path("icons/chevron-down.svg"))
                     .tooltip("Choose a simulator")
                     .dropdown_menu(move |menu, _window, _cx| device_menu(menu, &devices, None, weak.clone())),
@@ -158,44 +151,38 @@ impl SimulatorPanel {
             .into_any_element()
     }
 
-    fn render_stopped(&self, reason: &str, action: &'static str, cx: &mut Context<Self>) -> AnyElement {
-        let (theme, ty) = (self.theme, self.typography.clone());
-        div()
-            .flex()
-            .flex_col()
+    fn render_stopped(&self, reason: &str, action: &'static str, xcode_hint: bool, cx: &mut Context<Self>) -> AnyElement {
+        let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
+        let mut col = self
+            .screen()
             .items_center()
-            .gap(px(self.density.gap_inline))
-            .child(self.text(reason.to_owned(), ty.t_body_sm, theme.fg_muted))
+            .justify_center()
+            .gap(px(density.pad_panel))
+            .child(self.text(reason.to_owned(), ty.t_body_md, theme.fg_muted))
             .child(
                 Button::new("sim-reconnect")
                     .outline()
                     .small()
                     .label(action)
                     .on_click(cx.listener(|this, _, _window, cx| this.reconnect(cx))),
-            )
-            .into_any_element()
+            );
+        if xcode_hint {
+            col = col
+                .child(self.text("This version of Xcode is supported on a best-effort basis.", ty.t_body_sm, theme.status_warn))
+                .child(self.text("If the simulator doesn't stream, select Xcode 26:", ty.t_body_sm, theme.fg_muted))
+                .child(
+                    div()
+                        .font_family(ty.family_mono.clone())
+                        .text_size(px(ty.t_sub_label))
+                        .text_color(theme.fg_base)
+                        .child("sudo xcode-select -s /Applications/Xcode-26.app"),
+                );
+        }
+        col.into_any_element()
     }
 
-    fn xcode_hint(&self) -> AnyElement {
-        let (theme, ty) = (self.theme, self.typography.clone());
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(self.density.gap_inline))
-            .child(self.text("This version of Xcode is supported on a best-effort basis.", ty.t_body_sm, theme.status_warn))
-            .child(self.text("If the simulator doesn't stream, select Xcode 26:", ty.t_body_sm, theme.fg_muted))
-            .child(
-                div()
-                    .font_family(ty.family_mono.clone())
-                    .text_size(px(ty.t_sub_label))
-                    .text_color(theme.fg_base)
-                    .child("sudo xcode-select -s /Applications/Xcode-26.app"),
-            )
-            .into_any_element()
-    }
-
-    /// The setup checklist: one row per requirement, live-updated while
-    /// visible (the panel re-checks every few seconds).
+    /// The setup checklist, live-updated while visible (the panel re-checks
+    /// every few seconds), inside the phone like every other state.
     fn render_setup(&self, a: &Availability) -> AnyElement {
         let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
         let xcode_ok = matches!(a.xcode, Xcode::Found { .. });
@@ -203,64 +190,78 @@ impl SimulatorPanel {
             Xcode::Found { version: Some(v), .. } => Some(format!("Version {v}")),
             _ => None,
         };
-        let card = div()
+        let top = div()
             .flex()
             .flex_col()
+            .gap(px(density.gap_inline))
             .w_full()
-            .rounded(px(density.r_card))
-            .border_1()
-            .border_color(theme.border_inactive)
-            .bg(theme.bg_panel_alt)
-            .child(self.check_row(xcode_ok, "Xcode installed", version))
-            .child(self.check_row(a.macos_ok && a.arch_ok, "Apple silicon Mac on macOS 14 or later", None))
-            .child(self.check_row(!a.ios_runtimes.is_empty(), "iOS Simulator runtime installed", None))
-            .child(self.check_row(matches!(a.helper, HelperStatus::Found(_)), "Simulator helper bundled", None));
-        let reason = a.blocking_reason().unwrap_or_default();
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .w_full()
-            .gap(px(density.pad_panel))
-            .p(px(density.pad_panel))
-            .child(self.text("Set up the iOS simulator", ty.t_body_md, theme.fg_base).font_weight(ty.w_semibold))
-            .child(self.text("Progress updates automatically as each step finishes.", ty.t_body_sm, theme.fg_muted))
-            .child(card)
-            .child(self.text(reason, ty.t_body_sm, theme.fg_muted))
-            .child(self.text("Xcode is a trademark of Apple Inc.", ty.t_sub_label, theme.fg_subtle))
+            .child(self.heading("Set up the iOS simulator"))
+            .child(self.text("Progress updates automatically as each step finishes.", ty.t_body_md, theme.fg_muted))
+            .child(div().h(px(density.pad_panel)))
+            .child(self.check_card(xcode_ok, "Xcode installed", version))
+            .child(self.check_card(a.macos_ok && a.arch_ok, "Apple silicon Mac on macOS 14 or later", None))
+            .child(self.check_card(!a.ios_runtimes.is_empty(), "iOS Simulator runtime installed", None))
+            .child(self.check_card(matches!(a.helper, HelperStatus::Found(_)), "Simulator helper bundled", None))
+            .child(self.text(a.blocking_reason().unwrap_or_default(), ty.t_body_sm, theme.fg_muted));
+        self.screen()
+            .child(top)
+            .child(div().flex_1())
+            .child(self.text(TRADEMARK, ty.t_sub_label, theme.fg_subtle))
+            .child(div().h(px(density.pad_panel)))
             .child(
-                div().flex().justify_center().child(
-                    Button::new("sim-open-xcode").primary().small().label("Open Xcode").on_click(|_, _window, _cx| open_xcode()),
-                ),
+                Button::new("sim-open-xcode")
+                    .primary()
+                    .large()
+                    .w_full()
+                    .label("Open Xcode")
+                    .on_click(|_, _window, _cx| open_xcode()),
             )
             .into_any_element()
     }
 
-    fn check_row(&self, ok: bool, label: &'static str, detail: Option<String>) -> AnyElement {
+    /// One requirement as a rounded card: a filled status-ok disc with a
+    /// check when met, an empty ring when not.
+    fn check_card(&self, ok: bool, label: &'static str, detail: Option<String>) -> AnyElement {
         let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
-        let (icon, color) = if ok { ("icons/check.svg", theme.status_ok) } else { ("icons/circle.svg", theme.fg_subtle) };
-        let mut row = div()
+        let mark = if ok {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(CHECK_DISC))
+                .rounded_full()
+                .bg(theme.status_ok)
+                .child(Icon::default().path("icons/check.svg").size(px(CHECK_DISC * 0.65)).text_color(theme.bg_base))
+        } else {
+            div().size(px(CHECK_DISC)).rounded_full().border_1().border_color(theme.fg_subtle)
+        };
+        let mut card = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(density.gap_inline))
+            .gap(px(density.pad_panel))
             .w_full()
-            .px(px(density.pad_panel))
-            .py(px(density.pad_row))
-            .child(Icon::default().path(icon).size(px(14.0)).text_color(color))
+            .px(px(density.pad_panel * 1.5))
+            .py(px(density.pad_panel * 1.5))
+            .rounded(px(density.r_card))
+            .bg(theme.bg_panel_alt)
+            .child(mark.flex_none())
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(ty.t_body_sm))
-                    .text_color(if ok { theme.fg_base } else { theme.fg_muted })
+                    .text_size(px(ty.t_body_md))
+                    .text_color(if ok { theme.fg_muted } else { theme.fg_base })
                     .child(label),
             );
         if let Some(detail) = detail {
-            row = row.child(div().text_size(px(ty.t_sub_label)).text_color(theme.fg_subtle).child(detail));
+            card = card.child(div().text_size(px(ty.t_sub_label)).text_color(theme.fg_subtle).child(detail));
         }
-        row.into_any_element()
+        card.into_any_element()
     }
 }
+
+/// Size of a checklist card's status disc.
+const CHECK_DISC: f32 = 18.0;
 
 /// Open Xcode (Window › Devices is not scriptable). The `open` child is
 /// reaped on a short-lived thread so it never lingers as a zombie.

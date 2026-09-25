@@ -94,6 +94,6 @@ fn the_simulator_tab_trails_the_row_only_when_the_window_has_a_panel() {
         assert_eq!(with.last(), Some(&RightTab::Simulator));
         assert_eq!(with.len(), without.len() + 1);
     }
-    assert_eq!(RightTab::Simulator.title(), "iOS Simulator");
+    assert_eq!(RightTab::Simulator.title(), "iOS Simulator (Beta)");
     assert_eq!(RightTab::Simulator.icon_path(), "icons/smartphone.svg");
 }

@@ -113,7 +113,7 @@ impl RightTab {
             RightTab::SourceControl => "Source Control",
             RightTab::History => "Session History",
             RightTab::Ports => "Ports",
-            RightTab::Simulator => "iOS Simulator",
+            RightTab::Simulator => "iOS Simulator (Beta)",
         }
     }
 }

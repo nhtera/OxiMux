@@ -83,7 +83,7 @@ impl WorkspaceRoot {
             return;
         }
         self.simulator.visible = visible;
-        let window_w = f32::from(window.viewport_size().width);
+        let (window_w, window_h) = (f32::from(window.viewport_size().width), f32::from(window.viewport_size().height));
         let bump = visible && !self.simulator.bumped;
         let restore = !visible && self.simulator.maximized;
         if bump {
@@ -95,12 +95,13 @@ impl WorkspaceRoot {
         cx.defer(move |cx| {
             if bump || restore {
                 rs.update(cx, |sidebar, cx| {
-                    let width = if bump {
-                        px(widths::first_select_width(f32::from(sidebar.panel_width()), window_w))
-                    } else {
-                        restored_width(sidebar, window_w)
-                    };
-                    sidebar.set_panel_width_transient(width, cx);
+                    if restore {
+                        sidebar.set_fill(false, cx);
+                    }
+                    if bump {
+                        let width = widths::first_select_width(f32::from(sidebar.panel_width()), window_w, window_h);
+                        sidebar.set_panel_width_transient(px(width), cx);
+                    }
                 });
             }
             panel.update(cx, |panel, cx| {
@@ -123,25 +124,14 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
-    /// ⤢: widen to everything but the centre reserve, or restore the last
-    /// persisted width.
-    pub(crate) fn toggle_simulator_maximized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// "Fill" takes the whole content area (the centre panes step aside,
+    /// unmeasured, so terminals keep their size); "Split" gives it back.
+    pub(crate) fn toggle_simulator_maximized(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let (Some(rs), Some(panel)) = (self.right_sidebar.clone(), self.simulator.panel.clone()) else { return };
-        let window_w = f32::from(window.viewport_size().width);
-        let maximize = !self.simulator.maximized;
-        self.simulator.maximized = maximize;
-        rs.update(cx, |sidebar, cx| {
-            let width = if maximize { px(widths::maximized_width(window_w)) } else { restored_width(sidebar, window_w) };
-            sidebar.set_panel_width_transient(width, cx);
-        });
-        panel.update(cx, |panel, cx| panel.set_maximized(maximize, cx));
+        let fill = !self.simulator.maximized;
+        self.simulator.maximized = fill;
+        rs.update(cx, |sidebar, cx| sidebar.set_fill(fill, cx));
+        panel.update(cx, |panel, cx| panel.set_maximized(fill, cx));
         cx.notify();
     }
-}
-
-/// The width "restore" returns to: the last persisted (user-dragged) width,
-/// never narrower than a phone needs.
-fn restored_width(sidebar: &crate::shell::right_sidebar::RightSidebar, window_w: f32) -> gpui::Pixels {
-    let persisted = sidebar.persisted_panel_width(window_w).map(f32::from).unwrap_or(0.0);
-    px(widths::first_select_width(persisted, window_w))
 }

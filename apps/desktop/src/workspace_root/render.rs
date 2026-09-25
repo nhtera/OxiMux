@@ -304,13 +304,16 @@ impl Render for WorkspaceRoot {
                 .child(body)
         };
 
+        // The simulator's "Fill": the right column takes the centre's place.
+        let right_fills = right_open && self.right_sidebar.as_ref().is_some_and(|rs| rs.read(cx).fill);
         let right_column = match (self.right_sidebar.clone(), right_open) {
             (Some(sidebar), true) => Some(
                 div()
                     .flex()
                     .flex_col()
                     .h_full()
-                    .flex_shrink_0()
+                    .when(right_fills, |d| d.flex_1().min_w(px(0.)))
+                    .when(!right_fills, |d| d.flex_shrink_0())
                     .child(top_bar::right_header(right_column_tabs, theme, density))
                     .child(sidebar),
             ),
@@ -321,7 +324,9 @@ impl Render for WorkspaceRoot {
         if let Some(col) = left_column {
             row = row.child(col);
         }
-        row = row.child(center_column);
+        if !right_fills {
+            row = row.child(center_column);
+        }
         if let Some(col) = right_column {
             row = row.child(col);
         }

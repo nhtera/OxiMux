@@ -32,38 +32,15 @@ impl SimulatorPanel {
             .border_b_1()
             .border_color(theme.border_inactive)
             .child(
+                // Plain title, as in the reference; "Beta" rides on the tab's
+                // tooltip ("iOS Simulator (Beta)").
                 div()
                     .text_size(px(ty.t_body_md))
-                    .font_weight(ty.w_semibold)
                     .text_color(theme.fg_base)
                     .child("iOS Simulator"),
             )
-            .child(
-                // Beta: the feature ships as an experiment (validation S1).
-                div()
-                    .px(px(4.0))
-                    .rounded(px(density.r_xs))
-                    .border_1()
-                    .border_color(theme.border_inactive)
-                    .text_size(px(ty.t_label_caps))
-                    .text_color(theme.fg_muted)
-                    .child("BETA"),
-            )
             .child(div().flex_1())
-            .child(
-                Button::new("sim-maximize")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::default().path(if self.is_maximized() {
-                        "icons/minimize-2.svg"
-                    } else {
-                        "icons/maximize-2.svg"
-                    }))
-                    .tooltip(if self.is_maximized() { "Restore width" } else { "Maximize" })
-                    .on_click(|_, window: &mut Window, cx: &mut App| {
-                        window.dispatch_action(Box::new(ToggleSimulatorMaximized), cx)
-                    }),
-            )
+            .child(self.render_layout_button())
             .child(
                 Button::new("sim-close")
                     .ghost()
@@ -85,6 +62,31 @@ impl SimulatorPanel {
             header = header.child(self.render_stream_row(cx));
         }
         header.into_any_element()
+    }
+
+    /// ⤢ opens the layout popover: "Fill" takes the whole content area,
+    /// "Split" sits beside the centre panes. (Moving the panel to another
+    /// edge is not offered: the sidebar lives on the right.)
+    fn render_layout_button(&self) -> AnyElement {
+        let fill = self.is_maximized();
+        Button::new("sim-layout")
+            .ghost()
+            .xsmall()
+            .icon(Icon::default().path(if fill { "icons/minimize-2.svg" } else { "icons/maximize-2.svg" }))
+            .dropdown_menu(move |menu, _window, _cx| {
+                menu.label("Fill and arrange")
+                    .item(PopupMenuItem::new("Fill").checked(fill).on_click(move |_, window, cx| {
+                        if !fill {
+                            window.dispatch_action(Box::new(ToggleSimulatorMaximized), cx);
+                        }
+                    }))
+                    .item(PopupMenuItem::new("Split").checked(!fill).on_click(move |_, window, cx| {
+                        if fill {
+                            window.dispatch_action(Box::new(ToggleSimulatorMaximized), cx);
+                        }
+                    }))
+            })
+            .into_any_element()
     }
 
     fn render_device_row(&self, udid: DeviceId, cx: &mut Context<Self>) -> AnyElement {

@@ -25,8 +25,10 @@ use super::state::{self, Inputs, PanelState};
 
 pub(crate) use stream_row::settings;
 
+mod bezel;
 mod body;
 mod header;
+mod toolbar;
 mod stream_row;
 #[cfg(test)]
 mod tests;
