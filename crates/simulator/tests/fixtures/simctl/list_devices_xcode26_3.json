@@ -1,0 +1,366 @@
+{
+  "devices" : {
+    "com.apple.CoreSimulator.SimRuntime.iOS-17-0" : [
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/4DB6F23B-A9CC-4EE7-950A-8122E3A58389\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/4DB6F23B-A9CC-4EE7-950A-8122E3A58389",
+        "udid" : "4DB6F23B-A9CC-4EE7-950A-8122E3A58389",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state" : "Shutdown",
+        "name" : "iPhone 15 Pro"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/F3C6A60F-003E-40E1-BFE7-1DB674569CF6\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/F3C6A60F-003E-40E1-BFE7-1DB674569CF6",
+        "udid" : "F3C6A60F-003E-40E1-BFE7-1DB674569CF6",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro-Max",
+        "state" : "Shutdown",
+        "name" : "iPhone 15 Pro Max"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/19917695-F1E4-4A15-AAB5-7E83E28D17AD\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/19917695-F1E4-4A15-AAB5-7E83E28D17AD",
+        "udid" : "19917695-F1E4-4A15-AAB5-7E83E28D17AD",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-15",
+        "state" : "Shutdown",
+        "name" : "iPhone 15"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/FC7B1B8C-069E-4FE0-91EF-9A9631A71738\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/FC7B1B8C-069E-4FE0-91EF-9A9631A71738",
+        "udid" : "FC7B1B8C-069E-4FE0-91EF-9A9631A71738",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Plus",
+        "state" : "Shutdown",
+        "name" : "iPhone 15 Plus"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/4A4C4657-3AA3-4EC4-9265-8CF0BAA64E03\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/4A4C4657-3AA3-4EC4-9265-8CF0BAA64E03",
+        "udid" : "4A4C4657-3AA3-4EC4-9265-8CF0BAA64E03",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation",
+        "state" : "Shutdown",
+        "name" : "iPhone SE (3rd generation)"
+      },
+      {
+        "lastBootedAt" : "2024-12-17T20:52:24Z",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/787E3EE8-5586-4696-B1FD-64157C2694DE\/data",
+        "dataPathSize" : 2736226304,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/787E3EE8-5586-4696-B1FD-64157C2694DE",
+        "udid" : "787E3EE8-5586-4696-B1FD-64157C2694DE",
+        "isAvailable" : false,
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "logPathSize" : 77824,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-13",
+        "state" : "Shutdown",
+        "name" : "iPhone 13"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/3F6EFDD4-831B-4300-A041-F5602F916188\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/3F6EFDD4-831B-4300-A041-F5602F916188",
+        "udid" : "3F6EFDD4-831B-4300-A041-F5602F916188",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-4th-generation-8GB",
+        "state" : "Shutdown",
+        "name" : "iPad Pro (11-inch) (4th generation)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/FC6E9AF7-13E3-4CD3-9D8E-32B2338CBC24\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/FC6E9AF7-13E3-4CD3-9D8E-32B2338CBC24",
+        "udid" : "FC6E9AF7-13E3-4CD3-9D8E-32B2338CBC24",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-12-9-inch-6th-generation-8GB",
+        "state" : "Shutdown",
+        "name" : "iPad Pro (12.9-inch) (6th generation)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/52CE2E2D-C6A7-4C97-9F1A-66377484C15D\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/52CE2E2D-C6A7-4C97-9F1A-66377484C15D",
+        "udid" : "52CE2E2D-C6A7-4C97-9F1A-66377484C15D",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-10th-generation",
+        "state" : "Shutdown",
+        "name" : "iPad (10th generation)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/73C14AD5-1934-4CED-B5E4-88D24CE1C1CA\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/73C14AD5-1934-4CED-B5E4-88D24CE1C1CA",
+        "udid" : "73C14AD5-1934-4CED-B5E4-88D24CE1C1CA",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Air-5th-generation",
+        "state" : "Shutdown",
+        "name" : "iPad Air (5th generation)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/2149D27B-3683-4FE2-BC54-E8C4DEEF8709\/data",
+        "dataPathSize" : 13258752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/2149D27B-3683-4FE2-BC54-E8C4DEEF8709",
+        "udid" : "2149D27B-3683-4FE2-BC54-E8C4DEEF8709",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-mini-6th-generation",
+        "state" : "Shutdown",
+        "name" : "iPad mini (6th generation)"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-18-2" : [
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/B6D5837D-75B1-4B07-A8D6-313771C7D8B7\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/B6D5837D-75B1-4B07-A8D6-313771C7D8B7",
+        "udid" : "B6D5837D-75B1-4B07-A8D6-313771C7D8B7",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro",
+        "state" : "Shutdown",
+        "name" : "iPhone 16 Pro"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/D62CBF98-599E-4DDA-827E-BC9DAB86B8A2\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/D62CBF98-599E-4DDA-827E-BC9DAB86B8A2",
+        "udid" : "D62CBF98-599E-4DDA-827E-BC9DAB86B8A2",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro-Max",
+        "state" : "Shutdown",
+        "name" : "iPhone 16 Pro Max"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/32D0E4BD-483A-41E4-B26A-D3A55F9A634A\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/32D0E4BD-483A-41E4-B26A-D3A55F9A634A",
+        "udid" : "32D0E4BD-483A-41E4-B26A-D3A55F9A634A",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16",
+        "state" : "Shutdown",
+        "name" : "iPhone 16"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/24694555-07D8-4012-9006-596256BA6E8B\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/24694555-07D8-4012-9006-596256BA6E8B",
+        "udid" : "24694555-07D8-4012-9006-596256BA6E8B",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Plus",
+        "state" : "Shutdown",
+        "name" : "iPhone 16 Plus"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/5DF7D57A-4293-40E8-90FE-80391E1029CE\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/5DF7D57A-4293-40E8-90FE-80391E1029CE",
+        "udid" : "5DF7D57A-4293-40E8-90FE-80391E1029CE",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation",
+        "state" : "Shutdown",
+        "name" : "iPhone SE (3rd generation)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/995CBBB5-65A8-44FB-B42F-DD0680C5ACDE\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/995CBBB5-65A8-44FB-B42F-DD0680C5ACDE",
+        "udid" : "995CBBB5-65A8-44FB-B42F-DD0680C5ACDE",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M4-8GB",
+        "state" : "Shutdown",
+        "name" : "iPad Pro 11-inch (M4)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/E40B01D4-8B40-48BD-BC49-F756CBAD8DFC\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/E40B01D4-8B40-48BD-BC49-F756CBAD8DFC",
+        "udid" : "E40B01D4-8B40-48BD-BC49-F756CBAD8DFC",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M4-8GB",
+        "state" : "Shutdown",
+        "name" : "iPad Pro 13-inch (M4)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/C6791816-1F2C-41C9-946C-E6C4ED697F40\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/C6791816-1F2C-41C9-946C-E6C4ED697F40",
+        "udid" : "C6791816-1F2C-41C9-946C-E6C4ED697F40",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M2",
+        "state" : "Shutdown",
+        "name" : "iPad Air 11-inch (M2)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/A7203973-8BD9-4F0F-9F0F-278B3DF279AC\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/A7203973-8BD9-4F0F-9F0F-278B3DF279AC",
+        "udid" : "A7203973-8BD9-4F0F-9F0F-278B3DF279AC",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Air-13-inch-M2",
+        "state" : "Shutdown",
+        "name" : "iPad Air 13-inch (M2)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/62C07FED-9E81-46D6-B233-7E7EF2BC831D\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/62C07FED-9E81-46D6-B233-7E7EF2BC831D",
+        "udid" : "62C07FED-9E81-46D6-B233-7E7EF2BC831D",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-mini-A17-Pro",
+        "state" : "Shutdown",
+        "name" : "iPad mini (A17 Pro)"
+      },
+      {
+        "availabilityError" : "runtime profile not found using \"System\" match policy",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/3C75F669-1AA4-48B4-8223-A47C82D2AB79\/data",
+        "dataPathSize" : 16408576,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/3C75F669-1AA4-48B4-8223-A47C82D2AB79",
+        "udid" : "3C75F669-1AA4-48B4-8223-A47C82D2AB79",
+        "isAvailable" : false,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-10th-generation",
+        "state" : "Shutdown",
+        "name" : "iPad (10th generation)"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-3" : [
+      {
+        "lastBootedAt" : "2026-09-25T14:21:14Z",
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3\/data",
+        "dataPathSize" : 4692938752,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3",
+        "udid" : "81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3",
+        "isAvailable" : true,
+        "logPathSize" : 217088,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
+        "state" : "Booted",
+        "name" : "iPhone 17 Pro"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/C46299D9-CEC5-4CC4-BA9F-CBFB57CA02AE\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/C46299D9-CEC5-4CC4-BA9F-CBFB57CA02AE",
+        "udid" : "C46299D9-CEC5-4CC4-BA9F-CBFB57CA02AE",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max",
+        "state" : "Shutdown",
+        "name" : "iPhone 17 Pro Max"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/D4AE637C-5493-49EC-9E58-B301C988B616\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/D4AE637C-5493-49EC-9E58-B301C988B616",
+        "udid" : "D4AE637C-5493-49EC-9E58-B301C988B616",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-Air",
+        "state" : "Shutdown",
+        "name" : "iPhone Air"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/E0E0A1DD-2DAC-448E-86D3-07B7F809BCD2\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/E0E0A1DD-2DAC-448E-86D3-07B7F809BCD2",
+        "udid" : "E0E0A1DD-2DAC-448E-86D3-07B7F809BCD2",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-17",
+        "state" : "Shutdown",
+        "name" : "iPhone 17"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/D04F6442-E897-48D4-B38D-ABA0F31889E5\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/D04F6442-E897-48D4-B38D-ABA0F31889E5",
+        "udid" : "D04F6442-E897-48D4-B38D-ABA0F31889E5",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16e",
+        "state" : "Shutdown",
+        "name" : "iPhone 16e"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/EE0A84EC-6804-4E1F-A1ED-A9F8C3E9F114\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/EE0A84EC-6804-4E1F-A1ED-A9F8C3E9F114",
+        "udid" : "EE0A84EC-6804-4E1F-A1ED-A9F8C3E9F114",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M5-12GB",
+        "state" : "Shutdown",
+        "name" : "iPad Pro 13-inch (M5)"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/1B055B3F-1AC1-4E9D-8CC1-F1F761C54B00\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/1B055B3F-1AC1-4E9D-8CC1-F1F761C54B00",
+        "udid" : "1B055B3F-1AC1-4E9D-8CC1-F1F761C54B00",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-11-inch-M5-12GB",
+        "state" : "Shutdown",
+        "name" : "iPad Pro 11-inch (M5)"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/8312267A-33A1-465D-86E4-B2A1FFF845B2\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/8312267A-33A1-465D-86E4-B2A1FFF845B2",
+        "udid" : "8312267A-33A1-465D-86E4-B2A1FFF845B2",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-mini-A17-Pro",
+        "state" : "Shutdown",
+        "name" : "iPad mini (A17 Pro)"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/261BB387-E844-46F7-91A3-4B94B9795607\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/261BB387-E844-46F7-91A3-4B94B9795607",
+        "udid" : "261BB387-E844-46F7-91A3-4B94B9795607",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-A16",
+        "state" : "Shutdown",
+        "name" : "iPad (A16)"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/4488037F-F177-4862-89A5-2E6D218B91B4\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/4488037F-F177-4862-89A5-2E6D218B91B4",
+        "udid" : "4488037F-F177-4862-89A5-2E6D218B91B4",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Air-13-inch-M3",
+        "state" : "Shutdown",
+        "name" : "iPad Air 13-inch (M3)"
+      },
+      {
+        "dataPath" : "\/Users\/oximux\/Library\/Developer\/CoreSimulator\/Devices\/E9B14E60-3848-46CF-9B77-1F78C0A4A96E\/data",
+        "dataPathSize" : 18337792,
+        "logPath" : "\/Users\/oximux\/Library\/Logs\/CoreSimulator\/E9B14E60-3848-46CF-9B77-1F78C0A4A96E",
+        "udid" : "E9B14E60-3848-46CF-9B77-1F78C0A4A96E",
+        "isAvailable" : true,
+        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M3",
+        "state" : "Shutdown",
+        "name" : "iPad Air 11-inch (M3)"
+      }
+    ]
+  }
+}

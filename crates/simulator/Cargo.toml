@@ -1,0 +1,31 @@
+[package]
+name = "oximux-simulator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# gpui-free core of the iOS Simulator panel: the stdio protocol spoken with
+# `oximux-sim-helper` (released by the nhtera/serve-sim fork), helper process
+# supervision, `simctl` device discovery, availability checks, and the pure
+# keyboard / geometry / gesture / AX math. No sockets, no tokio: blocking calls
+# are plain functions meant for a background executor.
+
+[dependencies]
+base64.workspace = true
+fd-lock = "4"
+oximux-no-window.workspace = true
+oximux-proc-tree.workspace = true
+oximux-sibling-binary.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

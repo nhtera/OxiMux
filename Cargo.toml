@@ -9,6 +9,7 @@ members = [
     "crates/job-object",
     "crates/no-window",
     "crates/sibling-binary",
+    "crates/simulator",
     "crates/shell-env",
     "crates/dictation",
     "crates/pty",
@@ -71,6 +72,8 @@ oximux-job-object = { path = "crates/job-object" }
 # other dependency.
 oximux-no-window = { path = "crates/no-window" }
 oximux-sibling-binary = { path = "crates/sibling-binary" }
+# iOS Simulator panel core: helper protocol + supervision, simctl, geometry.
+oximux-simulator = { path = "crates/simulator" }
 # Which shell a terminal runs, and the locale it needs. Same sharing problem
 # again, and here the duplication was already real: both consumers carried a
 # byte-identical copy of the locale fix.

@@ -8702,6 +8702,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-simulator"
+version = "0.1.29"
+dependencies = [
+ "base64",
+ "fd-lock",
+ "libc",
+ "oximux-no-window",
+ "oximux-proc-tree",
+ "oximux-sibling-binary",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "oximux-single-instance"
 version = "0.1.29"
 dependencies = [
