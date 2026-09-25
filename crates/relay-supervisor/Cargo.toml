@@ -19,6 +19,7 @@ oximux-relay-client = { workspace = true }
 oximux-relay-proto = { workspace = true }
 oximux-owner-only = { workspace = true }
 oximux-no-window = { workspace = true }
+oximux-sibling-binary = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

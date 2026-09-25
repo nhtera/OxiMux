@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use oximux_relay_client::{ClientError, RelayClient};
 use oximux_relay_proto::ErrCode;
 use thiserror::Error;
@@ -333,36 +333,15 @@ fn write_token(path: &Path, token: &str) -> Result<()> {
 //    (`OxiMux.app/Contents/MacOS/oximux` → same dir +
 //    `/oximux-relay`).
 //
-// The name carries `EXE_SUFFIX` because the sibling is `oximux-relay.exe` on
-// Windows. Spawning would have survived the omission — `CreateProcessW` appends
-// `.exe` to an extensionless name itself — but the `exists()` gate below would
-// not, and it fails in the quietest possible way: the supervisor reports no
+// The name carries `EXE_SUFFIX` (added by `oximux_sibling_binary`) because
+// the sibling is `oximux-relay.exe` on Windows. Spawning would have survived
+// the omission — `CreateProcessW` appends `.exe` to an extensionless name
+// itself — but the `exists()` gate would not, and it fails in the quietest possible way: the supervisor reports no
 // relay binary, the app falls back to in-process PTYs, and the only visible
 // symptom is that terminals stop surviving a relaunch, which is the entire
 // reason the daemon exists.
 pub fn resolve_binary_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("OXIMUX_RELAY_BINARY") {
-        let p = PathBuf::from(p);
-        if !p.exists() {
-            bail!("OXIMUX_RELAY_BINARY={} does not exist", p.display());
-        }
-        return Ok(p);
-    }
-    let me = std::env::current_exe().context("current_exe")?;
-    let parent = me.parent().context("current_exe has no parent")?;
-    let candidate = parent.join(relay_binary_name());
-    if !candidate.exists() {
-        bail!(
-            "expected oximux-relay binary at {} (override with OXIMUX_RELAY_BINARY)",
-            candidate.display()
-        );
-    }
-    Ok(candidate)
-}
-
-/// The daemon's file name on this platform — `oximux-relay`, `.exe` and all.
-fn relay_binary_name() -> String {
-    format!("oximux-relay{}", std::env::consts::EXE_SUFFIX)
+    oximux_sibling_binary::locate("oximux-relay", Some("OXIMUX_RELAY_BINARY")).map_err(Into::into)
 }
 
 fn spawn_detached(
@@ -514,7 +493,7 @@ mod tests {
         // one actually on disk. Asserting against `EXE_SUFFIX` rather than a
         // literal keeps this a statement about the platform contract instead of
         // a second place to hardcode ".exe".
-        let name = relay_binary_name();
+        let name = oximux_sibling_binary::sibling_file_name("oximux-relay");
         assert_eq!(name, format!("oximux-relay{}", std::env::consts::EXE_SUFFIX));
         assert!(name.starts_with("oximux-relay"));
         if cfg!(windows) {

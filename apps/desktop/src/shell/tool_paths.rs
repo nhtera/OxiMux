@@ -22,34 +22,13 @@ pub fn rg_program() -> &'static Path {
 
 /// A sibling executable of the running binary, if it exists and is executable.
 ///
-/// `name` is the *stem*: the extension comes from `EXE_SUFFIX`, which is empty
-/// on macOS and `.exe` on Windows. Without that, a Windows bundle carrying a
-/// perfectly good `rg.exe` fails this lookup, falls back to PATH, and search
-/// breaks on exactly the machines the bundling exists for — with no error, just
-/// "ripgrep missing" in a panel. The fallback name is left bare because a PATH
-/// lookup on Windows appends the extensions in `PATHEXT` itself.
+/// `name` is the *stem*: `oximux_sibling_binary` adds `EXE_SUFFIX`, so a
+/// Windows bundle's `rg.exe` is found. The PATH fallback name is left bare
+/// because a PATH lookup on Windows appends the extensions in `PATHEXT` itself.
 fn bundled_sibling(name: &str) -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join(sibling_file_name(name));
-    is_executable(&candidate).then_some(candidate)
-}
-
-/// A helper tool's file name on this platform — `rg`, `.exe` and all.
-fn sibling_file_name(stem: &str) -> String {
-    format!("{stem}{}", std::env::consts::EXE_SUFFIX)
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+    oximux_sibling_binary::locate(name, None)
+        .ok()
+        .filter(|path| oximux_sibling_binary::is_executable(path))
 }
 
 #[cfg(test)]
@@ -76,7 +55,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rg");
         std::fs::write(&path, "not runnable").expect("write");
-        assert!(!is_executable(&path));
+        assert!(!oximux_sibling_binary::is_executable(&path));
     }
 
     /// The bundled sibling is looked for under the platform's executable name.
@@ -84,7 +63,7 @@ mod tests {
     /// even if the suffix were dropped again.
     #[test]
     fn the_sibling_looked_for_carries_the_platform_extension() {
-        let name = sibling_file_name("rg");
+        let name = oximux_sibling_binary::sibling_file_name("rg");
         #[cfg(windows)]
         assert_eq!(name, "rg.exe");
         #[cfg(not(windows))]
@@ -99,6 +78,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wrong = if cfg!(windows) { "rg" } else { "rg.exe" };
         std::fs::write(dir.path().join(wrong), "x").expect("write");
-        assert!(!is_executable(&dir.path().join(sibling_file_name("rg"))));
+        assert!(!oximux_sibling_binary::is_executable(
+            &dir.path().join(oximux_sibling_binary::sibling_file_name("rg"))
+        ));
     }
 }

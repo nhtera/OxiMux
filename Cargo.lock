@@ -8186,6 +8186,7 @@ dependencies = [
  "oximux-remote-proto",
  "oximux-settings",
  "oximux-shell-env",
+ "oximux-sibling-binary",
  "oximux-single-instance",
  "oximux-storage",
  "oximux-syntax",
@@ -8546,6 +8547,7 @@ dependencies = [
  "oximux-owner-only",
  "oximux-relay-client",
  "oximux-relay-proto",
+ "oximux-sibling-binary",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -8690,6 +8692,13 @@ dependencies = [
  "serde",
  "serde_json",
  "which 6.0.3",
+]
+
+[[package]]
+name = "oximux-sibling-binary"
+version = "0.1.29"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

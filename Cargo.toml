@@ -8,6 +8,7 @@ members = [
     "crates/owner-only",
     "crates/job-object",
     "crates/no-window",
+    "crates/sibling-binary",
     "crates/shell-env",
     "crates/dictation",
     "crates/pty",
@@ -69,6 +70,7 @@ oximux-job-object = { path = "crates/job-object" }
 # own crate for the usual reason: the spawn sites span crates that share no
 # other dependency.
 oximux-no-window = { path = "crates/no-window" }
+oximux-sibling-binary = { path = "crates/sibling-binary" }
 # Which shell a terminal runs, and the locale it needs. Same sharing problem
 # again, and here the duplication was already real: both consumers carried a
 # byte-identical copy of the locale fix.

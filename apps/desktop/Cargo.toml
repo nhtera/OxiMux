@@ -19,6 +19,7 @@ oximux-agents = { workspace = true }
 oximux-agent-core = { workspace = true }
 oximux-auto-update = { workspace = true }
 oximux-core = { workspace = true }
+oximux-sibling-binary = { workspace = true }
 oximux-dictation = { workspace = true }
 oximux-editor = { workspace = true }
 oximux-git = { workspace = true }
