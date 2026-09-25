@@ -81,6 +81,7 @@ impl SimulatorPanel {
             )
             .child(
                 Checkbox::new("sim-show-fps")
+                    .xsmall()
                     .label("FPS")
                     .checked(stream.show_fps)
                     .on_click(cx.listener(|this, checked: &bool, _window, cx| {

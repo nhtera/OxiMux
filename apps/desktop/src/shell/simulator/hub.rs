@@ -193,7 +193,13 @@ impl SimulatorHub {
                 hub.availability_in_flight = false;
                 let old = hub.availability.as_ref().map(|a| a.xcode.clone());
                 let changed = old.is_some_and(|old| old != fresh.xcode);
+                let xcode_found = matches!(fresh.xcode, availability::Xcode::Found { .. });
                 hub.availability = Some(fresh);
+                // The device menu's first listing waits on this check (no
+                // `xcrun` before Xcode is known); run it now that it is.
+                if xcode_found && !hub.devices_listed {
+                    hub.refresh_devices(cx);
+                }
                 if changed {
                     for udid in hub.registry.attached_devices() {
                         let effects = hub.registry.reconnect(&udid, true);
