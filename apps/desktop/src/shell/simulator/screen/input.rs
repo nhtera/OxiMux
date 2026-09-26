@@ -54,10 +54,10 @@ impl ScreenView {
     /// The frame's painted rect in window coordinates, if a frame is up.
     fn frame_rect(&self) -> Option<Rect> {
         let bounds = self.bounds.get()?;
-        let size = self.image.as_ref()?.size(0);
+        let (w, h) = self.frame_size()?;
         let fit = geometry::letterbox(
             Size::new(f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height))),
-            Size::new(f64::from(size.width.0), f64::from(size.height.0)),
+            Size::new(w, h),
         );
         Some(Rect::new(f64::from(f32::from(bounds.origin.x)) + fit.x, f64::from(f32::from(bounds.origin.y)) + fit.y, fit.w, fit.h))
     }

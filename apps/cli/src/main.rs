@@ -22,11 +22,12 @@ use clap::Parser as _;
 use cli::{
     Cli, Command, GitCommand, HeartbeatCommand, HostsCommand, ModeCommand, ModelCommand,
     PermitCommand, ProjectsCommand, ScheduleCommand, StateCommand, TeamCommand, TeamReportStatus,
-    TermCommand, WorktreeCommand,
+    TermCommand, WorktreeCommand, SimButtonArg, SimCommand,
 };
 use client::Client;
 use oximux_remote_proto::proto::{
-    CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SIMULATOR_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
+    CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
+    TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
 
@@ -279,6 +280,11 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         Command::Worktree {
             command: WorktreeCommand::Create { branch: Some(_), .. },
         } => Some((CREATE_WORKTREE_BASE_MIN_VERSION, "worktree create --branch")),
+        // v26: Android's buttons. Above the `Sim` arm, which would claim v25.
+        Command::Sim {
+            command: SimCommand::Button { button: SimButtonArg::Back | SimButtonArg::VolumeUp | SimButtonArg::VolumeDown },
+            ..
+        } => Some((SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, "sim button (Android)")),
         // v25: the iOS Simulator.
         Command::Sim { .. } => Some((SIMULATOR_MIN_VERSION, "sim")),
         // v18: the automation surface.
@@ -685,6 +691,10 @@ mod tests {
             (vec!["oximux", "state", "get", "k"], Some(18)),
             (vec!["oximux", "sim", "status"], Some(25)),
             (vec!["oximux", "sim", "--worktree", "/w", "tap", "1", "2"], Some(25)),
+            // Android's buttons need a host that knows them; the iOS ones do not.
+            (vec!["oximux", "sim", "button", "home"], Some(25)),
+            (vec!["oximux", "sim", "button", "back"], Some(26)),
+            (vec!["oximux", "sim", "button", "volume-down"], Some(26)),
             (vec!["oximux", "schedule", "run-once", "sch-1"], Some(17)),
             (vec!["oximux", "worktree", "ls"], Some(16)),
             (vec!["oximux", "transcript", "s1"], Some(16)),
@@ -711,6 +721,9 @@ mod tests {
             vec!["oximux", "sim", "--worktree", "/w", "screenshot", "--full"],
             vec!["oximux", "sim", "screenshot", "--worktree", "/w"],
             vec!["oximux", "sim", "button", "side-button"],
+            vec!["oximux", "sim", "button", "volume-up"],
+            vec!["oximux", "sim", "devices", "--platform", "android"],
+            vec!["oximux", "sim", "attach", "Medium Phone", "--platform", "android"],
             vec!["oximux", "sim", "rotate", "landscape-left"],
             vec!["oximux", "sim", "wait-consent", "--max-wait", "30"],
         ] {
@@ -719,7 +732,8 @@ mod tests {
         for bad in [
             vec!["oximux", "sim", "tap", "10", "20", "--label", "Settings"],
             vec!["oximux", "sim", "tap", "--label", "a", "--id", "b"],
-            vec!["oximux", "sim", "button", "volume-up"],
+            vec!["oximux", "sim", "button", "power-off"],
+            vec!["oximux", "sim", "devices", "--platform", "windows"],
         ] {
             assert!(Cli::try_parse_from(&bad).is_err(), "{bad:?}");
         }

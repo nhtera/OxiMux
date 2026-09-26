@@ -103,6 +103,10 @@ pub enum SimButtonWire {
     Siri,
     SideButton,
     AppSwitcher,
+    // v26: Android's buttons (an iOS device answers `BadInput`).
+    Back,
+    VolumeUp,
+    VolumeDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

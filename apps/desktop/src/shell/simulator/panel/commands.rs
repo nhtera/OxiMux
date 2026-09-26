@@ -11,9 +11,11 @@ use gpui::{Action, Context, Window};
 
 use super::SimulatorPanel;
 use crate::actions::{
-    SimAnnotate, SimDetach, SimHome, SimLock, SimOpenLogs, SimRotateCcw, SimRotateCw, SimScreenshot,
-    SimShutdown, SimToggleKeyboard, SimToggleRecord,
+    SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw, SimRotateCw,
+    SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord,
 };
+use oximux_simulator::Platform;
+
 use crate::shell::simulator::hub::is_udid;
 use crate::shell::simulator::state::PanelState;
 
@@ -21,6 +23,10 @@ use crate::shell::simulator::state::PanelState;
 pub enum SimCommand {
     Home,
     Lock,
+    /// Android only.
+    Back,
+    /// Android only: the app switcher.
+    Recents,
     RotateCw,
     RotateCcw,
     Screenshot,
@@ -38,6 +44,8 @@ impl SimCommand {
         match self {
             Self::Home => Box::new(SimHome),
             Self::Lock => Box::new(SimLock),
+            Self::Back => Box::new(SimBack),
+            Self::Recents => Box::new(SimRecents),
             Self::RotateCw => Box::new(SimRotateCw),
             Self::RotateCcw => Box::new(SimRotateCcw),
             Self::Screenshot => Box::new(SimScreenshot),
@@ -52,7 +60,7 @@ impl SimCommand {
 
     /// Needs the live stream (the helper), not just a booted device.
     fn needs_stream(self) -> bool {
-        matches!(self, Self::Home | Self::Lock | Self::RotateCw | Self::RotateCcw | Self::Annotate | Self::ToggleKeyboard)
+        matches!(self, Self::Home | Self::Lock | Self::Back | Self::Recents | Self::RotateCw | Self::RotateCcw | Self::Annotate | Self::ToggleKeyboard)
     }
 }
 
@@ -87,6 +95,8 @@ impl SimulatorPanel {
         let sent = match command {
             SimCommand::Home => hub.read(cx).home(&udid),
             SimCommand::Lock => hub.read(cx).lock(&udid),
+            SimCommand::Back => hub.read(cx).back(&udid),
+            SimCommand::Recents => hub.read(cx).recents(&udid),
             SimCommand::RotateCw | SimCommand::RotateCcw => {
                 hub.update(cx, |hub, cx| hub.rotate(&udid, command == SimCommand::RotateCw, cx))
             }
@@ -109,10 +119,18 @@ impl SimulatorPanel {
                 true
             }
             SimCommand::OpenLogs => {
-                // The id lands in a shell command line: only a well-formed one.
-                let Some(cwd) = self.worktree.clone().filter(|_| is_udid(udid.as_str())) else { return Outcome::NoDevice };
+                let Some(cwd) = self.worktree.clone() else { return Outcome::NoDevice };
                 let title = format!("{} log", self.device_name(cx));
-                return Outcome::OpenLogs { cwd, title, script: log_script(udid.as_str()) };
+                let script = match udid.platform() {
+                    // The id lands in a shell command line: only a well-formed one.
+                    Platform::Ios if is_udid(udid.as_str()) => log_script(udid.as_str()),
+                    Platform::Ios => return Outcome::NoDevice,
+                    Platform::Android => match hub.read(cx).logcat_script(&udid) {
+                        Some(script) => script,
+                        None => return Outcome::NotStreaming,
+                    },
+                };
+                return Outcome::OpenLogs { cwd, title, script };
             }
             SimCommand::Shutdown => {
                 self.confirm_shutdown = true;

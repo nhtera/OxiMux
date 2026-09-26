@@ -338,6 +338,7 @@ impl SimulatorPanel {
             phase: &phase,
             attaching: self.attaching,
             attach_error: self.attach_error.as_deref(),
+            android_ready: hub.android_sdk().is_some(),
         })
     }
 

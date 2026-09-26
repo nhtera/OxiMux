@@ -18,7 +18,7 @@ use std::time::Duration;
 use oximux_simulator::child_ledger::{Kind, Ledger};
 use oximux_simulator::helper::{self, HelperOptions};
 use oximux_simulator::protocol::{self, Command, Event, FatalReason, Frame, KeyPhase, Outbound, TouchPhase};
-use oximux_simulator::session::{SessionEvent, StreamSession};
+use oximux_simulator::session::{SessionEvent, HelperSession};
 use oximux_simulator::{Button, DeviceId, Orientation};
 use serde_json::{Value, json};
 
@@ -169,7 +169,7 @@ fn helper_exits_when_the_session_is_dropped_despite_other_children() {
     let ledger = std::sync::Arc::new(Ledger::open(dir.path().join("children.json")).unwrap());
     let opts = HelperOptions { ledger: Some(ledger.clone()), ..HelperOptions::default() };
     let session =
-        StreamSession::start_with_args(&path, &["--conformance".into()], &DeviceId("conformance".into()), &opts)
+        HelperSession::start_with_args(&path, &["--conformance".into()], &DeviceId("conformance".into()), &opts)
             .expect("conformance helper completes the handshake");
     let events = session.take_events().unwrap();
     let pid = session.pid();

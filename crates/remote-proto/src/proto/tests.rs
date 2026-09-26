@@ -19,10 +19,10 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 25,
-        "v25 = the iOS Simulator surface (Simulator request + Simulator reply, the \
-         verb set in its own append-only enums). v24 = worktree base refs \
-         (CreateWorktreeV2, answered by the existing WorktreeCreated)"
+        PROTOCOL_VERSION, 26,
+        "v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
+         VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
+         + Simulator reply, the verb set in its own append-only enums)"
     );
 }
 
@@ -586,6 +586,13 @@ fn simulator_verbs_round_trip_and_keep_their_ordinals() {
         SimCmdWire::Install { path: "/w/Build/App.app".into() },
         SimCmdWire::Shutdown { force: false },
     ];
+    // v26: Android's buttons append to the button enum, after the iOS ones.
+    for (ordinal, button) in [(5u8, SimButtonWire::Back), (6, SimButtonWire::VolumeUp), (7, SimButtonWire::VolumeDown)] {
+        let req = Request::Simulator(SimRequestWire { worktree: None, cmd: SimCmdWire::Button(button) });
+        let bytes = req.to_bytes().expect("encode");
+        assert_eq!(*bytes.last().unwrap(), ordinal, "{button:?}");
+        assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
+    }
     for (ordinal, cmd) in cmds.into_iter().enumerate() {
         let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: cmd.clone() });
         let bytes = req.to_bytes().expect("encode");

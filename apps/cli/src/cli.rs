@@ -793,10 +793,20 @@ pub enum SimCommand {
     /// Availability, the attached device, and whether agents may control it.
     Status,
     /// Every simulator on this Mac.
-    Devices,
+    Devices {
+        /// Only this platform's devices.
+        #[arg(long, value_enum)]
+        platform: Option<SimPlatformArg>,
+    },
     /// Attach a simulator to this worktree (booting it if needed): a name or
-    /// udid, or the automatic pick when omitted.
-    Attach { device: Option<String> },
+    /// id, or the automatic pick when omitted.
+    Attach {
+        device: Option<String>,
+        /// Look the name up among this platform's devices only (a name can
+        /// exist on both).
+        #[arg(long, value_enum)]
+        platform: Option<SimPlatformArg>,
+    },
     /// Detach this worktree's simulator.
     Detach,
     /// Wait until the user answers the consent question: exit 0 once allowed,
@@ -894,6 +904,18 @@ pub enum SimButtonArg {
     Siri,
     SideButton,
     AppSwitcher,
+    /// Android only.
+    Back,
+    /// Android only.
+    VolumeUp,
+    /// Android only.
+    VolumeDown,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimPlatformArg {
+    Ios,
+    Android,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

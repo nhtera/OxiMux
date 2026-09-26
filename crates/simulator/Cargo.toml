@@ -10,8 +10,9 @@ rust-version.workspace = true
 # gpui-free core of the iOS Simulator panel: the stdio protocol spoken with
 # `oximux-sim-helper` (released by the nhtera/serve-sim fork), helper process
 # supervision, `simctl` device discovery, availability checks, and the pure
-# keyboard / geometry / gesture / AX math. No sockets, no tokio: blocking calls
-# are plain functions meant for a background executor.
+# keyboard / geometry / gesture / AX math, and the Android side (adb, the
+# scrcpy protocol). No tokio: blocking calls are plain functions meant for a
+# background executor; the only sockets are to adb's forward on 127.0.0.1.
 
 [dependencies]
 base64.workspace = true
@@ -19,13 +20,27 @@ fd-lock = "4"
 oximux-no-window.workspace = true
 oximux-proc-tree.workspace = true
 oximux-sibling-binary.workspace = true
+roxmltree = "0.21"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# The scrcpy server jar, fetched on first Android use (P10).
+ureq.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Android video (P10): hardware H.264 decode into the `core_video` buffers
+# GPUI's `surface()` paints. Versions match what gpui / wry already pull in.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-video = "0.5"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "objc2-core-video", "CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-video-toolbox = { version = "0.3", default-features = false, features = ["std", "objc2-core-media", "objc2-core-video", "VTBase", "VTErrors", "VTDecompressionSession", "VTSession"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

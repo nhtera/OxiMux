@@ -10,7 +10,7 @@ use gpui_component::{
     Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
-use oximux_simulator::{DeviceId, DeviceInfo, DeviceState};
+use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, Platform};
 
 use super::SimulatorPanel;
 use crate::actions::{ToggleRightSidebar, ToggleSimulatorMaximized};
@@ -19,6 +19,9 @@ use crate::shell::simulator::state::PanelState;
 impl SimulatorPanel {
     pub(super) fn render_header(&self, state: &PanelState, cx: &mut Context<Self>) -> AnyElement {
         let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
+        // "Simulator" once Android devices are offered too.
+        let android = self.hub.as_ref().is_some_and(|h| h.read(cx).android_sdk().is_some());
+        let title = if android { "Simulator" } else { "iOS Simulator" };
         let title_row = div()
             .flex()
             .flex_row()
@@ -37,7 +40,7 @@ impl SimulatorPanel {
                 div()
                     .text_size(px(ty.t_body_md))
                     .text_color(theme.fg_base)
-                    .child("iOS Simulator"),
+                    .child(title),
             )
             .child(div().flex_1())
             .child(self.render_layout_button())
@@ -93,10 +96,7 @@ impl SimulatorPanel {
         let (theme, density) = (self.theme, self.density);
         let devices = self.devices(cx);
         let info = devices.iter().find(|d| d.udid == udid).cloned();
-        let label = info
-            .as_ref()
-            .map(|d| format!("{} · iOS {}", d.name, d.os_version))
-            .unwrap_or_else(|| udid.to_string());
+        let label = info.as_ref().map(|d| format!("{} · {}", d.name, os_label(d))).unwrap_or_else(|| udid.to_string());
         let dot = info.as_ref().map(|d| state_color(&d.state, theme)).unwrap_or(theme.fg_subtle);
         let weak = cx.weak_entity();
         let current = Some(udid);
@@ -146,8 +146,17 @@ pub(super) fn state_color(state: &DeviceState, theme: oximux_settings::Theme) ->
     }
 }
 
-/// The device menu: booted devices first, then everything else ("will
-/// boot"), each group by runtime. Picking a row attaches it.
+/// "iOS 26.3", or the Android runtime as listed ("Android API 37.1").
+pub(crate) fn os_label(d: &DeviceInfo) -> String {
+    match d.udid.platform() {
+        Platform::Ios => format!("iOS {}", d.os_version),
+        Platform::Android => d.runtime.clone(),
+    }
+}
+
+/// The device menu: iOS then Android; in each, booted devices first, then
+/// everything else ("will boot"), newest runtime first. Picking a row
+/// attaches it.
 pub(super) fn device_menu(
     mut menu: PopupMenu,
     devices: &[DeviceInfo],
@@ -159,11 +168,18 @@ pub(super) fn device_menu(
         .filter(|d| d.is_available && d.kind != oximux_simulator::DeviceKind::Other)
         .collect();
     if usable.is_empty() {
-        return menu.label("No iOS simulators found");
+        return menu.label("No simulators found");
     }
-    let (booted, rest): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) =
-        usable.into_iter().partition(|d| d.state == DeviceState::Booted);
-    for (title, mut group) in [("Booted", booted), ("Available (will boot)", rest)] {
+    let (ios, android): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) = usable.into_iter().partition(|d| d.udid.platform() == Platform::Ios);
+    let (ios_booted, ios_rest) = booted_first(ios);
+    let (android_running, android_rest) = booted_first(android);
+    let groups = [
+        ("iOS · Booted", ios_booted),
+        ("iOS · Available (will boot)", ios_rest),
+        ("Android · Running", android_running),
+        ("Android · Emulators (will boot)", android_rest),
+    ];
+    for (title, mut group) in groups {
         if group.is_empty() {
             continue;
         }
@@ -174,7 +190,7 @@ pub(super) fn device_menu(
             let udid = device.udid.clone();
             let panel = panel.clone();
             menu = menu.item(
-                PopupMenuItem::new(format!("{} — iOS {}", device.name, device.os_version))
+                PopupMenuItem::new(format!("{} — {}", device.name, os_label(device)))
                     .checked(current == Some(&device.udid))
                     .on_click(move |_, _window, cx| {
                         let udid = udid.clone();
@@ -189,6 +205,10 @@ pub(super) fn device_menu(
             let _ = refresh.update(cx, |panel, cx| panel.refresh(cx));
         }))
         .item(PopupMenuItem::new("Open Xcode").on_click(|_, _window, _cx| super::body::open_xcode()))
+}
+
+fn booted_first(list: Vec<&DeviceInfo>) -> (Vec<&DeviceInfo>, Vec<&DeviceInfo>) {
+    list.into_iter().partition(|d| d.state == DeviceState::Booted)
 }
 
 fn version_key(v: &str) -> Vec<u32> {

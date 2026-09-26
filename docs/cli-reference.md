@@ -624,15 +624,18 @@ _No arguments._
 
 Every simulator on this Mac
 
-_No arguments._
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--platform` | yes | Only this platform's devices |
 
 #### `oximux sim attach`
 
-Attach a simulator to this worktree (booting it if needed): a name or udid, or the automatic pick when omitted
+Attach a simulator to this worktree (booting it if needed): a name or id, or the automatic pick when omitted
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<DEVICE>` | yes |  |
+| `--platform` | yes | Look the name up among this platform's devices only (a name can exist on both) |
 
 #### `oximux sim detach`
 

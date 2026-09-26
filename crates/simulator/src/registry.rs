@@ -630,8 +630,11 @@ fn pause_if_hidden<S: Clone>(device: &mut Device<S>, now: Option<Instant>) -> Op
 /// runtime. Returns the device and whether it is already booted.
 pub fn auto_pick<'a>(devices: &'a [DeviceInfo], preferred: Option<&DeviceId>) -> Option<(&'a DeviceInfo, bool)> {
     let usable = |d: &&DeviceInfo| d.is_available && d.kind != DeviceKind::Other;
+    // A USB phone is someone's own device: only ever picked by name (or as
+    // the default device the user chose), never automatically.
+    let automatic = |d: &&DeviceInfo| usable(d) && !matches!(crate::android::Target::from_id(&d.udid), Some(crate::android::Target::Serial(_)));
     let booted = |d: &DeviceInfo| d.state == DeviceState::Booted;
-    if let Some(d) = devices.iter().filter(usable).find(|d| booted(d) && d.kind == DeviceKind::Phone) {
+    if let Some(d) = devices.iter().filter(automatic).find(|d| booted(d) && d.kind == DeviceKind::Phone) {
         return Some((d, true));
     }
     if let Some(d) = preferred.and_then(|p| devices.iter().filter(usable).find(|d| &d.udid == p)) {
@@ -639,7 +642,7 @@ pub fn auto_pick<'a>(devices: &'a [DeviceInfo], preferred: Option<&DeviceId>) ->
     }
     devices
         .iter()
-        .filter(usable)
+        .filter(automatic)
         .filter(|d| d.kind == DeviceKind::Phone)
         .max_by(|a, b| version_key(&a.os_version).cmp(&version_key(&b.os_version)))
         .map(|d| (d, booted(d)))

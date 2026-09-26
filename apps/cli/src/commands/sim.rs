@@ -20,7 +20,7 @@ use oximux_remote_proto::simulator::{
 };
 use serde_json::{Value, json};
 
-use crate::cli::{SimButtonArg, SimCommand, SimOrientationArg, exit};
+use crate::cli::{SimButtonArg, SimCommand, SimOrientationArg, SimPlatformArg, exit};
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
 
@@ -38,6 +38,29 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
             Ok((status_json(&status), status_human(&status)))
         }
         SimCommand::WaitConsent { max_wait } => wait_consent(client, &worktree, max_wait).await,
+        SimCommand::Devices { platform } => {
+            let SimReplyWire::Devices(devices) = call(client, &worktree, SimCmdWire::Devices, QUICK).await? else {
+                return Err(unexpected("Devices"));
+            };
+            let devices: Vec<SimDeviceWire> = devices.into_iter().filter(|d| on_platform(d, platform)).collect();
+            let human = if devices.is_empty() {
+                "no simulators (create one in Xcode › Devices and Simulators, or an emulator in Android Studio)".to_string()
+            } else {
+                devices.iter().map(device_line).collect::<Vec<_>>().join("\n")
+            };
+            Ok((json!({ "devices": devices.iter().map(device_json).collect::<Vec<_>>() }), human))
+        }
+        SimCommand::Attach { device, platform: Some(platform) } => {
+            // Resolved here, among that platform's devices; the host then
+            // attaches by id.
+            let SimReplyWire::Devices(devices) = call(client, &worktree, SimCmdWire::Devices, QUICK).await? else {
+                return Err(unexpected("Devices"));
+            };
+            let id = pick_on_platform(&devices, device.as_deref(), platform).ok_or_else(|| {
+                Failure::new("not-found", exit::ERROR, "no such device on that platform (see `oximux sim devices`)")
+            })?;
+            attached(call(client, &worktree, SimCmdWire::Attach { device: Some(id) }, Duration::from_secs(45)).await?)
+        }
         SimCommand::Screenshot { out, full } => {
             let reply = call(client, &worktree, SimCmdWire::Screenshot { full }, SLOW).await?;
             let SimReplyWire::Screenshot { png, width, height, scale } = reply else {
@@ -69,22 +92,7 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
             let (cmd, floor, said) = request_for(other, &cwd)?;
             let reply = call(client, &worktree, cmd, floor).await?;
             match reply {
-                SimReplyWire::Devices(devices) => {
-                    let human = if devices.is_empty() {
-                        "no simulators (create one in Xcode › Window › Devices and Simulators)".to_string()
-                    } else {
-                        devices.iter().map(device_line).collect::<Vec<_>>().join("\n")
-                    };
-                    Ok((json!({ "devices": devices.iter().map(device_json).collect::<Vec<_>>() }), human))
-                }
-                SimReplyWire::Attached(device) => {
-                    let booting = if device.state == "Booted" { "" } else { " — booting" };
-                    let human = format!(
-                        "attached {}{booting}\nif agents are not allowed on it yet, the first verb that looks at it asks the user (exit 7)",
-                        device_line(&device)
-                    );
-                    Ok((json!({ "device": device_json(&device) }), human))
-                }
+                reply @ SimReplyWire::Attached(_) => attached(reply),
                 SimReplyWire::Done => Ok((json!({ "ok": true }), said)),
                 other => Err(unexpected_reply("Simulator", &Response::Simulator(Ok(other)))),
             }
@@ -104,8 +112,7 @@ const INSTALL: Duration = Duration::from_secs(270);
 /// to say when it is done.
 fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration, String), Failure> {
     Ok(match command {
-        SimCommand::Devices => (SimCmdWire::Devices, QUICK, String::new()),
-        SimCommand::Attach { device } => (SimCmdWire::Attach { device }, Duration::from_secs(45), String::new()),
+        SimCommand::Attach { device, .. } => (SimCmdWire::Attach { device }, Duration::from_secs(45), String::new()),
         SimCommand::Detach => (SimCmdWire::Detach, QUICK, "detached".into()),
         SimCommand::Tap { x, y, label, id } => {
             let (target, said) = match (x, y, label, id) {
@@ -132,6 +139,9 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
                 SimButtonArg::Siri => SimButtonWire::Siri,
                 SimButtonArg::SideButton => SimButtonWire::SideButton,
                 SimButtonArg::AppSwitcher => SimButtonWire::AppSwitcher,
+                SimButtonArg::Back => SimButtonWire::Back,
+                SimButtonArg::VolumeUp => SimButtonWire::VolumeUp,
+                SimButtonArg::VolumeDown => SimButtonWire::VolumeDown,
             };
             (SimCmdWire::Button(wire), SLOW, format!("pressed {button:?}").to_lowercase())
         }
@@ -160,10 +170,51 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
             (SimCmdWire::Install { path: path.to_string_lossy().into_owned() }, INSTALL, said)
         }
         SimCommand::Shutdown { force } => (SimCmdWire::Shutdown { force }, SLOW, "shut down".into()),
-        SimCommand::Status | SimCommand::WaitConsent { .. } | SimCommand::Screenshot { .. } | SimCommand::Ax { .. } => {
+        SimCommand::Status
+        | SimCommand::WaitConsent { .. }
+        | SimCommand::Screenshot { .. }
+        | SimCommand::Ax { .. }
+        | SimCommand::Devices { .. } => {
             unreachable!("answered with a reply of their own")
         }
     })
+}
+
+fn attached(reply: SimReplyWire) -> Outcome {
+    let SimReplyWire::Attached(device) = reply else { return Err(unexpected("Attached")) };
+    let booting = if device.state == "Booted" { "" } else { " — booting" };
+    let human = format!(
+        "attached {}{booting}\nif agents are not allowed on it yet, the first verb that looks at it asks the user (exit 7)",
+        device_line(&device)
+    );
+    Ok((json!({ "device": device_json(&device) }), human))
+}
+
+/// Android ids are `avd:<name>` / `adb:<serial>`; iOS ids are bare UDIDs.
+fn is_android(device: &SimDeviceWire) -> bool {
+    device.udid.starts_with("avd:") || device.udid.starts_with("adb:")
+}
+
+fn on_platform(device: &SimDeviceWire, platform: Option<SimPlatformArg>) -> bool {
+    match platform {
+        None => true,
+        Some(SimPlatformArg::Android) => is_android(device),
+        Some(SimPlatformArg::Ios) => !is_android(device),
+    }
+}
+
+/// The device `wanted` names (id, else name, case-insensitive) on
+/// `platform` — or, without a name, its booted one, else its first.
+fn pick_on_platform(devices: &[SimDeviceWire], wanted: Option<&str>, platform: SimPlatformArg) -> Option<String> {
+    let mut candidates = devices.iter().filter(|d| on_platform(d, Some(platform)));
+    let found = match wanted.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => candidates.find(|d| d.udid == w || d.name.eq_ignore_ascii_case(w)),
+        None => {
+            let all: Vec<&SimDeviceWire> = candidates.collect();
+            all.iter().find(|d| d.state == "Booted").or(all.first()).copied()
+        }
+    };
+    found.map(|d| d.udid.clone())
 }
 
 /// `--worktree`, else the current directory, absolute.
@@ -190,7 +241,7 @@ async fn call(client: &Client, worktree: &Path, cmd: SimCmdWire, floor: Duration
         Response::Error(RpcError::Unsupported) => Err(Failure::new(
             "unsupported",
             exit::ERROR,
-            "this host has no iOS Simulator (the OxiMux desktop app on an Apple silicon Mac does)",
+            "this host has no simulators (the OxiMux desktop app on an Apple silicon Mac does)",
         )),
         Response::Error(e) => Err(rpc_failure(e)),
         other => Err(unexpected_reply("Simulator", &other)),
@@ -400,6 +451,29 @@ fn ax_line(n: &SimAxNodeWire, flat: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn device(udid: &str, name: &str, state: &str) -> SimDeviceWire {
+        SimDeviceWire { udid: udid.into(), name: name.into(), runtime: String::new(), state: state.into() }
+    }
+
+    /// A name on both platforms resolves on the one asked for; without a name
+    /// the platform's booted device wins.
+    #[test]
+    fn a_platform_narrows_the_lookup() {
+        let devices = [
+            device("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3", "Pixel", "Shutdown"),
+            device("avd:Pixel", "Pixel", "Shutdown"),
+            device("avd:Medium_Phone", "Medium Phone", "Booted"),
+        ];
+        assert_eq!(pick_on_platform(&devices, Some("pixel"), SimPlatformArg::Android).as_deref(), Some("avd:Pixel"));
+        assert_eq!(
+            pick_on_platform(&devices, Some("Pixel"), SimPlatformArg::Ios).as_deref(),
+            Some("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3")
+        );
+        assert_eq!(pick_on_platform(&devices, None, SimPlatformArg::Android).as_deref(), Some("avd:Medium_Phone"));
+        assert_eq!(pick_on_platform(&devices, Some("Medium Phone"), SimPlatformArg::Ios), None);
+        assert_eq!(devices.iter().filter(|d| on_platform(d, Some(SimPlatformArg::Android))).count(), 2);
+    }
+
     use super::*;
 
     #[test]

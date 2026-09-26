@@ -25,6 +25,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
+pub mod android;
 pub mod availability;
 pub mod ax;
 pub mod boot_watch;
@@ -41,8 +42,13 @@ pub mod registry;
 pub mod runner;
 pub mod session;
 pub mod simctl;
+pub mod stream;
+pub mod video;
 
-/// A simulator's UDID, as `simctl` reports it.
+/// A device, by a stable id: an iOS simulator's UDID as `simctl` reports it,
+/// or an Android device as `avd:<name>` (an emulator, stable across boots —
+/// its adb serial is not) or `adb:<serial>` (a USB phone). See
+/// [`android::Target`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DeviceId(pub String);
 
@@ -50,6 +56,19 @@ impl DeviceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Which platform this device runs. iOS ids are bare UDIDs, so an id
+    /// saved before Android existed still reads as iOS.
+    pub fn platform(&self) -> Platform {
+        if android::Target::from_id(self).is_some() { Platform::Android } else { Platform::Ios }
+    }
+}
+
+/// The two device platforms the panel drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Platform {
+    Ios,
+    Android,
 }
 
 impl std::fmt::Display for DeviceId {

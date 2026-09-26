@@ -51,6 +51,8 @@ pub fn install(cx: &mut App, repo: SettingsRepo, approvals: SimApprovalRepo) {
     if feature_used {
         hub.update(cx, |hub, cx| hub.refresh_availability(cx));
     }
+    // A filesystem lookup only: never runs adb.
+    hub.update(cx, |hub, cx| hub.refresh_android_sdk(cx));
     spawn_tick(cx, hub.downgrade());
     spawn_watch(cx, hub.downgrade());
 }
@@ -93,6 +95,7 @@ fn new_hub(
         paste_lock: Default::default(),
         agent: super::agent::AgentState::load(Some(approvals)),
         boot_claims: HashSet::new(),
+        android_sdk: None,
     })
 }
 
@@ -117,13 +120,60 @@ pub fn on_quit(cx: &mut App) {
         // be unplayable.
         hub.stop_recordings_blocking();
         let (sessions, owned) = hub.registry.quit();
+        // Owned emulators by serial: the live sessions know theirs, a parked
+        // one was seen by the watcher. No adb call on the quit path.
+        let serials: Vec<String> = owned
+            .iter()
+            .filter_map(|id| match oximux_simulator::android::Target::from_id(id)? {
+                oximux_simulator::android::Target::Avd(name) => sessions
+                    .iter()
+                    .filter_map(|s| s.android())
+                    .find(|a| a.id() == id)
+                    .map(|a| a.serial().to_owned())
+                    .or_else(|| oximux_simulator::android::devices::known_serial(&name)),
+                oximux_simulator::android::Target::Serial(_) => None,
+            })
+            .collect();
         for session in sessions {
             session.shutdown();
         }
         // `quit` already released ownership of what the script shuts down.
         sim_state_keys::save_snapshot(&hub.repo, &hub.registry.snapshot());
         spawn_detached_shutdown(&owned);
+        if let Some(sdk) = &hub.android_sdk {
+            spawn_detached_emulator_shutdown(&sdk.adb(), &serials);
+        }
     });
+}
+
+/// `adb -s <serial> emu kill` for each emulator OxiMux booted, in a process
+/// of its own that outlives the app — the graceful console stop, which keeps
+/// the quick-boot snapshot. Serials are positional arguments, and only
+/// well-formed ones.
+fn spawn_detached_emulator_shutdown(adb: &std::path::Path, serials: &[String]) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let safe = |s: &&String| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_'));
+        let serials: Vec<&String> = serials.iter().filter(safe).collect();
+        if serials.is_empty() {
+            return;
+        }
+        let spawned = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"adb=$1; shift; sleep 1; for s in "$@"; do "$adb" -s "$s" emu kill; done"#, "sh"])
+            .arg(adb)
+            .args(serials)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn();
+        if let Err(e) = spawned {
+            tracing::warn!("could not schedule shutdown of owned emulators: {e}");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (adb, serials);
 }
 
 /// `sleep 1; xcrun simctl shutdown …` in its own process group, so it
@@ -190,16 +240,26 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
         loop {
             cx.background_executor().timer(boot_watch::POLL_INTERVAL).await;
             let gate = hub.update(cx, |hub, cx| {
-                let gate = WatchGate { enabled: crate::shell::simulator::panel::settings(cx).enabled, ..hub.watch_gate() };
+                let xcode_ok = hub.watch_gate().xcode_ok;
+                // Android devices are watched with no Xcode at all.
+                let gate = WatchGate {
+                    enabled: crate::shell::simulator::panel::settings(cx).enabled,
+                    xcode_ok: xcode_ok || hub.android_sdk.is_some(),
+                    ..hub.watch_gate()
+                };
                 if !gate.should_poll() {
                     // Start from a fresh baseline when polling resumes: devices
                     // booted meanwhile are not news, and must not all fire at once.
                     hub.watch.lock().unwrap().forget();
                     return None;
                 }
-                Some((hub.runner.clone(), hub.registry.generation()))
+                // Android is polled only while an Android device is attached:
+                // an iOS-only user with Android Studio installed gets no adb.
+                let android_in_use = hub.registry.attached_devices().iter().any(|d| d.platform() == oximux_simulator::Platform::Android);
+                let sdk = hub.android_sdk.clone().filter(|_| android_in_use);
+                Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk))
             });
-            let (runner, listed_at) = match gate {
+            let (runner, listed_at, xcode_ok, sdk) = match gate {
                 Ok(Some(gate)) => gate,
                 Ok(None) => continue,
                 Err(_) => return, // the hub is gone
@@ -207,7 +267,10 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
             // The `simctl list` runs with no lock held: the UI thread reads
             // the watch state (reconnect, helper exit) and must never wait on
             // CoreSimulator.
-            let listed = cx.background_executor().spawn(async move { boot_watch::list_booted(runner.as_ref()) }).await;
+            let listed = cx
+                .background_executor()
+                .spawn(async move { super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref()) })
+                .await;
             let booted = match listed {
                 Ok(booted) => booted,
                 Err(e) => {
@@ -227,7 +290,9 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                             // Up again, by whoever: the power button's "stop"
                             // is over.
                             hub.clear_stopped_by_user(&udid);
-                            if !attached.contains(&udid) {
+                            // A phone plugged in is never taken over: phones
+                            // attach only when asked for.
+                            if !attached.contains(&udid) && !SimulatorHub::is_phone(&udid) {
                                 fresh.push(udid);
                             }
                         }

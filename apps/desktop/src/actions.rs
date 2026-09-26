@@ -663,6 +663,10 @@ actions!(
         SimHome,
         /// Simulator: press the side (lock) button. ⌘L while typing into it.
         SimLock,
+        /// Simulator (Android): the Back button.
+        SimBack,
+        /// Simulator (Android): the Recents (app switcher) button.
+        SimRecents,
         /// Simulator: rotate a quarter turn clockwise (⌘→ while typing into it).
         SimRotateCw,
         /// Simulator: rotate a quarter turn counter-clockwise (⌘←).

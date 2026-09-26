@@ -1,11 +1,11 @@
 ---
 name: oximux-simulator
 description: |
-  Drive the iOS Simulator attached to your worktree in the OxiMux desktop app:
-  build, install and launch the app, take screenshots, read the accessibility
-  tree, tap, type and swipe, then check the result. Activate when the task
-  involves an iOS app, the iOS Simulator, `xcodebuild` for a simulator, or
-  `oximux sim`.
+  Drive the iOS Simulator — or Android emulator / phone — attached to your
+  worktree in the OxiMux desktop app: build, install and launch the app, take
+  screenshots, read the accessibility tree, tap, type and swipe, then check the
+  result. Activate when the task involves an iOS or Android app, a simulator or
+  emulator, `xcodebuild` for a simulator, or `oximux sim`.
 ---
 
 # The iOS Simulator
@@ -132,6 +132,39 @@ oximux sim open-url "myapp://settings"
 
 `home` is the swipe-up gesture on Face ID devices and the button on the rest.
 `open-url` takes `http(s)` and app schemes, never `file:`.
+
+## Android
+
+The same verbs drive an Android emulator (an AVD) or a phone with USB
+debugging. Android devices are listed beside the simulators with ids of their
+own — `avd:<name>` for an emulator, `adb:<serial>` for a phone — and a name
+that exists on both platforms is narrowed with `--platform`:
+
+```sh
+oximux sim devices --platform android
+oximux sim attach "Medium Phone" --platform android
+oximux sim attach avd:Medium_Phone
+```
+
+What differs from iOS:
+
+- Coordinates are **dp** (Android's points): a default screenshot has one
+  pixel per dp, like iOS.
+- `install` takes an `.apk` inside your worktree
+  (`app/build/outputs/apk/debug/app-debug.apk`); `launch` takes the package
+  name (`com.example.app`).
+- `type` sends any text as text — no `--paste` needed.
+- Android's own buttons:
+
+```sh
+oximux sim button back
+oximux sim button app-switcher
+oximux sim button volume-up
+oximux sim button volume-down
+```
+
+- `shutdown` stops an emulator OxiMux booted (with `--force`, one the user
+  started). A phone is never shut down (exit 5).
 
 ## When something fails
 

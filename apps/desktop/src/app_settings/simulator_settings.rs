@@ -133,6 +133,9 @@ pub struct SimulatorSettings {
     /// back down.
     pub idle_shutdown_minutes: u32,
     pub stream: StreamSettings,
+    /// The Android SDK folder, when not found on its own (`ANDROID_HOME`,
+    /// `ANDROID_SDK_ROOT`, `~/Library/Android/sdk`). Chosen in Settings.
+    pub android_sdk: Option<String>,
 }
 
 impl Default for SimulatorSettings {
@@ -144,6 +147,7 @@ impl Default for SimulatorSettings {
             default_device: None,
             idle_shutdown_minutes: 10,
             stream: StreamSettings::default(),
+            android_sdk: None,
         }
     }
 }
@@ -173,8 +177,9 @@ impl SimulatorSettings {
     }
 
     /// Trim + normalize hand-edited values: snap an out-of-set fps to the
-    /// nearest allowed value and drop a blank device id.
+    /// nearest allowed value and drop a blank device id or SDK folder.
     pub fn sanitized(mut self) -> Self {
+        self.android_sdk = self.android_sdk.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
         self.stream.fps = clamp_fps(self.stream.fps);
         if self
             .default_device
@@ -331,6 +336,7 @@ mod tests {
                 resolution: Resolution::Full,
                 show_fps: true,
             },
+            android_sdk: Some("/opt/android-sdk".to_string()),
         };
         let parsed = SimulatorSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
         assert_eq!(parsed, s);

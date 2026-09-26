@@ -5,8 +5,9 @@
 //! so they need its stream; an agent does not need the panel open for that —
 //! [`live_session`] wakes a parked or never-started device the way the
 //! user's Reconnect would, and waits a moment for it. The app verbs
-//! (launch, open-url, install) are `simctl`, but wake the device the same way:
-//! an attached device may be shut down, and `simctl` cannot boot it.
+//! (launch, open-url, install) are `simctl` — `adb` on Android (see
+//! [`super::android`]) — but wake the device the same way: an attached device
+//! may be shut down, and `simctl` cannot boot it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,7 +22,7 @@ use oximux_simulator::geometry::{self, Size};
 use oximux_simulator::protocol::{Command, KeyPhase, TouchPhase};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::StreamSession;
-use oximux_simulator::{Button, DeviceId, Orientation, keyboard, simctl};
+use oximux_simulator::{Button, DeviceId, Orientation, Platform, keyboard, simctl};
 
 use super::Target;
 use crate::shell::simulator::hub::{SimulatorHub, Wake, home_button, paste_now};
@@ -131,6 +132,13 @@ pub(super) async fn run(
                 return Err(SimErrorWire::BadInput(format!("at most {MAX_TYPED} characters at a time")));
             }
             let session = live_session(hub, udid, cx).await?;
+            // Android takes text as text, any Unicode.
+            if let Some(android) = session.android().cloned() {
+                return on_own_thread(move || android.type_text(&text))
+                    .await?
+                    .map(|()| SimReplyWire::Done)
+                    .map_err(|e| SimErrorWire::Failed(format!("typing failed: {e}")));
+            }
             if paste || keyboard::needs_paste(&text) {
                 let lock = hub.read_with(cx, |hub, _| hub.paste_lock());
                 let udid = udid.clone();
@@ -146,6 +154,19 @@ pub(super) async fn run(
             }
             Ok(SimReplyWire::Done)
         }
+        SimCmdWire::Button(button @ (SimButtonWire::Back | SimButtonWire::VolumeUp | SimButtonWire::VolumeDown)) => {
+            use oximux_simulator::android::input::AndroidButton;
+            if udid.platform() != Platform::Android {
+                return Err(SimErrorWire::BadInput("that button exists only on Android".into()));
+            }
+            let session = live_session(hub, udid, cx).await?;
+            let button = match button {
+                SimButtonWire::Back => AndroidButton::Back,
+                SimButtonWire::VolumeUp => AndroidButton::VolumeUp,
+                _ => AndroidButton::VolumeDown,
+            };
+            session.press_android(button).map(|()| SimReplyWire::Done).map_err(|e| SimErrorWire::Failed(format!("the device did not take the button: {e}")))
+        }
         SimCmdWire::Button(button) => {
             let session = live_session(hub, udid, cx).await?;
             let name = match button {
@@ -154,6 +175,7 @@ pub(super) async fn run(
                 SimButtonWire::Siri => Button::Siri,
                 SimButtonWire::SideButton => Button::SideButton,
                 SimButtonWire::AppSwitcher => Button::AppSwitcher,
+                SimButtonWire::Back | SimButtonWire::VolumeUp | SimButtonWire::VolumeDown => unreachable!("matched above"),
             };
             send(&session, Command::Button { name })?;
             Ok(SimReplyWire::Done)
@@ -171,6 +193,10 @@ pub(super) async fn run(
                 .await
                 .map(|()| SimReplyWire::Done)
                 .map_err(|e| SimErrorWire::Failed(format!("rotation failed: {e}")))
+        }
+        SimCmdWire::Launch { bundle_id, relaunch } if udid.platform() == Platform::Android => {
+            let device = android_device(hub, udid, cx).await?;
+            on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done)
         }
         SimCmdWire::Launch { bundle_id, relaunch } => {
             let well_formed = bundle_id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -190,6 +216,11 @@ pub(super) async fn run(
                 .map(|()| SimReplyWire::Done)
                 .map_err(|e| SimErrorWire::Failed(format!("launch failed: {e}")))
         }
+        SimCmdWire::OpenUrl { url } if udid.platform() == Platform::Android => {
+            agent::check_url(&url).map_err(SimErrorWire::BadInput)?;
+            let device = android_device(hub, udid, cx).await?;
+            on_own_thread(move || device.open_url(url.trim())).await?.map(|()| SimReplyWire::Done)
+        }
         SimCmdWire::OpenUrl { url } => {
             agent::check_url(&url).map_err(SimErrorWire::BadInput)?;
             let udid = simctl_ready(hub, udid, cx).await?;
@@ -197,6 +228,11 @@ pub(super) async fn run(
                 .await?
                 .map(|()| SimReplyWire::Done)
                 .map_err(|e| SimErrorWire::Failed(format!("could not open the URL: {e}")))
+        }
+        SimCmdWire::Install { path } if udid.platform() == Platform::Android => {
+            let apk = super::android::apk_path(&path, &target.worktree)?;
+            let device = android_device(hub, udid, cx).await?;
+            on_own_thread(move || device.install(&apk)).await?.map(|()| SimReplyWire::Done)
         }
         SimCmdWire::Install { path } => {
             let udid = simctl_ready(hub, udid, cx).await?;
@@ -208,6 +244,9 @@ pub(super) async fn run(
             })
             .await?
             .map(|()| SimReplyWire::Done)
+        }
+        SimCmdWire::Shutdown { .. } if SimulatorHub::is_phone(udid) => {
+            Err(SimErrorWire::Refused("this is a phone; OxiMux never shuts one down".into()))
         }
         SimCmdWire::Shutdown { force } => {
             let refused = hub
@@ -274,6 +313,14 @@ fn phase_wake(hub: &SimulatorHub, udid: &DeviceId) -> Wake {
     }
 }
 
+/// An Android device's `adb` handle, once it streams (the serial is only
+/// known then).
+async fn android_device(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<super::android::Device, SimErrorWire> {
+    let session = live_session(hub, udid, cx).await?;
+    let adb = hub.read_with(cx, |hub, _| hub.android_sdk().map(|s| s.adb()));
+    super::android::Device::of(&session, adb)
+}
+
 /// `simctl` app verbs need Xcode and a booted device: wake it as the screen
 /// verbs do (a live stream means it is booted).
 async fn simctl_ready(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<DeviceId, SimErrorWire> {
@@ -302,11 +349,7 @@ async fn describe(session: &StreamSession, cx: &mut AsyncApp) -> Result<Vec<AxNo
         let session = session.clone();
         let tree = cx
             .background_executor()
-            .spawn(async move {
-                let reply = session.request(&Command::AxDescribe, HELPER_TIMEOUT).map_err(|e| e.to_string())?;
-                let bytes = serde_json::to_vec(&reply).map_err(|e| e.to_string())?;
-                ax::parse_describe(&bytes).map_err(|e| e.to_string())
-            })
+            .spawn(async move { session.describe(HELPER_TIMEOUT).map_err(|e| e.to_string()) })
             .await;
         match tree {
             Ok(nodes) if !nodes.is_empty() => return Ok(nodes),
@@ -324,7 +367,7 @@ fn root_size(nodes: &[AxNode]) -> Size {
 
 /// Pixels per point, read once per device from the AX root frame.
 async fn scale(hub: &Entity<SimulatorHub>, udid: &DeviceId, session: &StreamSession, cx: &mut AsyncApp) -> Result<f64, SimErrorWire> {
-    if let Some(scale) = hub.read_with(cx, |hub, _| hub.scale(udid)) {
+    if let Some(scale) = hub.read_with(cx, |hub, _| hub.scale(udid)).or_else(|| session.point_scale()) {
         return Ok(scale);
     }
     let nodes = describe(session, cx).await?;
@@ -339,7 +382,7 @@ fn scale_from(
     nodes: &[AxNode],
     cx: &mut AsyncApp,
 ) -> Result<f64, SimErrorWire> {
-    if let Some(scale) = hub.read_with(cx, |hub, _| hub.scale(udid)) {
+    if let Some(scale) = hub.read_with(cx, |hub, _| hub.scale(udid)).or_else(|| session.point_scale()) {
         return Ok(scale);
     }
     let (o, portrait) = screen(session)?;

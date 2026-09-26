@@ -44,11 +44,14 @@ pub struct Inputs<'a> {
     /// The panel asked the hub to attach and has not heard back.
     pub attaching: bool,
     pub attach_error: Option<&'a str>,
+    /// An Android SDK was found: Android devices work whatever the iOS side
+    /// is missing, so a missing Xcode does not block the panel.
+    pub android_ready: bool,
 }
 
 pub fn derive(i: Inputs<'_>) -> PanelState {
     let Some(availability) = i.availability else { return PanelState::Checking };
-    if !availability.is_ready() {
+    if !availability.is_ready() && !i.android_ready {
         return PanelState::Setup(availability.clone());
     }
     if !i.attached {
@@ -99,7 +102,7 @@ mod tests {
     }
 
     fn inputs<'a>(a: Option<&'a Availability>, attached: bool, phase: &'a Phase) -> Inputs<'a> {
-        Inputs { availability: a, attached, phase, attaching: false, attach_error: None }
+        Inputs { availability: a, attached, phase, attaching: false, attach_error: None, android_ready: false }
     }
 
     #[test]
@@ -109,6 +112,10 @@ mod tests {
         let mut missing = ready(Support::Supported);
         missing.ios_runtimes.clear();
         assert!(matches!(derive(inputs(Some(&missing), true, &idle)), PanelState::Setup(_)));
+        // With an Android SDK, a Mac missing the iOS pieces still gets a panel.
+        let mut android = inputs(Some(&missing), false, &idle);
+        android.android_ready = true;
+        assert_eq!(derive(android), PanelState::Empty { error: None });
     }
 
     #[test]

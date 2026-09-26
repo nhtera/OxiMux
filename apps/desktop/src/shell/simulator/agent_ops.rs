@@ -25,13 +25,14 @@ use oximux_remote_proto::simulator::{
 use oximux_simulator::consent::{State, Verdict};
 use oximux_simulator::registry::WorktreeKey;
 use oximux_simulator::runner::SystemRunner;
-use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, simctl};
+use oximux_simulator::{DeviceId, DeviceInfo, DeviceState};
 
 use super::auto_open::Trigger;
 use super::hub::{SimulatorHub, hub};
 use crate::platform::window_registry;
 use crate::workspace_root::WorkspaceRoot;
 
+mod android;
 mod verbs;
 
 /// `simctl` listing timeout.
@@ -217,14 +218,18 @@ fn status(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> Res
     cx.update(|cx| {
         let agent_control = super::panel::settings(cx).agent_control;
         hub.update(cx, |hub, _| {
+            let android = hub.android_sdk().is_some();
             let (available, reason, xcode) = match hub.availability() {
+                None if android => (true, None, None),
                 None => (false, Some("still checking for Xcode; try again in a moment".to_owned()), None),
                 Some(a) => {
                     let xcode = match &a.xcode {
                         oximux_simulator::availability::Xcode::Found { version, .. } => version.clone(),
                         _ => None,
                     };
-                    (a.is_ready(), a.blocking_reason(), xcode)
+                    // Android devices work without the iOS side.
+                    let reason = a.blocking_reason().filter(|_| !android);
+                    (a.is_ready() || android, reason, xcode)
                 }
             };
             let udid = hub.device_for(&target.worktree);
@@ -256,15 +261,18 @@ fn status(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> Res
     })
 }
 
-/// A fresh device listing (never without a resolvable Xcode, which would pop
-/// the command-line-tools dialog).
+/// A fresh device listing: iOS simulators (never without a resolvable Xcode,
+/// which would pop the command-line-tools dialog) and Android devices (with
+/// an SDK).
 async fn list_devices(hub: &Entity<SimulatorHub>, cx: &mut AsyncApp) -> Result<Vec<DeviceInfo>, SimErrorWire> {
-    let xcode_ok = hub.read_with(cx, |hub, _| hub.xcode_ok());
-    if !xcode_ok {
-        return Err(SimErrorWire::Unavailable("Xcode was not found (or is still being checked); see `oximux sim status`".into()));
+    let (xcode_ok, sdk) = hub.read_with(cx, |hub, _| (hub.xcode_ok(), hub.android_sdk().cloned()));
+    if !xcode_ok && sdk.is_none() {
+        return Err(SimErrorWire::Unavailable(
+            "neither Xcode nor an Android SDK was found (or they are still being checked); see `oximux sim status`".into(),
+        ));
     }
     cx.background_executor()
-        .spawn(async move { simctl::list_devices(&SystemRunner, LIST_TIMEOUT) })
+        .spawn(async move { super::hub::list_all(&SystemRunner, xcode_ok, sdk.as_ref(), LIST_TIMEOUT) })
         .await
         .map_err(|e| SimErrorWire::Failed(format!("could not list simulators: {e}")))
 }
@@ -323,7 +331,11 @@ fn device_wire(d: &DeviceInfo) -> SimDeviceWire {
     SimDeviceWire {
         udid: d.udid.to_string(),
         name: d.name.clone(),
-        runtime: format!("{platform} {}", d.os_version),
+        // Android's runtime is already "Android 16" / "Android API 37.1".
+        runtime: match d.udid.platform() {
+            oximux_simulator::Platform::Android => d.runtime.clone(),
+            oximux_simulator::Platform::Ios => format!("{platform} {}", d.os_version),
+        },
         state: state.to_owned(),
     }
 }

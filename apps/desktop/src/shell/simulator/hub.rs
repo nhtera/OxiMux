@@ -24,8 +24,8 @@ use oximux_simulator::child_ledger::Ledger;
 use oximux_simulator::helper::HelperOptions;
 use oximux_simulator::registry::{self, BootResult, Effect, Generation, Phase, Registry, WorktreeKey};
 use oximux_simulator::runner::SystemRunner;
-use oximux_simulator::session::{SessionEvent, StreamSession};
-use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, SimError, simctl};
+use oximux_simulator::session::{HelperSession, SessionEvent, StreamSession};
+use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, Platform, SimError, simctl};
 use oximux_storage::SettingsRepo;
 
 use crate::app_settings::sim_state_keys;
@@ -94,6 +94,8 @@ pub struct SimulatorHub {
     paste_lock: capture::PasteLock,
     /// Consent, the agent badge and device scales (see `agent`).
     agent: agent::AgentState,
+    /// The Android SDK, once found (see `android`).
+    android_sdk: Option<oximux_simulator::android::sdk::Sdk>,
     /// Booted devices a window already took for auto-attach (so one boot is
     /// attached once, not by every window); dropped when the device shuts down.
     boot_claims: HashSet<DeviceId>,
@@ -102,10 +104,12 @@ pub struct SimulatorHub {
 impl EventEmitter<HubEvent> for SimulatorHub {}
 
 mod agent;
+mod android;
 mod capture;
 mod lifecycle;
 
 pub use agent::Wake;
+pub(crate) use android::list_all;
 pub use capture::NoticeKind;
 pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
 
@@ -134,7 +138,7 @@ impl SimulatorHub {
     /// The helper's version, from any live stream's `hello` (`None` until a
     /// device streams this run).
     pub fn helper_version(&self) -> Option<String> {
-        self.registry.attached_devices().iter().find_map(|udid| self.session(udid)).map(|s| s.hello().version.clone())
+        self.registry.attached_devices().iter().find_map(|udid| self.session(udid)).and_then(|s| s.hello().map(|h| h.version.clone()))
     }
 
     pub fn availability(&self) -> Option<&Availability> {
@@ -166,15 +170,19 @@ impl SimulatorHub {
         Some((udid, info))
     }
 
-    /// Re-list devices in the background (never on the UI thread; never
+    /// Re-list devices in the background (never on the UI thread; iOS never
     /// without a resolvable Xcode, which would pop the tools dialog).
     pub fn refresh_devices(&mut self, cx: &mut Context<Self>) {
-        if !self.watch_gate().xcode_ok {
+        let (xcode_ok, sdk) = (self.watch_gate().xcode_ok, self.android_sdk.clone());
+        if !xcode_ok && sdk.is_none() {
             return;
         }
         let runner = self.runner.clone();
         cx.spawn(async move |this, cx| {
-            let listed = cx.background_executor().spawn(async move { simctl::list_devices(runner.as_ref(), SIMCTL_TIMEOUT) }).await;
+            let listed = cx
+                .background_executor()
+                .spawn(async move { android::list_all(runner.as_ref(), xcode_ok, sdk.as_ref(), SIMCTL_TIMEOUT) })
+                .await;
             let _ = this.update(cx, |hub, cx| match listed {
                 Ok(devices) => {
                     hub.devices = devices;
@@ -207,7 +215,23 @@ impl SimulatorHub {
     /// time, in order.
     pub fn paste(&self, udid: &DeviceId, text: String, cx: &mut Context<Self>) {
         let Some(session) = self.session(udid) else { return };
-        if text.is_empty() || !self.watch_gate().xcode_ok {
+        if text.is_empty() {
+            return;
+        }
+        // Android takes text as text (any Unicode), no clipboard round trip.
+        if let Some(android) = session.android().cloned() {
+            let lock = self.paste_lock.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let _turn = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Err(e) = android.type_text(&text) {
+                        tracing::debug!("android paste failed: {e}");
+                    }
+                })
+                .detach();
+            return;
+        }
+        if !self.watch_gate().xcode_ok {
             return;
         }
         let (target, lock) = (udid.clone(), self.paste_lock.clone());
@@ -253,6 +277,10 @@ impl SimulatorHub {
     /// Shut `udid` down (the toolbar's power button). The device watcher then
     /// sees it go and the panel shows Disconnected with Reconnect.
     pub fn shutdown_device(&self, udid: &DeviceId, cx: &mut Context<Self>) {
+        if udid.platform() == Platform::Android {
+            self.shutdown_android(udid, cx);
+            return;
+        }
         if !self.watch_gate().xcode_ok {
             return;
         }
@@ -329,9 +357,12 @@ impl SimulatorHub {
     pub fn attach(&mut self, worktree: &Path, device: Option<DeviceId>, preferred: Option<DeviceId>, cx: &mut Context<Self>) {
         let seq = self.begin_attach(worktree, cx);
         let key = WorktreeKey::from_path(worktree);
-        let runner = self.runner.clone();
+        let (runner, xcode_ok, sdk) = (self.runner.clone(), self.watch_gate().xcode_ok, self.android_sdk.clone());
         cx.spawn(async move |this, cx| {
-            let listed = cx.background_executor().spawn(async move { simctl::list_devices(runner.as_ref(), SIMCTL_TIMEOUT) }).await;
+            let listed = cx
+                .background_executor()
+                .spawn(async move { android::list_all(runner.as_ref(), xcode_ok, sdk.as_ref(), SIMCTL_TIMEOUT) })
+                .await;
             let _ = this.update(cx, |hub, cx| {
                 if hub.attach_seq.get(&key) != Some(&seq) {
                     return; // superseded by a newer attach for this worktree
@@ -441,6 +472,7 @@ impl SimulatorHub {
                 Effect::StopSession { session, .. } => session.shutdown(),
                 Effect::Pause(session) => drop(session.pause()),
                 Effect::Resume(session) => drop(session.resume()),
+                Effect::ShutdownDevice { udid } if udid.platform() == Platform::Android => self.shutdown_android(&udid, cx),
                 Effect::ShutdownDevice { udid } => {
                     // Never `xcrun` without a resolvable Xcode (the CLT dialog).
                     if !self.watch_gate().xcode_ok {
@@ -461,6 +493,10 @@ impl SimulatorHub {
     }
 
     fn boot(&mut self, udid: DeviceId, generation: Generation, cancel: Arc<AtomicBool>, cx: &mut Context<Self>) {
+        if udid.platform() == Platform::Android {
+            self.boot_android(udid, generation, cancel, cx);
+            return;
+        }
         let runner = self.runner.clone();
         cx.spawn(async move |this, cx| {
             let target = udid.clone();
@@ -487,6 +523,10 @@ impl SimulatorHub {
     }
 
     fn start_session(&mut self, udid: DeviceId, generation: Generation, cx: &mut Context<Self>) {
+        if udid.platform() == Platform::Android {
+            self.start_android_session(udid, generation, cx);
+            return;
+        }
         let helper = match self.availability.as_ref().map(|a| &a.helper) {
             Some(HelperStatus::Found(path)) => Ok(path.clone()),
             Some(HelperStatus::Missing(why)) => Err(why.clone()),
@@ -516,7 +556,7 @@ impl SimulatorHub {
                     let path = helper.map_err(|e| (e, false))?;
                     let (done, cvar) = &*reaped;
                     let _unused = cvar.wait_while(done.lock().unwrap(), |done| !*done).unwrap();
-                    StreamSession::start(&path, &target, &opts).map_err(|e| {
+                    HelperSession::start(&path, &target, &opts).map(StreamSession::from).map_err(|e| {
                         // Shut down between the watcher's polls (e.g. while
                         // parked): that is a disconnect, not a failure.
                         let gone = matches!(e, SimError::DeviceNotBooted);
@@ -524,23 +564,34 @@ impl SimulatorHub {
                     })
                 })
                 .await;
-            let _ = this.update(cx, |hub, cx| {
-                if let Ok(session) = &result {
-                    hub.listen(udid.clone(), generation, session, cx);
-                }
-                // Only for the attempt still current: a late answer must not
-                // stop a newer session or clear ownership.
-                if matches!(result, Err((_, true))) && hub.registry.phase(&udid) == (Phase::Starting { generation }) {
-                    let effects = hub.registry.device_shutdown(&udid);
-                    hub.run(effects, cx);
-                }
-                let result = result.map_err(|(e, _)| e);
-                let effects = hub.registry.session_started(&udid, generation, result);
-                hub.run(effects, cx);
-                cx.emit(HubEvent::Changed(udid));
-            });
+            let _ = this.update(cx, |hub, cx| hub.finish_start(udid, generation, result, cx));
         })
         .detach();
+    }
+
+    /// A session start for `udid` ended: listen to it, or record why not
+    /// (`true` with the error: the device was gone — a disconnect, not a
+    /// failure).
+    fn finish_start(
+        &mut self,
+        udid: DeviceId,
+        generation: Generation,
+        result: Result<StreamSession, (String, bool)>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(session) = &result {
+            self.listen(udid.clone(), generation, session, cx);
+        }
+        // Only for the attempt still current: a late answer must not
+        // stop a newer session or clear ownership.
+        if matches!(result, Err((_, true))) && self.starting(&udid, generation) {
+            let effects = self.registry.device_shutdown(&udid);
+            self.run(effects, cx);
+        }
+        let result = result.map_err(|(e, _)| e);
+        let effects = self.registry.session_started(&udid, generation, result);
+        self.run(effects, cx);
+        cx.emit(HubEvent::Changed(udid));
     }
 
     /// Become the session's sole wake/event consumer and fan out. The wake

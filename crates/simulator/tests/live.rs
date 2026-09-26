@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use oximux_simulator::helper::HelperOptions;
 use oximux_simulator::protocol::{Command, TouchPhase};
-use oximux_simulator::session::{SessionEvent, StreamSession};
+use oximux_simulator::session::{SessionEvent, HelperSession};
 use oximux_simulator::{DeviceId, Orientation};
 
 fn live_target() -> (PathBuf, DeviceId) {
@@ -39,7 +39,7 @@ fn first_booted_iphone() -> Option<String> {
     })
 }
 
-fn wait_for_frame(session: &StreamSession, seen: u64, timeout: Duration) -> (u64, u32, u32) {
+fn wait_for_frame(session: &HelperSession, seen: u64, timeout: Duration) -> (u64, u32, u32) {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some((seq, frame)) = session.latest_frame(seen) {
@@ -54,7 +54,7 @@ fn wait_for_frame(session: &StreamSession, seen: u64, timeout: Duration) -> (u64
 #[ignore = "needs Xcode and a booted simulator; run with --ignored"]
 fn streams_rotates_screenshots_and_takes_input() {
     let (helper, udid) = live_target();
-    let session = StreamSession::start(&helper, &udid, &HelperOptions::default()).expect("helper starts");
+    let session = HelperSession::start(&helper, &udid, &HelperOptions::default()).expect("helper starts");
     let events = session.take_events().unwrap();
     assert!(session.hello().xcode.is_some());
 

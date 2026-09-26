@@ -7925,6 +7925,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-video-toolbox"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05bf9a3c14831a7d9641b0d81d87dd913ee238a012b2fde27db5a84b56f5df3e"
+dependencies = [
+ "bitflags 2.11.1",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+]
+
+[[package]]
 name = "objc2-web-kit"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8710,16 +8722,25 @@ name = "oximux-simulator"
 version = "0.1.29"
 dependencies = [
  "base64",
+ "core-foundation 0.10.0",
+ "core-video",
  "fd-lock",
  "libc",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-video-toolbox",
  "oximux-no-window",
  "oximux-proc-tree",
  "oximux-sibling-binary",
+ "roxmltree 0.21.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

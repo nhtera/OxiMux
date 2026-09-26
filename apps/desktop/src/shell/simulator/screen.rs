@@ -1,8 +1,9 @@
 //! [`ScreenView`]: the live device screen inside the panel's phone outline.
 //!
 //! **Frames.** On each [`HubEvent::Frame`] for its device the view takes the
-//! session's newest frame, decodes it on the background executor
-//! ([`decode`]) and swaps it in. At most one decode is in flight; frames that
+//! session's newest frame. An Android frame arrives already decoded (a GPU
+//! pixel buffer) and is painted as is with `surface()`; an iOS frame is JPEG,
+//! decoded on the background executor ([`decode`]) and swapped in. At most one decode is in flight; frames that
 //! land meanwhile collapse into one more decode of whatever is newest then
 //! (latest wins). The previous image leaves the GPU atlas in the same update
 //! that replaces it, so at most two frame images are ever alive. Nothing is
@@ -30,7 +31,9 @@ use gpui::{
 use oximux_settings::{Theme, Typography};
 use oximux_simulator::DeviceId;
 use oximux_simulator::gesture::WheelDrag;
-use oximux_simulator::session::StreamSession;
+use oximux_simulator::session::{FrameData, StreamSession};
+#[cfg(target_os = "macos")]
+use oximux_simulator::video::vt_decoder::Picture;
 
 use super::hub::{HubEvent, SimulatorHub};
 use super::panel::settings;
@@ -58,6 +61,9 @@ pub struct ScreenView {
     hub: Entity<SimulatorHub>,
     binding: Binding,
     image: Option<Arc<RenderImage>>,
+    /// An Android frame (decoded on the GPU), shown instead of `image`.
+    #[cfg(target_os = "macos")]
+    picture: Option<Picture>,
     /// `(helper pid, frame seq)` of the last frame taken: a new session's
     /// sequence restarts at zero.
     taken: Option<(u32, u64)>,
@@ -85,16 +91,25 @@ pub struct ScreenView {
     _activation: Subscription,
 }
 
-/// Paint-side FPS bookkeeping: the image last painted, and when each new one
+/// Which frame a paint showed: an image, or an Android picture by sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shown {
+    Image(gpui::ImageId),
+    /// An Android picture (macOS only: elsewhere Android is not decoded).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Picture(u64),
+}
+
+/// Paint-side FPS bookkeeping: the frame last painted, and when each new one
 /// was painted over the last second.
 #[derive(Default)]
 struct Painted {
-    last: Option<gpui::ImageId>,
+    last: Option<Shown>,
     at: VecDeque<Instant>,
 }
 
 impl Painted {
-    fn record(&mut self, image: gpui::ImageId, now: Instant) {
+    fn record(&mut self, image: Shown, now: Instant) {
         if self.last.replace(image) != Some(image) {
             self.at.push_back(now);
         }
@@ -127,6 +142,8 @@ impl ScreenView {
             hub,
             binding: Binding { device: None, visible: false, radius: 0.0 },
             image: None,
+            #[cfg(target_os = "macos")]
+            picture: None,
             taken: None,
             decoding: false,
             behind: false,
@@ -161,6 +178,10 @@ impl ScreenView {
             self.release_input(cx);
             if let Some(old) = self.image.take() {
                 cx.drop_image(old, Some(window));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                self.picture = None;
             }
             self.taken = None;
             *self.painted.borrow_mut() = Painted::default();
@@ -207,6 +228,18 @@ impl ScreenView {
         let seen = self.taken.filter(|(p, _)| *p == pid).map_or(0, |(_, seq)| seq);
         let Some((seq, frame)) = session.latest_frame(seen) else { return };
         self.taken = Some((pid, seq));
+        let frame = match frame {
+            FrameData::Jpeg(frame) => frame,
+            #[cfg(target_os = "macos")]
+            FrameData::Picture(picture) => {
+                if let Some(old) = self.image.take() {
+                    cx.drop_image(old, Some(window));
+                }
+                self.picture = Some(picture);
+                cx.notify();
+                return;
+            }
+        };
         self.decoding = true;
         let decoded = cx.background_executor().spawn(async move { decode::decode(&frame) });
         cx.spawn_in(window, async move |this, cx| {
@@ -228,7 +261,32 @@ impl ScreenView {
         .detach();
     }
 
+    /// The pixel size of the frame on screen: the JPEG image, or the Android
+    /// picture (input maps through it — without it no touch is sent).
+    fn frame_size(&self) -> Option<(f64, f64)> {
+        #[cfg(target_os = "macos")]
+        if let Some(picture) = &self.picture {
+            let (w, h) = picture.size();
+            return Some((w as f64, h as f64));
+        }
+        let size = self.image.as_ref()?.size(0);
+        Some((f64::from(size.width.0), f64::from(size.height.0)))
+    }
+
+    /// The frame on screen now (for the FPS readout).
+    fn shown(&self) -> Option<Shown> {
+        #[cfg(target_os = "macos")]
+        if self.picture.is_some() {
+            return self.taken.map(|(_, seq)| Shown::Picture(seq));
+        }
+        self.image.as_ref().map(|image| Shown::Image(image.id))
+    }
+
     fn show(&mut self, image: Arc<RenderImage>, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.picture = None;
+        }
         if let Some(old) = self.image.replace(image) {
             cx.drop_image(old, Some(window));
         }
@@ -306,15 +364,15 @@ impl Render for ScreenView {
         let bounds = self.bounds.clone();
         let weak = cx.weak_entity();
         let painted = self.painted.clone();
-        let image_id = self.image.as_ref().map(|i| i.id);
+        let shown = self.shown();
         // Window-level drag listeners, so a drag keeps moving (and always
         // ends) when the pointer leaves the screen. Re-registered each paint;
         // they do nothing unless a drag is in progress.
         let meter = canvas(
             move |b, _, _| bounds.set(Some(b)),
             move |_, _, window, _| {
-                if let Some(id) = image_id {
-                    painted.borrow_mut().record(id, Instant::now());
+                if let Some(shown) = shown {
+                    painted.borrow_mut().record(shown, Instant::now());
                 }
                 let on_move = weak.clone();
                 // Capture phase: nothing drawn later can swallow them.
@@ -355,7 +413,19 @@ impl Render for ScreenView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_paste));
-        if let Some(image) = self.image.clone() {
+        #[cfg(target_os = "macos")]
+        let picture = self.picture.as_ref().map(|p| p.buffer().clone());
+        #[cfg(not(target_os = "macos"))]
+        let picture: Option<()> = None;
+        if let Some(_buffer) = picture {
+            // Zero-copy: the decoder's pixel buffer goes straight to Metal. A
+            // surface is not clipped to rounded corners; the bezel's corners
+            // overlap them.
+            #[cfg(target_os = "macos")]
+            {
+                screen = screen.child(gpui::surface(_buffer).size_full().object_fit(ObjectFit::Contain));
+            }
+        } else if let Some(image) = self.image.clone() {
             // Rounded itself: the parent's `overflow_hidden` clips to a
             // rectangle, not to the screen's rounded corners.
             screen = screen

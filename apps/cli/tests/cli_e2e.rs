@@ -313,7 +313,7 @@ fn sim_verbs_against_a_live_host() {
     assert_eq!(out.status.code(), Some(1));
     let v = json_stdout(&out);
     assert_eq!(v["error"]["code"], "unsupported");
-    assert!(v["error"]["message"].as_str().unwrap().contains("iOS Simulator"));
+    assert!(v["error"]["message"].as_str().unwrap().contains("no simulators"));
 }
 
 /// `status` and `ls --json` against a live host: exit 0, honest counts —

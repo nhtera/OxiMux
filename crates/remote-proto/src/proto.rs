@@ -137,12 +137,18 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// ([`crate::simulator`]), so later verbs append there instead of here. Only
 /// local callers are served; a paired device gets `Unauthorized`.
 ///
+/// v26: appended **Android buttons** to the simulator surface
+/// (`SimButtonWire::{Back, VolumeUp, VolumeDown}`), now that the panel drives
+/// Android emulators and phones too. Every other verb already names its device
+/// through the attachment, so nothing else changed on the wire. A v25 host
+/// cannot decode the new buttons: see [`SIMULATOR_ANDROID_BUTTONS_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -216,6 +222,12 @@ pub const CREATE_WORKTREE_BASE_MIN_VERSION: u32 = 24;
 /// host cannot decode the ordinal and would answer "undecodable request frame"
 /// — a complaint about bytes for what is really a version problem.
 pub const SIMULATOR_MIN_VERSION: u32 = 25;
+
+/// The oldest host that knows Android's buttons (`sim button back`,
+/// `volume-up`, `volume-down`). Read by the **client** and gated on what the
+/// command asks for: every other `sim` verb, and the iOS buttons, still work
+/// against a v25 host.
+pub const SIMULATOR_ANDROID_BUTTONS_MIN_VERSION: u32 = 26;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the

@@ -82,7 +82,7 @@ pub(crate) fn home_button(device_name: &str) -> Button {
 }
 
 impl SimulatorHub {
-    fn device_name(&self, udid: &DeviceId) -> String {
+    pub(super) fn device_name(&self, udid: &DeviceId) -> String {
         self.devices.iter().find(|d| &d.udid == udid).map_or_else(|| "Simulator".into(), |d| d.name.clone())
     }
 
@@ -100,6 +100,17 @@ impl SimulatorHub {
         self.send_button(udid, Button::Lock)
     }
 
+    /// Android's Back. False without a live stream (or on iOS).
+    pub fn back(&self, udid: &DeviceId) -> bool {
+        let Some(session) = self.session(udid) else { return false };
+        session.press_android(oximux_simulator::android::input::AndroidButton::Back).is_ok()
+    }
+
+    /// Android's Recents (the app switcher).
+    pub fn recents(&self, udid: &DeviceId) -> bool {
+        self.send_button(udid, Button::AppSwitcher)
+    }
+
     fn send_button(&self, udid: &DeviceId, button: Button) -> bool {
         let Some(session) = self.session(udid) else { return false };
         session.send(&oximux_simulator::protocol::Command::Button { name: button }).is_ok()
@@ -108,7 +119,8 @@ impl SimulatorHub {
     /// Save a full-resolution screenshot of `udid` to the Desktop and put it
     /// on the clipboard.
     pub fn screenshot(&self, udid: &DeviceId, cx: &mut Context<Self>) {
-        if !self.xcode_ok() {
+        let android = udid.platform() == oximux_simulator::Platform::Android;
+        if !android && !self.xcode_ok() {
             return;
         }
         let (runner, target, session) = (self.runner.clone(), udid.clone(), self.session(udid));
@@ -122,6 +134,8 @@ impl SimulatorHub {
                     // (parked, starting) simctl still has the device.
                     let png = match session.map(|s| s.screenshot_png(SIMCTL_TIMEOUT)) {
                         Some(Ok(png)) => png,
+                        Some(Err(e)) if android => return Err(e.to_string()),
+                        None if android => return Err("the device is not streaming".into()),
                         _ => simctl::screenshot_png(runner.as_ref(), target.as_str(), SIMCTL_TIMEOUT)
                             .map_err(|e| e.to_string())?,
                     };
@@ -157,6 +171,10 @@ impl SimulatorHub {
     }
 
     fn start_recording(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
+        if udid.platform() == oximux_simulator::Platform::Android {
+            self.start_android_recording(udid, cx);
+            return;
+        }
         if !self.xcode_ok() || !self.recording_starts.insert(udid.clone()) {
             return; // no Xcode, or a start is already in flight
         }
@@ -201,7 +219,7 @@ impl SimulatorHub {
     }
 
     /// Stop the recording at [`MAX_LENGTH`], if it is still the same one.
-    fn auto_stop(&self, udid: DeviceId, since: Instant, cx: &mut Context<Self>) {
+    pub(super) fn auto_stop(&self, udid: DeviceId, since: Instant, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(MAX_LENGTH).await;
             let _ = this.update(cx, |hub, cx| {

@@ -565,3 +565,23 @@ fn a_shown_worktree_joining_a_paused_device_resumes_it() {
     assert_eq!(kinds(&reg.attach(wt("b"), u.clone(), true, now)), ["resume s", "persist"]);
     assert!(reg.tick(now + PARK_AFTER * 2).is_empty(), "not parked while shown");
 }
+
+#[test]
+fn a_usb_phone_is_never_picked_automatically() {
+    let device = |udid: &str, booted: bool| DeviceInfo {
+        udid: DeviceId(udid.into()),
+        name: udid.into(),
+        runtime: "Android 16".into(),
+        os_version: "16".into(),
+        state: if booted { DeviceState::Booted } else { DeviceState::Shutdown },
+        kind: DeviceKind::Phone,
+        is_available: true,
+    };
+    let devices = [device("adb:R58M123ABC", true), device("avd:Medium_Phone", false)];
+    let (picked, booted) = auto_pick(&devices, None).expect("the emulator");
+    assert_eq!((picked.udid.as_str(), booted), ("avd:Medium_Phone", false));
+    // Chosen as the default device by the user: that is asking for it.
+    let preferred = DeviceId("adb:R58M123ABC".into());
+    assert_eq!(auto_pick(&devices, Some(&preferred)).map(|(d, _)| d.udid.as_str()), Some("adb:R58M123ABC"));
+    assert!(auto_pick(&devices[..1], None).is_none());
+}

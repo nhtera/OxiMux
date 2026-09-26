@@ -261,8 +261,11 @@ mod tests {
         // `..` and symlinks are resolved before the check.
         let sneaky = worktree.join("../elsewhere/Build/App.app");
         assert_eq!(check_install_path(&sneaky, &worktree, None), Err(InstallPathError::Outside));
-        std::os::unix::fs::symlink(app(&elsewhere), worktree.join("Link.app")).unwrap();
-        assert_eq!(check_install_path(&worktree.join("Link.app"), &worktree, None), Err(InstallPathError::Outside));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(app(&elsewhere), worktree.join("Link.app")).unwrap();
+            assert_eq!(check_install_path(&worktree.join("Link.app"), &worktree, None), Err(InstallPathError::Outside));
+        }
         // Not an app bundle.
         assert_eq!(check_install_path(&worktree.join("Build"), &worktree, None), Err(InstallPathError::NotAnApp));
         assert_eq!(check_install_path(&worktree.join("missing.app"), &worktree, None), Err(InstallPathError::NotAnApp));

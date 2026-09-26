@@ -176,6 +176,11 @@ pub(super) fn entries(
         ),
         entry("Helper", helper_summary(hub.as_ref(), cx), div()),
         entry(
+            "Android SDK",
+            android_summary(hub.as_ref(), s.android_sdk.as_deref(), cx),
+            value_chip("sim-android-sdk", "Choose…", theme, density, typography, |_, window, cx| choose_android_sdk(window, cx), cx),
+        ),
+        entry(
             "Device logs",
             "CoreSimulator's log folder, in Finder.",
             value_chip("sim-logs", "Open", theme, density, typography, |_, _, cx| open_logs_folder(cx), cx),
@@ -329,6 +334,31 @@ fn approval_rows(theme: Theme, density: Density, typography: &Typography, cx: &m
         ));
     }
     rows
+}
+
+/// Where the Android SDK was found, or how to point to it.
+fn android_summary(hub: Option<&Entity<SimulatorHub>>, chosen: Option<&str>, cx: &Context<SettingsModal>) -> SharedString {
+    match hub.and_then(|h| h.read(cx).android_sdk().map(|s| s.root.display().to_string())) {
+        Some(root) => format!("Android emulators and phones: {root}").into(),
+        None if chosen.is_some() => "No adb in the chosen folder (it wants the SDK root, with platform-tools inside).".into(),
+        None => "Not found. Install Android Studio, set ANDROID_HOME, or choose the SDK folder.".into(),
+    }
+}
+
+/// Pick the SDK folder, save it, and look again. Rooted in the window: the
+/// native panel resolves outside GPUI's window context.
+fn choose_android_sdk(window: &mut gpui::Window, cx: &mut Context<SettingsModal>) {
+    cx.spawn_in(window, async move |this, cx| {
+        let Some(folder) = rfd::AsyncFileDialog::new().set_title("Android SDK folder").pick_folder().await else { return };
+        let path = folder.path().to_string_lossy().into_owned();
+        let _ = this.update_in(cx, |_, _, cx| {
+            change(cx, |s| s.android_sdk = Some(path));
+            if let Some(hub) = hub(cx) {
+                hub.update(cx, |hub, cx| hub.refresh_android_sdk(cx));
+            }
+        });
+    })
+    .detach();
 }
 
 fn open_logs_folder(cx: &mut Context<SettingsModal>) {

@@ -1,4 +1,4 @@
-//! [`StreamSession`]: one running helper, as the UI and the agent verbs see it.
+//! [`HelperSession`]: one running helper, as the UI and the agent verbs see it.
 //!
 //! Three threads per session, none of them ever blocking the caller:
 //! - **reader** — parses the helper's stdout ([`helper::pump`]);
@@ -11,7 +11,9 @@
 //!
 //! Dropping the session closes stdin, which is the helper's signal to exit;
 //! a helper that has not exited a second later is killed. Neither `Drop`
-//! nor [`StreamSession::shutdown`] waits for that.
+//! nor [`HelperSession::shutdown`] waits for that.
+
+pub use crate::stream::{FrameData, StreamSession};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,7 +37,7 @@ pub const KEY_PACING: Duration = Duration::from_millis(4);
 const EXIT_GRACE: Duration = Duration::from_secs(1);
 
 /// Something the UI should react to. Frames are not events: poll
-/// [`StreamSession::latest_frame`] when woken.
+/// [`HelperSession::latest_frame`] when woken.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
     /// Portrait framebuffer size in pixels changed (or became known).
@@ -82,9 +84,9 @@ struct Inner {
 }
 
 /// A running helper streaming one device. Cheap to clone; when the last
-/// clone is dropped the helper is shut down (see [`StreamSession::shutdown`]).
+/// clone is dropped the helper is shut down (see [`HelperSession::shutdown`]).
 #[derive(Clone)]
-pub struct StreamSession {
+pub struct HelperSession {
     inner: Arc<Inner>,
     /// Shared by the clones only (the session threads hold `inner`, not
     /// this), so its drop marks "nobody is using the session any more".
@@ -99,7 +101,7 @@ impl Drop for Guard {
     }
 }
 
-impl StreamSession {
+impl HelperSession {
     /// Spawn the helper at `path` for `udid` and wait (≤ 10 s per step) for
     /// its `hello` and `ready`. Blocking: call from a background executor.
     pub fn start(path: &Path, udid: &DeviceId, opts: &HelperOptions) -> Result<Self> {
@@ -200,7 +202,7 @@ impl StreamSession {
     /// Called (from a session thread) after every new frame and event. Keep it
     /// cheap: wake the UI, do the work there.
     ///
-    /// The closure must not own a `StreamSession` clone: that clone would keep
+    /// The closure must not own a `HelperSession` clone: that clone would keep
     /// the session alive forever, so "shut down when the last clone drops"
     /// could never fire. Capture a weak UI handle instead.
     pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {

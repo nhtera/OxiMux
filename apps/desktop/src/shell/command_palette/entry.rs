@@ -191,6 +191,16 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         make_action: || Box::new(crate::actions::SimLock),
     },
     CommandEntry {
+        name: "Simulator: Back (Android)",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimBack),
+    },
+    CommandEntry {
+        name: "Simulator: Recents (Android)",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimRecents),
+    },
+    CommandEntry {
         name: "Simulator: Toggle Keyboard Capture",
         action_id: None,
         make_action: || Box::new(crate::actions::SimToggleKeyboard),
@@ -352,11 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_twenty_two_entries() {
+    fn palette_commands_has_thirty_two_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
-        // + "Reveal Active Workspace" + "Show iOS Simulator".
-        assert_eq!(PALETTE_COMMANDS.len(), 30);
+        // + "Reveal Active Workspace" + "Show iOS Simulator"
+        // + the Android "Back" and "Recents" simulator rows.
+        assert_eq!(PALETTE_COMMANDS.len(), 32);
     }
 
     #[test]

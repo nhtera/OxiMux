@@ -17,8 +17,8 @@ use super::hub::NoticeKind;
 use super::panel::{Outcome, PanelEvent, RootRequest, SimCommand, SimulatorPanel};
 use super::widths;
 use crate::actions::{
-    SimAnnotate, SimDetach, SimHome, SimLock, SimOpenLogs, SimRotateCcw, SimRotateCw, SimScreenshot, SimShutdown,
-    SimToggleKeyboard, SimToggleRecord,
+    SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw, SimRotateCw,
+    SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord,
 };
 use crate::shell::chrome::toast::{ToastAction, ToastKind};
 use crate::shell::right_sidebar::tab::RightTab;
@@ -311,6 +311,8 @@ pub(crate) fn simulator_actions<E: InteractiveElement>(el: E, cx: &mut Context<W
     }
     let el = on::<SimHome, _>(el, SimCommand::Home, cx);
     let el = on::<SimLock, _>(el, SimCommand::Lock, cx);
+    let el = on::<SimBack, _>(el, SimCommand::Back, cx);
+    let el = on::<SimRecents, _>(el, SimCommand::Recents, cx);
     let el = on::<SimRotateCw, _>(el, SimCommand::RotateCw, cx);
     let el = on::<SimRotateCcw, _>(el, SimCommand::RotateCcw, cx);
     let el = on::<SimScreenshot, _>(el, SimCommand::Screenshot, cx);

@@ -1,5 +1,6 @@
 //! The floating toolbar pill under the phone, in the reference layout:
-//! Home | Annotate, Screenshot, Record | Logs | Rotate | Shutdown, Detach.
+//! Home | Annotate, Screenshot, Record | Logs | Rotate | Shutdown, Detach —
+//! and for Android, Back, Home, Recents in front (the navigation bar's three).
 //! Buttons dispatch the same `Sim*` actions as the captured-keyboard
 //! shortcuts and the palette (see [`super::commands`]). While a shutdown is
 //! being confirmed, the pill becomes the question.
@@ -33,6 +34,24 @@ const ITEMS: [Option<(&str, &str, &str, SimCommand)>; 12] = [
     Some(("sim-tb-detach", "icons/log-out.svg", "Detach", SimCommand::Detach)),
 ];
 
+/// The Android pill: the navigation bar's three buttons, then the rest.
+const ANDROID_ITEMS: [Option<(&str, &str, &str, SimCommand)>; 14] = [
+    Some(("sim-tb-back", "icons/arrow-left.svg", "Back", SimCommand::Back)),
+    Some(("sim-tb-home", "icons/house.svg", "Home  ⌘⇧H", SimCommand::Home)),
+    Some(("sim-tb-recents", "icons/square.svg", "Recents", SimCommand::Recents)),
+    None,
+    Some(("sim-tb-annotate", "icons/pencil.svg", "Annotate for an agent", SimCommand::Annotate)),
+    Some(("sim-tb-shot", "icons/camera.svg", "Screenshot to Desktop  ⌘S", SimCommand::Screenshot)),
+    Some(("sim-tb-record", "icons/video.svg", "Record screen  ⌘R", SimCommand::ToggleRecord)),
+    None,
+    Some(("sim-tb-logs", "icons/square-terminal.svg", "Device logs (logcat)", SimCommand::OpenLogs)),
+    None,
+    Some(("sim-tb-rotate", "icons/rotate-cw.svg", "Rotate  ⌘→", SimCommand::RotateCw)),
+    None,
+    Some(("sim-tb-power", "icons/power.svg", "Shut down emulator", SimCommand::Shutdown)),
+    Some(("sim-tb-detach", "icons/log-out.svg", "Detach", SimCommand::Detach)),
+];
+
 /// `m:ss` for a recording's running time.
 pub(crate) fn elapsed_label(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
@@ -63,8 +82,13 @@ impl SimulatorPanel {
         let live = matches!(state, PanelState::Streaming);
         let attached = self.device(cx).is_some();
         let recording = self.recording_since(cx);
+        let device = self.device(cx);
+        let android = device.as_ref().is_some_and(|d| d.platform() == oximux_simulator::Platform::Android);
+        // A phone is never shut down from here.
+        let phone = device.as_ref().is_some_and(crate::shell::simulator::SimulatorHub::is_phone);
+        let items: &[Option<(&str, &str, &str, SimCommand)>] = if android { &ANDROID_ITEMS } else { &ITEMS };
         let mut pill = self.pill();
-        for item in ITEMS {
+        for &item in items {
             let Some((id, icon, tip, command)) = item else {
                 pill = pill.child(div().w(px(1.0)).h(px(density.h_row * 0.6)).bg(theme.border_inactive));
                 continue;
@@ -74,6 +98,7 @@ impl SimulatorPanel {
                 // Recording can always be stopped; captures work on any
                 // attached, streaming device.
                 SimCommand::ToggleRecord => live || recording.is_some(),
+                SimCommand::Shutdown => live && !phone,
                 _ => live,
             };
             let mut button = Button::new(id).ghost().small().tooltip(tip).disabled(!enabled);
