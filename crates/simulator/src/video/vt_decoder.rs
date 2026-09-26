@@ -10,6 +10,8 @@
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use core_foundation::base::TCFType;
 use core_video::pixel_buffer::{CVPixelBuffer, CVPixelBufferRef, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
@@ -66,6 +68,9 @@ pub struct Decoder {
     params: ParameterSets,
     /// Owned here; the output callback borrows it through its refcon.
     on_frame: *mut OnFrame,
+    /// Pictures handed to `on_frame` so far: a decode that adds none failed,
+    /// even when VideoToolbox reported success.
+    delivered: Arc<AtomicU64>,
 }
 
 // The session is thread-safe for our use (one decoding thread at a time), and
@@ -78,7 +83,12 @@ impl Decoder {
     pub fn new(params: &ParameterSets, on_frame: impl Fn(Picture) + Send + Sync + 'static) -> Result<Self> {
         let format = format_description(params)?;
         let attributes = destination_attributes();
-        let on_frame: *mut OnFrame = Box::into_raw(Box::new(Box::new(on_frame)));
+        let delivered = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&delivered);
+        let on_frame: *mut OnFrame = Box::into_raw(Box::new(Box::new(move |picture| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            on_frame(picture);
+        })));
         let callback = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(output_callback),
             decompressionOutputRefCon: on_frame.cast(),
@@ -103,7 +113,7 @@ impl Decoder {
         };
         // SAFETY: `create` returned it retained.
         let session = unsafe { CFRetained::from_raw(session) };
-        Ok(Self { session, format, params: params.clone(), on_frame })
+        Ok(Self { session, format, params: params.clone(), on_frame, delivered })
     }
 
     /// The parameter sets this session decodes.
@@ -114,10 +124,17 @@ impl Decoder {
     /// Decode one picture (an Annex-B media packet). Returns once the frame
     /// callback has run for it (decoding is synchronous).
     pub fn decode(&self, annexb_picture: &[u8]) -> Result<()> {
-        let mut sample = annexb::to_avcc(annexb_picture);
+        self.decode_avcc(annexb::to_avcc(annexb_picture))
+    }
+
+    /// Decode one picture that is already an AVCC sample (4-byte big-endian
+    /// NAL lengths), as the iOS helper sends them.
+    /// A picture that decodes to nothing paintable is an error.
+    pub fn decode_avcc(&self, mut sample: Vec<u8>) -> Result<()> {
         if sample.is_empty() {
             return Ok(());
         }
+        let before = self.delivered.load(Ordering::Acquire);
         let len = sample.len();
         let mut block: *mut CMBlockBuffer = ptr::null_mut();
         // SAFETY: `sample` outlives the block (the decode below is synchronous
@@ -158,6 +175,9 @@ impl Decoder {
         drop(sample);
         if status != 0 {
             return Err(vt_error("decode a frame", status));
+        }
+        if self.delivered.load(Ordering::Acquire) == before {
+            return Err(SimError::HelperFailed("the decoder produced no picture it could show".into()));
         }
         Ok(())
     }

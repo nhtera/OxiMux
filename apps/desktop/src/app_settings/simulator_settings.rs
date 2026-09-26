@@ -57,6 +57,34 @@ impl Resolution {
     }
 }
 
+/// How the iOS helper encodes the stream (the stream row's Encoding menu).
+/// H.264 is decoded on the GPU and costs a fraction of JPEG's CPU; JPEG is the
+/// fallback a helper without H.264 always uses. Android is always H.264.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Encoding {
+    #[default]
+    H264,
+    Jpeg,
+}
+
+impl Encoding {
+    pub fn label(self) -> &'static str {
+        match self {
+            Encoding::H264 => "H.264",
+            Encoding::Jpeg => "JPEG",
+        }
+    }
+
+    /// What to ask the helper for.
+    pub fn format(self) -> oximux_simulator::protocol::StreamFormat {
+        match self {
+            Encoding::H264 => oximux_simulator::protocol::StreamFormat::Avcc,
+            Encoding::Jpeg => oximux_simulator::protocol::StreamFormat::Jpeg,
+        }
+    }
+}
+
 /// The frame rates the stream row offers. `clamp_fps` snaps any other value
 /// (a hand-edited TOML, or a future build's now-removed option) to the
 /// nearest of these rather than silently falling back to the default,
@@ -82,6 +110,7 @@ pub struct StreamSettings {
     /// of those by [`SimulatorSettings::sanitized`].
     pub fps: u32,
     pub resolution: Resolution,
+    pub encoding: Encoding,
     /// Show the live FPS readout in the toolbar.
     pub show_fps: bool,
 }
@@ -91,6 +120,7 @@ impl Default for StreamSettings {
         Self {
             fps: 30,
             resolution: Resolution::Half,
+            encoding: Encoding::H264,
             show_fps: false,
         }
     }
@@ -319,6 +349,7 @@ mod tests {
         assert_eq!(s.idle_shutdown_minutes, 10);
         assert_eq!(s.stream.fps, 30);
         assert_eq!(s.stream.resolution, Resolution::Half);
+        assert_eq!(s.stream.encoding, Encoding::H264);
         assert!(!s.stream.show_fps);
         assert_eq!(s.stream.effective_scale(), 0.5);
     }
@@ -334,6 +365,7 @@ mod tests {
             stream: StreamSettings {
                 fps: 60,
                 resolution: Resolution::Full,
+                encoding: Encoding::Jpeg,
                 show_fps: true,
             },
             android_sdk: Some("/opt/android-sdk".to_string()),
@@ -353,6 +385,9 @@ mod tests {
         assert!(!s.agent_control);
         assert!(s.auto_open);
         assert_eq!(s.stream.fps, 30);
+        // A file from before the Encoding menu streams H.264.
+        let s = SimulatorSettings::from_toml_str("[stream]\nfps = 60\n").expect("parses");
+        assert_eq!((s.stream.fps, s.stream.encoding), (60, Encoding::H264));
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! call the same methods on both: input is the helper's portrait-normalized
 //! [`Command`] vocabulary, sizes are portrait framebuffer sizes, and the
 //! orientation is the device's. Where the platforms truly differ, the method
-//! says so: frames are JPEG from the helper and GPU pictures from Android
-//! ([`FrameData`]); the AX tree comes back already parsed ([`describe`]).
+//! says so: frames are JPEG or GPU pictures from the helper and GPU pictures
+//! from Android ([`FrameData`]); the AX tree comes back already parsed
+//! ([`describe`]).
 //!
 //! [`describe`]: StreamSession::describe
 
@@ -20,18 +21,32 @@ use crate::android::input::AndroidButton;
 use crate::android::session::AndroidSession;
 use crate::ax::{self, AxNode};
 use crate::helper::Hello;
-use crate::protocol::{Command, Frame};
+use crate::protocol::{Command, Frame, StreamFormat};
 use crate::session::{HelperSession, SessionEvent};
 use crate::{Orientation, Platform, Result, SimError};
 
 /// A frame to show.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum FrameData {
-    /// From the iOS helper: JPEG, decoded by the viewer.
+    /// From the iOS helper in JPEG format: decoded by the viewer.
     Jpeg(Arc<Frame>),
-    /// From an Android device: already decoded, painted as is.
+    /// H.264 from Android or the iOS helper: already decoded, painted as is.
     #[cfg(target_os = "macos")]
     Picture(crate::video::vt_decoder::Picture),
+}
+
+impl FrameData {
+    /// Width and height in pixels, as painted (rotated for display).
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Jpeg(frame) => (frame.width, frame.height),
+            #[cfg(target_os = "macos")]
+            Self::Picture(picture) => {
+                let (w, h) = picture.size();
+                (w as u32, h as u32)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -108,7 +123,7 @@ impl StreamSession {
     /// The newest frame, when newer than `seen` (pass 0 at first).
     pub fn latest_frame(&self, seen: u64) -> Option<(u64, FrameData)> {
         match self {
-            Self::Ios(s) => s.latest_frame(seen).map(|(seq, f)| (seq, FrameData::Jpeg(f))),
+            Self::Ios(s) => s.latest_frame(seen),
             #[cfg(target_os = "macos")]
             Self::Android(s) => s.latest_picture(seen).map(|(seq, p)| (seq, FrameData::Picture(p))),
             #[cfg(not(target_os = "macos"))]
@@ -172,6 +187,20 @@ impl StreamSession {
         match self {
             Self::Ios(s) => s.resume(),
             Self::Android(s) => s.resume(),
+        }
+    }
+
+    /// Whether the stream's encoding can be switched ([`Self::set_format`]):
+    /// an iOS helper with H.264. Android is always H.264.
+    pub fn supports_format_switch(&self) -> bool {
+        matches!(self, Self::Ios(s) if s.supports_avcc())
+    }
+
+    /// Switch an iOS stream between JPEG and H.264; a no-op elsewhere.
+    pub fn set_format(&self, format: StreamFormat, timeout: Duration) -> Result<()> {
+        match self {
+            Self::Ios(s) => s.set_format(format, timeout),
+            Self::Android(_) => Ok(()),
         }
     }
 

@@ -88,7 +88,7 @@ pub const WHEEL_SLOP: f64 = 0.015;
 
 /// Wheel / trackpad scrolling as a one-finger drag — what upstream's native
 /// `SimHID.scroll` does (`HIDInjector.swift` `sendScroll`), done here because
-/// helper v0.2.0 drops `scroll` (it passes a zero screen size, which
+/// helper (through v0.3.0) drops `scroll` (it passes a zero screen size, which
 /// upstream's guard rejects).
 ///
 /// Once the deltas add up to [`WHEEL_SLOP`], a finger goes down under the

@@ -195,19 +195,25 @@ jobs:
           print(next(x["udid"] for k, v in d.items() if "iOS" in k for x in v if "iPhone" in x["name"]))')
           xcrun simctl boot "$udid"
           xcrun simctl bootstatus "$udid" -b >/dev/null
+          # Both encodings: JPEG frames (kind 1) and H.264 pictures (kind 3,
+          # VideoToolbox inside the hardened runtime).
           (sleep 20) | "$helper" --udid "$udid" --scale 0.5 --fps 30 > "$RUNNER_TEMP/frames.bin" || true
+          (sleep 20) | "$helper" --udid "$udid" --scale 0.5 --fps 30 --format avcc > "$RUNNER_TEMP/video.bin" || true
           xcrun simctl shutdown "$udid" || true
-          python3 - "$RUNNER_TEMP/frames.bin" <<'PY'
+          python3 - "$RUNNER_TEMP/frames.bin" 1 "$RUNNER_TEMP/video.bin" 3 <<'PY'
           import struct, sys
-          b = open(sys.argv[1], "rb").read()
-          i = frames = 0
-          while i + 5 <= len(b):
-              kind = b[i]; n = struct.unpack("<I", b[i + 1:i + 5])[0]
-              if kind == 2:  # JSON event: ready / size / error — the only diagnostics
-                  print("event:", b[i + 5:i + 5 + n].decode(errors="replace"))
-              frames += kind == 1; i += 5 + n
-          print(f"helper streamed {frames} frames ({len(b)} bytes)")
-          sys.exit(0 if frames > 0 else 1)
+          ok = True
+          for path, want in zip(sys.argv[1::2], map(int, sys.argv[2::2])):
+              b = open(path, "rb").read()
+              i = pictures = 0
+              while i + 5 <= len(b):
+                  kind = b[i]; n = struct.unpack("<I", b[i + 1:i + 5])[0]
+                  if kind == 2:  # JSON event: ready / size / error — the only diagnostics
+                      print("event:", b[i + 5:i + 5 + n].decode(errors="replace"))
+                  pictures += kind == want; i += 5 + n
+              print(f"{path}: {pictures} messages of kind {want} ({len(b)} bytes)")
+              ok = ok and pictures > 0
+          sys.exit(0 if ok else 1)
           PY
 
       - name: Package, notarize, and staple the DMG

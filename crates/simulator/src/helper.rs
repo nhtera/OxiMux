@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use oximux_no_window::NoWindow;
 
-use crate::protocol::{self, Event, FatalReason, Outbound, PROTOCOL_VERSION};
+use crate::protocol::{self, Event, FatalReason, MIN_PROTOCOL_VERSION, Outbound, PROTOCOL_VERSION, StreamFormat};
 use crate::{DeviceId, Orientation, Result, SimError};
 
 /// The only variables the helper inherits.
@@ -42,6 +42,9 @@ pub struct HelperOptions {
     pub fps: f64,
     pub quality: f64,
     pub orientation: Orientation,
+    /// Asked of every helper; a protocol-1 helper ignores the flag and
+    /// streams JPEG.
+    pub format: StreamFormat,
     /// Where the helper's stderr goes; `None` discards it.
     pub log_path: Option<PathBuf>,
     /// Record the helper here while it runs, so the next launch can reap it
@@ -56,6 +59,7 @@ impl Default for HelperOptions {
             fps: 30.0,
             quality: 0.7,
             orientation: Orientation::Portrait,
+            format: StreamFormat::Jpeg,
             log_path: None,
             ledger: None,
         }
@@ -76,6 +80,8 @@ impl HelperOptions {
             self.quality.to_string(),
             "--orientation".into(),
             self.orientation.as_u8().to_string(),
+            "--format".into(),
+            self.format.as_str().into(),
         ]
     }
 }
@@ -126,6 +132,8 @@ fn open_log(path: &Path) -> Result<File> {
 /// What a completed handshake learned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hello {
+    /// The protocol version the helper speaks (within ours).
+    pub proto: u32,
     pub version: String,
     pub xcode: Option<String>,
 }
@@ -147,10 +155,10 @@ impl Handshake {
     ) -> Result<(Hello, Vec<Outbound>)> {
         let hello = match Self::next(rx, timeout, "hello")? {
             Outbound::Event(Event::Hello { proto, version, xcode }) => {
-                if proto != PROTOCOL_VERSION {
+                if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&proto) {
                     return Err(SimError::HelperIncompatible { expected: PROTOCOL_VERSION, got: proto });
                 }
-                Hello { version, xcode }
+                Hello { proto, version, xcode }
             }
             other => return Err(SimError::Protocol(format!("expected hello first, got {other:?}"))),
         };
@@ -233,7 +241,19 @@ mod tests {
         ]);
         let (h, rest) = Handshake::run(&rx, true, Duration::from_millis(50)).unwrap();
         assert_eq!(h.version, "0.2.0");
+        assert_eq!(h.proto, PROTOCOL_VERSION);
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn handshake_accepts_a_protocol_1_helper() {
+        let rx = feed(vec![
+            Ok(hello(MIN_PROTOCOL_VERSION)),
+            Ok(Outbound::Event(Event::Ready { udid: "U".into(), pid: 1, orientation: None })),
+        ]);
+        assert_eq!(Handshake::run(&rx, true, Duration::from_millis(50)).unwrap().0.proto, 1);
+        let rx = feed(vec![Ok(hello(0))]);
+        assert!(matches!(Handshake::run(&rx, true, Duration::from_millis(50)), Err(SimError::HelperIncompatible { got: 0, .. })));
     }
 
     #[test]
@@ -268,8 +288,12 @@ mod tests {
 
     #[test]
     fn args_carry_every_option() {
-        let args = HelperOptions { orientation: Orientation::LandscapeLeft, ..Default::default() }.args(&DeviceId("U".into()));
-        assert_eq!(args, ["--udid", "U", "--scale", "0.5", "--fps", "30", "--quality", "0.7", "--orientation", "3"]);
+        let opts = HelperOptions { orientation: Orientation::LandscapeLeft, format: StreamFormat::Avcc, ..Default::default() };
+        let args = opts.args(&DeviceId("U".into()));
+        assert_eq!(
+            args,
+            ["--udid", "U", "--scale", "0.5", "--fps", "30", "--quality", "0.7", "--orientation", "3", "--format", "avcc"]
+        );
     }
 
     #[test]

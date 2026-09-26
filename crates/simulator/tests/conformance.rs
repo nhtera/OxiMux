@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use oximux_simulator::child_ledger::{Kind, Ledger};
 use oximux_simulator::helper::{self, HelperOptions};
-use oximux_simulator::protocol::{self, Command, Event, FatalReason, Frame, KeyPhase, Outbound, TouchPhase};
+use oximux_simulator::protocol::{
+    self, Command, Event, FatalReason, Frame, KeyPhase, Outbound, StreamFormat, TouchPhase, Video, VideoTag,
+};
 use oximux_simulator::session::{SessionEvent, HelperSession};
 use oximux_simulator::{Button, DeviceId, Orientation};
 use serde_json::{Value, json};
@@ -62,11 +64,22 @@ fn conformance_run(path: &std::path::Path, commands: &[Vec<u8>]) -> Vec<Outbound
     out
 }
 
+/// The protocol version the helper at `path` announces. Tests expect the
+/// messages of that version, so the pinned (older) release and a locally
+/// built newer fork both pass.
+fn helper_proto(path: &std::path::Path) -> u32 {
+    match conformance_run(path, &[]).first() {
+        Some(Outbound::Event(Event::Hello { proto, .. })) => *proto,
+        other => panic!("first message must be hello, got {other:?}"),
+    }
+}
+
 #[test]
 fn opening_sequence_decodes_to_every_message_shape() {
     let path = require_helper!();
     let out = conformance_run(&path, &[]);
-    let expected = vec![
+    let v2 = helper_proto(&path) >= protocol::AVCC_MIN_VERSION;
+    let mut expected = vec![
         Outbound::Frame(Frame { width: 3, height: 2, jpeg: vec![0xFF, 0xD8, 0xFF, 0xD9] }),
         Outbound::Event(Event::Ready { udid: "conformance".into(), pid: 0, orientation: Some(Orientation::Portrait) }),
         Outbound::Event(Event::Size { width: 1206, height: 2622 }),
@@ -78,9 +91,19 @@ fn opening_sequence_decodes_to_every_message_shape() {
         Outbound::Event(Event::Fatal { reason: FatalReason::FrameworkLoadFailed, message: "example fatal".into() }),
         Outbound::Event(Event::ConformanceReady),
     ];
+    if v2 {
+        let video = Video { width: 3, height: 2, tag: VideoTag::Description, data: vec![0x01, 0x64, 0x00, 0x1F] };
+        expected.insert(1, Outbound::Video(video));
+        let error_at = expected.iter().position(|m| matches!(m, Outbound::Event(Event::Error { .. }))).unwrap();
+        let fallback = Event::Format { format: Some(StreamFormat::Jpeg), message: "example fallback".into() };
+        expected.insert(error_at + 1, Outbound::Event(fallback));
+    }
     match &out[0] {
         Outbound::Event(Event::Hello { proto, xcode, .. }) => {
-            assert_eq!(*proto, protocol::PROTOCOL_VERSION, "helper speaks another protocol version");
+            assert!(
+                (protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION).contains(proto),
+                "helper speaks protocol {proto}, outside what this build drives"
+            );
             assert_eq!(xcode.as_deref(), Some("conformance"));
         }
         other => panic!("first message must be hello, got {other:?}"),
@@ -92,7 +115,7 @@ fn opening_sequence_decodes_to_every_message_shape() {
 fn every_command_we_encode_parses_as_intended() {
     let path = require_helper!();
     // (what we send, what the helper must have understood)
-    let cases: Vec<(Command, Value)> = vec![
+    let mut cases: Vec<(Command, Value)> = vec![
         (Command::Ping, json!({"cmd": "ping"})),
         (Command::Touch { phase: TouchPhase::Begin, x: 0.25, y: 0.75, edge: 0 },
          json!({"cmd": "touch", "phase": "begin", "x": 0.25, "y": 0.75, "edge": 0})),
@@ -108,9 +131,9 @@ fn every_command_we_encode_parses_as_intended() {
         (Command::Button { name: Button::Home }, json!({"cmd": "button", "name": "home"})),
         (Command::Button { name: Button::SideButton }, json!({"cmd": "button", "name": "side_button"})),
         (Command::Button { name: Button::SwipeHome }, json!({"cmd": "button", "name": "swipe_home"})),
-        (Command::Configure { scale: Some(0.5), fps: Some(30.0), orientation: Some(Orientation::LandscapeLeft) },
+        (Command::Configure { scale: Some(0.5), fps: Some(30.0), orientation: Some(Orientation::LandscapeLeft), format: None },
          json!({"cmd": "configure", "scale": 0.5, "fps": 30, "orientation": 3})),
-        (Command::Configure { scale: None, fps: None, orientation: None }, json!({"cmd": "configure"})),
+        (Command::Configure { scale: None, fps: None, orientation: None, format: None }, json!({"cmd": "configure"})),
         (Command::Pause, json!({"cmd": "pause"})),
         (Command::Resume, json!({"cmd": "resume"})),
         (Command::Screenshot, json!({"cmd": "screenshot"})),
@@ -118,6 +141,14 @@ fn every_command_we_encode_parses_as_intended() {
         (Command::AxFrontmost, json!({"cmd": "ax_frontmost"})),
         (Command::MemoryWarning, json!({"cmd": "memory_warning"})),
     ];
+    // A protocol-1 helper rejects `format` (it never gets one: `set_format`
+    // checks the version first).
+    if helper_proto(&path) >= protocol::AVCC_MIN_VERSION {
+        for format in [StreamFormat::Avcc, StreamFormat::Jpeg] {
+            let command = Command::Configure { scale: None, fps: None, orientation: None, format: Some(format) };
+            cases.push((command, json!({"cmd": "configure", "format": format.as_str()})));
+        }
+    }
     let encoded: Vec<Vec<u8>> =
         cases.iter().enumerate().map(|(i, (c, _))| protocol::encode_command(c, Some(i as u64 + 100))).collect();
     let parsed: Vec<(Option<u64>, Result<Value, String>)> = conformance_run(&path, &encoded)

@@ -1,11 +1,13 @@
 //! [`HelperSession`]: one running helper, as the UI and the agent verbs see it.
 //!
-//! Three threads per session, none of them ever blocking the caller:
+//! Four threads per session, none of them ever blocking the caller:
 //! - **reader** — parses the helper's stdout ([`helper::pump`]);
 //! - **dispatcher** — keeps only the newest frame (latest-frame-wins, so a
 //!   slow UI drops frames instead of queueing them and the helper never
-//!   blocks on a full pipe), routes replies to waiting requests by id, and
-//!   turns everything else into [`SessionEvent`]s;
+//!   blocks on a full pipe), hands H.264 to the decoder thread, routes
+//!   replies to waiting requests by id, and turns everything else into
+//!   [`SessionEvent`]s;
+//! - **decoder** — H.264 pictures on the GPU (macOS; see `video`);
 //! - **writer** — owns the helper's stdin and paces key events 4 ms apart
 //!   (the simulator drops keys sent back-to-back).
 //!
@@ -14,6 +16,8 @@
 //! nor [`HelperSession::shutdown`] waits for that.
 
 pub use crate::stream::{FrameData, StreamSession};
+
+mod video;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,7 +31,7 @@ use serde_json::Value;
 
 use crate::child_ledger::{Entry, Kind, Ledger};
 use crate::helper::{self, Handshake, Hello, HelperOptions};
-use crate::protocol::{self, Command, Event, Frame, Outbound};
+use crate::protocol::{self, AVCC_MIN_VERSION, Command, Event, Outbound, StreamFormat};
 use crate::{DeviceId, Orientation, Result, SimError};
 
 /// Pause between consecutive key commands.
@@ -46,6 +50,9 @@ pub enum SessionEvent {
     Orientation(Orientation),
     /// A non-fatal helper complaint (malformed/dropped command).
     Error(String),
+    /// H.264 kept failing (to encode in the helper, or to decode here), so
+    /// the stream is JPEG until the user picks H.264 again.
+    EncodingFallback(String),
     /// The helper is gone. `fatal` carries its last words when it had any.
     Exited { code: Option<i32>, fatal: Option<String> },
     /// An event from a newer helper this build does not know.
@@ -60,7 +67,8 @@ type WriteReq = (Vec<u8>, bool);
 /// Mutable view of the stream, shared with the dispatcher.
 #[derive(Debug, Default)]
 struct View {
-    frame: Option<Arc<Frame>>,
+    /// The newest picture, JPEG or decoded H.264, whichever came last.
+    shown: Option<FrameData>,
     size: Option<(u32, u32)>,
     orientation: Option<Orientation>,
     exited: Option<Option<i32>>,
@@ -72,6 +80,12 @@ struct Inner {
     hello: Hello,
     view: Mutex<View>,
     frame_seq: AtomicU64,
+    /// Bumped by every [`HelperSession::set_format`], so a JPEG fallback
+    /// ends when the user asks for H.264 again.
+    format_requests: AtomicU64,
+    /// Set when the decoder's queue was full and a picture was dropped: the
+    /// decoder then waits for (and asks for) a key frame.
+    video_dropped: std::sync::atomic::AtomicBool,
     next_id: AtomicU64,
     /// Requests awaiting a reply; `None` once the helper's output has ended,
     /// so a late request fails at once instead of waiting out its timeout.
@@ -165,6 +179,8 @@ impl HelperSession {
             hello,
             view: Mutex::new(View { orientation: Some(opts.orientation), ..View::default() }),
             frame_seq: AtomicU64::new(0),
+            format_requests: AtomicU64::new(0),
+            video_dropped: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(Some(HashMap::new())),
             wake: RwLock::default(),
@@ -173,10 +189,21 @@ impl HelperSession {
             child: Mutex::new(child),
             ledger: opts.ledger.clone(),
         });
+        let (video_tx, video_rx) = mpsc::sync_channel(video::QUEUE);
+        let decoder = Arc::clone(&inner);
+        let decoder_events = events_tx.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("oximux-sim-decode".into())
+            .spawn(move || video::decode_loop(&decoder, &video_rx, &decoder_events))
+        {
+            shutdown(&inner);
+            forget(inner.ledger.as_deref(), pid);
+            return Err(e.into());
+        }
         let dispatcher = Arc::clone(&inner);
         if let Err(e) = std::thread::Builder::new()
             .name("oximux-sim-dispatch".into())
-            .spawn(move || dispatch_loop(&dispatcher, early, &rx, &events_tx))
+            .spawn(move || dispatch_loop(&dispatcher, early, &rx, &events_tx, &video_tx))
         {
             shutdown(&inner);
             forget(inner.ledger.as_deref(), pid);
@@ -216,13 +243,18 @@ impl HelperSession {
 
     /// The newest frame, when it is newer than `seen` (pass 0 at first). The
     /// returned sequence number is what to pass next time.
-    pub fn latest_frame(&self, seen: u64) -> Option<(u64, Arc<Frame>)> {
+    pub fn latest_frame(&self, seen: u64) -> Option<(u64, FrameData)> {
         let seq = self.inner.frame_seq.load(Ordering::Acquire);
         if seq <= seen {
             return None;
         }
-        let frame = self.inner.view.lock().unwrap().frame.clone()?;
+        let frame = self.inner.view.lock().unwrap().shown.clone()?;
         Some((seq, frame))
+    }
+
+    /// Whether this helper can stream H.264 ([`StreamFormat::Avcc`]).
+    pub fn supports_avcc(&self) -> bool {
+        self.inner.hello.proto >= AVCC_MIN_VERSION
     }
 
     /// Portrait framebuffer size in pixels, once the helper reported it.
@@ -297,7 +329,18 @@ impl HelperSession {
         orientation: Option<Orientation>,
         timeout: Duration,
     ) -> Result<()> {
-        self.request(&Command::Configure { scale, fps, orientation }, timeout).map(drop)
+        self.request(&Command::Configure { scale, fps, orientation, format: None }, timeout).map(drop)
+    }
+
+    /// Switch the stream's encoding. A no-op on a helper without H.264 (it
+    /// would reject the whole command).
+    pub fn set_format(&self, format: StreamFormat, timeout: Duration) -> Result<()> {
+        if !self.supports_avcc() {
+            return Ok(());
+        }
+        self.inner.format_requests.fetch_add(1, Ordering::AcqRel);
+        let command = Command::Configure { scale: None, fps: None, orientation: None, format: Some(format) };
+        self.request(&command, timeout).map(drop)
     }
 
     /// A full-resolution PNG of the screen, rotated like the stream.
@@ -388,13 +431,23 @@ fn dispatch_loop(
     early: Vec<Outbound>,
     rx: &mpsc::Receiver<Result<Outbound>>,
     events: &mpsc::Sender<SessionEvent>,
+    video: &mpsc::SyncSender<protocol::Video>,
 ) {
     let mut fatal = None;
     for message in early.into_iter().map(Ok).chain(rx.iter()) {
         match message {
             Ok(Outbound::Frame(frame)) => {
-                inner.view.lock().unwrap().frame = Some(Arc::new(frame));
+                inner.view.lock().unwrap().shown = Some(FrameData::Jpeg(Arc::new(frame)));
                 inner.frame_seq.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(Outbound::Video(message)) => {
+                // Never wait on the decoder: replies and events behind this
+                // picture must keep flowing. Decoded pictures wake the UI
+                // from the decoder's callback.
+                if let Err(mpsc::TrySendError::Full(_)) = video.try_send(message) {
+                    inner.video_dropped.store(true, Ordering::Release);
+                }
+                continue;
             }
             Ok(Outbound::Event(event)) => match event {
                 Event::Response { id, result } => {
@@ -414,6 +467,9 @@ fn dispatch_loop(
                 }
                 Event::Error { message } => {
                     let _ = events.send(SessionEvent::Error(message));
+                }
+                Event::Format { message, .. } => {
+                    let _ = events.send(SessionEvent::EncodingFallback(message));
                 }
                 Event::Fatal { message, .. } => fatal = Some(message),
                 Event::Unknown(value) => {
@@ -453,8 +509,9 @@ fn forget(ledger: Option<&Ledger>, pid: u32) {
     }
 }
 
+/// Also runs inside VideoToolbox's callback, so it never panics.
 fn notify(inner: &Inner) {
-    let wake = inner.wake.read().unwrap().clone();
+    let wake = inner.wake.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     if let Some(wake) = wake {
         wake();
     }

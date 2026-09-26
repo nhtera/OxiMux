@@ -221,7 +221,10 @@ pub enum SimError {
     Unsupported(String),
     #[error("simulator helper not found: {0}")]
     HelperNotFound(String),
-    #[error("simulator helper speaks protocol {got}, this app expects {expected}; update OxiMux")]
+    #[error(
+        "simulator helper speaks protocol {got}, this app drives {}–{expected}; the helper and OxiMux need updating together",
+        crate::protocol::MIN_PROTOCOL_VERSION
+    )]
     HelperIncompatible { expected: u32, got: u32 },
     #[error("the simulator helper could not load Xcode's simulator frameworks: {0}")]
     FrameworkLoadFailed(String),

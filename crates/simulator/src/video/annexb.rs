@@ -54,6 +54,35 @@ pub fn parameter_sets(config: &[u8]) -> Option<ParameterSets> {
     Some(ParameterSets { sps: sps.to_vec(), pps: pps.to_vec() })
 }
 
+/// The parameter sets in an avcC record (ISO/IEC 14496-15 §5.2.4.1: the
+/// first SPS and PPS), if it is well formed and uses 4-byte NAL lengths —
+/// the only length VideoToolbox's encoder writes and our decoder reads.
+pub fn from_avcc_record(record: &[u8]) -> Option<ParameterSets> {
+    let (&version, rest) = record.split_first()?;
+    if version != 1 || rest.len() < 5 || rest[3] & 0x03 != 3 {
+        return None;
+    }
+    let mut at = &rest[5 - 1..]; // the SPS count byte
+    let (sps, after) = first_set(at, at.first()? & 0x1f)?;
+    at = after;
+    let (pps, _) = first_set(at, *at.first()?)?;
+    Some(ParameterSets { sps, pps })
+}
+
+/// The first of `count` u16-length-prefixed sets after the count byte, and
+/// what follows all of them.
+fn first_set(data: &[u8], count: u8) -> Option<(Vec<u8>, &[u8])> {
+    let mut at = data.get(1..)?;
+    let mut first = None;
+    for _ in 0..count {
+        let len = u16::from_be_bytes([*at.first()?, *at.get(1)?]) as usize;
+        let set = at.get(2..2 + len)?;
+        first.get_or_insert_with(|| set.to_vec());
+        at = &at[2 + len..];
+    }
+    Some((first.filter(|s| !s.is_empty())?, at))
+}
+
 /// A picture as an AVCC sample. Parameter sets are left out: they belong in
 /// the format description, and repeating them in a sample confuses nothing
 /// but helps nothing either.
@@ -95,6 +124,27 @@ mod tests {
         assert_eq!(sets.sps, [0x67, 0x42, 0x00, 0x1f]);
         assert_eq!(sets.pps, [0x68, 0xce, 0x3c, 0x80]);
         assert_eq!(parameter_sets(&[0, 0, 1, 0x65, 1]), None);
+    }
+
+    #[test]
+    fn parameter_sets_come_from_an_avcc_record() {
+        // version, profile/compat/level, 0xFF (4-byte lengths), 1 SPS, 1 PPS.
+        let record = [1, 0x64, 0x00, 0x1f, 0xff, 0xe1, 0, 4, 0x67, 0x64, 0x00, 0x1f, 1, 0, 3, 0x68, 0xee, 0x3c];
+        let sets = from_avcc_record(&record).unwrap();
+        assert_eq!(sets.sps, [0x67, 0x64, 0x00, 0x1f]);
+        assert_eq!(sets.pps, [0x68, 0xee, 0x3c]);
+        // Truncated anywhere, a wrong version, or 2-byte NAL lengths: refused.
+        for cut in 0..record.len() {
+            assert_eq!(from_avcc_record(&record[..cut]), None, "cut at {cut}");
+        }
+        let mut v2 = record;
+        v2[0] = 2;
+        assert_eq!(from_avcc_record(&v2), None);
+        let mut short_lengths = record;
+        short_lengths[4] = 0xfd;
+        assert_eq!(from_avcc_record(&short_lengths), None);
+        // The conformance helper's 4-byte stub has no sets.
+        assert_eq!(from_avcc_record(&[0x01, 0x64, 0x00, 0x1f]), None);
     }
 
     #[test]

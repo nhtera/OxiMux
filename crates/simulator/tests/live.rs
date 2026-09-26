@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use oximux_simulator::helper::HelperOptions;
-use oximux_simulator::protocol::{Command, TouchPhase};
-use oximux_simulator::session::{SessionEvent, HelperSession};
+use oximux_simulator::protocol::{Command, StreamFormat, TouchPhase};
+use oximux_simulator::session::{FrameData, HelperSession, SessionEvent};
 use oximux_simulator::{DeviceId, Orientation};
 
 fn live_target() -> (PathBuf, DeviceId) {
@@ -40,10 +40,16 @@ fn first_booted_iphone() -> Option<String> {
 }
 
 fn wait_for_frame(session: &HelperSession, seen: u64, timeout: Duration) -> (u64, u32, u32) {
+    let (seq, frame) = wait_for_data(session, seen, timeout);
+    let (w, h) = frame.size();
+    (seq, w, h)
+}
+
+fn wait_for_data(session: &HelperSession, seen: u64, timeout: Duration) -> (u64, FrameData) {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some((seq, frame)) = session.latest_frame(seen) {
-            return (seq, frame.width, frame.height);
+        if let Some(found) = session.latest_frame(seen) {
+            return found;
         }
         assert!(Instant::now() < deadline, "no frame within {timeout:?}");
         std::thread::sleep(Duration::from_millis(20));
@@ -105,4 +111,66 @@ fn streams_rotates_screenshots_and_takes_input() {
             Err(e) => panic!("helper did not exit after shutdown: {e}"),
         }
     }
+}
+
+/// The same stream in H.264: pictures come decoded (IOSurface-backed), turn
+/// with the device, come back fast after a resume, and the encoding switches
+/// live both ways.
+#[test]
+#[ignore = "needs Xcode and a booted simulator; run with --ignored"]
+fn streams_h264_and_switches_encoding() {
+    let (helper, udid) = live_target();
+    let opts = HelperOptions { format: StreamFormat::Avcc, ..HelperOptions::default() };
+    let session = HelperSession::start(&helper, &udid, &opts).expect("helper starts");
+    assert!(session.supports_avcc(), "helper {} has no H.264", session.hello().version);
+
+    let (mut seen, frame) = wait_for_data(&session, 0, Duration::from_secs(10));
+    assert!(matches!(frame, FrameData::Picture(_)), "expected a decoded picture");
+    let (w, h) = frame.size();
+    assert!(h > w, "portrait picture expected, got {w}x{h}");
+
+    session.configure(None, None, Some(Orientation::LandscapeLeft), Duration::from_secs(10)).expect("rotate");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (s, w, h) = wait_for_frame(&session, seen, Duration::from_secs(10));
+        seen = s;
+        if w > h {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pictures never turned landscape");
+    }
+    session.configure(None, None, Some(Orientation::Portrait), Duration::from_secs(10)).expect("rotate back");
+
+    session.pause().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    seen = session.latest_frame(0).map_or(seen, |(s, _)| s);
+    let resumed = Instant::now();
+    session.resume().unwrap();
+    let (s, _) = wait_for_data(&session, seen, Duration::from_secs(5));
+    let took = resumed.elapsed();
+    eprintln!("H.264 resume → picture in {took:?}");
+    assert!(took < Duration::from_secs(1), "resume took {took:?}");
+    seen = s;
+
+    session.set_format(StreamFormat::Jpeg, Duration::from_secs(5)).expect("to JPEG");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (s, frame) = wait_for_data(&session, seen, Duration::from_secs(10));
+        seen = s;
+        if matches!(frame, FrameData::Jpeg(_)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never switched to JPEG");
+    }
+    session.set_format(StreamFormat::Avcc, Duration::from_secs(5)).expect("back to H.264");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (s, frame) = wait_for_data(&session, seen, Duration::from_secs(10));
+        seen = s;
+        if matches!(frame, FrameData::Picture(_)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never switched back to H.264");
+    }
+    session.shutdown();
 }

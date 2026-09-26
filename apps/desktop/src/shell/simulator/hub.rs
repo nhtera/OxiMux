@@ -22,6 +22,7 @@ use oximux_simulator::availability::{self, Availability, HelperStatus};
 use oximux_simulator::boot_watch::{BootWatch, WatchGate};
 use oximux_simulator::child_ledger::Ledger;
 use oximux_simulator::helper::HelperOptions;
+use oximux_simulator::protocol::StreamFormat;
 use oximux_simulator::registry::{self, BootResult, Effect, Generation, Phase, Registry, WorktreeKey};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::{HelperSession, SessionEvent, StreamSession};
@@ -203,6 +204,19 @@ impl SimulatorHub {
             .spawn(async move {
                 if let Err(e) = session.configure(Some(scale), Some(fps), None, Duration::from_secs(5)) {
                     tracing::debug!("simulator stream configure failed: {e}");
+                }
+            })
+            .detach();
+    }
+
+    /// Switch `udid`'s live stream between JPEG and H.264 (iOS helpers that
+    /// have H.264; a no-op otherwise).
+    pub fn set_stream_format(&self, udid: &DeviceId, format: StreamFormat, cx: &mut Context<Self>) {
+        let Some(session) = self.session(udid) else { return };
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = session.set_format(format, Duration::from_secs(5)) {
+                    tracing::debug!("simulator stream encoding change failed: {e}");
                 }
             })
             .detach();
@@ -543,6 +557,7 @@ impl SimulatorHub {
         let opts = HelperOptions {
             scale: f64::from(stream.effective_scale()),
             fps: f64::from(stream.fps),
+            format: stream.encoding.format(),
             log_path: Some(simulator_dir().join("logs").join(format!("helper-{udid}.log"))),
             ledger: self.ledger.clone(),
             ..HelperOptions::default()
@@ -631,6 +646,12 @@ impl SimulatorHub {
                             cx.emit(HubEvent::Changed(udid.clone()));
                         }
                         if current {
+                            // Visible, or the Encoding menu would say H.264
+                            // over a JPEG stream with no hint why.
+                            if let SessionEvent::EncodingFallback(why) = &event {
+                                let text = format!("{why}. Pick H.264 in the stream row to try again.");
+                                cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, text));
+                            }
                             cx.emit(HubEvent::Session(udid.clone(), event));
                         }
                     }

@@ -1,4 +1,5 @@
-//! The stdio wire protocol spoken with `oximux-sim-helper`, version 1.
+//! The stdio wire protocol spoken with `oximux-sim-helper`, version 2 (1 is
+//! still accepted: it has no `video`).
 //!
 //! The spec lives with the helper, in the fork: `oximux/PROTOCOL.md` in
 //! `nhtera/serve-sim` (branch `oximux`). This module is its Rust half and must
@@ -6,7 +7,8 @@
 //! binary's `--conformance` mode.
 //!
 //! - Outbound (helper → us, its stdout): `[u8 kind][u32 LE len][payload]`;
-//!   kind 1 is a frame `[u32 LE w][u32 LE h][JPEG]`, kind 2 a JSON event.
+//!   kind 1 is a frame `[u32 LE w][u32 LE h][JPEG]`, kind 2 a JSON event,
+//!   kind 3 an H.264 picture `[u32 LE w][u32 LE h][u8 tag][AVCC]`.
 //! - Inbound (us → helper, its stdin): `[u32 LE len][JSON command]`.
 //!
 //! Reading is bounded: a length prefix over [`MAX_MESSAGE_BYTES`] is refused
@@ -21,8 +23,16 @@ use serde_json::{Map, Value};
 use crate::{Button, Orientation, Result, SimError};
 
 /// The protocol version this build speaks. The helper announces its own in
-/// the first `hello` event; a mismatch is [`SimError::HelperIncompatible`].
-pub const PROTOCOL_VERSION: u32 = 1;
+/// the first `hello` event; one outside [`MIN_PROTOCOL_VERSION`]`..=` this is
+/// [`SimError::HelperIncompatible`].
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The oldest helper protocol this build still drives. Version 1 streams JPEG
+/// only; [`StreamFormat::Avcc`] needs [`AVCC_MIN_VERSION`].
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// The first protocol version with `--format avcc` and `video` messages.
+pub const AVCC_MIN_VERSION: u32 = 2;
 
 /// Largest outbound message we accept (a full-resolution iPad JPEG is a few
 /// MB; 16 MiB leaves room without letting a bad prefix run away).
@@ -34,6 +44,7 @@ pub const MAX_COMMAND_BYTES: usize = 1 << 20;
 
 const KIND_FRAME: u8 = 1;
 const KIND_EVENT: u8 = 2;
+const KIND_VIDEO: u8 = 3;
 
 /// One JPEG frame, already scaled and rotated for display by the helper.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +52,48 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub jpeg: Vec<u8>,
+}
+
+/// The stream encoding asked of the helper (`--format`, `configure.format`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamFormat {
+    /// One JPEG [`Frame`] per picture.
+    #[default]
+    Jpeg,
+    /// H.264 [`Video`] messages.
+    Avcc,
+}
+
+impl StreamFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpeg",
+            Self::Avcc => "avcc",
+        }
+    }
+}
+
+/// What a [`Video`] message carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoTag {
+    /// The avcC record (SPS/PPS); the helper sends one before every key frame.
+    Description,
+    /// An IDR picture.
+    Keyframe,
+    /// A picture that depends on the ones before it.
+    Delta,
+}
+
+/// One H.264 message. `width`/`height` are the display size (scaled and
+/// rotated), like a [`Frame`]'s; pictures are AVCC (4-byte big-endian NAL
+/// lengths).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Video {
+    pub width: u32,
+    pub height: u32,
+    pub tag: VideoTag,
+    pub data: Vec<u8>,
 }
 
 /// Why the helper gave up at startup (`fatal.reason`).
@@ -82,6 +135,9 @@ pub enum Event {
     Response { id: u64, result: std::result::Result<Value, String> },
     /// A non-fatal problem with no id to answer.
     Error { message: String },
+    /// The helper changed the stream format on its own (H.264 kept failing);
+    /// `format` is what it streams now, when this build knows the name.
+    Format { format: Option<StreamFormat>, message: String },
     /// Startup failed; the helper exits right after.
     Fatal { reason: FatalReason, message: String },
     /// `--conformance` only: how the helper parsed a command.
@@ -99,6 +155,7 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outbound {
     Frame(Frame),
+    Video(Video),
     Event(Event),
 }
 
@@ -118,6 +175,7 @@ pub fn read_message(r: &mut impl Read) -> Result<Option<Outbound>> {
     r.read_exact(&mut payload).map_err(truncated)?;
     match header[0] {
         KIND_FRAME => decode_frame(payload).map(|f| Some(Outbound::Frame(f))),
+        KIND_VIDEO => decode_video(payload).map(|v| Some(Outbound::Video(v))),
         KIND_EVENT => Ok(Some(Outbound::Event(
             decode_event(&payload).unwrap_or_else(|e| Event::Malformed(e.to_string())),
         ))),
@@ -164,6 +222,22 @@ fn decode_frame(mut payload: Vec<u8>) -> Result<Frame> {
     Ok(Frame { width, height, jpeg: payload })
 }
 
+fn decode_video(mut payload: Vec<u8>) -> Result<Video> {
+    if payload.len() < 9 {
+        return Err(SimError::Protocol(format!("video payload of {} bytes has no header", payload.len())));
+    }
+    let width = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let height = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let tag = match payload[8] {
+        1 => VideoTag::Description,
+        2 => VideoTag::Keyframe,
+        3 => VideoTag::Delta,
+        t => return Err(SimError::Protocol(format!("unknown video tag {t}"))),
+    };
+    payload.drain(..9);
+    Ok(Video { width, height, tag, data: payload })
+}
+
 /// Decode one event body. Unknown event names decode to [`Event::Unknown`]
 /// rather than failing, so an older OxiMux tolerates a newer helper's extras.
 pub fn decode_event(body: &[u8]) -> Result<Event> {
@@ -207,6 +281,14 @@ pub fn decode_event(body: &[u8]) -> Result<Event> {
             Event::Response { id, result }
         }
         "error" => Event::Error { message: str_field(&map, "message").unwrap_or_default() },
+        "format" => Event::Format {
+            format: match str_field(&map, "value").as_deref() {
+                Some("jpeg") => Some(StreamFormat::Jpeg),
+                Some("avcc") => Some(StreamFormat::Avcc),
+                _ => None,
+            },
+            message: str_field(&map, "message").unwrap_or_default(),
+        },
         "fatal" => Event::Fatal {
             reason: FatalReason::parse(&str_field(&map, "reason").unwrap_or_default()),
             message: str_field(&map, "message").unwrap_or_default(),
@@ -284,6 +366,9 @@ pub enum Command {
         fps: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none", serialize_with = "orientation_number")]
         orientation: Option<Orientation>,
+        /// Protocol 2+ only: an older helper rejects the whole command.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<StreamFormat>,
     },
     Pause,
     Resume,
@@ -378,7 +463,17 @@ mod tests {
         payload.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xD9]);
         bytes.extend(frame_msg(KIND_FRAME, &payload));
         bytes.extend(event_msg(r#"{"event":"response","id":7,"ok":true,"result":{"pong":true}}"#));
+        bytes.extend(frame_msg(KIND_VIDEO, &video_payload(2, &[0, 0, 0, 1, 0x65])));
         bytes
+    }
+
+    fn video_payload(tag: u8, data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&603u32.to_le_bytes());
+        payload.extend_from_slice(&1311u32.to_le_bytes());
+        payload.push(tag);
+        payload.extend_from_slice(data);
+        payload
     }
 
     #[test]
@@ -390,7 +485,7 @@ mod tests {
             while let Some(m) = read_message(&mut r).unwrap() {
                 got.push(m);
             }
-            assert_eq!(got.len(), 3, "step {step}");
+            assert_eq!(got.len(), 4, "step {step}");
             assert_eq!(
                 got[1],
                 Outbound::Frame(Frame { width: 603, height: 1311, jpeg: vec![0xFF, 0xD8, 0xFF, 0xD9] })
@@ -398,6 +493,10 @@ mod tests {
             assert_eq!(
                 got[2],
                 Outbound::Event(Event::Response { id: 7, result: Ok(serde_json::json!({"pong": true})) })
+            );
+            assert_eq!(
+                got[3],
+                Outbound::Video(Video { width: 603, height: 1311, tag: VideoTag::Keyframe, data: vec![0, 0, 0, 1, 0x65] })
             );
         }
     }
@@ -420,7 +519,9 @@ mod tests {
                 }
             }
             // Cutting exactly at a message boundary is a clean EOF.
-            let boundary = cut == first_len || cut == bytes.len() - event_msg(r#"{"event":"response","id":7,"ok":true,"result":{"pong":true}}"#).len();
+            let last_len = frame_msg(KIND_VIDEO, &video_payload(2, &[0, 0, 0, 1, 0x65])).len();
+            let response_len = event_msg(r#"{"event":"response","id":7,"ok":true,"result":{"pong":true}}"#).len();
+            let boundary = cut == first_len || cut == bytes.len() - last_len || cut == bytes.len() - last_len - response_len;
             assert_eq!(result.is_ok(), boundary, "cut at {cut}");
         }
     }
@@ -446,6 +547,12 @@ mod tests {
     fn unknown_kind_and_short_frame_are_protocol_errors() {
         assert!(read_message(&mut frame_msg(9, b"x").as_slice()).is_err());
         assert!(read_message(&mut frame_msg(KIND_FRAME, &[1, 2, 3]).as_slice()).is_err());
+        assert!(read_message(&mut frame_msg(KIND_VIDEO, &[0; 8]).as_slice()).is_err());
+        assert!(read_message(&mut frame_msg(KIND_VIDEO, &video_payload(4, &[])).as_slice()).is_err());
+        let description = read_message(&mut frame_msg(KIND_VIDEO, &video_payload(1, &[1, 0x64])).as_slice()).unwrap();
+        assert!(matches!(description, Some(Outbound::Video(Video { tag: VideoTag::Description, .. }))));
+        let delta = read_message(&mut frame_msg(KIND_VIDEO, &video_payload(3, &[])).as_slice()).unwrap();
+        assert!(matches!(delta, Some(Outbound::Video(Video { tag: VideoTag::Delta, .. }))));
     }
 
     #[test]
@@ -458,6 +565,8 @@ mod tests {
             (r#"{"event":"response","id":3,"ok":false,"error":"nope"}"#,
              Event::Response { id: 3, result: Err("nope".into()) }),
             (r#"{"event":"error","message":"m"}"#, Event::Error { message: "m".into() }),
+            (r#"{"event":"format","value":"jpeg","message":"m"}"#,
+             Event::Format { format: Some(StreamFormat::Jpeg), message: "m".into() }),
             (r#"{"event":"fatal","reason":"device_not_booted","message":"m"}"#,
              Event::Fatal { reason: FatalReason::DeviceNotBooted, message: "m".into() }),
             (r#"{"event":"parsed","error":"bad"}"#, Event::Parsed { id: None, command: Err("bad".into()) }),
@@ -483,8 +592,10 @@ mod tests {
              json!({"cmd":"scroll","dx":0.0,"dy":-3.0,"y":0.5})),
             (Command::Key { phase: KeyPhase::Down, usage: 0x04 }, json!({"cmd":"key","phase":"down","usage":4})),
             (Command::Button { name: Button::SideButton }, json!({"cmd":"button","name":"side_button"})),
-            (Command::Configure { scale: Some(0.5), fps: None, orientation: Some(Orientation::LandscapeRight) },
+            (Command::Configure { scale: Some(0.5), fps: None, orientation: Some(Orientation::LandscapeRight), format: None },
              json!({"cmd":"configure","scale":0.5,"orientation":4})),
+            (Command::Configure { scale: None, fps: None, orientation: None, format: Some(StreamFormat::Avcc) },
+             json!({"cmd":"configure","format":"avcc"})),
             (Command::AxDescribe, json!({"cmd":"ax_describe"})),
             (Command::MemoryWarning, json!({"cmd":"memory_warning"})),
         ];
