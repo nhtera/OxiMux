@@ -1,13 +1,13 @@
 //! Startup, quit and the hub's background loops (idle-shutdown tick, gated
 //! device watcher). A child of `hub` so it can reach the hub's state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext};
-use oximux_simulator::boot_watch::{self, BootWatch};
+use oximux_simulator::boot_watch::{self, BootWatch, WatchGate};
 use oximux_simulator::child_ledger::{self, Ledger};
 use oximux_simulator::registry::Registry;
 use oximux_simulator::runner::SystemRunner;
@@ -45,9 +45,35 @@ pub fn install(cx: &mut App, repo: SettingsRepo, approvals: SimApprovalRepo) {
             })
             .detach();
     }
+    let feature_used = sim_state_keys::feature_used(&repo);
+    let hub = new_hub(cx, repo, approvals, ledger, reaped);
+    cx.set_global(SimulatorService(hub.clone()));
+    if feature_used {
+        hub.update(cx, |hub, cx| hub.refresh_availability(cx));
+    }
+    spawn_tick(cx, hub.downgrade());
+    spawn_watch(cx, hub.downgrade());
+}
+
+/// A hub for tests: no child ledger (it lives in the real app data dir), no
+/// background loops, the startup reap already done.
+#[cfg(test)]
+pub(crate) fn install_for_test(cx: &mut App, repo: SettingsRepo, approvals: SimApprovalRepo) -> gpui::Entity<SimulatorHub> {
+    let hub = new_hub(cx, repo, approvals, None, Arc::new((Mutex::new(true), Condvar::new())));
+    cx.set_global(SimulatorService(hub.clone()));
+    hub
+}
+
+fn new_hub(
+    cx: &mut App,
+    repo: SettingsRepo,
+    approvals: SimApprovalRepo,
+    ledger: Option<Arc<Ledger>>,
+    reaped: Arc<(Mutex<bool>, Condvar)>,
+) -> gpui::Entity<SimulatorHub> {
     let snapshot = sim_state_keys::load_snapshot(&repo);
     let feature_used = sim_state_keys::feature_used(&repo);
-    let hub = cx.new(|_| SimulatorHub {
+    cx.new(|_| SimulatorHub {
         registry: Registry::restore(snapshot, Instant::now()),
         repo,
         runner: Arc::new(SystemRunner),
@@ -66,13 +92,8 @@ pub fn install(cx: &mut App, repo: SettingsRepo, approvals: SimApprovalRepo) {
         simctl: None,
         paste_lock: Default::default(),
         agent: super::agent::AgentState::load(Some(approvals)),
-    });
-    cx.set_global(SimulatorService(hub.clone()));
-    if feature_used {
-        hub.update(cx, |hub, cx| hub.refresh_availability(cx));
-    }
-    spawn_tick(cx, hub.downgrade());
-    spawn_watch(cx, hub.downgrade());
+        boot_claims: HashSet::new(),
+    })
 }
 
 struct OpenOnDrop(Arc<(Mutex<bool>, Condvar)>);
@@ -149,6 +170,8 @@ fn spawn_tick(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
         loop {
             cx.background_executor().timer(TICK).await;
             let alive = hub.update(cx, |hub, cx| {
+                let minutes = crate::shell::simulator::panel::settings(cx).idle_shutdown_minutes;
+                hub.registry.set_idle_shutdown((minutes > 0).then(|| Duration::from_secs(u64::from(minutes) * 60)));
                 let effects = hub.registry.tick(Instant::now());
                 hub.run(effects, cx);
                 hub.reap_recordings(cx);
@@ -166,8 +189,15 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(boot_watch::POLL_INTERVAL).await;
-            let gate = hub.update(cx, |hub, _| {
-                hub.watch_gate().should_poll().then(|| (hub.runner.clone(), hub.registry.generation()))
+            let gate = hub.update(cx, |hub, cx| {
+                let gate = WatchGate { enabled: crate::shell::simulator::panel::settings(cx).enabled, ..hub.watch_gate() };
+                if !gate.should_poll() {
+                    // Start from a fresh baseline when polling resumes: devices
+                    // booted meanwhile are not news, and must not all fire at once.
+                    hub.watch.lock().unwrap().forget();
+                    return None;
+                }
+                Some((hub.runner.clone(), hub.registry.generation()))
             });
             let (runner, listed_at) = match gate {
                 Ok(Some(gate)) => gate,
@@ -186,7 +216,29 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 }
             };
             let alive = hub.update(cx, |hub, cx| {
-                hub.watch.lock().unwrap().observe(booted.clone());
+                let events = hub.watch.lock().unwrap().observe(booted.clone());
+                // A device OxiMux attached is already somebody's; one booted
+                // elsewhere may be an agent's, for windows to pick up.
+                let attached = hub.registry.attached_devices();
+                let mut fresh = Vec::new();
+                for event in events {
+                    match event {
+                        boot_watch::WatchEvent::Booted(udid) => {
+                            // Up again, by whoever: the power button's "stop"
+                            // is over.
+                            hub.clear_stopped_by_user(&udid);
+                            if !attached.contains(&udid) {
+                                fresh.push(udid);
+                            }
+                        }
+                        boot_watch::WatchEvent::Shutdown(udid) => {
+                            hub.boot_claims.remove(&udid);
+                        }
+                    }
+                }
+                if !fresh.is_empty() {
+                    cx.emit(HubEvent::DeviceBooted(fresh));
+                }
                 // A boot or start finished while we were listing: the set may
                 // predate it and read a fresh boot as a shutdown. Skip; the
                 // next poll is three seconds away.

@@ -229,6 +229,10 @@ pub(super) async fn run(
     }
 }
 
+/// Why an agent may not wake a device the user shut down from the panel.
+const STOPPED_BY_USER: &str =
+    "the user shut this simulator down in OxiMux; ask them before booting it again (`oximux sim attach`)";
+
 /// The device's helper session, waking the device if it is parked, was never
 /// started this run, or dropped its stream.
 async fn live_session(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<StreamSession, SimErrorWire> {
@@ -245,6 +249,7 @@ async fn live_session(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut Asyn
         match (wake, session) {
             (Wake::Live, Some(session)) if session.framebuffer_size().is_some() => return Ok(session),
             (Wake::Failed(why), _) => return Err(SimErrorWire::Unavailable(why)),
+            (Wake::StoppedByUser, _) => return Err(SimErrorWire::Refused(STOPPED_BY_USER.into())),
             (Wake::Starting, _) if Instant::now() >= deadline => {
                 let booting = matches!(hub.read_with(cx, |hub, _| hub.phase(udid)), oximux_simulator::registry::Phase::Booting { .. });
                 return Err(if booting {

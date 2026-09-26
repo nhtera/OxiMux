@@ -567,6 +567,11 @@ impl RightSidebar {
         panel: Option<Entity<crate::shell::simulator::SimulatorPanel>>,
         cx: &mut Context<Self>,
     ) {
+        // Turned off in Settings while showing: fall back like any tab that
+        // left the visible set.
+        if panel.is_none() && self.active_tab == RightTab::Simulator {
+            self.active_tab = RightTab::Explorer;
+        }
         self.simulator_panel = panel;
         cx.notify();
     }

@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState};
 
-/// An owned device is shut down this long after its last detach.
+/// An owned device is shut down this long after its last detach, unless
+/// Settings chose another delay (or never: [`Registry::set_idle_shutdown`]).
 pub const IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// A device no viewer has shown for this long has its helper stopped (a
@@ -180,11 +181,20 @@ pub struct Registry<S> {
     /// Worktrees whose panel is visible, attached or not: a panel shown
     /// before its attach lands must not start its helper paused.
     visible: BTreeSet<WorktreeKey>,
+    /// How long an owned, unattached device idles before it is shut down;
+    /// `None` keeps it running.
+    idle_shutdown: Option<Duration>,
 }
 
 impl<S> Default for Registry<S> {
     fn default() -> Self {
-        Self { attachments: HashMap::new(), devices: HashMap::new(), next_generation: 1, visible: BTreeSet::new() }
+        Self {
+            attachments: HashMap::new(),
+            devices: HashMap::new(),
+            next_generation: 1,
+            visible: BTreeSet::new(),
+            idle_shutdown: Some(IDLE_SHUTDOWN),
+        }
     }
 }
 
@@ -510,8 +520,13 @@ impl<S: Clone> Registry<S> {
         gone.iter().flat_map(|udid| self.device_shutdown(udid)).collect()
     }
 
+    /// The idle-shutdown delay from Settings (`None`: never).
+    pub fn set_idle_shutdown(&mut self, after: Option<Duration>) {
+        self.idle_shutdown = after;
+    }
+
     /// Periodic housekeeping: park devices hidden for [`PARK_AFTER`], and
-    /// shut down owned devices idle for [`IDLE_SHUTDOWN`].
+    /// shut down owned devices idle for the idle-shutdown delay.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect<S>> {
         let mut effects = Vec::new();
         for (udid, device) in &mut self.devices {
@@ -528,11 +543,14 @@ impl<S: Clone> Registry<S> {
                 effects.push(Effect::StopSession { udid: udid.clone(), session });
             }
         }
+        let idle = self.idle_shutdown;
         let due: Vec<DeviceId> = self
             .devices
             .iter()
             .filter(|(_, d)| {
-                d.owned && d.attached.is_empty() && d.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE_SHUTDOWN)
+                d.owned
+                    && d.attached.is_empty()
+                    && idle.zip(d.idle_since).is_some_and(|(after, since)| now.duration_since(since) >= after)
             })
             .map(|(u, _)| u.clone())
             .collect();

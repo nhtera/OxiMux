@@ -706,6 +706,22 @@ impl PaneGroup {
             .sum()
     }
 
+    /// Whether an agent is at work in `worktree` here: an agent tab for it
+    /// mid-turn (not one merely open, or finished), or a terminal running one
+    /// in a group rooted there (the rail's presence test). The simulator's
+    /// auto-attach guard.
+    pub fn has_live_agent_for(&self, worktree: &std::path::Path, cx: &gpui::App) -> bool {
+        use oximux_core::AgentStatus;
+        let chat = self.tabs.iter().any(|t| match &t.kind {
+            PaneGroupTabKind::Agent { worktree_path, status_rx, .. } if worktree_path == worktree => matches!(
+                status_rx.borrow().status,
+                AgentStatus::Running | AgentStatus::WaitingForInput | AgentStatus::NeedsApproval(_)
+            ),
+            _ => false,
+        });
+        chat || (self.cwd == worktree && self.ambient_agent_count(cx) > 0)
+    }
+
     /// Worktree path of the agent tab matching `tab_id`, if this group
     /// owns it. Read-only counterpart of `set_active_by_tab_id` — the
     /// notification click router uses it to resolve which project (and

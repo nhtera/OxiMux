@@ -12,6 +12,7 @@ use oximux_settings::{Density, Theme, Typography};
 use std::path::Path;
 
 use super::agent_ops::same_worktree;
+use super::auto_open::{AutoOpen, Trigger};
 use super::hub::NoticeKind;
 use super::panel::{Outcome, PanelEvent, RootRequest, SimCommand, SimulatorPanel};
 use super::widths;
@@ -38,15 +39,19 @@ pub(crate) struct RootSimulator {
     /// sidebar is in place (a first visit builds it in the background), unless
     /// the moment passes first.
     reveal_for: Option<(std::path::PathBuf, std::time::Instant)>,
+    /// When the panel may open by itself (see `auto_open`).
+    pub(super) auto_open: AutoOpen,
+    /// Settings' `enabled` as last applied to the sidebars.
+    enabled: bool,
     _follow: Option<Subscription>,
+    _settings: Option<Subscription>,
     _notices: Option<Subscription>,
 }
 
-/// Apple silicon macOS, the feature enabled, and the hub installed.
+/// Apple silicon macOS with the hub installed. Whether the tab shows is
+/// Settings' `enabled`, applied live (see [`RootSimulator::panel`]).
 fn supported(cx: &gpui::App) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && super::panel::settings(cx).enabled
-        && super::hub(cx).is_some()
+    cfg!(all(target_os = "macos", target_arch = "aarch64")) && super::hub(cx).is_some()
 }
 
 impl RootSimulator {
@@ -62,14 +67,27 @@ impl RootSimulator {
                     };
                     root.push_toast(kind, text.clone(), cx);
                 }
+                PanelEvent::DeviceBooted(udids) => root.on_simulator_booted(udids, cx),
             })
         });
-        Self { panel, visible: false, bumped: false, maximized: false, reveal_for: None, _follow: None, _notices: notices }
+        Self {
+            panel,
+            visible: false,
+            bumped: false,
+            maximized: false,
+            reveal_for: None,
+            auto_open: AutoOpen::default(),
+            enabled: super::panel::settings(cx).enabled,
+            _follow: None,
+            _settings: None,
+            _notices: notices,
+        }
     }
 
-    /// The panel, for handing to sidebars (`None` hides the tab).
-    pub(crate) fn panel(&self) -> Option<Entity<SimulatorPanel>> {
-        self.panel.clone()
+    /// The panel, for handing to sidebars (`None` hides the tab: the
+    /// feature is unsupported here, or turned off in Settings).
+    pub(crate) fn panel(&self, cx: &gpui::App) -> Option<Entity<SimulatorPanel>> {
+        self.panel.clone().filter(|_| super::panel::settings(cx).enabled)
     }
 
     /// Follow the active tab's worktree. Call once the root entity exists.
@@ -87,7 +105,12 @@ impl RootSimulator {
                 });
             }));
         });
+        // Enabling or disabling in Settings shows or hides the tab at once.
+        self._settings = Some(cx.observe_global::<crate::app_settings::simulator_settings::SimulatorSettings>(
+            |root: &mut WorkspaceRoot, cx| root.sync_simulator_enabled(cx),
+        ));
         self._follow = Some(cx.subscribe_self(|root: &mut WorkspaceRoot, event: &ActiveWorktreeChanged, cx| {
+            root.simulator.auto_open.follow(event.0.as_deref());
             if let Some(panel) = root.simulator.panel.clone() {
                 let worktree = event.0.clone();
                 panel.update(cx, |panel, cx| panel.set_worktree(worktree, cx));
@@ -122,6 +145,9 @@ impl WorkspaceRoot {
             return;
         }
         self.simulator.visible = visible;
+        // Turned off in Settings is not the user closing it.
+        let by_user = self.active_worktree.as_deref().filter(|_| super::panel::settings(cx).enabled);
+        self.simulator.auto_open.visibility_changed(visible, by_user, rs.entity_id().as_u64());
         let (window_w, window_h) = (f32::from(window.viewport_size().width), f32::from(window.viewport_size().height));
         let bump = visible && !self.simulator.bumped;
         let restore = !visible && self.simulator.maximized;
@@ -152,10 +178,33 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Settings changed: when `enabled` flipped, hand every sidebar of this
+    /// window the panel (or take it away).
+    fn sync_simulator_enabled(&mut self, cx: &mut Context<Self>) {
+        let enabled = super::panel::settings(cx).enabled;
+        if enabled == self.simulator.enabled || self.simulator.panel.is_none() {
+            return;
+        }
+        self.simulator.enabled = enabled;
+        let panel = self.simulator.panel(cx);
+        let sidebars: Vec<_> = self.right_sidebar_by_project.values().cloned().chain(self.right_sidebar.clone()).collect();
+        for sidebar in sidebars {
+            let panel = panel.clone();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_simulator_panel(panel, cx));
+        }
+        cx.notify();
+    }
+
     /// Open the sidebar on the Simulator tab (the width bump happens when it
     /// becomes visible, see [`Self::sync_simulator_visibility`]).
     pub(crate) fn select_simulator_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(rs), Some(_)) = (self.right_sidebar.clone(), self.simulator.panel.as_ref()) else { return };
+        self.show_simulator_tab(cx);
+    }
+
+    /// [`Self::select_simulator_tab`] without a window (auto-open). Never
+    /// moves keyboard focus.
+    pub(crate) fn show_simulator_tab(&mut self, cx: &mut Context<Self>) {
+        let (Some(rs), Some(_)) = (self.right_sidebar.clone(), self.simulator.panel(cx)) else { return };
         rs.update(cx, |sidebar, cx| {
             sidebar.open = true;
             sidebar.select_tab(RightTab::Simulator, cx);
@@ -166,7 +215,7 @@ impl WorkspaceRoot {
     /// "Fill" takes the whole content area (the centre panes step aside,
     /// unmeasured, so terminals keep their size); "Split" gives it back.
     pub(crate) fn toggle_simulator_maximized(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(rs), Some(panel)) = (self.right_sidebar.clone(), self.simulator.panel.clone()) else { return };
+        let (Some(rs), Some(panel)) = (self.right_sidebar.clone(), self.simulator.panel(cx)) else { return };
         let fill = !self.simulator.maximized;
         self.simulator.maximized = fill;
         rs.update(cx, |sidebar, cx| sidebar.set_fill(fill, cx));
@@ -178,8 +227,9 @@ impl WorkspaceRoot {
 impl WorkspaceRoot {
     /// An agent in `worktree` asked to control `device`. Ask where that
     /// worktree is: the panel's banner when it is this window's active
-    /// worktree (opening the tab, if agents may open it), else a toast whose
-    /// Review switches there. Never over another worktree's panel.
+    /// worktree and the panel shows (or auto-open may open it), else a toast
+    /// whose Review shows it — switching there first when it is elsewhere.
+    /// Never over another worktree's panel.
     pub(crate) fn ask_simulator_consent(
         &mut self,
         worktree: &Path,
@@ -189,9 +239,7 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let active = self.active_worktree.as_deref().is_some_and(|a| same_worktree(a, worktree));
-        if active && super::panel::settings(cx).auto_open {
-            self.select_simulator_tab(window, cx);
+        if self.auto_open_simulator(worktree, Trigger::Verb, cx) {
             return;
         }
         let (root, handle) = (cx.weak_entity(), window.window_handle());
@@ -248,13 +296,10 @@ impl WorkspaceRoot {
         }
     }
 
-    /// An agent attached a device for `worktree`: show it when the user is
-    /// looking at that worktree and lets agents open the panel.
-    pub(crate) fn reveal_simulator_for(&mut self, worktree: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let active = self.active_worktree.as_deref().is_some_and(|a| same_worktree(a, worktree));
-        if active && super::panel::settings(cx).auto_open {
-            self.select_simulator_tab(window, cx);
-        }
+    /// An agent attached a device for `worktree` (`Attach`) or ran a verb on
+    /// it (`Verb`): show it, as auto-open allows.
+    pub(crate) fn reveal_simulator_for(&mut self, worktree: &Path, trigger: Trigger, cx: &mut Context<Self>) {
+        self.auto_open_simulator(worktree, trigger, cx);
     }
 }
 
@@ -279,7 +324,8 @@ pub(crate) fn simulator_actions<E: InteractiveElement>(el: E, cx: &mut Context<W
 
 impl WorkspaceRoot {
     fn run_simulator_command(&mut self, command: SimCommand, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(panel) = self.simulator.panel.clone() else { return };
+        // Nothing while the feature is off in Settings (the palette still lists it).
+        let Some(panel) = self.simulator.panel(cx) else { return };
         match panel.update(cx, |panel, cx| panel.run_command(command, window, cx)) {
             Outcome::Done => {}
             Outcome::NoDevice => {

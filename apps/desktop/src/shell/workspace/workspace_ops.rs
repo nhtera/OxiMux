@@ -772,7 +772,7 @@ impl WorkspaceRoot {
             // panel existed (or one restored into a different window) would
             // otherwise render the Ports tab empty forever.
             let ports_panel = self.ports_panel.clone();
-            let simulator_panel = self.simulator.panel();
+            let simulator_panel = self.simulator.panel(cx);
             cached.update(cx, |s, cx| {
                 s.set_ports_panel(ports_panel, cx);
                 s.set_simulator_panel(simulator_panel, cx);
@@ -867,7 +867,7 @@ impl WorkspaceRoot {
                 // this project reuses it (fast path above) instead of
                 // rebuilding from scratch.
                 let ports_panel = this.ports_panel.clone();
-                let simulator_panel = this.simulator.panel();
+                let simulator_panel = this.simulator.panel(cx);
                 built.update(cx, |s, cx| {
                     s.set_ports_panel(ports_panel, cx);
                     s.set_simulator_panel(simulator_panel, cx);

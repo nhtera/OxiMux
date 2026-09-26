@@ -128,8 +128,12 @@ impl SimulatorPanel {
     pub(super) fn answer_shutdown(&mut self, shut_down: bool, cx: &mut Context<Self>) {
         self.confirm_shutdown = false;
         if shut_down && let (Some(hub), Some(udid)) = (self.hub.clone(), self.device(cx)) {
-            // The movie is finalized before the device goes away.
-            hub.update(cx, |hub, cx| hub.shutdown_after_recording(&udid, cx));
+            // The movie is finalized before the device goes away, and agents
+            // may not boot it again behind the user's back.
+            hub.update(cx, |hub, cx| {
+                hub.note_stopped_by_user(&udid);
+                hub.shutdown_after_recording(&udid, cx);
+            });
         }
         cx.notify();
     }

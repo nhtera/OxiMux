@@ -76,6 +76,22 @@ fn an_owned_device_shuts_down_ten_minutes_after_its_last_detach() {
 }
 
 #[test]
+fn the_idle_shutdown_follows_settings_and_never_means_never() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    let fx = reg.attach(w.clone(), u.clone(), false, now);
+    reg.boot_finished(&u, start_gen(&fx), BootResult::Booted);
+    reg.detach(&w, now);
+    reg.set_idle_shutdown(None);
+    assert!(reg.tick(now + IDLE_SHUTDOWN * 100).is_empty(), "Never keeps an owned device running");
+    assert!(reg.is_owned(&u));
+    reg.set_idle_shutdown(Some(Duration::from_secs(5 * 60)));
+    assert!(reg.tick(now + Duration::from_secs(5 * 60 - 1)).is_empty());
+    assert_eq!(kinds(&reg.tick(now + Duration::from_secs(5 * 60))), ["shutdown U", "persist"]);
+}
+
+#[test]
 fn reattaching_cancels_the_idle_shutdown() {
     let now = Instant::now();
     let mut reg = Reg::default();

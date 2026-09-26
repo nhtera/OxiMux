@@ -60,6 +60,10 @@ pub enum HubEvent {
     Consent,
     /// The "Agent is using this device" badge came on or went off.
     AgentActivity(DeviceId),
+    /// The device watcher saw devices boot that no worktree has attached (an
+    /// agent's `simctl boot` or build, Simulator.app): a window may attach one
+    /// where an agent is working, after claiming it (P9 auto-open).
+    DeviceBooted(Vec<DeviceId>),
 }
 
 pub struct SimulatorHub {
@@ -90,6 +94,9 @@ pub struct SimulatorHub {
     paste_lock: capture::PasteLock,
     /// Consent, the agent badge and device scales (see `agent`).
     agent: agent::AgentState,
+    /// Booted devices a window already took for auto-attach (so one boot is
+    /// attached once, not by every window); dropped when the device shuts down.
+    boot_claims: HashSet<DeviceId>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -104,6 +111,8 @@ pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, pa
 
 pub use lifecycle::{install, on_quit};
 pub(crate) use lifecycle::{is_udid, simulator_dir};
+#[cfg(test)]
+pub(crate) use lifecycle::install_for_test;
 
 /// The global handle to the one hub.
 pub struct SimulatorService(pub Entity<SimulatorHub>);
@@ -116,6 +125,18 @@ pub fn hub(cx: &App) -> Option<Entity<SimulatorHub>> {
 }
 
 impl SimulatorHub {
+    /// Claim a freshly booted device for auto-attach: true for the first
+    /// caller only.
+    pub fn claim_booted(&mut self, udid: &DeviceId) -> bool {
+        self.boot_claims.insert(udid.clone())
+    }
+
+    /// The helper's version, from any live stream's `hello` (`None` until a
+    /// device streams this run).
+    pub fn helper_version(&self) -> Option<String> {
+        self.registry.attached_devices().iter().find_map(|udid| self.session(udid)).map(|s| s.hello().version.clone())
+    }
+
     pub fn availability(&self) -> Option<&Availability> {
         self.availability.as_ref()
     }
@@ -355,6 +376,8 @@ impl SimulatorHub {
             return Err("No usable iOS simulator. Install an iOS runtime in Xcode › Settings › Components.".into());
         };
         let info = info.clone();
+        // An attach (the user's pick, `sim attach`) boots it on purpose.
+        self.clear_stopped_by_user(&info.udid);
         if self.registry.device_for(key) != Some(&info.udid) {
             // Questions about the device it is leaving are moot.
             self.forget_consent_requests(key.path(), cx);
@@ -575,7 +598,8 @@ impl SimulatorHub {
     fn watch_gate(&self) -> WatchGate {
         WatchGate {
             xcode_ok: self.availability.as_ref().is_some_and(|a| matches!(a.xcode, availability::Xcode::Found { .. })),
-            // Settings (P9) will own this; the feature is on by default.
+            // The watcher fills this in from Settings, which the hub cannot
+            // read without an `App`; the other callers only need `xcode_ok`.
             enabled: true,
             feature_used: self.feature_used,
         }

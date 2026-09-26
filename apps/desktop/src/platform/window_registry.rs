@@ -197,6 +197,20 @@ pub fn all_windows(cx: &App) -> Vec<(String, Entity<WorkspaceRoot>)> {
         .unwrap_or_default()
 }
 
+/// Where the tracked window `persist_id` sits in the on-screen stacking order:
+/// 0 is frontmost; a window the platform does not report sorts last. For a
+/// deliberate pick when several windows could take something.
+pub fn front_rank(cx: &App, persist_id: &str) -> usize {
+    let Some(id) = cx.try_global::<WindowRegistry>().and_then(|reg| {
+        reg.windows.iter().find(|w| w.persist_id == persist_id).map(|w| w.window_id)
+    }) else {
+        return usize::MAX;
+    };
+    cx.window_stack()
+        .and_then(|stack| stack.iter().position(|w| w.window_id() == id))
+        .unwrap_or(usize::MAX)
+}
+
 /// The GPUI window of the tracked window `persist_id`, for work that needs a
 /// `Window` (opening a tab, switching a workspace) rather than just its root.
 pub fn window_handle(cx: &App, persist_id: &str) -> Option<gpui::AnyWindowHandle> {

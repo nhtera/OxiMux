@@ -8,7 +8,7 @@
 //! belongs to the worktree that asked** (it shows where that worktree's panel
 //! is, and nowhere else).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use gpui::Context;
 use oximux_simulator::DeviceId;
 use oximux_simulator::consent::{Consent, State, Verdict};
 use oximux_simulator::registry::{Phase, WorktreeKey};
-use oximux_storage::SimApprovalRepo;
+use oximux_storage::{SimApproval, SimApprovalRepo};
 
 use super::{HubEvent, SimulatorHub};
 
@@ -29,6 +29,12 @@ pub(crate) struct AgentState {
     consent: Consent,
     /// Where approvals persist. `None` in tests; grants then live in memory.
     approvals: Option<SimApprovalRepo>,
+    /// The approvals with their names and dates, for Settings (kept here so
+    /// the pane never reads the database while it paints).
+    granted: Vec<SimApproval>,
+    /// Devices the user shut down from the panel: an agent may not boot them
+    /// again until the user reconnects or someone attaches explicitly.
+    stopped: HashSet<DeviceId>,
     /// Per device: the badge shows until this instant.
     active_until: HashMap<DeviceId, Instant>,
     /// Per device: agent verbs still running (a long one — a boot, an
@@ -45,15 +51,15 @@ impl AgentState {
     /// Start from the persisted approvals. A database that cannot be read
     /// grants nothing: every device asks again.
     pub(crate) fn load(approvals: Option<SimApprovalRepo>) -> Self {
-        let approved = approvals
+        let granted = approvals
             .as_ref()
             .and_then(|repo| repo.list().inspect_err(|e| tracing::warn!("simulator approvals unreadable: {e}")).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|a| DeviceId(a.udid));
+            .unwrap_or_default();
         Self {
-            consent: Consent::new(approved),
+            consent: Consent::new(granted.iter().map(|a| DeviceId(a.udid.clone()))),
             approvals,
+            granted,
+            stopped: HashSet::new(),
             active_until: HashMap::new(),
             in_flight: HashMap::new(),
             scales: HashMap::new(),
@@ -107,6 +113,8 @@ pub enum Wake {
     Starting,
     /// Failed; the panel shows why and offers Retry.
     Failed(String),
+    /// The user shut it down from the panel; an agent may not boot it again.
+    StoppedByUser,
 }
 
 impl SimulatorHub {
@@ -149,6 +157,12 @@ impl SimulatorHub {
     /// only writer of an approval).
     pub fn allow_agents(&mut self, udid: &DeviceId, device_name: String, cx: &mut Context<Self>) {
         self.agent.consent.allow(udid);
+        self.agent.granted.retain(|a| a.udid != udid.as_str());
+        self.agent.granted.push(SimApproval {
+            udid: udid.to_string(),
+            device_name: device_name.clone(),
+            granted_at: chrono::Utc::now().to_rfc3339(),
+        });
         if let Some(repo) = self.agent.approvals.clone() {
             let udid = udid.clone();
             cx.background_executor()
@@ -168,9 +182,17 @@ impl SimulatorHub {
         cx.emit(HubEvent::Consent);
     }
 
-    /// Settings withdrew an approval.
+    /// The approved devices, oldest first (the Settings list).
+    pub fn approvals(&self) -> &[SimApproval] {
+        &self.agent.granted
+    }
+
+    /// Settings withdrew an approval: in memory at once, and from the
+    /// database (never revoke through the repository alone, or the grant in
+    /// memory would outlive it until a restart).
     pub fn revoke_agents(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         self.agent.consent.revoke(udid);
+        self.agent.granted.retain(|a| a.udid != udid.as_str());
         if let Some(repo) = self.agent.approvals.clone() {
             let udid = udid.clone();
             cx.background_executor()
@@ -244,14 +266,41 @@ impl SimulatorHub {
         self.agent.scales.insert(udid.clone(), scale);
     }
 
+    /// Settings' "Revoke all".
+    pub fn revoke_all_agents(&mut self, cx: &mut Context<Self>) {
+        let all: Vec<DeviceId> = self.agent.granted.iter().map(|a| DeviceId(a.udid.clone())).collect();
+        for udid in &all {
+            self.revoke_agents(udid, cx);
+        }
+    }
+
+    /// The user shut `udid` down from the panel (the confirmed power button).
+    /// Agents are refused a wake of it from now on (see [`Wake::StoppedByUser`]).
+    pub fn note_stopped_by_user(&mut self, udid: &DeviceId) {
+        self.agent.stopped.insert(udid.clone());
+    }
+
+    /// The user reconnected or picked `udid`, an attach chose it, or the
+    /// watcher saw it boot again: agents may wake it again. Never cleared by
+    /// an agent's own wake — its verb may land before the shutdown does.
+    pub fn clear_stopped_by_user(&mut self, udid: &DeviceId) {
+        self.agent.stopped.remove(udid);
+    }
+
     /// Bring up the helper for a device an agent needs: a parked, never
     /// started (restored) or disconnected device is restarted, as the user's
-    /// Reconnect would. The panel does not have to be open.
+    /// Reconnect would. The panel does not have to be open. A device the user
+    /// shut down from the panel is not: the power button means "stop".
     pub fn wake_for_agent(&mut self, udid: &DeviceId, cx: &mut Context<Self>) -> Wake {
         match self.registry.phase(udid) {
+            // Still streaming in the moments before a confirmed shutdown
+            // lands: the verb may use it, but the latch stays.
             Phase::Live { .. } => Wake::Live,
             Phase::Booting { .. } | Phase::Starting { .. } => Wake::Starting,
             Phase::Failed { error } => Wake::Failed(error),
+            Phase::Parked | Phase::Idle | Phase::Disconnected { .. } if self.agent.stopped.contains(udid) => {
+                Wake::StoppedByUser
+            }
             Phase::Parked | Phase::Idle | Phase::Disconnected { .. } => {
                 self.reconnect(udid, cx);
                 match self.registry.phase(udid) {
@@ -285,6 +334,29 @@ mod tests {
         assert!(!state.settle(&u, t + AGENT_BADGE * 5 + Duration::from_millis(10)), "not idle long enough");
         assert!(state.settle(&u, t + AGENT_BADGE * 6));
         assert!(state.begin(&u, t + AGENT_BADGE * 7), "and the next verb starts a new turn");
+    }
+
+    /// The power button means "stop": once the user shut a device down from
+    /// the panel, an agent's verbs are refused instead of booting it again,
+    /// however often they ask, until the user (or an attach) lifts it.
+    #[gpui::test]
+    fn a_device_the_user_shut_down_stays_down_for_agents(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        let udid = DeviceId("U-1".into());
+        hub.update(cx, |hub, cx| {
+            let key = WorktreeKey::from_path(Path::new("/nonexistent/w"));
+            drop(hub.registry.attach(key, udid.clone(), true, Instant::now()));
+            drop(hub.registry.device_shutdown(&udid));
+            assert!(matches!(hub.registry.phase(&udid), Phase::Disconnected { .. }), "{:?}", hub.registry.phase(&udid));
+            hub.note_stopped_by_user(&udid);
+            assert_eq!(hub.wake_for_agent(&udid, cx), Wake::StoppedByUser);
+            assert_eq!(hub.wake_for_agent(&udid, cx), Wake::StoppedByUser, "asking again does not lift it");
+            hub.clear_stopped_by_user(&udid);
+            assert!(!hub.agent.stopped.contains(&udid));
+        });
     }
 
     /// Editing `simulator.toml` cannot grant an approval. The file sits where

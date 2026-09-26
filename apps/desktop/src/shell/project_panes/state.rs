@@ -946,6 +946,12 @@ impl ProjectPanes {
         true
     }
 
+    /// Whether an agent is at work in `worktree` in any group (see
+    /// `PaneGroup::has_live_agent_for`).
+    pub fn has_live_agent_for(&self, worktree: &std::path::Path, cx: &gpui::App) -> bool {
+        self.groups.values().any(|g| g.read(cx).has_live_agent_for(worktree, cx))
+    }
+
     /// Whether any group in these panes holds the agent tab for `session_id`.
     /// Read-only — used to locate the owning project before switching to it.
     pub fn has_agent_session(

@@ -167,6 +167,7 @@ impl SimulatorPanel {
                     cx.notify();
                 }
             }
+            HubEvent::DeviceBooted(udids) => cx.emit(PanelEvent::DeviceBooted(udids.clone())),
             // Frames repaint the screen view, not the whole panel.
             HubEvent::Frame(_) | HubEvent::Session(..) => {}
         }
@@ -363,7 +364,11 @@ impl SimulatorPanel {
 
     pub(crate) fn reconnect(&mut self, cx: &mut Context<Self>) {
         let (Some(hub), Some(udid)) = (self.hub.clone(), self.device(cx)) else { return };
-        hub.update(cx, |hub, cx| hub.reconnect(&udid, cx));
+        hub.update(cx, |hub, cx| {
+            // The user's own Reconnect lifts the power button's "stop".
+            hub.clear_stopped_by_user(&udid);
+            hub.reconnect(&udid, cx);
+        });
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -400,6 +405,9 @@ impl SimulatorPanel {
 pub enum PanelEvent {
     /// Show this as a toast.
     Notice(NoticeKind, String),
+    /// Devices nobody attached booted (the window may attach one where an
+    /// agent is working; see `auto_open`).
+    DeviceBooted(Vec<DeviceId>),
 }
 
 impl EventEmitter<PanelEvent> for SimulatorPanel {}

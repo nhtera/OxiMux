@@ -32,7 +32,9 @@ oximux sim status --json
 ```
 
 No device yet? Attach one (it boots if needed). A name or udid picks one; none
-picks automatically:
+picks automatically. OxiMux shows the Simulator panel by itself when you
+attach, run a verb, or build for a simulator — you do not need to ask the user
+to open it:
 
 ```sh
 oximux sim devices
@@ -139,7 +141,8 @@ oximux sim open-url "myapp://settings"
 | 5 | `consent-denied` | stop; tell the user what you needed |
 | 5 | `agent-control-off` | the user turned it off; do not work around it |
 | 5 | `path-outside-worktree` | build into the worktree or DerivedData |
-| 5 | `refused` | not without the user asking (e.g. shutting down a device they booted) |
+| 5 | `refused` | not without the user asking (e.g. shutting down a device they booted, or booting one they shut down) |
+| 1 | `unavailable` | no Xcode, the device is still booting, or the user turned the iOS Simulator off in Settings; the message says which |
 | 1 | `no-device` | `oximux sim attach` |
 | 1 | `not-streaming` | the device is starting; retry in a few seconds |
 | 1 | `not-found` | `oximux sim ax` to see what is on screen |
@@ -155,3 +158,5 @@ oximux sim open-url "myapp://settings"
   they allowed it; do not sign in to real accounts on the simulator.
 - `oximux sim shutdown` refuses a device the user booted themselves. Do not add
   `--force` unless the user asked you to shut it down.
+- A device the user shut down from the panel stays down: verbs exit 5
+  (`refused`). Ask the user before running `oximux sim attach` to boot it again.

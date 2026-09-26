@@ -78,6 +78,11 @@ impl BootWatch {
         events
     }
 
+    /// Drop the baseline: the next observation is a fresh one, not a diff.
+    pub fn forget(&mut self) {
+        self.booted = None;
+    }
+
     /// Whether `udid` was booted at the last poll (`None` before the first).
     pub fn is_booted(&self, udid: &DeviceId) -> Option<bool> {
         self.booted.as_ref().map(|b| b.contains(udid))

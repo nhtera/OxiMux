@@ -56,6 +56,9 @@ pub enum SettingsPane {
     Agents,
     Voice,
     ScreenControl,
+    /// The iOS Simulator panel (Beta): agents' auto-open and control, the
+    /// approved devices, stream defaults. Apple silicon Macs only.
+    Simulator,
     Notifications,
     Schedules,
     Remote,
@@ -83,10 +86,11 @@ impl SettingsPane {
     /// filed out of order prints its heading twice. `nav_groups_are_contiguous`
     /// holds that invariant — which matters most for the next person adding a
     /// pane at the end of the list, where the obvious place is the wrong one.
-    const EVERY: [SettingsPane; 12] = [
+    const EVERY: [SettingsPane; 13] = [
         SettingsPane::Agents,
         SettingsPane::Voice,
         SettingsPane::ScreenControl,
+        SettingsPane::Simulator,
         SettingsPane::Git,
         SettingsPane::Terminal,
         SettingsPane::Schedules,
@@ -111,6 +115,7 @@ impl SettingsPane {
     fn is_available(self) -> bool {
         match self {
             SettingsPane::ScreenControl => cfg!(any(target_os = "macos", windows)),
+            SettingsPane::Simulator => cfg!(all(target_os = "macos", target_arch = "aarch64")),
             _ => true,
         }
     }
@@ -123,9 +128,10 @@ impl SettingsPane {
     /// Which section this pane files under.
     pub(super) fn group(self) -> SettingsGroup {
         match self {
-            SettingsPane::Agents | SettingsPane::Voice | SettingsPane::ScreenControl => {
-                SettingsGroup::Ai
-            }
+            SettingsPane::Agents
+            | SettingsPane::Voice
+            | SettingsPane::ScreenControl
+            | SettingsPane::Simulator => SettingsGroup::Ai,
             SettingsPane::Git
             | SettingsPane::Terminal
             | SettingsPane::Schedules
@@ -151,6 +157,7 @@ impl SettingsPane {
             // controlling this screen from elsewhere. Two adjacent rows both
             // named for screens would be read as two halves of one feature.
             SettingsPane::ScreenControl => "Computer use",
+            SettingsPane::Simulator => "iOS Simulator",
             SettingsPane::Notifications => "Notifications",
             SettingsPane::Schedules => "Schedules",
             SettingsPane::Remote => "Remote",
@@ -171,6 +178,7 @@ impl SettingsPane {
             SettingsPane::Agents => "icons/sparkles.svg",
             SettingsPane::Voice => "icons/mic.svg",
             SettingsPane::ScreenControl => "icons/crosshair.svg",
+            SettingsPane::Simulator => "icons/smartphone.svg",
             SettingsPane::Notifications => "icons/bell.svg",
             SettingsPane::Schedules => "icons/history.svg",
             SettingsPane::Remote => "icons/globe.svg",
@@ -328,8 +336,8 @@ mod tests {
     /// heading a second time further down the list. Ordering is the invariant
     /// that keeps one heading per group, and it is easy to break by adding a
     /// pane in the "obvious" place at the end of `ALL`.
-    /// Nothing but Computer use may be platform-gated, and the Git pane in
-    /// particular must appear everywhere.
+    /// Nothing but Computer use and the iOS Simulator may be platform-gated,
+    /// and the Git pane in particular must appear everywhere.
     ///
     /// The old failure this replaces: two cfg-gated arrays meant a pane could
     /// be added to the one your machine compiles and missed in the other,
@@ -338,15 +346,15 @@ mod tests {
     /// that survived.
     #[test]
     fn only_the_platform_specific_pane_is_ever_withheld() {
-        // Screen control is the only pane that is ever withheld, so on the
-        // platforms that offer it the two lists are identical, and on the
-        // ones that do not they differ by exactly that pane.
+        // Screen control and the iOS Simulator are the only panes ever
+        // withheld, so on the platforms that offer them the two lists are
+        // identical, and on the others they differ by exactly those.
         let offered = SettingsPane::offered();
         let withheld: Vec<SettingsPane> =
             SettingsPane::EVERY.into_iter().filter(|p| !offered.contains(p)).collect();
         assert!(
-            withheld.iter().all(|p| matches!(p, SettingsPane::ScreenControl)),
-            "a pane other than Computer use is being withheld: {withheld:?}"
+            withheld.iter().all(|p| matches!(p, SettingsPane::ScreenControl | SettingsPane::Simulator)),
+            "a pane other than Computer use or the iOS Simulator is being withheld: {withheld:?}"
         );
         assert!(
             offered.contains(&SettingsPane::Git),

@@ -27,6 +27,7 @@ use oximux_simulator::registry::WorktreeKey;
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, simctl};
 
+use super::auto_open::Trigger;
 use super::hub::{SimulatorHub, hub};
 use crate::platform::window_registry;
 use crate::workspace_root::WorkspaceRoot;
@@ -44,6 +45,9 @@ struct Known {
     window: String,
     /// It is that window's active tab's worktree.
     active: bool,
+    /// The window's place in the stacking order (0 = frontmost): the
+    /// deliberate pick among windows that tie otherwise.
+    front: usize,
     project_id: String,
     workspace_id: String,
     /// "project / worktree", for the consent question.
@@ -66,6 +70,9 @@ pub async fn run(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Sim
     let hub = cx
         .update(|cx| hub(cx))
         .ok_or_else(|| SimErrorWire::Unavailable("the iOS Simulator panel needs an Apple silicon Mac".into()))?;
+    if !cx.update(|cx| super::panel::settings(cx).enabled) {
+        return Err(SimErrorWire::Unavailable("the iOS Simulator is turned off in OxiMux Settings".into()));
+    }
     let known = cx.update(known_worktrees);
     // Canonicalizing touches the filesystem: off the UI thread.
     let target = cx.background_executor().spawn(async move { resolve(&path, known) }).await.ok_or(SimErrorWire::NoDevice)?;
@@ -83,6 +90,8 @@ pub async fn run(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Sim
         control => {
             let (udid, name) = authorize(&hub, &target, cx)?;
             hub.update(cx, |hub, cx| hub.agent_verb_started(&udid, cx));
+            let worktree = target.worktree.clone();
+            with_root(cx, &target, move |root, _, cx| root.reveal_simulator_for(&worktree, Trigger::Verb, cx));
             let out = verbs::run(&hub, &udid, &name, control, &target, cx).await;
             hub.update(cx, |hub, cx| hub.agent_verb_finished(&udid, cx));
             out
@@ -94,6 +103,7 @@ pub async fn run(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Sim
 fn known_worktrees(cx: &mut App) -> Vec<Known> {
     let mut out = Vec::new();
     for (window, root) in window_registry::all_windows(cx) {
+        let front = window_registry::front_rank(cx, &window);
         let root = root.read(cx);
         let active = root.active_worktree.as_ref().map(|p| p.to_string_lossy().into_owned());
         let projects = &root.app_state.recent_projects;
@@ -104,6 +114,7 @@ fn known_worktrees(cx: &mut App) -> Vec<Known> {
                 path: path.to_owned(),
                 window: window.clone(),
                 active: active.as_deref() == Some(path),
+                front,
                 project_id: project_id.to_owned(),
                 workspace_id,
                 label,
@@ -131,7 +142,8 @@ fn known_worktrees(cx: &mut App) -> Vec<Known> {
 
 /// The deepest known worktree containing `path`, compared canonically (so a
 /// symlinked or `/tmp` path still matches); a window where it is active wins a
-/// tie. `None` when the path is in no worktree the app knows.
+/// tie, then the frontmost. `None` when the path is in no worktree the app
+/// knows.
 fn resolve(path: &str, known: Vec<Known>) -> Option<Target> {
     let path = std::fs::canonicalize(path).ok()?;
     known
@@ -140,7 +152,7 @@ fn resolve(path: &str, known: Vec<Known>) -> Option<Target> {
             let root = std::fs::canonicalize(&k.path).ok()?;
             path.starts_with(&root).then(|| (root.components().count(), k))
         })
-        .max_by_key(|(depth, k)| (*depth, k.active))
+        .max_by_key(|(depth, k)| (*depth, k.active, std::cmp::Reverse(k.front)))
         .map(|(_, k)| Target {
             worktree: PathBuf::from(k.path),
             window: k.window,
@@ -272,7 +284,7 @@ async fn attach(hub: &Entity<SimulatorHub>, target: &Target, device: Option<Stri
         .map_err(SimErrorWire::Failed)?;
     // Show it where the user is looking at this worktree.
     let worktree = target.worktree.clone();
-    with_root(cx, target, move |root, window, cx| root.reveal_simulator_for(&worktree, window, cx));
+    with_root(cx, target, move |root, _, cx| root.reveal_simulator_for(&worktree, Trigger::Attach, cx));
     Ok(SimReplyWire::Attached(device_wire(&info)))
 }
 
@@ -363,6 +375,7 @@ mod tests {
             path: path.into(),
             window: window.into(),
             active,
+            front: 0,
             project_id: "p".into(),
             workspace_id: path.into(),
             label: path.into(),
@@ -388,6 +401,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let s = root.path().to_string_lossy().into_owned();
         let list = vec![known(&s, "w-1", false), known(&s, "w-2", true), known(&s, "w-3", false)];
+        assert_eq!(resolve(&s, list).unwrap().window, "w-2");
+    }
+
+    /// Known to several windows and active in none: the frontmost takes it,
+    /// never whichever the registry lists first (P8 review L6).
+    #[test]
+    fn otherwise_the_frontmost_window_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let s = root.path().to_string_lossy().into_owned();
+        let at = |window: &str, front: usize| Known { front, ..known(&s, window, false) };
+        let list = vec![at("w-1", 2), at("w-2", 0), at("w-3", usize::MAX)];
         assert_eq!(resolve(&s, list).unwrap().window, "w-2");
     }
 }

@@ -12,7 +12,7 @@ use oximux_settings::{Density, Typography};
 use super::{
     CARD_HEIGHT, CARD_WIDTH, SettingsModal, SettingsPane, layout, nav, pane_about, pane_agents,
     pane_git, pane_integrations, pane_keybindings, pane_notifications, pane_remote, pane_schedules,
-    pane_terminal, pane_voice,
+    pane_simulator, pane_terminal, pane_voice,
 };
 #[cfg(any(target_os = "macos", windows))]
 use super::pane_computer_use;
@@ -59,6 +59,11 @@ impl SettingsModal {
                 (
                     SettingsPane::ScreenControl.label(),
                     pane_computer_use::entries(self, theme, density, typography, cx),
+                ),
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                (
+                    SettingsPane::Simulator.label(),
+                    pane_simulator::entries(self, theme, density, typography, cx),
                 ),
                 (
                     SettingsPane::Notifications.label(),
@@ -107,6 +112,7 @@ impl SettingsModal {
             // Not reachable: `offered()` withholds the pane here.
             #[cfg(not(any(target_os = "macos", windows)))]
             SettingsPane::ScreenControl => gpui::div().into_any_element(),
+            SettingsPane::Simulator => pane_simulator::render(self, theme, density, typography, cx),
             SettingsPane::Notifications => {
                 pane_notifications::render(self, theme, density, typography, cx)
             }

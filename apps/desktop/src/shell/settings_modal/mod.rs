@@ -17,6 +17,7 @@ mod pane_about;
 mod pane_agents;
 #[cfg(any(target_os = "macos", windows))]
 mod pane_computer_use;
+mod pane_simulator;
 /// The Windows half of the same pane. Separate module rather than a fork of
 /// `pane_computer_use` because almost none of that pane transfers: there is no
 /// signature to report, no in-app installer to drive, and the master switch and
@@ -174,6 +175,9 @@ pub struct SettingsModal {
     /// Working copy of the screen-control settings, reseeded from the global at
     /// each `open()` and written straight back on every edit.
     pub(super) computer_use: ComputerUseSettings,
+    /// Repaints the iOS Simulator pane when the hub's availability, device
+    /// list or approvals change (it reads them straight from the hub).
+    _simulator: Option<gpui::Subscription>,
     /// Result of the last driver check. Held rather than recomputed per frame:
     /// verification spawns `codesign`, and the pane repaints constantly.
     #[cfg(target_os = "macos")]
@@ -386,6 +390,7 @@ impl SettingsModal {
             agent_launch: AgentLaunchSettings::default(),
             dictation: DictationSettings::default(),
             computer_use: ComputerUseSettings::default(),
+            _simulator: pane_simulator::watch_hub(cx),
             #[cfg(target_os = "macos")]
             driver_status: pane_computer_use::DriverStatus::Unknown,
             #[cfg(windows)]
@@ -1570,7 +1575,7 @@ mod env_editor_tests {
     ///
     /// Returns both handles because the window is what carries a `Window` into
     /// a closure, and the modal is what the assertions are about.
-    fn modal(
+    pub(super) fn modal(
         cx: &mut TestAppContext,
     ) -> (gpui::WindowHandle<gpui_component::Root>, Entity<SettingsModal>) {
         cx.update(gpui_component::init);
