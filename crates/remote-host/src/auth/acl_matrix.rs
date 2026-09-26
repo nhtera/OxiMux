@@ -63,6 +63,9 @@ struct Row {
     // The one surface a confined caller deliberately shares host-wide.
     read_state: bool,
     write_state: bool,
+    // Local callers only, at either scope (the handler pins a confined one to
+    // its own worktree).
+    control_simulator: bool,
 }
 
 /// Ask every predicate about one caller.
@@ -90,6 +93,7 @@ fn observe(store: &AuthStore, peer: &Peer) -> Row {
         attempt_heartbeat_writes: store.may_attempt_heartbeat_writes(peer),
         read_state: store.may_read_state(peer),
         write_state: store.may_write_state(peer),
+        control_simulator: store.may_control_simulator(peer),
     }
 }
 
@@ -118,6 +122,7 @@ const NOTHING: Row = Row {
     attempt_heartbeat_writes: false,
     read_state: false,
     write_state: false,
+    control_simulator: false,
 };
 
 /// A *valid* Ed25519 public key from a seed — `register` verifies the point is
@@ -187,6 +192,7 @@ fn a_local_operator_reaches_everything_including_pairing() {
             attempt_heartbeat_writes: true,
             read_state: true,
             write_state: true,
+            control_simulator: true,
         },
         "the local operator is the host's own owner",
     );
@@ -224,6 +230,10 @@ fn a_session_confined_agent_reaches_only_its_own_session() {
             // session contents.
             read_state: true,
             write_state: true,
+            // Deliberate exception 3: the simulator on this machine. The
+            // handler pins a confined caller to its own session's worktree, so
+            // it reaches the device its own work uses and nothing else.
+            control_simulator: true,
             ..NOTHING
         },
         "session confinement is the only boundary around an agent's own CLI",
@@ -281,6 +291,9 @@ fn a_full_remote_device_reaches_everything_except_pairing() {
             attempt_heartbeat_writes: true,
             read_state: true,
             write_state: true,
+            // A phone never drives the simulator: its screenshots would leave
+            // the machine.
+            control_simulator: false,
         },
         "a paired device may not enroll further devices",
     );
@@ -329,6 +342,9 @@ fn a_session_scoped_remote_device_mirrors_the_confined_agent() {
             attempt_heartbeat_writes: true,
             read_state: true,
             write_state: true,
+            // The one place the mirror breaks, on purpose: the simulator is a
+            // device on the host machine, reachable by local callers only.
+            control_simulator: false,
             ..NOTHING
         },
         "a session-bound pairing confines exactly as a session-scoped local caller does",

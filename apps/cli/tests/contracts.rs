@@ -67,15 +67,17 @@ fn the_exit_codes_are_the_numbers_scripts_branch_on() {
     assert_eq!(codes["host_unreachable"], 3);
     assert_eq!(codes["timeout"], 4);
     assert_eq!(codes["access_denied"], 5);
+    // Not 6: `serve` already exits 6 when another host holds the data dir.
+    assert_eq!(codes["pending_user"], 7);
 
-    // And the dump names exactly these six — a seventh nobody documented, or a
+    // And the dump names exactly these seven — one nobody documented, or a
     // renamed key, both break a caller reading the map by name.
     let named: Vec<&str> = codes.as_object().expect("a map").keys().map(String::as_str).collect();
     let mut sorted = named.clone();
     sorted.sort_unstable();
     assert_eq!(
         sorted,
-        ["access_denied", "error", "host_unreachable", "ok", "timeout", "usage"],
+        ["access_denied", "error", "host_unreachable", "ok", "pending_user", "timeout", "usage"],
         "the exit-code vocabulary changed: {named:?}",
     );
 }

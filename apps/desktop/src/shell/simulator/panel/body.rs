@@ -63,7 +63,9 @@ impl SimulatorPanel {
             PanelState::Disconnected { reason } => self.render_stopped(reason, "Reconnect", false, cx),
             PanelState::Error { message, xcode_hint } => self.render_stopped(message, "Retry", *xcode_hint, cx),
         };
+        let (banner, badge) = (self.render_consent_banner(cx), self.render_agent_badge(cx));
         div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -74,8 +76,10 @@ impl SimulatorPanel {
             .px(px(density.pad_panel))
             .pt(px(density.pad_panel * 2.0))
             .pb(px(density.pad_panel))
+            .children(banner)
             .child(phone(self.theme, &device, &self.area, cx.weak_entity(), screen))
             .child(if self.annotate.is_some() { self.render_annotate_controls(cx) } else { self.render_toolbar(state, cx) })
+            .children(badge)
             .into_any_element()
     }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::simulator::*;
 use oximux_agent_core::thread::{PermissionDecision, ThreadEvent};
 use serde::Deserialize;
 use serde_json::json;
@@ -18,12 +19,10 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 24,
-        "v24 = worktree base refs (CreateWorktreeV2, answered by the existing \
-         WorktreeCreated). A field on CreateWorktree was not an option: postcard is \
-         not self-describing, so an appended Option costs a byte even when None — a \
-         v24 client making a PLAIN create would become undecodable to every v23 host, \
-         breaking the common case for the sake of the rare one"
+        PROTOCOL_VERSION, 25,
+        "v25 = the iOS Simulator surface (Simulator request + Simulator reply, the \
+         verb set in its own append-only enums). v24 = worktree base refs \
+         (CreateWorktreeV2, answered by the existing WorktreeCreated)"
     );
 }
 
@@ -557,6 +556,83 @@ fn early_variants_keep_their_literal_ordinals() {
         summary: String::new(),
     };
     assert_eq!(Response::ScheduleCreatedV2(sched_v2).to_bytes().expect("encode")[0], 51);
+
+    // v25: the simulator — one request (69) and one reply (52) for every verb.
+    let sim = Request::Simulator(SimRequestWire { worktree: None, cmd: SimCmdWire::Status });
+    assert_eq!(sim.to_bytes().expect("encode")[0], 69);
+    assert_eq!(Response::Simulator(Ok(SimReplyWire::Done)).to_bytes().expect("encode")[0], 52);
+}
+
+/// Every simulator verb and reply survives the codec, and the verb enum's
+/// ordinals are pinned: a CLI and a desktop built a release apart must agree
+/// on what `Tap` means.
+#[test]
+fn simulator_verbs_round_trip_and_keep_their_ordinals() {
+    let point = SimPointWire { x: 10.5, y: 20.0 };
+    let cmds = [
+        SimCmdWire::Status,
+        SimCmdWire::Devices,
+        SimCmdWire::Attach { device: Some("iPhone 17 Pro".into()) },
+        SimCmdWire::Detach,
+        SimCmdWire::Screenshot { full: false },
+        SimCmdWire::Ax { max: 200 },
+        SimCmdWire::Tap(SimTargetWire::Label("Settings".into())),
+        SimCmdWire::Swipe { from: point, to: SimPointWire { x: 1.0, y: 2.0 }, duration_ms: 300 },
+        SimCmdWire::Type { text: "héllo".into(), paste: true },
+        SimCmdWire::Button(SimButtonWire::AppSwitcher),
+        SimCmdWire::Rotate(SimOrientationWire::LandscapeLeft),
+        SimCmdWire::Launch { bundle_id: "com.apple.Preferences".into(), relaunch: true },
+        SimCmdWire::OpenUrl { url: "https://example.com".into() },
+        SimCmdWire::Install { path: "/w/Build/App.app".into() },
+        SimCmdWire::Shutdown { force: false },
+    ];
+    for (ordinal, cmd) in cmds.into_iter().enumerate() {
+        let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: cmd.clone() });
+        let bytes = req.to_bytes().expect("encode");
+        // After the envelope ordinal and the `Some("/w")` worktree (tag,
+        // length, two bytes), the verb's own ordinal.
+        assert_eq!(bytes[5] as usize, ordinal, "{cmd:?}");
+        assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
+    }
+
+    let device = SimDeviceWire {
+        udid: "81CE1BE8-0000-0000-0000-000000000000".into(),
+        name: "iPhone 17 Pro".into(),
+        runtime: "iOS 26.0".into(),
+        state: "Booted".into(),
+    };
+    let replies = [
+        Ok(SimReplyWire::Status(SimStatusWire {
+            available: true,
+            reason: None,
+            xcode: Some("26.0".into()),
+            worktree: "/w".into(),
+            device: Some(device.clone()),
+            streaming: true,
+            consent: SimConsentWire::Denied { retry_after_secs: 540 },
+            agent_control: true,
+        })),
+        Ok(SimReplyWire::Devices(vec![device.clone()])),
+        Ok(SimReplyWire::Attached(device)),
+        Ok(SimReplyWire::Screenshot { png: vec![0x89, b'P', b'N', b'G'], width: 402, height: 874, scale: 1.0 }),
+        Ok(SimReplyWire::Ax(vec![SimAxNodeWire {
+            depth: 1,
+            role: "Button".into(),
+            label: Some("Settings".into()),
+            identifier: None,
+            value: None,
+            enabled: true,
+            frame: [0.0, 1.5, 100.0, 44.0],
+        }])),
+        Err(SimErrorWire::ConsentPending),
+        Err(SimErrorWire::ConsentDenied { retry_after_secs: 600 }),
+        Err(SimErrorWire::PathOutsideWorktree),
+        Err(SimErrorWire::Refused("booted by the user".into())),
+    ];
+    for reply in replies {
+        let resp = Response::Simulator(reply);
+        assert_eq!(Response::from_bytes(&resp.to_bytes().expect("encode")).expect("decode"), resp);
+    }
 }
 
 /// The v10 schedule shape is frozen, byte for byte.

@@ -197,6 +197,13 @@ pub fn all_windows(cx: &App) -> Vec<(String, Entity<WorkspaceRoot>)> {
         .unwrap_or_default()
 }
 
+/// The GPUI window of the tracked window `persist_id`, for work that needs a
+/// `Window` (opening a tab, switching a workspace) rather than just its root.
+pub fn window_handle(cx: &App, persist_id: &str) -> Option<gpui::AnyWindowHandle> {
+    let id = cx.try_global::<WindowRegistry>()?.windows.iter().find(|w| w.persist_id == persist_id)?.window_id;
+    cx.windows().into_iter().find(|w| w.window_id() == id)
+}
+
 /// Remove the entry for `window_id`, returning it so the caller can capture
 /// state before the strong `WorkspaceRoot` handle drops. `None` when the id
 /// isn't tracked (e.g. a non-workspace spike window).

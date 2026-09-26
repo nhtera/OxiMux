@@ -405,7 +405,7 @@ fn main() {
         // background, and its device watcher stays off until then (a Mac
         // without Xcode never runs `xcrun` because of it).
         oximux_app::simulator_settings::install(cx);
-        oximux_app::shell::simulator::install(cx, app_state.settings_repo().clone());
+        oximux_app::shell::simulator::install(cx, app_state.settings_repo().clone(), app_state.sim_approval_repo());
         // Process-wide last-known-`GitState` cache. (Appearance is installed
         // further up, before the gpui-component bridge that reads it.) Registered before any
         // window opens so the first SCM panel can seed from it (no-op on a
@@ -480,6 +480,15 @@ fn main() {
             let (rewinder, requests) = oximux_app::remote_control::rewind_bridge::rewind_bridge();
             remote_control.set_rewinder(std::sync::Arc::new(rewinder));
             oximux_app::remote_control::rewind_bridge::serve_rewinds(requests, cx);
+        }
+        // `oximux sim …`: agents drive the simulator attached to their
+        // worktree. Only where the panel exists (Apple silicon); elsewhere
+        // the host answers `Unsupported`. Each verb runs as its own task on
+        // the UI thread, so a slow install never holds up another agent.
+        if oximux_app::shell::simulator::hub(cx).is_some() {
+            let (simulator, requests) = oximux_app::remote_control::sim_bridge::sim_bridge();
+            remote_control.set_simulator(std::sync::Arc::new(simulator));
+            oximux_app::remote_control::sim_bridge::serve_simulator(requests, cx);
         }
         // Schedules the phone can list and manage: the same store the desktop's
         // ticker fires and its Settings pane edits, so all three surfaces share one

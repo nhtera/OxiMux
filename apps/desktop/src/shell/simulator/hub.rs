@@ -25,8 +25,7 @@ use oximux_simulator::helper::HelperOptions;
 use oximux_simulator::registry::{self, BootResult, Effect, Generation, Phase, Registry, WorktreeKey};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::{SessionEvent, StreamSession};
-use oximux_simulator::protocol::{Command, KeyPhase};
-use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, SimError, keyboard, simctl};
+use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, SimError, simctl};
 use oximux_storage::SettingsRepo;
 
 use crate::app_settings::sim_state_keys;
@@ -56,6 +55,11 @@ pub enum HubEvent {
     /// Something the user should hear about for this device (a saved
     /// screenshot, a failed paste): the window shows it as a toast.
     Notice(DeviceId, NoticeKind, String),
+    /// A consent request was raised, answered or dropped: panels re-read
+    /// [`SimulatorHub::consent_request`].
+    Consent,
+    /// The "Agent is using this device" badge came on or went off.
+    AgentActivity(DeviceId),
 }
 
 pub struct SimulatorHub {
@@ -84,15 +88,19 @@ pub struct SimulatorHub {
     /// `simctl`'s path, once resolved (recordings spawn it directly).
     simctl: Option<PathBuf>,
     paste_lock: capture::PasteLock,
+    /// Consent, the agent badge and device scales (see `agent`).
+    agent: agent::AgentState,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
 
+mod agent;
 mod capture;
 mod lifecycle;
 
+pub use agent::Wake;
 pub use capture::NoticeKind;
-pub(crate) use capture::{CaptureKind, capture_dir, capture_path, stamp};
+pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
 
 pub use lifecycle::{install, on_quit};
 pub(crate) use lifecycle::{is_udid, simulator_dir};
@@ -181,30 +189,10 @@ impl SimulatorHub {
         if text.is_empty() || !self.watch_gate().xcode_ok {
             return;
         }
-        let (runner, target, lock) = (self.runner.clone(), udid.clone(), self.paste_lock.clone());
+        let (target, lock) = (udid.clone(), self.paste_lock.clone());
         let udid = udid.clone();
         cx.spawn(async move |this, cx| {
-            let failed = cx
-                .background_executor()
-                .spawn(async move {
-                    // One paste at a time: the clipboard is shared, so a second
-                    // ⌘V must not overwrite it before the first chord lands.
-                    let _turn = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let keys = match simctl::pbcopy(runner.as_ref(), target.as_str(), &text, SIMCTL_TIMEOUT) {
-                        Ok(()) => keyboard::paste_chord(),
-                        Err(e) if !keyboard::needs_paste(&text) => {
-                            tracing::debug!(%target, "simulator pbcopy failed ({e}); typing instead");
-                            keyboard::text_to_key_events(&text).unwrap_or_default()
-                        }
-                        Err(e) => return Some(e.to_string()),
-                    };
-                    for key in keys {
-                        let phase = if key.down { KeyPhase::Down } else { KeyPhase::Up };
-                        let _ = session.send(&Command::Key { phase, usage: key.usage });
-                    }
-                    None
-                })
-                .await;
+            let failed = cx.background_executor().spawn(async move { paste_now(&session, &target, &text, &lock).err() }).await;
             if let Some(e) = failed {
                 let _ = this.update(cx, |_, cx| {
                     cx.emit(HubEvent::Notice(udid, NoticeKind::Error, format!("Paste into the simulator failed: {e}")));
@@ -212,6 +200,16 @@ impl SimulatorHub {
             }
         })
         .detach();
+    }
+
+    /// The lock that keeps pastes in order (agents paste through it too).
+    pub(crate) fn paste_lock(&self) -> capture::PasteLock {
+        self.paste_lock.clone()
+    }
+
+    /// OxiMux booted `udid` (so it may shut it down without asking).
+    pub fn is_owned(&self, udid: &DeviceId) -> bool {
+        self.registry.is_owned(udid)
     }
 
     /// Rotate `udid` a quarter turn (Simulator.app's "Rotate Right" when
@@ -308,11 +306,8 @@ impl SimulatorHub {
     /// Attach `worktree` to `device`, or to an automatically picked one.
     /// Lists devices in the background first (to know whether it is booted).
     pub fn attach(&mut self, worktree: &Path, device: Option<DeviceId>, preferred: Option<DeviceId>, cx: &mut Context<Self>) {
-        self.mark_used(cx);
+        let seq = self.begin_attach(worktree, cx);
         let key = WorktreeKey::from_path(worktree);
-        self.next_attach += 1;
-        let seq = self.next_attach;
-        self.attach_seq.insert(key.clone(), seq);
         let runner = self.runner.clone();
         cx.spawn(async move |this, cx| {
             let listed = cx.background_executor().spawn(async move { simctl::list_devices(runner.as_ref(), SIMCTL_TIMEOUT) }).await;
@@ -320,39 +315,77 @@ impl SimulatorHub {
                 if hub.attach_seq.get(&key) != Some(&seq) {
                     return; // superseded by a newer attach for this worktree
                 }
-                let fail = |cx: &mut Context<SimulatorHub>, why: String| {
+                if let Err(why) = hub.attach_listed(&key, listed, device.as_ref(), preferred.as_ref(), cx) {
                     tracing::warn!("simulator attach: {why}");
                     cx.emit(HubEvent::AttachFailed(key.path().to_path_buf(), why));
-                };
-                let devices = match listed {
-                    Ok(devices) => devices,
-                    Err(e) => return fail(cx, format!("could not list simulators: {e}")),
-                };
-                hub.devices = devices.clone();
-                hub.devices_listed = true;
-                cx.emit(HubEvent::Devices);
-                let pick = match &device {
-                    Some(udid) => devices.iter().find(|d| &d.udid == udid).map(|d| (d, d.state == DeviceState::Booted)),
-                    None => registry::auto_pick(&devices, preferred.as_ref()),
-                };
-                let Some((info, booted)) = pick else {
-                    return fail(cx, "No usable iOS simulator. Install an iOS runtime in Xcode › Settings › Components.".into());
-                };
-                let udid = info.udid.clone();
-                let effects = hub.registry.attach(key, udid.clone(), booted, Instant::now());
-                hub.run(effects, cx);
-                // Switching device may have left the old one unattached.
-                hub.stop_unattached_recordings(cx);
-                cx.emit(HubEvent::Changed(udid));
+                }
             });
         })
         .detach();
+    }
+
+    /// Start an attach for `worktree`: supersede any older one in flight.
+    /// Returns its sequence number.
+    fn begin_attach(&mut self, worktree: &Path, cx: &mut Context<Self>) -> u64 {
+        self.mark_used(cx);
+        self.next_attach += 1;
+        self.attach_seq.insert(WorktreeKey::from_path(worktree), self.next_attach);
+        self.next_attach
+    }
+
+    /// Finish an attach with a device listing taken for it: pick `device` (or
+    /// the automatic choice) and attach. Returns the device, or why not.
+    pub(crate) fn attach_listed(
+        &mut self,
+        key: &WorktreeKey,
+        listed: Result<Vec<DeviceInfo>, SimError>,
+        device: Option<&DeviceId>,
+        preferred: Option<&DeviceId>,
+        cx: &mut Context<Self>,
+    ) -> Result<DeviceInfo, String> {
+        let devices = listed.map_err(|e| format!("could not list simulators: {e}"))?;
+        self.devices = devices;
+        self.devices_listed = true;
+        cx.emit(HubEvent::Devices);
+        let pick = match device {
+            Some(udid) => self.devices.iter().find(|d| &d.udid == udid).map(|d| (d, d.state == DeviceState::Booted)),
+            None => registry::auto_pick(&self.devices, preferred),
+        };
+        let Some((info, booted)) = pick else {
+            return Err("No usable iOS simulator. Install an iOS runtime in Xcode › Settings › Components.".into());
+        };
+        let info = info.clone();
+        if self.registry.device_for(key) != Some(&info.udid) {
+            // Questions about the device it is leaving are moot.
+            self.forget_consent_requests(key.path(), cx);
+        }
+        let effects = self.registry.attach(key.clone(), info.udid.clone(), booted, Instant::now());
+        self.run(effects, cx);
+        // Switching device may have left the old one unattached.
+        self.stop_unattached_recordings(cx);
+        cx.emit(HubEvent::Changed(info.udid.clone()));
+        Ok(info)
+    }
+
+    /// An agent's attach: the listing is the agent's own, so it resolves a
+    /// device name first. Supersedes any attach in flight for `worktree`.
+    pub(crate) fn attach_for_agent(
+        &mut self,
+        worktree: &Path,
+        listed: Result<Vec<DeviceInfo>, SimError>,
+        device: Option<&DeviceId>,
+        preferred: Option<&DeviceId>,
+        cx: &mut Context<Self>,
+    ) -> Result<DeviceInfo, String> {
+        self.begin_attach(worktree, cx);
+        self.attach_listed(&WorktreeKey::from_path(worktree), listed, device, preferred, cx)
     }
 
     pub fn detach(&mut self, worktree: &Path, cx: &mut Context<Self>) {
         let key = WorktreeKey::from_path(worktree);
         self.attach_seq.remove(&key); // a pending attach must not land after this
         let udid = self.registry.device_for(&key).cloned();
+        self.forget_consent_requests(worktree, cx);
         let effects = self.registry.detach(&key, Instant::now());
         self.run(effects, cx);
         // A recording belongs to the device: it ends with its last attachment.

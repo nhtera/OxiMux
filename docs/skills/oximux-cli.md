@@ -62,6 +62,7 @@ stopped waiting.
 | 3 | no host answered — retrying may help |
 | 4 | timed out |
 | 5 | not allowed — retrying will not help |
+| 7 | waiting on the user (`sim` consent) — wait, then retry |
 
 Branch on the number. `--json` prints `{"ok":true,"data":…}` or
 `{"ok":false,"error":{code,message,next_steps}}`; streaming verbs emit NDJSON
@@ -215,3 +216,10 @@ subprocess you do not control, or write it anywhere it will be read back later.
 In that scope, the `worktree set` and `state set` verbs above are how you
 report progress, and `heartbeat create` with no `--session` arms your own
 wake-up.
+
+## The iOS Simulator
+
+Building an iOS app? The desktop app streams a simulator per worktree, and
+`oximux sim status` is where to start. The `oximux-simulator` guide
+(`oximux skills get oximux-simulator`) covers the loop: install, launch,
+screenshot, tap, check — and the consent step (exit 7) the first time.

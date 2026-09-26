@@ -4,6 +4,7 @@
 //! ([`panel`]) and its live screen ([`screen`]). See
 //! `plans/260924-1433-ios-simulator-panel/`.
 
+pub(crate) mod agent_ops;
 mod annotate;
 pub mod hub;
 pub(crate) mod panel;

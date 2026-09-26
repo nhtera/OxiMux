@@ -12,7 +12,10 @@
 //! An agent that reads a PNG the user asked about should still show it on the
 //! phone; that image is in the conversation because the user put it there.
 //! What is removed is narrower: images produced *by the screen-control server*,
-//! identified by the tool that returned them.
+//! identified by the tool that returned them — and everything a tool call
+//! brought back from the **iOS Simulator's** screen (`oximux sim screenshot` /
+//! `ax`, or a read of a saved screenshot; see [`crate::sim_tools`]). For those
+//! the text goes too: the accessibility tree *is* the screen's text.
 //!
 //! # Why the event path needs to remember something
 //!
@@ -38,14 +41,19 @@ use serde_json::Value;
 /// outlive interleaving from parallel tool calls, not the whole conversation.
 const REMEMBERED_CALLS: usize = 256;
 
+/// What stands in for a simulator capture's text on a paired device.
+pub const SIM_CAPTURE_PLACEHOLDER: &str = "[simulator screen capture — shown on the desktop only]";
+
 /// Tracks which tool calls came from the screen-control server, so their images
-/// can be dropped on the way out.
+/// can be dropped on the way out, and which captured the simulator's screen,
+/// whose text goes as well.
 ///
 /// Deliberately not a `HashSet`: eviction order is what bounds it, and the ids
 /// are consumed in roughly the order they arrive.
 #[derive(Debug, Default)]
 pub struct ScreenshotFilter {
     screen_calls: VecDeque<String>,
+    sim_calls: VecDeque<String>,
 }
 
 impl ScreenshotFilter {
@@ -60,36 +68,53 @@ impl ScreenshotFilter {
     /// exactly this value onward.
     pub fn scrub(&mut self, event: &mut ThreadEvent) -> bool {
         match event {
-            ThreadEvent::ToolCallStarted { id, name, .. } => {
+            ThreadEvent::ToolCallStarted { id, name, input } => {
                 if crate::screen_tools::is_computer_use_tool(name) {
-                    self.remember(id.clone());
+                    remember(&mut self.screen_calls, id.clone());
+                } else if crate::sim_tools::is_simulator_capture(input) {
+                    // The finalized input may arrive after an empty preview
+                    // under the same id; either one decides.
+                    remember(&mut self.sim_calls, id.clone());
                 }
                 false
             }
             ThreadEvent::ToolResultImages { tool_use_id, images } => {
-                if !self.is_screen_call(tool_use_id) || images.is_empty() {
+                if !(self.is_screen_call(tool_use_id) || self.is_sim_call(tool_use_id)) || images.is_empty() {
                     return false;
                 }
                 images.clear();
+                true
+            }
+            ThreadEvent::ToolResult { tool_use_id, content, structured, .. } if self.is_sim_call(tool_use_id) => {
+                *content = SIM_CAPTURE_PLACEHOLDER.to_string();
+                *structured = None;
+                true
+            }
+            ThreadEvent::ToolOutputDelta { id, chunk } if self.is_sim_call(id) && !chunk.is_empty() => {
+                chunk.clear();
                 true
             }
             _ => false,
         }
     }
 
-    fn remember(&mut self, id: String) {
-        if self.screen_calls.contains(&id) {
-            return;
-        }
-        if self.screen_calls.len() == REMEMBERED_CALLS {
-            self.screen_calls.pop_front();
-        }
-        self.screen_calls.push_back(id);
-    }
-
     fn is_screen_call(&self, id: &str) -> bool {
         self.screen_calls.iter().any(|known| known == id)
     }
+
+    fn is_sim_call(&self, id: &str) -> bool {
+        self.sim_calls.iter().any(|known| known == id)
+    }
+}
+
+fn remember(calls: &mut VecDeque<String>, id: String) {
+    if calls.contains(&id) {
+        return;
+    }
+    if calls.len() == REMEMBERED_CALLS {
+        calls.pop_front();
+    }
+    calls.push_back(id);
 }
 
 /// Drop screen-control images from a folded transcript, returning how many
@@ -140,7 +165,8 @@ pub fn scrub_transcript(entries_json: &str) -> (String, usize) {
     }
 }
 
-/// Clear the images on every screen-control tool call reachable from `node`.
+/// Clear the images on every screen-control tool call reachable from `node`,
+/// and everything a simulator capture brought back.
 ///
 /// Recurses for the same reason the frame-budget pass downstream of it does: the
 /// wire shape is the desktop's entry taxonomy, and a redactor that hardcodes
@@ -160,6 +186,31 @@ fn scrub_entry(node: &mut Value, scrubbed: &mut usize) {
             {
                 images.clear();
                 *scrubbed += 1;
+                return;
+            }
+            let is_sim_capture = map.contains_key("name")
+                && map.get("input").is_some_and(crate::sim_tools::is_simulator_capture);
+            if is_sim_capture {
+                let mut changed = false;
+                if let Some(Value::Array(images)) = map.get_mut("images")
+                    && !images.is_empty()
+                {
+                    images.clear();
+                    changed = true;
+                }
+                if let Some(result) = map.get_mut("result")
+                    && result.as_str().is_some_and(|r| r != SIM_CAPTURE_PLACEHOLDER)
+                {
+                    *result = Value::String(SIM_CAPTURE_PLACEHOLDER.into());
+                    changed = true;
+                }
+                if let Some(structured) = map.get_mut("structured")
+                    && !structured.is_null()
+                {
+                    *structured = Value::Null;
+                    changed = true;
+                }
+                *scrubbed += usize::from(changed);
                 return;
             }
             for value in map.values_mut() {
@@ -369,6 +420,68 @@ mod tests {
         let (out, count) = scrub_transcript(&transcript);
         assert_eq!(count, 0);
         assert_eq!(out, transcript, "the user's own attachment stays");
+    }
+
+    fn result(id: &str, content: &str) -> ThreadEvent {
+        ThreadEvent::ToolResult {
+            tool_use_id: id.into(),
+            content: content.into(),
+            is_error: false,
+            structured: Some(json!({"stdout": content})),
+        }
+    }
+
+    #[test]
+    fn a_simulator_capture_loses_its_text_and_images_live() {
+        let mut filter = ScreenshotFilter::new();
+        let ax = ThreadEvent::ToolCallStarted { id: "ax".into(), name: "Bash".into(), input: json!({"command": "oximux sim ax"}) };
+        filter.scrub(&mut ax.clone());
+        let read = ThreadEvent::ToolCallStarted {
+            id: "read".into(),
+            name: "Read".into(),
+            input: json!({"file_path": "/var/folders/T/oximux-sim/screenshot-1.png"}),
+        };
+        filter.scrub(&mut read.clone());
+        filter.scrub(&mut started("tap", "Bash"));
+
+        let mut tree = result("ax", "Button “Pay $120 to Alex”");
+        assert!(filter.scrub(&mut tree));
+        match tree {
+            ThreadEvent::ToolResult { content, structured, .. } => {
+                assert_eq!(content, SIM_CAPTURE_PLACEHOLDER);
+                assert_eq!(structured, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut delta = ThreadEvent::ToolOutputDelta { id: "ax".into(), chunk: "Button".into() };
+        assert!(filter.scrub(&mut delta));
+        let mut shot = images_for("read");
+        assert!(filter.scrub(&mut shot));
+        assert_eq!(images_in(&shot), 0);
+        // Other commands keep their output.
+        let mut other = result("tap", "tapped (10, 20)");
+        assert!(!filter.scrub(&mut other));
+    }
+
+    #[test]
+    fn a_folded_transcript_loses_simulator_captures() {
+        let mut ax = ToolCall::new("a", "Bash", json!({"command": "oximux --json sim ax"}));
+        ax.result = Some("Button “Pay $120 to Alex”".into());
+        ax.structured = Some(json!({"stdout": "Button “Pay $120 to Alex”"}));
+        let mut read = ToolCall::new("r", "Read", json!({"file_path": "/tmp/oximux-sim/s.png"}));
+        read.images = vec![image()];
+        let mut tap = ToolCall::new("t", "Bash", json!({"command": "oximux sim tap --label Pay"}));
+        tap.result = Some("tapped “Pay”".into());
+        let entries = vec![ThreadEntry::ToolCall(ax), ThreadEntry::ToolCall(read), ThreadEntry::ToolCall(tap)];
+        let transcript = serde_json::to_string(&entries).unwrap();
+
+        let (out, count) = scrub_transcript(&transcript);
+        assert_eq!(count, 2);
+        assert!(!out.contains("Pay $120"), "the AX text is gone: {out}");
+        assert!(!out.contains("iVBORw0KGgo="), "the screenshot is gone");
+        assert!(out.contains("tapped “Pay”"), "a tap's own result stays");
+        // Scrubbing is idempotent: a second pass finds nothing left.
+        assert_eq!(scrub_transcript(&out).1, 0);
     }
 
     #[test]

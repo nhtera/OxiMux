@@ -39,6 +39,7 @@ mod annotating;
 mod bezel;
 mod body;
 mod commands;
+mod consent;
 mod header;
 mod toolbar;
 mod stream_row;
@@ -154,7 +155,12 @@ impl SimulatorPanel {
                     cx.notify();
                 }
             }
-            HubEvent::Availability | HubEvent::Devices => cx.notify(),
+            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent => cx.notify(),
+            HubEvent::AgentActivity(udid) => {
+                if self.device(cx).as_ref() == Some(udid) {
+                    cx.notify();
+                }
+            }
             // The phone outline follows the stream's size and orientation.
             HubEvent::Session(udid, SessionEvent::Size { .. } | SessionEvent::Orientation(_)) => {
                 if self.device(cx).as_ref() == Some(udid) {

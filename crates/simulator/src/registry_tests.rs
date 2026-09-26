@@ -452,6 +452,32 @@ fn a_long_hidden_device_is_parked_and_restarts_when_shown() {
     assert_eq!(reg.phase(&u), Phase::Live { generation: g2 });
 }
 
+/// An agent driving a hidden device counts as a viewer: the paused helper
+/// resumes (a paused one captures nothing), nothing parks it, and once the
+/// agent stops it pauses and parks one period later.
+#[test]
+fn an_agent_is_a_viewer_while_it_drives() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    live(&mut reg, &w, &u, "s", now);
+    assert_eq!(kinds(&reg.set_visible(&w, false, now)), ["pause s"]);
+    assert_eq!(kinds(&reg.set_agent_active(&u, true, now)), ["resume s"]);
+    assert!(reg.tick(now + PARK_AFTER * 3).is_empty(), "never parked while driven");
+    let done = now + PARK_AFTER * 3;
+    assert_eq!(kinds(&reg.set_agent_active(&u, false, done)), ["pause s"]);
+    assert!(reg.tick(done + PARK_AFTER - Duration::from_secs(1)).is_empty());
+    assert_eq!(kinds(&reg.tick(done + PARK_AFTER)), ["stop U s"]);
+    // A session that starts while an agent drives is not paused at all.
+    let (w2, u2) = (wt("b"), dev("V"));
+    let g = start_gen(&reg.attach(w2.clone(), u2.clone(), true, now));
+    reg.set_agent_active(&u2, true, now);
+    assert!(reg.session_started(&u2, g, Ok("t")).is_empty(), "not paused under an agent");
+    // Shown in a panel, an agent changes nothing.
+    assert!(reg.set_visible(&w2, true, now).is_empty());
+    assert!(reg.set_agent_active(&u2, false, now).is_empty());
+}
+
 /// A session that starts hidden gets its parking clock from the first tick.
 #[test]
 fn a_hidden_start_parks_one_period_after_the_first_tick() {

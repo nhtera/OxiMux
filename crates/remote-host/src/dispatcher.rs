@@ -22,6 +22,7 @@ mod heartbeats;
 mod pairing_admin;
 mod schedules;
 mod serve;
+mod simulator;
 mod state;
 mod stream;
 mod team;
@@ -161,6 +162,10 @@ pub struct Dispatcher {
     /// instead of resyncing. Always present: it is a bounded in-memory ring, so
     /// a host with no watchers pays a `VecDeque` for it and nothing else.
     state_log: state::StateLog,
+    /// The desktop's iOS Simulator, when the host has one. `None` answers an
+    /// **authorized** caller `Unsupported` (a headless host has no simulator);
+    /// anyone else still gets `Unauthorized` first.
+    simulator: Option<Arc<dyn crate::simulator::SimulatorControl>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -185,6 +190,7 @@ impl Dispatcher {
             coord: None,
             state_events: None,
             state_log: state::StateLog::default(),
+            simulator: None,
             now_secs: system_now_secs,
         }
     }
@@ -286,6 +292,12 @@ impl Dispatcher {
         self.coord = Some(coord);
         let (tx, _) = tokio::sync::broadcast::channel(64);
         self.state_events = Some(tx);
+        self
+    }
+
+    /// Let this dispatcher drive the desktop's iOS Simulator.
+    pub fn with_simulator(mut self, simulator: Arc<dyn crate::simulator::SimulatorControl>) -> Self {
+        self.simulator = Some(simulator);
         self
     }
 

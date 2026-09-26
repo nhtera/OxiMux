@@ -36,6 +36,7 @@ mod pane_session;
 mod project;
 mod remote_device;
 mod settings;
+mod sim_approval;
 mod workspace;
 mod worktree_settings;
 
@@ -48,6 +49,7 @@ pub use pane_session::PaneSessionRepo;
 pub use project::ProjectRepo;
 pub use remote_device::{RemoteDeviceRepo, RemoteDeviceRow, RemoteScope};
 pub use settings::SettingsRepo;
+pub use sim_approval::{SimApproval, SimApprovalRepo};
 pub use workspace::WorkspaceRepo;
 pub use worktree_settings::WorktreeSettingsRepo;
 

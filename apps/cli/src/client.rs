@@ -285,17 +285,34 @@ impl Client {
     pub async fn call_streaming(
         &self,
         req: Request,
+        on_push: impl FnMut(Response),
+    ) -> Result<Response, Failure> {
+        self.call_within(req, self.timeout, on_push).await
+    }
+
+    /// [`call`](Self::call) for a request the host may legitimately take
+    /// longer to answer than `--timeout` allows — an install copies a whole
+    /// app, and a parked simulator takes seconds to wake. Waits at least
+    /// `floor`; a larger `--timeout` still wins.
+    pub async fn call_at_least(&self, req: Request, floor: Duration) -> Result<Response, Failure> {
+        self.call_within(req, self.timeout.max(floor), |_| {}).await
+    }
+
+    async fn call_within(
+        &self,
+        req: Request,
+        timeout: Duration,
         mut on_push: impl FnMut(Response),
     ) -> Result<Response, Failure> {
         let bytes = req.to_bytes().map_err(|e| {
             Failure::new("encode", exit::ERROR, format!("could not encode request: {e}"))
         })?;
-        tokio::time::timeout(self.timeout, self.transport.send(bytes))
+        tokio::time::timeout(timeout, self.transport.send(bytes))
             .await
             .map_err(|_| timed_out("sending to the host"))?
             .map_err(|e| Failure::new("transport", exit::UNREACHABLE, e.to_string()))?;
         loop {
-            let frame = tokio::time::timeout(self.timeout, self.recv_frame())
+            let frame = tokio::time::timeout(timeout, self.recv_frame())
                 .await
                 .map_err(|_| timed_out("waiting for the host's reply"))??;
             if is_push(&frame) {

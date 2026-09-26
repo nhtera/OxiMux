@@ -30,5 +30,5 @@ pub use migrations::{MIGRATIONS, Migration};
 pub use repositories::{
     AgentLastParamsRepo, AgentSessionRepo, DiffReviewNoteRepo, PaneBufferRepo, PaneRelayIdRepo,
     PaneSessionRepo, ProjectRepo, RemoteDeviceRepo, RemoteDeviceRow, RemoteScope, SettingsRepo,
-    WorkspaceRepo, WorktreeSettingsRepo,
+    SimApproval, SimApprovalRepo, WorkspaceRepo, WorktreeSettingsRepo,
 };

@@ -249,6 +249,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "workspace_adoption_and_project_prefs",
         sql: include_str!("../migrations/V030__workspace_adoption_and_project_prefs.sql"),
     },
+    // V031: the iOS Simulator devices the user has let agents control. In the
+    // database, not the settings file, so an agent cannot grant itself one.
+    Migration {
+        version: 31,
+        name: "sim_device_approvals",
+        sql: include_str!("../migrations/V031__sim_device_approvals.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

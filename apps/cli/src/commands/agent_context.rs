@@ -34,6 +34,7 @@ pub fn dump() -> Value {
             "host_unreachable": exit::UNREACHABLE,
             "timeout": exit::TIMEOUT,
             "access_denied": exit::DENIED,
+            "pending_user": exit::PENDING,
         },
         "conventions": {
             "json_flag": "--json prints {\"ok\":true,\"data\":…} or {\"ok\":false,\"error\":{code,message,next_steps}} on stdout; `error.data` is present only when a failure leaves something addressable behind (e.g. session_id on a turn timeout)",

@@ -102,6 +102,7 @@ printf '%s' "$DUMP" | jq -r '
   + "| " + (.exit_codes.host_unreachable | tostring) + " | `host_unreachable` | No host answered. Retrying may help. |\n"
   + "| " + (.exit_codes.timeout | tostring) + " | `timeout` | The host did not reply in time. |\n"
   + "| " + (.exit_codes.access_denied | tostring) + " | `access_denied` | The caller is not allowed to do this. Retrying will not help. |\n"
+  + "| " + (.exit_codes.pending_user | tostring) + " | `pending_user` | Waiting on a person (a `sim` verb before the user allowed agents on the device). Wait, then retry. |\n"
   + "\n"
   + "## Conventions\n"
   + "\n"

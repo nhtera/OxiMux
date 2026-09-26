@@ -16,6 +16,11 @@ pub mod exit {
     pub const UNREACHABLE: u8 = 3;
     pub const TIMEOUT: u8 = 4;
     pub const DENIED: u8 = 5;
+    /// Waiting on a person, not failed: `sim` control verbs before the user
+    /// has answered the consent question. Retry after `sim wait-consent`.
+    /// (7, not 6: `serve` already exits 6 when another host holds the data
+    /// directory.)
+    pub const PENDING: u8 = 7;
 }
 
 /// Drive a running OxiMux host from the command line.
@@ -26,7 +31,7 @@ pub mod exit {
 /// it, not when the agent finishes — watch the session for completion.
 ///
 /// Exit codes: 0 ok · 1 error · 2 usage · 3 host unreachable · 4 timed out ·
-/// 5 access denied.
+/// 5 access denied · 7 waiting for the user (`sim` consent).
 #[derive(Parser, Debug)]
 #[command(name = "oximux", version, about, verbatim_doc_comment)]
 pub struct Cli {
@@ -339,6 +344,25 @@ pub enum Command {
     State {
         #[command(subcommand)]
         command: StateCommand,
+    },
+    /// Drive the iOS Simulator attached to this worktree in the desktop app.
+    ///
+    /// The loop: build for the simulator, `install` and `launch` the app, then
+    /// `screenshot` → act (`tap`, `type`, `swipe`) → `screenshot` to check.
+    /// Coordinates are points, which is what a default screenshot's pixels are.
+    ///
+    /// The first verb that looks at or touches the device asks the user in
+    /// OxiMux and exits 7 at once; run `sim wait-consent`, then retry. The
+    /// answer covers that device from then on.
+    #[command(verbatim_doc_comment)]
+    Sim {
+        /// The worktree whose simulator to use (default: the current
+        /// directory). Ignored for a session-scoped agent, which always uses
+        /// its own.
+        #[arg(long, global = true, value_name = "DIR")]
+        worktree: Option<PathBuf>,
+        #[command(subcommand)]
+        command: SimCommand,
     },
     /// Run this machine as a headless OxiMux host.
     ///
@@ -762,6 +786,122 @@ pub enum WorktreeCommand {
         #[arg(long, value_name = "PHASE")]
         phase: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SimCommand {
+    /// Availability, the attached device, and whether agents may control it.
+    Status,
+    /// Every simulator on this Mac.
+    Devices,
+    /// Attach a simulator to this worktree (booting it if needed): a name or
+    /// udid, or the automatic pick when omitted.
+    Attach { device: Option<String> },
+    /// Detach this worktree's simulator.
+    Detach,
+    /// Wait until the user answers the consent question: exit 0 once allowed,
+    /// 5 if refused, 4 when the wait runs out.
+    WaitConsent {
+        /// Give up after this many seconds (below the usual 120 s limit on an
+        /// agent's shell command).
+        #[arg(long, default_value_t = 90, value_name = "SECS")]
+        max_wait: u64,
+    },
+    /// Save a PNG of the screen and print its path and size. By default one
+    /// pixel is one point, so a position read off the image can be tapped.
+    Screenshot {
+        /// Where to write it (default: a new file under $TMPDIR/oximux-sim/).
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// The device's full resolution instead (its scale is printed).
+        #[arg(long)]
+        full: bool,
+    },
+    /// The accessibility tree: every element's role, label, identifier and
+    /// frame (points).
+    Ax {
+        /// One line per element, without the tree's indentation.
+        #[arg(long)]
+        flat: bool,
+        /// At most this many elements.
+        #[arg(long, default_value_t = 300, value_name = "N")]
+        max: u32,
+    },
+    /// Tap a point (x y, in points from the top-left), or the element with an
+    /// accessibility label or identifier.
+    Tap {
+        x: Option<f64>,
+        y: Option<f64>,
+        /// An accessibility label: exact match first, then a case-insensitive
+        /// substring.
+        #[arg(long, value_name = "TEXT", conflicts_with_all = ["x", "y", "id"])]
+        label: Option<String>,
+        /// An accessibility identifier, exact.
+        #[arg(long, value_name = "AXID", conflicts_with_all = ["x", "y"])]
+        id: Option<String>,
+    },
+    /// Swipe from (x1, y1) to (x2, y2), in points. Starting at the very
+    /// bottom edge is the home gesture.
+    Swipe {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        #[arg(long, default_value_t = 300, value_name = "MS")]
+        duration: u32,
+    },
+    /// Type text into the focused field. Non-ASCII text is pasted.
+    Type {
+        text: String,
+        /// Paste through the device clipboard instead of typing key by key.
+        #[arg(long)]
+        paste: bool,
+    },
+    /// Press a hardware button.
+    Button {
+        #[arg(value_enum)]
+        button: SimButtonArg,
+    },
+    /// Rotate the device.
+    Rotate {
+        #[arg(value_enum)]
+        to: SimOrientationArg,
+    },
+    /// Launch an installed app by bundle id.
+    Launch {
+        bundle_id: String,
+        /// Terminate it first, so it starts fresh.
+        #[arg(long)]
+        relaunch: bool,
+    },
+    /// Open a URL (http, https, or an app's own scheme; not file:).
+    OpenUrl { url: String },
+    /// Install a built .app. It must be inside this worktree or Xcode's
+    /// DerivedData.
+    Install { path: PathBuf },
+    /// Shut the simulator down. One the user booted is refused without
+    /// --force.
+    Shutdown {
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimButtonArg {
+    Home,
+    Lock,
+    Siri,
+    SideButton,
+    AppSwitcher,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimOrientationArg {
+    Portrait,
+    LandscapeLeft,
+    LandscapeRight,
+    UpsideDown,
 }
 
 #[derive(Subcommand, Debug)]

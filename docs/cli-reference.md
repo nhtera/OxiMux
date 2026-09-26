@@ -16,6 +16,7 @@ differs from what is committed.
 | 3 | `host_unreachable` | No host answered. Retrying may help. |
 | 4 | `timeout` | The host did not reply in time. |
 | 5 | `access_denied` | The caller is not allowed to do this. Retrying will not help. |
+| 7 | `pending_user` | Waiting on a person (a `sim` verb before the user allowed agents on the device). Wait, then retry. |
 
 ## Conventions
 
@@ -606,6 +607,145 @@ Print every matching key, then stream changes until Ctrl+C.
 | --- | --- | --- |
 | `--prefix` | yes | Only keys starting with this (default: every key) |
 | `--since` | yes | Resume after this sequence number (from a previous watch's `seq`). Without it the watch starts from the board as it stands now |
+
+### `oximux sim`
+
+Drive the iOS Simulator attached to this worktree in the desktop app.
+
+_No arguments._
+
+#### `oximux sim status`
+
+Availability, the attached device, and whether agents may control it
+
+_No arguments._
+
+#### `oximux sim devices`
+
+Every simulator on this Mac
+
+_No arguments._
+
+#### `oximux sim attach`
+
+Attach a simulator to this worktree (booting it if needed): a name or udid, or the automatic pick when omitted
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<DEVICE>` | yes |  |
+
+#### `oximux sim detach`
+
+Detach this worktree's simulator
+
+_No arguments._
+
+#### `oximux sim wait-consent`
+
+Wait until the user answers the consent question: exit 0 once allowed, 5 if refused, 4 when the wait runs out
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--max-wait` | yes | Give up after this many seconds (below the usual 120 s limit on an agent's shell command) |
+
+#### `oximux sim screenshot`
+
+Save a PNG of the screen and print its path and size. By default one pixel is one point, so a position read off the image can be tapped
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--out` | yes | Where to write it (default: a new file under $TMPDIR/oximux-sim/) |
+| `--full` | no | The device's full resolution instead (its scale is printed) |
+
+#### `oximux sim ax`
+
+The accessibility tree: every element's role, label, identifier and frame (points)
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--flat` | no | One line per element, without the tree's indentation |
+| `--max` | yes | At most this many elements |
+
+#### `oximux sim tap`
+
+Tap a point (x y, in points from the top-left), or the element with an accessibility label or identifier
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<X>` | yes |  |
+| `<Y>` | yes |  |
+| `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring |
+| `--id` | yes | An accessibility identifier, exact |
+
+#### `oximux sim swipe`
+
+Swipe from (x1, y1) to (x2, y2), in points. Starting at the very bottom edge is the home gesture
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<X1>` | yes |  |
+| `<Y1>` | yes |  |
+| `<X2>` | yes |  |
+| `<Y2>` | yes |  |
+| `--duration` | yes |  |
+
+#### `oximux sim type`
+
+Type text into the focused field. Non-ASCII text is pasted
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<TEXT>` | yes |  |
+| `--paste` | no | Paste through the device clipboard instead of typing key by key |
+
+#### `oximux sim button`
+
+Press a hardware button
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<BUTTON>` | yes |  |
+
+#### `oximux sim rotate`
+
+Rotate the device
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<TO>` | yes |  |
+
+#### `oximux sim launch`
+
+Launch an installed app by bundle id
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<BUNDLE_ID>` | yes |  |
+| `--relaunch` | no | Terminate it first, so it starts fresh |
+
+#### `oximux sim open-url`
+
+Open a URL (http, https, or an app's own scheme; not file:)
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<URL>` | yes |  |
+
+#### `oximux sim install`
+
+Install a built .app. It must be inside this worktree or Xcode's DerivedData
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<PATH>` | yes |  |
+
+#### `oximux sim shutdown`
+
+Shut the simulator down. One the user booted is refused without --force
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--force` | no |  |
 
 ### `oximux serve`
 

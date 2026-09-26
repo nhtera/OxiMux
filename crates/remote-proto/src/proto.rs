@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 // them so callers reach them as `proto::RegisterReq` etc. and `proto::tests`
 // sees them via `super`.
 pub use crate::messages::*;
+pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 
 /// Bumped whenever the wire schema changes. v1: initial remote-control surface
 /// (handshake + session list/info + prompt/resolve/steer/cancel + event
@@ -129,12 +130,19 @@ pub use crate::messages::*;
 /// a narrower authorization than its payload alone implies: see
 /// [`Request::CreateWorktreeV2`].
 ///
+/// v25: appended the **iOS Simulator** surface (`Simulator`, answered by the
+/// `Simulator` reply): the `oximux sim …` verbs an agent uses to see and drive
+/// the simulator attached to its worktree in the desktop app. One request and
+/// one reply carry the whole verb set as enums of their own
+/// ([`crate::simulator`]), so later verbs append there instead of here. Only
+/// local callers are served; a paired device gets `Unauthorized`.
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -201,6 +209,13 @@ pub const SCHEDULE_CRON_MIN_VERSION: u32 = 23;
 /// [`RpcError::BadRequest`] with "undecodable request frame", a message about
 /// malformed bytes for what is really a version problem.
 pub const CREATE_WORKTREE_BASE_MIN_VERSION: u32 = 24;
+
+/// The oldest host that serves the simulator verbs ([`Request::Simulator`]).
+///
+/// Read by the **client**, like [`CREATE_WORKTREE_BASE_MIN_VERSION`]: an older
+/// host cannot decode the ordinal and would answer "undecodable request frame"
+/// — a complaint about bytes for what is really a version problem.
+pub const SIMULATOR_MIN_VERSION: u32 = 25;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -811,6 +826,16 @@ pub enum Request {
         slug: String,
         base: CreateBaseWire,
     },
+
+    // ---- v25: the iOS Simulator ----
+    /// One `oximux sim …` verb against the simulator attached to a worktree.
+    /// Local callers only: a paired device is refused with
+    /// [`RpcError::Unauthorized`], and a host without a simulator (headless
+    /// `oximux serve`) answers an authorized caller [`RpcError::Unsupported`].
+    /// A control verb additionally needs the user's per-device consent, which
+    /// the reply reports as [`SimErrorWire::ConsentPending`] rather than
+    /// blocking on it.
+    Simulator(SimRequestWire),
 }
 
 /// Host → client.
@@ -1036,6 +1061,10 @@ pub enum Response {
     /// Reply to [`Request::CreateScheduleV2`] — the stored row, so the client
     /// can show the resolved next fire without a second round trip.
     ScheduleCreatedV2(ScheduleV2Wire),
+
+    // ---- v25: the iOS Simulator ----
+    /// Reply to [`Request::Simulator`].
+    Simulator(Result<SimReplyWire, SimErrorWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

@@ -12,7 +12,10 @@ use std::time::Instant;
 
 use gpui::{ClipboardItem, Context, Image, ImageFormat};
 use oximux_simulator::record::{self, FINALIZE_GRACE, MAX_LENGTH, Recording};
-use oximux_simulator::{Button, DeviceId, simctl};
+use oximux_simulator::protocol::{Command, KeyPhase};
+use oximux_simulator::runner::SystemRunner;
+use oximux_simulator::session::StreamSession;
+use oximux_simulator::{Button, DeviceId, keyboard, simctl};
 
 use super::{HubEvent, SIMCTL_TIMEOUT, SimulatorHub};
 
@@ -300,13 +303,35 @@ impl SimulatorHub {
         }
     }
 
-    pub(super) fn xcode_ok(&self) -> bool {
+    pub(crate) fn xcode_ok(&self) -> bool {
         self.watch_gate().xcode_ok
     }
 }
 
+/// Paste `text` into `udid` now (blocking: call from a background executor):
+/// onto the device clipboard with `simctl pbcopy`, then a HID ⌘V — the route
+/// that works for any Unicode. If `pbcopy` fails, ASCII is typed out instead.
+/// Holds `lock` throughout, so a second paste cannot overwrite the clipboard
+/// before the first chord lands.
+pub(crate) fn paste_now(session: &StreamSession, udid: &DeviceId, text: &str, lock: &PasteLock) -> Result<(), String> {
+    let _turn = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let keys = match simctl::pbcopy(&SystemRunner, udid.as_str(), text, SIMCTL_TIMEOUT) {
+        Ok(()) => keyboard::paste_chord(),
+        Err(e) if !keyboard::needs_paste(text) => {
+            tracing::debug!(%udid, "simulator pbcopy failed ({e}); typing instead");
+            keyboard::text_to_key_events(text).unwrap_or_default()
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    for key in keys {
+        let phase = if key.down { KeyPhase::Down } else { KeyPhase::Up };
+        session.send(&Command::Key { phase, usage: key.usage }).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Serializes pastes so two quick ⌘V land in order.
-pub(super) type PasteLock = Arc<std::sync::Mutex<()>>;
+pub(crate) type PasteLock = Arc<std::sync::Mutex<()>>;
 
 #[cfg(test)]
 mod tests {

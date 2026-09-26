@@ -143,14 +143,19 @@ fn serve_host_with_registry(
     for id in ["sess-1", "sess-2"] {
         registry.register(id.into(), Arc::new(StubConnection::default()));
     }
-    let dispatcher = Arc::new(
-        Dispatcher::new(registry.clone(), Arc::new(AuthStore::new()))
-            .with_launcher(Arc::new(StubLauncher {
-                registry: registry.clone(),
-                counter: AtomicU32::new(0),
-            }))
-            .with_worktrees(Arc::new(StubWorktrees)),
-    );
+    let dispatcher = Dispatcher::new(registry.clone(), Arc::new(AuthStore::new()))
+        .with_launcher(Arc::new(StubLauncher {
+            registry: registry.clone(),
+            counter: AtomicU32::new(0),
+        }))
+        .with_worktrees(Arc::new(StubWorktrees));
+    (serve_dispatcher(rt, runtime_dir, dispatcher), registry)
+}
+
+/// Serve `dispatcher` on an owner-only socket at `runtime_dir`; returns the
+/// per-session secret granted to `sess-1`.
+fn serve_dispatcher(rt: &tokio::runtime::Runtime, runtime_dir: &Path, dispatcher: Dispatcher) -> String {
+    let dispatcher = Arc::new(dispatcher);
     let listener = {
         let _guard = rt.enter();
         LocalControlListener::bind(runtime_dir, &generate_token()).unwrap()
@@ -185,7 +190,130 @@ fn serve_host_with_registry(
             });
         }
     });
-    (agent_secret, registry)
+    agent_secret
+}
+
+/// A simulator that asks for consent on every control verb until
+/// `allowed`, then answers each with something plausible — enough for the
+/// CLI's half of the loop: exit codes, the screenshot file, the worktree it
+/// sends.
+struct StubSimulator {
+    allowed: std::sync::atomic::AtomicBool,
+    worktrees: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl oximux_remote_host::SimulatorControl for StubSimulator {
+    async fn run(
+        &self,
+        worktree: &str,
+        cmd: oximux_remote_proto::simulator::SimCmdWire,
+    ) -> Result<oximux_remote_proto::simulator::SimReplyWire, oximux_remote_proto::simulator::SimErrorWire> {
+        use oximux_remote_proto::simulator::*;
+        self.worktrees.lock().unwrap().push(worktree.to_string());
+        let allowed = self.allowed.load(Ordering::SeqCst);
+        if cmd.is_control() && !allowed {
+            return Err(SimErrorWire::ConsentPending);
+        }
+        Ok(match cmd {
+            SimCmdWire::Status => SimReplyWire::Status(SimStatusWire {
+                available: true,
+                reason: None,
+                xcode: Some("26.0".into()),
+                worktree: worktree.into(),
+                device: Some(SimDeviceWire {
+                    udid: "81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into(),
+                    name: "iPhone 17 Pro".into(),
+                    runtime: "iOS 26.0".into(),
+                    state: "Booted".into(),
+                }),
+                streaming: true,
+                consent: if allowed { SimConsentWire::Allowed } else { SimConsentWire::Pending },
+                agent_control: true,
+            }),
+            SimCmdWire::Screenshot { .. } => {
+                let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+                png.extend_from_slice(&402u32.to_be_bytes());
+                png.extend_from_slice(&874u32.to_be_bytes());
+                SimReplyWire::Screenshot { png, width: 402, height: 874, scale: 1.0 }
+            }
+            SimCmdWire::Install { path } if !path.starts_with(worktree) => return Err(SimErrorWire::PathOutsideWorktree),
+            _ => SimReplyWire::Done,
+        })
+    }
+}
+
+/// `oximux sim` end to end against a stub simulator: consent is exit 7 and
+/// names the way out, `wait-consent` returns once allowed, a screenshot is
+/// written by the CLI, the worktree sent is the one asked for — and a host
+/// without a simulator says so plainly.
+#[test]
+fn sim_verbs_against_a_live_host() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let sim = Arc::new(StubSimulator { allowed: Default::default(), worktrees: Default::default() });
+    let registry = Arc::new(SessionRegistry::new());
+    let dispatcher = Dispatcher::new(registry, Arc::new(AuthStore::new())).with_simulator(sim.clone());
+    serve_dispatcher(&rt, &runtime_dir, dispatcher);
+    let worktree = dir.path().join("app");
+    std::fs::create_dir_all(&worktree).unwrap();
+    // Canonical, as the process's own cwd reads back (`/private/var/…`).
+    let worktree = worktree.canonicalize().unwrap();
+    let wt = worktree.to_str().unwrap();
+
+    // Consent pending: exit 7, a stable code, and the next step.
+    let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "tap", "10", "20"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(7), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "consent-pending");
+    assert!(v["error"]["next_steps"].to_string().contains("wait-consent"));
+
+    // Status reports it without asking again, and names the worktree.
+    let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "status"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v = json_stdout(&out);
+    assert_eq!(v["data"]["consent"], "pending");
+    assert_eq!(v["data"]["device"]["name"], "iPhone 17 Pro");
+
+    // The user allows it; `wait-consent` returns.
+    sim.allowed.store(true, Ordering::SeqCst);
+    let out = bin(&runtime_dir).args(["sim", "--worktree", wt, "wait-consent", "--max-wait", "5"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    // A screenshot is written by the CLI, where it was asked to go.
+    let shot = dir.path().join("shot.png");
+    let out = bin(&runtime_dir)
+        .args(["--json", "sim", "--worktree", wt, "screenshot", "--out", shot.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v = json_stdout(&out);
+    assert_eq!((v["data"]["width"].as_u64(), v["data"]["scale"].as_f64()), (Some(402), Some(1.0)));
+    assert!(std::fs::read(&shot).unwrap().starts_with(b"\x89PNG"));
+
+    // A relative install path is resolved where the caller stands, not on
+    // the host.
+    let out = bin(&runtime_dir)
+        .current_dir(&worktree)
+        .args(["sim", "--worktree", wt, "install", "Build/App.app"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "install", "/elsewhere/App.app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(json_stdout(&out)["error"]["code"], "path-outside-worktree");
+
+    assert!(sim.worktrees.lock().unwrap().iter().all(|w| w == wt), "{:?}", sim.worktrees.lock().unwrap());
+
+    // No simulator on this host (headless `serve`): said plainly, exit 1.
+    let bare_dir = dir.path().join("bare");
+    serve_host(&rt, &bare_dir);
+    let out = bin(&bare_dir).args(["--json", "sim", "--worktree", wt, "status"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "unsupported");
+    assert!(v["error"]["message"].as_str().unwrap().contains("iOS Simulator"));
 }
 
 /// `status` and `ls --json` against a live host: exit 0, honest counts —

@@ -89,6 +89,12 @@ impl AppState {
         RemoteDeviceRepo::new(self.db.clone())
     }
 
+    /// The iOS Simulator devices the user let agents control. Built on demand
+    /// like [`Self::remote_device_repo`]: a repo is just a `Db` handle.
+    pub fn sim_approval_repo(&self) -> oximux_storage::SimApprovalRepo {
+        oximux_storage::SimApprovalRepo::new(self.db.clone())
+    }
+
     /// The scheduled-run store, built on demand for the same reason as
     /// [`Self::remote_device_repo`]: it is taken once at startup and is just a
     /// handle on the shared connection.

@@ -44,6 +44,11 @@ pub const GUIDES: &[Guide] = &[
         summary: "Run several agents on one task with roles, worktrees, and the state blackboard",
         text: include_str!("../../../../docs/skills/oximux-team.md"),
     },
+    Guide {
+        topic: "oximux-simulator",
+        summary: "Build, install, launch, see and drive the iOS Simulator attached to your worktree",
+        text: include_str!("../../../../docs/skills/oximux-simulator.md"),
+    },
 ];
 
 /// Where a guide goes for one agent, or `None` if that agent has no home to

@@ -12,7 +12,7 @@ use oximux_simulator::child_ledger::{self, Ledger};
 use oximux_simulator::registry::Registry;
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::DeviceId;
-use oximux_storage::SettingsRepo;
+use oximux_storage::{SettingsRepo, SimApprovalRepo};
 
 use super::{HubEvent, SimulatorHub, SimulatorService, TICK, hub};
 use crate::app_settings::sim_state_keys;
@@ -23,7 +23,7 @@ pub(crate) fn simulator_dir() -> PathBuf {
 
 /// Create the hub, reap a previous run's orphans in the background, and start
 /// the idle-shutdown tick and the (gated) device watcher. Call once at startup.
-pub fn install(cx: &mut App, repo: SettingsRepo) {
+pub fn install(cx: &mut App, repo: SettingsRepo, approvals: SimApprovalRepo) {
     let ledger = Ledger::open(simulator_dir().join("children.json"))
         .map(Arc::new)
         .inspect_err(|e| tracing::warn!("simulator child ledger unavailable: {e}"))
@@ -65,6 +65,7 @@ pub fn install(cx: &mut App, repo: SettingsRepo) {
         recording_starts: Default::default(),
         simctl: None,
         paste_lock: Default::default(),
+        agent: super::agent::AgentState::load(Some(approvals)),
     });
     cx.set_global(SimulatorService(hub.clone()));
     if feature_used {
@@ -151,6 +152,7 @@ fn spawn_tick(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 let effects = hub.registry.tick(Instant::now());
                 hub.run(effects, cx);
                 hub.reap_recordings(cx);
+                hub.expire_consent(cx);
             });
             if alive.is_err() {
                 return;

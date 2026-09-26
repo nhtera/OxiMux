@@ -366,6 +366,22 @@ impl AuthStore {
         }
     }
 
+    /// May this caller drive the desktop's iOS Simulator (`oximux sim …`)?
+    ///
+    /// **Local callers only**, at either scope. The simulator is a device on
+    /// this machine that an agent working here builds and tests against, which
+    /// is why a session-confined agent is admitted: the handler pins it to its
+    /// own session's worktree, so it reaches the one device its own work
+    /// uses and no other. A paired phone is refused outright, at every tier:
+    /// driving a device across the network is not something anyone asked for,
+    /// and its screenshots would leave the machine.
+    ///
+    /// This is only the first gate. Every control verb also needs the user's
+    /// consent for that device, which the desktop asks for and records.
+    pub fn may_control_simulator(&self, peer: &Peer) -> bool {
+        matches!(peer.kind(), PeerKind::Local(_))
+    }
+
     /// May this caller write the coordination blackboard? Same reach as
     /// [`may_read_state`](Self::may_read_state), minus the read-only tier: a
     /// device that may only watch must not be able to steer agents by editing

@@ -20,3 +20,8 @@ pub mod redact;
 /// The screen-control MCP server's tool-naming contract — what `redact` matches
 /// on. Separated from the driver for the same reason as `redact` itself.
 pub mod screen_tools;
+
+/// Recognising a tool call that captured the iOS Simulator's screen
+/// (`oximux sim screenshot|ax`, or a read of a saved screenshot) — the other
+/// thing `redact` removes.
+pub mod sim_tools;

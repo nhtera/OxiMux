@@ -582,6 +582,16 @@ impl Dispatcher {
             }
             return self.send(transport, response).await;
         }
+        // The simulator round-trips to the desktop's UI thread and waits on
+        // the device (a screenshot, an install), so it is awaited here like
+        // `CreateSession`. Its handler applies the simulator gate.
+        if let Request::Simulator(req) = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.simulator(&peer, req).await;
+            return self.send(transport, response).await;
+        }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it
         // `spawn_blocking`s the decode) and is awaited here rather than in the
         // sync `dispatch`. Gated on the authenticated connection alone — it names

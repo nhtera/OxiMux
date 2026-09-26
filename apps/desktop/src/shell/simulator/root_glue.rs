@@ -9,6 +9,9 @@
 use gpui::{AppContext as _, Context, Entity, InteractiveElement, Subscription, Window, px};
 use oximux_settings::{Density, Theme, Typography};
 
+use std::path::Path;
+
+use super::agent_ops::same_worktree;
 use super::hub::NoticeKind;
 use super::panel::{Outcome, PanelEvent, RootRequest, SimCommand, SimulatorPanel};
 use super::widths;
@@ -16,10 +19,13 @@ use crate::actions::{
     SimAnnotate, SimDetach, SimHome, SimLock, SimOpenLogs, SimRotateCcw, SimRotateCw, SimScreenshot, SimShutdown,
     SimToggleKeyboard, SimToggleRecord,
 };
-use crate::shell::chrome::toast::ToastKind;
+use crate::shell::chrome::toast::{ToastAction, ToastKind};
 use crate::shell::right_sidebar::tab::RightTab;
 use crate::shell::workspace::focus_follow::ActiveWorktreeChanged;
 use crate::workspace_root::WorkspaceRoot;
+
+/// How long a consent toast's Review waits for its worktree switch to land.
+const REVEAL_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) struct RootSimulator {
     panel: Option<Entity<SimulatorPanel>>,
@@ -28,6 +34,10 @@ pub(crate) struct RootSimulator {
     /// The one-time width bump on first select has happened.
     bumped: bool,
     maximized: bool,
+    /// Open the Simulator tab once this worktree is active and its project's
+    /// sidebar is in place (a first visit builds it in the background), unless
+    /// the moment passes first.
+    reveal_for: Option<(std::path::PathBuf, std::time::Instant)>,
     _follow: Option<Subscription>,
     _notices: Option<Subscription>,
 }
@@ -54,7 +64,7 @@ impl RootSimulator {
                 }
             })
         });
-        Self { panel, visible: false, bumped: false, maximized: false, _follow: None, _notices: notices }
+        Self { panel, visible: false, bumped: false, maximized: false, reveal_for: None, _follow: None, _notices: notices }
     }
 
     /// The panel, for handing to sidebars (`None` hides the tab).
@@ -103,6 +113,7 @@ impl WorkspaceRoot {
     pub(crate) fn sync_simulator_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.simulator.panel.clone() else { return };
         let Some(rs) = self.right_sidebar.clone() else { return };
+        self.apply_pending_reveal(&rs, cx);
         let visible = {
             let rs = rs.read(cx);
             rs.open && rs.active_tab == RightTab::Simulator
@@ -161,6 +172,89 @@ impl WorkspaceRoot {
         rs.update(cx, |sidebar, cx| sidebar.set_fill(fill, cx));
         panel.update(cx, |panel, cx| panel.set_maximized(fill, cx));
         cx.notify();
+    }
+}
+
+impl WorkspaceRoot {
+    /// An agent in `worktree` asked to control `device`. Ask where that
+    /// worktree is: the panel's banner when it is this window's active
+    /// worktree (opening the tab, if agents may open it), else a toast whose
+    /// Review switches there. Never over another worktree's panel.
+    pub(crate) fn ask_simulator_consent(
+        &mut self,
+        worktree: &Path,
+        label: &str,
+        device: &str,
+        (project_id, workspace_id): (String, String),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_worktree.as_deref().is_some_and(|a| same_worktree(a, worktree));
+        if active && super::panel::settings(cx).auto_open {
+            self.select_simulator_tab(window, cx);
+            return;
+        }
+        let (root, handle) = (cx.weak_entity(), window.window_handle());
+        let path = worktree.to_string_lossy().into_owned();
+        let review = ToastAction::new("Review", move |cx| {
+            let (root, path, project_id, workspace_id) = (root.clone(), path.clone(), project_id.clone(), workspace_id.clone());
+            // Deferred: this runs inside the toast layer's update, and a
+            // workspace switch may toast.
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = root.update(cx, |root, cx| {
+                        let here = root.active_worktree.as_deref().is_some_and(|a| same_worktree(a, Path::new(&path)));
+                        if here {
+                            root.select_simulator_tab(window, cx);
+                        } else {
+                            // The tab opens once the switch lands (see
+                            // `apply_pending_reveal`).
+                            root.simulator.reveal_for = Some((path.clone().into(), std::time::Instant::now()));
+                            root.activate_workspace_from_jump(workspace_id, project_id, path, window, cx);
+                            cx.notify();
+                        }
+                    });
+                });
+            });
+        });
+        let text = format!("An agent in {label} wants to control {device}.");
+        self.toast_layer.update(cx, |layer, cx| layer.push_with_actions(ToastKind::Info, text, vec![review], cx));
+    }
+
+    /// Open the Simulator tab for a worktree switched to from a consent
+    /// toast, once the switch has landed: the worktree is active and the
+    /// sidebar on screen is its project's. Deferred, as this runs in render.
+    fn apply_pending_reveal(&mut self, rs: &Entity<crate::shell::right_sidebar::RightSidebar>, cx: &mut Context<Self>) {
+        let Some((want, since)) = self.simulator.reveal_for.clone() else { return };
+        if since.elapsed() > REVEAL_WITHIN {
+            self.simulator.reveal_for = None;
+            return;
+        }
+        let here = self.active_worktree.as_deref().is_some_and(|a| same_worktree(a, &want));
+        let ready = self
+            .active_project
+            .as_ref()
+            .and_then(|p| self.right_sidebar_by_project.get(&p.id))
+            .is_some_and(|built| built.entity_id() == rs.entity_id());
+        if here && ready {
+            self.simulator.reveal_for = None;
+            let rs = rs.clone();
+            cx.defer(move |cx| {
+                rs.update(cx, |sidebar, cx| {
+                    sidebar.open = true;
+                    sidebar.select_tab(RightTab::Simulator, cx);
+                });
+            });
+        }
+    }
+
+    /// An agent attached a device for `worktree`: show it when the user is
+    /// looking at that worktree and lets agents open the panel.
+    pub(crate) fn reveal_simulator_for(&mut self, worktree: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.active_worktree.as_deref().is_some_and(|a| same_worktree(a, worktree));
+        if active && super::panel::settings(cx).auto_open {
+            self.select_simulator_tab(window, cx);
+        }
     }
 }
 

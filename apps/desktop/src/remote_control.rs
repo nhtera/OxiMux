@@ -18,6 +18,7 @@ pub mod project_provider;
 pub mod worktree_service;
 pub mod rewind_bridge;
 pub mod session_catalog;
+pub mod sim_bridge;
 pub mod relay_terminals;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -217,6 +218,9 @@ pub struct RemoteControl {
     /// The desktop's rewind path, when one is installed. `None` answers
     /// `RewindSession` with `Unauthorized`, as `launcher` does.
     rewinder: Option<Arc<dyn RewindService>>,
+    /// The desktop's iOS Simulator (`oximux sim …`), when installed. `None`
+    /// answers an authorized local caller `Unsupported`.
+    simulator: Option<Arc<dyn oximux_remote_host::SimulatorControl>>,
     /// The desktop's schedule store, when one is installed. `None` answers the
     /// schedule RPCs with `Unauthorized`, as `launcher` does — whether this
     /// desktop keeps schedules is not a fact an unauthorized client should be able
@@ -317,6 +321,7 @@ impl RemoteControl {
             terminals: None,
             launcher: None,
             rewinder: None,
+            simulator: None,
             schedules: None,
             teams: None,
             coord: None,
@@ -358,6 +363,11 @@ impl RemoteControl {
     /// Install the rewind service the host serves. Called once at boot.
     pub fn set_rewinder(&mut self, rewinder: Arc<dyn RewindService>) {
         self.rewinder = Some(rewinder);
+    }
+
+    /// Install the simulator the host serves. Called once at boot.
+    pub fn set_simulator(&mut self, simulator: Arc<dyn oximux_remote_host::SimulatorControl>) {
+        self.simulator = Some(simulator);
     }
 
     /// Install the schedule store the host serves. Called once at boot with the
@@ -520,6 +530,9 @@ impl RemoteControl {
         }
         if let Some(rewinder) = &self.rewinder {
             dispatcher = dispatcher.with_rewinder(Arc::clone(rewinder));
+        }
+        if let Some(simulator) = &self.simulator {
+            dispatcher = dispatcher.with_simulator(Arc::clone(simulator));
         }
         if let Some(schedules) = &self.schedules {
             dispatcher = dispatcher.with_schedule_store(Arc::clone(schedules));

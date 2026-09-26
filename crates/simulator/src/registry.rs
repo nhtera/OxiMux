@@ -148,6 +148,9 @@ struct Device<S> {
     /// When the helper was paused, for parking; filled by the next
     /// [`Registry::tick`] when the pause had no clock at hand.
     hidden_since: Option<Instant>,
+    /// An agent is driving it: it counts as a viewer, so the helper runs
+    /// (a paused helper captures nothing, not even the screen's size).
+    agent: bool,
 }
 
 impl<S> Device<S> {
@@ -163,6 +166,7 @@ impl<S> Device<S> {
             restarts: 0,
             paused: false,
             hidden_since: None,
+            agent: false,
         }
     }
 }
@@ -334,6 +338,16 @@ impl<S: Clone> Registry<S> {
             device.phase = Phase::Starting { generation };
             return vec![Effect::StartSession { udid, generation }];
         }
+        pause_if_hidden(device, Some(now)).into_iter().collect()
+    }
+
+    /// An agent started or stopped driving `udid`. While it drives, the
+    /// device counts as seen: a paused helper resumes and nothing parks it.
+    /// Once it stops, a device no panel shows pauses again and parks
+    /// [`PARK_AFTER`] later, like any hidden device.
+    pub fn set_agent_active(&mut self, udid: &DeviceId, active: bool, now: Instant) -> Vec<Effect<S>> {
+        let Some(device) = self.devices.get_mut(udid) else { return Vec::new() };
+        device.agent = active;
         pause_if_hidden(device, Some(now)).into_iter().collect()
     }
 
@@ -584,7 +598,7 @@ fn start_or_boot<S>(device: &mut Device<S>, udid: &DeviceId, booted: bool, gener
 /// `now` starts the parking clock (`None`: the next tick starts it).
 fn pause_if_hidden<S: Clone>(device: &mut Device<S>, now: Option<Instant>) -> Option<Effect<S>> {
     let session = device.session.clone()?;
-    let hidden = device.visible.is_empty();
+    let hidden = device.visible.is_empty() && !device.agent;
     if hidden == device.paused {
         return None;
     }
