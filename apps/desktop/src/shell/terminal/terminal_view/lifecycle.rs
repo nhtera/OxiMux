@@ -103,6 +103,8 @@ impl TerminalView {
         .detach();
         cx.on_blur(&focus_handle, window, |view, _, cx| {
             view.focused = false;
+            view.ime_typed.reset();
+            view.clear_ime_marked(cx);
             cx.notify();
         })
         .detach();
@@ -153,6 +155,7 @@ impl TerminalView {
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
             ime_marked: None,
+            ime_typed: Default::default(),
             selecting: None,
             opener: None,
             hovered_link: None,
@@ -365,6 +368,8 @@ impl TerminalView {
         .detach();
         cx.on_blur(&focus_handle, window, |view, _, cx| {
             view.focused = false;
+            view.ime_typed.reset();
+            view.clear_ime_marked(cx);
             cx.notify();
         })
         .detach();
@@ -407,6 +412,7 @@ impl TerminalView {
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
             ime_marked: None,
+            ime_typed: Default::default(),
             selecting: None,
             opener: None,
             hovered_link: None,

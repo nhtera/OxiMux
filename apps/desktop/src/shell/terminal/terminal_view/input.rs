@@ -849,6 +849,7 @@ impl TerminalView {
                     if self.copy_selection(cx) {
                         return;
                     }
+                    self.ime_typed.reset();
                     self.send_bytes(b"\x03", cx);
                     return;
                 }
@@ -911,6 +912,13 @@ impl TerminalView {
         // those propagating so app-level bindings still see them.
         if bytes.is_empty() {
             return;
+        }
+        // A key the input method left alone: Backspace takes back its last
+        // letter; anything else moves the caret away from what it typed.
+        if bytes == b"\x7f" {
+            self.ime_typed.backspace();
+        } else {
+            self.ime_typed.reset();
         }
         self.send_bytes(&bytes, cx);
         // Claim the keystroke. GPUI's macOS window reads a *propagating* key
@@ -1030,6 +1038,16 @@ impl TerminalView {
         self.clear_ime_marked(cx);
         if !text.is_empty() {
             self.send_bytes(text.as_bytes(), cx);
+            self.ime_typed.committed(text);
+        }
+    }
+
+    /// The input method replaces `range` of its document: erase in the shell
+    /// the committed letters it covers (Telex rewriting `o` as `ô`).
+    pub(super) fn rewind_ime(&mut self, range: Option<&std::ops::Range<usize>>, cx: &mut Context<Self>) {
+        let erased = self.ime_typed.rewind(range);
+        if erased > 0 {
+            self.send_bytes(&b"\x7f".repeat(erased), cx);
         }
     }
 
@@ -1040,6 +1058,7 @@ impl TerminalView {
     /// when a terminal is the focused pane.
     pub(crate) fn insert_dictation_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !text.is_empty() {
+            self.ime_typed.reset();
             self.send_bytes(text.as_bytes(), cx);
         }
     }
@@ -1104,6 +1123,7 @@ impl TerminalView {
         if text.is_empty() {
             return;
         }
+        self.ime_typed.reset();
         // Security: drop every ESC byte from the clipboard payload before
         // it hits the PTY. Two attacks this defeats:
         //

@@ -42,8 +42,12 @@ impl Render for TerminalView {
         // through silently in the hidden case — no `if` gating in the hot
         // path. Pane-focus also drives the inactive FG dim
         // (`terminal_row::UNFOCUSED_FG_ALPHA`).
+        //   - Focused + composing → hidden: the caret is drawn after the
+        //                           marked text instead (`paint_ime_preedit`),
+        //                           where the next letter goes. At the shell's
+        //                           caret it sat at the START of the syllable.
         let pane_focused = self.focus_handle.is_focused(window);
-        let cursor_visible = !pane_focused || self.cursor_visible;
+        let cursor_visible = !pane_focused || (self.ime_marked.is_none() && self.cursor_visible);
         let cursor = if cursor_visible {
             (
                 self.snapshot.cursor.0 as usize,
@@ -190,6 +194,17 @@ impl Render for TerminalView {
         let view_entity = cx.entity();
         let input_focus = self.focus_handle.clone();
         let ime_marked = self.ime_marked.clone();
+        // The IME anchors at the shell's real caret, NOT `paint_params.cursor`:
+        // that one is swapped for an off-grid sentinel on every blink-off
+        // phase, which used to blank the preedit overlay and the candidate
+        // window's anchor twice a second mid-composition. Visible only with
+        // an input method that holds a whole syllable as marked text across
+        // several blink ticks (macOS Vietnamese "Simple Telex" does); plain
+        // typing forces the cursor on via `send_bytes`, so it never showed.
+        // `None` only when the caret is scrolled out of the viewport (the
+        // snapshot's `u16::MAX` sentinel) — no on-screen anchor exists then.
+        let (crow, ccol) = self.snapshot.cursor;
+        let ime_cell = (crow != u16::MAX).then_some((crow as usize, ccol as usize));
         let grid_canvas = canvas(
             // Prepaint: no per-paint state to capture; return unit.
             |_bounds, _window, _cx| (),
@@ -207,22 +222,10 @@ impl Render for TerminalView {
                     // repaint on its own.
                     window.refresh();
                 }
-                // Cursor cell bounds in window coords, for IME placement and
-                // the preedit overlay. `(MAX, MAX)` means the cursor is
-                // suppressed (off-blink) — no anchor then.
-                let (crow, ccol) = paint_params.cursor;
-                let cursor_bounds = if crow == usize::MAX || ccol == usize::MAX {
-                    None
-                } else {
-                    let cw = metrics.cell_width;
-                    let lh = metrics.line_height;
-                    let x = f32::from(bounds.origin.x) + paint_params.pad + ccol as f32 * cw;
-                    let y = f32::from(bounds.origin.y) + paint_params.pad + crow as f32 * lh;
-                    Some(Bounds {
-                        origin: point(px(x), px(y)),
-                        size: size(px(cw), px(lh)),
-                    })
-                };
+                // Caret cell bounds in window coords, for IME placement and
+                // the preedit overlay. Blink-independent (see `ime_cell`).
+                let cursor_bounds =
+                    ime_cell.map(|cell| cell_bounds(cell, bounds, &metrics, paint_params.pad));
                 // Register the platform IME bridge. `handle_input` is a no-op
                 // unless this view holds focus, so only the focused terminal
                 // claims text input. This both enables multi-keystroke
@@ -289,6 +292,8 @@ impl Render for TerminalView {
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
+                    // A click is where the input method starts over.
+                    this.ime_typed.reset();
                     // Cmd-click on a link opens it instead of selecting/reporting.
                     if this.try_open_link(ev, window, cx) {
                         cx.notify();

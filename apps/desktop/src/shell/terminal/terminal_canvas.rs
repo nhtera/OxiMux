@@ -137,6 +137,26 @@ pub fn point_to_cell(
     (row, col)
 }
 
+/// Inverse of [`point_to_cell`]: the window-space bounds of cell `(row, col)`
+/// in a canvas painted into `bounds` with the same `pad` inset. Anchors the
+/// IME preedit overlay and the OS candidate window at the caret.
+pub fn cell_bounds(
+    (row, col): (usize, usize),
+    bounds: Bounds<Pixels>,
+    metrics: &CellMetrics,
+    pad: f32,
+) -> Bounds<Pixels> {
+    let x = f32::from(bounds.origin.x) + pad + col as f32 * metrics.cell_width;
+    let y = f32::from(bounds.origin.y) + pad + row as f32 * metrics.line_height;
+    Bounds {
+        origin: point(px(x), px(y)),
+        size: Size {
+            width: px(metrics.cell_width),
+            height: px(metrics.line_height),
+        },
+    }
+}
+
 /// Paint the grid into `bounds`. Designed to be called from the paint
 /// closure of `gpui::canvas`. Borrows `PaintParams` so the caller can
 /// reuse it (e.g. to compute resize dims) before/after painting.
@@ -451,7 +471,10 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
 /// Telex syllable or a CJK character) the in-progress letters live in
 /// `TerminalView::ime_marked`, not in the PTY grid — so they're drawn here on
 /// top of the grid, over an opaque background quad so they stay readable.
-/// `cursor_origin` is the cursor cell's top-left in window pixels.
+/// A caret follows the marked text — where the next letter lands, as in a
+/// native text field — while the grid hides its own cursor (it would sit at
+/// the syllable's start). `cursor_origin` is the cursor cell's top-left in
+/// window pixels.
 pub fn paint_ime_preedit(
     marked: &str,
     cursor_origin: Point<Pixels>,
@@ -491,6 +514,14 @@ pub fn paint_ime_preedit(
     };
     window.paint_quad(fill(bg, theme.bg_base));
     let _ = shaped.paint(cursor_origin, line_height, TextAlign::Left, None, window, cx);
+    let caret = Bounds {
+        origin: point((cursor_origin.x + shaped.width).floor(), cursor_origin.y),
+        size: Size {
+            width: px(2.0),
+            height: line_height,
+        },
+    };
+    window.paint_quad(fill(caret, theme.fg_base));
 }
 
 /// One styled run of consecutive cells that share fg, bg, inverse, dim,
@@ -900,6 +931,27 @@ mod tests {
             point_to_cell(point(px(0.0), px(0.0)), bounds, &metrics, pad),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn cell_bounds_is_the_inverse_of_point_to_cell() {
+        let metrics = CellMetrics {
+            cell_width: 8.0,
+            line_height: 16.0,
+        };
+        let bounds = Bounds {
+            origin: point(px(10.0), px(20.0)),
+            size: Size {
+                width: px(800.0),
+                height: px(600.0),
+            },
+        };
+        let pad = 4.0;
+        let cb = cell_bounds((2, 3), bounds, &metrics, pad);
+        assert_eq!(cb.origin, point(px(14.0 + 8.0 * 3.0), px(24.0 + 16.0 * 2.0)));
+        assert_eq!(cb.size.width, px(8.0));
+        assert_eq!(cb.size.height, px(16.0));
+        assert_eq!(point_to_cell(cb.origin, bounds, &metrics, pad), (2, 3));
     }
 
     #[test]

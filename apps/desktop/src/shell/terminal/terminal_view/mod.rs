@@ -27,7 +27,7 @@ use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, InputHandler,
     InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled,
-    Task, TouchPhase, UTF16Selection, WeakEntity, Window, canvas, div, point, px, relative, size,
+    Task, TouchPhase, UTF16Selection, WeakEntity, Window, canvas, div, px, relative,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -48,7 +48,7 @@ use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_scrollbar::{ScrollbarDrag, drag_to_offset, thumb_geometry};
 use crate::shell::terminal_links::{Existence, ExistenceCache, LinkMatch, LinkTarget, detect_at};
 use crate::shell::terminal_canvas::{
-    Alphas, PaintParams, grid_dims_for, paint_grid, point_to_cell,
+    Alphas, PaintParams, cell_bounds, grid_dims_for, paint_grid, point_to_cell,
 };
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
@@ -602,6 +602,9 @@ pub struct TerminalView {
     /// (`TerminalInputHandler`); the committed result arrives separately and
     /// is written to the PTY. Rendered as an underlined overlay at the cursor.
     ime_marked: Option<String>,
+    /// What the input method committed since the caret last moved another
+    /// way: the text it may read back and rewrite (see `ime_doc`).
+    ime_typed: ime_doc::ImeTyped,
     /// Canvas bounds (window coords) captured by the paint closure each
     /// frame. Read by the mouse handlers to map a pixel position back to a
     /// cell via `point_to_cell`. Shared via `Rc<Cell<_>>` for the same
@@ -712,6 +715,7 @@ pub struct TerminalView {
     _queued_input_timer: Option<Task<()>>,
 }
 
+mod ime_doc;
 mod input;
 mod lifecycle;
 mod render;
@@ -927,65 +931,74 @@ impl InputHandler for TerminalInputHandler {
     ) -> Option<UTF16Selection> {
         // Disable the IME on the alt-screen (full-screen TUIs — vim, less,
         // htop — must read keys raw). Off the alt-screen, present a
-        // zero-length selection at the caret so the OS routes composition here.
+        // zero-length selection at the caret so the OS routes composition here:
+        // after the marked text while composing, as a native field does, so
+        // what the OS anchors at the insertion point (the input-source
+        // indicator) follows the typing instead of the syllable's start.
         let view = self.view.read(cx);
         let sid = view.session_id;
         let alt_screen = view.with_backend(|be| be.mouse_mode(sid).alt_screen);
         if alt_screen {
             None
         } else {
+            let end = view.ime_typed.caret(view.ime_marked.as_deref());
             Some(UTF16Selection {
-                range: 0..0,
+                range: end..end,
                 reversed: false,
             })
         }
     }
 
     fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
-        let len = self
-            .view
-            .read(cx)
-            .ime_marked
-            .as_ref()?
-            .encode_utf16()
-            .count();
-        Some(0..len)
+        let view = self.view.read(cx);
+        let marked = view.ime_marked.as_deref()?;
+        let start = view.ime_typed.marked_start();
+        Some(start..start + marked.encode_utf16().count())
     }
 
     fn text_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
-        _adjusted_range: &mut Option<Range<usize>>,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<String> {
-        // The terminal exposes no queryable text buffer to the IME.
-        None
+        // Only what the input method itself committed since the caret last
+        // moved, then the marked text (see `ime_doc`): the shell's line is
+        // not ours to hand out.
+        let view = self.view.read(cx);
+        let (text, covered) = view.ime_typed.text(view.ime_marked.as_deref(), range_utf16);
+        *adjusted_range = Some(covered);
+        Some(text)
     }
 
     fn replace_text_in_range(
         &mut self,
-        _replacement_range: Option<Range<usize>>,
+        replacement_range: Option<Range<usize>>,
         text: &str,
         _window: &mut Window,
         cx: &mut App,
     ) {
         let text = text.to_owned();
-        self.view
-            .update(cx, |view, cx| view.commit_ime_text(&text, cx));
+        self.view.update(cx, |view, cx| {
+            view.rewind_ime(replacement_range.as_ref(), cx);
+            view.commit_ime_text(&text, cx);
+        });
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
-        _range_utf16: Option<Range<usize>>,
+        range_utf16: Option<Range<usize>>,
         new_text: &str,
         _new_selected_range: Option<Range<usize>>,
         _window: &mut Window,
         cx: &mut App,
     ) {
         let new_text = new_text.to_owned();
-        self.view
-            .update(cx, |view, cx| view.set_ime_marked(new_text, cx));
+        self.view.update(cx, |view, cx| {
+            view.rewind_ime(range_utf16.as_ref(), cx);
+            view.set_ime_marked(new_text, cx);
+        });
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
@@ -996,12 +1009,15 @@ impl InputHandler for TerminalInputHandler {
         &mut self,
         range_utf16: Range<usize>,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
         let mut bounds = self.cursor_bounds?;
-        // Shift the candidate window by the composition offset; one cell width
-        // is `bounds.size.width` (the cursor cell).
-        bounds.origin.x += bounds.size.width * range_utf16.start as f32;
+        // Shift the candidate window by the offset from the shell's caret
+        // (where the marked text starts); one cell width is
+        // `bounds.size.width` (the cursor cell).
+        let marked_start = self.view.read(cx).ime_typed.marked_start();
+        let cells = range_utf16.start as f32 - marked_start as f32;
+        bounds.origin.x += bounds.size.width * cells;
         Some(bounds)
     }
 
