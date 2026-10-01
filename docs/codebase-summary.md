@@ -87,9 +87,9 @@ src/
     ├── left_rail/          250px workspace + nav rail (replaces old sidebar stub)
     │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state; snapshots diff_counts
     │   ├── nav_section.rs  NavItem (Tasks/Automations/Agents/Search) + pure bg/fg helpers
-    │   │                   NavItem::opens_in_pane(): Tasks + Automations open a
-    │   │                   singleton PANE tab (they need width); Agents swaps the
-    │   │                   rail body; Search is still a shell.
+    │   │                   NavItem::opens_outside_rail(): Tasks + Automations open a
+    │   │                   singleton PANE tab (they need width); Search opens the
+    │   │                   search palette (= ⌘J); Agents swaps the rail body.
     │   ├── workspace_row.rs WorkspaceCardPlan + build_workspace_card_plan (pure) + sum_numstat;
     │   │                   status_dot_color delegates to agent_verb for color parity
     │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
@@ -140,6 +140,12 @@ src/
     │   ├── row_render.rs   single-row painter (project · branch · name · verb · diff)
     │   └── mod.rs          render_agents_dashboard — virtualized uniform_list + empty state;
     │                       row click → activate_workspace (cross-project focus)
+    ├── search_palette/     ⌘J + rail Search overlay: empty query = recent tabs (⌘1–9) +
+    │   │                   recent worktrees; typed = tabs / worktrees / projects / settings /
+    │   │                   actions. Pure model/sources/recency/rank/sections/state (unit-
+    │   │                   tested; snapshot reads rail caches only, no SQLite) + view/
+    │   │                   render_chrome/render_rows/filter_popover/keys. Root glue:
+    │   │                   workspace_root/search_palette.rs (open, focus hand-back, activate).
     ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay (interactive: type-to-filter,
     │   │                   ↑/↓ nav, Enter/click dispatch, Esc close — mirrors project_picker)
     │   ├── mod.rs          PaletteModal entity; activate_item (dispatch + close) shared by

@@ -1044,6 +1044,7 @@ impl ProjectPanes {
             }
             if active < g.tab_count() {
                 g.set_active(active, window, cx);
+                g.forget_focus_stamps();
             }
             g.focus_active(window, cx);
         });
@@ -1282,6 +1283,7 @@ impl ProjectPanes {
                 }
                 if active < g.tab_count() {
                     g.set_active(active, window, cx);
+                    g.forget_focus_stamps();
                 }
             });
         }

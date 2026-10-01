@@ -4,6 +4,26 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased — Search palette (left-rail Search, ⌘J)
+
+- **Search finally searches.** The left-rail Search row and ⌘J open one
+  palette. With nothing typed it lists *Recent Chats & Terminals* (⌘1–9 to
+  jump) and *Recent Worktrees*, newest first, with ages, a `project ·
+  worktree` location chip, `Current Worktree` / `primary` badges and the
+  worktree's live status dot.
+- **Typing searches everything open.** Tabs across every open project,
+  worktrees, projects, settings panes and app actions, ranked exact → prefix →
+  word → substring, with multi-word queries matching across fields
+  (`oximux main`). A trailing *Create worktree "…"* row starts a new worktree
+  with the name filled in.
+- **Filter by project.** `Tab` (or the Filter button) narrows results to one
+  or more projects.
+- **Replaces "Jump to workspace".** ⌘J keeps its shortcut and keymap id, so a
+  custom binding still works; the old list-only jump mode is gone.
+- **Limits.** Recency is kept for the current run only (restarts fall back to
+  agent-session times), and tabs of projects that have not been opened this
+  run are not listed.
+
 ### 2026-10-01 — v0.1.36: Keep computer awake — On / Agent / Off
 
 - **Three modes, one place to see them.** A status-bar chip (coffee icon,

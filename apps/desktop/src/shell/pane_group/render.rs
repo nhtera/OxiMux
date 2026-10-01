@@ -526,6 +526,34 @@ fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus>
     }
 }
 
+/// Leading glyph for a tab of this kind — shared by the Ctrl+Tab switcher and
+/// the search palette so both read the same as the tab strip.
+pub(crate) fn tab_kind_icon(kind: &PaneGroupTabKind) -> &'static str {
+    match kind {
+        // Diff and commit-detail tabs share the file glyph with
+        // editor tabs.
+        PaneGroupTabKind::Editor { .. }
+        | PaneGroupTabKind::Diff { .. }
+        | PaneGroupTabKind::Commit { .. }
+        | PaneGroupTabKind::BranchFile { .. }
+        | PaneGroupTabKind::StashFile { .. }
+        | PaneGroupTabKind::StashAll { .. }
+        | PaneGroupTabKind::CombinedDiff { .. } => "icons/file.svg",
+        PaneGroupTabKind::Terminal => "icons/square-terminal.svg",
+        PaneGroupTabKind::Browser { .. } => "icons/globe.svg",
+        // Tasks uses the list-tree glyph for the Ctrl+Tab switcher row.
+        PaneGroupTabKind::Tasks => "icons/list-tree.svg",
+        // Automations matches its nav row and tab chip: the calendar.
+        PaneGroupTabKind::Automations => "icons/calendar.svg",
+        // Agent Chat uses the sparkles glyph (AI convention), matching its
+        // tab chip in the Ctrl+Tab switcher.
+        PaneGroupTabKind::AgentChat { .. } => "icons/sparkles.svg",
+        // Match the tab chip: brand the agent by its adapter glyph so
+        // the Ctrl+Tab switcher reads the same as the strip.
+        PaneGroupTabKind::Agent { adapter_id, .. } => agent_icon(adapter_id),
+    }
+}
+
 /// Per-adapter brand glyph for an agent tab. Slugs match the agent registry;
 /// an adapter the cockpit ships no mark for falls back to the generic terminal
 /// glyph — the chip already sits in a tab strip, where a terminal reads better
@@ -1796,29 +1824,7 @@ fn render_mru_hud(
             .custom_title
             .clone()
             .unwrap_or_else(|| tab.label.clone());
-        let icon_path = match tab.kind {
-            // Diff and commit-detail tabs share the file glyph with
-            // editor tabs (see marker note above).
-            PaneGroupTabKind::Editor { .. }
-            | PaneGroupTabKind::Diff { .. }
-            | PaneGroupTabKind::Commit { .. }
-            | PaneGroupTabKind::BranchFile { .. }
-            | PaneGroupTabKind::StashFile { .. }
-            | PaneGroupTabKind::StashAll { .. }
-            | PaneGroupTabKind::CombinedDiff { .. } => "icons/file.svg",
-            PaneGroupTabKind::Terminal => "icons/square-terminal.svg",
-            PaneGroupTabKind::Browser { .. } => "icons/globe.svg",
-            // Tasks uses the list-tree glyph for the Ctrl+Tab switcher row.
-            PaneGroupTabKind::Tasks => "icons/list-tree.svg",
-            // Automations matches its nav row and tab chip: the calendar.
-            PaneGroupTabKind::Automations => "icons/calendar.svg",
-            // Agent Chat uses the sparkles glyph (AI convention), matching its
-            // tab chip in the Ctrl+Tab switcher.
-            PaneGroupTabKind::AgentChat { .. } => "icons/sparkles.svg",
-            // Match the tab chip: brand the agent by its adapter glyph so
-            // the Ctrl+Tab switcher reads the same as the strip.
-            PaneGroupTabKind::Agent { adapter_id, .. } => agent_icon(adapter_id),
-        };
+        let icon_path = tab_kind_icon(&tab.kind);
         let is_highlighted = row_ix == cursor;
         let row_bg = if is_highlighted {
             theme.selection

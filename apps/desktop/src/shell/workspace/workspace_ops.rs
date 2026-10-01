@@ -10,7 +10,6 @@
 //! of the helper.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
@@ -862,6 +861,7 @@ impl WorkspaceRoot {
 
         self.active_workspace_id = Some(workspace.id.clone());
         self.record_nav(&workspace.project_id, &workspace.id);
+        self.recency.stamp_worktree(&workspace.id, crate::shell::search_palette::recency::now_ms());
 
         let worktree_path = PathBuf::from(&workspace.worktree_path);
         if let Some(panes) = self.active_project_panes() {
@@ -1032,68 +1032,49 @@ impl WorkspaceRoot {
         workspaces_with_primary_for(&self.app_state.workspace_repo, project)
     }
 
-    /// Build the Cmd+J jump candidates: every workspace across all projects
-    /// (incl. synthesized primaries), labeled `Project · branch/slug` and
-    /// tagged with its `attention_rank` so action-needing ones float to the
-    /// top of the browse order.
-    pub(crate) fn build_workspace_jump_items(
-        &self,
+    /// Open the new-workspace dialog, optionally seeding its Name field (the
+    /// search palette's "Create worktree" row). Every route lands here — ⌘N,
+    /// ⌘⇧N, the palette rows, the rail `+` — so this is the one place the
+    /// precondition is said. A workspace is a worktree OF a project; with none
+    /// open, the dialog would offer an empty project dropdown and a Create that
+    /// can never enable. Refuse in words instead.
+    pub(crate) fn open_workspace_create(
+        &mut self,
+        prefill: Option<&str>,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<crate::shell::command_palette::entry::WorkspaceJumpItem> {
-        use crate::shell::agents_dashboard::model::attention_rank;
-        use crate::shell::command_palette::entry::WorkspaceJumpItem;
-
-        let mut live: HashSet<String> = HashSet::new();
-        for panes in self.project_panes_by_project.values() {
-            live.extend(panes.read(cx).live_worktree_paths(cx));
+    ) {
+        let projects = self.app_state.recent_projects.clone();
+        if projects.is_empty() {
+            crate::shell::toast::toast(
+                cx,
+                crate::shell::toast::ToastKind::Info,
+                "Open a project first \u{2014} a workspace is a worktree of a project.",
+            );
+            return;
         }
-
-        let mut items = Vec::new();
-        for project in &self.app_state.recent_projects {
-            for w in self.workspaces_with_primary(project) {
-                let status = self
-                    .app_state
-                    .agent_session_repo
-                    .list_for_workspace(&w.id)
-                    .ok()
-                    .and_then(|mut s| s.drain(..).next().map(|s| s.status));
-                let is_live = live.contains(&w.worktree_path);
-                // A workspace with no agent session is ready-to-jump, not an
-                // error — keep dormant rows above the failed/interrupted tier
-                // (which is where `attention_rank(None, false)` would put them)
-                // so a fresh project's primary row never sinks below errors.
-                let attention = match status.as_ref() {
-                    Some(s) => attention_rank(Some(s), is_live),
-                    None if is_live => 2,
-                    None => 3,
-                };
-                let branch_or_slug = if !w.branch.is_empty() {
-                    w.branch.as_str()
-                } else {
-                    w.slug.as_str()
-                };
-                let label = if branch_or_slug.is_empty() {
-                    project.name.clone()
-                } else {
-                    format!("{} · {}", project.name, branch_or_slug)
-                };
-                items.push(WorkspaceJumpItem {
-                    workspace_id: w.id.clone(),
-                    project_id: w.project_id.clone(),
-                    worktree_path: w.worktree_path.clone(),
-                    label,
-                    attention,
-                });
+        let active = self.active_project.clone();
+        // The codename an empty Name gets is picked against every slug already
+        // in use, so the preview cannot promise a branch that already exists.
+        let existing_slugs = crate::shell::workspace::codename_ops::existing_slugs_across(
+            &self.app_state.workspace_repo,
+            &projects,
+        );
+        self.close_modal_overlays(cx);
+        let default_agent = self.default_agent_for_create(cx);
+        self.workspace_dialog.update(cx, |d, cx| {
+            d.open_create(projects, active, existing_slugs, default_agent, window, cx);
+            if let Some(name) = prefill {
+                d.prefill_name(name, window, cx);
             }
-        }
-        items
+        });
     }
 
-    /// Resolve a Cmd+J jump activation: build a minimal `Workspace` from the
-    /// carried identity (the only fields `activate_workspace` reads) and
-    /// activate it. Works for synthesized primary rows too, since their
-    /// `worktree_path` is the project root.
-    pub(crate) fn activate_workspace_from_jump(
+    /// Activate a worktree named only by identity (search palette, simulator
+    /// glue): build a minimal `Workspace` from it (the only fields
+    /// `activate_workspace` reads) and activate it. Works for synthesized
+    /// primary rows too, since their `worktree_path` is the project root.
+    pub(crate) fn activate_workspace_by_ref(
         &mut self,
         workspace_id: String,
         project_id: String,
@@ -1210,10 +1191,27 @@ impl WorkspaceRoot {
             .find(|w| w.id == entry.workspace_id)
     }
 
+    /// Whether any overlay [`Self::close_modal_overlays`] would close is open.
+    pub(crate) fn any_modal_overlay_open(&self, cx: &gpui::App) -> bool {
+        self.palette.read(cx).is_open()
+            || self.pane_actions.read(cx).is_open()
+            || self.adapter_picker.read(cx).is_open()
+            || self.project_picker.read(cx).is_open()
+            || self.settings_modal.read(cx).is_open()
+            || self.workspace_dialog.read(cx).is_open()
+            || self.row_menu.read(cx).is_open()
+            || self.project_menu.read(cx).is_open()
+            || self.dashboard_status_menu.read(cx).is_open()
+            || self.options_menu.read(cx).is_open()
+            || self.add_project_dialog.read(cx).is_open()
+            || self.session_history.read(cx).is_open()
+    }
+
     /// Close every full-window modal overlay. Callers invoke this before
     /// opening a new overlay so two inset-0 dismiss regions never compete.
     pub(crate) fn close_modal_overlays(&mut self, cx: &mut Context<Self>) {
         self.palette.update(cx, |p, cx| p.close(cx));
+        self.search_palette.update(cx, |p, cx| p.hand_off(cx));
         self.pane_actions.update(cx, |p, cx| p.close(cx));
         self.adapter_picker.update(cx, |p, cx| p.close(cx));
         self.project_picker.update(cx, |p, cx| p.close(cx));

@@ -138,7 +138,6 @@ fn header_row(
     let mode_label = match mode {
         PaletteMode::QuickOpen => "Files",
         PaletteMode::Commands => "Commands",
-        PaletteMode::WorkspaceJump => "Workspaces",
     };
 
     div()
@@ -207,10 +206,8 @@ fn result_list(input: &ModalRenderInput<'_>) -> gpui::AnyElement {
                 ));
             }
         }
-        // QuickOpen and WorkspaceJump both render plain string rows from
-        // `file_rows` via `file_row`; only the row source + activation differ
-        // (resolved by the caller before this runs).
-        PaletteMode::QuickOpen | PaletteMode::WorkspaceJump => {
+        // QuickOpen renders plain string rows from `file_rows` via `file_row`.
+        PaletteMode::QuickOpen => {
             // `row_count == 0` ⇒ the single row is a non-actionable hint.
             let actionable = input.row_count > 0;
             for (i, path) in input.file_rows.iter().enumerate() {

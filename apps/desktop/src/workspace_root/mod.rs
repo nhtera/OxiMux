@@ -90,7 +90,7 @@ use crate::notifier::{AgentNotifySettings, Notifier};
 use crate::state::AppState;
 
 use crate::actions::{
-    ActivateGroupTab, ActivateWorkspaceFromJump, ApplyLayoutBottomTerminal, ApplyLayoutHorizontal,
+    ActivateGroupTab, ApplyLayoutBottomTerminal, ApplyLayoutHorizontal,
     ApplyLayoutStacked, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
     OpenAddProjectDialog, OpenComposerBar,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
@@ -100,7 +100,7 @@ use crate::actions::{
     NewBrowserTab, NewTab, OpenChatSession, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, RestartToUpdate, ShowWelcomeWizard,
     OpenTabContextMenuAt, OpenTerminalContextMenuAt, ResumeAgentSession,
-    OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, RevealActiveWorkspace,
+    OpenWorkspaceCreate, OpenSearchPalette, RequestOpenAdapterPicker, RevealActiveWorkspace,
     Search, SelectExplorerTab,
     SelectFilesTab, SelectHistoryTab,
     SelectSearchTab,
@@ -248,6 +248,8 @@ pub struct WorkspaceRoot {
     pub(crate) right_sidebar: Option<Entity<RightSidebar>>,
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
+    /// Left-rail Search row / ⌘J palette (recent + typed search).
+    pub(crate) search_palette: Entity<crate::shell::search_palette::SearchPalette>,
     pub(crate) session_history: Entity<SessionHistoryModal>,
     pub(crate) pane_actions: Entity<PaneActionsMenu>,
     pub(crate) tab_context_menu: Entity<TabContextMenu>,
@@ -346,6 +348,7 @@ pub struct WorkspaceRoot {
     /// Same focus-restore guard for the command palette and project picker
     /// (both grab focus on open).
     pub(crate) _palette_sub: Option<Subscription>,
+    pub(crate) _search_palette_sub: Option<Subscription>,
     pub(crate) _session_history_sub: Option<Subscription>,
     pub(crate) _project_picker_sub: Option<Subscription>,
     /// Workspace create / rename dialog (Cmd+Shift+N + sidebar rename).
@@ -536,6 +539,9 @@ pub struct WorkspaceRoot {
     /// `ended_at` if finished, else `started_at`) — same lifecycle as
     /// `rail_latest_status`. Drives the dashboard's in-tier recency sort.
     pub(crate) rail_last_active: HashMap<String, String>,
+    /// Worktree visit stamps for the search palette's recent-worktrees order
+    /// (in-memory, this window only). Stamped in `activate_workspace`.
+    pub(crate) recency: crate::shell::search_palette::recency::RecencyLedger,
     /// Every agent session per workspace id (`agent_sessions` rows, newest
     /// first) — same gather lifecycle as `rail_latest_status`. `refresh_left_rail`
     /// merges this DB history with the live `live_agents` map into the rail's
@@ -843,6 +849,9 @@ impl WorkspaceRoot {
             rail.init_layout(app_state.settings_repo.clone());
         });
         let palette = cx.new(|cx| PaletteModal::new(theme, density, typography.clone(), cx));
+        let search_palette = cx.new(|cx| {
+            crate::shell::search_palette::SearchPalette::new(theme, density, typography.clone(), cx)
+        });
         let session_history =
             cx.new(|cx| SessionHistoryModal::new(theme, density, typography.clone(), cx));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
@@ -1103,6 +1112,13 @@ impl WorkspaceRoot {
             window,
             |root, _palette, _ev: &PaletteEvent, window, cx| {
                 root.focus_handle.focus(window, cx);
+            },
+        );
+        let search_palette_sub = cx.subscribe_in(
+            &search_palette,
+            window,
+            |root, _palette, ev: &crate::shell::search_palette::SearchPaletteEvent, window, cx| {
+                root.on_search_palette_event(ev, window, cx);
             },
         );
         let session_history_sub = cx.subscribe_in(
@@ -1448,6 +1464,7 @@ impl WorkspaceRoot {
             right_sidebar,
             left_rail,
             palette,
+            search_palette,
             session_history,
             pane_actions,
             tab_context_menu,
@@ -1492,6 +1509,7 @@ impl WorkspaceRoot {
             _awake_settings_observer: awake_settings_observer,
             _onboarding_sub: Some(onboarding_sub),
             _palette_sub: Some(palette_sub),
+            _search_palette_sub: Some(search_palette_sub),
             _session_history_sub: Some(session_history_sub),
             _project_picker_sub: Some(project_picker_sub),
             app_state,
@@ -1530,6 +1548,7 @@ impl WorkspaceRoot {
             rail_latest_status: HashMap::new(),
             rail_latest_adapter: HashMap::new(),
             rail_last_active: HashMap::new(),
+            recency: Default::default(),
             rail_workspace_sessions: HashMap::new(),
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
@@ -1806,4 +1825,5 @@ mod daemon_confirm;
 pub mod kill_all;
 mod ops;
 mod render;
+mod search_palette;
 mod stash_dialogs;

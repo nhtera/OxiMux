@@ -24,6 +24,7 @@ impl Render for WorkspaceRoot {
         // hides instead of floating over the modal. Set before the panes
         // render below.
         let panes_covered = self.palette.read(cx).is_open()
+            || self.search_palette.read(cx).is_open()
             || self.project_picker.read(cx).is_open()
             || self.settings_modal.read(cx).is_open()
             || self.workspace_dialog.read(cx).is_open()
@@ -903,27 +904,9 @@ impl Render for WorkspaceRoot {
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &OpenWorkspaceJump, window, cx| {
-                this.close_modal_overlays(cx);
-                // Snapshot all workspaces + attention state, push into the
-                // palette, then open it in jump mode.
-                let items = this.build_workspace_jump_items(cx);
-                this.palette.update(cx, |p, cx| {
-                    p.set_workspace_items(items, cx);
-                    p.open(PaletteMode::WorkspaceJump, window, cx);
-                });
+            .on_action(cx.listener(|this, _: &OpenSearchPalette, window, cx| {
+                this.open_search_palette(window, cx);
             }))
-            .on_action(cx.listener(
-                |this, action: &ActivateWorkspaceFromJump, window, cx| {
-                    this.activate_workspace_from_jump(
-                        action.workspace_id.clone(),
-                        action.project_id.clone(),
-                        action.worktree_path.clone(),
-                        window,
-                        cx,
-                    );
-                },
-            ))
             .on_action(cx.listener(
                 |this, action: &oximux_editor::RevealInExplorer, _window, cx| {
                     this.reveal_path_in_explorer(std::path::PathBuf::from(&action.path), cx);
@@ -946,33 +929,7 @@ impl Render for WorkspaceRoot {
                 this.request_worktree_stats_refresh(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
-                let projects = this.app_state.recent_projects.clone();
-                // Every route lands here — ⌘N, ⌘⇧N, the palette row, the
-                // rail `+` — so this is the one place the precondition is
-                // said. A workspace is a worktree OF a project; with none
-                // open, the dialog would offer an empty project dropdown and
-                // a Create that can never enable. Refuse in words instead.
-                if projects.is_empty() {
-                    crate::shell::toast::toast(
-                        cx,
-                        crate::shell::toast::ToastKind::Info,
-                        "Open a project first \u{2014} a workspace is a worktree of a project.",
-                    );
-                    return;
-                }
-                let active = this.active_project.clone();
-                // The codename an empty Name gets is picked against every slug
-                // already in use, so the preview cannot promise a branch that
-                // already exists.
-                let existing_slugs = crate::shell::workspace::codename_ops::existing_slugs_across(
-                    &this.app_state.workspace_repo,
-                    &projects,
-                );
-                this.close_modal_overlays(cx);
-                let default_agent = this.default_agent_for_create(cx);
-                this.workspace_dialog.update(cx, |d, cx| {
-                    d.open_create(projects, active, existing_slugs, default_agent, window, cx)
-                });
+                this.open_workspace_create(None, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenAddProjectDialog, window, cx| {
                 this.close_modal_overlays(cx);
@@ -2322,6 +2279,7 @@ impl Render for WorkspaceRoot {
             })
             // Palette modal — appended above the rest of the chrome.
             .child(self.palette.clone())
+            .child(self.search_palette.clone())
             // Session-history picker — same z-level as the palette.
             .child(self.session_history.clone())
             // Settings modal — above the rest of the chrome (last child =

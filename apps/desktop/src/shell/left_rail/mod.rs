@@ -1181,8 +1181,8 @@ impl LeftRail {
     /// group. Callers that have a `&mut Window` should use `select_nav_in` so
     /// those get the window context required to open the pane tab.
     pub fn select_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
-        // Pane-hosted pages skip the rail-body toggle path entirely.
-        if item.opens_in_pane() {
+        // Pane-hosted pages and the search overlay skip the rail-body toggle.
+        if item.opens_outside_rail() {
             return;
         }
         self.active_nav = if self.active_nav == Some(item) {
@@ -1217,7 +1217,12 @@ impl LeftRail {
                     root.open_automations_tab(window, cx);
                 });
             }
-            NavItem::Agents | NavItem::Search => self.select_nav(item, cx),
+            NavItem::Search => {
+                let _ = self.weak_root.update(cx, |root, cx| {
+                    root.open_search_palette(window, cx);
+                });
+            }
+            NavItem::Agents => self.select_nav(item, cx),
         }
     }
 }

@@ -160,6 +160,9 @@ impl PaneGroup {
     ) {
         if let Some(tab) = self.tabs.get_mut(idx) {
             tab.restore_rank = Some(meta.rank);
+            // Mounting a restored tab is not a visit: drop the spawn path's
+            // MRU stamp so the palette falls back to the session-history seed.
+            tab.last_focused_ms = 0;
             tab.is_preview = meta.is_preview;
             tab.pinned = meta.pinned;
             tab.color = meta.color;

@@ -334,6 +334,13 @@ impl WorkspaceDialog {
         cx.notify();
     }
 
+    /// Seed the Name field after [`Self::open_create`] — the search palette's
+    /// "Create worktree “<query>”" row.
+    pub fn prefill_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.name_input.update(cx, |s, cx| s.set_value(name, window, cx));
+        cx.notify();
+    }
+
     pub fn open_rename(
         &mut self,
         workspace: Workspace,
