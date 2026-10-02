@@ -769,9 +769,9 @@ impl Render for WorkspaceRoot {
                 // Default the picker to the active project's sessions (root +
                 // worktrees), mirroring the agent CLI's same-repo /resume; an
                 // empty scope opens the all-projects view.
-                let scope = this.active_project_scope_paths();
+                let context = this.session_history_context(cx);
                 this.session_history
-                    .update(cx, |m, cx| m.open(scope, window, cx));
+                    .update(cx, |m, cx| m.open(context, window, cx));
             }))
             // Root fallback for the composer chord. `OpenComposerBar` is
             // handled at the PaneGroup level, so a Cmd+I dispatched while

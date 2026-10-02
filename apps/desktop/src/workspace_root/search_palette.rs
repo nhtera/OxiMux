@@ -1,13 +1,16 @@
-//! Root glue for the search palette (left-rail Search row, ⌘J): open it over
-//! a fresh snapshot, hand focus back when it closes, and resolve activations
-//! against live state — the snapshot may be stale by then, so a missing
-//! target is a toast, never a panic.
+//! Root glue for the search palette (left-rail Search row, ⌘J) and the
+//! session-history picker's search context: open over a fresh snapshot, hand
+//! focus back when closed, and resolve activations against live state — the
+//! snapshot may be stale by then, so a missing target is a toast, never a
+//! panic.
 
-use gpui::{Context, Window};
+use gpui::{App, Context, Window};
 
 use crate::shell::search_palette::SearchPaletteEvent;
 use crate::shell::search_palette::model::Target;
 use crate::shell::search_palette::sources;
+use crate::shell::session_history::{HistoryContext, SessionHistoryEvent};
+use crate::shell::settings_modal::SettingsPane;
 use crate::shell::toast::{ToastKind, toast};
 
 use super::WorkspaceRoot;
@@ -47,7 +50,8 @@ impl WorkspaceRoot {
         }
     }
 
-    fn activate_search_target(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+    /// Also the session-history picker's "jump to open tab".
+    pub(crate) fn activate_search_target(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             Target::Tab { project_id, uid } => {
                 let found = self.switch_to_project(&project_id, window, cx)
@@ -77,6 +81,38 @@ impl WorkspaceRoot {
             Target::CreateWorktree(name) => self.open_workspace_create(Some(&name), window, cx),
         }
         cx.notify();
+    }
+
+    /// What the session-history picker opens with: the project's launch
+    /// dirs, the active tab's worktree, and the open agent tabs.
+    pub(crate) fn session_history_context(&self, cx: &App) -> HistoryContext {
+        let worktree_path = self
+            .active_project_panes()
+            .and_then(|panes| panes.read(cx).active_group())
+            .map(|group| group.read(cx).active_tab_worktree().display().to_string());
+        HistoryContext {
+            project_paths: self.active_project_scope_paths(),
+            worktree_path,
+            live_tabs: crate::shell::session_history::jump::live_tabs(self, cx),
+        }
+    }
+
+    pub(crate) fn on_session_history_event(
+        &mut self,
+        event: &SessionHistoryEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SessionHistoryEvent::Closed => self.focus_handle.focus(window, cx),
+            SessionHistoryEvent::JumpToTab { project_id, uid } => {
+                let target = Target::Tab { project_id: project_id.clone(), uid: *uid };
+                self.activate_search_target(target, window, cx);
+            }
+            SessionHistoryEvent::OpenSessionSearchSettings => {
+                self.settings_modal.update(cx, |m, cx| m.open_to_pane(SettingsPane::Agents, window, cx));
+            }
+        }
     }
 
     /// Make `project_id` the active project. `false` when it is no longer in

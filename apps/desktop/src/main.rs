@@ -382,6 +382,10 @@ fn main() {
         #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_variables))]
         oximux_app::agent_retry_settings::install(cx);
         oximux_app::git_settings::install(cx);
+        // Session search (off by default). The service starts its indexer
+        // thread only when enabled, and never blocks boot.
+        oximux_app::session_search_settings::install(cx);
+        oximux_app::session_search_service::install(cx);
         let upgraded_this_boot = oximux_app::auto_update_settings::install(cx);
         // The indicator that appears while an agent can drive the screen — a
         // menu-bar item on macOS, a notification-area icon on Windows. Watches
@@ -782,6 +786,7 @@ fn install_app_lifecycle(cx: &mut gpui::App, app_state: oximux_app::state::AppSt
         // ≤ 5 s), close every helper's stdin (they exit on EOF) and hand
         // devices we booted to a detached `simctl shutdown`.
         oximux_app::shell::simulator::on_quit(cx);
+        oximux_app::session_search_service::on_quit(cx);
         // Persist the last-known git states so the next launch seeds from
         // them instead of flashing "loading git…". Best-effort: a write
         // error only costs one Loading flash next time.

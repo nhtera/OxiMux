@@ -1,7 +1,7 @@
 //! Agents / AI pane — the keep-awake mode, then the `CommitMessageAiSettings`
-//! working copy (commit-message generation mode + agent + model). Applies
-//! immediately: mutate the copy, write `commit_message_ai.toml`, watcher
-//! re-applies. Desktop-notification prefs live in the Notifications pane.
+//! working copy (commit-message generation mode + agent + model), launch
+//! defaults, and the session-search opt-in. Applies immediately: mutate the
+//! copy, write `commit_message_ai.toml`, watcher re-applies. Desktop-notification prefs live in the Notifications pane.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use oximux_settings::{CommitMessageAiMode, Density, Theme, Typography};
@@ -143,6 +143,9 @@ pub(super) fn render(
             typography,
         ));
 
+    let search_section =
+        super::pane_agents_session_search::render_section(modal, theme, density, typography, cx);
+
     div()
         .flex()
         .flex_col()
@@ -152,6 +155,7 @@ pub(super) fn render(
         .child(ai_section)
         .child(launch_section)
         .child(env_section)
+        .child(search_section)
         .into_any_element()
 }
 
@@ -183,6 +187,7 @@ pub(super) fn entries(
     all.extend(super::pane_agents_launch::entries(
         modal, theme, density, typography, cx,
     ));
+    all.extend(super::pane_agents_session_search::entries(modal, theme, density, typography, cx));
     all
 }
 

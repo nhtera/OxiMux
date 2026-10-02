@@ -4,6 +4,27 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased — Session search (search inside past conversations)
+
+- **Find a conversation by what was said in it.** Turn on *Session search* in
+  Settings › Agents and OxiMux keeps a local full-text index of your Claude
+  and Codex conversations — prompts, replies, tool commands and their output.
+  Session History (⌘⇧H) then searches that text as you type and shows the
+  matching line (`You:` / `Agent:` / `Tool:`) with the words highlighted.
+- **Scope and sort.** Narrow to this worktree, this project or everything
+  (⌃A cycles), sort by relevance or newest, and load more results at the end
+  of the list.
+- **Already open? Jump to it.** Enter on a result whose conversation is
+  running in a tab focuses that tab instead of starting a second copy;
+  ⇧↵ forks and ⌘↵ opens it as a chat as before.
+- **Stays on this computer, off by default.** The index is built in the
+  background, kept current as conversations grow, and lives in its own file;
+  the settings card shows how much it holds and how big it is, and *Clear
+  search data* deletes it (it is rebuilt from the transcripts on demand).
+- **Fixed: typing lost after opening a picker over Settings.** Opening Session
+  History (or any overlay) while Settings was still open left the new
+  overlay without keyboard focus.
+
 ### Unreleased — Search palette (left-rail Search, ⌘J)
 
 - **Search finally searches.** The left-rail Search row and ⌘J open one

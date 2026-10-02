@@ -423,7 +423,7 @@ fn clean_command_xml(s: &str) -> String {
 /// the preview pane which applies its own longer limit. Command parsing is the
 /// shared [`crate::command_envelope`] helper; the non-command fallback keeps the
 /// lossy stray-tag strip (fine for a one-line preview, unlike a full transcript).
-pub(super) fn unwrap_command_xml(s: &str) -> String {
+pub(crate) fn unwrap_command_xml(s: &str) -> String {
     if let Some(cmd) = crate::command_envelope::parse_slash_command(s) {
         return cmd.normalized();
     }
@@ -516,7 +516,7 @@ fn collect_codex(codex_dir: &Path, scope: &SessionScope, out: &mut Vec<SessionEn
 /// Depth-bounded collection of every `rollout-*.jsonl` under the sessions tree.
 /// Codex nests three levels deep (`YYYY/MM/DD`); the cap guards a pathological
 /// tree from unbounded recursion. Symlinked entries are never followed.
-fn collect_rollout_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_rollout_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     const MAX_DEPTH: usize = 5;
     if depth > MAX_DEPTH {
         return;
@@ -710,12 +710,12 @@ pub(super) fn cwd_matches(cwd: &str, target: &str) -> bool {
 
 // --- shared helpers --------------------------------------------------------
 
-pub(super) fn line_value(line: &str) -> Option<Value> {
+pub(crate) fn line_value(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line).ok()
 }
 
 /// One-line, whitespace-collapsed, length-capped prompt preview.
-pub(super) fn truncate_prompt(s: &str) -> String {
+pub(crate) fn truncate_prompt(s: &str) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= PROMPT_MAX_CHARS {
         return flat;

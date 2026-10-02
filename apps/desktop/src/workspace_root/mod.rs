@@ -1089,7 +1089,12 @@ impl WorkspaceRoot {
             &settings_modal,
             window,
             |root, _modal, _ev: &SettingsModalEvent, window, cx| {
-                root.focus_handle.focus(window, cx);
+                // Settings also closes when another overlay opens over it
+                // (`close_modal_overlays`); this event lands after that
+                // overlay took focus, so leave focus alone then.
+                if !root.any_modal_overlay_open(cx) && !root.search_palette.read(cx).is_open() {
+                    root.focus_handle.focus(window, cx);
+                }
             },
         );
         // A mode picked in Settings → Agents shows in this window's chip at
@@ -1124,8 +1129,8 @@ impl WorkspaceRoot {
         let session_history_sub = cx.subscribe_in(
             &session_history,
             window,
-            |root, _modal, _ev: &SessionHistoryEvent, window, cx| {
-                root.focus_handle.focus(window, cx);
+            |root, _modal, ev: &SessionHistoryEvent, window, cx| {
+                root.on_session_history_event(ev, window, cx);
             },
         );
         let project_picker_sub = cx.subscribe_in(

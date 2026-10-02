@@ -8124,6 +8124,7 @@ dependencies = [
  "oximux-git",
  "oximux-job-object",
  "oximux-no-window",
+ "oximux-owner-only",
  "oximux-pty",
  "oximux-shell-env",
  "oximux-storage",
