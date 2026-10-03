@@ -101,6 +101,12 @@ pub struct SearchState {
     /// hold: the next edit replaces the query, Backspace clears it, and Cmd+C
     /// copies it. Private so only the edit paths below can set or clear it.
     query_selected: bool,
+    /// Whether the find box has the keyboard. The terminal keeps the GPUI
+    /// focus either way; this decides whether [`Self::handle_key`] claims
+    /// keystrokes or hands them to the terminal. Opening (Cmd+F) or clicking
+    /// the bar sets it; a click on the grid clears it, so with the bar still
+    /// open the user can type, Cmd+A, or Esc in the terminal itself.
+    input_focused: bool,
 }
 
 impl Default for SearchState {
@@ -120,6 +126,7 @@ impl SearchState {
             options: SearchOptions::default(),
             compiled: None,
             query_selected: false,
+            input_focused: false,
         }
     }
 
@@ -128,10 +135,22 @@ impl SearchState {
         self.query_selected
     }
 
-    /// Collapse a selected query back to the caret, leaving its text alone.
-    /// The host calls this when a click lands on the grid: that is the user
-    /// leaving the find box, so Cmd+C must copy the grid selection again.
-    pub fn deselect_query(&mut self) {
+    /// Whether the find box has the keyboard, for the overlay paint (caret
+    /// and focus ring).
+    pub fn is_input_focused(&self) -> bool {
+        self.active && self.input_focused
+    }
+
+    /// Give the keyboard back to the find box (a click on the bar).
+    pub fn focus_input(&mut self) {
+        self.input_focused = true;
+    }
+
+    /// Hand the keyboard to the terminal while the bar stays open (a click
+    /// on the grid). Drops any query selection with it, so Cmd+C copies the
+    /// grid selection again.
+    pub fn blur_input(&mut self) {
+        self.input_focused = false;
         self.query_selected = false;
     }
 
@@ -145,12 +164,14 @@ impl SearchState {
         true
     }
 
-    /// Flip into search mode. Idempotent — re-opening preserves the query
-    /// so a stray Cmd+F while already open is a no-op state-wise (host
-    /// still triggers a re-scan against a fresh grid, which is what the
-    /// user expects).
+    /// Flip into search mode and give the find box the keyboard. Re-opening
+    /// preserves the query and selects it, the way Cmd+F does in a browser or
+    /// editor: typing replaces the old needle, Enter keeps searching for it.
+    /// (Host still triggers a re-scan against a fresh grid.)
     pub fn open(&mut self) {
         self.active = true;
+        self.input_focused = true;
+        self.query_selected = !self.query.is_empty();
     }
 
     /// Close the overlay and drop all search state. Host calls `cx.notify`
@@ -162,6 +183,7 @@ impl SearchState {
         self.history_len = 0;
         self.current_index = None;
         self.query_selected = false;
+        self.input_focused = false;
     }
 
     /// Re-scan the grid for the current query under the current `options`.
@@ -285,8 +307,10 @@ impl SearchState {
     }
 
     /// Dispatch a keystroke while the overlay is active. Returns
-    /// `SearchKeyOutcome::Pass` when search is inactive (or the keystroke
-    /// carries Cmd/Ctrl/Alt — those should reach the regular path).
+    /// `SearchKeyOutcome::Pass` when search is inactive, when the terminal
+    /// has the keyboard (the user clicked back into the grid), or when the
+    /// keystroke carries a Cmd/Ctrl/Alt chord the box does not claim — those
+    /// reach the regular terminal path.
     ///
     /// Bindings:
     /// - Escape       → dismiss
@@ -302,7 +326,7 @@ impl SearchState {
     /// - Printable    → append, or replace a selected query (re-runs scan)
     /// - Other        → swallow (no repaint)
     pub fn handle_key(&mut self, event: &KeyDownEvent) -> SearchKeyOutcome {
-        if !self.active {
+        if !self.active || !self.input_focused {
             return SearchKeyOutcome::Pass;
         }
         let ks = &event.keystroke;
@@ -601,16 +625,60 @@ mod tests {
 
         // A click on the grid deselects, so Cmd+C copies the grid again.
         s.handle_key(&key("cmd-a"));
-        s.deselect_query();
+        s.blur_input();
         assert!(matches!(s.handle_key(&key("cmd-c")), SearchKeyOutcome::Pass));
 
         // Match navigation leaves the selection alone; closing drops it.
+        s.focus_input();
         s.handle_key(&key("cmd-a"));
         s.handle_key(&key("enter"));
         assert!(s.is_query_selected());
         s.handle_key(&key("escape"));
         assert!(!s.is_query_selected());
         assert!(s.query.is_empty());
+    }
+
+    #[test]
+    fn grid_click_hands_every_key_to_the_terminal() {
+        let mut s = SearchState::new();
+        s.open();
+        assert!(s.is_input_focused());
+        s.query.push_str("needle");
+
+        // Back in the grid: the bar stays open, but select-all, typing, Esc
+        // and paste all belong to the terminal again.
+        s.blur_input();
+        assert!(s.active);
+        assert!(!s.is_input_focused());
+        for chord in ["cmd-a", "cmd-c", "cmd-v", "x", "backspace", "escape", "enter"] {
+            assert!(
+                matches!(s.handle_key(&key(chord)), SearchKeyOutcome::Pass),
+                "{chord} must reach the terminal"
+            );
+        }
+        assert_eq!(s.query, "needle", "the query is untouched");
+        assert!(!s.is_query_selected());
+
+        // Clicking the bar takes the keyboard back.
+        s.focus_input();
+        assert!(matches!(
+            s.handle_key(&key("cmd-a")),
+            SearchKeyOutcome::SelectionChanged
+        ));
+        assert!(s.is_query_selected());
+
+        // Cmd+F from the grid refocuses the box with its query selected, so
+        // typing replaces the old needle.
+        s.blur_input();
+        s.open();
+        assert!(s.is_input_focused());
+        assert!(s.is_query_selected());
+        s.handle_key(&key("z"));
+        assert_eq!(s.query, "z");
+
+        // Closing drops focus with the rest of the state.
+        s.close();
+        assert!(!s.is_input_focused());
     }
 
     fn hit(row: usize) -> MatchRange {

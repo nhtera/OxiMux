@@ -85,6 +85,11 @@ pub struct PaintParams {
     /// empty vec.
     pub buckets: Vec<Vec<MatchHit>>,
     pub pane_focused: bool,
+    /// Typing lands at the terminal cursor: the pane is focused AND the find
+    /// box is not holding the keyboard. When false the cursor paints as in
+    /// an unfocused pane (steady, ghosted) while the text keeps full
+    /// strength, so only the find box's caret reads as "type here".
+    pub cursor_focused: bool,
     pub pad: f32,
     /// `(row, col_start, col_end)` of the link the pointer is hovering with
     /// Cmd held — underlined so the user sees it's clickable. `None` = none.
@@ -240,7 +245,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         let mut col: usize = 0;
         for run in &runs {
             let n_cells = run.cols;
-            let (_fg, bg) = effective_colors(run, p.pane_focused, &p.theme, p.alphas);
+            let (_fg, bg) = run_colors(run, p);
             // Match highlight overrides bg unless the cursor is also on
             // this run (cursor inverse wins — keeps the cursor visible
             // on a matched cell).
@@ -311,7 +316,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         let mut text = String::with_capacity(row.len());
         let mut text_runs: Vec<TextRun> = Vec::with_capacity(runs.len());
         for run in &runs {
-            let (fg, bg) = effective_colors(run, p.pane_focused, &p.theme, p.alphas);
+            let (fg, bg) = run_colors(run, p);
             // Current-match fg uses theme.match_fg for legibility against
             // the bright amber match_bg_current. Inverse cells (incl. the
             // cursor) already have the inverted color from effective_colors;
@@ -402,7 +407,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         {
             let x_left = (origin.x + cell_w * p.cursor.1 as f32).floor();
             let mut color = p.theme.fg_base;
-            if !p.pane_focused {
+            if !p.cursor_focused {
                 color.a *= p.alphas.unfocused_cursor;
             }
             let thickness = px(2.0);
@@ -655,6 +660,18 @@ fn effective_colors(run: &Run, pane_focused: bool, theme: &Theme, alphas: Alphas
         } else {
             fg.a *= alphas.unfocused;
         }
+    }
+    (fg, bg)
+}
+
+/// [`effective_colors`] for this frame, plus the cursor ghosting that
+/// follows [`PaintParams::cursor_focused`] rather than pane focus: with the
+/// find box holding the keyboard the block fades like an unfocused pane's,
+/// but the rest of the grid is not dimmed (matches stay readable).
+fn run_colors(run: &Run, p: &PaintParams) -> (Hsla, Hsla) {
+    let (fg, mut bg) = effective_colors(run, p.pane_focused, &p.theme, p.alphas);
+    if run.is_cursor && p.pane_focused && !p.cursor_focused {
+        bg.a *= p.alphas.unfocused_cursor;
     }
     (fg, bg)
 }
