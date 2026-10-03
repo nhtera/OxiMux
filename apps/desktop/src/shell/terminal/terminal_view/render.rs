@@ -400,8 +400,11 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                    // Focus the pane being acted on (matches left-click).
+                    // Focus the pane being acted on (matches left-click),
+                    // keyboard included: the find box lets go of it, so the
+                    // menu's Copy and a later ⌘C act on the grid word.
                     this.focus_handle.focus(window, cx);
+                    this.search.blur_input();
                     // A mouse-reporting app consumes the press — never shadow
                     // its own right-click handling with a local menu.
                     if this.report_mouse(

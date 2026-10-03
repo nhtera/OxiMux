@@ -318,7 +318,8 @@ impl SearchState {
     /// - Shift+Enter  → prev match (cycle back)
     /// - Up           → prev match
     /// - Down         → next match
-    /// - Backspace    → pop char (re-runs scan)
+    /// - Backspace    → pop char, or clear a selected query (re-runs scan)
+    /// - Delete       → clear a selected query
     /// - Cmd+V / Ctrl+Shift+V → paste into the query (host reads clipboard)
     /// - Cmd+A        → select the whole query
     /// - Left/Right/Home/End → collapse a selected query
@@ -370,6 +371,12 @@ impl SearchState {
             "left" | "right" | "home" | "end" if self.query_selected => {
                 self.query_selected = false;
                 return SearchKeyOutcome::SelectionChanged;
+            }
+            // Forward Delete clears a selected query like Backspace; with
+            // the caret pinned to the end there is nothing after it otherwise.
+            "delete" if self.query_selected => {
+                self.take_selected_query();
+                return SearchKeyOutcome::QueryChanged;
             }
             "backspace" => {
                 if !self.take_selected_query() {
@@ -588,6 +595,19 @@ mod tests {
         s.handle_key(&key("cmd-a"));
         assert!(matches!(
             s.handle_key(&key("backspace")),
+            SearchKeyOutcome::QueryChanged
+        ));
+        assert!(s.query.is_empty());
+        assert!(!s.is_query_selected());
+
+        // Forward Delete clears a selection too; without one it is a no-op
+        // (the caret is pinned to the end of the query).
+        s.query.push_str("abc");
+        assert!(matches!(s.handle_key(&key("delete")), SearchKeyOutcome::Consumed));
+        assert_eq!(s.query, "abc");
+        s.handle_key(&key("cmd-a"));
+        assert!(matches!(
+            s.handle_key(&key("delete")),
             SearchKeyOutcome::QueryChanged
         ));
         assert!(s.query.is_empty());
