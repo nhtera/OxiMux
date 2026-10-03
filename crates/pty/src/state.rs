@@ -545,6 +545,7 @@ fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
         wide_spacer: cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+        wrapline: cell.flags.contains(Flags::WRAPLINE),
     }
 }
 
@@ -940,6 +941,22 @@ mod tests {
         for row in &grid {
             assert_eq!(row.len(), 80);
         }
+    }
+
+    #[test]
+    fn soft_wrap_surfaces_as_wrapline_on_the_row_end() {
+        // 16 chars into a 10-col grid: the parser wraps after column 9, so
+        // row 0's last cell carries WRAPLINE; the explicit CRLF that ends the
+        // logical line does NOT mark row 1. Copy relies on exactly this split.
+        let mut state = TerminalState::new(10, 4, 100);
+        state.advance(b"abcdefghijklmnop\r\nxy");
+        let snap = fresh_snapshot(&state);
+        assert!(snap.cells[0][9].wrapline, "soft wrap must set wrapline");
+        assert!(!snap.cells[0][..9].iter().any(|c| c.wrapline));
+        assert!(!snap.cells[1].iter().any(|c| c.wrapline), "CRLF is a hard break");
+        let grid = state.fill_search_grid();
+        let row0 = grid.len() - 4;
+        assert!(grid[row0][9].wrapline, "search grid carries the same flag");
     }
 
     #[test]

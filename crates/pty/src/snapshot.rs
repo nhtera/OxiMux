@@ -70,6 +70,11 @@ pub struct Cell {
     /// painted by the wide glyph — and selection text omits it so copy
     /// yields one character, not "char + space".
     pub wide_spacer: bool,
+    /// True on the LAST cell of a row the terminal soft-wrapped (the text ran
+    /// past the right edge and continued on the next row — alacritty's
+    /// `WRAPLINE`). Selection copy joins such a row to the next one instead
+    /// of inserting a `\n`, so a long line copies back as one line.
+    pub wrapline: bool,
 }
 
 /// Cursor shape the app requested via DECSCUSR, decoupled from alacritty's
@@ -132,7 +137,8 @@ impl TerminalSnapshot {
     }
 
     /// Plain text for visible rows in `[start_row, end_row]` inclusive.
-    /// Right-trims each row, joins with `\n`, drops `wide_spacer` cells
+    /// Right-trims each row, joins with `\n` (soft-wrapped rows join their
+    /// continuation untrimmed, no `\n`), drops `wide_spacer` cells
     /// (their column is owned by the adjacent wide glyph) and replaces
     /// `\0` with space. Out-of-range coords clamp silently to the grid.
     /// Used by the agent-context extractors and any future "send rows to
@@ -156,6 +162,12 @@ impl TerminalSnapshot {
                 }
                 let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
                 line.push(ch);
+            }
+            // A soft-wrapped row continues on the next one: join untrimmed,
+            // no `\n` (the space at the wrap column is real text).
+            if idx < r1 && row.last().is_some_and(|c| c.wrapline) {
+                out.push_str(&line);
+                continue;
             }
             out.push_str(line.trim_end());
             if idx < r1 {
@@ -310,6 +322,14 @@ mod tests {
         ]);
         assert_eq!(snap.rows_text(0, 2), "hello\nworld!\n");
         assert_eq!(snap.rows_text(0, 1), "hello\nworld!");
+    }
+
+    #[test]
+    fn rows_text_joins_soft_wrapped_rows() {
+        let mut wrapped = row_of("ab ");
+        wrapped[2].wrapline = true;
+        let snap = snap_with_rows(vec![wrapped, row_of("cd "), row_of("e  ")]);
+        assert_eq!(snap.rows_text(0, 2), "ab cd\ne");
     }
 
     #[test]

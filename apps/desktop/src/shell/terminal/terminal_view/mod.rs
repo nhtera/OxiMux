@@ -886,8 +886,10 @@ fn word_range_at(row: &[oximux_pty::Cell], col: usize) -> (usize, usize) {
 /// Extract the text covered by a cell-coordinate selection from the
 /// current snapshot. End coords are inclusive. Each row is right-trimmed
 /// of trailing whitespace then joined with `\n` — matching the
-/// common terminal "copy preserves visual newlines but not visual
-/// padding" convention. Out-of-range coordinates clamp silently to grid.
+/// common terminal "copy preserves real newlines but not visual
+/// padding" convention. Soft-wrapped rows ([`oximux_pty::Cell::wrapline`])
+/// join their continuation untrimmed, so a long line copies back as ONE
+/// line. Out-of-range coordinates clamp silently to grid.
 fn extract_selection_text(
     snapshot: &TerminalSnapshot,
     sel: (usize, usize, usize, usize),
@@ -926,6 +928,13 @@ fn extract_selection_text_cells(
         } else {
             (0, last_col_in_row)
         };
+        // A soft-wrapped row (the terminal ran out of columns, not a real
+        // newline) continues on the next row: join them with no `\n` and no
+        // right-trim — a space sitting exactly at the wrap column is real
+        // text, trimming it would glue two words together. Only applies when
+        // the selection covers the row through its last column.
+        let soft_wrapped =
+            row_idx < r1 && c1 == last_col_in_row && row.last().is_some_and(|c| c.wrapline);
         if c1 < c0 {
             out.push('\n');
             continue;
@@ -940,6 +949,10 @@ fn extract_selection_text_cells(
             }
             let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
             line.push(ch);
+        }
+        if soft_wrapped {
+            out.push_str(&line);
+            continue;
         }
         // Right-trim trailing spaces — matches user intuition that a
         // selected line ending in blank padding shouldn't paste 80 spaces.
@@ -1614,6 +1627,59 @@ mod selection_tests {
         // Whole grid.
         let all = extract_selection_text_cells(&cells, (0, 0, 3, usize::MAX));
         assert_eq!(all, "old prompt\noutput one\noutput two\nnew prompt");
+    }
+
+    /// Rows as cells, with `wrapline` set on the last cell of every row whose
+    /// index is in `wrapped` — the shape alacritty leaves after a soft wrap.
+    fn wrapped_cells(rows: &[&str], wrapped: &[usize]) -> Vec<Vec<Cell>> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut row: Vec<Cell> = r.chars().map(cell).collect();
+                if wrapped.contains(&i)
+                    && let Some(last) = row.last_mut()
+                {
+                    last.wrapline = true;
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extract_joins_soft_wrapped_rows_into_one_line() {
+        // `"bio": "Donec … Cras dictum` wrapped at 10 cols. A real newline
+        // follows `nunc.",`; the next logical line keeps its own row.
+        let cells = wrapped_cells(
+            &["\"bio\": \"Cr", "as dictum ", "nunc.\",   ", "  \"v\": 6  "],
+            &[0, 1],
+        );
+        let txt = extract_selection_text_cells(&cells, (0, 0, 3, usize::MAX));
+        // The space at the wrap column (end of row 1) is real text — it must
+        // survive, not be trimmed into `dictumnunc`.
+        assert_eq!(txt, "\"bio\": \"Cras dictum nunc.\",\n  \"v\": 6");
+    }
+
+    #[test]
+    fn extract_soft_wrap_partial_last_row_and_single_row() {
+        let cells = wrapped_cells(&["abcde", "fgh  "], &[0]);
+        // Selection ending mid-way through the continuation row still joins.
+        assert_eq!(extract_selection_text_cells(&cells, (0, 2, 1, 1)), "cdefg");
+        // A selection that stops on the wrapped row itself adds nothing extra.
+        assert_eq!(extract_selection_text_cells(&cells, (0, 0, 0, 4)), "abcde");
+    }
+
+    #[test]
+    fn copy_round_trips_long_lines_through_the_real_parser() {
+        // The reported case: JSON with long `bio` lines echoed into a
+        // 55-column pane. Copying it back must reproduce the source, not the
+        // pane-width wrap points.
+        let src = "[\n  {\n    \"name\": \"Adeel Solangi\",\n    \"bio\": \"Donec lobortis eleifend condimentum. Cras dictum dolor lacinia lectus vehicula rutrum. Maecenas quis nisi nunc.\",\n    \"version\": 6.1\n  },\n  {\n    \"bio\": \"Vestibulum pharetra libero et velit gravida euismod. Quisque mauris ligula, efficitur porttitor sodales ac.\"\n  }\n]";
+        let mut state = oximux_pty::TerminalState::new(55, 40, 100);
+        state.advance(src.replace('\n', "\r\n").as_bytes());
+        let grid = state.fill_search_grid();
+        let txt = extract_selection_text_cells(&grid, (0, 0, grid.len() - 1, usize::MAX));
+        assert_eq!(txt.trim_end(), src);
     }
 }
 
