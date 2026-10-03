@@ -1194,7 +1194,8 @@ fn accumulate_scroll_lines(acc: &mut f32, delta_px: f32, line_height: f32) -> i3
 /// Faint top-right chip shown while the viewport is scrolled up off the live
 /// tail (`display_offset > 0`). Click it to jump back to the bottom; any
 /// keystroke also snaps down (`send_bytes` → `scroll_to_bottom`). The caller
-/// wires the click handler — this only builds the chip + pointer affordance.
+/// wires the click handler and anchors the chip (below the find bar when it
+/// is open) — this only builds the chip + pointer affordance.
 fn build_scroll_indicator(
     theme: &Theme,
     offset: usize,
@@ -1203,9 +1204,6 @@ fn build_scroll_indicator(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id("oximux-scroll-to-tail")
-        .absolute()
-        .top(px(6.0))
-        .right(px(10.0))
         .px(px(8.0))
         .py(px(2.0))
         .rounded(px(density.r_xs))
@@ -1216,7 +1214,7 @@ fn build_scroll_indicator(
         .border_color(theme.border_inactive)
         .cursor_pointer()
         // `↑` = U+2191 Upwards Arrow. `⤓` hints the click jumps to the tail.
-        .child(format!("↑ {offset} lines · ⤓"))
+        .child(format!("↑ {offset} {} · ⤓", if offset == 1 { "line" } else { "lines" }))
 }
 
 #[cfg(test)]

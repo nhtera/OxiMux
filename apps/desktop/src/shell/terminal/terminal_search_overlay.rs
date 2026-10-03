@@ -47,6 +47,9 @@ pub struct Params<'a> {
     pub query: &'a str,
     pub badge: String,
     pub caret_on: bool,
+    /// Whole query selected (Cmd+A): paint it on the selection colour and
+    /// hide the caret, the way a native text field shows a selection.
+    pub query_selected: bool,
     pub options: SearchOptions,
     pub theme: &'a Theme,
     pub typography: &'a Typography,
@@ -59,7 +62,9 @@ pub struct Params<'a> {
     pub on_close: ClickHandler,
 }
 
-/// Build the search overlay element. See [`Params`] for inputs.
+/// Build the search overlay element. See [`Params`] for inputs. The bar is
+/// not positioned: the host anchors it top-right together with the
+/// scrolled-up chip, so the two stack instead of overlapping.
 ///
 /// The trailing `+ use<>` is required under Rust 2024's precise-capture
 /// rules. Without it, the compiler conservatively captures every input
@@ -72,6 +77,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         query,
         badge,
         caret_on,
+        query_selected,
         options,
         theme,
         typography,
@@ -84,6 +90,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         on_close,
     } = params;
     let query_empty = query.is_empty();
+    let caret_on = caret_on && !query_selected;
     let query_text = if query_empty {
         SharedString::from("Find")
     } else {
@@ -96,9 +103,6 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
     let mono = typography.mono_font();
 
     div()
-        .absolute()
-        .top(px(8.0))
-        .right(px(12.0))
         .flex()
         .flex_row()
         .items_center()
@@ -142,7 +146,11 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
                             theme.fg_base
                         })
                         .when(query_empty, |this| this.italic())
-                        .child(query_text)
+                        .child(
+                            div()
+                                .when(query_selected, |this| this.bg(theme.selection))
+                                .child(query_text),
+                        )
                         .child(
                             // Editor-style caret. `caret_on` syncs with
                             // the terminal's 530ms blink_task — no second

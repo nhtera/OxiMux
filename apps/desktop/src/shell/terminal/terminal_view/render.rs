@@ -144,6 +144,7 @@ impl Render for TerminalView {
                     query: &query,
                     badge,
                     caret_on,
+                    query_selected: self.search.is_query_selected(),
                     options,
                     theme: &theme,
                     typography: &typography,
@@ -294,6 +295,9 @@ impl Render for TerminalView {
                     this.focus_handle.focus(window, cx);
                     // A click is where the input method starts over.
                     this.ime_typed.reset();
+                    // ...and where the find box loses its ⌘A selection, so a
+                    // grid selection made now is what ⌘C copies.
+                    this.search.deselect_query();
                     // Cmd-click on a link opens it instead of selecting/reporting.
                     if this.try_open_link(ev, window, cx) {
                         cx.notify();
@@ -468,9 +472,6 @@ impl Render for TerminalView {
                 this.on_key_down(event, window, cx);
             }))
             .child(grid_canvas);
-        if let Some(o) = overlay {
-            root = root.child(o);
-        }
         if let Some(badge) = dormant_badge {
             root = root.child(badge);
         }
@@ -492,8 +493,8 @@ impl Render for TerminalView {
         // Scrolled-up indicator: a faint chip while the viewport is off the
         // live tail, so the user knows new output is landing below the fold
         // and that any keystroke will snap back down.
-        if self.snapshot.display_offset > 0 {
-            root = root.child(build_scroll_indicator(&theme, self.snapshot.display_offset, self.density, &self.typography).on_mouse_down(
+        let scroll_chip = (self.snapshot.display_offset > 0).then(|| {
+            build_scroll_indicator(&theme, self.snapshot.display_offset, self.density, &self.typography).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                     // Click the chip to jump to the live tail. Stop propagation
@@ -502,7 +503,26 @@ impl Render for TerminalView {
                     this.scroll_to_tail(cx);
                     cx.stop_propagation();
                 }),
-            ));
+            )
+        });
+        // One top-right anchor for the find bar and, under it, the scroll
+        // chip. Each used to pin itself to the same corner, so scrolling up
+        // with find open hid the match count and nav buttons under the chip.
+        // No id or listeners on the anchor: clicks between the two still
+        // reach the grid.
+        if overlay.is_some() || scroll_chip.is_some() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(8.0))
+                    .right(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(4.0))
+                    .children(overlay)
+                    .children(scroll_chip),
+            );
         }
         // Overlay scrollbar on the right edge (only when scrollback exists).
         if let Some(bar) = self.render_scrollbar(&theme, cx) {
