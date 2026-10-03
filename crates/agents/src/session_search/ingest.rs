@@ -46,22 +46,46 @@ pub fn discover(sources: &IndexSources) -> Discovered {
         complete &= discover_claude(dir, &mut files);
     }
     if let Some(dir) = &sources.codex_dir {
-        let root = dir.join("sessions");
-        complete &= listable(&root);
         let mut found = Vec::new();
-        crate::session_log::session_index::collect_rollout_files(&root, 0, &mut found);
+        complete &= collect_rollouts(&dir.join("sessions"), 0, &mut found);
         files.extend(found.into_iter().filter_map(|p| source(p, Agent::Codex)));
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.stat.mtime_ms));
     Discovered { files, complete }
 }
 
-/// `dir` can be listed, or does not exist at all.
-fn listable(dir: &Path) -> bool {
-    match fs::read_dir(dir) {
-        Ok(_) => true,
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+/// Every `rollout-*.jsonl` under Codex's `sessions/YYYY/MM/DD` tree
+/// (depth-bounded, symlinks never followed). `false` when any directory in it
+/// failed to list for a reason other than not existing.
+fn collect_rollouts(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> bool {
+    const MAX_DEPTH: usize = 5;
+    if depth > MAX_DEPTH {
+        return true;
     }
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let mut complete = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
+        let Ok(ft) = entry.file_type() else {
+            complete = false;
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            complete &= collect_rollouts(&path, depth + 1, out);
+        } else if ft.is_file()
+            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+        {
+            out.push(path);
+        }
+    }
+    complete
 }
 
 /// `<claude_dir>/projects/<slug>/<session>.jsonl` — one level only, so
@@ -185,10 +209,10 @@ pub fn index_file(
         }
         let paused = due && (stop.load(Ordering::Relaxed) || Instant::now() >= deadline);
         if chars >= BATCH_CHARS || paused {
-            // A pause records the consumed offset as the size, so the next
-            // pass sees the file as changed and resumes it.
-            let size = if paused { consumed } else { file.stat.size.max(consumed) };
-            session_row_id = commit(conn, file, &key, &fallback_id, session_row_id, &meta, &rows, consumed, size)?;
+            // Mid-file: record the consumed offset as the size, so a read that
+            // never reaches the final commit (pause, crash, quit) leaves the
+            // file looking changed and the next pass resumes it.
+            session_row_id = commit(conn, file, &key, &fallback_id, session_row_id, &meta, &rows, consumed, consumed)?;
             meta = MetaDelta::default();
             rows.clear();
             chars = 0;

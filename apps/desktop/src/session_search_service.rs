@@ -86,10 +86,17 @@ impl SessionSearchService {
     }
     /// Detach what Clear needs so the slow half (joining the thread, deleting
     /// files) can run off the UI thread; finish with [`Self::resume`].
-    pub fn begin_clear(&mut self) -> ClearJob {
+    ///
+    /// `None` while another Clear (from any window) is still running: one
+    /// Clear at a time, so a finished one never restarts the indexer under a
+    /// second one still deleting files.
+    pub fn begin_clear(&mut self) -> Option<ClearJob> {
+        if self.clearing {
+            return None;
+        }
         self.clearing = true;
         let handles = [self.handle.take(), self.retired.take()].into_iter().flatten().collect();
-        ClearJob { handles, db_path: self.db_path.clone() }
+        Some(ClearJob { handles, db_path: self.db_path.clone() })
     }
 
     /// Restart (or not) after a clear, per the setting as it is now.
@@ -102,7 +109,7 @@ impl SessionSearchService {
     #[cfg(test)]
     fn clear(&mut self) -> anyhow::Result<()> {
         let was_running = self.is_running();
-        self.begin_clear().run()?;
+        self.begin_clear().expect("no Clear running").run()?;
         self.resume(was_running);
         Ok(())
     }
@@ -198,7 +205,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = service(dir.path());
         s.set_enabled(true);
-        let job = s.begin_clear();
+        let job = s.begin_clear().unwrap();
+        assert!(s.begin_clear().is_none(), "a second Clear waits for the first");
         s.set_enabled(false);
         s.set_enabled(true);
         assert!(!s.is_running(), "no indexer may start under a running Clear");

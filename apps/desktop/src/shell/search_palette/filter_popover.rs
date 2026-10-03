@@ -43,7 +43,8 @@ pub fn filter_popover(input: &ChromeInput<'_>) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(3.))
+                        // Half the smallest radius token: a 14px box.
+                        .rounded(px(input.density.r_xs * 0.5))
                         .border_1()
                         .border_color(if checked { theme.border_active } else { theme.border_inactive })
                         .when(checked, |d| {

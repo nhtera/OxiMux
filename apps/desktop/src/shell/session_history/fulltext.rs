@@ -87,6 +87,10 @@ pub struct FullText {
     pub total: usize,
     pub next_cursor: Option<String>,
     pub loading: bool,
+    /// The query, scope, sort or filter changed and the new first page has
+    /// not landed: the rows shown answer the old controls, so they are dimmed
+    /// and cannot be opened.
+    pub replacing: bool,
     /// The query the shown hits answer.
     pub shown_query: String,
     pub error: Option<String>,
@@ -150,23 +154,12 @@ pub fn hit_entry(hit: &SearchHit) -> SessionEntry {
     }
 }
 
-/// The open tab already running this hit's session: by the agent's own
-/// session id, else by exact cwd + title when exactly one tab fits. Never a
-/// guess between several.
+/// The open tab already running this hit's session, matched by the
+/// conversation id its agent reported. A tab that has not reported one yet is
+/// never guessed at by directory or title: two agents (or two sessions) can
+/// share both, and a wrong jump hides the session the user picked.
 pub fn live_tab_for<'a>(hit: &SearchHit, tabs: &'a [LiveTab]) -> Option<&'a LiveTab> {
-    if let Some(t) = tabs.iter().find(|t| t.provider_session.as_deref() == Some(hit.session_id.as_str())) {
-        return Some(t);
-    }
-    // Only tabs that have not reported an id: one that has is a different
-    // session, whatever its title says.
-    let cwd = hit.cwd.as_deref()?;
-    let mut fits = tabs
-        .iter()
-        .filter(|t| t.provider_session.is_none() && t.cwd == cwd && !hit.title.is_empty() && t.title == hit.title);
-    match (fits.next(), fits.next()) {
-        (Some(t), None) => Some(t),
-        _ => None,
-    }
+    tabs.iter().find(|t| t.provider_session.as_deref() == Some(hit.session_id.as_str()))
 }
 
 impl SessionHistoryModal {
@@ -211,6 +204,7 @@ impl SessionHistoryModal {
             return;
         };
         self.fulltext.loading = true;
+        self.fulltext.replacing = !self.fulltext.hits.is_empty();
         self.run_fulltext(req, false, Some(DEBOUNCE), cx);
     }
 
@@ -271,9 +265,19 @@ impl SessionHistoryModal {
                     return;
                 }
                 m.fulltext.loading = false;
+                m.fulltext.replacing = false;
                 match result {
                     Ok(page) => m.apply_page(page, append, query),
-                    Err(e) => m.fulltext.error = Some(e.to_string()),
+                    Err(e) => {
+                        // A failed first page must not leave the old rows
+                        // posing as its answer.
+                        if !append {
+                            m.fulltext.hits.clear();
+                            m.fulltext.total = 0;
+                            m.fulltext.next_cursor = None;
+                        }
+                        m.fulltext.error = Some(e.to_string());
+                    }
                 }
                 cx.notify();
             });
@@ -319,6 +323,9 @@ impl SessionHistoryModal {
     /// The selected row as a history entry, in either mode.
     pub(super) fn selected_entry(&self) -> Option<SessionEntry> {
         if self.fulltext_active() {
+            if self.fulltext.replacing {
+                return None;
+            }
             return self.fulltext.hits.get(self.selected_idx).map(hit_entry);
         }
         let order = self.filtered();
@@ -327,7 +334,7 @@ impl SessionHistoryModal {
 
     /// The open tab running the selected hit's session, if any.
     pub(super) fn selected_live_tab(&self) -> Option<LiveTab> {
-        if !self.fulltext_active() {
+        if !self.fulltext_active() || self.fulltext.replacing {
             return None;
         }
         let hit = self.fulltext.hits.get(self.selected_idx)?;
@@ -413,17 +420,12 @@ mod tests {
     }
 
     #[test]
-    fn live_tab_matches_by_session_then_unique_cwd_and_title() {
+    fn live_tab_matches_only_by_reported_session() {
         let h = hit("s1", "/r", "Fix login");
         let by_id = [tab(1, Some("other"), "/r", "Fix login"), tab(2, Some("s1"), "/x", "y")];
         assert_eq!(live_tab_for(&h, &by_id).map(|t| t.uid), Some(2));
-        let unique = [tab(3, None, "/r", "Fix login"), tab(4, None, "/r", "Other")];
-        assert_eq!(live_tab_for(&h, &unique).map(|t| t.uid), Some(3));
-        // Two tabs fit: never guess.
-        let ambiguous = [tab(5, None, "/r", "Fix login"), tab(6, None, "/r", "Fix login")];
-        assert!(live_tab_for(&h, &ambiguous).is_none());
-        // A tab that reported a different session is never a title match.
-        assert!(live_tab_for(&h, &[tab(7, Some("s2"), "/r", "Fix login")]).is_none());
+        // Same directory and title, no reported id: not a match.
+        assert!(live_tab_for(&h, &[tab(3, None, "/r", "Fix login")]).is_none());
         assert!(live_tab_for(&h, &[]).is_none());
     }
 }

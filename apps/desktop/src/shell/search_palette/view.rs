@@ -227,6 +227,7 @@ impl SearchPalette {
     pub(super) fn clear_filter(&mut self, cx: &mut Context<Self>) {
         if let Some(state) = self.state.as_mut() {
             state.clear_filter();
+            self.scroll.scroll_to_item(0);
             cx.notify();
         }
     }

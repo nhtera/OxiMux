@@ -48,14 +48,18 @@ impl Home {
         let root = dir.path().to_path_buf();
         Self { _dir: dir, root }
     }
+    // Built one component at a time: the indexer keys files by the path
+    // discovery yields, which on Windows uses backslashes throughout.
     fn claude_file(&self) -> PathBuf {
-        self.root.join(".claude/projects/-work-app").join(format!("{CLAUDE_SESSION}.jsonl"))
+        self.root.join(".claude").join("projects").join("-work-app").join(format!("{CLAUDE_SESSION}.jsonl"))
     }
     fn codex_file(&self) -> PathBuf {
-        self.root.join(".codex/sessions/2026/09/02/rollout-2026-09-02T08-00-00-0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl")
+        ["sessions", "2026", "09", "02", "rollout-2026-09-02T08-00-00-0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"]
+            .iter()
+            .fold(self.root.join(".codex"), |p, c| p.join(c))
     }
     fn db(&self) -> PathBuf {
-        self.root.join("data/session-search.sqlite")
+        self.root.join("data").join("session-search.sqlite")
     }
     fn worker(&self) -> Worker {
         let sources = IndexSources {

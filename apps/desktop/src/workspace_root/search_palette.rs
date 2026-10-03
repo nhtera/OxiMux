@@ -65,7 +65,17 @@ impl WorkspaceRoot {
                 }
             }
             Target::Worktree { workspace_id, project_id, worktree_path } => {
-                self.activate_workspace_by_ref(workspace_id, project_id, worktree_path, window, cx);
+                // The snapshot may predate an archive or delete in another
+                // window: activate only a row the rail still lists.
+                let live = self
+                    .rail_workspaces_by_project
+                    .get(&project_id)
+                    .is_some_and(|rows| rows.iter().any(|w| w.id == workspace_id && w.archived_at.is_none()));
+                if live {
+                    self.activate_workspace_by_ref(workspace_id, project_id, worktree_path, window, cx);
+                } else {
+                    toast(cx, ToastKind::Info, "That worktree no longer exists");
+                }
             }
             Target::Project { project_id } => {
                 if !self.switch_to_project(&project_id, window, cx) {

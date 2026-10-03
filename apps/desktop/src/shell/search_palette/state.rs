@@ -4,7 +4,7 @@
 
 use crate::shell::search_palette::model::{ItemRef, Snapshot, Target};
 use crate::shell::search_palette::rank::{Prepared, prepare};
-use crate::shell::search_palette::sections::{Entry, Expansions, ProjectFilter, layout};
+use crate::shell::search_palette::sections::{Entry, Expansions, ProjectFilter, Section, layout};
 
 /// What activating a row produced.
 #[derive(Clone)]
@@ -109,17 +109,24 @@ impl PaletteState {
         }
     }
 
-    /// ⌘N: the recent tab carrying digit `n` — empty query only.
+    /// ⌘N: the recent tab carrying digit `n` — empty query only. ⌘1–9
+    /// reach the nine most recent tabs even while only six are shown.
     pub fn quick_select(&self, n: u8) -> Option<Target> {
         if !self.prepared.is_empty() {
             return None;
         }
-        self.entries.iter().find_map(|e| match e {
-            Entry::Item { item: item @ ItemRef::Tab(_), digit: Some(d), .. } if *d == n => {
-                Some(self.snapshot.target(*item))
-            }
-            _ => None,
-        })
+        let find = |entries: &[Entry]| {
+            entries.iter().find_map(|e| match e {
+                Entry::Item { item: item @ ItemRef::Tab(_), digit: Some(d), .. } if *d == n => Some(*item),
+                _ => None,
+            })
+        };
+        let item = find(&self.entries).or_else(|| {
+            let mut expanded = self.expansions.clone();
+            expanded.insert(Section::RecentTabs, 1);
+            find(&layout(&self.snapshot, &self.prepared, &self.filter, &expanded))
+        })?;
+        Some(self.snapshot.target(item))
     }
 
     /// Per-project row counts (tabs + worktrees) for the filter popover.
@@ -137,8 +144,13 @@ impl PaletteState {
 
     fn relayout_and_select_first(&mut self) {
         self.entries = layout(&self.snapshot, &self.prepared, &self.filter, &self.expansions);
-        // The first item, never a hint or the "Create worktree" row.
-        self.selected = self.entries.iter().position(|e| matches!(e, Entry::Item { .. }));
+        // The first item, never a hint. "Create worktree" only when it is
+        // the one thing Enter could do — never ahead of a real match.
+        self.selected = self
+            .entries
+            .iter()
+            .position(|e| matches!(e, Entry::Item { .. }))
+            .or_else(|| self.entries.iter().position(|e| matches!(e, Entry::CreateWorktree(_))));
     }
 }
 
@@ -203,13 +215,22 @@ mod tests {
     }
 
     #[test]
-    fn create_worktree_row_is_never_initially_selected() {
+    fn create_worktree_row_is_selected_only_when_alone() {
         let mut s = PaletteState::new(snapshot(0, 0));
         s.set_query("brand-new");
-        assert_eq!(s.selected, None);
-        s.move_selection(1);
         assert!(matches!(selected_entry(&s), Entry::CreateWorktree(n) if n == "brand-new"));
         assert!(matches!(s.activate_selected(), Some(Outcome::Run(Target::CreateWorktree(_)))));
+        // With a real match, the match is selected, not the create row.
+        let mut s = PaletteState::new(snapshot(2, 0));
+        s.set_query("tab");
+        assert!(matches!(selected_entry(&s), Entry::Item { .. }));
+    }
+
+    #[test]
+    fn quick_select_reaches_tabs_behind_see_more() {
+        let s = PaletteState::new(snapshot(9, 0));
+        assert!(s.quick_select(9).is_some(), "⌘9 works while only six rows show");
+        assert!(PaletteState::new(snapshot(9, 0)).quick_select(10).is_none());
     }
 
     #[test]

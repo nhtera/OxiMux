@@ -191,7 +191,26 @@ fn candidates_for(conn: &Connection, expr: &str, req: &SearchRequest) -> Result<
             filters.join(" AND ")
         )
     };
-    let from = if scoped.is_empty() { " WHERE messages_fts MATCH ?1".to_string() } else { scoped };
+    // Newest picks its candidates by recency, so the caps never drop a recent
+    // session in favour of an older, better-scoring one; that needs the
+    // session row inside the CTE even without a filter.
+    let (from, cte_order, outer_order) = match req.sort {
+        Sort::Relevance => (
+            if scoped.is_empty() { " WHERE messages_fts MATCH ?1".to_string() } else { scoped },
+            "score DESC",
+            "score DESC",
+        ),
+        Sort::Newest => (
+            if scoped.is_empty() {
+                " JOIN messages m ON m.id = f.rowid JOIN sessions s ON s.id = m.session_row_id WHERE messages_fts MATCH ?1"
+                    .to_string()
+            } else {
+                scoped
+            },
+            "s.updated_ms DESC, score DESC",
+            "s.updated_ms DESC, score DESC",
+        ),
+    };
     // bm25() is unavailable inside an aggregate, so rows are scored in a
     // materialized CTE and grouped outside it. With one max() aggregate,
     // SQLite takes the bare columns (rowid, role) from the max row.
@@ -199,7 +218,7 @@ fn candidates_for(conn: &Connection, expr: &str, req: &SearchRequest) -> Result<
         "WITH hits AS MATERIALIZED (
            SELECT f.rowid AS rid, -bm25(messages_fts, {WEIGHTS}) AS score
            FROM messages_fts f{from}
-           ORDER BY score DESC LIMIT {ROW_CAP}
+           ORDER BY {cte_order} LIMIT {ROW_CAP}
          )
          SELECT m.session_row_id, max(h.score) AS score, h.rid, m.role,
            s.agent, s.session_id, COALESCE(s.custom_title, s.ai_title, s.last_prompt, s.first_prompt, ''),
@@ -207,7 +226,7 @@ fn candidates_for(conn: &Connection, expr: &str, req: &SearchRequest) -> Result<
          FROM hits h
          JOIN messages m ON m.id = h.rid
          JOIN sessions s ON s.id = m.session_row_id
-         GROUP BY m.session_row_id ORDER BY score DESC LIMIT {CANDIDATE_CAP}"
+         GROUP BY m.session_row_id ORDER BY {outer_order} LIMIT {CANDIDATE_CAP}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn ToSql> = args.iter().map(|a| a.as_ref()).collect();

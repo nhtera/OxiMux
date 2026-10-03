@@ -30,11 +30,17 @@ pub(crate) struct SessionSearchPane {
     idle: Option<IndexStatus>,
     /// First Clear click arms it; the second clears.
     confirm_clear: bool,
-    clearing: bool,
+    /// The last save or Clear failure, shown until the next attempt.
+    notice: Option<String>,
 }
 
 fn enabled(cx: &gpui::App) -> bool {
     cx.try_global::<SessionSearchSettings>().is_some_and(|s| s.enabled)
+}
+
+/// A Clear is running — from this window or any other.
+fn clearing(cx: &gpui::App) -> bool {
+    cx.try_global::<SessionSearchService>().is_some_and(SessionSearchService::is_clearing)
 }
 
 /// What the card shows right now.
@@ -89,13 +95,17 @@ pub(super) fn entries(
         theme,
         |this: &mut SettingsModal, _w, cx| {
             // A Clear holds toggles until it has deleted the index.
-            if this.session_search.clearing {
+            if clearing(cx) {
                 return;
             }
             let next = SessionSearchSettings { enabled: !enabled(cx) };
             if let Err(err) = crate::session_search_settings::save(&next, cx) {
                 tracing::warn!(%err, "session_search.toml write failed");
+                this.session_search.notice = Some(format!("Couldn't save the setting: {err}"));
+                cx.notify();
+                return;
             }
+            this.session_search.notice = None;
             this.session_search.idle = None;
             // Turning off: read the file's numbers now (the indexer is told to
             // stop only after this handler returns).
@@ -110,7 +120,8 @@ pub(super) fn entries(
     let status = current_status(modal, cx);
     let pane = &modal.session_search;
     let has_data = status.as_ref().is_some_and(|s| s.db_bytes > 0);
-    let clear_label = match (pane.clearing, pane.confirm_clear) {
+    let busy = clearing(cx);
+    let clear_label = match (busy, pane.confirm_clear) {
         (true, _) => "Clearing…",
         (false, true) => "Click again to clear",
         (false, false) => "Clear search data",
@@ -119,7 +130,7 @@ pub(super) fn entries(
         "session-search-clear",
         clear_label,
         ChipTone::Danger,
-        has_data && !pane.clearing,
+        has_data && !busy,
         theme,
         density,
         typography,
@@ -141,7 +152,13 @@ pub(super) fn entries(
             toggle,
         ),
         entry("Index", status_line(on, status.as_ref()), status_value(&size, theme, typography)),
-        entry("Search data", "Deleting it is safe: the index is rebuilt from the transcripts.", clear),
+        entry(
+            "Search data",
+            pane.notice
+                .clone()
+                .unwrap_or_else(|| "Deleting it is safe: the index is rebuilt from the transcripts.".to_string()),
+            clear,
+        ),
     ]
 }
 
@@ -263,17 +280,23 @@ impl SettingsModal {
             return;
         }
         self.session_search.confirm_clear = false;
-        self.session_search.clearing = true;
-        let job = cx.update_global::<SessionSearchService, _>(|s, _| s.begin_clear());
+        // Another window's Clear is still running: that one finishes the job.
+        let Some(job) = cx.update_global::<SessionSearchService, _>(|s, _| s.begin_clear()) else {
+            return;
+        };
+        self.session_search.notice = None;
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { job.run() }).await;
-            let _ = this.update(cx, |this, cx| {
-                if let Err(err) = result {
-                    tracing::warn!(%err, "clearing the session index failed");
-                }
+            // The service resumes even if this window closed meanwhile.
+            cx.update(|cx| {
                 let on = enabled(cx);
                 cx.update_global::<SessionSearchService, _>(|s, _| s.resume(on));
-                this.session_search.clearing = false;
+            });
+            let _ = this.update(cx, |this, cx| {
+                if let Err(err) = &result {
+                    tracing::warn!(%err, "clearing the session index failed");
+                    this.session_search.notice = Some(format!("Couldn't clear search data: {err:#}"));
+                }
                 this.session_search.idle = None;
                 cx.notify();
             });

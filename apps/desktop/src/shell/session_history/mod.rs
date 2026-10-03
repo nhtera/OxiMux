@@ -615,7 +615,8 @@ impl Render for SessionHistoryModal {
 
         if fulltext {
             for (i, hit) in self.fulltext.hits.iter().enumerate() {
-                list = list.child(fulltext_rows::hit_row(i, hit, i == selected, show_all, &rows_cx));
+                let stale = self.fulltext.replacing;
+                list = list.child(fulltext_rows::hit_row(i, hit, i == selected, show_all, stale, &rows_cx));
             }
             if self.fulltext.hits.is_empty() && !self.fulltext.loading {
                 let msg = match &self.fulltext.error {

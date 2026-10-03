@@ -68,7 +68,7 @@ fn line(child: impl IntoElement, size: f32, color: gpui::Hsla) -> impl IntoEleme
     )
 }
 
-pub fn hit_row(i: usize, hit: &SearchHit, selected: bool, show_all: bool, cx: &Ctx<'_>) -> AnyElement {
+pub fn hit_row(i: usize, hit: &SearchHit, selected: bool, show_all: bool, stale: bool, cx: &Ctx<'_>) -> AnyElement {
     let entry = hit_entry(hit);
     let title = picker::session_row_title(&entry);
     let mut meta = picker::session_row_subtitle(&entry, cx.now_ms, show_all, cx.home);
@@ -92,6 +92,8 @@ pub fn hit_row(i: usize, hit: &SearchHit, selected: bool, show_all: bool, cx: &C
         .cursor_pointer()
         .when(selected, |d| d.bg(cx.theme.selection))
         .when(!selected, |d| d.hover(|s| s.bg(cx.theme.hover_overlay)))
+        // Rows answering the previous query wait for the new one.
+        .when(stale, |d| d.opacity(0.45))
         .on_mouse_down(MouseButton::Left, move |_e, window, cx| {
             ent.update(cx, |m, cx| m.import_selected(i, window, cx));
         })
@@ -169,6 +171,16 @@ pub fn results_bar(m: &SessionHistoryModal, cx: &Ctx<'_>) -> AnyElement {
                 .child(sort_chip("hits-sort-relevance", "Most relevant", Sort::Relevance))
                 .child(sort_chip("hits-sort-newest", "Newest", Sort::Newest)),
         )
+        .when_some(ft.error.clone().filter(|_| !ft.hits.is_empty()), |d, err| {
+            d.child(
+                div()
+                    .px(px(12.))
+                    .pb(px(4.))
+                    .text_size(px(cx.typography.t_sub_label))
+                    .text_color(cx.theme.status_error)
+                    .child(format!("Search failed: {err}")),
+            )
+        })
         .when(ft.indexing, |d| {
             d.child(
                 div()

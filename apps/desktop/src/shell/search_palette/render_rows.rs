@@ -315,9 +315,11 @@ fn keycap(label: &str, cx: &RowCtx<'_>) -> impl IntoElement {
 /// `▪ project · worktree` — tint square (the worktree's tab colour, else a
 /// neutral swatch) then the location, truncated past [`LOCATION_MAX_W`].
 fn location_chip(label: &str, tint: Option<u32>, cx: &RowCtx<'_>) -> impl IntoElement {
+    // Half the smallest radius token: an 8px swatch.
+    let radius = px(cx.density.r_xs * 0.5);
     let swatch = match tint {
-        Some(hex) => div().size(px(8.)).rounded(px(2.)).bg(rgb(hex)),
-        None => div().size(px(8.)).rounded(px(2.)).bg(cx.theme.fg_subtle),
+        Some(hex) => div().size(px(8.)).rounded(radius).bg(rgb(hex)),
+        None => div().size(px(8.)).rounded(radius).bg(cx.theme.fg_subtle),
     };
     div()
         .flex()

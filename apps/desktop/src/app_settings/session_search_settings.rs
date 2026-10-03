@@ -23,12 +23,15 @@ pub fn install(cx: &mut App) {
     cx.set_global(settings);
 }
 
-/// Persist `settings` and swap the global (which starts or stops the indexer).
+/// Persist `settings`, then swap the global (which starts or stops the
+/// indexer). A failed write changes nothing, so the running state never
+/// disagrees with what the next launch will read.
 pub fn save(settings: &SessionSearchSettings, cx: &mut App) -> std::io::Result<()> {
-    cx.set_global(settings.clone());
     let path = settings_path().ok_or_else(|| std::io::Error::other("no app data dir for session_search.toml"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, settings.to_toml_string())
+    std::fs::write(&path, settings.to_toml_string())?;
+    cx.set_global(settings.clone());
+    Ok(())
 }

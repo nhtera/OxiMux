@@ -516,7 +516,7 @@ fn collect_codex(codex_dir: &Path, scope: &SessionScope, out: &mut Vec<SessionEn
 /// Depth-bounded collection of every `rollout-*.jsonl` under the sessions tree.
 /// Codex nests three levels deep (`YYYY/MM/DD`); the cap guards a pathological
 /// tree from unbounded recursion. Symlinked entries are never followed.
-pub(crate) fn collect_rollout_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn collect_rollout_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     const MAX_DEPTH: usize = 5;
     if depth > MAX_DEPTH {
         return;
