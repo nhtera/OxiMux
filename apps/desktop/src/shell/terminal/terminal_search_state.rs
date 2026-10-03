@@ -43,6 +43,17 @@ pub enum SearchKeyOutcome {
     /// this the chord fell through to the terminal's own paste path and the
     /// clipboard went to the shell instead of the find box.
     PasteRequested,
+    /// The query's selection changed without editing it: Cmd+A selected the
+    /// whole query (or the empty box swallowed the chord), or a caret key
+    /// collapsed the selection. Host only repaints. Without the Cmd+A claim
+    /// the chord fell through to the terminal's own select-all and
+    /// highlighted the grid instead of the find box.
+    SelectionChanged,
+    /// Cmd+C landed while the query was selected. The host copies
+    /// [`SearchState::query`] to the clipboard. Without the claim the chord
+    /// fell through to the terminal's copy, which sends SIGINT to the shell
+    /// when the grid has no selection.
+    CopyRequested,
 }
 
 /// Which highlight style applies to a match cell run. `Current` is the
@@ -85,6 +96,17 @@ pub struct SearchState {
     /// needle (scroll-driven refreshes, toggles that don't affect the
     /// pattern) skip recompilation. `None` also covers invalid patterns.
     compiled: Option<(String, bool, regex::Regex)>,
+    /// Whether the whole query is selected (Cmd+A). The find box has no
+    /// movable caret, so "everything selected" is the only selection it can
+    /// hold: the next edit replaces the query, Backspace clears it, and Cmd+C
+    /// copies it. Private so only the edit paths below can set or clear it.
+    query_selected: bool,
+    /// Whether the find box has the keyboard. The terminal keeps the GPUI
+    /// focus either way; this decides whether [`Self::handle_key`] claims
+    /// keystrokes or hands them to the terminal. Opening (Cmd+F) or clicking
+    /// the bar sets it; a click on the grid clears it, so with the bar still
+    /// open the user can type, Cmd+A, or Esc in the terminal itself.
+    input_focused: bool,
 }
 
 impl Default for SearchState {
@@ -103,15 +125,53 @@ impl SearchState {
             current_index: None,
             options: SearchOptions::default(),
             compiled: None,
+            query_selected: false,
+            input_focused: false,
         }
     }
 
-    /// Flip into search mode. Idempotent — re-opening preserves the query
-    /// so a stray Cmd+F while already open is a no-op state-wise (host
-    /// still triggers a re-scan against a fresh grid, which is what the
-    /// user expects).
+    /// Whether the whole query is selected (Cmd+A), for the overlay paint.
+    pub fn is_query_selected(&self) -> bool {
+        self.query_selected
+    }
+
+    /// Whether the find box has the keyboard, for the overlay paint (caret
+    /// and focus ring).
+    pub fn is_input_focused(&self) -> bool {
+        self.active && self.input_focused
+    }
+
+    /// Give the keyboard back to the find box (a click on the bar).
+    pub fn focus_input(&mut self) {
+        self.input_focused = true;
+    }
+
+    /// Hand the keyboard to the terminal while the bar stays open (a click
+    /// on the grid). Drops any query selection with it, so Cmd+C copies the
+    /// grid selection again.
+    pub fn blur_input(&mut self) {
+        self.input_focused = false;
+        self.query_selected = false;
+    }
+
+    /// Drop the query if it is selected, so the edit that follows replaces
+    /// it rather than appending to it. Returns whether anything was dropped.
+    fn take_selected_query(&mut self) -> bool {
+        if !std::mem::take(&mut self.query_selected) {
+            return false;
+        }
+        self.query.clear();
+        true
+    }
+
+    /// Flip into search mode and give the find box the keyboard. Re-opening
+    /// preserves the query and selects it, the way Cmd+F does in a browser or
+    /// editor: typing replaces the old needle, Enter keeps searching for it.
+    /// (Host still triggers a re-scan against a fresh grid.)
     pub fn open(&mut self) {
         self.active = true;
+        self.input_focused = true;
+        self.query_selected = !self.query.is_empty();
     }
 
     /// Close the overlay and drop all search state. Host calls `cx.notify`
@@ -122,6 +182,8 @@ impl SearchState {
         self.matches.clear();
         self.history_len = 0;
         self.current_index = None;
+        self.query_selected = false;
+        self.input_focused = false;
     }
 
     /// Re-scan the grid for the current query under the current `options`.
@@ -209,8 +271,9 @@ impl SearchState {
         self.current_index = Some(prev);
     }
 
-    /// Append clipboard text to the query. Returns whether the query
-    /// changed, so the host knows whether a re-scan is due.
+    /// Append clipboard text to the query — or replace it, when it is
+    /// selected. Returns whether the query changed, so the host knows whether
+    /// a re-scan is due.
     ///
     /// Only the first line is taken: the scan is row-major, so a needle
     /// containing a line break can never match, and a multi-line paste into
@@ -219,10 +282,15 @@ impl SearchState {
     /// `handle_key` rejects control characters — the grid never holds them.
     pub fn paste(&mut self, text: &str) -> bool {
         let first_line = text.split(['\n', '\r']).next().unwrap_or("");
-        let before = self.query.len();
-        self.query
-            .extend(first_line.chars().filter(|c| !c.is_control()));
-        self.query.len() != before
+        let pasted: String = first_line.chars().filter(|c| !c.is_control()).collect();
+        // A paste with nothing printable leaves a selected query selected,
+        // the way a text field ignores an empty clipboard.
+        if pasted.is_empty() {
+            return false;
+        }
+        self.take_selected_query();
+        self.query.push_str(&pasted);
+        true
     }
 
     /// Format the count badge for the overlay: empty when no query, else
@@ -239,8 +307,10 @@ impl SearchState {
     }
 
     /// Dispatch a keystroke while the overlay is active. Returns
-    /// `SearchKeyOutcome::Pass` when search is inactive (or the keystroke
-    /// carries Cmd/Ctrl/Alt — those should reach the regular path).
+    /// `SearchKeyOutcome::Pass` when search is inactive, when the terminal
+    /// has the keyboard (the user clicked back into the grid), or when the
+    /// keystroke carries a Cmd/Ctrl/Alt chord the box does not claim — those
+    /// reach the regular terminal path.
     ///
     /// Bindings:
     /// - Escape       → dismiss
@@ -248,17 +318,28 @@ impl SearchState {
     /// - Shift+Enter  → prev match (cycle back)
     /// - Up           → prev match
     /// - Down         → next match
-    /// - Backspace    → pop char (re-runs scan)
+    /// - Backspace    → pop char, or clear a selected query (re-runs scan)
+    /// - Delete       → clear a selected query
     /// - Cmd+V / Ctrl+Shift+V → paste into the query (host reads clipboard)
-    /// - Printable    → append (re-runs scan)
+    /// - Cmd+A        → select the whole query
+    /// - Left/Right/Home/End → collapse a selected query
+    /// - Cmd+C        → copy the query, when it is selected (host writes it)
+    /// - Printable    → append, or replace a selected query (re-runs scan)
     /// - Other        → swallow (no repaint)
     pub fn handle_key(&mut self, event: &KeyDownEvent) -> SearchKeyOutcome {
-        if !self.active {
+        if !self.active || !self.input_focused {
             return SearchKeyOutcome::Pass;
         }
         let ks = &event.keystroke;
         if is_paste_chord(&ks.modifiers, &ks.key) {
             return SearchKeyOutcome::PasteRequested;
+        }
+        if is_cmd_chord(&ks.modifiers, &ks.key, "a") {
+            self.query_selected = !self.query.is_empty();
+            return SearchKeyOutcome::SelectionChanged;
+        }
+        if self.query_selected && is_cmd_chord(&ks.modifiers, &ks.key, "c") {
+            return SearchKeyOutcome::CopyRequested;
         }
         if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt {
             return SearchKeyOutcome::Pass;
@@ -284,8 +365,23 @@ impl SearchState {
                 self.next_match();
                 return SearchKeyOutcome::CurrentChanged;
             }
+            // Caret keys collapse the selection, so the next key appends
+            // again instead of replacing; with nothing selected they stay
+            // swallowed (the caret is pinned to the end of the query).
+            "left" | "right" | "home" | "end" if self.query_selected => {
+                self.query_selected = false;
+                return SearchKeyOutcome::SelectionChanged;
+            }
+            // Forward Delete clears a selected query like Backspace; with
+            // the caret pinned to the end there is nothing after it otherwise.
+            "delete" if self.query_selected => {
+                self.take_selected_query();
+                return SearchKeyOutcome::QueryChanged;
+            }
             "backspace" => {
-                self.query.pop();
+                if !self.take_selected_query() {
+                    self.query.pop();
+                }
                 return SearchKeyOutcome::QueryChanged;
             }
             _ => {}
@@ -304,6 +400,7 @@ impl SearchState {
         if let Some(s) = candidate
             && s.chars().all(|c| !c.is_control())
         {
+            self.take_selected_query();
             self.query.push_str(s);
             return SearchKeyOutcome::QueryChanged;
         }
@@ -388,6 +485,12 @@ fn is_paste_chord(mods: &gpui::Modifiers, key: &str) -> bool {
     cmd_v || ctrl_shift_v
 }
 
+/// Plain Cmd+`key` — no Shift/Ctrl/Alt, so `Cmd+Shift+A` and friends keep
+/// reaching whatever else binds them.
+fn is_cmd_chord(mods: &gpui::Modifiers, key: &str, want: &str) -> bool {
+    key == want && mods.platform && !mods.control && !mods.alt && !mods.shift
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,7 +518,8 @@ mod tests {
             s.handle_key(&key("ctrl-shift-v")),
             SearchKeyOutcome::PasteRequested
         ));
-        // Other Cmd chords (copy, select-all) still belong to the terminal.
+        // Other Cmd chords (copy with nothing selected in the box) still
+        // belong to the terminal.
         assert!(matches!(s.handle_key(&key("cmd-c")), SearchKeyOutcome::Pass));
         assert!(matches!(s.handle_key(&key("cmd-shift-v")), SearchKeyOutcome::Pass));
         assert!(matches!(s.handle_key(&key("ctrl-v")), SearchKeyOutcome::Pass));
@@ -440,6 +544,161 @@ mod tests {
         assert!(!s.paste("\x1b\x07"));
         assert!(!s.paste("\r\nonly a second line"));
         assert_eq!(s.query, "nmk-copilotx!");
+    }
+
+    #[test]
+    fn select_all_selects_the_query_not_the_terminal() {
+        let mut s = SearchState::new();
+        // Closed overlay: Cmd+A is the terminal's select-all.
+        assert!(matches!(s.handle_key(&key("cmd-a")), SearchKeyOutcome::Pass));
+
+        s.open();
+        // Empty box still claims the chord so the grid is never selected,
+        // but there is nothing to select.
+        assert!(matches!(
+            s.handle_key(&key("cmd-a")),
+            SearchKeyOutcome::SelectionChanged
+        ));
+        assert!(!s.is_query_selected());
+
+        s.query.push_str("ssss");
+        assert!(matches!(
+            s.handle_key(&key("cmd-a")),
+            SearchKeyOutcome::SelectionChanged
+        ));
+        assert!(s.is_query_selected());
+        assert_eq!(s.query, "ssss", "selecting never edits the query");
+
+        // Cmd+Shift+A is not select-all; it keeps reaching the terminal.
+        assert!(matches!(
+            s.handle_key(&key("cmd-shift-a")),
+            SearchKeyOutcome::Pass
+        ));
+    }
+
+    #[test]
+    fn selected_query_is_replaced_cleared_or_copied() {
+        let mut s = SearchState::new();
+        s.open();
+
+        // Typing over a selection replaces the query.
+        s.query.push_str("ssss");
+        s.handle_key(&key("cmd-a"));
+        assert!(matches!(s.handle_key(&key("x")), SearchKeyOutcome::QueryChanged));
+        assert_eq!(s.query, "x");
+        assert!(!s.is_query_selected());
+        // ...and a second key appends again.
+        s.handle_key(&key("y"));
+        assert_eq!(s.query, "xy");
+
+        // Backspace over a selection clears the whole query.
+        s.handle_key(&key("cmd-a"));
+        assert!(matches!(
+            s.handle_key(&key("backspace")),
+            SearchKeyOutcome::QueryChanged
+        ));
+        assert!(s.query.is_empty());
+        assert!(!s.is_query_selected());
+
+        // Forward Delete clears a selection too; without one it is a no-op
+        // (the caret is pinned to the end of the query).
+        s.query.push_str("abc");
+        assert!(matches!(s.handle_key(&key("delete")), SearchKeyOutcome::Consumed));
+        assert_eq!(s.query, "abc");
+        s.handle_key(&key("cmd-a"));
+        assert!(matches!(
+            s.handle_key(&key("delete")),
+            SearchKeyOutcome::QueryChanged
+        ));
+        assert!(s.query.is_empty());
+        assert!(!s.is_query_selected());
+
+        // Paste over a selection replaces; an empty paste keeps it selected.
+        s.query.push_str("old");
+        s.handle_key(&key("cmd-a"));
+        assert!(!s.paste("\n"));
+        assert!(s.is_query_selected());
+        assert!(s.paste("new"));
+        assert_eq!(s.query, "new");
+        assert!(!s.is_query_selected());
+
+        // Cmd+C copies only while the query is selected; otherwise the
+        // terminal keeps its copy / SIGINT behaviour.
+        assert!(matches!(s.handle_key(&key("cmd-c")), SearchKeyOutcome::Pass));
+        s.handle_key(&key("cmd-a"));
+        assert!(matches!(
+            s.handle_key(&key("cmd-c")),
+            SearchKeyOutcome::CopyRequested
+        ));
+        assert!(s.is_query_selected(), "copy keeps the selection");
+
+        // A caret key collapses the selection; the next key appends again.
+        s.query.push_str("ab");
+        s.handle_key(&key("cmd-a"));
+        assert!(matches!(
+            s.handle_key(&key("right")),
+            SearchKeyOutcome::SelectionChanged
+        ));
+        assert!(!s.is_query_selected());
+        s.handle_key(&key("c"));
+        assert_eq!(s.query, "newabc");
+
+        // A click on the grid deselects, so Cmd+C copies the grid again.
+        s.handle_key(&key("cmd-a"));
+        s.blur_input();
+        assert!(matches!(s.handle_key(&key("cmd-c")), SearchKeyOutcome::Pass));
+
+        // Match navigation leaves the selection alone; closing drops it.
+        s.focus_input();
+        s.handle_key(&key("cmd-a"));
+        s.handle_key(&key("enter"));
+        assert!(s.is_query_selected());
+        s.handle_key(&key("escape"));
+        assert!(!s.is_query_selected());
+        assert!(s.query.is_empty());
+    }
+
+    #[test]
+    fn grid_click_hands_every_key_to_the_terminal() {
+        let mut s = SearchState::new();
+        s.open();
+        assert!(s.is_input_focused());
+        s.query.push_str("needle");
+
+        // Back in the grid: the bar stays open, but select-all, typing, Esc
+        // and paste all belong to the terminal again.
+        s.blur_input();
+        assert!(s.active);
+        assert!(!s.is_input_focused());
+        for chord in ["cmd-a", "cmd-c", "cmd-v", "x", "backspace", "escape", "enter"] {
+            assert!(
+                matches!(s.handle_key(&key(chord)), SearchKeyOutcome::Pass),
+                "{chord} must reach the terminal"
+            );
+        }
+        assert_eq!(s.query, "needle", "the query is untouched");
+        assert!(!s.is_query_selected());
+
+        // Clicking the bar takes the keyboard back.
+        s.focus_input();
+        assert!(matches!(
+            s.handle_key(&key("cmd-a")),
+            SearchKeyOutcome::SelectionChanged
+        ));
+        assert!(s.is_query_selected());
+
+        // Cmd+F from the grid refocuses the box with its query selected, so
+        // typing replaces the old needle.
+        s.blur_input();
+        s.open();
+        assert!(s.is_input_focused());
+        assert!(s.is_query_selected());
+        s.handle_key(&key("z"));
+        assert_eq!(s.query, "z");
+
+        // Closing drops focus with the rest of the state.
+        s.close();
+        assert!(!s.is_input_focused());
     }
 
     fn hit(row: usize) -> MatchRange {

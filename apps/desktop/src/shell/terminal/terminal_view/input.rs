@@ -816,6 +816,20 @@ impl TerminalView {
                 cx.stop_propagation();
                 return;
             }
+            SearchKeyOutcome::SelectionChanged => {
+                // ⌘A selects the find box's query, never the grid behind it;
+                // a caret key collapses that selection again.
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            SearchKeyOutcome::CopyRequested => {
+                // ⌘C on a selected query copies it; falling through would hit
+                // `copy_selection` / the SIGINT fallback below instead.
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.search.query.clone()));
+                cx.stop_propagation();
+                return;
+            }
         }
 
         let ks = &event.keystroke;

@@ -47,7 +47,11 @@ impl Render for TerminalView {
         //                           where the next letter goes. At the shell's
         //                           caret it sat at the START of the syllable.
         let pane_focused = self.focus_handle.is_focused(window);
-        let cursor_visible = !pane_focused || (self.ime_marked.is_none() && self.cursor_visible);
+        // The find box borrows the keyboard without taking GPUI focus, so the
+        // terminal cursor goes steady + ghosted like an unfocused pane's —
+        // otherwise two carets blink and both claim the next keystroke.
+        let cursor_focused = pane_focused && !self.search.is_input_focused();
+        let cursor_visible = !cursor_focused || (self.ime_marked.is_none() && self.cursor_visible);
         let cursor = if cursor_visible {
             (
                 self.snapshot.cursor.0 as usize,
@@ -91,6 +95,7 @@ impl Render for TerminalView {
             cursor_shape: self.snapshot.cursor_shape,
             buckets,
             pane_focused,
+            cursor_focused,
             pad,
             hovered_link: self.underlinable_hover(cx),
             selection: self.selection,
@@ -110,6 +115,15 @@ impl Render for TerminalView {
             // Toggle handlers flip the bit and rerun the scan. Rerun
             // touches the backend so it has to live inside the listener
             // (we have `&mut Self` + `&mut Context` here).
+            // A click on the bar hands the keyboard back to the find box.
+            // It also focuses the pane (the grid's own mouse-down never runs
+            // for it) and stops the click before it starts a grid selection.
+            let on_focus_input = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                this.focus_handle.focus(window, cx);
+                this.search.focus_input();
+                cx.stop_propagation();
+                cx.notify();
+            })) as terminal_search_overlay::ToggleHandler;
             let on_toggle_case = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
                 this.search.toggle_case_sensitive();
                 this.rerun_search(cx);
@@ -144,10 +158,13 @@ impl Render for TerminalView {
                     query: &query,
                     badge,
                     caret_on,
+                    query_selected: self.search.is_query_selected(),
+                    input_focused: self.search.is_input_focused(),
                     options,
                     theme: &theme,
                     typography: &typography,
                     density: self.density,
+                    on_focus_input,
                     on_toggle_case,
                     on_toggle_word,
                     on_toggle_regex,
@@ -294,6 +311,10 @@ impl Render for TerminalView {
                     this.focus_handle.focus(window, cx);
                     // A click is where the input method starts over.
                     this.ime_typed.reset();
+                    // ...and where the find box hands the keyboard back to the
+                    // terminal: with the bar still open, typing, ⌘A, ⌘C and Esc
+                    // act on the terminal again (a click on the bar refocuses).
+                    this.search.blur_input();
                     // Cmd-click on a link opens it instead of selecting/reporting.
                     if this.try_open_link(ev, window, cx) {
                         cx.notify();
@@ -379,8 +400,11 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                    // Focus the pane being acted on (matches left-click).
+                    // Focus the pane being acted on (matches left-click),
+                    // keyboard included: the find box lets go of it, so the
+                    // menu's Copy and a later ⌘C act on the grid word.
                     this.focus_handle.focus(window, cx);
+                    this.search.blur_input();
                     // A mouse-reporting app consumes the press — never shadow
                     // its own right-click handling with a local menu.
                     if this.report_mouse(
@@ -468,9 +492,6 @@ impl Render for TerminalView {
                 this.on_key_down(event, window, cx);
             }))
             .child(grid_canvas);
-        if let Some(o) = overlay {
-            root = root.child(o);
-        }
         if let Some(badge) = dormant_badge {
             root = root.child(badge);
         }
@@ -492,8 +513,8 @@ impl Render for TerminalView {
         // Scrolled-up indicator: a faint chip while the viewport is off the
         // live tail, so the user knows new output is landing below the fold
         // and that any keystroke will snap back down.
-        if self.snapshot.display_offset > 0 {
-            root = root.child(build_scroll_indicator(&theme, self.snapshot.display_offset, self.density, &self.typography).on_mouse_down(
+        let scroll_chip = (self.snapshot.display_offset > 0).then(|| {
+            build_scroll_indicator(&theme, self.snapshot.display_offset, self.density, &self.typography).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                     // Click the chip to jump to the live tail. Stop propagation
@@ -502,7 +523,26 @@ impl Render for TerminalView {
                     this.scroll_to_tail(cx);
                     cx.stop_propagation();
                 }),
-            ));
+            )
+        });
+        // One top-right anchor for the find bar and, under it, the scroll
+        // chip. Each used to pin itself to the same corner, so scrolling up
+        // with find open hid the match count and nav buttons under the chip.
+        // No id or listeners on the anchor: clicks between the two still
+        // reach the grid.
+        if overlay.is_some() || scroll_chip.is_some() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(8.0))
+                    .right(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(4.0))
+                    .children(overlay)
+                    .children(scroll_chip),
+            );
         }
         // Overlay scrollbar on the right edge (only when scrollback exists).
         if let Some(bar) = self.render_scrollbar(&theme, cx) {

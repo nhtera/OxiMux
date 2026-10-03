@@ -12,10 +12,10 @@
 //! chevron + close use `gpui_component::Button` for icon-glyph parity with
 //! the rest of the UI.
 //!
-//! Anti-`.occlude()` lesson still applies: the outer container has no
-//! `.id()` / `.occlude()` / wrapper listeners. Click capture happens only
-//! on the inline toggle divs + nav buttons, so clicks outside their
-//! bounding boxes pass through to the terminal grid behind.
+//! Anti-`.occlude()` lesson still applies: nothing here has `.id()` /
+//! `.occlude()` or a full-area wrapper. The bar's own mouse-down (see
+//! [`Params::on_focus_input`]) fires only inside its bounds, so clicks
+//! anywhere else still reach the terminal grid behind.
 
 use gpui::{
     App, ClickEvent, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -47,10 +47,20 @@ pub struct Params<'a> {
     pub query: &'a str,
     pub badge: String,
     pub caret_on: bool,
+    /// Whole query selected (Cmd+A): paint it on the selection colour and
+    /// hide the caret, the way a native text field shows a selection.
+    pub query_selected: bool,
+    /// The find box has the keyboard. Off after a click on the grid: the
+    /// caret hides and the frame drops its focus ring, so it is clear typing
+    /// goes to the terminal.
+    pub input_focused: bool,
     pub options: SearchOptions,
     pub theme: &'a Theme,
     pub typography: &'a Typography,
     pub density: Density,
+    /// Mouse-down anywhere on the bar: the find box takes the keyboard
+    /// back, and the click stops here instead of reaching the grid.
+    pub on_focus_input: ToggleHandler,
     pub on_toggle_case: ToggleHandler,
     pub on_toggle_word: ToggleHandler,
     pub on_toggle_regex: ToggleHandler,
@@ -59,7 +69,9 @@ pub struct Params<'a> {
     pub on_close: ClickHandler,
 }
 
-/// Build the search overlay element. See [`Params`] for inputs.
+/// Build the search overlay element. See [`Params`] for inputs. The bar is
+/// not positioned: the host anchors it top-right together with the
+/// scrolled-up chip, so the two stack instead of overlapping.
 ///
 /// The trailing `+ use<>` is required under Rust 2024's precise-capture
 /// rules. Without it, the compiler conservatively captures every input
@@ -72,10 +84,13 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         query,
         badge,
         caret_on,
+        query_selected,
+        input_focused,
         options,
         theme,
         typography,
         density,
+        on_focus_input,
         on_toggle_case,
         on_toggle_word,
         on_toggle_regex,
@@ -84,6 +99,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         on_close,
     } = params;
     let query_empty = query.is_empty();
+    let caret_on = caret_on && input_focused && !query_selected;
     let query_text = if query_empty {
         SharedString::from("Find")
     } else {
@@ -96,9 +112,6 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
     let mono = typography.mono_font();
 
     div()
-        .absolute()
-        .top(px(8.0))
-        .right(px(12.0))
         .flex()
         .flex_row()
         .items_center()
@@ -109,12 +122,14 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         .border_1()
         .border_color(theme.border_inactive)
         .rounded(px(density.r_xs))
+        .on_mouse_down(MouseButton::Left, on_focus_input)
         .child(
             // Input frame: query | toggles | badge, all on one row. Border
-            // uses `focus_ring` because the overlay is the active keyboard
-            // target while open (TerminalView intercepts keystrokes through
-            // the search state machine), so the input is, in effect,
-            // focused — committing to the focused style up front is honest.
+            // uses `focus_ring` while the find box has the keyboard
+            // (TerminalView routes keystrokes through the search state
+            // machine) and drops to the resting input border once a grid
+            // click hands typing back to the terminal — still a field, just
+            // not the one receiving keys.
             div()
                 .flex()
                 .flex_row()
@@ -125,7 +140,11 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
                 .min_w(px(260.0))
                 .bg(theme.bg_base)
                 .border_1()
-                .border_color(theme.focus_ring)
+                .border_color(if input_focused {
+                    theme.focus_ring
+                } else {
+                    theme.border_input
+                })
                 .rounded(px(density.r_xs))
                 .font(mono.clone())
                 .text_size(px(typography.t_body_lg))
@@ -142,7 +161,11 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
                             theme.fg_base
                         })
                         .when(query_empty, |this| this.italic())
-                        .child(query_text)
+                        .child(
+                            div()
+                                .when(query_selected, |this| this.bg(theme.selection))
+                                .child(query_text),
+                        )
                         .child(
                             // Editor-style caret. `caret_on` syncs with
                             // the terminal's 530ms blink_task — no second
