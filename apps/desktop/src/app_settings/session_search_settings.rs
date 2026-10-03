@@ -31,7 +31,13 @@ pub fn save(settings: &SessionSearchSettings, cx: &mut App) -> std::io::Result<(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, settings.to_toml_string())?;
+    // Write beside the target, then rename over it: a failed write leaves the
+    // previous file intact instead of truncated.
+    let tmp = path.with_extension("toml.tmp");
+    if let Err(e) = std::fs::write(&tmp, settings.to_toml_string()).and_then(|()| std::fs::rename(&tmp, &path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     cx.set_global(settings.clone());
     Ok(())
 }

@@ -48,7 +48,7 @@ pub fn discover(sources: &IndexSources) -> Discovered {
     if let Some(dir) = &sources.codex_dir {
         let mut found = Vec::new();
         complete &= collect_rollouts(&dir.join("sessions"), 0, &mut found);
-        files.extend(found.into_iter().filter_map(|p| source(p, Agent::Codex)));
+        files.extend(found.into_iter().filter_map(|p| source(p, Agent::Codex, &mut complete)));
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.stat.mtime_ms));
     Discovered { files, complete }
@@ -109,15 +109,24 @@ fn discover_claude(claude_dir: &Path, out: &mut Vec<SourceFile>) -> bool {
         for f in files.flatten() {
             let path = f.path();
             if path.extension().is_some_and(|e| e == "jsonl") && f.file_type().is_ok_and(|t| t.is_file()) {
-                out.extend(source(path, Agent::Claude));
+                out.extend(source(path, Agent::Claude, &mut complete));
             }
         }
     }
     complete
 }
 
-fn source(path: PathBuf, agent: Agent) -> Option<SourceFile> {
-    let meta = fs::metadata(&path).ok()?;
+/// Stat a listed file. A file gone since the listing is simply absent; any
+/// other failure clears `complete`, so a transient error never retires the
+/// file's indexed content.
+fn source(path: PathBuf, agent: Agent, complete: &mut bool) -> Option<SourceFile> {
+    let meta = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            *complete &= e.kind() == std::io::ErrorKind::NotFound;
+            return None;
+        }
+    };
     let mtime_ms = meta
         .modified()
         .ok()
