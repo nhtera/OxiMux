@@ -29,7 +29,7 @@ pub(crate) use state::turn_in_flight;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
@@ -223,8 +223,41 @@ pub struct PaneGroupTab {
     /// every tab settle into its saved slot regardless of mount order. `None`
     /// outside of restore — cleared once the strip has settled.
     pub restore_rank: Option<usize>,
+    /// Process-unique id, stable across reorder / close of siblings — the
+    /// search palette addresses any tab kind by it (indices drift). Assigned
+    /// by [`PaneGroupTab::new`], the one constructor every tab goes through.
+    pub uid: u64,
+    /// Unix ms of the last time this tab became most-recently-used (stamped
+    /// in `bump_mru`); `0` = never focused this run. Drives the palette's
+    /// recent-tabs order. Runtime-only.
+    pub last_focused_ms: i64,
     pub _observer: Option<Subscription>,
     pub _status_task: Option<Task<()>>,
+}
+
+static NEXT_TAB_UID: AtomicU64 = AtomicU64::new(1);
+
+impl PaneGroupTab {
+    /// A tab with every optional field at its default. All tab construction
+    /// goes through here (call sites override fields with struct-update
+    /// syntax) so `uid` can never be forgotten or duplicated.
+    pub(crate) fn new(label: SharedString, content: PaneContent, kind: PaneGroupTabKind) -> Self {
+        Self {
+            label,
+            content,
+            kind,
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            uid: NEXT_TAB_UID.fetch_add(1, Ordering::Relaxed),
+            last_focused_ms: 0,
+            _observer: None,
+            _status_task: None,
+        }
+    }
 }
 
 /// Saved per-tab state re-applied during a restore. Bundled so the many

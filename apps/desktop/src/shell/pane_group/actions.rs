@@ -35,6 +35,25 @@ impl PaneGroup {
         true
     }
 
+    /// Activate the tab with this [`PaneGroupTab::uid`], any kind. `false`
+    /// when this group no longer holds it (closed, or moved to another group).
+    pub fn activate_by_uid(&mut self, uid: u64, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(idx) = self.tabs.iter().position(|t| t.uid == uid) else {
+            return false;
+        };
+        self.set_active(idx, window, cx);
+        true
+    }
+
+    /// Clear every tab's focus stamp. Restore re-selects the saved active
+    /// tab through `set_active`, which is not a visit this run; clearing lets
+    /// the search palette fall back to session-history recency instead.
+    pub fn forget_focus_stamps(&mut self) {
+        for tab in &mut self.tabs {
+            tab.last_focused_ms = 0;
+        }
+    }
+
     /// Cycle to the tab AFTER the active tab in VISUAL order. After the
     /// user drag-reorders chips, `tab_order` no longer matches the
     /// insertion-order `tabs` vector — walking `tabs.len()` directly

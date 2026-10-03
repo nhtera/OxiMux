@@ -28,6 +28,7 @@ pub mod ports_panel;
 pub mod pr_dialog;
 pub mod project_panes;
 pub mod right_sidebar;
+pub mod search_palette;
 pub mod search_panel;
 pub mod session_history;
 pub mod settings_modal;

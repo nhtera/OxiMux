@@ -15,6 +15,7 @@ pub mod project_panes_factory;
 pub mod relay_lifecycle;
 pub mod remote_control;
 pub mod scheduler;
+pub mod session_search_service;
 pub mod shell;
 pub mod state;
 // Staging and swapping an install, verified before it is trusted: a `.app`
@@ -53,7 +54,8 @@ pub use app_settings::{
     commit_message_ai_settings,
     computer_use_settings, dictation_settings, font_settings, git_settings, keybindings_settings,
     motion_settings,
-    port_label_settings, scm_layout_settings, simulator_settings, terminal_settings,
+    port_label_settings, scm_layout_settings, session_search_settings, simulator_settings,
+    terminal_settings,
 };
 #[doc(inline)]
 pub use loaders::{

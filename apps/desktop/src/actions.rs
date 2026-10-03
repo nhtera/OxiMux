@@ -171,16 +171,12 @@ pub struct OpenFileFromContextMenu {
     pub split_right: bool,
 }
 
-/// Fired when a workspace-jump (Cmd+J) palette row is activated. Carries the
-/// minimal identity `WorkspaceRoot::activate_workspace` needs so the handler
-/// builds the target `Workspace` without re-resolving (synthesized "primary"
-/// rows are not DB rows). Dispatched at the workspace level.
+/// ⌘1…⌘9 inside the search palette: activate the recent tab carrying this
+/// digit. Bound only in the palette's key context (empty query).
 #[derive(Clone, Debug, Default, PartialEq, Action)]
 #[action(namespace = oximux, no_json)]
-pub struct ActivateWorkspaceFromJump {
-    pub workspace_id: String,
-    pub project_id: String,
-    pub worktree_path: String,
+pub struct SearchPaletteQuickSelect {
+    pub digit: u8,
 }
 
 /// Right-click in the empty area below the file tree. Carries the
@@ -484,6 +480,10 @@ actions!(
         /// search input binds `Ctrl+A` itself (line start on macOS, select
         /// all elsewhere) and would consume the key first.
         ToggleSessionHistoryScope,
+        /// Open the search palette's project filter. Bound to `Tab` in the
+        /// palette's key context — an action because GPUI consumes `Tab` for
+        /// focus navigation before element key listeners see it.
+        SearchPaletteFocusFilter,
         /// Split the focused pane horizontally — new pane on the right.
         /// Alias of `SplitRight`. Kept for legacy callers; the Cmd+D
         /// keybinding now drives `SplitSubPaneRight` instead so it
@@ -690,9 +690,10 @@ actions!(
         OpenQuickOpen,
         /// Open the action Command Palette (Cmd+Shift+P). Phase 05.
         OpenCommandPalette,
-        /// Open the workspace-jump palette (Cmd+J): fuzzy-jump to any
-        /// workspace/worktree across every project.
-        OpenWorkspaceJump,
+        /// Open the search palette (Cmd+J, left-rail Search row): recent tabs
+        /// and worktrees, plus typed search across tabs, worktrees, projects,
+        /// settings and actions. Keymap id stays `open_workspace_jump`.
+        OpenSearchPalette,
         /// Open the inline adapter-picker popover anchored to the `+`
         /// button. Cmd+Shift+A reroutes here so the keyboard and mouse
         /// paths converge on the same surface. A second dispatch while the

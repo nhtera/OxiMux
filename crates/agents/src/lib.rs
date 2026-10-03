@@ -21,6 +21,7 @@ pub mod schedule;
 pub mod session_registry;
 pub mod runtime_impl;
 pub mod session_log;
+pub mod session_search;
 pub mod status_machine;
 pub mod tab_title;
 pub mod team;

@@ -15,7 +15,12 @@
 //! All non-GPUI logic — row labels, fuzzy filtering, resume/fork mapping —
 //! lives in [`picker`] so it stays unit-testable; this file is the thin view.
 
+mod fulltext;
+mod fulltext_rows;
+pub mod jump;
 pub mod picker;
+
+pub use fulltext::{HistoryContext, HistoryScope};
 
 use gpui::{
     AnyElement, Animation, AnimationExt, App, AppContext, Context, Entity, EventEmitter,
@@ -94,6 +99,10 @@ const PREVIEW_MAX_MESSAGES: usize = 8;
 /// focus (the modal grabs focus on open).
 pub enum SessionHistoryEvent {
     Closed,
+    /// Focus the open tab already running a session (full-text hit).
+    JumpToTab { project_id: String, uid: u64 },
+    /// Open Settings › Agents at the session-search card.
+    OpenSessionSearchSettings,
 }
 
 pub struct SessionHistoryModal {
@@ -104,11 +113,14 @@ pub struct SessionHistoryModal {
     loading: bool,
     /// Captured at open time so row ages render consistently for the frame.
     now_ms: i64,
-    /// Active project's launch dirs (root + worktrees) — the default scope.
-    /// Empty when no project is active, which forces the all-projects view.
-    scope_paths: Vec<String>,
-    /// When true, ignore `scope_paths` and list every project (the ⌃A view).
-    show_all: bool,
+    /// Active project's launch dirs (root + worktrees), the active worktree,
+    /// and the open agent tabs — captured at open.
+    context: HistoryContext,
+    /// Which sessions are listed (⌃A cycles the offered scopes). Without an
+    /// active project only `All` is offered.
+    scope: HistoryScope,
+    /// Transcript search (session search on, query ≥ 2 chars).
+    fulltext: fulltext::FullText,
     /// Which agent-type segment the list is narrowed to (chips + `Tab`).
     type_filter: AgentTypeFilter,
     /// Entry index the preview pane currently shows (or is loading). `None`
@@ -142,8 +154,9 @@ impl SessionHistoryModal {
             entries: Vec::new(),
             loading: false,
             now_ms: 0,
-            scope_paths: Vec::new(),
-            show_all: false,
+            context: HistoryContext::default(),
+            scope: HistoryScope::All,
+            fulltext: fulltext::FullText::default(),
             type_filter: AgentTypeFilter::All,
             preview_idx: None,
             preview_msgs: Vec::new(),
@@ -162,16 +175,18 @@ impl SessionHistoryModal {
 
     /// Open the modal, focus its query field, and scan past sessions.
     ///
-    /// `scope_paths` are the active project's launch dirs (root + worktrees);
-    /// the default view lists only those, mirroring Claude Code's same-repo
-    /// `/resume`. An empty list (no active project) opens the all view.
-    pub fn open(&mut self, scope_paths: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// `context.project_paths` are the active project's launch dirs (root +
+    /// worktrees); the default view lists only those, mirroring Claude Code's
+    /// same-repo `/resume`. An empty list (no active project) opens the all
+    /// view.
+    pub fn open(&mut self, context: HistoryContext, window: &mut Window, cx: &mut Context<Self>) {
         self.open = true;
         self.query.clear();
         self.selected_idx = 0;
         self.now_ms = now_unix_ms();
-        self.scope_paths = scope_paths;
-        self.show_all = self.scope_paths.is_empty();
+        self.scope = if context.project_paths.is_empty() { HistoryScope::All } else { HistoryScope::Project };
+        self.context = context;
+        self.fulltext.reset(cx);
         self.type_filter = AgentTypeFilter::All;
         let input = self.ensure_query_input(window, cx);
         input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -192,6 +207,7 @@ impl SessionHistoryModal {
             if matches!(ev, InputEvent::Change) {
                 this.query = input.read(cx).value().to_string();
                 this.selected_idx = 0;
+                this.schedule_fulltext(cx);
                 this.refresh_preview(cx);
                 cx.notify();
             }
@@ -199,6 +215,15 @@ impl SessionHistoryModal {
         self.query_input = Some(input.clone());
         self._query_sub = Some(sub);
         input
+    }
+
+    /// What should hold focus while the modal is open: the search input, or
+    /// the modal root before the input exists.
+    fn query_focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.query_input {
+            Some(input) => input.read(cx).focus_handle(cx),
+            None => self.focus_handle.clone(),
+        }
     }
 
     /// Put keyboard focus in the search input (falls back to the modal root
@@ -219,7 +244,7 @@ impl SessionHistoryModal {
     /// else a terminal resume); ⇧↵ forks into a terminal.
     fn confirm(&mut self, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
         if shift {
-            self.launch(self.selected_idx, LaunchKind::Fork, window, cx);
+            self.launch_selected(LaunchKind::Fork, window, cx);
         } else {
             self.import_selected(self.selected_idx, window, cx);
         }
@@ -234,6 +259,7 @@ impl SessionHistoryModal {
         }
         self.type_filter = filter;
         self.selected_idx = 0;
+        self.schedule_fulltext(cx);
         self.refresh_preview(cx);
         cx.notify();
     }
@@ -243,15 +269,22 @@ impl SessionHistoryModal {
         self.set_type_filter(self.type_filter.next(), cx);
     }
 
-    /// Flip between this-project and all-projects scope, then re-scan (⌃A).
-    /// No-op without an active project — that view is already all-projects.
-    fn toggle_show_all(&mut self, cx: &mut Context<Self>) {
-        if self.scope_paths.is_empty() {
+    /// Advance to the next offered scope (⌃A): worktree → project → all when
+    /// session search is on, project ↔ all otherwise. No-op without an active
+    /// project — that view is already all-projects.
+    fn cycle_scope(&mut self, cx: &mut Context<Self>) {
+        let next = self.scope.next(&self.offered_scopes());
+        self.set_scope(next, cx);
+    }
+
+    fn set_scope(&mut self, scope: HistoryScope, cx: &mut Context<Self>) {
+        if self.scope == scope {
             return;
         }
-        self.show_all = !self.show_all;
+        self.scope = scope;
         self.selected_idx = 0;
         self.rescan(cx);
+        self.schedule_fulltext(cx);
         cx.notify();
     }
 
@@ -265,10 +298,12 @@ impl SessionHistoryModal {
         // entries land.
         self.preview_idx = None;
         self.preview_msgs.clear();
-        let scope = if self.show_all {
-            SessionScope::AllProjects
-        } else {
-            SessionScope::Projects(self.scope_paths.clone())
+        let scope = match self.scope {
+            HistoryScope::All => SessionScope::AllProjects,
+            HistoryScope::Project => SessionScope::Projects(self.context.project_paths.clone()),
+            HistoryScope::Worktree => {
+                SessionScope::Projects(self.context.worktree_path.iter().cloned().collect())
+            }
         };
         let task = cx.spawn(async move |this, cx| {
             let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone()) else {
@@ -301,6 +336,12 @@ impl SessionHistoryModal {
     /// if it isn't already shown. Reads the log off-thread; a generation guard
     /// drops a stale result when the selection moved on before it finished.
     fn refresh_preview(&mut self, cx: &mut Context<Self>) {
+        // Full-text hits preview their snippet; nothing to load.
+        if self.fulltext_active() {
+            self.preview_idx = None;
+            self.preview_loading = false;
+            return;
+        }
         let order = self.filtered();
         let Some(&entry_idx) = order.get(self.selected_idx) else {
             self.preview_idx = None;
@@ -390,14 +431,15 @@ impl SessionHistoryModal {
         picker::filter_sessions_typed(&self.query, self.type_filter, &self.entries)
     }
 
-    /// Short scope label for the header: the project folder name when scoped,
-    /// "All projects" in the all view (or when there's no active project).
+    /// Short scope label for the header: the worktree or project folder name
+    /// when scoped, "All projects" in the all view (or with no active project).
     fn scope_label(&self) -> String {
-        if self.show_all {
-            return "All projects".to_string();
-        }
-        self.scope_paths
-            .first()
+        let path = match self.scope {
+            HistoryScope::All => return "All projects".to_string(),
+            HistoryScope::Worktree => self.context.worktree_path.as_ref(),
+            HistoryScope::Project => self.context.project_paths.first(),
+        };
+        path
             .map(|p| {
                 std::path::Path::new(p)
                     .file_name()
@@ -417,20 +459,10 @@ impl SessionHistoryModal {
         cx.notify();
     }
 
-    /// Relaunch the session at filtered-list position `list_idx`: dispatch a
-    /// resume/fork action and close. No-op when out of range.
-    fn launch(
-        &mut self,
-        list_idx: usize,
-        kind: LaunchKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let order = self.filtered();
-        let Some(&entry_idx) = order.get(list_idx) else {
-            return;
-        };
-        let Some(entry) = self.entries.get(entry_idx) else {
+    /// Relaunch the selected session (title row or full-text hit): dispatch a
+    /// resume/fork action and close. No-op with nothing selected.
+    fn launch_selected(&mut self, kind: LaunchKind, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_entry() else {
             return;
         };
         // Pi resumes by rollout file path (`pi --session <file>`); OpenCode /
@@ -456,19 +488,15 @@ impl SessionHistoryModal {
         window.dispatch_action(Box::new(action), cx);
     }
 
-    /// Reopen the session at filtered-list position `list_idx` as a chat tab:
-    /// dispatch [`OpenChatSession`] — which imports the transcript and spawns a
-    /// resumed chat — then close. No-op for adapters without a chat runner (ACP
-    /// presets, terminal-only) or when out of range.
-    fn open_as_chat(&mut self, list_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.filtered();
-        let Some(&entry_idx) = order.get(list_idx) else {
+    /// Reopen the selected session as a chat tab: dispatch [`OpenChatSession`]
+    /// — which imports the transcript and spawns a resumed chat — then close.
+    /// No-op for adapters without a chat runner (ACP presets, terminal-only)
+    /// or with nothing selected.
+    fn open_as_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_entry() else {
             return;
         };
-        let Some(entry) = self.entries.get(entry_idx) else {
-            return;
-        };
-        if !entry_opens_as_chat(entry) {
+        if !entry_opens_as_chat(&entry) {
             return;
         }
         let action = OpenChatSession {
@@ -496,24 +524,27 @@ impl SessionHistoryModal {
     /// `default_open_mode`) — otherwise resumes in a terminal. So a user who set
     /// their agent to open as chat gets a chat tab on import; the classic
     /// terminal-default user is unchanged.
+    ///
+    /// A full-text hit whose session is already open in a tab jumps there
+    /// instead — resuming would start a second CLI on the same conversation.
     fn import_selected(&mut self, list_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.filtered();
-        let Some(&entry_idx) = order.get(list_idx) else {
+        self.selected_idx = list_idx;
+        if self.jump_to_live_tab(window, cx) {
+            return;
+        }
+        let Some(entry) = self.selected_entry() else {
             return;
         };
-        let Some(entry) = self.entries.get(entry_idx) else {
-            return;
-        };
-        let id = picker::entry_slug(entry);
-        let open_chat = entry_opens_as_chat(entry)
+        let id = picker::entry_slug(&entry);
+        let open_chat = entry_opens_as_chat(&entry)
             && cx
                 .try_global::<oximux_settings::AgentLaunchSettings>()
                 .map(|s| s.opens_as_chat(id))
                 .unwrap_or(false);
         if open_chat {
-            self.open_as_chat(list_idx, window, cx);
+            self.open_as_chat(window, cx);
         } else {
-            self.launch(list_idx, LaunchKind::Resume, window, cx);
+            self.launch_selected(LaunchKind::Resume, window, cx);
         }
     }
 }
@@ -553,13 +584,23 @@ impl Render for SessionHistoryModal {
         let density = self.density;
         let typography = self.typography.clone();
         let motion = crate::motion_settings::active(cx);
-        let order = self.filtered();
-        let row_count = order.len();
+        let fulltext = self.fulltext_active();
+        let order = if fulltext { Vec::new() } else { self.filtered() };
+        let row_count = self.row_count();
         let selected = self.selected_idx;
         let entity = cx.entity();
+        let show_all = self.scope == HistoryScope::All;
         // Home dir for `~`-abbreviating cwd paths (all-mode rows + preview meta).
         let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
         let selected_entry = order.get(selected).and_then(|&i| self.entries.get(i));
+        let rows_cx = fulltext_rows::Ctx {
+            theme,
+            density,
+            typography: &typography,
+            entity: entity.clone(),
+            now_ms: self.now_ms,
+            home: home.as_deref(),
+        };
 
         let mut list = div()
             .id("session-history-list")
@@ -572,7 +613,20 @@ impl Render for SessionHistoryModal {
             .h(px(LIST_MAX_HEIGHT))
             .overflow_y_scroll();
 
-        if self.loading {
+        if fulltext {
+            for (i, hit) in self.fulltext.hits.iter().enumerate() {
+                let stale = self.fulltext.replacing;
+                list = list.child(fulltext_rows::hit_row(i, hit, i == selected, show_all, stale, &rows_cx));
+            }
+            if self.fulltext.hits.is_empty() && !self.fulltext.loading {
+                let msg = match &self.fulltext.error {
+                    Some(err) => format!("Search failed: {err}"),
+                    None => "No conversations mention that".to_string(),
+                };
+                list = list.child(hint_row(&msg, theme, &typography));
+            }
+            list = list.children(fulltext_rows::load_more_row(self, &rows_cx));
+        } else if self.loading {
             list = list.child(hint_row("Scanning sessions…", theme, &typography));
         } else if row_count == 0 {
             let seg_msg;
@@ -596,7 +650,7 @@ impl Render for SessionHistoryModal {
                 let entry = &self.entries[entry_idx];
                 let title = picker::session_row_title(entry);
                 let subtitle =
-                    picker::session_row_subtitle(entry, self.now_ms, self.show_all, home.as_deref());
+                    picker::session_row_subtitle(entry, self.now_ms, show_all, home.as_deref());
                 let is_selected = i == selected;
                 let ent = entity.clone();
                 // Each line is a flex-row wrapper holding a min-w-0 text child —
@@ -664,6 +718,13 @@ impl Render for SessionHistoryModal {
             }
         }
 
+        if !self.fulltext.available
+            && cx.has_global::<crate::session_search_service::SessionSearchService>()
+            && self.query.trim().chars().count() >= fulltext::MIN_QUERY_CHARS
+        {
+            list = list.child(fulltext_rows::enable_hint_row(&rows_cx));
+        }
+
         // Preview pane (right): the highlighted session's opening exchange +
         // metadata, mirroring Claude's `/resume` preview.
         let mut preview = div()
@@ -676,7 +737,17 @@ impl Render for SessionHistoryModal {
             .py(px(12.))
             .gap(px(10.))
             .overflow_y_scroll();
-        if let Some(entry) = selected_entry {
+        if fulltext {
+            match self.fulltext.hits.get(selected) {
+                Some(hit) => {
+                    let live = self.selected_live_tab().is_some();
+                    preview = preview.child(fulltext_rows::hit_preview(hit, live, &rows_cx));
+                }
+                None => {
+                    preview = preview.child(preview_hint("Select a result to preview", theme, &typography));
+                }
+            }
+        } else if let Some(entry) = selected_entry {
             let title = picker::session_row_title(entry);
             let mut meta = picker::session_row_subtitle(entry, self.now_ms, true, home.as_deref());
             if let Some(n) = entry.message_count {
@@ -752,6 +823,18 @@ impl Render for SessionHistoryModal {
             None => div().into_any_element(),
         };
 
+        let scope_control = if self.fulltext.available {
+            fulltext_rows::scope_chips(self, &rows_cx)
+        } else {
+            scope_text(&self.scope_label(), theme, &typography)
+        };
+        let results_bar = fulltext.then(|| fulltext_rows::results_bar(self, &rows_cx));
+        let footer = footer_hints(
+            self.scope.next(&self.offered_scopes()),
+            self.offered_scopes().len() > 1,
+            theme,
+            &typography,
+        );
         let dismiss_entity = entity.clone();
         let card = div()
             .flex()
@@ -761,13 +844,7 @@ impl Render for SessionHistoryModal {
             .overflow_hidden()
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_e, _window, cx| cx.stop_propagation())
-            .child(header_row(
-                query_field,
-                &self.scope_label(),
-                theme,
-                density,
-                &typography,
-            ))
+            .child(header_row(query_field, scope_control, theme, density, &typography))
             .child(type_filter_chips(
                 self.type_filter,
                 theme,
@@ -776,9 +853,10 @@ impl Render for SessionHistoryModal {
                 entity.clone(),
             ))
             .child(divider(theme))
+            .children(results_bar)
             .child(body)
             .child(divider(theme))
-            .child(footer_hints(self.show_all, self.scope_paths.is_empty(), theme, &typography));
+            .child(footer);
 
         div()
             .absolute()
@@ -798,13 +876,13 @@ impl Render for SessionHistoryModal {
             })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &OpenHistoryEntryAsChat, window, cx| {
-                this.open_as_chat(this.selected_idx, window, cx);
+                this.open_as_chat(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CycleSessionTypeFilter, _window, cx| {
                 this.cycle_type_filter(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSessionHistoryScope, _window, cx| {
-                this.toggle_show_all(cx);
+                this.cycle_scope(cx);
             }))
             // The focused search `Input` turns Esc / ↵ / ↑ / ↓ into its own
             // actions before raw key listeners on ancestors run, so they are
@@ -820,19 +898,19 @@ impl Render for SessionHistoryModal {
             .capture_action(cx.listener(|this, ev: &InputEnter, window, cx| {
                 cx.stop_propagation();
                 if ev.secondary {
-                    this.open_as_chat(this.selected_idx, window, cx);
+                    this.open_as_chat(window, cx);
                 } else {
                     this.confirm(ev.shift, window, cx);
                 }
             }))
             .capture_action(cx.listener(move |this, _: &MoveUp, _window, cx| {
                 cx.stop_propagation();
-                let n = this.filtered().len();
+                let n = this.row_count();
                 this.move_selection(-1, n, cx);
             }))
             .capture_action(cx.listener(move |this, _: &MoveDown, _window, cx| {
                 cx.stop_propagation();
-                let n = this.filtered().len();
+                let n = this.row_count();
                 this.move_selection(1, n, cx);
             }))
             // Fallback for when focus sits on the modal root rather than the
@@ -857,7 +935,7 @@ impl Render for SessionHistoryModal {
 
 fn header_row(
     query_field: AnyElement,
-    scope: &str,
+    scope: AnyElement,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -884,17 +962,22 @@ fn header_row(
                 .text_color(theme.fg_muted)
                 .child("History"),
         )
-        // Current scope — the project folder name, or "All projects" (⌃A).
-        .child(
-            div()
-                .max_w(px(220.))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_size(px(typography.t_sub_label))
-                .text_color(theme.fg_subtle)
-                .child(scope.to_string()),
-        )
+        // Current scope — the folder name / "All projects", or the scope
+        // chips when session search is on (⌃A cycles either).
+        .child(scope)
         .child(div().flex_1().min_w_0().child(query_field))
+}
+
+/// The scope as plain text (session search off).
+fn scope_text(label: &str, theme: Theme, typography: &Typography) -> AnyElement {
+    div()
+        .max_w(px(220.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.fg_subtle)
+        .child(label.to_string())
+        .into_any_element()
 }
 
 /// The agent-type segment chips (`All | Claude | Codex | OpenCode`). The active
@@ -1019,8 +1102,8 @@ fn divider(theme: Theme) -> impl IntoElement {
 }
 
 fn footer_hints(
-    show_all: bool,
-    no_project: bool,
+    next_scope: HistoryScope,
+    can_cycle: bool,
     theme: Theme,
     typography: &Typography,
 ) -> impl IntoElement {
@@ -1043,11 +1126,11 @@ fn footer_hints(
         .child(hint("⇧↵ fork"))
         .child(hint("⌘↵ open as chat"))
         // The scope toggle is meaningless with no active project (always all).
-        .when(!no_project, |d| {
-            d.child(hint(if show_all {
-                "⌃A this project"
-            } else {
-                "⌃A all projects"
+        .when(can_cycle, |d| {
+            d.child(hint(match next_scope {
+                HistoryScope::Worktree => "⌃A this worktree",
+                HistoryScope::Project => "⌃A this project",
+                HistoryScope::All => "⌃A all projects",
             }))
         })
         .child(hint("esc dismiss"))

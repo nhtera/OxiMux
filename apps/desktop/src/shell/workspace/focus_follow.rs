@@ -189,6 +189,8 @@ impl WorkspaceRoot {
             return;
         };
         self.last_focused_group = Some(focused);
+        // Focusing a worktree's tab is a visit, as much as clicking its row.
+        self.recency.stamp_worktree(&id, crate::shell::search_palette::recency::now_ms());
         self.active_workspace_id = Some(id);
     }
 }

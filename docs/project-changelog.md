@@ -4,6 +4,47 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased — Session search (search inside past conversations)
+
+- **Find a conversation by what was said in it.** Turn on *Session search* in
+  Settings › Agents and OxiMux keeps a local full-text index of your Claude
+  and Codex conversations — prompts, replies, tool commands and their output.
+  Session History (⌘⇧H) then searches that text as you type and shows the
+  matching line (`You:` / `Agent:` / `Tool:`) with the words highlighted.
+- **Scope and sort.** Narrow to this worktree, this project or everything
+  (⌃A cycles), sort by relevance or newest, and load more results at the end
+  of the list.
+- **Already open? Jump to it.** Enter on a result whose conversation is
+  running in a tab focuses that tab instead of starting a second copy;
+  ⇧↵ forks and ⌘↵ opens it as a chat as before.
+- **Stays on this computer, off by default.** The index is built in the
+  background, kept current as conversations grow, and lives in its own file;
+  the settings card shows how much it holds and how big it is, and *Clear
+  search data* deletes it (it is rebuilt from the transcripts on demand).
+- **Fixed: typing lost after opening a picker over Settings.** Opening Session
+  History (or any overlay) while Settings was still open left the new
+  overlay without keyboard focus.
+
+### Unreleased — Search palette (left-rail Search, ⌘J)
+
+- **Search finally searches.** The left-rail Search row and ⌘J open one
+  palette. With nothing typed it lists *Recent Chats & Terminals* (⌘1–9 to
+  jump) and *Recent Worktrees*, newest first, with ages, a `project ·
+  worktree` location chip, `Current Worktree` / `primary` badges and the
+  worktree's live status dot.
+- **Typing searches everything open.** Tabs across every open project,
+  worktrees, projects, settings panes and app actions, ranked exact → prefix →
+  word → substring, with multi-word queries matching across fields
+  (`oximux main`). A trailing *Create worktree "…"* row starts a new worktree
+  with the name filled in.
+- **Filter by project.** `Tab` (or the Filter button) narrows results to one
+  or more projects.
+- **Replaces "Jump to workspace".** ⌘J keeps its shortcut and keymap id, so a
+  custom binding still works; the old list-only jump mode is gone.
+- **Limits.** Recency is kept for the current run only (restarts fall back to
+  agent-session times), and tabs of projects that have not been opened this
+  run are not listed.
+
 ### 2026-10-01 — v0.1.36: Keep computer awake — On / Agent / Off
 
 - **Three modes, one place to see them.** A status-bar chip (coffee icon,

@@ -121,7 +121,7 @@ impl SettingsPane {
     }
 
     /// The panes this platform actually shows, in nav order.
-    pub(super) fn offered() -> Vec<SettingsPane> {
+    pub(crate) fn offered() -> Vec<SettingsPane> {
         Self::EVERY.into_iter().filter(|p| p.is_available()).collect()
     }
 
@@ -144,7 +144,7 @@ impl SettingsPane {
         }
     }
 
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             SettingsPane::Git => "Git & Source Control",
             SettingsPane::Terminal => "Terminal",
@@ -171,7 +171,7 @@ impl SettingsPane {
     /// Leading nav glyph. Terminal/Notifications/Appearance/About resolve
     /// from the bundled component catalog; Keybindings ships a local
     /// `keyboard.svg`.
-    fn icon_path(self) -> &'static str {
+    pub(crate) fn icon_path(self) -> &'static str {
         match self {
             SettingsPane::Git => "icons/git-branch.svg",
             SettingsPane::Terminal => "icons/square-terminal.svg",

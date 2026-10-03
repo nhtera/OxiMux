@@ -423,7 +423,7 @@ fn clean_command_xml(s: &str) -> String {
 /// the preview pane which applies its own longer limit. Command parsing is the
 /// shared [`crate::command_envelope`] helper; the non-command fallback keeps the
 /// lossy stray-tag strip (fine for a one-line preview, unlike a full transcript).
-pub(super) fn unwrap_command_xml(s: &str) -> String {
+pub(crate) fn unwrap_command_xml(s: &str) -> String {
     if let Some(cmd) = crate::command_envelope::parse_slash_command(s) {
         return cmd.normalized();
     }
@@ -710,12 +710,12 @@ pub(super) fn cwd_matches(cwd: &str, target: &str) -> bool {
 
 // --- shared helpers --------------------------------------------------------
 
-pub(super) fn line_value(line: &str) -> Option<Value> {
+pub(crate) fn line_value(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line).ok()
 }
 
 /// One-line, whitespace-collapsed, length-capped prompt preview.
-pub(super) fn truncate_prompt(s: &str) -> String {
+pub(crate) fn truncate_prompt(s: &str) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= PROMPT_MAX_CHARS {
         return flat;

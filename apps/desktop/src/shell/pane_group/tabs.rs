@@ -115,21 +115,11 @@ impl PaneGroup {
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         let n = self.next_terminal_n;
         self.next_terminal_n += 1;
-        let tab = PaneGroupTab {
-            label: SharedString::from(format!("Terminal {n}")),
-            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
-            kind: PaneGroupTabKind::Terminal,
-            color: None,
-            custom_title: None,
-            pinned: false,
-            // Tab-level observer is unused for terminal tabs — sub-pane
-            // observers inside TerminalSplitTree drive re-renders.
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
-            _observer: None,
-            _status_task: None,
-        };
+        let tab = PaneGroupTab::new(
+            SharedString::from(format!("Terminal {n}")),
+            PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
+            PaneGroupTabKind::Terminal,
+        );
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
@@ -190,17 +180,12 @@ impl PaneGroup {
         let n = self.next_terminal_n;
         self.next_terminal_n += 1;
         let tab = PaneGroupTab {
-            label: SharedString::from(format!("Terminal {n}")),
-            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
-            kind: PaneGroupTabKind::Terminal,
-            color: None,
             custom_title: Some(title),
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
-            _observer: None,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                SharedString::from(format!("Terminal {n}")),
+                PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
+                PaneGroupTabKind::Terminal,
+            )
         };
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
@@ -537,17 +522,13 @@ impl PaneGroup {
         let (view, observer) = self.build_editor_view(&path, window, cx);
         let label = editor_tab_label(&path);
         let tab = PaneGroupTab {
-            label: SharedString::from(label),
-            content: PaneContent::Editor(view),
-            kind: PaneGroupTabKind::Editor { path },
-            color: None,
-            custom_title: None,
-            pinned: false,
             is_preview: preview,
-            external_mutation: None,
-            restore_rank: None,
             _observer: Some(observer),
-            _status_task: None,
+            ..PaneGroupTab::new(
+                SharedString::from(label),
+                PaneContent::Editor(view),
+                PaneGroupTabKind::Editor { path },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -631,17 +612,12 @@ impl PaneGroup {
             SharedString::from(format!("{leaf}{suffix}"))
         };
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::Diff(view),
-            kind: PaneGroupTabKind::Diff { path, staged },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Diff(view),
+                PaneGroupTabKind::Diff { path, staged },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -683,17 +659,12 @@ impl PaneGroup {
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let label = crate::shell::browser_view::host_label(&url);
         let tab = PaneGroupTab {
-            label: SharedString::from(label),
-            content: PaneContent::Browser(view),
-            kind: PaneGroupTabKind::Browser { url },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                SharedString::from(label),
+                PaneContent::Browser(view),
+                PaneGroupTabKind::Browser { url },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -771,17 +742,12 @@ impl PaneGroup {
         });
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let tab = PaneGroupTab {
-            label: SharedString::from("Tasks"),
-            content: PaneContent::Tasks(view),
-            kind: PaneGroupTabKind::Tasks,
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                SharedString::from("Tasks"),
+                PaneContent::Tasks(view),
+                PaneGroupTabKind::Tasks,
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -833,17 +799,12 @@ impl PaneGroup {
         });
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let tab = PaneGroupTab {
-            label: SharedString::from("Automations"),
-            content: PaneContent::Automations(view),
-            kind: PaneGroupTabKind::Automations,
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                SharedString::from("Automations"),
+                PaneContent::Automations(view),
+                PaneGroupTabKind::Automations,
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -1071,17 +1032,12 @@ impl PaneGroup {
             SharedString::from(format!("Chat {n}"))
         };
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::AgentChat(view),
-            kind: PaneGroupTabKind::AgentChat { cwd, model },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::AgentChat(view),
+                PaneGroupTabKind::AgentChat { cwd, model },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -2089,17 +2045,12 @@ impl PaneGroup {
             SharedString::from(format!("{short_oid}: {subject_trim}{suffix}"))
         };
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::Diff(view),
-            kind: PaneGroupTabKind::Commit { sha },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Diff(view),
+                PaneGroupTabKind::Commit { sha },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -2154,17 +2105,12 @@ impl PaneGroup {
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let label = SharedString::from(format!("{leaf} · branch"));
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::Diff(view),
-            kind: PaneGroupTabKind::BranchFile { path },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Diff(view),
+                PaneGroupTabKind::BranchFile { path },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -2238,17 +2184,12 @@ impl PaneGroup {
             SharedString::from(format!("Stash · {trimmed}{suffix}"))
         };
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::Diff(view),
-            kind: PaneGroupTabKind::StashAll { sha },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Diff(view),
+                PaneGroupTabKind::StashAll { sha },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -2312,17 +2253,12 @@ impl PaneGroup {
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let label = SharedString::from(format!("{leaf} · {stash_label}"));
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::Diff(view),
-            kind: PaneGroupTabKind::StashFile { sha, path },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Diff(view),
+                PaneGroupTabKind::StashFile { sha, path },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -2372,17 +2308,12 @@ impl PaneGroup {
         view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::Diff(view),
-            kind: PaneGroupTabKind::CombinedDiff { scope_key },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Diff(view),
+                PaneGroupTabKind::CombinedDiff { scope_key },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -2434,17 +2365,12 @@ impl PaneGroup {
         view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let tab = PaneGroupTab {
-            label,
-            content: PaneContent::Diff(view),
-            kind: PaneGroupTabKind::CombinedDiff { scope_key },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
             _observer: observer,
-            _status_task: None,
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Diff(view),
+                PaneGroupTabKind::CombinedDiff { scope_key },
+            )
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
@@ -2510,26 +2436,21 @@ impl PaneGroup {
         // single-leaf sub-pane tree so Cmd+D can later add side PTYs.
         let agent_observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         self.tabs.push(PaneGroupTab {
-            label,
-            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, agent_observer)),
-            kind: PaneGroupTabKind::Agent {
-                adapter,
-                adapter_id,
-                worktree_path,
-                model,
-                effort,
-                session_id,
-                status_rx,
-                profile,
-            },
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
-            _observer: None,
             _status_task: Some(status_task),
+            ..PaneGroupTab::new(
+                label,
+                PaneContent::Terminal(TerminalSplitTree::new_single(view, agent_observer)),
+                PaneGroupTabKind::Agent {
+                    adapter,
+                    adapter_id,
+                    worktree_path,
+                    model,
+                    effort,
+                    session_id,
+                    status_rx,
+                    profile,
+                },
+            )
         });
         let _ = observer; // legacy single-view observer no longer used
         self.tab_order.push(self.tabs.len() - 1);
@@ -2645,19 +2566,11 @@ impl PaneGroup {
         // after a session restore.
         Self::wire_opener(&view, cx);
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
-        self.tabs.push(PaneGroupTab {
-            label: SharedString::from(label),
-            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
-            kind: PaneGroupTabKind::Terminal,
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
-            _observer: None,
-            _status_task: None,
-        });
+        self.tabs.push(PaneGroupTab::new(
+            SharedString::from(label),
+            PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
+            PaneGroupTabKind::Terminal,
+        ));
         self.tab_order.push(self.tabs.len() - 1);
         self.pin_tab_strip_to_end();
         cx.notify();
@@ -2684,19 +2597,11 @@ impl PaneGroup {
         for view in &views {
             Self::wire_opener(view, cx);
         }
-        self.tabs.push(PaneGroupTab {
-            label: SharedString::from(label),
-            content: PaneContent::Terminal(tree),
-            kind: PaneGroupTabKind::Terminal,
-            color: None,
-            custom_title: None,
-            pinned: false,
-            is_preview: false,
-            external_mutation: None,
-            restore_rank: None,
-            _observer: None,
-            _status_task: None,
-        });
+        self.tabs.push(PaneGroupTab::new(
+            SharedString::from(label),
+            PaneContent::Terminal(tree),
+            PaneGroupTabKind::Terminal,
+        ));
         self.tab_order.push(self.tabs.len() - 1);
         self.pin_tab_strip_to_end();
         cx.notify();
@@ -3004,6 +2909,9 @@ impl PaneGroup {
     fn bump_mru(&mut self, idx: usize) {
         self.mru.retain(|&i| i != idx);
         self.mru.insert(0, idx);
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.last_focused_ms = chrono::Utc::now().timestamp_millis();
+        }
     }
 
     /// Drop `idx` from the MRU queue and decrement every later entry

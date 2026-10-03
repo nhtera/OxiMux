@@ -26,6 +26,7 @@ mod pane_simulator;
 #[cfg(windows)]
 mod pane_driver_trust;
 mod pane_agents_launch;
+mod pane_agents_session_search;
 mod pane_git;
 mod pane_integrations;
 mod pane_keybindings;
@@ -331,6 +332,8 @@ pub struct SettingsModal {
     pub(super) integration_copied: Option<usize>,
     /// Guards against stacking one poll loop per install click.
     pub(super) integration_poll_running: bool,
+    /// The Agents pane's session-search card (status, Clear confirm).
+    pub(super) session_search: pane_agents_session_search::SessionSearchPane,
 }
 
 /// Parse the custom-words editor field into a de-duplicated dictionary. Splits
@@ -405,6 +408,7 @@ impl SettingsModal {
             integration_handles: std::collections::HashMap::new(),
             integration_copied: None,
             integration_poll_running: false,
+            session_search: Default::default(),
             driver_upgraded: false,
             notify,
             notify_repo,

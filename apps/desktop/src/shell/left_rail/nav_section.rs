@@ -1,9 +1,8 @@
 //! Nav rows at the top of the left rail — Tasks / Automations / Agents / Search.
 //!
 //! Two of these open a PANE tab rather than a rail body (Tasks, Automations):
-//! both are pages that need width, and the rail is 250px. Agents is a rail
-//! body. Search is still a shell — clicking it sets `active_nav` and the body
-//! falls through to the workspace list.
+//! both are pages that need width, and the rail is 250px. Search opens the
+//! search palette overlay (same as ⌘J). Agents is the only rail body.
 
 use gpui::{
     App, Entity, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -48,12 +47,13 @@ impl NavItem {
         }
     }
 
-    /// Whether this row opens a pane tab instead of swapping the rail body.
-    /// The rail keeps no highlight for these — the tab strip is the "you are
+    /// Whether this row opens somewhere other than the rail body — a pane tab
+    /// (Tasks, Automations) or the search palette overlay (Search). The rail
+    /// keeps no highlight for these — the tab strip / overlay is the "you are
     /// here", and two competing highlights would disagree the moment the user
     /// switched tabs.
-    pub fn opens_in_pane(self) -> bool {
-        matches!(self, NavItem::Tasks | NavItem::Automations)
+    pub fn opens_outside_rail(self) -> bool {
+        matches!(self, NavItem::Tasks | NavItem::Automations | NavItem::Search)
     }
 }
 
@@ -131,8 +131,15 @@ fn render_nav_row(
     let fg = nav_row_fg(item, active, theme);
     let icon_fg = nav_row_icon_fg(item, active, theme);
     let bg = nav_row_bg(item, active, theme);
+    // Search shares ⌘J; reveal the live chord on hover so it is discoverable
+    // without a permanent label competing with the badge column.
+    let chord = (item == NavItem::Search)
+        .then(|| crate::keymap_registry::display_chord_for("open_workspace_jump"))
+        .flatten();
+    let group = gpui::SharedString::from(format!("nav-row-{}", item.label()));
 
     div()
+        .group(group.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -163,6 +170,15 @@ fn render_nav_row(
                 .text_color(fg)
                 .child(item.label()),
         )
+        .when_some(chord, |row, chord| {
+            row.child(
+                div()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(gpui::transparent_black())
+                    .group_hover(group, |s| s.text_color(theme.fg_subtle))
+                    .child(chord),
+            )
+        })
         .when(badge > 0, |row| {
             // Unread chip — sessions that hit an attention/terminal state
             // while this page was closed. Cleared when the page opens.
@@ -298,9 +314,9 @@ mod tests {
     /// as "the click did nothing".
     #[test]
     fn only_the_page_rows_open_in_a_pane() {
-        assert!(NavItem::Tasks.opens_in_pane());
-        assert!(NavItem::Automations.opens_in_pane());
-        assert!(!NavItem::Agents.opens_in_pane());
-        assert!(!NavItem::Search.opens_in_pane());
+        assert!(NavItem::Tasks.opens_outside_rail());
+        assert!(NavItem::Automations.opens_outside_rail());
+        assert!(!NavItem::Agents.opens_outside_rail());
+        assert!(NavItem::Search.opens_outside_rail());
     }
 }

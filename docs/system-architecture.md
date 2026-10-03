@@ -81,7 +81,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `auto-update` | `oximux-auto-update` | `src/lib.rs` | desktop app self-update: GitHub release feed, download/mount/stage/verify pipeline, `UpdateStatus` state machine — swap is staged only, never live |
 | `git` | `oximux-git` | `src/lib.rs` | `Repository`, `StatusPoller`, git ops, `GhCmd` |
 | `agent-core` | `oximux-agent-core` | `src/lib.rs` | portable `ThreadEvent` vocabulary + stream-json decoder + `ChatThread` fold (serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — mobile-portable); re-exported by `agents` under `crate::thread::*` |
-| `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine`; `SessionRegistry` (gpui-free session event bus + command surface, built for Remote Control, not yet wired into the view) |
+| `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine`; `SessionRegistry` (gpui-free session event bus + command surface, built for Remote Control, not yet wired into the view); `session_search/` (opt-in FTS5 index of agent transcripts: indexer thread + query engine) |
 | `remote-proto` | `oximux-remote-proto` | `src/lib.rs` | transport-free Remote Control wire vocabulary — postcard RPC envelope, `HostEvent` stream frame, `PairingTicket` codec, `Transport` trait seam; `remote-host`, `remote-session`, `remote-iroh`, and the `oximux` CLI all speak it |
 | `remote-local` | `oximux-remote-local` | `src/lib.rs` | the same-machine control transport: the owner-only unix socket / named pipe the `oximux` CLI uses to reach a host (desktop app or `oximux serve`), behind `remote-proto`'s `Transport` seam — both the listener a host binds and the dial the CLI makes live here |
 | `remote-host` | `oximux-remote-host` | `src/lib.rs` | the remote-control host core: transport-agnostic RPC dispatcher, two-key pairing/auth handshake + ACL, host identity; serves `agents`' `SessionRegistry` over `remote-proto`. Used by both hosts (`apps/desktop` and `apps/cli`'s `serve`) — never ships to mobile |
@@ -143,6 +143,7 @@ confining it to its own conversation instead of the operator's full scope.
 | `notifier/` | OS notifications |
 | `platform/` | macOS-specific glue (App Nap, single-instance) |
 | `session_restore/` | cold/warm session restore orchestration |
+| `session_search_service.rs` | `SessionSearchService` global: owns the session-search indexer thread, follows the `SessionSearchSettings` toggle, Clear (off-thread), quit signal |
 | `updater.rs` | `UpdaterState` global; 6h background-check ticker; boot sweep; quit-time swap (`apply_pending_at_quit`, called from `on_app_quit`); user-initiated restart |
 
 ### `apps/desktop/src/shell/<domain>/` — GPUI views
@@ -150,7 +151,8 @@ confining it to its own conversation instead of the operator's full scope.
 One folder per cockpit zone: `agent_ui`, `agents_dashboard`, `browser_view`,
 `chrome`, `command_palette`, `commit_dialog`, `compose_bar`, `diff_view`,
 `file_explorer`, `forge`, `git_panel`, `left_rail`, `onboarding`, `pane_group`,
-`panes`, `pr_dialog`, `project_panes`, `right_sidebar`, `search_panel`, `session_history`,
+`panes`, `pr_dialog`, `project_panes`, `right_sidebar`, `search_palette` (⌘J / rail Search),
+`search_panel`, `session_history` (⌘⇧H; full-text mode in `fulltext*.rs`, live-tab jump in `jump.rs`),
 `settings_modal`, `simulator`, `source_control`, `stash_panel`, `tasks_view`, `terminal`,
 `usage`, `welcome`, `workspace`. Each re-exports its modules
 so existing `crate::shell::<name>::…` paths resolve regardless of folder.
@@ -169,6 +171,7 @@ WorkspaceRoot (GPUI entity)
 │   │     open_file_in_active_pane(path, window, cx)
 │   │       → MainPane::open_editor_in_focused_pane(path, window, cx)
 │   ├── palette: Entity<PaletteModal>      ← Cmd+P / Cmd+Shift+P overlay
+│   ├── search_palette: Entity<SearchPalette> ← Cmd+J / left-rail Search overlay (recency: `recency` ledger + PaneGroupTab::last_focused_ms)
 │   ├── settings_modal: Entity<SettingsModal> ← Cmd+, / left-rail cog overlay
 │   ├── onboarding: Entity<OnboardingWizard>  ← first-run welcome wizard (boot-gate mailbox; palette "Show Welcome Wizard")
 │   └── floating_terminal: Option<Entity<FloatingTerminal>> ← Cmd+Shift+T PiP overlay

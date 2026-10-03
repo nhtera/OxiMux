@@ -89,6 +89,9 @@ pub fn install_scoped(cx: &mut App) {
     // the modal's search input win their tie with the input's own bindings
     // only by being registered later.
     crate::shell::session_history::register_session_history_key_bindings(cx);
+    // Search palette Tab (project filter) and ⌘1…⌘9 (quick select); same
+    // ordering constraint as above — the input-scoped copies must come later.
+    crate::shell::search_palette::keys::register_search_palette_key_bindings(cx);
     // Stash-section cursor keys. Context-scoped for a sharper version of the
     // same reason: these are bare arrow keys and `Enter`, which in the global
     // keymap would shadow every list and every input in the app.

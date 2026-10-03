@@ -19,7 +19,7 @@ use crate::actions::{
     FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent,
     NewAgentChat, NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
     OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
-    OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
+    OpenSettings, OpenWorkspaceCreate, OpenSearchPalette, PrevTab, RefreshSourceControl,
     KillAllTerminalSessions, ReloadCustomCommands, RestartTerminalDaemon, RevealActiveWorkspace, Search, SelectExplorerTab, SelectHistoryTab,
     SelectSimulatorTab,
     SelectSearchTab,
@@ -310,7 +310,8 @@ pub const ACTIONS: &[ActionSpec] = &[
         OpenCommandPalette
     ),
     // Jump to any workspace/worktree across all projects.
-    entry!("open_workspace_jump", "Jump to workspace", Navigation, "secondary-j", OpenWorkspaceJump),
+    // Id kept from the old jump-to-workspace palette so user keymaps survive.
+    entry!("open_workspace_jump", "Search", Navigation, "secondary-j", OpenSearchPalette),
     entry!(
         "reveal_active_workspace",
         "Reveal active workspace",

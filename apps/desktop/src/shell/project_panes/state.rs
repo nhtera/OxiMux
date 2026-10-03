@@ -367,6 +367,23 @@ impl ProjectPanes {
         }
     }
 
+    /// Activate the tab with this `PaneGroupTab::uid` (any kind) in whichever
+    /// group holds it — it may have been dragged to another group since it
+    /// was listed — and focus that group. `false` when the tab is gone.
+    pub fn activate_tab_by_uid(&mut self, uid: u64, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let found = self
+            .groups
+            .iter()
+            .find(|(_, g)| g.read(cx).tabs().iter().any(|t| t.uid == uid))
+            .map(|(id, g)| (*id, g.clone()));
+        let Some((id, group)) = found else {
+            return false;
+        };
+        group.update(cx, |g, cx| g.activate_by_uid(uid, window, cx));
+        self.set_active_group(id, window, cx);
+        true
+    }
+
     /// Worktree path of the agent tab matching `tab_id` anywhere in this
     /// project's groups. `Some` doubles as the ownership answer for the
     /// notification click router's cross-project search.

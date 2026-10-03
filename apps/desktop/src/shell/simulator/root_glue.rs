@@ -258,7 +258,7 @@ impl WorkspaceRoot {
                             // The tab opens once the switch lands (see
                             // `apply_pending_reveal`).
                             root.simulator.reveal_for = Some((path.clone().into(), std::time::Instant::now()));
-                            root.activate_workspace_from_jump(workspace_id, project_id, path, window, cx);
+                            root.activate_workspace_by_ref(workspace_id, project_id, path, window, cx);
                             cx.notify();
                         }
                     });

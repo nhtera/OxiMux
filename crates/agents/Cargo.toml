@@ -20,6 +20,8 @@ oximux-shell-env = { workspace = true }
 # CREATE_NO_WINDOW on agent-CLI / probe / curl spawns (empty console windows
 # otherwise pop out of the GUI-subsystem Windows build).
 oximux-no-window = { workspace = true }
+# Owner-only permissions on the session-search index (its rows are transcript text).
+oximux-owner-only = { workspace = true }
 anyhow = { workspace = true }
 # "Is this agent CLI installed?" and bare-name -> absolute-path resolution
 # (`cli::detect`, the pi binary resolver, the detached-spawn program resolver).
