@@ -4,7 +4,23 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### Unreleased — Session search (search inside past conversations)
+### 2026-10-03 — v0.1.37: Terminal copy and find fixes (#45, #46)
+
+- **Copy keeps long lines whole.** Copying a line that wrapped at the pane
+  edge used to paste it split in two; soft-wrapped rows now join back into the
+  original line (Copy, copy-on-select, Select All, send-to-agent and
+  last-command output alike). Only real line breaks become newlines.
+- **⌘A in the find bar selects the search text**, not the whole terminal.
+  Typing, Backspace, Delete or paste replace the selection, and ⌘C copies it
+  instead of sending Ctrl-C to the shell.
+- **Click back into the terminal and it gets the keyboard**, with the find
+  bar still open: typing, ⌘A, ⌘C and Esc act on the terminal again. Click the
+  bar or press ⌘F to return to it (⌘F selects the search text). Only the
+  active one shows a blinking caret; the other dims.
+- **The "↑ N lines" chip no longer covers the find bar.** It sits just below
+  it, and says "1 line" rather than "1 lines".
+
+### 2026-10-03 — v0.1.37: Session search (search inside past conversations)
 
 - **Find a conversation by what was said in it.** Turn on *Session search* in
   Settings › Agents and OxiMux keeps a local full-text index of your Claude
@@ -25,7 +41,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
   History (or any overlay) while Settings was still open left the new
   overlay without keyboard focus.
 
-### Unreleased — Search palette (left-rail Search, ⌘J)
+### 2026-10-03 — v0.1.37: Search palette (left-rail Search, ⌘J)
 
 - **Search finally searches.** The left-rail Search row and ⌘J open one
   palette. With nothing typed it lists *Recent Chats & Terminals* (⌘1–9 to
