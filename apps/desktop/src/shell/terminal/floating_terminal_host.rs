@@ -122,6 +122,7 @@ impl WorkspaceRoot {
             .unwrap_or_else(|| PathBuf::from("/"));
         let cwd_str = cwd.to_string_lossy().into_owned();
         let ids = SurfaceIds::fresh(cwd_str.clone());
+        crate::shell::terminal::shell_history::seed_from_worktree(&cwd, &ids.tab_id);
         let (backend, session_id) = crate::shell::terminal_view::spawn_local_pty(cwd, ids.env())?;
         Some(FloatingTabSpec {
             backend,

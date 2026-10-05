@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use oximux_pty::SpawnConfig;
+use oximux_settings::PerTerminalHistory;
 use oximux_shell_env::ResolvedShell;
 
 /// Process-wide mirror of `TerminalSettings::scrollback_lines`. The PTY spawn
@@ -47,6 +48,29 @@ pub fn set_shell_integration_enabled(enabled: bool) {
 
 pub(crate) fn shell_integration_enabled() -> bool {
     SHELL_INTEGRATION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide mirror of `TerminalSettings::per_terminal_history`, for the
+/// same `cx`-less spawn paths (and the history copies made just before them).
+static PER_TERMINAL_HISTORY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Update the history-mode mirror from settings. Called once at startup and
+/// on every settings reload.
+pub fn set_per_terminal_history(mode: PerTerminalHistory) {
+    let raw = match mode {
+        PerTerminalHistory::Auto => 0,
+        PerTerminalHistory::Always => 1,
+        PerTerminalHistory::Off => 2,
+    };
+    PER_TERMINAL_HISTORY.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn per_terminal_history() -> PerTerminalHistory {
+    match PER_TERMINAL_HISTORY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => PerTerminalHistory::Always,
+        2 => PerTerminalHistory::Off,
+        _ => PerTerminalHistory::Auto,
+    }
 }
 
 /// Process-wide mirror of the resolved spawn shell. Same reason as the two

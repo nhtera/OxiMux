@@ -480,7 +480,8 @@ fn share_history_turned_on_late_hands_history_back() {
     s.run(&cmd(2));
     s.kill9();
     assert!(sb.read(&sb.global(Sh::Zsh)).contains(&cmd(2)));
-    assert!(!sb.read(&sb.tab(Sh::Zsh, TAB_A)).contains(&cmd(2)), "still writing the tab file");
+    assert!(sb.read(&sb.global(Sh::Zsh)).contains(&cmd(1)), "a line written before the hand-back was lost");
+    assert!(!sb.tab(Sh::Zsh, TAB_A).exists(), "a frozen tab file was left for new tabs to copy");
 }
 
 #[test]
@@ -652,4 +653,91 @@ fn bash_saves_a_command_when_it_starts_not_only_at_the_next_prompt() {
         std::thread::sleep(Duration::from_millis(20));
     }
     s.kill9();
+}
+
+#[test]
+fn an_exported_histfile_never_reaches_a_child_shell() {
+    // Your rc exports HISTFILE. A shell started inside the pane must keep to
+    // its own default history: the tab file is this shell's alone.
+    for sh in [Sh::Zsh, Sh::Bash] {
+        let sb = Sandbox::new("child-env");
+        let Some(mut s) = Session::start(sh, &sb, TAB_A, Opts { rc: "export HISTFILE", ..Opts::default() }) else {
+            continue;
+        };
+        let env = s.run("printf 'E[%s]\\n' \"$(printenv HISTFILE)\"");
+        assert!(env.contains("E[]"), "{sh:?}: a child sees HISTFILE: {env:?}");
+        let child = s.run("bash --norc -ic 'printf \"H[%s]\\n\" \"$HISTFILE\"'");
+        assert!(!child.contains("hist dir"), "{sh:?}: a child bash writes the tab file: {child:?}");
+        assert!(child.contains(".bash_history]"), "{sh:?}: {child:?}");
+        s.kill9();
+    }
+}
+
+#[test]
+fn a_child_bash_never_trims_the_tab_file() {
+    for sh in [Sh::Zsh, Sh::Bash] {
+        let sb = Sandbox::new("child-trim");
+        let seed: Vec<String> = (0..10).map(|i| format!("echo seeded{i}")).collect();
+        sb.seed_global(sh, &seed.iter().map(String::as_str).collect::<Vec<_>>());
+        let Some(mut s) = Session::start(sh, &sb, TAB_A, Opts { rc: "export HISTFILE", ..Opts::default() }) else {
+            continue;
+        };
+        s.run(&cmd(1));
+        // An interactive child on the pane's tty: bash trims its HISTFILE to
+        // HISTFILESIZE as it starts.
+        s.start_line("HISTFILESIZE=5 bash --norc -i");
+        s.run("exit");
+        s.kill9();
+        let tab = sb.read(&sb.tab(sh, TAB_A));
+        assert!(tab.contains("echo seeded0") && tab.contains(&cmd(1)), "{sh:?}: tab file trimmed: {tab}");
+    }
+}
+
+#[test]
+fn an_exported_fish_history_never_reaches_a_child_fish() {
+    let sb = Sandbox::new("fish-child-env");
+    let mut s = start!(Sh::Fish, &sb, TAB_A, Opts { rc: "set -gx fish_history mine", ..Opts::default() });
+    let child = s.run("fish --no-config -c 'printf \"F[%s]\\n\" $fish_history'");
+    assert!(child.contains("F[]"), "a child fish sees our session: {child:?}");
+    s.run(&cmd(1));
+    s.kill9();
+    // ...while this shell still keeps its own session.
+    assert!(sb.read(&sb.tab(Sh::Fish, TAB_A)).contains("' 1"));
+}
+
+#[test]
+fn handing_history_back_exports_your_histfile_again() {
+    let sb = Sandbox::new("late-share-export");
+    let mut s = start!(Sh::Zsh, &sb, TAB_A, Opts { rc: "export HISTFILE", ..Opts::default() });
+    s.run("setopt share_history");
+    let env = s.run("printf 'E[%s]\\n' \"$(printenv HISTFILE)\"");
+    s.kill9();
+    assert!(env.contains("/.zsh_history]") && !env.contains("hist dir"), "{env:?}");
+}
+
+#[test]
+fn always_keeps_per_terminal_history_under_share_history() {
+    // oh-my-zsh / prezto turn share_history on: either in the rc, or later
+    // from a deferred plugin loader.
+    for late in [false, true] {
+        let sb = Sandbox::new("always-share");
+        let env: &[(&str, &str)] = &[(history::OPT_OUT_ENV, "always")];
+        let rc = if late { "" } else { "setopt share_history" };
+        let mut a = start!(Sh::Zsh, &sb, TAB_A, Opts { rc, env, ..Opts::default() });
+        let mut b = Session::start(Sh::Zsh, &sb, TAB_B, Opts { rc, env, ..Opts::default() }).unwrap();
+        if late {
+            a.run("setopt share_history");
+            b.run("setopt share_history");
+        }
+        a.run(&cmd(1));
+        b.run(&cmd(2));
+        a.run(""); // a prompt after B's command: share_history would pull it in here
+        let recalled = a.up_enter();
+        assert!(recalled.contains(&out(1)) && !recalled.contains(&out(2)), "late={late}: A recalled {recalled:?}");
+        a.kill9();
+        b.kill9();
+        let global = sb.read(&sb.global(Sh::Zsh));
+        assert!(global.contains(&cmd(1)) && global.contains(&cmd(2)), "late={late}: global: {global}");
+        assert!(!sb.read(&sb.tab(Sh::Zsh, TAB_A)).contains(&cmd(2)), "late={late}: B's command in A's file");
+    }
 }

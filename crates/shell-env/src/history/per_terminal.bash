@@ -3,6 +3,8 @@
 # appended to it and to your HISTFILE. Off when PROMPT_COMMAND already shares
 # history live (history -n/-r), under OXIMUX_PER_TERMINAL_HISTORY=0, or once
 # you change or unset HISTFILE. Not yet on Git Bash (MSYSTEM): unverified there.
+# The tab file is never exported: a shell started inside this one keeps to its
+# own default history.
 __oximux_uuid_re='^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'   # bash 3.2: regex must come from a variable
 if [[ "${OXIMUX_PER_TERMINAL_HISTORY:-1}" != 0 && -n "${OXIMUX_HISTORY_DIR:-}" && -n "${HISTFILE:-}" \
       && "${OXIMUX_TAB_ID:-}" =~ $__oximux_uuid_re && -z "${__oximux_hist:-}" && -z "${MSYSTEM:-}" ]]; then
@@ -19,6 +21,7 @@ if [[ "${OXIMUX_PER_TERMINAL_HISTORY:-1}" != 0 && -n "${OXIMUX_HISTORY_DIR:-}" &
         || printf ' \n' >"$__oximux_hist" )   # bash 3.2: history -a needs a non-empty load
     ( umask 077; : >| "$__oximux_hist_buf" )
     HISTFILE="$__oximux_hist"                 # bash loads HISTFILE after the rcfile
+    export -n HISTFILE   # your rc exported it: a child bash would write (and trim) this file
     __oximux_hist_flush() {
       local __s=$?
       if [[ "${HISTFILE:-}" == "$__oximux_hist" ]] && shopt -oq history; then

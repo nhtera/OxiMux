@@ -1,14 +1,20 @@
 # Per-terminal history: Up-arrow reads this terminal's own file (seeded from
 # the parent pane on a split, else from your HISTFILE). zsh writes that file
 # per command and the new bytes are appended to your HISTFILE too. Off under
-# share_history, SAVEHIST=0 or OXIMUX_PER_TERMINAL_HISTORY=0, and paused while
-# HISTFILE is unset or points elsewhere.
+# share_history (unless OXIMUX_PER_TERMINAL_HISTORY=always), SAVEHIST=0 or
+# OXIMUX_PER_TERMINAL_HISTORY=0, and paused while HISTFILE is unset or points
+# elsewhere. The tab file is never exported: a
+# shell started inside this one keeps to its own default history.
 if [[ -z ${__oximux_tab_hist:-} && ${OXIMUX_PER_TERMINAL_HISTORY:-1} != 0 \
       && -n ${OXIMUX_HISTORY_DIR:-} && -n ${HISTFILE:-} && ${SAVEHIST:-0} -gt 0 \
       && ${OXIMUX_TAB_ID:-} =~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' ]] \
-   && [[ ! -o share_history ]] \
+   && [[ ${OXIMUX_PER_TERMINAL_HISTORY:-} == always || ! -o share_history ]] \
    && zmodload -F zsh/stat b:zstat 2>/dev/null && zmodload zsh/system 2>/dev/null; then
   typeset -g __oximux_shared_hist=$HISTFILE __oximux_savehist=$SAVEHIST
+  # always: share_history then re-reads only the tab file, which only this
+  # shell writes, so no other pane's commands come in.
+  typeset -gi __oximux_hist_always=0
+  [[ ${OXIMUX_PER_TERMINAL_HISTORY:-} == always ]] && __oximux_hist_always=1
   typeset -g __oximux_tab_hist=$OXIMUX_HISTORY_DIR/$OXIMUX_TAB_ID.zsh_history
   [[ -e $__oximux_tab_hist ]] || ( umask 077
     command cp -f -- "$__oximux_shared_hist" "$__oximux_tab_hist" 2>/dev/null || : >| "$__oximux_tab_hist" )
@@ -18,7 +24,10 @@ if [[ -z ${__oximux_tab_hist:-} && ${OXIMUX_PER_TERMINAL_HISTORY:-1} != 0 \
   # trimmed once instead, at the first prompt, to the history zsh loaded.
   HISTFILE=$__oximux_tab_hist
   SAVEHIST=1000000000
-  typeset -gi __oximux_hist_off=-1 __oximux_hist_ino=0 __oximux_hist_away=0
+  typeset -gi __oximux_hist_off=-1 __oximux_hist_ino=0 __oximux_hist_away=0 __oximux_hist_exp=0
+  # Your rc exported HISTFILE: a child bash or zsh would write (and trim) this
+  # file. Keep it to this shell; handing history back exports yours again.
+  [[ ${(t)HISTFILE} == *export* ]] && __oximux_hist_exp=1 && typeset +x HISTFILE
   # Both hooks run under your options; `emulate -L zsh` keeps sh_word_split /
   # ksh_arrays from mangling them ($? is read first, emulate would reset it).
   __oximux_hist_mark() {               # zstat -A: [2] inode, [8] size
@@ -30,9 +39,13 @@ if [[ -z ${__oximux_tab_hist:-} && ${OXIMUX_PER_TERMINAL_HISTORY:-1} != 0 \
   __oximux_hist_tee() {
     local __s=$?
     emulate -L zsh
-    if [[ -o share_history ]]; then
-      # Turned on later (a deferred plugin): hand history back for good.
+    if [[ -o share_history ]] && (( ! __oximux_hist_always )); then
+      # Turned on later (a deferred plugin): hand history back for good. The
+      # tab file goes too (its lines are all in yours already): left behind,
+      # a new tab could start from it, frozen at this moment.
       HISTFILE=$__oximux_shared_hist
+      command rm -f -- "$__oximux_tab_hist"
+      (( __oximux_hist_exp )) && export HISTFILE
       (( SAVEHIST == 1000000000 )) && SAVEHIST=$__oximux_savehist
       preexec_functions=(${preexec_functions:#__oximux_hist_tee})
       precmd_functions=(${precmd_functions:#__oximux_hist_tee})

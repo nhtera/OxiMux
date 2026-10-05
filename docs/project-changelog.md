@@ -4,6 +4,29 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased — Shell history: worktrees, a setting, child shells
+
+- **New tabs start from their own worktree.** A new tab, a lifecycle-script
+  tab or a new floating tab starts from the history of the terminal you last
+  used in the same worktree, so Up-arrow in one worktree no longer recalls a
+  command from another. A worktree with no terminal yet still starts from
+  your normal history. Splits still copy their parent.
+- **Settings › Terminal › Shell history.** Choose *Auto* (the default, as
+  before: per terminal, unless your shell already shares history live),
+  *Per terminal* or *Shared*. *Per terminal* keeps each terminal's history
+  separate even with zsh `share_history`, which oh-my-zsh and prezto turn on
+  by default (live sharing between panes stops; bash live sharing stays
+  shared). *Shared* gives every terminal your one
+  history file. Changes apply to new terminals, with no restart and no shell
+  rc edit, so it also works when OxiMux is opened from Finder. Also
+  available as `per_terminal_history` in `terminal.toml`.
+- **Shells started inside a pane keep to their own history.** With an
+  exported `HISTFILE` (or `fish_history`), a `bash` or `zsh` started inside a
+  pane used to write to, and could trim, that pane's history. It now uses its
+  own default history, as in any other terminal.
+
+---
+
 ### 2026-10-05 — v0.1.38: Per-terminal shell history (#47)
 
 - **Each terminal remembers its own commands.** Up-arrow in a pane recalls

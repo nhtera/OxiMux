@@ -98,6 +98,7 @@ impl TerminalView {
             // Focusing the pane means the user is now looking — clear any
             // pending attention ring.
             view.attention = false;
+            view.note_history_focus();
             cx.notify();
         })
         .detach();
@@ -321,6 +322,9 @@ impl TerminalView {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .external_id_of(session_id);
+        // A restored pane can be focused while still a placeholder (no pid,
+        // no relay id); point its history note at the shell it now has.
+        crate::shell::terminal::shell_history::refresh_focus(&self.ids.tab_id, self.history_focus_note());
         // The session was attached/spawned at its own size; (0,0) can never
         // equal a real canvas grid, so the next render always resizes it to
         // the painted bounds.
@@ -381,6 +385,7 @@ impl TerminalView {
             view.cursor_visible = true;
             view.attention = false;
             view.respawn_if_dormant(window, cx);
+            view.note_history_focus();
             cx.notify();
         })
         .detach();
@@ -749,6 +754,24 @@ impl TerminalView {
             let dir = crate::relay_cold_restore::default_checkpoints_dir()?;
             crate::relay_cold_restore::read_checkpoint_pid(&dir, &pty_id)
         })
+    }
+
+    /// Record this terminal as the most recently focused one: a new
+    /// top-level terminal in its worktree starts from its history.
+    fn note_history_focus(&self) {
+        crate::shell::terminal::shell_history::note_focus(&self.ids.tab_id, self.history_focus_note());
+    }
+
+    /// What a later seed needs to find this terminal's cwd (see
+    /// [`note_history_focus`](Self::note_history_focus)).
+    fn history_focus_note(&self) -> crate::shell::terminal::shell_history::FocusNote {
+        let id = self.session_id;
+        crate::shell::terminal::shell_history::FocusNote {
+            pid: self.with_backend(|be| be.os_pid(id)),
+            relay_pty_id: self.external_id(),
+            cwd_hint: self.cwd_hint(),
+            spawn_cwd: std::path::PathBuf::from(&self.ids.workspace_id),
+        }
     }
 
     /// F4.7: shell-tracked CWD via OSC 7. Returns `None` when the shell

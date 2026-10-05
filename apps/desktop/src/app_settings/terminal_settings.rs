@@ -24,7 +24,8 @@ use tokio::sync::mpsc;
 use oximux_shell_env::ResolvedShell;
 
 use crate::shell::terminal_view::{
-    set_shell_integration_enabled, set_spawn_scrollback, set_spawn_shell_resolved,
+    set_per_terminal_history, set_shell_integration_enabled, set_spawn_scrollback,
+    set_spawn_shell_resolved,
 };
 
 
@@ -93,6 +94,7 @@ fn seed_default_if_absent() {
 fn apply(cx: &mut App, settings: TerminalSettings) {
     set_spawn_scrollback(settings.scrollback_lines);
     set_shell_integration_enabled(settings.shell_integration);
+    set_per_terminal_history(settings.per_terminal_history);
     set_spawn_shell_resolved(resolve_spawn_shell(&settings));
     cx.set_global(settings);
 }

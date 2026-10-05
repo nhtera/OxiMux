@@ -78,6 +78,21 @@ fn inherit_copies_each_shell_file_the_parent_has() {
 }
 
 #[test]
+fn only_a_terminal_with_a_file_has_history() {
+    let dir = temp_dir("has-history");
+    assert!(!has_history(&dir, &id(PARENT)));
+    fs::write(tab_file(&dir, &id(PARENT), HistoryShell::Bash), "ls\n").unwrap();
+    assert!(has_history(&dir, &id(PARENT)));
+    // fish: only through a pointer to a file that is really there.
+    let fish = dir.join(format!("{}_history", id(CHILD).fish_session()));
+    fs::write(fish_pointer(&dir, &id(CHILD)), format!("{}\n", fish.display())).unwrap();
+    assert!(!has_history(&dir, &id(CHILD)));
+    fs::write(&fish, "- cmd: ls\n").unwrap();
+    assert!(has_history(&dir, &id(CHILD)));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn inherit_without_parent_history_creates_nothing() {
     let dir = temp_dir("inherit-none");
     inherit(&dir, &id(PARENT), &id(CHILD)).unwrap();

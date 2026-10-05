@@ -51,7 +51,7 @@ pub use keybindings::KeybindingOverrides;
 pub use motion::{Motion, ease_out_spring};
 pub use project_scripts::{ProjectScripts, ScriptKind, SetupDecision, load_for_project};
 pub use session_search::SessionSearchSettings;
-pub use terminal::{BellStyle, TerminalSettings, WindowsPowerShell, WindowsShell};
+pub use terminal::{BellStyle, PerTerminalHistory, TerminalSettings, WindowsPowerShell, WindowsShell};
 #[cfg(feature = "gpui")]
 pub use theme::{GitDecorations, SyntaxPalette, Theme};
 #[cfg(feature = "gpui")]
