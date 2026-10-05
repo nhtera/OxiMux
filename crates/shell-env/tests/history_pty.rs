@@ -480,7 +480,8 @@ fn share_history_turned_on_late_hands_history_back() {
     s.run(&cmd(2));
     s.kill9();
     assert!(sb.read(&sb.global(Sh::Zsh)).contains(&cmd(2)));
-    assert!(!sb.read(&sb.tab(Sh::Zsh, TAB_A)).contains(&cmd(2)), "still writing the tab file");
+    assert!(sb.read(&sb.global(Sh::Zsh)).contains(&cmd(1)), "a line written before the hand-back was lost");
+    assert!(!sb.tab(Sh::Zsh, TAB_A).exists(), "a frozen tab file was left for new tabs to copy");
 }
 
 #[test]

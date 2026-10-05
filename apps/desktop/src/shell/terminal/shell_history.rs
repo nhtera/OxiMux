@@ -203,6 +203,14 @@ pub fn note_focus(tab: &str, note: FocusNote) {
     focused.notes.insert(tab.to_string(), (seq, note));
 }
 
+/// Terminal `tab` now runs another session (a restored placeholder attached
+/// to its shell): update its note, if it has one, without counting as a focus.
+pub fn refresh_focus(tab: &str, note: FocusNote) {
+    if let Some((_, old)) = lock_focused().notes.get_mut(tab) {
+        *old = note;
+    }
+}
+
 /// The most recently focused live terminal in the worktree of `cwd`, if any.
 pub fn seed_parent_for(cwd: &Path) -> Option<String> {
     if !enabled() {
@@ -493,6 +501,21 @@ mod tests {
             ..FocusNote::default()
         };
         assert_eq!(note.live_cwd(), PathBuf::from("/reported"));
+    }
+
+    #[test]
+    fn a_refresh_updates_a_note_but_never_adds_or_reorders_one() {
+        let (tab, unseen) = ("55555555-2222-3333-4444-555555555555", "66666666-2222-3333-4444-555555555555");
+        note_focus(tab, FocusNote::default());
+        let seq = lock_focused().notes[tab].0;
+        let live = FocusNote { pid: Some(42), ..FocusNote::default() };
+        refresh_focus(tab, live.clone());
+        refresh_focus(unseen, live.clone());
+        let focused = lock_focused();
+        assert_eq!(focused.notes[tab], (seq, live));
+        assert!(!focused.notes.contains_key(unseen), "a refresh is not a focus");
+        drop(focused);
+        forget(tab);
     }
 
     #[test]

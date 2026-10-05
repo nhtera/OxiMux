@@ -40,8 +40,11 @@ if [[ -z ${__oximux_tab_hist:-} && ${OXIMUX_PER_TERMINAL_HISTORY:-1} != 0 \
     local __s=$?
     emulate -L zsh
     if [[ -o share_history ]] && (( ! __oximux_hist_always )); then
-      # Turned on later (a deferred plugin): hand history back for good.
+      # Turned on later (a deferred plugin): hand history back for good. The
+      # tab file goes too (its lines are all in yours already): left behind,
+      # a new tab could start from it, frozen at this moment.
       HISTFILE=$__oximux_shared_hist
+      command rm -f -- "$__oximux_tab_hist"
       (( __oximux_hist_exp )) && export HISTFILE
       (( SAVEHIST == 1000000000 )) && SAVEHIST=$__oximux_savehist
       preexec_functions=(${preexec_functions:#__oximux_hist_tee})
