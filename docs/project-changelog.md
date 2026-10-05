@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-10-05 — Unreleased: Per-terminal shell history
+### 2026-10-05 — v0.1.38: Per-terminal shell history (#47)
 
 - **Each terminal remembers its own commands.** Up-arrow in a pane recalls
   what was typed in *that* pane, not the last command typed anywhere. Works
