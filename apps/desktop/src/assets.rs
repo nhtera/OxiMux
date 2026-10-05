@@ -257,6 +257,12 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/columns.svg",
         include_bytes!("../assets/icons/columns.svg"),
     ),
+    // Editor find widget: replace every match (replacing one uses the
+    // bundled `Replace` icon).
+    (
+        "icons/replace-all.svg",
+        include_bytes!("../assets/icons/replace-all.svg"),
+    ),
     // Voice-dictation mic button in the Agent Chat composer.
     ("icons/mic.svg", include_bytes!("../assets/icons/mic.svg")),
     // Voice-dictation history row: copy the transcript; trash removes a

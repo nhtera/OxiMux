@@ -45,6 +45,9 @@ use crate::markdown_preview::{self, MarkdownViewMode};
 use crate::mermaid;
 use crate::pdf_preview::{self, PdfContent, PdfDocument};
 
+mod find_bar;
+mod preview_find;
+
 actions!(
     oximux,
     [
@@ -366,6 +369,12 @@ pub struct EditorView {
     /// Per-view so two open `.md` tabs never share diagram state. Empty
     /// whenever the document has no mermaid fences.
     mermaid: mermaid::MermaidCache,
+    /// The preview renderer's state, created on the first Preview/Split
+    /// render. `None` for non-markdown files and until then.
+    md_preview: Option<preview_find::PreviewText>,
+    /// The find widget (Cmd+F) over the source or the preview; `None` while
+    /// closed.
+    find: Option<find_bar::FindBar>,
     /// Whether the breadcrumb "⋯" actions dropdown is showing. View-lifetime.
     actions_menu_open: bool,
     /// Leftover Cmd+wheel scroll travel (px) below one zoom step. Carried
@@ -495,6 +504,8 @@ impl EditorView {
             is_markdown,
             md_mode,
             mermaid: mermaid::MermaidCache::default(),
+            md_preview: None,
+            find: None,
             actions_menu_open: false,
             autosave_gen: 0,
             wheel_zoom_accum: 0.0,
@@ -781,6 +792,9 @@ impl EditorView {
     /// succeeds.
     fn finish_load(&mut self, content: EditorContent, cx: &mut Context<Self>) {
         self.content = content;
+        // Find and the preview's renderer state belong to the old content.
+        self.find = None;
+        self.md_preview = None;
         self.is_markdown =
             matches!(self.content, EditorContent::Text(_)) && is_markdown_path(&self.file_path);
         // Mirror `new()`: markdown opens in Preview; anything else uses Source
@@ -1242,6 +1256,10 @@ fn decide_content(
     let language = language_for_path(path);
     let state = cx.new(|cx| {
         EditorState::new(window, cx)
+            // Find is the view's own floating widget (`find_bar`), which
+            // drives this editor's search engine directly; the built-in panel
+            // stays off so there is only ever one find UI.
+            .searchable(false)
             .language(language)
             .tab_size(TabSize {
                 tab_size: 4,
@@ -1320,11 +1338,10 @@ impl Render for EditorView {
         // ```mermaid fences come back rewritten to file:// images, which
         // `absolutize_image_paths` later passes through untouched (it skips
         // URLs with a scheme). `Some` exactly when a Preview/Split arm below
-        // will consume it — and those arms fall back to re-reading the raw
-        // buffer, so a future condition drift degrades to an un-rewritten
-        // preview, never a blank one.
+        // will consume it. The renderer-state update and the find bar's
+        // render also need `&mut cx`, so they happen here too.
         let is_dark = cx.theme().is_dark();
-        let mut md_preview_value = match &self.content {
+        let md_preview_value = match &self.content {
             EditorContent::Text(t)
                 if self.is_markdown
                     && matches!(
@@ -1337,6 +1354,13 @@ impl Render for EditorView {
             }
             _ => None,
         };
+        // Into the view-owned renderer state, which the find bar searches.
+        // `Some` exactly when a Preview/Split arm below renders it.
+        let md_preview_state = md_preview_value.map(|value| {
+            let source = markdown_preview::preview_source(&value, self.file_path.parent());
+            self.sync_preview_text(&source, cx)
+        });
+        let find_widget = self.render_find(window, cx);
 
         // A PDF pane's page is derived from its scroll offset, so following
         // it is a render-time read: point the rail at it (the deferred
@@ -1405,11 +1429,12 @@ impl Render for EditorView {
             .when(self.is_markdown, |row| {
                 row.child(
                     markdown_preview::mode_toggle(self.md_mode, cx.entity_id()).on_click(cx.listener(
-                        |this, clicks: &Vec<usize>, _window, cx| {
+                        |this, clicks: &Vec<usize>, window, cx| {
                             if let Some(mode) =
                                 clicks.first().and_then(|&i| MarkdownViewMode::from_index(i))
                             {
                                 this.md_mode = mode;
+                                this.find_after_mode_change(window, cx);
                                 cx.notify();
                             }
                         },
@@ -1455,27 +1480,24 @@ impl Render for EditorView {
                     .text_size(mono_size)
                     .size_full();
                 let view_id = cx.entity_id();
-                match self.md_mode {
-                    MarkdownViewMode::Source => input.into_any_element(),
-                    MarkdownViewMode::Preview => {
-                        let value = md_preview_value
-                            .take()
-                            .unwrap_or_else(|| t.state.read(cx).value().to_string());
-                        markdown_preview::render_preview(
-                            &value,
-                            dir,
-                            view_id,
-                            is_dark,
-                            typo.t_body_sm,
-                            preview_body,
-                            preview_factor,
-                            self.document_opener.clone(),
-                        )
-                    }
-                    MarkdownViewMode::Split => {
-                        let value = md_preview_value
-                            .take()
-                            .unwrap_or_else(|| t.state.read(cx).value().to_string());
+                // `md_preview_state` is `Some` exactly in Preview/Split; were
+                // the two conditions ever to drift apart, the source editor
+                // shows instead of a blank pane.
+                let preview = md_preview_state.as_ref().map(|state| {
+                    markdown_preview::render_preview(
+                        state,
+                        dir,
+                        view_id,
+                        is_dark,
+                        typo.t_body_sm,
+                        preview_body,
+                        preview_factor,
+                        self.document_opener.clone(),
+                    )
+                });
+                match (self.md_mode, preview) {
+                    (MarkdownViewMode::Preview, Some(preview)) => preview,
+                    (MarkdownViewMode::Split, Some(preview)) => {
                         // Bound the split's height to the region below the 28px
                         // breadcrumb: `h_resizable` is `size_full`, so without a
                         // `flex_1`/`min_h_0` wrapper it would overflow the header.
@@ -1485,23 +1507,11 @@ impl Render for EditorView {
                             .child(
                                 h_resizable(("md-split", view_id))
                                     .child(resizable_panel().child(input))
-                                    .child(
-                                        resizable_panel().child(
-                                            markdown_preview::render_preview(
-                                                &value,
-                                                dir,
-                                                view_id,
-                                                is_dark,
-                                                typo.t_body_sm,
-                                                preview_body,
-                                                preview_factor,
-                                                self.document_opener.clone(),
-                                            ),
-                                        ),
-                                    ),
+                                    .child(resizable_panel().child(preview)),
                             )
                             .into_any_element()
                     }
+                    _ => input.into_any_element(),
                 }
             }
             EditorContent::Text(t) => Editor::new(&t.state)
@@ -1596,6 +1606,9 @@ impl Render for EditorView {
             )
             .child(breadcrumb)
             .child(body)
+            // Cmd+F: floats over the text's top-right corner, below the
+            // breadcrumb.
+            .children(find_widget)
             // Cmd+scroll and pinch font zoom. Registered as CAPTURE-phase
             // window mouse listeners rather than `.on_scroll_wheel` /
             // `.on_pinch`: the child `Input` handles plain wheel scroll in

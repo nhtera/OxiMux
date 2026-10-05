@@ -133,9 +133,9 @@ oximux-proc-ports = { path = "crates/proc-ports" }
 # cargo builds two copies of `gpui::App` in one dep graph (one of v0.9's exact
 # failure modes). The package renames are cargo-side only — the crates are
 # still `use`d as `gpui`, `gpui_platform`, `gpui_macros`.
-gpui = { package = "gpui-pre", version = "0.3.5" }
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui_macros = { package = "gpui-pre-macros", version = "0.3.5" }
+gpui = { package = "gpui-pre", version = "0.3.8" }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.8", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui_macros = { package = "gpui-pre-macros", version = "0.3.8" }
 # Enable a broad set of tree-sitter grammars so the code editor can syntax-
 # highlight the language families a typical workspace contains. The
 # `tree-sitter-languages` meta-feature pulls in every grammar shipped by
@@ -144,8 +144,10 @@ gpui_macros = { package = "gpui-pre-macros", version = "0.3.5" }
 # bash, make, cmake, proto, graphql, diff, ...). Build time is a few extra
 # seconds; the runtime cost is per-file (lazy parser construction).
 # Sourced from our fork's `oximux` branch, which currently tracks upstream
-# `longbridge/gpui-kit` 0.6.4 with no local patches — the two commits we used
-# to carry (`TextView::on_link_click`, and the soft-break reflow fix that made
+# `longbridge/gpui-kit` 0.7.1 with no local patches. 0.7 brought the markdown
+# `TextViewState` search API the preview's find bar uses and moved GPUI to the
+# 0.3.8 snapshots, so the `gpui-pre*` versions above move with it. The two
+# commits we used to carry (`TextView::on_link_click`, and the soft-break reflow fix that made
 # every source line wrap render as a hard line break) have both landed
 # upstream. The branch exists so an OxiMux-only fix has somewhere to live
 # without repinning; the tag `pin-ccc1e76-link-click` preserves the rev used
@@ -155,8 +157,8 @@ gpui_macros = { package = "gpui-pre-macros", version = "0.3.5" }
 # `gpui-base` (text, input core), `gpui-component` (the component library,
 # still that package name) and `gpui-kit-assets` (formerly
 # `gpui-component-assets`).
-gpui-component = { git = "https://github.com/nhtera/gpui-kit", rev = "6b8581a1e5458eace91beb842376f833beaef2ff", features = ["tree-sitter-languages"] }
-gpui-component-assets = { package = "gpui-kit-assets", git = "https://github.com/nhtera/gpui-kit", rev = "6b8581a1e5458eace91beb842376f833beaef2ff" }
+gpui-component = { git = "https://github.com/nhtera/gpui-kit", rev = "87d10ae5e1299d1be18670a37570c5402f952e34", features = ["tree-sitter-languages"] }
+gpui-component-assets = { package = "gpui-kit-assets", git = "https://github.com/nhtera/gpui-kit", rev = "87d10ae5e1299d1be18670a37570c5402f952e34" }
 
 # Async + util
 tokio = { version = "1", features = ["full"] }

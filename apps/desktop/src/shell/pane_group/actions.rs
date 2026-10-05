@@ -171,11 +171,14 @@ impl PaneGroup {
         self.open_browser_tab(crate::shell::browser_view::DEFAULT_URL, None, window, cx);
     }
 
-    /// Open the scrollback search overlay on the active tab's active terminal
-    /// sub-pane. Used by the root-level Search fallback so the command palette
-    /// "Search Pane" entry works while the palette (not a terminal) has focus.
-    /// No-op when the active tab isn't terminal-backed.
-    pub(crate) fn open_search_active_terminal(
+    /// Open the active tab's find: the scrollback search overlay on its
+    /// active terminal sub-pane, or an editor's find. Used
+    /// by the root-level Search fallback, which is where Cmd+F lands from a
+    /// focused editor (it has no listener of its own) and where the command
+    /// palette "Search Pane" entry lands while the palette holds focus.
+    /// For an editor that is its find widget, over the source or the markdown
+    /// preview (see `EditorView::open_find`). No-op for any other tab.
+    pub(crate) fn open_search_active_pane(
         &mut self,
         action: &Search,
         window: &mut Window,
@@ -184,8 +187,22 @@ impl PaneGroup {
         let Some(active_tab) = self.tabs.get(self.active) else {
             return;
         };
-        let PaneContent::Terminal(tree) = &active_tab.content else {
-            return;
+        let tree = match &active_tab.content {
+            PaneContent::Terminal(tree) => tree,
+            PaneContent::Editor(editor) => {
+                let editor = editor.clone();
+                if editor.update(cx, |e, cx| e.open_find(window, cx)) {
+                    // Same palette-path focus race as the terminal below: the
+                    // palette's queued root refocus would land after the find
+                    // input's focus. Only refocus here — opening again could
+                    // retarget the widget, since focus has moved to its query.
+                    window.defer(cx, move |window, cx| {
+                        editor.update(cx, |e, cx| e.refocus_find(window, cx));
+                    });
+                }
+                return;
+            }
+            _ => return,
         };
         let Some(view) = tree.active_view().cloned() else {
             return;

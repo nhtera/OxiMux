@@ -8,7 +8,8 @@
 //!
 //! 1. Exposes the `MarkdownViewMode` tri-state (Source / Preview / Split) and
 //!    the segmented header toggle that drives it.
-//! 2. Builds the scrollable preview element.
+//! 2. Builds the scrollable preview element over a renderer state the owning
+//!    view holds (so its find bar can search and mark the rendered text).
 //! 3. Fixes the one real gap vs. a polished editor: the renderer consumes
 //!    image URLs verbatim, so a relative `![](./img.png)` never resolves.
 //!    `absolutize_image_paths` rewrites repo-relative image paths to
@@ -23,8 +24,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, EntityId, InteractiveElement, IntoElement, ParentElement, Pixels, Styled,
-    Window, div, prelude::FluentBuilder as _, px, rems,
+    AnyElement, App, Entity, EntityId, InteractiveElement, IntoElement, ParentElement, Pixels,
+    Styled, Window, div, prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, Selectable, Sizable,
@@ -32,7 +33,7 @@ use gpui_component::{
     clipboard::Clipboard,
     h_flex,
     highlighter::HighlightTheme,
-    text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewStyle},
+    text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState, TextViewStyle},
 };
 
 /// Callback the host app installs so a clicked document link in the rendered
@@ -118,18 +119,26 @@ fn preview_style(is_dark: bool) -> TextViewStyle {
     .paragraph_gap(rems(1.1))
 }
 
-/// Render the markdown preview element: absolutize relative image paths, then
-/// hand the source to the GFM renderer. Wrapped in a bounded `flex_1`
-/// container because `scrollable(true)` virtualizes via `gpui::list`, which
-/// needs a fixed-height parent (see `TextView::scrollable` docs).
+/// The text the preview renders for `source`: relative image paths
+/// absolutized against `base_dir`, the document's directory
+/// (`file_path.parent()`). When `None` (file at filesystem root, no parent)
+/// image paths are left untouched.
+pub fn preview_source(source: &str, base_dir: Option<&Path>) -> String {
+    match base_dir {
+        Some(dir) => absolutize_image_paths(source, dir),
+        None => source.to_owned(),
+    }
+}
+
+/// Render the markdown preview element over `state`, the owning view's
+/// renderer state, which already holds the [`preview_source`] text. Wrapped
+/// in a bounded `flex_1` container because `scrollable(true)` virtualizes via
+/// `gpui::list`, which needs a fixed-height parent (see `TextView::scrollable`
+/// docs).
 ///
-/// `base_dir` is the document's directory (`file_path.parent()`); when `None`
-/// (file at filesystem root, no parent) image paths are left untouched.
-///
-/// `view_id` scopes the element ids (wrapper + `TextView`) to the owning view
-/// so two open `.md` tabs never share the renderer's keyed state. `is_dark`
-/// follows the active app theme so preview surface + code-block syntax track
-/// dark/light.
+/// `view_id` scopes the wrapper's element id to the owning view so two open
+/// `.md` tabs never share it. `is_dark` follows the active app theme so
+/// preview surface + code-block syntax track dark/light.
 ///
 /// `body_size` is the editor-zoomed body text size (the un-zoomed default is
 /// the theme's `font_size`, which the `TextView` would otherwise inherit via
@@ -145,7 +154,7 @@ fn preview_style(is_dark: bool) -> TextViewStyle {
 /// default open-URL behavior.
 #[allow(clippy::too_many_arguments)]
 pub fn render_preview(
-    source: &str,
+    state: &Entity<TextViewState>,
     base_dir: Option<&Path>,
     view_id: EntityId,
     is_dark: bool,
@@ -154,14 +163,10 @@ pub fn render_preview(
     zoom_factor: f32,
     opener: Option<DocumentOpener>,
 ) -> AnyElement {
-    let rendered = match base_dir {
-        Some(dir) => absolutize_image_paths(source, dir),
-        None => source.to_owned(),
-    };
     let mut style = preview_style(is_dark);
     style.heading_base_font_size *= zoom_factor;
     let lang_tag_size = lang_tag_size * zoom_factor;
-    let mut text_view = TextView::markdown(("md-preview-text", view_id), rendered)
+    let mut text_view = TextView::new(state)
         .style(style)
         // YAML frontmatter is not CommonMark: with the construct off, a plan's
         // `---` block parses as a thematic rule plus a *setext underline*, so

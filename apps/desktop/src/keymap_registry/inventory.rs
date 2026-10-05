@@ -247,7 +247,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         ApplyLayoutBottomTerminal
     ),
     // ---- Terminal & Agents -------------------------------------------
-    entry!("search_scrollback", "Search scrollback", Terminal, "secondary-f", Search),
+    // Opens the active pane's find: terminal scrollback search, or an
+    // editor's find (source or markdown preview). The id predates editor find
+    // and is kept, since saved keybinding overrides are keyed by it.
+    entry!("search_scrollback", "Search pane", Terminal, "secondary-f", Search),
     entry!("find_next_match", "Find next match", Terminal, "secondary-g", FindNextMatch),
     // cmd-shift-g (the platform "find previous" convention) is owned by
     // select_source_control_tab, a shipped default; prev gets the alt
