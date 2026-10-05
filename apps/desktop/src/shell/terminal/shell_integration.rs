@@ -30,6 +30,11 @@
 //!   POSIX shells get from elsewhere — on Windows there is no `/proc` and no
 //!   libproc, so this hook is the only thing that can report a cwd at all.
 //!
+//! The POSIX overlays also carry per-terminal history (see
+//! [`super::shell_history`]): after the hooks above, a block from
+//! `oximux_shell_env::history::scripts` points the shell's history at this
+//! terminal's own file and tees each command to the user's.
+//!
 //! All four are guarded against double-emitting marks: a re-entry sentinel
 //! makes a re-source idempotent, an opt-out env var
 //! (`OXIMUX_SHELL_INTEGRATION=0`, also surfaced as the `shell_integration`
@@ -55,7 +60,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use oximux_pty::SpawnConfig;
+use oximux_shell_env::history;
 
+use super::shell_history;
 use super::terminal_view::shell_integration_enabled;
 
 /// Shells we know how to bootstrap. Anything else is left untouched.
@@ -78,6 +85,12 @@ struct Integration {
 /// a failed file write just leaves the shell un-instrumented.
 pub fn augment_spawn_config(cfg: &mut SpawnConfig) {
     if !shell_integration_enabled() {
+        // This shell keeps the user's own history. Drop any per-terminal file
+        // a past integrated run left, so turning integration back on later
+        // cannot bring back a history that went stale meanwhile.
+        if let Some((_, tab)) = cfg.env.iter().find(|(k, _)| k == history::TAB_ID_ENV) {
+            shell_history::forget(tab);
+        }
         return;
     }
     let Some(kind) = shell_kind(&cfg.shell) else {
@@ -110,9 +123,15 @@ pub fn augment_spawn_config(cfg: &mut SpawnConfig) {
         cfg.args = args;
     }
     // Caller env wins on key collision because the backend applies `cfg.env`
-    // last; our keys (`ZDOTDIR`, `OXIMUX_ORIG_ZDOTDIR`) don't collide with the
-    // context-id env the terminal sets, so a plain extend is correct.
+    // last; our keys (`ZDOTDIR`, `OXIMUX_ORIG_ZDOTDIR`, `OXIMUX_HISTORY_DIR`)
+    // don't collide with the context-id env the terminal sets, so a plain
+    // extend is correct.
     cfg.env.extend(integration.env);
+    if kind != ShellKind::PowerShell
+        && let Some(pair) = shell_history::env_pair()
+    {
+        cfg.env.push(pair);
+    }
 }
 
 /// Classify a shell by its path's file name. Login shells whose argv[0] is
@@ -165,7 +184,8 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
             migrate_zsh_overlay(&dir, &zsh_home(orig));
             write_if_changed(&dir.join(".zshenv"), scripts::ZSH_ZSHENV)?;
             write_if_changed(&dir.join(".zprofile"), scripts::ZSH_ZPROFILE)?;
-            write_if_changed(&dir.join(".zshrc"), scripts::ZSH_ZSHRC)?;
+            let zshrc = format!("{}{}", scripts::ZSH_ZSHRC, history::scripts::ZSH_BLOCK);
+            write_if_changed(&dir.join(".zshrc"), &zshrc)?;
             write_if_changed(&dir.join(".zlogin"), scripts::ZSH_ZLOGIN)?;
             let mut env = vec![("ZDOTDIR".to_string(), dir.to_string_lossy().into_owned())];
             if let Some(orig) = orig {
@@ -175,7 +195,8 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
         }
         ShellKind::Bash => {
             let rcfile = base.join("bash").join("rcfile");
-            write_if_changed(&rcfile, scripts::BASH_RCFILE)?;
+            let rc = format!("{}{}", scripts::BASH_RCFILE, history::scripts::BASH_BLOCK);
+            write_if_changed(&rcfile, &rc)?;
             Ok(Integration {
                 env: Vec::new(),
                 args: vec!["--rcfile".to_string(), rcfile.to_string_lossy().into_owned()],
@@ -185,7 +206,10 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
         // pass the hook as an init-command so the user's config loads normally.
         ShellKind::Fish => Ok(Integration {
             env: Vec::new(),
-            args: vec!["-C".to_string(), scripts::FISH_INIT.to_string()],
+            args: vec![
+                "-C".to_string(),
+                format!("{}{}", scripts::FISH_INIT, history::scripts::FISH_BLOCK),
+            ],
         }),
         // PowerShell has no "extra profile" flag, so the hook is dot-sourced by
         // a `-Command` that runs after `$PROFILE` — which is the ordering we
@@ -369,7 +393,9 @@ unset __oximux_emits_133 __oximux_f
     /// bash `--rcfile`. Source the user's rc, then install a `PROMPT_COMMAND`
     /// (emit `D;$?` for the finished command, then `A`) plus a `DEBUG` trap
     /// (emit `C` once per command). The `__oximux_in_command` latch keeps the
-    /// trap from firing for the prompt command itself or for completion.
+    /// trap from firing for the prompt command itself or for completion, and
+    /// the `__oximux_*` guard keeps every OxiMux prompt hook (the history
+    /// flush included) from reading as a user command.
     pub const BASH_RCFILE: &str = "\
 # OxiMux shell integration overlay. Chains to your real bash startup files.
 [[ -f /etc/bash.bashrc ]] && source /etc/bash.bashrc
@@ -395,7 +421,10 @@ if [[ -z \"${__oximux_shell_integration:-}\" && \"${OXIMUX_SHELL_INTEGRATION:-1}
   __oximux_preexec() {
     [[ -n \"${COMP_LINE:-}\" ]] && return
     [[ -n \"${__oximux_in_command:-}\" ]] && return
-    [[ \"$BASH_COMMAND\" == \"__oximux_precmd\" ]] && return
+    [[ \"$BASH_COMMAND\" == __oximux_* ]] && return
+    # Save the command to history now, not at the next prompt: a long-running
+    # one would otherwise be lost when its pane closes before it ends.
+    declare -F __oximux_hist_flush >/dev/null && __oximux_hist_flush
     printf '\\033]133;C\\007'
     __oximux_in_command=1
   }
@@ -758,6 +787,44 @@ mod tests {
         // fish needs no on-disk overlay.
         assert!(!base.join("fish").exists());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn every_posix_overlay_ends_with_its_history_block() {
+        // After the user's rc and the OSC 133 hooks, so the block sees the
+        // final HISTFILE / options and its hooks run after `__oximux_precmd`.
+        let base = temp_base("history-blocks");
+        install(ShellKind::Zsh, &base, None).expect("zsh");
+        let zshrc = fs::read_to_string(base.join("zsh").join(".zshrc")).expect("zshrc");
+        assert!(zshrc.ends_with(history::scripts::ZSH_BLOCK));
+        assert!(zshrc.find("add-zsh-hook precmd __oximux_precmd") < zshrc.find("__oximux_hist_tee"));
+        install(ShellKind::Bash, &base, None).expect("bash");
+        let rc = fs::read_to_string(base.join("bash").join("rcfile")).expect("rcfile");
+        assert!(rc.ends_with(history::scripts::BASH_BLOCK));
+        let fish = install(ShellKind::Fish, &base, None).expect("fish");
+        assert!(fish.args[1].starts_with(scripts::FISH_INIT));
+        assert!(fish.args[1].ends_with(history::scripts::FISH_BLOCK));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_bash_trap_ignores_every_oximux_prompt_hook() {
+        // The history flush runs from PROMPT_COMMAND too; if the DEBUG trap
+        // took it for a user command it would emit a phantom `C` mark.
+        assert!(scripts::BASH_RCFILE.contains("[[ \"$BASH_COMMAND\" == __oximux_* ]] && return"));
+        assert!(history::scripts::BASH_BLOCK.contains("__oximux_hist_flush"));
+    }
+
+    #[test]
+    fn a_posix_shell_spawn_carries_the_history_dir() {
+        let mut cfg = SpawnConfig {
+            shell: "/bin/zsh".to_string(),
+            ..SpawnConfig::default()
+        };
+        augment_spawn_config(&mut cfg);
+        let dir = shell_history::history_dir().expect("test data dir");
+        assert!(cfg.env.iter().any(|(k, v)| k == history::HISTORY_DIR_ENV
+            && Path::new(v) == dir));
     }
 
     #[test]

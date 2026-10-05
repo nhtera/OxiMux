@@ -23,7 +23,7 @@ use oximux_core::AgentAdapter;
 use crate::shell::pane_tree::PaneId;
 use crate::shell::pane_tree::{Axis, PaneTree};
 
-const KEY_PREFIX: &str = "terminal_tabs:";
+pub(crate) const KEY_PREFIX: &str = "terminal_tabs:";
 
 /// Build the settings key for per-window tab persistence. Format:
 /// `terminal_tabs:<project_id>:<window_id>`. The window_id scopes saves

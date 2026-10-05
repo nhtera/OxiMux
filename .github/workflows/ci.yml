@@ -292,6 +292,12 @@ jobs:
       - name: cargo test (proc-cwd Linux arm)
         run: cargo test -p oximux-proc-cwd
 
+      # Per-terminal shell history: the history blocks run against real
+      # shells over a PTY. macOS covers zsh 5.9 + bash 3.2; this is the only
+      # leg with bash 5 (array PROMPT_COMMAND), and zsh when the image has it.
+      - name: cargo test (shell-env, per-terminal history)
+        run: cargo test -p oximux-shell-env
+
       # The only end-to-end coverage of PTY spawn/attach/replay on Linux —
       # same rationale as the Windows job's step of the same name.
       - name: cargo test (relay daemon end-to-end)

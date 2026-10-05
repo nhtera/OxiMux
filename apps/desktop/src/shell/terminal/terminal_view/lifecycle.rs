@@ -173,6 +173,7 @@ impl TerminalView {
             progress: None,
             pending_attach: false,
             pending_relay_hint: None,
+            detached: Cell::new(false),
             exited: None,
             relay_pty_id,
             lost_to_daemon: false,
@@ -440,6 +441,7 @@ impl TerminalView {
             progress: None,
             pending_attach: false,
             pending_relay_hint: None,
+            detached: Cell::new(false),
             exited: None,
             relay_pty_id: None,
             lost_to_daemon: false,
@@ -719,6 +721,9 @@ impl TerminalView {
     /// closes it. That case is excluded at the menu level (`can_tear_off` is
     /// only `true` when `external_id()` is `Some`).
     pub fn detach(&self) {
+        // The shell lives on in another window under the same tab id, so
+        // this view's drop is not a close: keep its history.
+        self.detached.set(true);
         let id = self.session_id;
         self.with_backend(|be| {
             if let Err(err) = be.detach(id) {

@@ -410,6 +410,9 @@ fn main() {
         // without Xcode never runs `xcrun` because of it).
         oximux_app::simulator_settings::install(cx);
         oximux_app::shell::simulator::install(cx, app_state.settings_repo().clone(), app_state.sim_approval_repo());
+        // Per-terminal shell history of terminals no layout refers to any
+        // more, swept off the main thread (skipped if any layout is unreadable).
+        oximux_app::shell::terminal::shell_history::spawn_boot_gc(app_state.settings_repo().clone());
         // The daemon status every restart surface reads, kept current from the
         // relay lifecycle's events. Before any window opens so none reads it
         // missing.

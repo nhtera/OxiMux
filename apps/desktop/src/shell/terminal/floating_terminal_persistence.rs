@@ -13,9 +13,12 @@
 use oximux_storage::SettingsRepo;
 use serde::{Deserialize, Serialize};
 
+/// Settings-key prefix shared by every window's floating-tab blob.
+pub(crate) const TABS_KEY_PREFIX: &str = "floating_terminal.tabs.";
+
 /// Settings key for one window's floating-tab blob.
 pub fn tabs_key(window_id: &str) -> String {
-    format!("floating_terminal.tabs.{window_id}")
+    format!("{TABS_KEY_PREFIX}{window_id}")
 }
 
 /// One persisted floating tab — enough to reattach (external id) or
@@ -32,6 +35,13 @@ pub struct PersistedFloatingTab {
     /// ran on the in-process fallback backend (dies with the app).
     #[serde(default)]
     pub external_id: Option<String>,
+    /// The tab's `OXIMUX_SURFACE_ID` / `OXIMUX_TAB_ID`, so a restored tab is
+    /// the same terminal (its shell history included). Empty in blobs
+    /// written before they were persisted; restore mints fresh ones then.
+    #[serde(default)]
+    pub surface_id: String,
+    #[serde(default)]
+    pub tab_id: String,
 }
 
 /// The whole per-window blob.
@@ -88,11 +98,14 @@ mod tests {
                     custom_title: None,
                     cwd: "/w/a".into(),
                     external_id: Some("ext-1".into()),
+                    surface_id: "surface-a".into(),
+                    tab_id: "tab-a".into(),
                 },
                 PersistedFloatingTab {
                     custom_title: Some("build".into()),
                     cwd: "/w/b".into(),
                     external_id: None,
+                    ..PersistedFloatingTab::default()
                 },
             ],
         }
@@ -110,6 +123,20 @@ mod tests {
         let b = blob();
         b.save(&r, &tabs_key("main"));
         assert_eq!(FloatingTabsBlob::load(Some(&r), &tabs_key("main")), b);
+    }
+
+    #[test]
+    fn a_blob_from_before_ids_were_persisted_still_loads() {
+        let r = repo();
+        r.set(
+            &tabs_key("main"),
+            r#"{"relay_session":null,"active":0,"tabs":[{"custom_title":null,"cwd":"/w","external_id":null}]}"#,
+        )
+        .unwrap();
+        let loaded = FloatingTabsBlob::load(Some(&r), &tabs_key("main"));
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].cwd, "/w");
+        assert!(loaded.tabs[0].tab_id.is_empty(), "restore mints a fresh id for it");
     }
 
     #[test]

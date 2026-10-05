@@ -587,6 +587,13 @@ impl ProjectPanes {
                     )
             })
             .unwrap_or(false);
+        // That fresh terminal is a split of the source one: it starts with
+        // the source's shell history.
+        let parent_tab = self
+            .groups
+            .get(&source)
+            .filter(|_| spawn_new_terminal)
+            .and_then(|g| g.read(cx).terminal_tab_id_at(source_tab_idx, cx));
         // 1. Allocate the new sibling group in the layout tree.
         let Some(GroupSplitOutcome { new_group, .. }) =
             self.manager.split_at_target(target, axis, insert)
@@ -621,7 +628,7 @@ impl ProjectPanes {
                 .map(|g| {
                     g.update(cx, |g, cx| {
                         g.set_next_terminal_n(n);
-                        g.open_terminal_tab(window, cx).is_some()
+                        g.open_terminal_tab_from(parent_tab.as_deref(), window, cx).is_some()
                     })
                 })
                 .unwrap_or(false);
@@ -744,6 +751,11 @@ impl ProjectPanes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PaneGroupId> {
+        // The terminal being split, read before the split moves focus: the
+        // new pane starts with its shell history.
+        let parent_tab = self
+            .active_group()
+            .and_then(|g| g.read(cx).terminal_tab_id_at(g.read(cx).active(), cx));
         let GroupSplitOutcome { new_group, .. } = self.manager.split_active_group(axis, insert)?;
         let group = build_group(
             self.cwd.clone(),
@@ -759,7 +771,7 @@ impl ProjectPanes {
         group.update(cx, |g, cx| {
             g.set_chrome_width(self.chrome_w_px, cx);
             g.set_next_terminal_n(n);
-            g.open_terminal_tab(window, cx);
+            g.open_terminal_tab_from(parent_tab.as_deref(), window, cx);
         });
         let group_observer = observe_group(&group, cx);
         let group_focus_observer = observe_group_focus(&group, new_group, window, cx);

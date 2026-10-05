@@ -693,6 +693,10 @@ pub struct TerminalView {
     /// dropping the row (which would orphan the daemon PTY on next boot).
     /// Read only by [`relay_id_for_capture`](Self::relay_id_for_capture).
     pending_relay_hint: Option<String>,
+    /// Set by [`detach`](Self::detach) when the session moves to another
+    /// window (tear-off). The drop that follows is then not a close, so it
+    /// must not delete the terminal's shell history.
+    detached: Cell<bool>,
     /// `Some(code)` once the PTY's child process exits (`TerminalEvent::Exit`);
     /// `None` while it runs. Drives the "process exited" banner so a pane whose
     /// leader has died — e.g. a program run with `exec`, leaving no shell to
@@ -804,28 +808,42 @@ impl Drop for TerminalView {
         }
         let id = self.session_id;
         let backend = self.backend.clone();
-        std::thread::spawn(move || match backend.lock() {
-            Ok(mut be) => {
-                // Per-session drain (NOT the global `drain_events`): on the
-                // shared relay backend a global drain would also consume
-                // OTHER sessions' queued events — including the one-shot
-                // synthetic Exits seeded after a daemon-crash backend swap,
-                // silently starving an agent status poller of its
-                // termination signal. The unblock effect for THIS session's
-                // teardown is identical.
-                let _ = be.drain_events_for(id);
-                if let Err(err) = be.close(id) {
-                    tracing::warn!(
-                        ?err,
-                        ?id,
-                        "terminal-view: backend.close failed in drop helper"
-                    );
-                }
-            }
-            Err(_) => {
-                tracing::warn!(?id, "terminal-view: backend mutex poisoned at drop");
+        // A real close ends this terminal, so its per-terminal shell history
+        // goes too (every command is already in the user's own file). A
+        // torn-off view is not a close: its shell continues elsewhere.
+        let closed_tab = (!self.detached.get()).then(|| self.ids.tab_id.clone());
+        std::thread::spawn(move || {
+            close_backend_session(&backend, id);
+            if let Some(tab) = closed_tab {
+                crate::shell::terminal::shell_history::forget_after_close(&tab);
             }
         });
+    }
+}
+
+/// [`TerminalView`]'s drop-time teardown, on the drop's helper thread.
+fn close_backend_session(backend: &SharedBackend, id: TerminalSessionId) {
+    match backend.lock() {
+        Ok(mut be) => {
+            // Per-session drain (NOT the global `drain_events`): on the
+            // shared relay backend a global drain would also consume
+            // OTHER sessions' queued events — including the one-shot
+            // synthetic Exits seeded after a daemon-crash backend swap,
+            // silently starving an agent status poller of its
+            // termination signal. The unblock effect for THIS session's
+            // teardown is identical.
+            let _ = be.drain_events_for(id);
+            if let Err(err) = be.close(id) {
+                tracing::warn!(
+                    ?err,
+                    ?id,
+                    "terminal-view: backend.close failed in drop helper"
+                );
+            }
+        }
+        Err(_) => {
+            tracing::warn!(?id, "terminal-view: backend mutex poisoned at drop");
+        }
     }
 }
 

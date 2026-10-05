@@ -204,6 +204,21 @@ impl PaneGroup {
         });
     }
 
+    /// The terminal a split of tab `tab_idx` copies its shell history from:
+    /// the focused leaf (`tree.active` does not follow mouse focus), else the
+    /// active one. `None` for a non-terminal tab.
+    pub(crate) fn terminal_tab_id_at(&self, tab_idx: usize, cx: &App) -> Option<String> {
+        let PaneContent::Terminal(tree) = &self.tabs.get(tab_idx)?.content else {
+            return None;
+        };
+        let view = tree
+            .iter_live()
+            .find(|(_, v)| v.read(cx).focused())
+            .map(|(_, v)| v)
+            .or_else(|| tree.active_view())?;
+        Some(view.read(cx).tab_id().to_string())
+    }
+
     /// Cmd+Shift+T — add a terminal tab to the FOCUSED split pane's own
     /// tab strip (per-pane tabs). When the active workspace tab isn't a
     /// terminal, fall back to a workspace-level new terminal tab.
@@ -268,6 +283,10 @@ impl PaneGroup {
             })
             .unwrap_or(fallback_cwd);
         let ids = SurfaceIds::fresh(workspace_id);
+        // ...and its shell history, like a split does.
+        if let Some(parent) = tree.active_view() {
+            crate::shell::terminal::shell_history::inherit(parent.read(cx).tab_id(), &ids.tab_id);
+        }
         let Some((backend, session_id)) = spawn_local_pty(inherited_cwd, ids.env()) else {
             return;
         };
@@ -671,6 +690,10 @@ impl PaneGroup {
         // workspace_id stays the project root even though the new sub-pane
         // spawns at the inherited (possibly cd'd) cwd.
         let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
+        // ...and starts with the split pane's shell history, then diverges.
+        if let Some(parent) = tree.active_view() {
+            crate::shell::terminal::shell_history::inherit(parent.read(cx).tab_id(), &ids.tab_id);
+        }
         let Some((backend, session_id)) = spawn_local_pty(inherited_cwd, ids.env()) else {
             return;
         };

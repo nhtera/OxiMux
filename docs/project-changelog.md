@@ -4,6 +4,37 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-10-05 — Unreleased: Per-terminal shell history
+
+- **Each terminal remembers its own commands.** Up-arrow in a pane recalls
+  what was typed in *that* pane, not the last command typed anywhere. Works
+  for zsh, bash and fish 4+.
+- **Splits start where their parent left off.** A split (⌘D, Split
+  Right/Down, layout presets, drag-to-split) or a new tab inside a pane starts
+  with a copy of the source pane's history, then builds its own. A brand-new
+  top-level tab starts from your normal history.
+- **Restores bring it back.** After a reboot, a relay restart or a tear-off
+  into a new window, each terminal's Up-arrow shows its own last command.
+- **Your history file still gets everything.** Every command is still
+  appended to your `~/.zsh_history` / `~/.bash_history` / fish history as you
+  run it, with your filters applied (ignored and space-prefixed commands stay
+  out of both). `unset HISTFILE` / `set +o history` still keep a command out
+  of both files.
+- **Left alone:** live sharing you set up yourself — zsh `share_history`
+  (oh-my-zsh and prezto turn it on by default), bash `history -n`/`-r` in
+  `PROMPT_COMMAND`, atuin's Up-arrow — plus fish 3.x, Git Bash and
+  PowerShell. Those terminals keep one shared history, as before.
+- **Turn it off** with `export OXIMUX_PER_TERMINAL_HISTORY=0` in your shell rc
+  or `~/.zshenv` (the app's own environment is not read when it is opened from
+  Finder).
+- **Notes.** OxiMux shells no longer trim your global history file; a normal
+  shell elsewhere still trims it when it exits. Terminals already open when
+  you upgrade start from your shared history once, then become per-terminal.
+  Closing a terminal deletes its history file (its commands are already in
+  yours). To start over, delete `shell-history` in the OxiMux data folder.
+
+---
+
 ### 2026-10-03 — v0.1.37: Terminal copy and find fixes (#45, #46)
 
 - **Copy keeps long lines whole.** Copying a line that wrapped at the pane

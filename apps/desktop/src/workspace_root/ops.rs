@@ -1516,7 +1516,7 @@ impl WorkspaceRoot {
 
         // 1. Borrow the group to collect external_id(s) and tab metadata.
         //    All reads happen while the tab is still alive.
-        let (external_ids, label, color, custom_title) = {
+        let (leaves, label, color, custom_title) = {
             let panes_ref = panes.read(cx);
             let Some(group) = panes_ref.group(group_id) else {
                 return;
@@ -1531,11 +1531,19 @@ impl WorkspaceRoot {
                 .unwrap_or_else(|| tab.label.clone());
             let color = tab.color;
             let custom_title = tab.custom_title.clone();
-            // Collect external_ids from every live terminal leaf.
-            let ids: Vec<String> = match &tab.content {
+            // Collect external_ids (plus each leaf's identity, which the
+            // still-running shell carries) from every live terminal leaf.
+            let ids: Vec<crate::window_registry::PendingLeaf> = match &tab.content {
                 crate::shell::pane_content::PaneContent::Terminal(tree) => tree
                     .iter_live()
-                    .filter_map(|(_, view)| view.read(cx).external_id())
+                    .filter_map(|(_, view)| {
+                        let view = view.read(cx);
+                        Some(crate::window_registry::PendingLeaf {
+                            external_id: view.external_id()?,
+                            surface_id: view.surface_id().to_string(),
+                            tab_id: view.tab_id().to_string(),
+                        })
+                    })
                     .collect(),
                 _ => return, // not a terminal tab — bail silently
             };
@@ -1579,10 +1587,6 @@ impl WorkspaceRoot {
 
         // 4. Mint a destination persist id and push the pending entry.
         let dest_window_id = crate::window_registry::next_persist_id(cx);
-        let leaves: Vec<crate::window_registry::PendingLeaf> = external_ids
-            .into_iter()
-            .map(|id| crate::window_registry::PendingLeaf { external_id: id })
-            .collect();
         let app_state = self.app_state.clone();
         let project_id = self.active_project_id();
         let pending = crate::window_registry::PendingTearOff {
@@ -1640,9 +1644,8 @@ impl WorkspaceRoot {
         let typography = self.typography.clone();
         // The torn-off PTY survives in the daemon, so its shell keeps the
         // original OXIMUX_* env it was spawned with. The destination view
-        // gets a fresh identity under THIS window's workspace for future
-        // persistence/respawn (carrying the source ids across windows is a
-        // follow-up).
+        // adopts the same surface/tab ids (under THIS window's workspace),
+        // so a later respawn and its shell history stay this terminal's.
         let workspace_id = panes.read(cx).cwd().to_string_lossy().into_owned();
 
         for leaf in &tearoff.leaves {
@@ -1654,13 +1657,20 @@ impl WorkspaceRoot {
                     dest_window_id = %tearoff.dest_window_id,
                     "mount_pending_tearoff: attach_pty_existing failed; PTY orphaned in relay"
                 );
+                // No view will ever own this terminal again, so no close
+                // will clean its shell history up either.
+                crate::shell::terminal::shell_history::forget(&leaf.tab_id);
                 continue;
             };
 
             // Mount a fresh TerminalView in this window's entity context.
             // Entity<TerminalView> cannot cross windows — a new one is
             // required in the destination window context.
-            let ids = crate::shell::context_env::SurfaceIds::fresh(workspace_id.clone());
+            let ids = crate::shell::context_env::SurfaceIds::restored(
+                workspace_id.clone(),
+                leaf.surface_id.clone(),
+                leaf.tab_id.clone(),
+            );
             let view = cx.new(|cx| {
                 crate::shell::terminal_view::TerminalView::mount(
                     backend,

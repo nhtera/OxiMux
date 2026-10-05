@@ -17,6 +17,8 @@ pub mod tab_drag_zones;
 mod e2e_tests;
 #[cfg(test)]
 mod daemon_loss_tests;
+#[cfg(all(test, unix))]
+mod history_tests;
 mod actions;
 mod agent_restore;
 mod kill_all;

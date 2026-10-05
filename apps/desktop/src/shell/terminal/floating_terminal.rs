@@ -92,6 +92,10 @@ struct FloatingTab {
     /// Relay-side PTY id captured at mount — `None` on the in-process
     /// fallback backend (then the tab respawns by cwd on restore).
     external_id: Option<String>,
+    /// The view's surface / tab ids, persisted so a restored tab keeps its
+    /// identity (and shell history).
+    surface_id: String,
+    tab_id: String,
     /// Brings the tab back when its daemon is replaced, and refreshes the ids
     /// above once it is.
     _daemon_loss: gpui::Subscription,
@@ -182,6 +186,7 @@ impl FloatingTerminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> FloatingTab {
+        let (surface_id, tab_id) = (spec.ids.surface_id.clone(), spec.ids.tab_id.clone());
         let view = cx.new(|cx| {
             TerminalView::mount(
                 spec.backend,
@@ -215,6 +220,8 @@ impl FloatingTerminal {
             cwd: spec.cwd,
             custom_title: spec.custom_title,
             external_id: crate::shell::terminal_view::external_id_for_session(spec.session_id),
+            surface_id,
+            tab_id,
             _daemon_loss: daemon_loss,
         }
     }
@@ -416,6 +423,8 @@ impl FloatingTerminal {
                     custom_title: t.custom_title.clone(),
                     cwd: t.cwd.clone(),
                     external_id: t.external_id.clone(),
+                    surface_id: t.surface_id.clone(),
+                    tab_id: t.tab_id.clone(),
                 })
                 .collect(),
         }
