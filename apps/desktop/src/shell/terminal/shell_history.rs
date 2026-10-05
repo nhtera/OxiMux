@@ -87,8 +87,15 @@ pub fn forget(tab: &str) {
 
 /// Delete a closed terminal's history: now, and again once its shell is
 /// surely gone. Blocks for [`CLOSE_SETTLE`]; call it off the main thread.
+/// The first pass keeps the fish pointer, so the second can still find a
+/// fish history file rewritten as the shell exited.
 pub fn forget_after_close(tab: &str) {
-    forget(tab);
+    let (Some(dir), Some(id)) = (history_dir(), TabId::parse(tab)) else {
+        return;
+    };
+    if let Err(err) = history::forget_keeping_fish_pointer(dir, &id) {
+        tracing::warn!(?err, tab, "shell history forget failed");
+    }
     std::thread::sleep(CLOSE_SETTLE);
     forget(tab);
 }

@@ -272,3 +272,36 @@ fn the_shell_blocks_stand_down_where_history_is_shared_or_off() {
     assert!(fish.contains("not set -q fish_private_mode"));
     assert!(fish.contains("([4-9]|[1-9][0-9])\\."), "fish 3.x lacks `history append`");
 }
+
+#[test]
+fn a_fish_copy_backdates_entries_from_the_last_seconds() {
+    let dir = temp_dir("fish-backdate");
+    let file = dir.join("h");
+    fs::write(&file, "- cmd: old\n  when: 1000\n- cmd: fresh\n  when: 2000\n  paths:\n    - x\n").unwrap();
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(2001);
+    backdate_recent_fish_items(&file, now).unwrap();
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "- cmd: old\n  when: 1000\n- cmd: fresh\n  when: 1999\n  paths:\n    - x\n"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_first_close_pass_keeps_the_fish_pointer_for_the_second() {
+    let dir = temp_dir("forget-two-pass");
+    let fish_dir = temp_dir("forget-two-pass-fish");
+    let fish_file = fish_dir.join(format!("{}_history", id(PARENT).fish_session()));
+    fs::write(&fish_file, "- cmd: x\n").unwrap();
+    fs::write(fish_pointer(&dir, &id(PARENT)), format!("{}\n", fish_file.display())).unwrap();
+    forget_keeping_fish_pointer(&dir, &id(PARENT)).unwrap();
+    assert!(!fish_file.exists());
+    // fish rewrites its history as it exits...
+    fs::write(&fish_file, "- cmd: x\n").unwrap();
+    // ...and the second pass still finds it.
+    forget(&dir, &id(PARENT)).unwrap();
+    assert!(!fish_file.exists());
+    assert!(!fish_pointer(&dir, &id(PARENT)).exists());
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&fish_dir);
+}

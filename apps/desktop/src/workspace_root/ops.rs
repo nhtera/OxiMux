@@ -1657,6 +1657,9 @@ impl WorkspaceRoot {
                     dest_window_id = %tearoff.dest_window_id,
                     "mount_pending_tearoff: attach_pty_existing failed; PTY orphaned in relay"
                 );
+                // No view will ever own this terminal again, so no close
+                // will clean its shell history up either.
+                crate::shell::terminal::shell_history::forget(&leaf.tab_id);
                 continue;
             };
 

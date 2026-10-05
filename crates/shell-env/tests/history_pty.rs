@@ -331,7 +331,7 @@ fn a_split_starts_from_its_parent_not_from_the_global_tail() {
         let child_tab = "cccccccc-2222-3333-4444-555555555555";
         history::inherit(&sb.hist_dir(), &TabId::parse(TAB_A).unwrap(), &TabId::parse(child_tab).unwrap())
             .unwrap();
-        std::thread::sleep(Duration::from_millis(1100)); // fish hides same-second foreign items
+        // No sleep: the app spawns the split right after copying.
         let mut child = Session::start(sh, &sb, child_tab, Opts::default()).unwrap();
         let recalled = child.up_enter();
         assert!(recalled.contains(&out(100)), "{sh:?}: split recalled {recalled:?}");

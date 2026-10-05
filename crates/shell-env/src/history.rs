@@ -138,6 +138,7 @@ pub fn inherit(dir: &Path, parent: &TabId, child: &TabId) -> io::Result<()> {
     {
         let dst = fish_dir.join(format!("{}_history", child.fish_session()));
         if copy_new(&src, &dst)? {
+            backdate_recent_fish_items(&dst, SystemTime::now())?;
             // Record it now, so closing the child before its shell got to
             // write the pointer still finds the file to delete.
             let mut pointer = create_new(&fish_pointer(dir, child))?;
@@ -147,9 +148,45 @@ pub fn inherit(dir: &Path, parent: &TabId, child: &TabId) -> io::Result<()> {
     Ok(())
 }
 
+/// fish hides history entries stamped in the second its session started (it
+/// takes them for another session's), and a split spawns right after the
+/// copy. Stamp the copy's newest entries two seconds back so they show.
+fn backdate_recent_fish_items(path: &Path, now: SystemTime) -> io::Result<()> {
+    let now = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let floor = now.saturating_sub(2);
+    let text = fs::read(path)?;
+    let mut changed = false;
+    let mut out = Vec::with_capacity(text.len());
+    for line in text.split_inclusive(|&b| b == b'\n') {
+        let stamp = std::str::from_utf8(line)
+            .ok()
+            .and_then(|l| l.strip_prefix("  when: "))
+            .and_then(|rest| rest.trim_end().parse::<u64>().ok());
+        match stamp {
+            Some(when) if when > floor => {
+                out.extend_from_slice(format!("  when: {floor}\n").as_bytes());
+                changed = true;
+            }
+            _ => out.extend_from_slice(line),
+        }
+    }
+    if changed { fs::write(path, out) } else { Ok(()) }
+}
+
 /// Delete everything this terminal's history left behind. Missing files are
 /// fine; the first other error is returned after every removal was tried.
 pub fn forget(dir: &Path, id: &TabId) -> io::Result<()> {
+    forget_files(dir, id, true)
+}
+
+/// [`forget`], but keep the fish pointer: the first of the two passes after a
+/// close. fish may write its history once more as it exits, and the second
+/// pass can only find that file through the pointer.
+pub fn forget_keeping_fish_pointer(dir: &Path, id: &TabId) -> io::Result<()> {
+    forget_files(dir, id, false)
+}
+
+fn forget_files(dir: &Path, id: &TabId, drop_pointer: bool) -> io::Result<()> {
     let mut paths = Vec::new();
     for shell in HistoryShell::ALL {
         let file = tab_file(dir, id, shell);
@@ -163,7 +200,9 @@ pub fn forget(dir: &Path, id: &TabId) -> io::Result<()> {
     if let Some(target) = fish_target(dir, id) {
         paths.push(target);
     }
-    paths.push(fish_pointer(dir, id));
+    if drop_pointer {
+        paths.push(fish_pointer(dir, id));
+    }
     let mut first_err = None;
     for path in paths {
         match fs::remove_file(&path) {
