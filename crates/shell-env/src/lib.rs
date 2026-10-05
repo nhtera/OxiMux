@@ -10,6 +10,8 @@
 use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 
+pub mod history;
+
 /// Which shell family a new terminal pane runs on Windows.
 ///
 /// Stored in `terminal.toml` (via `oximux-settings`) and surfaced as a

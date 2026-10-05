@@ -2692,6 +2692,12 @@ impl WorkspaceRoot {
                     cx.notify();
                     return;
                 }
+                // Its terminals are gone for good, including any in windows
+                // never opened this session (those have no view to close).
+                crate::shell::terminal::shell_history::forget_project(
+                    &this.app_state.settings_repo,
+                    &project_id,
+                );
                 // Drop the in-memory panes + observer + cached sidebar for the
                 // gone project so a stale entity can't keep rendering, saving,
                 // or polling git in the background.

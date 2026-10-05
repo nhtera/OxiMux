@@ -101,7 +101,22 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
+        self.open_terminal_tab_from(None, window, cx)
+    }
+
+    /// [`open_terminal_tab`](Self::open_terminal_tab) for a split: the new
+    /// shell starts with a copy of terminal `parent_tab_id`'s history. `None`
+    /// seeds it from the user's own history, like any new tab.
+    pub fn open_terminal_tab_from(
+        &mut self,
+        parent_tab_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
         let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
+        if let Some(parent) = parent_tab_id {
+            crate::shell::terminal::shell_history::inherit(parent, &ids.tab_id);
+        }
         let (backend, session_id) = spawn_local_pty(self.cwd.clone(), ids.env())?;
         let theme = self.theme;
         let density = self.density;

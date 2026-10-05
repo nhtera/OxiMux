@@ -34,6 +34,12 @@ use crate::workspace_root::WorkspaceRoot;
 #[derive(Clone, Debug)]
 pub struct PendingLeaf {
     pub external_id: String,
+    /// The leaf's `OXIMUX_SURFACE_ID` / `OXIMUX_TAB_ID`. The shell keeps
+    /// running with them in its env, so the destination view adopts them
+    /// too: its persisted layout, respawn and shell history stay this
+    /// terminal's.
+    pub surface_id: String,
+    pub tab_id: String,
 }
 
 /// One pending tab tear-off: a destination window id, one or more relay
@@ -361,6 +367,8 @@ mod tests {
             dest_window_id: dest.to_string(),
             leaves: vec![PendingLeaf {
                 external_id: external_id.to_string(),
+                surface_id: String::new(),
+                tab_id: String::new(),
             }],
             label: SharedString::from(format!("Terminal for {dest}")),
             color: None,

@@ -79,7 +79,7 @@ impl WorkspaceRoot {
         );
         let mut specs = Vec::new();
         for tab in &blob.tabs {
-            let ids = SurfaceIds::fresh(tab.cwd.clone());
+            let ids = SurfaceIds::restored(tab.cwd.clone(), tab.surface_id.clone(), tab.tab_id.clone());
             let reattached = tab.external_id.as_deref().and_then(|ext| {
                 (session_ok && snap.live_external_ids.contains(ext))
                     .then(|| crate::shell::terminal_view::attach_pty_existing(ext))
