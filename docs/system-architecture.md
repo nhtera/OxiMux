@@ -748,13 +748,51 @@ EditorView::new(path, cx)
         Preview → render_preview()
         Split   → h_resizable(source_pane | preview_pane)
 
-render_preview()
-  absolutize_image_paths(text, file_path)
+render (Preview / Split)
+  preview_source(text, file_path)  → absolutize_image_paths
     rewrites repo-relative ![](path) → file:// URI (pure fn)
-  gpui-component text::markdown (GFM renderer)
+  sync_preview_text() → view-owned Entity<TextViewState>::set_text
+  render_preview(&state) → gpui-component TextView::new(&state) (GFM renderer)
     headings / bold / italic / inline-code / tables / task lists /
     blockquotes / links / fenced code blocks / images
 ```
+
+**Find in preview** (`crates/editor/src/editor_view/preview_find.rs`). Cmd+F
+(the app-wide `Search` action) over a Preview/Split document opens a find bar
+at the preview's top-right: query, `n/total`, previous/next (Shift+Enter /
+Enter), close (Esc). The renderer state is owned by `EditorView` — not keyed
+inside the element — so find can reach it:
+
+```
+Search (Cmd+F) ─bubbles→ WorkspaceRoot fallback
+  → PaneGroup::open_search_active_pane → EditorView::open_find
+query / re-parse → find_matches(TextViewState::rendered_text())   case-insensitive,
+                                                                  ranges in RENDERED text
+  → set_range_highlights(RangeHighlight × n)   match_bg_other / match_bg_current
+  → reveal_range(current)                       scrolls the current match into view
+```
+
+Matching runs over the text the reader sees (`**bold**` → `bold`; markers and
+fences dropped), not the source. Highlights are washes of the theme's
+`match_bg_current` amber (the text keeps its own colour, so a solid fill would
+make light text unreadable) and repaint when the theme changes.
+`EditorView::open_find` is the single Cmd+F entry for every editor tab, and
+`editor_view/find_bar.rs` the one floating find widget they share: a replace
+chevron (source only), the query field with a Match Case toggle inside it,
+`n of total` / "No results", previous / next, close. It searches the preview
+while the preview shows and the source lacks the caret, otherwise the source
+— Source mode, non-markdown files, the source half of Split — through
+gpui-kit's custom-search API on `EditorState` (`set_search_query`,
+`next/previous_search_match`, `replace_current/all_search_matches`); the
+editor's built-in panel is switched off (`searchable(false)`). The editor's
+own `cmd-f` binding (context `Input`) could never fire in the app anyway:
+gpui ranks a binding with *no* context as the deepest match, so the
+registry's context-less `Search` binding always wins. Whole-word, regex and
+find-in-selection are not offered — the matcher has none of them. Switching
+the markdown mode closes a widget whose text left the screen. A ≤4 KB re-parse lands synchronously inside
+`set_text` during render, where gpui drops the notify, so `sync_preview_text`
+re-checks the snapshot itself; larger documents re-search from the state
+observer when their background parse lands.
 
 **FileHttpClient** (`apps/desktop/src/file_http_client.rs`):
 

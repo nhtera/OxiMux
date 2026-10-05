@@ -4,6 +4,24 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased: Find in the markdown preview and every editor
+
+- **⌘F works in the markdown preview.** Matches are highlighted in the
+  rendered page — headings, code blocks, tables — with the current one
+  brighter, and the page scrolls to it. Searching follows what you see, so
+  `**bold**` is found as `bold`.
+- **⌘F works in every file you open.** Source mode and code files now get
+  find too; it previously did nothing there.
+- **One compact find box everywhere.** It floats at the top right: the query
+  with a Match Case toggle inside it, `1 of 93` or "No results", previous and
+  next (Enter / Shift+Enter) and close (Esc). In code, the chevron opens
+  Replace and Replace All (⌘Enter).
+- **In Split, ⌘F follows the caret** — the source while you are typing in it,
+  the preview otherwise — and keeps your query when it moves.
+- Highlight colours follow light and dark themes as you switch.
+
+---
+
 ### 2026-10-05 — v0.1.39: Shell history per worktree, a history setting, child shells (#48)
 
 - **New tabs start from their own worktree.** A new tab, a lifecycle-script

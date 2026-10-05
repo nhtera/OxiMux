@@ -1734,19 +1734,20 @@ impl Render for WorkspaceRoot {
                     }
                 });
             }))
-            // Root-level fallback for Search (scrollback search overlay). The
-            // primary listener lives on the focused TerminalView, which is not
-            // on the dispatch path when the command palette holds focus. Route
-            // to the active group's active terminal so the palette "Search
-            // Pane" entry opens the overlay; a focused terminal consumes the
-            // action first when no overlay is up.
+            // Root-level fallback for Search (scrollback search overlay, or an
+            // editor's find). The terminal's listener lives on the focused
+            // TerminalView, which is not on the dispatch path when the command
+            // palette holds focus; an editor has no listener at all. Route to
+            // the active group's active pane so the palette "Search Pane"
+            // entry and Cmd+F over an editor both open their find; a focused
+            // terminal consumes the action first when no overlay is up.
             .on_action(cx.listener(|this, action: &Search, window, cx| {
                 let Some(panes) = this.active_project_panes() else {
                     return;
                 };
                 panes.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
-                        group.update(cx, |g, cx| g.open_search_active_terminal(action, window, cx));
+                        group.update(cx, |g, cx| g.open_search_active_pane(action, window, cx));
                     }
                 });
             }))
