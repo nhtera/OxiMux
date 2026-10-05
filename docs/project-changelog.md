@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### Unreleased — Shell history: worktrees, a setting, child shells
+### 2026-10-05 — v0.1.39: Shell history per worktree, a history setting, child shells (#48)
 
 - **New tabs start from their own worktree.** A new tab, a lifecycle-script
   tab or a new floating tab starts from the history of the terminal you last
