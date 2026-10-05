@@ -138,7 +138,11 @@ pub fn inherit(dir: &Path, parent: &TabId, child: &TabId) -> io::Result<()> {
     {
         let dst = fish_dir.join(format!("{}_history", child.fish_session()));
         if copy_new(&src, &dst)? {
-            backdate_recent_fish_items(&dst, SystemTime::now())?;
+            if let Err(err) = backdate_recent_fish_items(&dst, SystemTime::now()) {
+                // Same as a torn copy: better none than a half-written one.
+                let _ = fs::remove_file(&dst);
+                return Err(err);
+            }
             // Record it now, so closing the child before its shell got to
             // write the pointer still finds the file to delete.
             let mut pointer = create_new(&fish_pointer(dir, child))?;
@@ -197,13 +201,20 @@ fn forget_files(dir: &Path, id: &TabId, drop_pointer: bool) -> io::Result<()> {
         }
         paths.push(file);
     }
-    if let Some(target) = fish_target(dir, id) {
-        paths.push(target);
+    let mut first_err = None;
+    // The fish file first: if it cannot go, its pointer stays so a later
+    // pass can still find it.
+    let mut fish_left = false;
+    if let Some(target) = fish_target(dir, id)
+        && let Err(err) = fs::remove_file(&target)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        fish_left = true;
+        first_err = Some(err);
     }
-    if drop_pointer {
+    if drop_pointer && !fish_left {
         paths.push(fish_pointer(dir, id));
     }
-    let mut first_err = None;
     for path in paths {
         match fs::remove_file(&path) {
             Err(err) if err.kind() != io::ErrorKind::NotFound => {

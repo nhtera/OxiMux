@@ -305,3 +305,22 @@ fn the_first_close_pass_keeps_the_fish_pointer_for_the_second() {
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&fish_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_fish_file_that_cannot_be_deleted_keeps_its_pointer() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("forget-keep-pointer");
+    let fish_dir = temp_dir("forget-keep-pointer-fish");
+    let fish_file = fish_dir.join(format!("{}_history", id(PARENT).fish_session()));
+    fs::write(&fish_file, "- cmd: x\n").unwrap();
+    fs::write(fish_pointer(&dir, &id(PARENT)), format!("{}\n", fish_file.display())).unwrap();
+    fs::set_permissions(&fish_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(forget(&dir, &id(PARENT)).is_err());
+    assert!(fish_pointer(&dir, &id(PARENT)).exists(), "a later pass must still find the file");
+    fs::set_permissions(&fish_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    forget(&dir, &id(PARENT)).unwrap();
+    assert!(!fish_file.exists() && !fish_pointer(&dir, &id(PARENT)).exists());
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&fish_dir);
+}
