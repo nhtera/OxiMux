@@ -306,7 +306,8 @@ fn settings_entries(
         entry(
             "Shell history",
             "Up-arrow recalls each terminal's own commands, and every command still reaches your history file. \
-             Always also covers zsh share_history, which stops live sharing between panes. Applies to new terminals.",
+             Auto keeps history shared when your shell already shares it live (zsh share_history, on in oh-my-zsh); \
+             Per terminal separates it anyway. Applies to new terminals.",
             history,
         ),
         entry(
@@ -339,12 +340,12 @@ fn settings_entries(
     rows
 }
 
-/// The Shell history picker: per terminal (`auto`), always per terminal, or
-/// one shared history (`off`).
+/// The Shell history picker: `auto` (per terminal unless the shell shares
+/// history live), per terminal (`always`), or one shared history (`off`).
 fn history_segments(mode: PerTerminalHistory) -> Vec<Segment> {
     [
-        ("Per terminal", PerTerminalHistory::Auto),
-        ("Always per terminal", PerTerminalHistory::Always),
+        ("Auto", PerTerminalHistory::Auto),
+        ("Per terminal", PerTerminalHistory::Always),
         ("Shared", PerTerminalHistory::Off),
     ]
     .into_iter()
@@ -367,6 +368,8 @@ mod tests {
         let (w, m) = super::super::env_editor_tests::modal(cx);
         let toml = crate::terminal_settings::app_data_dir().expect("test data dir").join("terminal.toml");
         let segments = history_segments(PerTerminalHistory::Auto);
+        let labels: Vec<&str> = segments.iter().map(|s| s.label.as_ref()).collect();
+        assert_eq!(labels, ["Auto", "Per terminal", "Shared"]);
         let selected: Vec<bool> = segments.iter().map(|s| s.selected).collect();
         assert_eq!(selected, [true, false, false]);
         for (idx, mode, text) in [(1, PerTerminalHistory::Always, "always"), (2, PerTerminalHistory::Off, "off")] {
