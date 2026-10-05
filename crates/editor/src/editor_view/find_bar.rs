@@ -121,7 +121,9 @@ impl EditorView {
     /// while it shows and the source does not have the caret, otherwise the
     /// source. A second Cmd+F on an open widget refocuses its query and
     /// selects it, so typing replaces it; a Cmd+F that lands on the other
-    /// text moves the widget there, keeping the query.
+    /// text moves the widget there, keeping the query. Pressed from inside
+    /// the widget it keeps the widget's target: focus is in a find field
+    /// then, not the source, which would otherwise read as "the preview".
     ///
     /// Returns `false`, doing nothing, for content with nothing to search
     /// (images, PDFs, binaries, a load in progress).
@@ -130,7 +132,13 @@ impl EditorView {
             return false;
         };
         let source_focused = source.read(cx).focus_handle(cx).is_focused(window);
-        let target = if self.preview_visible() && !source_focused {
+        let widget_target = self.find.as_ref().and_then(|find| {
+            let focused = |input: &Entity<InputState>| input.read(cx).focus_handle(cx).is_focused(window);
+            (focused(&find.query) || focused(&find.replace)).then_some(find.target)
+        });
+        let target = if let Some(target) = widget_target {
+            target
+        } else if self.preview_visible() && !source_focused {
             FindTarget::Preview
         } else {
             FindTarget::Source
@@ -677,6 +685,19 @@ mod tests {
                 // `**plan**` counts in the source (markers and all), not just
                 // the rendered word.
                 assert_eq!(view.find_position(cx), (Some(0), 2), "kept the query");
+            })
+            .expect("window alive");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                // Focus is now in the widget's query, not the source. A second
+                // Cmd+F from there must stay on the source, not read the
+                // unfocused source as "search the preview" and switch.
+                let query = view.find.as_ref().unwrap().query.clone();
+                assert!(query.read(cx).focus_handle(cx).is_focused(window));
+                assert!(view.open_find(window, cx));
+                assert_eq!(view.find.as_ref().unwrap().target, FindTarget::Source);
+                assert_eq!(view.find_position(cx), (Some(0), 2));
             })
             .expect("window alive");
     }

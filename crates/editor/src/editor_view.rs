@@ -792,6 +792,9 @@ impl EditorView {
     /// succeeds.
     fn finish_load(&mut self, content: EditorContent, cx: &mut Context<Self>) {
         self.content = content;
+        // Find and the preview's renderer state belong to the old content.
+        self.find = None;
+        self.md_preview = None;
         self.is_markdown =
             matches!(self.content, EditorContent::Text(_)) && is_markdown_path(&self.file_path);
         // Mirror `new()`: markdown opens in Preview; anything else uses Source

@@ -176,8 +176,8 @@ impl PaneGroup {
     /// by the root-level Search fallback, which is where Cmd+F lands from a
     /// focused editor (it has no listener of its own) and where the command
     /// palette "Search Pane" entry lands while the palette holds focus.
-    /// For an editor that is the preview's find bar or the code editor's own
-    /// find panel (see `EditorView::open_find`). No-op for any other tab.
+    /// For an editor that is its find widget, over the source or the markdown
+    /// preview (see `EditorView::open_find`). No-op for any other tab.
     pub(crate) fn open_search_active_pane(
         &mut self,
         action: &Search,
