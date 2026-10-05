@@ -2318,11 +2318,11 @@ impl Render for WorkspaceRoot {
             // "Listening…" pill shown while dictating into a terminal/editor
             // pane. Renders nothing when idle; never steals clicks.
             .child(self.dictation_hud.clone())
-            // gpui-component notification layer. `Root::render` does not mount
-            // it automatically, so leaf views that call `push_notification`
-            // (e.g. the editor breadcrumb's copy/reveal actions) need it here
-            // or their toasts never paint.
-            .children(gpui_component::Root::render_notification_layer(window, cx))
+            // No gpui-component notification layer here: since gpui-kit 0.7
+            // the window `Root` mounts it (with the dialog and sheet layers)
+            // after the application content, so `push_notification` toasts
+            // (e.g. the editor breadcrumb's copy/reveal actions) paint without
+            // a hand-mounted copy.
     }
 }
 

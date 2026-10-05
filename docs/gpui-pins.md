@@ -34,6 +34,7 @@ The correct cargo idiom for git deps shared with an unpinned transitive crate is
 |---|---|---|---|
 | 2026-05-15 | — | Initial pin (Phase 0) | n/a |
 | 2026-07-17 | `4e06b33e…` → `3bd9d13b…` (doc-only) | Reconcile stale doc rev with `Cargo.lock` (authoritative). No dependency change — the lockfile already resolved `3bd9d13b…`; only this table was out of date. | n/a |
+| 2026-10-06 | gpui-kit `6b8581a1…` (0.6.4) → `87d10ae5…` (0.7.1); `gpui-pre*` 0.3.5 → 0.3.8 | Markdown preview find: `TextViewState::rendered_text` / `set_range_highlights` / `reveal_range` landed in 0.7.0 (longbridge/gpui-kit#3215, #3216). Fork branch `oximux` fast-forwarded to upstream `v0.7.1`, still no local patches. | `Root::render_notification_layer` removed — the window `Root` now mounts the notification layer itself, so the hand-mounted copy in `workspace_root/render.rs` was dropped. Nothing else. |
 
 ## Bump procedure
 
