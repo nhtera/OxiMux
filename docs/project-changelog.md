@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### Unreleased: Find in the markdown preview and every editor
+### 2026-10-06 — v0.1.40: Find in the markdown preview and every editor (#49)
 
 - **⌘F works in the markdown preview.** Matches are highlighted in the
   rendered page — headings, code blocks, tables — with the current one
