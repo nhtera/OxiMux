@@ -106,7 +106,8 @@ impl PaneGroup {
 
     /// [`open_terminal_tab`](Self::open_terminal_tab) for a split: the new
     /// shell starts with a copy of terminal `parent_tab_id`'s history. `None`
-    /// seeds it from the user's own history, like any new tab.
+    /// seeds it like any new tab: from the worktree's most recently focused
+    /// terminal, else from the user's own history.
     pub fn open_terminal_tab_from(
         &mut self,
         parent_tab_id: Option<&str>,
@@ -114,8 +115,9 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) -> Option<usize> {
         let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
-        if let Some(parent) = parent_tab_id {
-            crate::shell::terminal::shell_history::inherit(parent, &ids.tab_id);
+        match parent_tab_id {
+            Some(parent) => crate::shell::terminal::shell_history::inherit(parent, &ids.tab_id),
+            None => crate::shell::terminal::shell_history::seed_from_worktree(&self.cwd, &ids.tab_id),
         }
         let (backend, session_id) = spawn_local_pty(self.cwd.clone(), ids.env())?;
         let theme = self.theme;
@@ -168,6 +170,7 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) -> Option<usize> {
         let ids = SurfaceIds::fresh(cwd.to_string_lossy().into_owned());
+        crate::shell::terminal::shell_history::seed_from_worktree(&cwd, &ids.tab_id);
         let (backend, session_id) = spawn_local_pty(cwd, ids.env())?;
         {
             let mut guard = backend.lock().expect("shared backend poisoned");

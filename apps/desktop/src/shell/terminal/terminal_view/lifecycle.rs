@@ -98,6 +98,7 @@ impl TerminalView {
             // Focusing the pane means the user is now looking — clear any
             // pending attention ring.
             view.attention = false;
+            view.note_history_focus();
             cx.notify();
         })
         .detach();
@@ -381,6 +382,7 @@ impl TerminalView {
             view.cursor_visible = true;
             view.attention = false;
             view.respawn_if_dormant(window, cx);
+            view.note_history_focus();
             cx.notify();
         })
         .detach();
@@ -749,6 +751,19 @@ impl TerminalView {
             let dir = crate::relay_cold_restore::default_checkpoints_dir()?;
             crate::relay_cold_restore::read_checkpoint_pid(&dir, &pty_id)
         })
+    }
+
+    /// Record this terminal as the most recently focused one: a new
+    /// top-level terminal in its worktree starts from its history.
+    fn note_history_focus(&self) {
+        let id = self.session_id;
+        let note = crate::shell::terminal::shell_history::FocusNote {
+            pid: self.with_backend(|be| be.os_pid(id)),
+            relay_pty_id: self.external_id(),
+            cwd_hint: self.cwd_hint(),
+            spawn_cwd: std::path::PathBuf::from(&self.ids.workspace_id),
+        };
+        crate::shell::terminal::shell_history::note_focus(&self.ids.tab_id, note);
     }
 
     /// F4.7: shell-tracked CWD via OSC 7. Returns `None` when the shell

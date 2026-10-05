@@ -63,7 +63,7 @@ use oximux_pty::SpawnConfig;
 use oximux_shell_env::history;
 
 use super::shell_history;
-use super::terminal_view::shell_integration_enabled;
+use super::terminal_view::{per_terminal_history, shell_integration_enabled};
 
 /// Shells we know how to bootstrap. Anything else is left untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,12 +125,12 @@ pub fn augment_spawn_config(cfg: &mut SpawnConfig) {
     // Caller env wins on key collision because the backend applies `cfg.env`
     // last; our keys (`ZDOTDIR`, `OXIMUX_ORIG_ZDOTDIR`, `OXIMUX_HISTORY_DIR`)
     // don't collide with the context-id env the terminal sets, so a plain
-    // extend is correct.
+    // extend is correct. Applied last also means they override what the app
+    // inherited (an OxiMux started from an OxiMux pane).
     cfg.env.extend(integration.env);
-    if kind != ShellKind::PowerShell
-        && let Some(pair) = shell_history::env_pair()
-    {
-        cfg.env.push(pair);
+    if kind != ShellKind::PowerShell {
+        let tab = cfg.env.iter().find(|(k, _)| k == history::TAB_ID_ENV).map(|(_, v)| v.clone());
+        cfg.env.extend(shell_history::spawn_env(per_terminal_history(), tab.as_deref()));
     }
 }
 
@@ -825,6 +825,24 @@ mod tests {
         let dir = shell_history::history_dir().expect("test data dir");
         assert!(cfg.env.iter().any(|(k, v)| k == history::HISTORY_DIR_ENV
             && Path::new(v) == dir));
+    }
+
+    #[test]
+    fn a_spawn_names_its_own_history_dir_and_tab_over_inherited_ones() {
+        // An OxiMux started from an OxiMux pane inherits that pane's ids. The
+        // backends apply `cfg.env` over the inherited environment, so a spawn
+        // must carry both keys itself.
+        let tab = "11111111-2222-3333-4444-555555555555";
+        let mut cfg = SpawnConfig {
+            shell: "/bin/bash".to_string(),
+            env: crate::shell::context_env::context_env("/p", "surface", tab),
+            ..SpawnConfig::default()
+        };
+        augment_spawn_config(&mut cfg);
+        let last = |key: &str| cfg.env.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        assert_eq!(last(history::TAB_ID_ENV).as_deref(), Some(tab));
+        let dir = shell_history::history_dir().expect("test data dir");
+        assert_eq!(last(history::HISTORY_DIR_ENV).map(PathBuf::from).as_deref(), Some(dir));
     }
 
     #[test]

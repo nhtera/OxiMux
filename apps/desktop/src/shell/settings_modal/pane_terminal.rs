@@ -3,7 +3,9 @@
 //! `terminal.toml`; the live-reload watcher re-applies to open panes.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
-use oximux_settings::{BellStyle, Density, Theme, Typography, WindowsPowerShell, WindowsShell};
+use oximux_settings::{
+    BellStyle, Density, PerTerminalHistory, Theme, Typography, WindowsPowerShell, WindowsShell,
+};
 
 use super::SettingsModal;
 use super::controls::{stepper, toggle_switch};
@@ -215,6 +217,15 @@ fn settings_entries(
         cx,
     );
 
+    let history = segmented(
+        "term-history",
+        history_segments(t.per_terminal_history),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
     let cursor_blink = toggle_switch(
         "term-cursorblink",
         t.cursor_blink,
@@ -293,6 +304,12 @@ fn settings_entries(
         ),
         entry("Bell", "Visual flash on the terminal bell, or off.", bell),
         entry(
+            "Shell history",
+            "Up-arrow recalls each terminal's own commands, and every command still reaches your history file. \
+             Always also covers zsh share_history, which stops live sharing between panes. Applies to new terminals.",
+            history,
+        ),
+        entry(
             "Cursor blink",
             "Blink the cursor while the terminal is focused.",
             cursor_blink,
@@ -320,4 +337,47 @@ fn settings_entries(
     ]);
 
     rows
+}
+
+/// The Shell history picker: per terminal (`auto`), always per terminal, or
+/// one shared history (`off`).
+fn history_segments(mode: PerTerminalHistory) -> Vec<Segment> {
+    [
+        ("Per terminal", PerTerminalHistory::Auto),
+        ("Always per terminal", PerTerminalHistory::Always),
+        ("Shared", PerTerminalHistory::Off),
+    ]
+    .into_iter()
+    .map(|(label, value)| {
+        Segment::new(label, mode == value, move |this, _w, cx| {
+            this.terminal.per_terminal_history = value;
+            this.persist_terminal(cx);
+        })
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn the_history_picker_writes_the_mode_to_terminal_toml(cx: &mut TestAppContext) {
+        let (w, m) = super::super::env_editor_tests::modal(cx);
+        let toml = crate::terminal_settings::app_data_dir().expect("test data dir").join("terminal.toml");
+        let segments = history_segments(PerTerminalHistory::Auto);
+        let selected: Vec<bool> = segments.iter().map(|s| s.selected).collect();
+        assert_eq!(selected, [true, false, false]);
+        for (idx, mode, text) in [(1, PerTerminalHistory::Always, "always"), (2, PerTerminalHistory::Off, "off")] {
+            w.update(cx, |_, window, cx| m.update(cx, |m, cx| (segments[idx].on_select)(m, window, cx)))
+                .unwrap();
+            assert_eq!(m.read_with(cx, |m, _| m.terminal.per_terminal_history), mode);
+            let written = std::fs::read_to_string(&toml).expect("terminal.toml");
+            assert!(written.contains(&format!("per_terminal_history = \"{text}\"")), "{written}");
+        }
+        // Back to the default, so the shared test data dir keeps defaults.
+        w.update(cx, |_, window, cx| m.update(cx, |m, cx| (segments[0].on_select)(m, window, cx))).unwrap();
+        assert_eq!(m.read_with(cx, |m, _| m.terminal.per_terminal_history), PerTerminalHistory::Auto);
+    }
 }

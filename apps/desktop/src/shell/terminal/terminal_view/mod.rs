@@ -155,9 +155,10 @@ pub fn terminal_settings(cx: &App) -> TerminalSettings {
 
 mod spawn_settings;
 pub use spawn_settings::{
-    set_shell_integration_enabled, set_spawn_scrollback, set_spawn_shell, set_spawn_shell_resolved,
+    set_per_terminal_history, set_shell_integration_enabled, set_spawn_scrollback, set_spawn_shell,
+    set_spawn_shell_resolved,
 };
-pub(crate) use spawn_settings::shell_integration_enabled;
+pub(crate) use spawn_settings::{per_terminal_history, shell_integration_enabled};
 use spawn_settings::{shell_spawn_config, spawn_scrollback};
 
 /// Width (px) of the overlay scrollbar gutter on the terminal's right edge.

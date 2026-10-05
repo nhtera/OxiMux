@@ -1,7 +1,9 @@
 # Per-terminal history (fish >= 4.0): this terminal keeps its own history
 # session, seeded from the parent pane on a split, else from yours; each
 # command fish keeps is also appended to your session. Off in private mode,
-# with an empty fish_history, or under OXIMUX_PER_TERMINAL_HISTORY=0.
+# with an empty fish_history, or under OXIMUX_PER_TERMINAL_HISTORY=0. The
+# session is never exported (`set -u`): a fish started inside this one keeps to
+# its own.
 if test "$OXIMUX_PER_TERMINAL_HISTORY" != 0 -a -n "$OXIMUX_HISTORY_DIR"
   and not set -q __oximux_hist; and not set -q fish_private_mode
   and string match -qr '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' -- "$OXIMUX_TAB_ID"
@@ -19,7 +21,7 @@ if test "$OXIMUX_PER_TERMINAL_HISTORY" != 0 -a -n "$OXIMUX_HISTORY_DIR"
     and cp $d/{$__oximux_hist_shared}_history $d/{$__oximux_hist}_history
   end
   printf '%s\n' $d/{$__oximux_hist}_history >$OXIMUX_HISTORY_DIR/$OXIMUX_TAB_ID.fish_path
-  set -g fish_history $__oximux_hist
+  set -gu fish_history $__oximux_hist
   # fish adds a command to history before running it; mirror that into your
   # session with the same filter fish applied.
   function __oximux_hist_global --on-event fish_preexec
@@ -30,9 +32,9 @@ if test "$OXIMUX_PER_TERMINAL_HISTORY" != 0 -a -n "$OXIMUX_HISTORY_DIR"
     else
       string match -q ' *' -- $argv[1]; and return
     end
-    set -g fish_history $__oximux_hist_shared
+    set -gu fish_history $__oximux_hist_shared
     builtin history append -- $argv[1]
     builtin history save
-    set -g fish_history $__oximux_hist
+    set -gu fish_history $__oximux_hist
   end
 end

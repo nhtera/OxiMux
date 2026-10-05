@@ -1,7 +1,8 @@
 //! Per-terminal shell history, app side: the moments only the app sees.
 //!
 //! A split and a new tab in a pane must start from the source terminal's
-//! history file; a closed terminal's file must go; a torn-off (detached)
+//! history file, a new top-level tab from its worktree's most recently
+//! focused terminal; a closed terminal's file must go; a torn-off (detached)
 //! terminal's must stay. Real PTYs are spawned, running `/bin/sh` so no shell
 //! history block races the files these tests plant and read.
 
@@ -24,8 +25,11 @@ use crate::shell::terminal_view::{TerminalView, set_spawn_shell};
 
 fn make_group(cx: &mut TestAppContext) -> (gpui::WindowHandle<PaneGroup>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
-    let cwd = dir.path().to_path_buf();
-    let window = cx.add_window(|_win, cx| {
+    (group_at(dir.path().to_path_buf(), cx), dir)
+}
+
+fn group_at(cwd: PathBuf, cx: &mut TestAppContext) -> gpui::WindowHandle<PaneGroup> {
+    cx.add_window(|_win, cx| {
         PaneGroup::new(
             cwd,
             Theme::default(),
@@ -36,8 +40,7 @@ fn make_group(cx: &mut TestAppContext) -> (gpui::WindowHandle<PaneGroup>, TempDi
             Arc::new(AtomicBool::new(true)),
             cx,
         )
-    });
-    (window, dir)
+    })
 }
 
 /// Every terminal view in the active tab, all leaves and per-pane tabs.
@@ -150,5 +153,45 @@ async fn closing_a_terminal_deletes_its_history_but_a_detach_does_not(cx: &mut T
         std::thread::sleep(Duration::from_secs(3));
         assert!(zsh_file(&torn_off).exists(), "a tear-off deleted live history");
         assert!(!zsh_file(&closed).exists(), "the delayed re-delete must not resurrect");
+    });
+}
+
+#[gpui::test]
+async fn a_new_tab_starts_from_its_own_worktree_not_the_last_one_used(cx: &mut TestAppContext) {
+    with_plain_sh(|| {
+        // Two worktrees of one repo (a checkout and a linked one), plus an
+        // unrelated repo with no terminal yet.
+        let root = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("a/.git")).unwrap();
+        std::fs::create_dir_all(root.path().join("b")).unwrap();
+        std::fs::write(root.path().join("b/.git"), "gitdir: ../a/.git/worktrees/b\n").unwrap();
+        std::fs::create_dir_all(root.path().join("c/.git")).unwrap();
+        let open = |window: &gpui::WindowHandle<PaneGroup>, cx: &mut TestAppContext| {
+            // Focus events only fire in the active window.
+            window.update(cx, |_, win, _| win.activate_window()).unwrap();
+            window.update(cx, |g, win, cx| g.open_terminal_tab(win, cx)).unwrap().expect("PTY spawn");
+            cx.run_until_parked();
+            tab_id(&views(window, cx)[0], cx)
+        };
+        // Work in B, then in A: A's terminal is the most recently focused.
+        let (a, b) = (group_at(root.path().join("a"), cx), group_at(root.path().join("b"), cx));
+        let in_b = open(&b, cx);
+        let in_a = open(&a, cx);
+        std::fs::write(zsh_file(&in_b), ": 1:0;echo from-b\n").unwrap();
+        std::fs::write(zsh_file(&in_a), ": 1:0;echo from-a\n").unwrap();
+        // The newest terminal in B keeps no history (an agent CLI, a shell
+        // that stood down): it has nothing to give, so B's older one wins.
+        let no_history = open(&b, cx);
+        let _ = std::fs::remove_file(zsh_file(&no_history));
+
+        let new_in_b = open(&b, cx);
+        assert_eq!(
+            std::fs::read_to_string(zsh_file(&new_in_b)).ok().as_deref(),
+            Some(": 1:0;echo from-b\n"),
+            "a new tab in B must start from B's terminal, not A's"
+        );
+        // No terminal in C yet: it starts from the user's own history.
+        let new_in_c = open(&group_at(root.path().join("c"), cx), cx);
+        assert!(!zsh_file(&new_in_c).exists(), "C copied another worktree's history");
     });
 }

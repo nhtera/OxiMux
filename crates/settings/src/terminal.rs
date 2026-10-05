@@ -30,6 +30,22 @@ pub enum BellStyle {
     Notify,
 }
 
+/// Whether each terminal keeps its own shell history (zsh, bash, fish).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PerTerminalHistory {
+    /// Per terminal, except where your shell already shares history live
+    /// (zsh `share_history`, bash `history -n/-r`).
+    #[default]
+    Auto,
+    /// Per terminal even under zsh `share_history` (on by default in
+    /// oh-my-zsh and prezto); live sharing between panes stops. bash live
+    /// sharing stays shared.
+    Always,
+    /// Every terminal shares your history file.
+    Off,
+}
+
 /// All user-tunable terminal knobs. `#[serde(default)]` lets a partial TOML
 /// override only the keys it sets; unknown keys are ignored for forward-compat.
 // Not `Copy`: the shell override is a `String`. The render path reads this
@@ -85,6 +101,8 @@ pub struct TerminalSettings {
     pub windows_powershell: WindowsPowerShell,
     /// How a bell is surfaced.
     pub bell: BellStyle,
+    /// Per-terminal shell history. Sourced at spawn: applies to new terminals.
+    pub per_terminal_history: PerTerminalHistory,
 }
 
 impl Default for TerminalSettings {
@@ -110,6 +128,7 @@ impl Default for TerminalSettings {
             windows_shell: WindowsShell::default(),
             windows_powershell: WindowsPowerShell::default(),
             bell: BellStyle::Visual,
+            per_terminal_history: PerTerminalHistory::Auto,
         }
     }
 }
@@ -257,6 +276,22 @@ mod tests {
         // Full default round-trips through TOML unchanged.
         let toml = d.to_toml_string();
         assert_eq!(TerminalSettings::from_toml_str(&toml).expect("round-trip"), d);
+    }
+
+    #[test]
+    fn per_terminal_history_defaults_to_auto_and_round_trips() {
+        // A file written before the key existed.
+        let old = TerminalSettings::from_toml_str("bell = \"off\"\n").expect("parse");
+        assert_eq!(old.per_terminal_history, PerTerminalHistory::Auto);
+        for (text, mode) in [("always", PerTerminalHistory::Always), ("off", PerTerminalHistory::Off)] {
+            let s = TerminalSettings::from_toml_str(&format!("per_terminal_history = \"{text}\"\n"))
+                .expect("parse");
+            assert_eq!(s.per_terminal_history, mode);
+            assert_eq!(TerminalSettings::from_toml_str(&s.to_toml_string()).expect("round-trip"), s);
+        }
+        // Like every enum key, an unknown value fails the parse, and the
+        // loader then falls back to the defaults with a warning.
+        assert!(TerminalSettings::from_toml_str("per_terminal_history = \"sometimes\"\n").is_err());
     }
 
     #[test]

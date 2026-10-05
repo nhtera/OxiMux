@@ -27,7 +27,11 @@ use std::time::{Duration, SystemTime};
 /// turns the feature off in every shell block.
 pub const HISTORY_DIR_ENV: &str = "OXIMUX_HISTORY_DIR";
 
-/// Env var a user sets to `0` to keep every terminal on their own history file.
+/// Env var a user sets to `0` to keep every terminal on their own history
+/// file, or to `always` to keep per-terminal history under zsh
+/// `share_history` too. The app sets it from its history setting unless that
+/// is `auto`, and a value set in the user's rc wins over the app's, except
+/// that under the app's `off` there is no history dir to turn back on.
 pub const OPT_OUT_ENV: &str = "OXIMUX_PER_TERMINAL_HISTORY";
 
 /// The terminal identity env var (minted by the app, persisted with the pane).
@@ -118,6 +122,15 @@ fn fish_target(dir: &Path, id: &TabId) -> Option<PathBuf> {
         Ok(meta) if !meta.file_type().is_file() => None,
         _ => Some(target),
     }
+}
+
+/// Whether terminal `id` keeps a history of its own: a zsh or bash tab file,
+/// or a fish session its pointer names. A terminal whose shell stood down (or
+/// that runs no integrated shell, such as an agent CLI) has none, so copying
+/// from it would give nothing.
+pub fn has_history(dir: &Path, id: &TabId) -> bool {
+    HistoryShell::ALL.iter().any(|&shell| tab_file(dir, id, shell).is_file())
+        || fish_target(dir, id).is_some_and(|target| target.is_file())
 }
 
 /// Seed `child`'s history from `parent`'s, before the child's shell starts.
