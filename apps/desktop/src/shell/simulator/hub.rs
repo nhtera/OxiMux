@@ -123,6 +123,9 @@ pub struct SimulatorHub {
     physical_used: bool,
     /// The SDK in use has no emulator (a standalone `adb`): phones only.
     android_phones_only: bool,
+    /// An SDK was found before and is gone now (a `brew upgrade` mid-way):
+    /// the tick keeps looking.
+    android_sdk_lost: bool,
     /// Attached phones whose screen is off (they stream nothing).
     screen_off: HashSet<DeviceId>,
     /// The phones (and their adb states) the last phone watch saw.

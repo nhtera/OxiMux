@@ -105,6 +105,7 @@ fn new_hub(
         phone_watch_until: None,
         screen_off: HashSet::new(),
         android_phones_only: false,
+        android_sdk_lost: false,
         physical_used: false,
         phone_states: None,
     })

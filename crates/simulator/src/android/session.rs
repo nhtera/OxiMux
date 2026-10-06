@@ -116,7 +116,7 @@ impl AndroidSession {
                 return Err(e);
             }
         };
-        let scrcpy_server::Connection { mut video, control, server, log, .. } = conn;
+        let scrcpy_server::Connection { mut video, control, server, on_input_blocked, .. } = conn;
         // Until the session owns them, a failure stops the server and drops
         // the forward.
         let mut pending = Pending { server: Some(server), adb: adb.to_path_buf(), serial: serial.to_owned(), port };
@@ -150,20 +150,17 @@ impl AndroidSession {
         });
         // The guard first: if the reader cannot start, dropping it stops all.
         let guard = Arc::new(Guard(Arc::clone(&inner)));
-        if let Some(log) = log {
-            // Drained for the server's life; a refused injection is told once.
-            let told = Arc::downgrade(&inner);
-            std::thread::Builder::new().name(format!("oximux-android-log-{}", inner.serial)).spawn(move || {
-                super::server_log::drain(log, || {
-                    if let Some(inner) = told.upgrade() {
-                        if let Some(tx) = inner.events_tx.lock().unwrap().as_ref() {
-                            let _ = tx.send(SessionEvent::Error(super::server_log::INPUT_BLOCKED.into()));
-                        }
-                        wake(&inner);
-                    }
-                });
-            })?;
-        }
+        // The server's log is already being drained; a refused injection is
+        // told once, to this session's listener.
+        let told = Arc::downgrade(&inner);
+        *on_input_blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+            if let Some(inner) = told.upgrade() {
+                if let Some(tx) = inner.events_tx.lock().unwrap().as_ref() {
+                    let _ = tx.send(SessionEvent::Error(super::server_log::INPUT_BLOCKED.into()));
+                }
+                wake(&inner);
+            }
+        }));
         let reader = Arc::clone(&inner);
         std::thread::Builder::new().name(format!("oximux-android-video-{}", inner.serial)).spawn(move || read_loop(reader, video))?;
         Ok(Self { inner, _guard: guard })

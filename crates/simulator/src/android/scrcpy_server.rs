@@ -113,6 +113,9 @@ fn download(url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Where the log reader reports a refused injection (see [`Connection`]).
+pub type InputBlockedHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
 /// A running server and its two sockets.
 pub struct Connection {
     pub video: TcpStream,
@@ -121,8 +124,10 @@ pub struct Connection {
     pub device_name: String,
     /// `adb shell … app_process …`: the server lives as long as this does.
     pub server: Child,
-    /// The server's log (stderr): read it to its end (see `server_log`).
-    pub log: Option<std::process::ChildStderr>,
+    /// Called (from the log's reader) when the server refuses injected input;
+    /// the session installs it. The log is read from the moment the server
+    /// starts, so warnings during the handshake can never fill the pipe.
+    pub on_input_blocked: InputBlockedHook,
     /// The local port of the adb forward (removed on close).
     pub port: u16,
 }
@@ -141,11 +146,21 @@ pub fn start(adb: &Path, serial: &str, scid: u32, opts: StreamOptions, port: u16
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let log = server.stderr.take();
+    let on_input_blocked = InputBlockedHook::default();
+    if let Some(log) = server.stderr.take() {
+        let hook = on_input_blocked.clone();
+        std::thread::Builder::new().name(format!("oximux-android-log-{serial}")).spawn(move || {
+            super::server_log::drain(log, || {
+                if let Some(report) = hook.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+                    report();
+                }
+            });
+        })?;
+    }
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let opened = open_sockets(port, deadline);
     match opened {
-        Ok((video, control, device_name)) => Ok(Connection { video, control, device_name, server, port, log }),
+        Ok((video, control, device_name)) => Ok(Connection { video, control, device_name, server, port, on_input_blocked }),
         Err(e) => {
             let _ = server.kill();
             let _ = server.wait();

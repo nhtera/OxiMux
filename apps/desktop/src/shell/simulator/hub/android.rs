@@ -72,8 +72,15 @@ pub(crate) fn phone_states(runner: &dyn Runner, sdk: &Sdk) -> Option<BTreeMap<St
 }
 
 /// Each phone's screen state, for the watcher (`None`: no answer).
-pub(crate) fn screens_awake(runner: &dyn Runner, sdk: &Sdk, phones: Vec<(DeviceId, String)>) -> Vec<(DeviceId, Option<bool>)> {
-    phones.into_iter().map(|(udid, serial)| (udid, devices::screen_awake(runner, sdk, &serial, SCREEN_PROBE_TIMEOUT))).collect()
+/// Side by side: one slow phone must not add its timeout to every other's.
+pub(crate) fn screens_awake(runner: &(dyn Runner + Sync), sdk: &Sdk, phones: Vec<(DeviceId, String)>) -> Vec<(DeviceId, Option<bool>)> {
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = phones
+            .into_iter()
+            .map(|(udid, serial)| (udid, scope.spawn(move || devices::screen_awake(runner, sdk, &serial, SCREEN_PROBE_TIMEOUT))))
+            .collect();
+        probes.into_iter().map(|(udid, probe)| (udid, probe.join().unwrap_or(None))).collect()
+    })
 }
 
 /// Every booted device, for the watcher.
@@ -106,7 +113,13 @@ impl SimulatorHub {
     /// The `adb` in use went away (a `brew upgrade` deletes the versioned
     /// folder a standalone one resolved to): look again. A stat, from the tick.
     pub(super) fn recheck_android_sdk(&mut self, cx: &mut Context<Self>) {
-        if self.android_sdk.as_ref().is_some_and(|sdk| !sdk.adb().is_file()) {
+        // Also while it is still missing: mid-upgrade neither the old nor the
+        // new adb exists, and the first look finds nothing.
+        let gone = match &self.android_sdk {
+            Some(sdk) => !sdk.adb().is_file(),
+            None => self.android_sdk_lost,
+        };
+        if gone {
             tracing::info!("adb went away; looking for the Android SDK again");
             self.refresh_android_sdk(cx);
         }
@@ -127,6 +140,8 @@ impl SimulatorHub {
             let (found, phones_only) = found;
             let _ = this.update(cx, |hub, cx| {
                 hub.android_phones_only = phones_only;
+                // Lost: it was there before and is not now. Keep looking.
+                hub.android_sdk_lost = found.is_none() && (hub.android_sdk.is_some() || hub.android_sdk_lost);
                 if hub.android_sdk != found {
                     hub.android_sdk = found;
                     hub.refresh_devices(cx);
