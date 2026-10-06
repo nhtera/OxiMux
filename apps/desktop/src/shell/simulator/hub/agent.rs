@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gpui::Context;
-use oximux_simulator::{DeviceId, Platform};
+use oximux_simulator::{DeviceId, Source};
 use oximux_simulator::consent::{Consent, State, Verdict};
 use oximux_simulator::registry::{Phase, WorktreeKey};
 use oximux_storage::{SimApproval, SimApprovalRepo};
@@ -24,6 +24,31 @@ use crate::app_settings::sim_state_keys;
 
 /// How long the badge stays after an agent's last verb.
 pub(crate) const AGENT_BADGE: Duration = Duration::from_secs(2);
+
+/// How long an "Install … on this phone?" question waits for the user.
+pub(crate) const INSTALL_ASK_TTL: Duration = Duration::from_secs(90);
+
+/// An agent's install on a real device, waiting for the user's yes. Asked
+/// every time: approval to control a phone is not approval to put apps on it.
+struct InstallAsk {
+    id: u64,
+    udid: DeviceId,
+    worktree: WorktreeKey,
+    device_name: String,
+    app: String,
+    asked: Instant,
+    answer: Option<bool>,
+}
+
+/// Where an install question stands, for the waiting agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstallAnswer {
+    Pending,
+    Allowed,
+    Refused,
+    /// Expired or dropped (the worktree moved on): not allowed.
+    Gone,
+}
 
 /// Agent-control state the hub keeps.
 pub(crate) struct AgentState {
@@ -49,6 +74,9 @@ pub(crate) struct AgentState {
     input: HashMap<DeviceId, Arc<futures::lock::Mutex<()>>>,
     /// Orders the approval writes (see [`LatestWrites`]).
     writes: LatestWrites,
+    /// Install questions about real devices (see [`InstallAsk`]).
+    installs: Vec<InstallAsk>,
+    next_install: u64,
 }
 
 /// Approval writes land in the order the user decided them. The writes run
@@ -90,12 +118,17 @@ impl LatestWrites {
 
 impl AgentState {
     /// Start from the persisted approvals. A database that cannot be read
-    /// grants nothing: every device asks again.
+    /// grants nothing: every device asks again. A real device's approval
+    /// lasts only until OxiMux quits, so a saved one (an older build wrote
+    /// it) grants nothing either.
     pub(crate) fn load(approvals: Option<SimApprovalRepo>) -> Self {
-        let granted = approvals
+        let granted: Vec<SimApproval> = approvals
             .as_ref()
             .and_then(|repo| repo.list().inspect_err(|e| tracing::warn!("simulator approvals unreadable: {e}")).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| !DeviceId(a.udid.clone()).is_physical())
+            .collect();
         Self {
             consent: Consent::new(granted.iter().map(|a| DeviceId(a.udid.clone()))),
             approvals,
@@ -106,6 +139,8 @@ impl AgentState {
             scales: HashMap::new(),
             input: HashMap::new(),
             writes: LatestWrites::default(),
+            installs: Vec::new(),
+            next_install: 0,
         }
     }
 
@@ -185,7 +220,71 @@ impl SimulatorHub {
 
     /// `worktree` detached or changed device: drop its open questions.
     pub(super) fn forget_consent_requests(&mut self, worktree: &Path, cx: &mut Context<Self>) {
-        if self.agent.consent.forget_worktree(&WorktreeKey::from_path(worktree)) {
+        let key = WorktreeKey::from_path(worktree);
+        let asks = self.agent.installs.len();
+        self.agent.installs.retain(|a| a.worktree != key);
+        if self.agent.consent.forget_worktree(&key) || self.agent.installs.len() != asks {
+            cx.emit(HubEvent::Consent);
+        }
+    }
+
+    /// Whether an agent may attach `udid` itself. A real device only once the
+    /// user allowed agents on it this run (they attach it in the panel, an
+    /// agent asks, they say yes): an agent must never pick someone's phone
+    /// on its own — whichever CLI, old or new, chose it.
+    pub(crate) fn agent_may_attach(&self, udid: &DeviceId) -> Result<(), String> {
+        if !udid.is_physical() || self.agent.consent.is_approved(udid) {
+            return Ok(());
+        }
+        Err(format!(
+            "{udid} is a real device: agents may attach it only after the user attached it in the Mobile Emulator panel and allowed agents on it"
+        ))
+    }
+
+    /// Ask the user whether an agent may install `app` on the real device
+    /// `udid`. Returns the question's number, for [`Self::install_answer`].
+    pub(crate) fn ask_install(&mut self, udid: &DeviceId, worktree: &Path, device_name: &str, app: &str, cx: &mut Context<Self>) -> u64 {
+        self.agent.next_install += 1;
+        let id = self.agent.next_install;
+        self.agent.installs.push(InstallAsk {
+            id,
+            udid: udid.clone(),
+            worktree: WorktreeKey::from_path(worktree),
+            device_name: device_name.to_owned(),
+            app: app.to_owned(),
+            asked: Instant::now(),
+            answer: None,
+        });
+        cx.emit(HubEvent::Consent);
+        id
+    }
+
+    /// The user's answer to install question `id`, once (an answered or
+    /// expired question is dropped as it is read).
+    pub(crate) fn install_answer(&mut self, id: u64) -> InstallAnswer {
+        let Some(at) = self.agent.installs.iter().position(|a| a.id == id) else { return InstallAnswer::Gone };
+        let answer = match self.agent.installs[at].answer {
+            Some(true) => InstallAnswer::Allowed,
+            Some(false) => InstallAnswer::Refused,
+            None if self.agent.installs[at].asked.elapsed() >= INSTALL_ASK_TTL => InstallAnswer::Gone,
+            None => return InstallAnswer::Pending,
+        };
+        self.agent.installs.remove(at);
+        answer
+    }
+
+    /// The install question `worktree`'s agent is waiting on about the device
+    /// attached there now: its number, the device's name and the app's.
+    pub fn install_request(&self, worktree: &Path) -> Option<(u64, String, String)> {
+        let (udid, key) = (self.device_for(worktree)?, WorktreeKey::from_path(worktree));
+        let ask = self.agent.installs.iter().find(|a| a.worktree == key && a.udid == udid && a.answer.is_none())?;
+        Some((ask.id, ask.device_name.clone(), ask.app.clone()))
+    }
+
+    /// The banner's Install / Don't install.
+    pub fn answer_install(&mut self, id: u64, allow: bool, cx: &mut Context<Self>) {
+        if let Some(ask) = self.agent.installs.iter_mut().find(|a| a.id == id) {
+            ask.answer = Some(allow);
             cx.emit(HubEvent::Consent);
         }
     }
@@ -239,7 +338,7 @@ impl SimulatorHub {
     pub(super) fn forget_deleted_simulators(&mut self, cx: &mut Context<Self>) {
         let listed: HashSet<&DeviceId> = self.devices.iter().map(|d| &d.udid).collect();
         let attached = self.registry.attached_devices();
-        let gone = |udid: &DeviceId| udid.platform() == Platform::Ios && !listed.contains(udid) && !attached.contains(udid);
+        let gone = |udid: &DeviceId| udid.source() == Source::Simctl && !listed.contains(udid) && !attached.contains(udid);
         let revoked: Vec<DeviceId> =
             self.agent.granted.iter().map(|a| DeviceId(a.udid.clone())).filter(|udid| gone(udid)).collect();
         let latched = self.agent.stopped.len();
@@ -254,8 +353,12 @@ impl SimulatorHub {
     }
 
     /// Save a grant (`Some(name)`) or a revoke of `udid`, off the UI thread and
-    /// in decision order.
+    /// in decision order. A real device's grant is never saved: it lasts
+    /// until OxiMux quits.
     fn persist_approval(&mut self, udid: &DeviceId, grant: Option<String>, cx: &mut Context<Self>) {
+        if grant.is_some() && udid.is_physical() {
+            return;
+        }
         let Some(repo) = self.agent.approvals.clone() else { return };
         let writes = self.agent.writes.clone();
         let seq = writes.begin(udid.as_str());
@@ -275,9 +378,16 @@ impl SimulatorHub {
             .detach();
     }
 
-    /// Drop consent requests nobody polls any more (from the tick).
+    /// Drop consent requests nobody polls any more, and install questions
+    /// nobody answered in time — or whose answer no agent came back for (its
+    /// CLI gave up) — from the tick.
     pub(super) fn expire_consent(&mut self, cx: &mut Context<Self>) {
-        if self.agent.consent.expire(Instant::now()) {
+        let asks = self.agent.installs.len();
+        // An answer gets a little longer than the question: the waiting agent
+        // reads it within a quarter second.
+        let grace = |a: &InstallAsk| if a.answer.is_some() { Duration::from_secs(15) } else { Duration::ZERO };
+        self.agent.installs.retain(|a| a.asked.elapsed() < INSTALL_ASK_TTL + grace(a));
+        if self.agent.consent.expire(Instant::now()) || self.agent.installs.len() != asks {
             cx.emit(HubEvent::Consent);
         }
     }
@@ -345,10 +455,10 @@ impl SimulatorHub {
 
     /// The user shut `udid` down from the panel (the confirmed power button).
     /// Agents are refused a wake of it from now on (see [`Wake::StoppedByUser`]).
-    /// A phone is never latched: OxiMux never shuts one down, so nothing
-    /// would ever lift it.
+    /// A real device is never latched: OxiMux never shuts one down, so
+    /// nothing would ever lift it.
     pub fn note_stopped_by_user(&mut self, udid: &DeviceId) {
-        if !Self::is_phone(udid) && self.agent.stopped.insert(udid.clone()) {
+        if !udid.is_physical() && self.agent.stopped.insert(udid.clone()) {
             sim_state_keys::save_stopped(&self.repo, &self.agent.stopped);
         }
     }
@@ -531,10 +641,90 @@ mod tests {
         assert_eq!(state.consent.check(&udid, &worktree, "iPhone", Instant::now()).0, Verdict::Allowed);
     }
 
+    /// Agent access to a real device lasts until OxiMux quits: the Allow
+    /// works now but is never saved, and a saved one (an older build wrote
+    /// it) grants nothing at the next launch.
+    #[gpui::test]
+    fn a_real_devices_approval_lasts_until_quit(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let (settings, approvals) = (oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db));
+        let hub = cx.update(|cx| super::super::install_for_test(cx, settings.clone(), approvals.clone()));
+        let (phone, sim, w) = (DeviceId("adb:R58M123".into()), DeviceId("U-1".into()), Path::new("/w"));
+        hub.update(cx, |hub, cx| {
+            hub.allow_agents(&phone, "Galaxy".into(), cx);
+            hub.allow_agents(&sim, "iPhone".into(), cx);
+            assert_eq!(hub.consent_check(&phone, w, "Galaxy", cx).0, Verdict::Allowed, "allowed this run");
+        });
+        cx.run_until_parked();
+        let saved: Vec<String> = approvals.list().expect("list").into_iter().map(|a| a.udid).collect();
+        assert_eq!(saved, ["U-1"], "the phone's approval is not saved");
+        // An older build saved one; this build reads none of it.
+        approvals.grant("adb:R58M123", "Galaxy").expect("grant");
+        let mut state = AgentState::load(Some(approvals));
+        let key = WorktreeKey::from_path(w);
+        assert_eq!(state.consent.check(&phone, &key, "Galaxy", Instant::now()).0, Verdict::Pending);
+        assert_eq!(state.consent.check(&sim, &key, "iPhone", Instant::now()).0, Verdict::Allowed);
+        assert!(state.granted.iter().all(|a| a.udid != "adb:R58M123"), "nor lists it in Settings");
+    }
+
+    /// An agent never attaches someone's phone on its own (an old CLI may
+    /// pick one by id): only once the user allowed agents on it this run.
+    #[gpui::test]
+    fn an_agent_attaches_a_real_device_only_once_allowed(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        hub.update(cx, |hub, cx| {
+            let (phone, iphone) = (DeviceId("adb:R58M123".into()), DeviceId("iosdev:00008110-001A2C3E0A88401E".into()));
+            assert!(hub.agent_may_attach(&DeviceId("U-1".into())).is_ok() && hub.agent_may_attach(&DeviceId("avd:Pixel".into())).is_ok());
+            assert!(hub.agent_may_attach(&phone).is_err());
+            assert!(hub.agent_may_attach(&iphone).is_err());
+            hub.allow_agents(&phone, "Galaxy".into(), cx);
+            assert!(hub.agent_may_attach(&phone).is_ok());
+            hub.revoke_agents(&phone, cx);
+            assert!(hub.agent_may_attach(&phone).is_err());
+        });
+    }
+
+    /// An install on a real device is asked every time and shown only where
+    /// that worktree's agent asked; the answer is read once, an unanswered
+    /// question expires, and a detach drops it.
+    #[gpui::test]
+    fn an_install_on_a_real_device_waits_for_the_user(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        let (phone, w, other) = (DeviceId("adb:R58M123".into()), Path::new("/nonexistent/w"), Path::new("/nonexistent/o"));
+        hub.update(cx, |hub, cx| {
+            drop(hub.registry.attach(WorktreeKey::from_path(w), phone.clone(), true, Instant::now()));
+            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
+            assert_eq!(hub.install_answer(id), InstallAnswer::Pending);
+            assert_eq!(hub.install_request(w), Some((id, "Galaxy".into(), "app-debug.apk".into())));
+            assert_eq!(hub.install_request(other), None, "never over another worktree's panel");
+            hub.answer_install(id, true, cx);
+            assert_eq!(hub.install_answer(id), InstallAnswer::Allowed);
+            assert_eq!(hub.install_answer(id), InstallAnswer::Gone, "read once");
+
+            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
+            hub.answer_install(id, false, cx);
+            assert_eq!(hub.install_answer(id), InstallAnswer::Refused);
+
+            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
+            hub.agent.installs[0].asked -= INSTALL_ASK_TTL;
+            assert_eq!(hub.install_answer(id), InstallAnswer::Gone, "expired: not allowed");
+
+            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
+            hub.detach(w, cx);
+            assert_eq!(hub.install_answer(id), InstallAnswer::Gone, "the worktree moved on");
+        });
+    }
+
     /// A simulator deleted in Xcode drops out of `simctl`'s listing: its
-    /// approval and latch go with it, in memory and on disk. Android devices
-    /// (an unplugged phone, an AVD `-list-avds` missed) and an attached
-    /// device are kept.
+    /// approval and latch go with it, in memory and on disk. An emulator (an
+    /// AVD `-list-avds` missed) and an attached device are kept. (A phone's
+    /// saved approval is not loaded at all: real devices' last until quit.)
     #[gpui::test]
     fn a_deleted_simulator_loses_its_approval_and_latch(cx: &mut gpui::TestAppContext) {
         let db = oximux_storage::open_memory().expect("db");
@@ -558,11 +748,12 @@ mod tests {
                 state: oximux_simulator::DeviceState::Shutdown,
                 kind: oximux_simulator::DeviceKind::Phone,
                 is_available: true,
+                note: None,
             };
             assert!(hub.land_listing(stamp, vec![listed], cx));
             hub.forget_deleted_simulators(cx);
             let left: Vec<&str> = hub.approvals().iter().map(|a| a.udid.as_str()).collect();
-            assert_eq!(left.len(), 4, "{left:?}");
+            assert_eq!(left.len(), 3, "{left:?}");
             assert!(!left.contains(&"U-gone"));
             assert!(hub.agent.stopped.contains(&kept) && !hub.agent.stopped.contains(&gone));
         });

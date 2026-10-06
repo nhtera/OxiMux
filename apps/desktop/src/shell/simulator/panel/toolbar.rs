@@ -84,8 +84,10 @@ impl SimulatorPanel {
         let recording = self.recording_since(cx);
         let device = self.device(cx);
         let android = device.as_ref().is_some_and(|d| d.platform() == oximux_simulator::Platform::Android);
-        // A phone is never shut down from here.
-        let phone = device.as_ref().is_some_and(crate::shell::simulator::SimulatorHub::is_phone);
+        // What this device can do: a real phone is never rotated or shut
+        // down from here. Phase 8: for_session — an iPhone's runner adds input.
+        let caps = device.as_ref().map(oximux_simulator::caps::DeviceCaps::for_id);
+        let can = |command: SimCommand| caps.as_ref().is_none_or(|caps| command.allowed(caps));
         let items: &[Option<(&str, &str, &str, SimCommand)>] = if android { &ANDROID_ITEMS } else { &ITEMS };
         let mut pill = self.pill();
         for &item in items {
@@ -97,9 +99,8 @@ impl SimulatorPanel {
                 SimCommand::Detach => attached,
                 // Recording can always be stopped; captures work on any
                 // attached, streaming device.
-                SimCommand::ToggleRecord => live || recording.is_some(),
-                SimCommand::Shutdown => live && !phone,
-                _ => live,
+                SimCommand::ToggleRecord => (live && can(command)) || recording.is_some(),
+                _ => live && can(command),
             };
             let mut button = Button::new(id).ghost().small().tooltip(tip).disabled(!enabled);
             let mut glyph = Icon::default().path(icon);

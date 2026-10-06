@@ -116,7 +116,8 @@ impl SimulatorPanel {
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _window, _cx| {
                         device_menu(menu, &devices, current.as_ref(), weak.clone())
-                    }),
+                    })
+                    .on_open_change(watch_phones_while_open(self.hub.clone())),
             )
             .child(div().flex_1())
             .child(
@@ -153,16 +154,21 @@ pub(crate) fn os_label(d: &DeviceInfo) -> String {
     }
 }
 
-/// The usable devices in menu order: iOS then Android; in each, booted
-/// devices first, then everything else ("will boot"); newest runtime first,
-/// then by name. Empty groups are left out. Shared by the panel's device menu
-/// and the Settings pane's default-device menu.
+/// The title of the device menu's group of real devices (phones, iPhones).
+pub(crate) const PHYSICAL_GROUP: &str = "Physical devices";
+
+/// The devices in menu order: iOS simulators then Android emulators — in
+/// each, booted devices first, then everything else ("will boot") — then the
+/// real devices ([`PHYSICAL_GROUP`]), which keep their unavailable rows (a
+/// phone that has not approved this Mac yet: shown disabled, with its note).
+/// Newest runtime first, then by name; empty groups are left out. Shared by
+/// the panel's device menu and the Settings pane (whose default-device menu
+/// leaves the real devices out: one is never attached automatically).
 pub(crate) fn device_groups(devices: &[DeviceInfo]) -> Vec<(&'static str, Vec<&DeviceInfo>)> {
-    let usable: Vec<&DeviceInfo> = devices
-        .iter()
-        .filter(|d| d.is_available && d.kind != oximux_simulator::DeviceKind::Other)
-        .collect();
-    let (ios, android): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) = usable.into_iter().partition(|d| d.udid.platform() == Platform::Ios);
+    let (physical, virtual_devices): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) =
+        devices.iter().filter(|d| d.kind != oximux_simulator::DeviceKind::Other).partition(|d| d.udid.is_physical());
+    let usable = virtual_devices.into_iter().filter(|d| d.is_available);
+    let (ios, android): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) = usable.partition(|d| d.udid.platform() == Platform::Ios);
     let (ios_booted, ios_rest) = booted_first(ios);
     let (android_running, android_rest) = booted_first(android);
     [
@@ -170,6 +176,7 @@ pub(crate) fn device_groups(devices: &[DeviceInfo]) -> Vec<(&'static str, Vec<&D
         ("iOS · Available (will boot)", ios_rest),
         ("Android · Running", android_running),
         ("Android · Emulators (will boot)", android_rest),
+        (PHYSICAL_GROUP, physical),
     ]
     .into_iter()
     .filter(|(_, group)| !group.is_empty())
@@ -178,6 +185,18 @@ pub(crate) fn device_groups(devices: &[DeviceInfo]) -> Vec<(&'static str, Vec<&D
         (title, group)
     })
     .collect()
+}
+
+/// For a device menu's `on_open_change`: phones are watched while it is open,
+/// so a row enables the moment its phone approves this Mac.
+pub(super) fn watch_phones_while_open(
+    hub: Option<gpui::Entity<crate::shell::simulator::SimulatorHub>>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    move |open, _window, cx| {
+        if let Some(hub) = &hub {
+            hub.update(cx, |hub, _| hub.set_device_menu_open(*open));
+        }
+    }
 }
 
 /// The device menu ([`device_groups`]). Picking a row attaches it.
@@ -197,8 +216,9 @@ pub(super) fn device_menu(
             let udid = device.udid.clone();
             let panel = panel.clone();
             menu = menu.item(
-                PopupMenuItem::new(format!("{} — {}", device.name, os_label(device)))
+                PopupMenuItem::new(menu_label(device))
                     .checked(current == Some(&device.udid))
+                    .disabled(!device.is_available)
                     .on_click(move |_, _window, cx| {
                         let udid = udid.clone();
                         let _ = panel.update(cx, |panel, cx| panel.attach(Some(udid), cx));
@@ -212,6 +232,16 @@ pub(super) fn device_menu(
             let _ = refresh.update(cx, |panel, cx| panel.refresh(cx));
         }))
         .item(PopupMenuItem::new("Open Xcode").on_click(|_, _window, _cx| super::body::open_xcode()))
+}
+
+/// "Pixel 8 — Android 16", and for a device that cannot be used yet, why
+/// ("… · Unlock the phone and tap Allow USB debugging").
+pub(super) fn menu_label(device: &DeviceInfo) -> String {
+    let label = format!("{} — {}", device.name, os_label(device));
+    match device.note.as_deref().filter(|_| !device.is_available) {
+        Some(note) => format!("{label} · {note}"),
+        None => label,
+    }
 }
 
 fn booted_first(list: Vec<&DeviceInfo>) -> (Vec<&DeviceInfo>, Vec<&DeviceInfo>) {

@@ -19,7 +19,7 @@ use oximux_simulator::{DeviceKind, DeviceState};
 use super::SimulatorPanel;
 use super::bezel::{Device, fit, phone};
 use crate::shell::simulator::screen::Binding;
-use super::header::device_menu;
+use super::header::{device_menu, watch_phones_while_open};
 use crate::shell::simulator::state::PanelState;
 
 /// The full trademark notice, as the platform owner asks it to be written.
@@ -194,7 +194,8 @@ impl SimulatorPanel {
                     .large()
                     .icon(Icon::default().path("icons/chevron-down.svg"))
                     .tooltip("Choose a device")
-                    .dropdown_menu(move |menu, _window, _cx| device_menu(menu, &devices, None, weak.clone())),
+                    .dropdown_menu(move |menu, _window, _cx| device_menu(menu, &devices, None, weak.clone()))
+                    .on_open_change(watch_phones_while_open(self.hub.clone())),
             )
             .into_any_element()
     }

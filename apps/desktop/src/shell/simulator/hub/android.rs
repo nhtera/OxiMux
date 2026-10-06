@@ -4,12 +4,13 @@
 //! Android devices like simulators; what differs is only how each effect is
 //! carried out, which is what this file owns.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use gpui::Context;
+use oximux_simulator::android::adb::AdbState;
 use oximux_simulator::android::scrcpy_server::{self, StreamOptions};
 use oximux_simulator::android::sdk::{self, Sdk};
 use oximux_simulator::android::session::AndroidSession;
@@ -58,6 +59,13 @@ pub(crate) fn list_sides(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Opti
 /// is usually found first).
 pub(crate) fn listing_due(xcode_found: bool, ios_listed: bool, has_sdk: bool, listed: bool) -> bool {
     (xcode_found && !ios_listed) || (has_sdk && !listed)
+}
+
+/// Every phone adb sees and its state, for the watcher (only while phones
+/// matter: see `lifecycle::spawn_watch`). A failed listing reads as `None`:
+/// no news, not "every phone unplugged".
+pub(crate) fn phone_states(runner: &dyn Runner, sdk: &Sdk) -> Option<BTreeMap<String, AdbState>> {
+    devices::phone_states(runner, sdk, ADB_TIMEOUT).inspect_err(|e| tracing::debug!("phone watch: {e}")).ok()
 }
 
 /// Every booted device, for the watcher.
@@ -130,7 +138,7 @@ impl SimulatorHub {
         .detach();
     }
 
-    fn finish_boot(&mut self, udid: DeviceId, generation: Generation, result: BootResult, cx: &mut Context<Self>) {
+    pub(super) fn finish_boot(&mut self, udid: DeviceId, generation: Generation, result: BootResult, cx: &mut Context<Self>) {
         let effects = self.registry.boot_finished(&udid, generation, result);
         self.run(effects, cx);
         self.refresh_devices(cx);
@@ -235,9 +243,16 @@ impl SimulatorHub {
         }
     }
 
-    /// Whether `udid` is a phone (never booted or shut down by us).
-    pub fn is_phone(udid: &DeviceId) -> bool {
-        matches!(Target::from_id(udid), Some(Target::Serial(_)))
+    /// The phone watch's latest view. A change — a phone plugged in,
+    /// unplugged, or approving this Mac — refreshes the device list and says
+    /// so; the first view is only a baseline.
+    pub(super) fn observe_phones(&mut self, now: BTreeMap<String, AdbState>, cx: &mut Context<Self>) {
+        let before = self.phone_states.replace(now);
+        if before.is_some_and(|before| Some(&before) != self.phone_states.as_ref()) {
+            tracing::info!("phone watch: a phone was plugged in, unplugged or approved");
+            self.refresh_devices(cx);
+            cx.emit(HubEvent::PhysicalChanged);
+        }
     }
 
     /// The phase a session start for `udid` found (for the "gone" check).
@@ -261,6 +276,7 @@ mod tests {
             state: DeviceState::Shutdown,
             kind: DeviceKind::Phone,
             is_available: true,
+            note: None,
         }
     }
 
@@ -338,6 +354,44 @@ mod tests {
             assert!(hub.devices().is_empty(), "the cleared SDK's emulators are gone");
             assert!(hub.devices_listed());
         });
+    }
+
+    /// The phone watch: its first view is a baseline; a phone approving this
+    /// Mac (unauthorized → device), or being unplugged, is news — the device
+    /// list refreshes and panels hear of it — and an unchanged view is not.
+    #[gpui::test]
+    fn a_phone_approving_this_mac_refreshes_the_device_list(cx: &mut gpui::TestAppContext) {
+        use oximux_simulator::android::adb::AdbState;
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = changes.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&hub, move |_, ev: &super::super::HubEvent, _| {
+                if matches!(ev, super::super::HubEvent::PhysicalChanged) {
+                    seen.set(seen.get() + 1);
+                }
+            })
+        });
+        let states = |state: AdbState| std::collections::BTreeMap::from([("R58".to_owned(), state)]);
+        hub.update(cx, |hub, cx| {
+            assert!(!hub.watching_phones(), "nothing asks for adb yet");
+            hub.set_device_menu_open(true);
+            assert!(hub.watching_phones(), "an open menu watches phones");
+            hub.observe_phones(states(AdbState::Unauthorized), cx);
+            hub.observe_phones(states(AdbState::Unauthorized), cx);
+            hub.observe_phones(states(AdbState::Device), cx);
+            hub.observe_phones(std::collections::BTreeMap::new(), cx);
+            hub.set_device_menu_open(false);
+            assert!(!hub.watching_phones());
+            // A menu whose close was never reported stops watching anyway.
+            hub.set_device_menu_open(true);
+            hub.phone_watch_until = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            assert!(!hub.watching_phones(), "the lease ran out");
+        });
+        assert_eq!(changes.get(), 2, "approved, then unplugged");
     }
 
     #[test]

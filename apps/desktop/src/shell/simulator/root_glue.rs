@@ -225,7 +225,8 @@ impl WorkspaceRoot {
 }
 
 impl WorkspaceRoot {
-    /// An agent in `worktree` asked to control `device`. Ask where that
+    /// An agent in `worktree` asked to do `what` ("control iPhone 17", or
+    /// "install App.apk on Pixel 8" on a real device). Ask where that
     /// worktree is: the panel's banner when it is this window's active
     /// worktree and the panel shows (or auto-open may open it), else a toast
     /// whose Review shows it — switching there first when it is elsewhere.
@@ -234,7 +235,7 @@ impl WorkspaceRoot {
         &mut self,
         worktree: &Path,
         label: &str,
-        device: &str,
+        what: &str,
         (project_id, workspace_id): (String, String),
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -265,7 +266,7 @@ impl WorkspaceRoot {
                 });
             });
         });
-        let text = format!("An agent in {label} wants to control {device}.");
+        let text = format!("An agent in {label} wants to {what}.");
         self.toast_layer.update(cx, |layer, cx| layer.push_with_actions(ToastKind::Info, text, vec![review], cx));
     }
 

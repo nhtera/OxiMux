@@ -194,12 +194,12 @@ fn authorize(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> 
     })?;
     let (udid, name, verdict, raised) = checked;
     if raised {
-        let (target_for_root, name_for_root) = (target.clone(), name.clone());
+        let (target_for_root, what) = (target.clone(), format!("control {name}"));
         with_root(cx, target, move |root, window, cx| {
             root.ask_simulator_consent(
                 &target_for_root.worktree,
                 &target_for_root.label,
-                &name_for_root,
+                &what,
                 (target_for_root.project_id.clone(), target_for_root.workspace_id.clone()),
                 window,
                 cx,
@@ -312,6 +312,11 @@ async fn attach(hub: &Entity<SimulatorHub>, target: &Target, device: Option<Stri
                 .ok_or_else(|| SimErrorWire::NotFound(format!("no simulator named “{name}” (see `oximux sim devices`)")))?,
         ),
     };
+    // An agent never picks someone's phone itself: a real device only once
+    // the user allowed agents on it (an old CLI may send one by id).
+    if let Some(udid) = &wanted {
+        hub.read_with(cx, |hub, _| hub.agent_may_attach(udid)).map_err(SimErrorWire::Refused)?;
+    }
     let preferred = cx.update(|cx| super::panel::settings(cx).default_device.map(DeviceId));
     let info = hub
         .update(cx, |hub, cx| hub.attach_for_agent(&target.worktree, seen, Ok(devices), stamp, wanted.as_ref(), preferred.as_ref(), cx))
@@ -385,6 +390,7 @@ mod tests {
             state,
             kind: DeviceKind::Phone,
             is_available: true,
+            note: None,
         }
     }
 

@@ -75,4 +75,27 @@ mod tests {
         assert_eq!(udid.platform(), Platform::Ios, "ids saved before Android existed stay iOS");
         assert_eq!(Target::from_id(&DeviceId("avd:".into())), None, "an empty name is not a device");
     }
+
+    /// Every id names its source and whether it is a real device. A real
+    /// iPhone is iOS but `devicectl`'s, never `simctl`'s; a malformed
+    /// `adb:`/`iosdev:` id never falls through to `simctl`.
+    #[test]
+    fn ids_name_their_source_and_class() {
+        use crate::Source;
+        let cases = [
+            ("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3", Source::Simctl, Platform::Ios, false),
+            ("avd:Medium_Phone", Source::Adb, Platform::Android, false),
+            ("adb:R58M123ABC", Source::Adb, Platform::Android, true),
+            ("iosdev:00008110-001A2C3E0A88401E", Source::Devicectl, Platform::Ios, true),
+            ("adb:", Source::Adb, Platform::Android, true),
+            ("iosdev:", Source::Devicectl, Platform::Ios, true),
+        ];
+        for (raw, source, platform, physical) in cases {
+            let id = DeviceId(raw.into());
+            assert_eq!((id.source(), id.platform(), id.is_physical()), (source, platform, physical), "{raw}");
+            assert_eq!(id.sim_udid().is_some(), source == Source::Simctl, "{raw}");
+        }
+        let iphone = DeviceId(format!("{}00008110-001A2C3E0A88401E", crate::IOSDEV_PREFIX));
+        assert_eq!(Target::from_id(&iphone), None, "an iPhone is not an adb target");
+    }
 }

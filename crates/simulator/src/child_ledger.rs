@@ -37,6 +37,12 @@ pub enum Kind {
     /// `simctl`'s own documented way to stop a recording cleanly) and a
     /// longer grace period before `SIGKILL`.
     Record,
+    /// A kind a newer OxiMux recorded (a rollback reading its ledger). Kept,
+    /// not an error: the ledger must stay readable, and an orphan of an
+    /// unknown kind still gets the generic stop — `SIGTERM`, then `SIGKILL`
+    /// — once its `argv[0]` proves who it is.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One process this app spawned and is responsible for cleaning up.
@@ -226,7 +232,7 @@ fn kill_entry(entry: &Entry) {
 
     let (first_signal, grace) = match entry.kind {
         Kind::Record => (libc::SIGINT, Duration::from_secs(5)),
-        Kind::Helper => (libc::SIGTERM, Duration::from_secs(1)),
+        Kind::Helper | Kind::Unknown => (libc::SIGTERM, Duration::from_secs(1)),
     };
     send_signal(entry.pid, first_signal);
 
@@ -292,6 +298,23 @@ mod tests {
 
         // Removing an already-gone pid is a no-op, not an error.
         ledger.remove(111).unwrap();
+    }
+
+    /// A rollback reads a ledger a newer build wrote, with a kind it does
+    /// not know: the file stays usable — record, remove and reap all work —
+    /// and the unknown entry is reaped (a dead pid here) rather than failing
+    /// the whole ledger.
+    #[test]
+    fn a_ledger_with_an_unknown_kind_still_works() {
+        let (dir, ledger) = temp_ledger();
+        let newer = r#"[{"pid":4294967290,"kind":"xcodebuild","exe":"/usr/bin/xcodebuild","started_at_unix":0,"udid":null,"owner_pid":0}]"#;
+        std::fs::write(dir.path().join("children.json"), newer).unwrap();
+        assert_eq!(ledger.entries().unwrap()[0].kind, Kind::Unknown);
+        ledger.record(entry(111, "/bin/sleep")).unwrap();
+        ledger.remove(111).unwrap();
+        assert_eq!(ledger.entries().unwrap().len(), 1, "the unknown entry is kept");
+        assert_eq!(reap_stale(&ledger).dropped, vec![4_294_967_290]);
+        assert!(ledger.entries().unwrap().is_empty());
     }
 
     #[test]

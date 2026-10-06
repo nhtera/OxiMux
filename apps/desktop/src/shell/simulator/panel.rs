@@ -34,7 +34,7 @@ use super::state::{self, Inputs, PanelState};
 
 pub(crate) use stream_row::settings;
 pub(crate) use commands::{Outcome, SimCommand};
-pub(crate) use header::{device_groups, os_label};
+pub(crate) use header::{PHYSICAL_GROUP, device_groups, os_label};
 
 mod annotating;
 mod bezel;
@@ -156,7 +156,7 @@ impl SimulatorPanel {
                     cx.notify();
                 }
             }
-            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent => cx.notify(),
+            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged => cx.notify(),
             HubEvent::AgentActivity(udid) => {
                 if self.device(cx).as_ref() == Some(udid) {
                     cx.notify();

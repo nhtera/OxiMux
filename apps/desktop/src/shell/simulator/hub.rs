@@ -26,7 +26,7 @@ use oximux_simulator::protocol::StreamFormat;
 use oximux_simulator::registry::{self, BootResult, Effect, Generation, Phase, Registry, WorktreeKey};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::{HelperSession, SessionEvent, StreamSession};
-use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, Platform, SimError, simctl};
+use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, SimError, Source, simctl};
 use oximux_storage::SettingsRepo;
 
 use crate::app_settings::sim_state_keys;
@@ -36,6 +36,11 @@ const SIMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often devices are checked for parking and the idle shutdown (so a
 /// hidden device parks 60–75 s after it was hidden).
 const TICK: Duration = Duration::from_secs(15);
+/// How long an opened device menu keeps phones watched. A lease, not a
+/// count: gpui-kit does not report a menu closed when its button goes away
+/// (an attach landing under an open empty-state menu), and a count stuck
+/// above zero would poll `adb` until quit.
+const MENU_PHONE_WATCH: Duration = Duration::from_secs(120);
 
 /// What panels hear about.
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +70,9 @@ pub enum HubEvent {
     /// agent's `simctl boot` or build, Simulator.app): a window may attach one
     /// where an agent is working, after claiming it (P9 auto-open).
     DeviceBooted(Vec<DeviceId>),
+    /// A phone was plugged in, unplugged, or approved this Mac (the device
+    /// list is being refreshed): a row may enable, a Reconnect may apply.
+    PhysicalChanged,
 }
 
 pub struct SimulatorHub {
@@ -108,6 +116,13 @@ pub struct SimulatorHub {
     /// Booted devices a window already took for auto-attach (so one boot is
     /// attached once, not by every window); dropped when the device shuts down.
     boot_claims: HashSet<DeviceId>,
+    /// Until when an opened device menu has phones watched, so a row enables
+    /// when its phone approves this Mac (see [`MENU_PHONE_WATCH`]).
+    phone_watch_until: Option<Instant>,
+    /// A real device was attached this run: phones stay watched.
+    physical_used: bool,
+    /// The phones (and their adb states) the last phone watch saw.
+    phone_states: Option<std::collections::BTreeMap<String, oximux_simulator::android::adb::AdbState>>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -118,6 +133,7 @@ mod capture;
 mod lifecycle;
 
 pub use agent::Wake;
+pub(crate) use agent::InstallAnswer;
 pub(crate) use android::list_all;
 pub use capture::NoticeKind;
 pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
@@ -220,6 +236,21 @@ impl SimulatorHub {
             });
         })
         .detach();
+    }
+
+    /// A device menu opened or closed. While one is open (for at most
+    /// [`MENU_PHONE_WATCH`]) the watcher also watches phones (`adb devices`),
+    /// so an approval shows without reopening it.
+    pub fn set_device_menu_open(&mut self, open: bool) {
+        self.phone_watch_until = open.then(|| Instant::now() + MENU_PHONE_WATCH);
+    }
+
+    /// Whether the watcher should watch phones now: a menu is open, or a real
+    /// device was attached this run (to see it unplugged and back).
+    pub(crate) fn watching_phones(&self) -> bool {
+        self.phone_watch_until.is_some_and(|until| Instant::now() < until)
+            || self.physical_used
+            || self.registry.attached_devices().iter().any(DeviceId::is_physical)
     }
 
     /// Number a device listing as it starts; `ios`: it asks `simctl`.
@@ -335,20 +366,25 @@ impl SimulatorHub {
     }
 
     /// Shut `udid` down (the toolbar's power button). The device watcher then
-    /// sees it go and the panel shows Disconnected with Reconnect.
+    /// sees it go and the panel shows Disconnected with Reconnect. A real
+    /// device is never shut down.
     pub fn shutdown_device(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
-        if udid.platform() == Platform::Android {
+        if udid.is_physical() {
+            tracing::warn!(%udid, "refused to shut down a real device");
+            return;
+        }
+        if udid.source() == Source::Adb {
             self.shutdown_android(udid, cx);
             return;
         }
+        let Some(sim) = udid.sim_udid() else { return };
         let (runner, udid) = (self.runner.clone(), udid.clone());
         let xcode_ok = self.watch_gate().xcode_ok;
         cx.spawn(async move |this, cx| {
             // Never `xcrun` without a resolvable Xcode (the CLT dialog).
             let result = if xcode_ok {
-                let target = udid.clone();
                 cx.background_executor()
-                    .spawn(async move { simctl::shutdown(runner.as_ref(), target.as_str(), SIMCTL_TIMEOUT) })
+                    .spawn(async move { simctl::shutdown(runner.as_ref(), &sim, SIMCTL_TIMEOUT) })
                     .await
                     .map_err(|e| e.to_string())
             } else {
@@ -529,6 +565,7 @@ impl SimulatorHub {
             return Err("No usable device. Install an iOS runtime in Xcode › Settings › Components, or create an Android emulator.".into());
         };
         let info = info.clone();
+        self.physical_used |= info.udid.is_physical();
         // An attach (the user's pick, `sim attach`) boots it on purpose.
         self.clear_stopped_by_user(&info.udid);
         if self.registry.device_for(key) != Some(&info.udid) {
@@ -614,16 +651,19 @@ impl SimulatorHub {
                 Effect::StopSession { session, .. } => session.shutdown(),
                 Effect::Pause(session) => drop(session.pause()),
                 Effect::Resume(session) => drop(session.resume()),
-                Effect::ShutdownDevice { udid } if udid.platform() == Platform::Android => self.shutdown_android(&udid, cx),
+                // The registry never asks this of a real device; refused here
+                // too, whatever asked.
+                Effect::ShutdownDevice { udid } if udid.is_physical() => {
+                    tracing::warn!(%udid, "refused to shut down a real device");
+                }
+                Effect::ShutdownDevice { udid } if udid.source() == Source::Adb => self.shutdown_android(&udid, cx),
                 Effect::ShutdownDevice { udid } => {
                     // Never `xcrun` without a resolvable Xcode (the CLT dialog).
-                    if !self.watch_gate().xcode_ok {
-                        continue;
-                    }
+                    let Some(sim) = udid.sim_udid().filter(|_| self.watch_gate().xcode_ok) else { continue };
                     let runner = self.runner.clone();
                     cx.background_executor()
                         .spawn(async move {
-                            if let Err(e) = simctl::shutdown(runner.as_ref(), udid.as_str(), SIMCTL_TIMEOUT) {
+                            if let Err(e) = simctl::shutdown(runner.as_ref(), &sim, SIMCTL_TIMEOUT) {
                                 tracing::warn!(%udid, "idle simulator shutdown failed: {e}");
                             }
                         })
@@ -635,16 +675,22 @@ impl SimulatorHub {
     }
 
     fn boot(&mut self, udid: DeviceId, generation: Generation, cancel: Arc<AtomicBool>, cx: &mut Context<Self>) {
-        if udid.platform() == Platform::Android {
-            self.boot_android(udid, generation, cancel, cx);
-            return;
+        // The registry never boots a real device; refused here too.
+        if udid.is_physical() {
+            tracing::warn!(%udid, "refused to boot a real device");
+            return self.finish_boot(udid, generation, BootResult::Failed("A real device is never booted by OxiMux.".into()), cx);
         }
+        if udid.source() == Source::Adb {
+            return self.boot_android(udid, generation, cancel, cx);
+        }
+        let Some(sim) = udid.sim_udid() else {
+            return self.finish_boot(udid, generation, BootResult::Failed("not a simulator".into()), cx);
+        };
         let runner = self.runner.clone();
         cx.spawn(async move |this, cx| {
-            let target = udid.clone();
             let result = match cx
                 .background_executor()
-                .spawn(async move { simctl::boot(runner.as_ref(), target.as_str(), SIMCTL_TIMEOUT, &cancel) })
+                .spawn(async move { simctl::boot(runner.as_ref(), &sim, SIMCTL_TIMEOUT, &cancel) })
                 .await
             {
                 Ok(simctl::BootOutcome::Booted) => BootResult::Booted,
@@ -665,9 +711,15 @@ impl SimulatorHub {
     }
 
     fn start_session(&mut self, udid: DeviceId, generation: Generation, cx: &mut Context<Self>) {
-        if udid.platform() == Platform::Android {
-            self.start_android_session(udid, generation, cx);
-            return;
+        match udid.source() {
+            Source::Adb => return self.start_android_session(udid, generation, cx),
+            // Never the simulator helper: it would ask CoreSimulator for an
+            // id it has never heard of.
+            Source::Devicectl => {
+                let why = "Streaming a real iPhone is not available in this version of OxiMux.".to_owned();
+                return self.finish_start(udid, generation, Err((why, false)), cx);
+            }
+            Source::Simctl => {}
         }
         let helper = match self.availability.as_ref().map(|a| &a.helper) {
             Some(HelperStatus::Found(path)) => Ok(path.clone()),

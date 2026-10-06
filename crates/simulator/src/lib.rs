@@ -28,6 +28,7 @@ pub mod agent;
 pub mod android;
 pub mod availability;
 pub mod ax;
+pub mod caps;
 pub mod boot_watch;
 pub mod child_ledger;
 pub mod classify;
@@ -47,21 +48,51 @@ pub mod video;
 pub mod xcode_app;
 
 /// A device, by a stable id: an iOS simulator's UDID as `simctl` reports it,
-/// or an Android device as `avd:<name>` (an emulator, stable across boots —
-/// its adb serial is not) or `adb:<serial>` (a USB phone). See
-/// [`android::Target`].
+/// an Android device as `avd:<name>` (an emulator, stable across boots — its
+/// adb serial is not) or `adb:<serial>` (a USB phone; see
+/// [`android::Target`]), or a real iPhone as `iosdev:<udid>`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DeviceId(pub String);
+
+/// The prefix of a real iPhone's id (its `devicectl` UDID follows).
+pub const IOSDEV_PREFIX: &str = "iosdev:";
 
 impl DeviceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Which platform this device runs. iOS ids are bare UDIDs, so an id
-    /// saved before Android existed still reads as iOS.
+    /// Which platform this device runs. iOS simulator ids are bare UDIDs, so
+    /// an id saved before Android existed still reads as iOS.
     pub fn platform(&self) -> Platform {
-        if android::Target::from_id(self).is_some() { Platform::Android } else { Platform::Ios }
+        match self.source() {
+            Source::Adb => Platform::Android,
+            Source::Simctl | Source::Devicectl => Platform::Ios,
+        }
+    }
+
+    /// Which tool lists and drives this device. Decided by prefix alone, so a
+    /// malformed `adb:`/`iosdev:` id can never fall through to `simctl`.
+    pub fn source(&self) -> Source {
+        let id = self.as_str();
+        if id.starts_with(IOSDEV_PREFIX) {
+            Source::Devicectl
+        } else if id.starts_with("avd:") || id.starts_with("adb:") {
+            Source::Adb
+        } else {
+            Source::Simctl
+        }
+    }
+
+    /// A real device (a USB or Wi-Fi Android phone, an iPhone): never booted,
+    /// owned, shut down or picked automatically by OxiMux.
+    pub fn is_physical(&self) -> bool {
+        self.as_str().starts_with("adb:") || self.source() == Source::Devicectl
+    }
+
+    /// This id as a `simctl` argument: `None` for anything but a simulator.
+    pub fn sim_udid(&self) -> Option<simctl::SimUdid> {
+        simctl::SimUdid::new(self)
     }
 }
 
@@ -70,6 +101,18 @@ impl DeviceId {
 pub enum Platform {
     Ios,
     Android,
+}
+
+/// The tool a device belongs to. The device watcher reconciles per source: a
+/// round in which one tool did not answer says nothing about its devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Source {
+    /// iOS simulators (bare UDIDs).
+    Simctl,
+    /// Android emulators and phones (`avd:`, `adb:`).
+    Adb,
+    /// Real iPhones (`iosdev:`).
+    Devicectl,
 }
 
 impl std::fmt::Display for DeviceId {
@@ -123,8 +166,13 @@ pub struct DeviceInfo {
     pub os_version: String,
     pub state: DeviceState,
     pub kind: DeviceKind,
-    /// `simctl`'s `isAvailable`: false when the runtime is missing.
+    /// `simctl`'s `isAvailable`: false when the runtime is missing (or a
+    /// phone that cannot be used yet).
     pub is_available: bool,
+    /// Why an unavailable device cannot be used, for the device menu (e.g.
+    /// "Unlock the phone and tap *Allow USB debugging*").
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// Device orientation, numbered as UIKit's `UIDeviceOrientation` and as the

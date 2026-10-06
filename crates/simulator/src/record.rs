@@ -95,8 +95,10 @@ pub struct Recording {
 impl Recording {
     /// Start recording `udid` into `path` (overwritten if present).
     pub fn start(simctl: &Path, udid: &DeviceId, path: &Path, ledger: Option<Arc<Ledger>>) -> Result<Self> {
+        // Only a simulator's id reaches `simctl`.
+        let sim = udid.sim_udid().ok_or_else(|| SimError::Unsupported(format!("{udid} is not a simulator")))?;
         let path_arg = path.to_string_lossy().into_owned();
-        let args = ["io", udid.as_str(), "recordVideo", "--codec=h264", "--force", path_arg.as_str()];
+        let args = ["io", sim.as_str(), "recordVideo", "--codec=h264", "--force", path_arg.as_str()];
         Self::spawn(simctl, &args, udid, path, ledger)
     }
 

@@ -19,9 +19,13 @@ use super::SimulatorPanel;
 
 impl SimulatorPanel {
     /// The question this worktree's agent is waiting on, in the flow above
-    /// the phone.
+    /// the phone: may agents control the device, or — on a real device,
+    /// asked every time — may one install an app on it.
     pub(super) fn render_consent_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (hub, worktree) = (self.hub.as_ref()?, self.worktree.as_ref()?);
+        if let Some((id, device, app)) = hub.read(cx).install_request(worktree) {
+            return Some(self.render_install(id, device, app, cx));
+        }
         let (udid, name) = hub.read(cx).consent_request(worktree)?;
         Some(self.render_consent(udid, name, cx))
     }
@@ -31,7 +35,11 @@ impl SimulatorPanel {
     /// the phone must not jump each time.
     pub(super) fn render_agent_badge(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (hub, udid) = (self.hub.as_ref()?, self.device(cx)?);
-        if !hub.read(cx).agent_active(&udid) || hub.read(cx).consent_request(self.worktree.as_ref()?).is_some() {
+        let worktree = self.worktree.as_ref()?;
+        if !hub.read(cx).agent_active(&udid)
+            || hub.read(cx).consent_request(worktree).is_some()
+            || hub.read(cx).install_request(worktree).is_some()
+        {
             return None;
         }
         Some(
@@ -48,9 +56,60 @@ impl SimulatorPanel {
     }
 
     fn render_consent(&self, udid: DeviceId, name: String, cx: &mut Context<Self>) -> AnyElement {
-        let (theme, density, ty) = (self.theme, self.density, &self.typography);
+        let body = consent_body(&udid);
         let (allow, deny) = (udid.clone(), udid);
         let allowed_name = name.clone();
+        self.render_question(
+            format!("Let agents control {name}?"),
+            body,
+            ("sim-consent-deny", "Don't allow"),
+            ("sim-consent-allow", "Allow"),
+            cx.listener(move |this, _, _window, cx| {
+                if let Some(hub) = this.hub.clone() {
+                    hub.update(cx, |hub, cx| hub.deny_agents(&deny, cx));
+                }
+            }),
+            cx.listener(move |this, _, _window, cx| {
+                if let Some(hub) = this.hub.clone() {
+                    hub.update(cx, |hub, cx| hub.allow_agents(&allow, allowed_name.clone(), cx));
+                }
+            }),
+        )
+    }
+
+    /// An agent wants to install `app` on the real device `device`. Asked
+    /// every time: controlling a phone is not putting apps on it.
+    fn render_install(&self, id: u64, device: String, app: String, cx: &mut Context<Self>) -> AnyElement {
+        self.render_question(
+            format!("Install {app} on {device}?"),
+            "An agent in this worktree wants to install this app on your real device. Allow it only if you expected this build."
+                .into(),
+            ("sim-install-deny", "Don't install"),
+            ("sim-install-allow", "Install"),
+            cx.listener(move |this, _, _window, cx| {
+                if let Some(hub) = this.hub.clone() {
+                    hub.update(cx, |hub, cx| hub.answer_install(id, false, cx));
+                }
+            }),
+            cx.listener(move |this, _, _window, cx| {
+                if let Some(hub) = this.hub.clone() {
+                    hub.update(cx, |hub, cx| hub.answer_install(id, true, cx));
+                }
+            }),
+        )
+    }
+
+    /// One question card: a title, why it is asked, and two answers.
+    fn render_question(
+        &self,
+        title: String,
+        body: String,
+        (deny_id, deny_label): (&'static str, &'static str),
+        (allow_id, allow_label): (&'static str, &'static str),
+        on_deny: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+        on_allow: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    ) -> AnyElement {
+        let (theme, density, ty) = (self.theme, self.density, &self.typography);
         div()
             .flex()
             .flex_col()
@@ -68,32 +127,17 @@ impl SimulatorPanel {
                     .text_size(px(ty.t_body_md))
                     .font_weight(ty.w_semibold)
                     .text_color(theme.fg_base)
-                    .child(format!("Let agents control {name}?")),
+                    .child(title),
             )
-            .child(div().text_size(px(ty.t_body_sm)).text_color(theme.fg_muted).child(
-                "An agent in this worktree wants to tap, type, and take screenshots of this simulator. \
-                 Screenshots go to the agent's model provider — don't sign in to real accounts on this device.",
-            ))
+            .child(div().text_size(px(ty.t_body_sm)).text_color(theme.fg_muted).child(body))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .justify_end()
                     .gap(px(density.gap_inline))
-                    .child(Button::new("sim-consent-deny").ghost().small().label("Don't allow").on_click(cx.listener(
-                        move |this, _, _window, cx| {
-                            if let Some(hub) = this.hub.clone() {
-                                hub.update(cx, |hub, cx| hub.deny_agents(&deny, cx));
-                            }
-                        },
-                    )))
-                    .child(Button::new("sim-consent-allow").primary().small().label("Allow").on_click(cx.listener(
-                        move |this, _, _window, cx| {
-                            if let Some(hub) = this.hub.clone() {
-                                hub.update(cx, |hub, cx| hub.allow_agents(&allow, allowed_name.clone(), cx));
-                            }
-                        },
-                    ))),
+                    .child(Button::new(deny_id).ghost().small().label(deny_label).on_click(on_deny))
+                    .child(Button::new(allow_id).primary().small().label(allow_label).on_click(on_allow)),
             )
             .into_any_element()
     }
@@ -115,5 +159,33 @@ impl SimulatorPanel {
             .child(div().size(px(6.)).rounded_full().bg(theme.status_info))
             .child(div().text_size(px(ty.t_body_sm)).text_color(theme.fg_base).child("Agent is using this device"))
             .into_any_element()
+    }
+}
+
+/// Why the consent question is asked. A real device's says so — screenshots
+/// may show the owner's own data — and that the answer lasts until quit.
+fn consent_body(udid: &DeviceId) -> String {
+    if udid.is_physical() {
+        "An agent in this worktree wants to tap, type, and take screenshots of this real device. \
+         Screenshots go to the agent's model provider and may show your personal data. \
+         Access lasts until OxiMux quits."
+            .into()
+    } else {
+        "An agent in this worktree wants to tap, type, and take screenshots of this simulator. \
+         Screenshots go to the agent's model provider — don't sign in to real accounts on this device."
+            .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_real_device_is_named_as_one_and_its_access_ends_at_quit() {
+        let real = consent_body(&DeviceId("adb:R58M123".into()));
+        assert!(real.contains("real device") && real.contains("until OxiMux quits"), "{real}");
+        let sim = consent_body(&DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into()));
+        assert!(sim.contains("simulator") && !sim.contains("real device"));
     }
 }
