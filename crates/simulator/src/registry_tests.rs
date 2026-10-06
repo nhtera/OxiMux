@@ -683,5 +683,38 @@ fn a_round_without_a_devices_source_leaves_it_alone() {
     assert!(matches!(reg.phase(&iphone), Phase::Live { .. }) && matches!(reg.phase(&phone), Phase::Live { .. }));
     // The phone's own source answered without it: unplugged.
     assert_eq!(kinds(&reg.reconcile_booted(&booted(&[]), &[Source::Simctl, Source::Adb])), ["stop adb:R58 p"]);
+    assert!(matches!(reg.phase(&phone), Phase::Disconnected { reason } if reason.contains("unplugged")));
     assert!(matches!(reg.phase(&iphone), Phase::Live { .. }));
+}
+
+/// R6: a phone's stream ending is never restarted behind the user's back.
+/// Unplugged, it says so; still listed (the server died), the reason stands.
+/// Either way Reconnect brings it back.
+#[test]
+fn a_real_devices_exit_is_never_restarted() {
+    let now = Instant::now();
+    let phone = dev("adb:R58");
+    let mut reg = Reg::default();
+    let g = live(&mut reg, &wt("a"), &phone, "s", now);
+    assert_eq!(kinds(&reg.session_exited(&phone, g, false, "the Android stream ended".into())), ["stop adb:R58 s"]);
+    assert!(matches!(reg.phase(&phone), Phase::Disconnected { reason } if reason.contains("unplugged")), "{:?}", reg.phase(&phone));
+    assert_eq!(kinds(&reg.reconnect(&phone, true)), ["start adb:R58"]);
+
+    let mut reg = Reg::default();
+    let g = live(&mut reg, &wt("a"), &phone, "s", now);
+    let dropped = crate::android::session::STREAM_DROPPED.to_owned();
+    assert_eq!(kinds(&reg.session_exited(&phone, g, true, dropped)), ["stop adb:R58 s"], "no restart");
+    assert!(matches!(reg.phase(&phone), Phase::Disconnected { reason } if reason.contains("Reconnect to stream again")), "{:?}", reg.phase(&phone));
+    // The watcher then sees it gone (the stream's end came first): unplugged.
+    reg.reconcile_booted(&booted(&[]), &[Source::Adb]);
+    assert!(matches!(reg.phase(&phone), Phase::Disconnected { reason } if reason.contains("unplugged")), "{:?}", reg.phase(&phone));
+    // Any other failure keeps its own words (Reconnect would fail the same way).
+    let mut reg = Reg::default();
+    let g = live(&mut reg, &wt("a"), &phone, "s", now);
+    reg.session_exited(&phone, g, true, "the Android stream ended: the video decoder could not start: -12906".into());
+    assert!(matches!(reg.phase(&phone), Phase::Disconnected { reason } if reason.contains("decoder")));
+    // A simulator still gets its one automatic restart.
+    let mut reg = Reg::default();
+    let g = live(&mut reg, &wt("a"), &dev("U"), "s", now);
+    assert_eq!(kinds(&reg.session_exited(&dev("U"), g, true, "x".into())), ["stop U s", "start U"]);
 }

@@ -45,7 +45,13 @@ pub fn running(runner: &dyn Runner, sdk: &Sdk, timeout: Duration) -> Result<BTre
 /// [`running`] with its identity cache passed in (tests).
 pub fn running_with(runner: &dyn Runner, sdk: &Sdk, timeout: Duration, known: &Identities) -> Result<BTreeMap<DeviceId, AdbDevice>> {
     let adb = Adb::new(runner, &sdk.adb());
-    let online: Vec<AdbDevice> = adb.devices(timeout)?.into_iter().filter(|d| d.state == AdbState::Device).collect();
+    let all = adb.devices(timeout)?;
+    Ok(identify(&adb, all, known))
+}
+
+/// The online devices of one `adb devices` listing, by the id the panel uses.
+fn identify(adb: &Adb<'_>, all: Vec<AdbDevice>, known: &Identities) -> BTreeMap<DeviceId, AdbDevice> {
+    let online: Vec<AdbDevice> = all.into_iter().filter(|d| d.state == AdbState::Device).collect();
     let mut known = known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // A serial that went away (or is booting again, offline) may come back
     // as another AVD: forget it.
@@ -77,7 +83,30 @@ pub fn running_with(runner: &dyn Runner, sdk: &Sdk, timeout: Duration, known: &I
         };
         out.insert(target.id(), device);
     }
-    Ok(out)
+    out
+}
+
+/// Phones adb lists that cannot be used yet, as disabled rows with why: one
+/// that has not approved this Mac, or an offline one. Emulators are left
+/// out (an offline one is still booting).
+fn unavailable(all: &[AdbDevice]) -> Vec<DeviceInfo> {
+    all.iter()
+        .filter(|d| !d.is_emulator())
+        .filter_map(|d| {
+            let (state, note) = match &d.state {
+                AdbState::Device => return None,
+                AdbState::Unauthorized => ("Unauthorized".to_owned(), "Unlock the phone and tap “Allow USB debugging”".to_owned()),
+                AdbState::Offline => ("Offline".to_owned(), "Reconnect the cable".to_owned()),
+                AdbState::Other(state) => (state.clone(), format!("adb lists it as “{state}”")),
+            };
+            let mut row = info(Target::Serial(d.serial.clone()).id(), d.display_name(), None, false);
+            row.is_available = false;
+            // What an agent's `sim devices` shows: not "Shutdown".
+            row.state = DeviceState::Other(state);
+            row.note = Some(note);
+            Some(row)
+        })
+        .collect()
 }
 
 /// Every phone adb lists, by serial, in whatever state it is in — offline
@@ -86,6 +115,13 @@ pub fn running_with(runner: &dyn Runner, sdk: &Sdk, timeout: Duration, known: &I
 pub fn phone_states(runner: &dyn Runner, sdk: &Sdk, timeout: Duration) -> Result<BTreeMap<String, AdbState>> {
     let adb = Adb::new(runner, &sdk.adb());
     Ok(adb.devices(timeout)?.into_iter().filter(|d| !d.is_emulator()).map(|d| (d.serial, d.state)).collect())
+}
+
+/// Whether the phone `serial`'s screen is on (`None`: it did not say). A
+/// sleeping phone streams nothing, silently: the panel says so instead.
+pub fn screen_awake(runner: &dyn Runner, sdk: &Sdk, serial: &str, timeout: Duration) -> Option<bool> {
+    let out = Adb::new(runner, &sdk.adb()).shell(serial, &["dumpsys", "power", "|", "grep", "mWakefulness="], timeout).ok()?;
+    super::adb::parse_awake(&out)
 }
 
 /// The ids of every running Android device (the device watcher's view).
@@ -99,7 +135,9 @@ pub fn list(runner: &dyn Runner, sdk: &Sdk, avd_home: Option<&Path>, timeout: Du
 }
 
 fn list_with(runner: &dyn Runner, sdk: &Sdk, avd_home: Option<&Path>, timeout: Duration, known: &Identities) -> Result<Vec<DeviceInfo>> {
-    let running = running_with(runner, sdk, timeout, known)?;
+    let all = Adb::new(runner, &sdk.adb()).devices(timeout)?;
+    let waiting = unavailable(&all);
+    let running = identify(&Adb::new(runner, &sdk.adb()), all, known);
     let avds = if sdk.has_emulator() { avd::list_avds(runner, &sdk.emulator(), timeout).unwrap_or_default() } else { Vec::new() };
     let mut out: Vec<DeviceInfo> = avds
         .iter()
@@ -113,15 +151,21 @@ fn list_with(runner: &dyn Runner, sdk: &Sdk, avd_home: Option<&Path>, timeout: D
     for (id, device) in &running {
         // Phones, and an emulator whose AVD lives somewhere `-list-avds` does
         // not look (another AVD home): listed as they run.
+        let adb = Adb::new(runner, &sdk.adb());
         let name = match Target::from_id(id) {
-            Some(Target::Serial(_)) => device.display_name(),
+            // The name on the box ("Redmi Note 14"), not adb's model code.
+            Some(Target::Serial(_)) => adb
+                .getprop(&device.serial, "ro.product.marketname", QUICK)
+                .ok()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| device.display_name()),
             Some(Target::Avd(name)) if !avds.contains(&name) => name.replace('_', " "),
             _ => continue,
         };
-        let adb = Adb::new(runner, &sdk.adb());
         let release = adb.getprop(&device.serial, "ro.build.version.release", QUICK).ok().filter(|v| !v.is_empty());
         out.push(info(id.clone(), name, release.map(|r| format!("Android {r}")), true));
     }
+    out.extend(waiting);
     Ok(out)
 }
 
@@ -259,6 +303,7 @@ R58 unauthorized usb:2 transport_id:3\n";
             .expect(&format!("{adb} -s emulator-5554 shell getprop ro.boot.qemu.avd_name"), CmdOutput::ok("\n"))
             .expect(&format!("{adb} -s emulator-5554 emu avd name"), CmdOutput::ok("Medium_Phone\r\nOK\r\n"))
             .expect(&format!("{emu} -list-avds"), CmdOutput::ok("Medium_Phone\nPixel_Tablet\n"))
+            .expect(&format!("{adb} -s 0A1B2C shell getprop ro.product.marketname"), CmdOutput::ok("\n"))
             .expect(&format!("{adb} -s 0A1B2C shell getprop ro.build.version.release"), CmdOutput::ok("16\n"));
         let home = dir.path().join("avd");
         std::fs::create_dir_all(home.join("Medium_Phone.avd")).unwrap();
@@ -273,8 +318,14 @@ R58 unauthorized usb:2 transport_id:3\n";
                 ("avd:Medium_Phone".into(), "Medium Phone".into(), "Android API 37.1".into(), DeviceState::Booted),
                 ("avd:Pixel_Tablet".into(), "Pixel Tablet".into(), "Android".into(), DeviceState::Shutdown),
                 ("adb:0A1B2C".into(), "Pixel 8 Pro".into(), "Android 16".into(), DeviceState::Booted),
+                ("adb:R58".into(), "R58".into(), "Android".into(), DeviceState::Other("Unauthorized".into())),
             ]
         );
+        // A phone that has not approved this Mac is listed, disabled, with why.
+        let waiting = list.iter().find(|d| d.udid.as_str() == "adb:R58").unwrap();
+        assert!(!waiting.is_available);
+        assert!(waiting.note.as_deref().is_some_and(|n| n.contains("Allow USB debugging")));
+        assert!(list.iter().filter(|d| d.udid.as_str() != "adb:R58").all(|d| d.is_available && d.note.is_none()));
         assert!(list.iter().all(|d| d.udid.platform() == crate::Platform::Android));
     }
 

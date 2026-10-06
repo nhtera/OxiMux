@@ -121,6 +121,8 @@ pub struct Connection {
     pub device_name: String,
     /// `adb shell … app_process …`: the server lives as long as this does.
     pub server: Child,
+    /// The server's log (stderr): read it to its end (see `server_log`).
+    pub log: Option<std::process::ChildStderr>,
     /// The local port of the adb forward (removed on close).
     pub port: u16,
 }
@@ -137,12 +139,13 @@ pub fn start(adb: &Path, serial: &str, scid: u32, opts: StreamOptions, port: u16
         .args(server_command(scid, opts))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
+    let log = server.stderr.take();
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let opened = open_sockets(port, deadline);
     match opened {
-        Ok((video, control, device_name)) => Ok(Connection { video, control, device_name, server, port }),
+        Ok((video, control, device_name)) => Ok(Connection { video, control, device_name, server, port, log }),
         Err(e) => {
             let _ = server.kill();
             let _ = server.wait();

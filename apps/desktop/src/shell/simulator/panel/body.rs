@@ -52,6 +52,8 @@ impl SimulatorPanel {
             PanelState::Streaming if self.annotate.is_some() => {
                 self.annotate.clone().map(IntoElement::into_any_element).unwrap_or_else(|| self.centered_line(""))
             }
+            // A sleeping phone streams nothing: say so, and let the user wake it.
+            PanelState::Streaming if self.screen_off(cx) => self.render_screen_off(cx),
             PanelState::Streaming => {
                 let radius = self.area.get().and_then(|a| fit(a, &device)).map_or(0.0, |l| l.screen_radius);
                 let binding = Binding { device: self.device(cx), visible: self.visible && self.window_visible, radius };
@@ -197,6 +199,31 @@ impl SimulatorPanel {
                     .dropdown_menu(move |menu, _window, _cx| device_menu(menu, &devices, None, weak.clone()))
                     .on_open_change(watch_phones_while_open(self.hub.clone())),
             )
+            .into_any_element()
+    }
+
+    /// Whether the attached phone's screen is off (it then streams nothing).
+    fn screen_off(&self, cx: &App) -> bool {
+        let (Some(hub), Some(udid)) = (self.hub.as_ref(), self.device(cx)) else { return false };
+        hub.read(cx).screen_off(&udid)
+    }
+
+    /// The phone's screen is off. OxiMux never wakes a phone by itself; the
+    /// user's click does.
+    fn render_screen_off(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
+        self.screen()
+            .items_center()
+            .justify_center()
+            .gap(px(density.pad_panel))
+            .child(self.text("The phone's screen is off.", ty.t_body_md, theme.fg_muted))
+            // Waking shows the lock screen, which sleeps again in seconds.
+            .child(self.text("Wake it, then unlock the phone.", ty.t_body_sm, theme.fg_subtle))
+            .child(Button::new("sim-wake").outline().small().label("Wake").on_click(cx.listener(|this, _, _window, cx| {
+                if let (Some(hub), Some(udid)) = (this.hub.clone(), this.device(cx)) {
+                    hub.update(cx, |hub, cx| hub.wake_screen(&udid, cx));
+                }
+            })))
             .into_any_element()
     }
 

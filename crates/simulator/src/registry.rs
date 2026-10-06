@@ -63,6 +63,12 @@ impl WorktreeKey {
     }
 }
 
+/// Why a real device's stream ended when the device itself went away.
+const UNPLUGGED: &str = "The phone was unplugged. Plug it back in, then Reconnect.";
+/// Why a real device's stream ended while the device is still there (its
+/// USB connection reset, the stream server died).
+const DROPPED: &str = "The connection to the phone dropped. Reconnect to stream again.";
+
 /// Monotonic id of one boot or session attempt.
 pub type Generation = u64;
 
@@ -432,7 +438,9 @@ impl<S: Clone> Registry<S> {
 
     /// The session for `generation` ended (helper exited). One automatic
     /// restart while the device is still booted and attached; after that the
-    /// panel shows Disconnected and waits for the user.
+    /// panel shows Disconnected and waits for the user. A real device is
+    /// never restarted behind the user's back (an unplug ends a session too):
+    /// it shows Disconnected at once, and Reconnect brings it back.
     pub fn session_exited(&mut self, udid: &DeviceId, generation: Generation, still_booted: bool, reason: String) -> Vec<Effect<S>> {
         let next = self.bump();
         let Some(device) = self.devices.get_mut(udid) else { return Vec::new() };
@@ -445,10 +453,21 @@ impl<S: Clone> Registry<S> {
             .map(|session| Effect::StopSession { udid: udid.clone(), session })
             .into_iter()
             .collect();
-        if still_booted && !device.attached.is_empty() && device.restarts == 0 {
+        if still_booted && !device.attached.is_empty() && device.restarts == 0 && !udid.is_physical() {
             device.restarts += 1;
             device.phase = Phase::Starting { generation: next };
             effects.push(Effect::StartSession { udid: udid.clone(), generation: next });
+        } else if udid.is_physical() {
+            // A connection that just ended says so in words for a person; any
+            // other failure (a decoder, an OEM encoder) keeps its own.
+            let reason = if !still_booted {
+                UNPLUGGED.into()
+            } else if reason == crate::android::session::STREAM_DROPPED {
+                DROPPED.into()
+            } else {
+                reason
+            };
+            device.phase = Phase::Disconnected { reason };
         } else {
             device.phase = Phase::Disconnected { reason };
         }
@@ -505,7 +524,13 @@ impl<S: Clone> Registry<S> {
             effects.push(Effect::StopSession { udid: udid.clone(), session });
         }
         if matches!(device.phase, Phase::Live { .. } | Phase::Starting { .. } | Phase::Parked) {
-            device.phase = Phase::Disconnected { reason: "The device shut down.".into() };
+            // A real device is never shut down from here: it went away.
+            let reason = if udid.is_physical() { UNPLUGGED } else { "The device shut down." };
+            device.phase = Phase::Disconnected { reason: reason.into() };
+        } else if udid.is_physical() && device.phase == (Phase::Disconnected { reason: DROPPED.into() }) {
+            // The stream's end beat the watcher to it: the phone is gone, not
+            // just its connection.
+            device.phase = Phase::Disconnected { reason: UNPLUGGED.into() };
         }
         if was_owned {
             effects.push(Effect::Persist);
@@ -533,7 +558,10 @@ impl<S: Clone> Registry<S> {
                 listed.contains(&udid.source())
                     && !booted.contains(*udid)
                     && !matches!(d.phase, Phase::Booting { .. })
-                    && (d.owned || matches!(d.phase, Phase::Live { .. } | Phase::Starting { .. } | Phase::Parked))
+                    && (d.owned
+                        || matches!(d.phase, Phase::Live { .. } | Phase::Starting { .. } | Phase::Parked)
+                        // A dropped phone the watcher now sees gone: unplugged.
+                        || d.phase == (Phase::Disconnected { reason: DROPPED.into() }))
             })
             .map(|(u, _)| u.clone())
             .collect();

@@ -103,6 +103,8 @@ fn new_hub(
         boot_claims: HashSet::new(),
         android_sdk: None,
         phone_watch_until: None,
+        screen_off: HashSet::new(),
+        android_phones_only: false,
         physical_used: false,
         phone_states: None,
     })
@@ -235,6 +237,7 @@ fn spawn_tick(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 hub.run(effects, cx);
                 hub.reap_recordings(cx);
                 hub.expire_consent(cx);
+                hub.recheck_android_sdk(cx);
             });
             if alive.is_err() {
                 return;
@@ -274,10 +277,12 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 // Phones are watched (every adb state) only while they matter:
                 // a device menu is open, or a real device was attached.
                 let phones = hub.android_sdk.clone().filter(|_| hub.watching_phones());
+                // A streaming phone's screen: a sleeping one sends nothing.
+                let screens = hub.android_sdk.clone().map(|sdk| (sdk, hub.screens_to_watch()));
                 let sdk = hub.android_sdk.clone().filter(|_| android_in_use);
-                Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk, phones))
+                Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk, (phones, screens)))
             });
-            let (runner, listed_at, xcode_ok, sdk, phones) = match gate {
+            let (runner, listed_at, xcode_ok, sdk, (phones, screens)) = match gate {
                 Ok(Some(gate)) => gate,
                 Ok(None) => continue,
                 Err(_) => return, // the hub is gone
@@ -288,18 +293,22 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
             // The `simctl list` runs with no lock held: the UI thread reads
             // the watch state (reconnect, helper exit) and must never wait on
             // CoreSimulator.
-            let (listed, phones) = cx
+            let (listed, phones, screens) = cx
                 .background_executor()
                 .spawn(async move {
                     let phones = phones.and_then(|sdk| super::android::phone_states(runner.as_ref(), &sdk));
-                    (super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref()), phones)
+                    let screens = screens.map(|(sdk, watched)| super::android::screens_awake(runner.as_ref(), &sdk, watched));
+                    (super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref()), phones, screens)
                 })
                 .await;
-            if let Some(phones) = phones {
-                let alive = hub.update(cx, |hub, cx| hub.observe_phones(phones, cx));
-                if alive.is_err() {
-                    return;
+            let alive = hub.update(cx, |hub, cx| {
+                if let Some(phones) = phones {
+                    hub.observe_phones(phones, cx);
                 }
+                hub.observe_screens(screens.unwrap_or_default(), cx);
+            });
+            if alive.is_err() {
+                return;
             }
             let booted = match listed {
                 Ok(booted) => booted,

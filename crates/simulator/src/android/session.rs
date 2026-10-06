@@ -116,7 +116,7 @@ impl AndroidSession {
                 return Err(e);
             }
         };
-        let scrcpy_server::Connection { mut video, control, server, .. } = conn;
+        let scrcpy_server::Connection { mut video, control, server, log, .. } = conn;
         // Until the session owns them, a failure stops the server and drops
         // the forward.
         let mut pending = Pending { server: Some(server), adb: adb.to_path_buf(), serial: serial.to_owned(), port };
@@ -150,6 +150,20 @@ impl AndroidSession {
         });
         // The guard first: if the reader cannot start, dropping it stops all.
         let guard = Arc::new(Guard(Arc::clone(&inner)));
+        if let Some(log) = log {
+            // Drained for the server's life; a refused injection is told once.
+            let told = Arc::downgrade(&inner);
+            std::thread::Builder::new().name(format!("oximux-android-log-{}", inner.serial)).spawn(move || {
+                super::server_log::drain(log, || {
+                    if let Some(inner) = told.upgrade() {
+                        if let Some(tx) = inner.events_tx.lock().unwrap().as_ref() {
+                            let _ = tx.send(SessionEvent::Error(super::server_log::INPUT_BLOCKED.into()));
+                        }
+                        wake(&inner);
+                    }
+                });
+            })?;
+        }
         let reader = Arc::clone(&inner);
         std::thread::Builder::new().name(format!("oximux-android-video-{}", inner.serial)).spawn(move || read_loop(reader, video))?;
         Ok(Self { inner, _guard: guard })
@@ -321,6 +335,15 @@ impl AndroidSession {
     }
 }
 
+/// A session's fatal reason when the connection itself ended (not a decoder
+/// or server failure, whose own words are kept).
+pub const STREAM_DROPPED: &str = "the connection to the phone dropped";
+
+fn is_transport_end(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+    matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe)
+}
+
 fn orientation_of(size: Option<(u32, u32)>, requested: Option<Orientation>) -> Orientation {
     let landscape = size.is_some_and(|(w, h)| w > h);
     match requested {
@@ -342,6 +365,12 @@ fn read_loop(inner: Arc<Inner>, mut video: TcpStream) {
     let failure = loop {
         let event = match scrcpy_video::read_event(&mut video) {
             Ok(event) => event,
+            // The device's end went away (unplugged, adb reset): no detail
+            // for a person in "failed to fill whole buffer".
+            Err(SimError::Io(e)) if is_transport_end(&e) => {
+                tracing::debug!("android video: {e}");
+                break STREAM_DROPPED.to_owned();
+            }
             Err(e) => break e.to_string(),
         };
         match event {
@@ -401,7 +430,7 @@ fn read_loop(inner: Arc<Inner>, mut video: TcpStream) {
     let closing = inner.closing.load(Ordering::Acquire);
     inner.view.lock().unwrap().exited = Some(None);
     *inner.control.lock().unwrap() = None;
-    let fatal = (!closing).then(|| format!("the Android stream ended: {failure}"));
+    let fatal = (!closing).then(|| if failure == STREAM_DROPPED { failure } else { format!("the Android stream ended: {failure}") });
     emit(SessionEvent::Exited { code: None, fatal });
     *inner.events_tx.lock().unwrap() = None;
 }
