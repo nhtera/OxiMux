@@ -245,10 +245,11 @@ impl SimulatorHub {
 
     /// The phone watch's latest view. A change — a phone plugged in,
     /// unplugged, or approving this Mac — refreshes the device list and says
-    /// so; the first view is only a baseline.
+    /// so. So does the first view: the list may predate a phone plugged in
+    /// before anything watched.
     pub(super) fn observe_phones(&mut self, now: BTreeMap<String, AdbState>, cx: &mut Context<Self>) {
         let before = self.phone_states.replace(now);
-        if before.is_some_and(|before| Some(&before) != self.phone_states.as_ref()) {
+        if before.is_none_or(|before| Some(&before) != self.phone_states.as_ref()) {
             tracing::info!("phone watch: a phone was plugged in, unplugged or approved");
             self.refresh_devices(cx);
             cx.emit(HubEvent::PhysicalChanged);
@@ -356,9 +357,10 @@ mod tests {
         });
     }
 
-    /// The phone watch: its first view is a baseline; a phone approving this
-    /// Mac (unauthorized → device), or being unplugged, is news — the device
-    /// list refreshes and panels hear of it — and an unchanged view is not.
+    /// The phone watch: its first view refreshes the device list (a phone may
+    /// have been plugged in before anything watched); a phone approving this
+    /// Mac (unauthorized → device), or being unplugged, is news too; an
+    /// unchanged view is not.
     #[gpui::test]
     fn a_phone_approving_this_mac_refreshes_the_device_list(cx: &mut gpui::TestAppContext) {
         use oximux_simulator::android::adb::AdbState;
@@ -391,7 +393,7 @@ mod tests {
             hub.phone_watch_until = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
             assert!(!hub.watching_phones(), "the lease ran out");
         });
-        assert_eq!(changes.get(), 2, "approved, then unplugged");
+        assert_eq!(changes.get(), 3, "first seen, approved, then unplugged");
     }
 
     #[test]
