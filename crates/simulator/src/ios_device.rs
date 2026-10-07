@@ -11,6 +11,8 @@
 //! [`HelperKind::DeviceCapture`]: crate::helper::HelperKind::DeviceCapture
 
 #[cfg(target_os = "macos")]
+pub mod runner_build;
+#[cfg(target_os = "macos")]
 pub mod runner_client;
 #[cfg(target_os = "macos")]
 pub mod team;
