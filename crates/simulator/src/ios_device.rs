@@ -15,6 +15,8 @@ pub mod runner_build;
 #[cfg(target_os = "macos")]
 pub mod runner_client;
 #[cfg(target_os = "macos")]
+pub mod runner_supervisor;
+#[cfg(target_os = "macos")]
 pub mod team;
 #[cfg(target_os = "macos")]
 pub mod usbmux;
