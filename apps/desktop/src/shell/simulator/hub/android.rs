@@ -36,13 +36,15 @@ pub(crate) fn list_all(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Option
 }
 
 /// [`list_all`], and whether `simctl` answered (so the listing holds every
-/// iOS simulator there is, not none because that side failed).
+/// iOS simulator there is, not none because that side failed). Real iPhones
+/// (`devicectl`, with Xcode) come last; their side failing hides only them.
 pub(crate) fn list_sides(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Option<&Sdk>, timeout: Duration) -> Result<(Vec<DeviceInfo>, bool)> {
     // Side by side: a slow adb must not hold up the simulators.
-    let (ios, android) = std::thread::scope(|scope| {
+    let (ios, android, iphones) = std::thread::scope(|scope| {
         let android = scope.spawn(|| sdk.map(|sdk| devices::list(runner, sdk, devices::avd_home().as_deref(), timeout)));
+        let iphones = scope.spawn(|| xcode_ok.then(|| super::iphone::list(runner)).flatten());
         let ios = xcode_ok.then(|| simctl::list_devices(runner, timeout));
-        (ios, android.join().unwrap_or(None))
+        (ios, android.join().unwrap_or(None), iphones.join().unwrap_or(None))
     });
     match (ios, android) {
         (None, None) => Ok((Vec::new(), false)),
@@ -52,6 +54,7 @@ pub(crate) fn list_sides(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Opti
             let ios_ok = ios.is_some();
             let mut all = ios.unwrap_or_default();
             all.extend(android.and_then(|r| r.inspect_err(|e| tracing::debug!("Android listing: {e}")).ok()).unwrap_or_default());
+            all.extend(iphones.unwrap_or_default());
             Ok((all, ios_ok))
         }
     }

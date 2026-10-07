@@ -33,6 +33,7 @@ use crate::platform::window_registry;
 use crate::workspace_root::WorkspaceRoot;
 
 mod android;
+mod iphone;
 mod verbs;
 
 /// `simctl` listing timeout.

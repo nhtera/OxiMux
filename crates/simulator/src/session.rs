@@ -12,7 +12,8 @@
 //!   (the simulator drops keys sent back-to-back).
 //!
 //! Dropping the session closes stdin, which is the helper's signal to exit;
-//! a helper that has not exited a second later is killed. Neither `Drop`
+//! a helper that has not exited a second later is killed (twelve, for a
+//! capture helper that may be finishing a movie: `HelperKind::exit_grace`). Neither `Drop`
 //! nor [`HelperSession::shutdown`] waits for that.
 
 pub use crate::stream::{FrameData, StreamSession};
@@ -21,7 +22,6 @@ mod video;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,15 +30,12 @@ use base64::Engine as _;
 use serde_json::Value;
 
 use crate::child_ledger::{Entry, Kind, Ledger};
-use crate::helper::{self, Handshake, Hello, HelperOptions};
+use crate::helper::{self, Handshake, Hello, HelperChild, HelperKind, HelperOptions};
 use crate::protocol::{self, AVCC_MIN_VERSION, Command, Event, Outbound, StreamFormat};
 use crate::{DeviceId, Orientation, Result, SimError};
 
 /// Pause between consecutive key commands.
 pub const KEY_PACING: Duration = Duration::from_millis(4);
-
-/// How long a closed helper gets to exit before it is killed.
-const EXIT_GRACE: Duration = Duration::from_secs(1);
 
 /// Something the UI should react to. Frames are not events: poll
 /// [`HelperSession::latest_frame`] when woken.
@@ -72,6 +69,9 @@ struct View {
     size: Option<(u32, u32)>,
     orientation: Option<Orientation>,
     exited: Option<Option<i32>>,
+    /// Capture helper: a movie it finalized on its way out (an unplug in
+    /// the middle of a recording), from its `recorded` event.
+    recorded: Option<std::path::PathBuf>,
 }
 
 struct Inner {
@@ -93,8 +93,9 @@ struct Inner {
     wake: RwLock<Option<Wake>>,
     events: Mutex<Option<mpsc::Receiver<SessionEvent>>>,
     writer: Mutex<Option<mpsc::Sender<WriteReq>>>,
-    child: Mutex<Child>,
+    child: Mutex<HelperChild>,
     ledger: Option<Arc<Ledger>>,
+    kind: HelperKind,
 }
 
 /// A running helper streaming one device. Cheap to clone; when the last
@@ -125,7 +126,7 @@ impl HelperSession {
     /// [`start`](Self::start) with an explicit argument list — for the
     /// helper's `--conformance` mode in tests, which has no device.
     pub fn start_with_args(path: &Path, args: &[String], udid: &DeviceId, opts: &HelperOptions) -> Result<Self> {
-        let spawned = helper::spawn(path, args, opts.log_path.as_deref())?;
+        let spawned = helper::spawn_kind(opts.kind, path, args, opts.log_path.as_deref())?;
         let mut child = spawned.child;
         let pid = child.id();
         // Recorded before the handshake: a crash while waiting for `ready`
@@ -144,7 +145,7 @@ impl HelperSession {
             }
         }
         // Any failure from here on must not leave the helper running.
-        let abandon = |child: &mut Child, e: SimError| {
+        let abandon = |child: &mut HelperChild, e: SimError| {
             let _ = child.kill();
             let _ = child.wait();
             forget(opts.ledger.as_deref(), pid);
@@ -158,7 +159,8 @@ impl HelperSession {
         {
             return Err(abandon(&mut child, e.into()));
         }
-        let (hello, early) = match Handshake::run(&rx, true, helper::HANDSHAKE_TIMEOUT) {
+        let cancel = opts.cancel.as_deref();
+        let (hello, early) = match Handshake::run_with(&rx, true, helper::HANDSHAKE_TIMEOUT, opts.kind.ready_timeout(), cancel) {
             Ok(done) => done,
             Err(e) => return Err(abandon(&mut child, e)),
         };
@@ -177,7 +179,11 @@ impl HelperSession {
             udid: udid.clone(),
             pid,
             hello,
-            view: Mutex::new(View { orientation: Some(opts.orientation), ..View::default() }),
+            // A phone is shown as it is held: never rotated here.
+            view: Mutex::new(View {
+                orientation: Some(if opts.kind == HelperKind::DeviceCapture { Orientation::Portrait } else { opts.orientation }),
+                ..View::default()
+            }),
             frame_seq: AtomicU64::new(0),
             format_requests: AtomicU64::new(0),
             video_dropped: std::sync::atomic::AtomicBool::new(false),
@@ -188,6 +194,7 @@ impl HelperSession {
             writer: Mutex::new(Some(writer_tx)),
             child: Mutex::new(child),
             ledger: opts.ledger.clone(),
+            kind: opts.kind,
         });
         let (video_tx, video_rx) = mpsc::sync_channel(video::QUEUE);
         let decoder = Arc::clone(&inner);
@@ -224,6 +231,11 @@ impl HelperSession {
     /// The helper's self-description from its `hello`.
     pub fn hello(&self) -> &Hello {
         &self.inner.hello
+    }
+
+    /// Which helper this is (a simulator's, or a real iPhone's capture).
+    pub fn kind(&self) -> HelperKind {
+        self.inner.kind
     }
 
     /// Called (from a session thread) after every new frame and event. Keep it
@@ -270,6 +282,11 @@ impl HelperSession {
     /// `Some(code)` once the helper has exited.
     pub fn exited(&self) -> Option<Option<i32>> {
         self.inner.view.lock().unwrap().exited
+    }
+
+    /// Capture helper: the movie it finalized as it ended, if it did.
+    pub fn recorded(&self) -> Option<std::path::PathBuf> {
+        self.inner.view.lock().unwrap().recorded.clone()
     }
 
     /// Fire-and-forget input (touch, key, button, scroll, pause/resume). Key
@@ -343,6 +360,19 @@ impl HelperSession {
         self.request(&command, timeout).map(drop)
     }
 
+    /// Capture helper: start recording the screen into `path` (a `.mov` in
+    /// a folder that exists).
+    pub fn record_start(&self, path: &Path, timeout: Duration) -> Result<()> {
+        let path = path.to_str().ok_or_else(|| SimError::Unsupported("the recording's path is not UTF-8".into()))?;
+        self.request(&Command::RecordStart { path: path.to_owned() }, timeout).map(drop)
+    }
+
+    /// Capture helper: finish the recording; its length in milliseconds.
+    pub fn record_stop(&self, timeout: Duration) -> Result<u64> {
+        let reply = self.request(&Command::RecordStop, timeout)?;
+        Ok(reply.get("duration_ms").and_then(Value::as_u64).unwrap_or(0))
+    }
+
     /// A full-resolution PNG of the screen, rotated like the stream.
     pub fn screenshot_png(&self, timeout: Duration) -> Result<Vec<u8>> {
         let reply = self.request(&Command::Screenshot, timeout)?;
@@ -375,7 +405,7 @@ fn shutdown(inner: &Arc<Inner>) {
     let inner = Arc::clone(inner);
     let _ = std::thread::Builder::new()
         .name("oximux-sim-reaper".into())
-        .spawn(move || reap(&inner.child, EXIT_GRACE));
+        .spawn(move || reap(&inner.child, inner.kind.exit_grace()));
 }
 
 /// How long a killed helper may take to be reaped. A process wedged in
@@ -386,7 +416,7 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Wait up to `grace` for the helper to exit, then kill it and wait up to
 /// [`KILL_GRACE`] more. Returns its exit code (`None` when killed by a signal
 /// or unreapable). Never holds the lock while sleeping.
-fn reap(child: &Mutex<Child>, grace: Duration) -> Option<i32> {
+fn reap(child: &Mutex<HelperChild>, grace: Duration) -> Option<i32> {
     let deadline = Instant::now() + grace;
     let mut killed_at: Option<Instant> = None;
     loop {
@@ -411,7 +441,7 @@ fn reap(child: &Mutex<Child>, grace: Duration) -> Option<i32> {
     }
 }
 
-fn write_loop(mut stdin: std::process::ChildStdin, rx: mpsc::Receiver<WriteReq>) {
+fn write_loop(mut stdin: Box<dyn std::io::Write + Send>, rx: mpsc::Receiver<WriteReq>) {
     use std::io::Write as _;
     for (bytes, pace) in rx {
         if stdin.write_all(&bytes).and_then(|()| stdin.flush()).is_err() {
@@ -461,6 +491,10 @@ fn dispatch_loop(
                     inner.view.lock().unwrap().size = Some((width, height));
                     let _ = events.send(SessionEvent::Size { width, height });
                 }
+                // A phone's frames already show it the way it is held (and
+                // `size` follows): to us it is always "portrait", so display
+                // and screen coordinates are one and the same.
+                Event::Orientation(_) if inner.kind == HelperKind::DeviceCapture => continue,
                 Event::Orientation(o) => {
                     inner.view.lock().unwrap().orientation = Some(o);
                     let _ = events.send(SessionEvent::Orientation(o));
@@ -473,6 +507,12 @@ fn dispatch_loop(
                 }
                 Event::Fatal { message, .. } => fatal = Some(message),
                 Event::Unknown(value) => {
+                    if inner.kind == HelperKind::DeviceCapture
+                        && value.get("event").and_then(Value::as_str) == Some("recorded")
+                        && let Some(path) = value.get("path").and_then(Value::as_str)
+                    {
+                        inner.view.lock().unwrap().recorded = Some(path.into());
+                    }
                     let _ = events.send(SessionEvent::Unknown(value));
                 }
                 Event::Malformed(why) => {
@@ -494,7 +534,7 @@ fn dispatch_loop(
     // waiting request now, refuse new ones, and stop accepting writes.
     inner.pending.lock().unwrap().take();
     inner.writer.lock().unwrap().take();
-    let code = reap(&inner.child, EXIT_GRACE);
+    let code = reap(&inner.child, inner.kind.exit_grace());
     forget(inner.ledger.as_deref(), inner.pid);
     inner.view.lock().unwrap().exited = Some(code);
     let _ = events.send(SessionEvent::Exited { code, fatal });

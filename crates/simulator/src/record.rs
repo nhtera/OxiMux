@@ -15,6 +15,12 @@
 //! reach it — so stopping sends `pkill -INT screenrecord` over adb, waits for
 //! the recorder to exit, then pulls the movie and deletes it from the device.
 //! Android caps a recording at [`ANDROID_MAX_LENGTH`].
+//!
+//! A real iPhone: its capture helper records what it streams
+//! (`record_start` / `record_stop`). It is a process of its own as far as
+//! macOS privacy goes, so it writes into OxiMux's own folder — never the
+//! Desktop, which would ask it for access — and the finished movie is moved
+//! to where the user's recordings go.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -22,6 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::child_ledger::{Entry, Kind, Ledger};
+use crate::ios_device::DeviceSession;
 use crate::runner::Runner;
 use crate::{DeviceId, Result, SimError};
 
@@ -85,12 +92,24 @@ pub fn simctl_path(runner: &dyn Runner, timeout: Duration) -> Result<PathBuf> {
 
 /// A recording in progress.
 pub struct Recording {
-    child: Child,
+    /// The recorder process (`None` for an iPhone, whose helper records).
+    child: Option<Child>,
     pub path: PathBuf,
     pub started: Instant,
     ledger: Option<Arc<Ledger>>,
     android: Option<OnDevice>,
+    capture: Option<Capture>,
 }
+
+/// An iPhone recording: its helper writes `staging`, moved to `path` when
+/// finished.
+struct Capture {
+    session: DeviceSession,
+    staging: PathBuf,
+}
+
+/// How long the capture helper may take to start or finalize a movie.
+const CAPTURE_REPLY: Duration = Duration::from_secs(15);
 
 impl Recording {
     /// Start recording `udid` into `path` (overwritten if present).
@@ -134,6 +153,24 @@ impl Recording {
         Ok(recording)
     }
 
+    /// Start recording a real iPhone through its capture helper, into
+    /// `staging_dir` until it is finished (then it moves to `path`).
+    /// Blocking: waits for the helper's answer.
+    pub fn start_capture(session: DeviceSession, staging_dir: &Path, path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(staging_dir)?;
+        let name = path.file_name().ok_or_else(|| SimError::Unsupported("a recording needs a file name".into()))?;
+        let staging = staging_dir.join(name);
+        session.record_start(&staging, CAPTURE_REPLY)?;
+        Ok(Self {
+            child: None,
+            path: path.to_path_buf(),
+            started: Instant::now(),
+            ledger: None,
+            android: None,
+            capture: Some(Capture { session, staging }),
+        })
+    }
+
     fn spawn(exe: &Path, args: &[&str], udid: &DeviceId, path: &Path, ledger: Option<Arc<Ledger>>) -> Result<Self> {
         let child = Command::new(exe)
             .args(args)
@@ -159,30 +196,39 @@ impl Recording {
                 tracing::warn!("could not record the screen recording in the child ledger: {e}");
             }
         }
-        Self { child, path: path.to_path_buf(), started: Instant::now(), ledger, android: None }
+        Self { child: Some(child), path: path.to_path_buf(), started: Instant::now(), ledger, android: None, capture: None }
     }
 
+    /// The recorder process's id (0 for an iPhone's, recorded by its helper).
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().map_or(0, Child::id)
     }
 
-    /// Whether `simctl` is still running (it exits on its own when the
-    /// device shuts down).
+    /// Whether the recorder is still running (`simctl` exits on its own when
+    /// the device shuts down; an iPhone's helper, when it is unplugged).
     pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        match (&mut self.child, &self.capture) {
+            (Some(child), _) => matches!(child.try_wait(), Ok(None)),
+            (None, Some(capture)) => capture.session.video().exited().is_none(),
+            (None, None) => false,
+        }
     }
 
     /// Interrupt, wait up to `grace` for the movie to be finalized, then kill.
     /// Blocking: call from a background thread (or at quit). Returns the movie
     /// when `simctl` finished cleanly.
     pub fn stop(mut self, grace: Duration) -> Result<PathBuf> {
-        let pid = self.child.id();
+        if let Some(capture) = self.capture.take() {
+            return finish_capture(&capture, &self.path);
+        }
+        let Some(mut child) = self.child.take() else { return Err(SimError::Unsupported("nothing was recording".into())) };
+        let pid = child.id();
         if let Some(device) = &self.android {
             // The recorder runs on the device: interrupt it there.
             device.interrupt();
         }
         #[cfg(unix)]
-        if self.android.is_none() && matches!(self.child.try_wait(), Ok(None)) {
+        if self.android.is_none() && matches!(child.try_wait(), Ok(None)) {
             // SAFETY: plain kill(2) on our own child's pid, which we have not
             // reaped yet, so it cannot have been recycled.
             unsafe {
@@ -191,12 +237,12 @@ impl Recording {
         }
         let deadline = Instant::now() + grace;
         let status = loop {
-            match self.child.try_wait() {
+            match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
                 _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    let _ = child.kill();
+                    let _ = child.wait();
                     break None;
                 }
             }
@@ -226,6 +272,35 @@ impl Recording {
     }
 }
 
+/// Have the iPhone's helper finish the movie, then move it home. A helper
+/// that is ending (the phone unplugged, its session closed) finishes the
+/// movie on its way out and says so (`recorded`): wait for that instead.
+fn finish_capture(capture: &Capture, path: &Path) -> Result<PathBuf> {
+    if let Err(e) = capture.session.record_stop(CAPTURE_REPLY) {
+        let video = capture.session.video();
+        let deadline = Instant::now() + video.kind().exit_grace();
+        while video.exited().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // One recording per helper: a movie it reports is this one.
+        if video.recorded().is_none() || !capture.staging.exists() {
+            return Err(e);
+        }
+    }
+    move_file(&capture.staging, path)?;
+    Ok(path.to_path_buf())
+}
+
+/// `rename`, or copy and delete when `to` is on another volume.
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
 /// Bring an Android movie home and delete it from the device.
 fn pull(device: &OnDevice, path: &Path) -> Result<PathBuf> {
     // screenrecord closes the file a moment after it exits.
@@ -245,11 +320,14 @@ impl Drop for Recording {
         if let Some(device) = self.android.take() {
             let _ = std::thread::Builder::new().name("oximux-screenrecord-stop".into()).spawn(move || device.discard());
         }
+        // An iPhone's helper finalizes the movie itself when it exits.
         #[cfg(unix)]
-        if matches!(self.child.try_wait(), Ok(None)) {
+        if let Some(child) = self.child.as_mut()
+            && matches!(child.try_wait(), Ok(None))
+        {
             // SAFETY: kill(2) on our own unreaped child.
             unsafe {
-                libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
+                libc::kill(child.id() as libc::pid_t, libc::SIGINT);
             }
         }
     }
@@ -286,6 +364,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         let err = rec.stop(Duration::from_millis(300)).unwrap_err();
         assert!(matches!(err, SimError::Timeout { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_finished_movie_moves_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("staging.mov"), dir.path().join("home.mov"));
+        std::fs::write(&from, b"movie").unwrap();
+        move_file(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"movie");
+        assert!(!from.exists());
+        assert!(move_file(&from, &to).is_err(), "nothing left to move");
     }
 
     #[test]

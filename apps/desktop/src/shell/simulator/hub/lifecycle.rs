@@ -112,6 +112,8 @@ fn new_hub(
         wifi: Default::default(),
         physical_used: false,
         phone_states: None,
+        iphone_states: None,
+        capture_starts: Default::default(),
     })
 }
 
@@ -135,6 +137,11 @@ pub fn on_quit(cx: &mut App) {
         // Movies first: a recording killed by the device shutdown below would
         // be unplayable.
         hub.stop_recordings_blocking();
+        // A capture helper still in the Camera prompt is killed, prompt and
+        // all (the child ledger catches it next launch if we exit first).
+        for (_, cancel) in hub.capture_starts.drain() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
         let (sessions, owned) = hub.registry.quit();
         // Owned emulators by serial: the live sessions know theirs, a parked
         // one was seen by the watcher. No adb call on the quit path.
@@ -282,28 +289,37 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 // Phones are watched (every adb state) only while they matter:
                 // a device menu is open, or a real device was attached.
                 let phones = hub.android_sdk.clone().filter(|_| hub.watching_phones());
+                // So are real iPhones (`devicectl`, ~30 ms), with Xcode.
+                let iphones = xcode_ok && hub.watching_phones();
                 // A streaming phone's screen: a sleeping one sends nothing.
                 let screens = hub.android_sdk.clone().map(|sdk| (sdk, hub.screens_to_watch()));
                 let sdk = hub.android_sdk.clone().filter(|_| android_in_use);
-                Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk, (phones, screens)))
+                Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk, (phones, screens, iphones)))
             });
-            let (runner, listed_at, xcode_ok, sdk, (phones, screens)) = match gate {
+            let (runner, listed_at, xcode_ok, sdk, (phones, screens, iphones)) = match gate {
                 Ok(Some(gate)) => gate,
                 Ok(None) => continue,
                 Err(_) => return, // the hub is gone
             };
             // What this round lists: only those sources' devices can be read
-            // as shut down (never a real iPhone: `devicectl` is not polled).
-            let sources: Vec<Source> = [xcode_ok.then_some(Source::Simctl), sdk.is_some().then_some(Source::Adb)].into_iter().flatten().collect();
+            // as shut down. Real iPhones join below, only if `devicectl`
+            // answered: a round it missed says nothing about them.
+            let mut sources: Vec<Source> = [xcode_ok.then_some(Source::Simctl), sdk.is_some().then_some(Source::Adb)].into_iter().flatten().collect();
             // The `simctl list` runs with no lock held: the UI thread reads
             // the watch state (reconnect, helper exit) and must never wait on
             // CoreSimulator.
-            let (listed, phones, screens) = cx
+            let (listed, phones, screens, iphones) = cx
                 .background_executor()
                 .spawn(async move {
                     let phones = phones.and_then(|sdk| super::android::phone_states(runner.as_ref(), &sdk));
                     let screens = screens.map(|(sdk, watched)| super::android::screens_awake(runner.as_ref(), &sdk, watched));
-                    (super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref()), phones, screens)
+                    // Beside the rest: a slow CoreDevice must not hold up
+                    // simulator and unplug detection.
+                    std::thread::scope(|scope| {
+                        let iphones = scope.spawn(|| iphones.then(|| super::iphone::list(runner.as_ref())).flatten());
+                        let booted = super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref());
+                        (booted, phones, screens, iphones.join().unwrap_or(None))
+                    })
                 })
                 .await;
             let alive = hub.update(cx, |hub, cx| {
@@ -311,17 +327,26 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                     hub.observe_phones(phones, cx);
                 }
                 hub.observe_screens(screens.unwrap_or_default(), cx);
+                if let Some(iphones) = &iphones {
+                    hub.observe_iphones(super::iphone::states(iphones), cx);
+                }
             });
             if alive.is_err() {
                 return;
             }
-            let booted = match listed {
+            let mut booted = match listed {
                 Ok(booted) => booted,
                 Err(e) => {
                     tracing::debug!("simulator device watch: {e}");
                     continue;
                 }
             };
+            // A cabled, trusting iPhone is "booted"; one only on Wi-Fi is not
+            // (devicectl keeps listing a paired phone after it is unplugged).
+            if let Some(iphones) = &iphones {
+                sources.push(Source::Devicectl);
+                booted.extend(oximux_simulator::devicectl::connected(iphones).cloned());
+            }
             let alive = hub.update(cx, |hub, cx| {
                 let (events, newly_listed) = {
                     let mut watch = hub.watch.lock().unwrap();

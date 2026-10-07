@@ -204,8 +204,9 @@ mod tests {
             wake: RwLock::default(),
             events: Mutex::new(None),
             writer: Mutex::new(Some(tx)),
-            child: Mutex::new(child),
+            child: Mutex::new(crate::helper::HelperChild::Std(child)),
             ledger: None,
+            kind: crate::helper::HelperKind::Simulator,
         };
         (Arc::new(inner), rx)
     }

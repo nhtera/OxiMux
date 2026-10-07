@@ -80,6 +80,12 @@
 # and NO entitlements: it needs none (it only dlopens Apple-signed simulator
 # frameworks), and the app's entitlements must not leak onto a binary that
 # runs private-framework code.
+#
+# OxiMux Device Capture.app (Contents/Helpers/) streams a USB iPhone's screen.
+# Same release; signed as its own bundle with the hardened runtime and ONLY
+# the camera entitlement (assets/device-capture.entitlements): macOS shows
+# an iPhone's screen as a camera, and OxiMux spawns this app responsible for
+# itself, so that grant is never OxiMux's terminals' or agents'.
 
 set -euo pipefail
 
@@ -88,6 +94,8 @@ cd "$REPO_ROOT"
 
 APP_DIR="dist/OxiMux.app"
 ENTITLEMENTS="assets/OxiMux.entitlements"
+CAPTURE_ENTITLEMENTS="assets/device-capture.entitlements"
+CAPTURE_APP="OxiMux Device Capture.app"
 # Keychain profile name for notarytool credentials; override if you keep more
 # than one Apple account on this machine.
 NOTARY_PROFILE="${OXIMUX_NOTARY_PROFILE:-oximux-notary}"
@@ -178,6 +186,17 @@ sign_bundle() {
             helper_opts+=(--options runtime --timestamp)
         fi
         codesign "${helper_opts[@]}" "$APP_DIR/Contents/MacOS/oximux-sim-helper"
+    fi
+    # The iPhone capture app: its own bundle, signed with the camera
+    # entitlement and nothing else (an iPhone's screen is a camera to macOS;
+    # OxiMux spawns it responsible for itself, so the grant stays its own).
+    # A nested bundle, so it is sealed before the app around it.
+    if [[ -d "$APP_DIR/Contents/Helpers/$CAPTURE_APP" ]]; then
+        local capture_opts=(--force -s "$sign_id" --entitlements "$CAPTURE_ENTITLEMENTS")
+        if [[ "$HARDENED" -eq 1 ]]; then
+            capture_opts+=(--options runtime --timestamp)
+        fi
+        codesign "${capture_opts[@]}" "$APP_DIR/Contents/Helpers/$CAPTURE_APP"
     fi
     # Bundled third-party tools (rg) sign like our own helper binaries —
     # nested-first, before the bundle seal. Guarded: an older bundle refreshed
@@ -366,6 +385,18 @@ bundle_sim_helper() {
     cp -f "target/bundle-tools/oximux-sim-helper.LICENSE" \
         "$APP_DIR/Contents/Resources/licenses/serve-sim-LICENSE"
     echo "==> Bundled oximux-sim-helper"
+    bundle_capture_app
+}
+
+# The iPhone capture app (same release, same licence), into Contents/Helpers.
+bundle_capture_app() {
+    if [[ ! -d "target/bundle-tools/$CAPTURE_APP" ]]; then
+        return 0
+    fi
+    mkdir -p "$APP_DIR/Contents/Helpers"
+    rm -rf "$APP_DIR/Contents/Helpers/$CAPTURE_APP"
+    ditto "target/bundle-tools/$CAPTURE_APP" "$APP_DIR/Contents/Helpers/$CAPTURE_APP"
+    echo "==> Bundled $CAPTURE_APP"
 }
 
 # Fast path: refresh the bundled binary in place. Fail loudly if there
@@ -405,10 +436,12 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
     if [[ -f "target/bundle-tools/rg" ]]; then
         cp -f "target/bundle-tools/rg" "$APP_DIR/Contents/MacOS/rg"
     fi
-    # Same for the simulator helper: cache only, never the network.
+    # Same for the simulator helper and the capture app: cache only, never
+    # the network.
     if [[ -f "target/bundle-tools/oximux-sim-helper" ]]; then
         cp -f "target/bundle-tools/oximux-sim-helper" "$APP_DIR/Contents/MacOS/oximux-sim-helper"
     fi
+    bundle_capture_app
     # The fresh binary carries no rpath, so re-copy the dylibs + re-add it.
     bundle_dylibs debug
     sign_bundle
