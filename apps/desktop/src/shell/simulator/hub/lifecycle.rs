@@ -113,6 +113,7 @@ fn new_hub(
         physical_used: false,
         phone_states: None,
         iphone_states: None,
+        capture_starts: Default::default(),
     })
 }
 
@@ -307,8 +308,13 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 .spawn(async move {
                     let phones = phones.and_then(|sdk| super::android::phone_states(runner.as_ref(), &sdk));
                     let screens = screens.map(|(sdk, watched)| super::android::screens_awake(runner.as_ref(), &sdk, watched));
-                    let iphones = iphones.then(|| super::iphone::list(runner.as_ref())).flatten();
-                    (super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref()), phones, screens, iphones)
+                    // Beside the rest: a slow CoreDevice must not hold up
+                    // simulator and unplug detection.
+                    std::thread::scope(|scope| {
+                        let iphones = scope.spawn(|| iphones.then(|| super::iphone::list(runner.as_ref())).flatten());
+                        let booted = super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref());
+                        (booted, phones, screens, iphones.join().unwrap_or(None))
+                    })
                 })
                 .await;
             let alive = hub.update(cx, |hub, cx| {

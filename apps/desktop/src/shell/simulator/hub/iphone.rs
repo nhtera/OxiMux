@@ -5,6 +5,8 @@
 //! carried out, which is what this file owns.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::Context;
@@ -19,8 +21,13 @@ use oximux_simulator::{DeviceId, DeviceInfo, SimError, devicectl};
 
 use super::{CaptureKind, HubEvent, NoticeKind, SimulatorHub, capture_dir, capture_path, simulator_dir, stamp};
 
-/// `devicectl list devices` takes ~30 ms; this bounds a wedged CoreDevice.
-pub(super) const DEVICECTL_TIMEOUT: Duration = Duration::from_secs(10);
+/// `devicectl list devices` took 30 ms when measured (Xcode 26, one phone);
+/// this bounds a wedged CoreDevice. It runs beside the other listings, never
+/// in front of them.
+pub(super) const DEVICECTL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a cabled iPhone cannot be shown by this build: it has no capture app.
+pub const NO_CAPTURE_APP: &str = "This build of OxiMux cannot show an iPhone's screen yet";
 
 /// What the panel says when macOS keeps the camera from the capture helper
 /// (the panel offers to open the Camera settings beside it).
@@ -32,7 +39,16 @@ pub const DEVICE_BUSY: &str = "Another app is showing this iPhone's screen. Clos
 /// The real iPhones, for the device menu and the watcher. A failed listing
 /// is `None` (no news), never "every iPhone unplugged".
 pub(crate) fn list(runner: &dyn Runner) -> Option<Vec<DeviceInfo>> {
-    devicectl::list(runner, DEVICECTL_TIMEOUT).inspect_err(|e| tracing::debug!("iPhone listing: {e}")).ok()
+    let mut iphones = devicectl::list(runner, DEVICECTL_TIMEOUT).inspect_err(|e| tracing::debug!("iPhone listing: {e}")).ok()?;
+    // Without the capture app an iPhone is listed, never offered.
+    if matches!(availability::default_capture_probe(), HelperStatus::Missing(_)) {
+        for phone in iphones.iter_mut().filter(|p| p.is_available) {
+            phone.is_available = false;
+            phone.state = oximux_simulator::DeviceState::Other("Unavailable".into());
+            phone.note = Some(NO_CAPTURE_APP.into());
+        }
+    }
+    Some(iphones)
 }
 
 /// What the watcher compares between rounds: each iPhone's id and whether
@@ -73,7 +89,14 @@ impl SimulatorHub {
     /// is on the background executor, never here.
     pub(super) fn start_iphone_session(&mut self, udid: DeviceId, generation: Generation, cx: &mut Context<Self>) {
         let stream = crate::shell::simulator::panel::settings(cx).stream;
+        // One capture helper per phone: a start still waiting gives way.
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(older) = self.capture_starts.insert(udid.clone(), cancel.clone()) {
+            older.store(true, Ordering::Release);
+        }
+        let mine = cancel.clone();
         let opts = HelperOptions {
+            cancel: Some(cancel),
             kind: HelperKind::DeviceCapture,
             scale: f64::from(stream.effective_scale()),
             fps: f64::from(stream.fps),
@@ -100,9 +123,28 @@ impl SimulatorHub {
                         .map_err(|e| (start_error(&e), matches!(e, SimError::DeviceNotBooted)))
                 })
                 .await;
-            let _ = this.update(cx, |hub, cx| hub.finish_start(udid, generation, result, cx));
+            let _ = this.update(cx, |hub, cx| {
+                if hub.capture_starts.get(&udid).is_some_and(|c| Arc::ptr_eq(c, &mine)) {
+                    hub.capture_starts.remove(&udid);
+                }
+                hub.finish_start(udid, generation, result, cx);
+            });
         })
         .detach();
+    }
+
+    /// Give up the capture starts nobody waits for any more (detached,
+    /// reconnected, superseded): their helper is killed, and with it any
+    /// Camera prompt it raised.
+    pub(super) fn cancel_stale_capture_starts(&mut self) {
+        let registry = &self.registry;
+        self.capture_starts.retain(|udid, cancel| {
+            let wanted = matches!(registry.phase(udid), oximux_simulator::registry::Phase::Starting { .. });
+            if !wanted {
+                cancel.store(true, Ordering::Release);
+            }
+            wanted
+        });
     }
 
     /// Record a streaming iPhone through its capture helper. The movie is

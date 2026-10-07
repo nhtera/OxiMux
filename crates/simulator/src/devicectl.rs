@@ -164,6 +164,9 @@ struct RawHardware {
 }
 
 fn parse_list(bytes: &[u8]) -> Result<Vec<DeviceInfo>> {
+    // `--quiet` keeps stdout to the JSON; should a notice ever precede it,
+    // the JSON starts at its first brace.
+    let bytes = bytes.iter().position(|&b| b == b'{').map_or(bytes, |at| &bytes[at..]);
     let raw: Raw = serde_json::from_slice(bytes)
         .map_err(|e| SimError::Parse { what: "devicectl list devices".into(), detail: e.to_string() })?;
     // One row at a time: a row of a shape this build cannot read is skipped.
@@ -252,6 +255,7 @@ mod tests {
         assert_eq!((rows[0].name.as_str(), rows[0].runtime.as_str()), ("iPhone", "iOS"));
         assert_eq!(rows[1].name, "iPhone 17");
         assert!(parse_list(b"not json").is_err());
+        assert_eq!(parse_list(b"a notice first\n{\"result\":{\"devices\":[]}}").unwrap(), Vec::new());
         assert!(parse_list(b"{}").unwrap().is_empty());
     }
 
@@ -269,5 +273,57 @@ mod tests {
         assert!(hint("Developer Mode is disabled").unwrap().contains("Developer Mode"));
         assert!(hint("Unable to locate application com.x").unwrap().contains("not installed"));
         assert_eq!(hint("something else"), None);
+    }
+
+    #[test]
+    fn missing_fields_in_devicectl_response_are_handled_gracefully() {
+        // Test rows with missing optional fields still parse correctly
+        let json = br#"{"result":{"devices":[
+            {"hardwareProperties":{"reality":"physical","deviceType":"iPhone","udid":"0001"},"connectionProperties":{"transportType":"wired","pairingState":"paired"}},
+            {"hardwareProperties":{"reality":"physical","deviceType":"iPhone","udid":"0002"},"connectionProperties":{"transportType":"wired","pairingState":"paired"},"deviceProperties":{"name":"Named iPhone"}},
+            {"hardwareProperties":{"reality":"physical","deviceType":"iPhone","udid":"0003","marketingName":"iPhone 16"},"connectionProperties":{"transportType":"wired","pairingState":"paired"},"deviceProperties":{"osVersionNumber":"17.5"}}
+        ]}}"#;
+        let rows = parse_list(json).unwrap();
+        assert_eq!(rows.len(), 3);
+        // First device: minimal fields
+        assert_eq!(rows[0].name, "iPhone");
+        assert_eq!(rows[0].runtime, "iOS");
+        assert_eq!(rows[0].os_version, "");
+        // Second device: custom name
+        assert_eq!(rows[1].name, "Named iPhone");
+        // Third device: marketing name and OS version
+        assert_eq!(rows[2].name, "iPhone 16");
+        assert_eq!(rows[2].runtime, "iOS 17.5");
+    }
+
+    /// No transport (missing or null) means the phone is not around: no
+    /// row. An empty one is some transport, but not a cable.
+    #[test]
+    fn empty_or_null_transport_is_unavailable() {
+        let json = br#"{"result":{"devices":[
+            {"hardwareProperties":{"reality":"physical","deviceType":"iPhone","udid":"0004"},"connectionProperties":{"transportType":null,"pairingState":"paired"}},
+            {"hardwareProperties":{"reality":"physical","deviceType":"iPhone","udid":"0005"},"connectionProperties":{"transportType":"","pairingState":"paired"}},
+            {"hardwareProperties":{"reality":"physical","deviceType":"iPhone","udid":"0006"},"connectionProperties":{"pairingState":"paired"}}
+        ]}}"#;
+        let rows = parse_list(json).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].udid.as_str(), "iosdev:0005");
+        assert!(!rows[0].is_available);
+        assert_eq!(rows[0].note.as_deref(), Some(CONNECT_WITH_CABLE));
+    }
+
+    #[test]
+    fn is_udid_validates_hex_format() {
+        // Valid UDIDs
+        assert!(is_udid("00008130-000A1B2C3D4E5F60"));
+        assert!(is_udid("AAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"));
+        assert!(is_udid("0"));
+        assert!(is_udid("a"));
+        // Invalid: contains non-hex
+        assert!(!is_udid("0000ZZZZ"));
+        assert!(!is_udid(""));
+        assert!(!is_udid(&"x".repeat(65))); // too long
+        assert!(!is_udid("../escape"));
+        assert!(!is_udid("00 00 00 00")); // spaces
     }
 }

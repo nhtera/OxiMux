@@ -20,8 +20,8 @@ use crate::protocol::Command;
 use crate::session::HelperSession;
 use crate::{Result, SimError};
 
-/// What to do to use an iPhone with the mouse and keyboard.
-pub const ENABLE_CONTROL_HINT: &str = "enable control in the Mobile Emulator panel to use it from here";
+/// What to do instead, while OxiMux only shows an iPhone.
+pub const ENABLE_CONTROL_HINT: &str = "use the phone itself";
 
 #[derive(Clone)]
 pub struct DeviceSession {
@@ -116,6 +116,29 @@ mod tests {
         let rotate = Command::Configure { scale: None, fps: None, orientation: Some(Orientation::LandscapeLeft), format: None };
         let SimError::Unsupported(why) = refusal(&rotate, &udid) else { panic!() };
         assert!(why.starts_with("Rotation") && !why.contains(ENABLE_CONTROL_HINT), "{why}");
+    }
+
+    #[test]
+    fn all_input_commands_are_refused_on_view_only_iphone() {
+        let udid = DeviceId("iosdev:00008130-0002".into());
+        let commands = vec![
+            Command::Touch { phase: TouchPhase::Begin, x: 0.5, y: 0.5, edge: 0 },
+            Command::Multitouch { phase: TouchPhase::Begin, x1: 0.5, y1: 0.5, x2: 0.6, y2: 0.6 },
+            Command::Scroll { x: Some(0.5), y: Some(0.5), dx: 10.0, dy: 10.0 },
+            Command::Key { phase: crate::protocol::KeyPhase::Down, usage: 0 },
+            Command::Button { name: crate::Button::Home },
+        ];
+        for cmd in commands {
+            let err = refusal(&cmd, &udid);
+            assert!(matches!(err, SimError::Unsupported(_)));
+        }
+    }
+
+    #[test]
+    fn frontmost_is_refused_like_ax_describe() {
+        let udid = DeviceId("iosdev:00008130-0004".into());
+        let SimError::Unsupported(why) = refusal(&Command::AxFrontmost, &udid) else { panic!() };
+        assert!(why.starts_with("Accessibility"));
     }
 }
 

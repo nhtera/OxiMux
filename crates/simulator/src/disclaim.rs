@@ -292,4 +292,37 @@ mod tests {
     fn a_missing_program_is_an_error() {
         assert!(spawn(Path::new("/nonexistent/helper"), &[], &[], None).is_err());
     }
+
+    #[test]
+    fn nul_in_an_argument_is_rejected() {
+        let args = vec!["first\0second".to_owned()];
+        let result = spawn(Path::new("/bin/sh"), &args, &[], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nul_in_an_environment_variable_is_rejected() {
+        let env = vec![("KEY".to_owned(), std::ffi::OsString::from("val\0ue"))];
+        let result = spawn(Path::new("/bin/sh"), &[], &env, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nul_in_environment_key_is_rejected() {
+        let env = vec![("KE\0Y".to_owned(), std::ffi::OsString::from("value"))];
+        let result = spawn(Path::new("/bin/sh"), &[], &env, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_wait_on_exited_child_returns_status() {
+        use std::time::Duration;
+        let mut spawned = spawn(Path::new("/bin/sh"), &["-c".into(), "exit 0".into()], &[], None).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let first = spawned.child.try_wait().unwrap();
+        assert!(first.is_some());
+        // Asking again should return the cached status
+        let second = spawned.child.try_wait().unwrap();
+        assert!(second.is_some());
+    }
 }

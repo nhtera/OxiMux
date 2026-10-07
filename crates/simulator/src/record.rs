@@ -273,13 +273,19 @@ impl Recording {
 }
 
 /// Have the iPhone's helper finish the movie, then move it home. A helper
-/// that already ended (the phone unplugged) finalized it on its way out when
-/// it says so.
+/// that is ending (the phone unplugged, its session closed) finishes the
+/// movie on its way out and says so (`recorded`): wait for that instead.
 fn finish_capture(capture: &Capture, path: &Path) -> Result<PathBuf> {
-    if let Err(e) = capture.session.record_stop(CAPTURE_REPLY)
-        && capture.session.video().recorded().as_deref() != Some(capture.staging.as_path())
-    {
-        return Err(e);
+    if let Err(e) = capture.session.record_stop(CAPTURE_REPLY) {
+        let video = capture.session.video();
+        let deadline = Instant::now() + video.kind().exit_grace();
+        while video.exited().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // One recording per helper: a movie it reports is this one.
+        if video.recorded().is_none() || !capture.staging.exists() {
+            return Err(e);
+        }
     }
     move_file(&capture.staging, path)?;
     Ok(path.to_path_buf())

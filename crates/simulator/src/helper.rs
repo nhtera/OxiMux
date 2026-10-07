@@ -62,7 +62,19 @@ impl HelperKind {
             Self::DeviceCapture => CAPTURE_READY_TIMEOUT,
         }
     }
+
+    /// How long a closed helper gets to exit before it is killed: the
+    /// capture helper may be finishing a movie (it allows itself 10 s).
+    pub fn exit_grace(self) -> Duration {
+        match self {
+            Self::Simulator => Duration::from_secs(1),
+            Self::DeviceCapture => Duration::from_secs(12),
+        }
+    }
 }
+
+/// How often a wait for `ready` looks at its cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(250);
 
 /// Log files rotate past this size (one previous generation is kept).
 const LOG_ROTATE_BYTES: u64 = 1 << 20;
@@ -84,6 +96,9 @@ pub struct HelperOptions {
     /// if this process dies without cleaning up (see `child_ledger`).
     pub ledger: Option<std::sync::Arc<crate::child_ledger::Ledger>>,
     pub kind: HelperKind,
+    /// Set to give up waiting for `ready` (the user detached while the
+    /// capture helper sat in the Camera prompt): the helper is killed.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for HelperOptions {
@@ -97,6 +112,7 @@ impl Default for HelperOptions {
             log_path: None,
             ledger: None,
             kind: HelperKind::Simulator,
+            cancel: None,
         }
     }
 }
@@ -275,16 +291,18 @@ impl Handshake {
         wait_for_ready: bool,
         timeout: Duration,
     ) -> Result<(Hello, Vec<Outbound>)> {
-        Self::run_with(rx, wait_for_ready, timeout, timeout)
+        Self::run_with(rx, wait_for_ready, timeout, timeout, None)
     }
 
     /// [`run`](Self::run), with its own bound for `ready` (the capture helper
-    /// may wait in the Camera prompt: [`HelperKind::ready_timeout`]).
+    /// may wait in the Camera prompt: [`HelperKind::ready_timeout`]), given
+    /// up early once `cancel` is set ([`SimError::Cancelled`]).
     pub fn run_with(
         rx: &mpsc::Receiver<Result<Outbound>>,
         wait_for_ready: bool,
         timeout: Duration,
         ready_timeout: Duration,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(Hello, Vec<Outbound>)> {
         let hello = match Self::next(rx, timeout, "hello")? {
             Outbound::Event(Event::Hello { proto, version, xcode }) => {
@@ -299,8 +317,21 @@ impl Handshake {
         if !wait_for_ready {
             return Ok((hello, rest));
         }
+        let deadline = std::time::Instant::now() + ready_timeout;
         loop {
-            match Self::next(rx, ready_timeout, "ready")? {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            // In slices, to notice a cancel.
+            let message = match Self::next(rx, left.min(CANCEL_POLL), "ready") {
+                Err(SimError::Timeout { .. }) if !left.is_zero() => {
+                    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+                        return Err(SimError::Cancelled);
+                    }
+                    continue;
+                }
+                Err(SimError::Timeout { what, .. }) => return Err(SimError::Timeout { what, secs: ready_timeout.as_secs() }),
+                other => other?,
+            };
+            match message {
                 Outbound::Event(Event::Ready { .. }) => return Ok((hello, rest)),
                 Outbound::Event(Event::Fatal { reason, message }) => return Err(fatal_error(reason, message)),
                 other => rest.push(other),
@@ -441,8 +472,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(80));
             tx.send(Ok(Outbound::Event(Event::Ready { udid: "U".into(), pid: 1, orientation: None }))).unwrap();
         });
-        assert!(Handshake::run_with(&rx, true, Duration::from_millis(20), Duration::from_secs(5)).is_ok());
+        assert!(Handshake::run_with(&rx, true, Duration::from_millis(20), Duration::from_secs(5), None).is_ok());
         late.join().unwrap();
+    }
+
+    #[test]
+    fn a_wait_for_ready_can_be_given_up() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(hello(PROTOCOL_VERSION))).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        let err = Handshake::run_with(&rx, true, Duration::from_millis(20), Duration::from_secs(60), Some(&cancel)).unwrap_err();
+        assert!(matches!(err, SimError::Cancelled), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(tx);
     }
 
     #[test]

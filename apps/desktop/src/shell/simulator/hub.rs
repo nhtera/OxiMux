@@ -136,6 +136,9 @@ pub struct SimulatorHub {
     phone_states: Option<std::collections::BTreeMap<String, oximux_simulator::android::adb::AdbState>>,
     /// The real iPhones (and whether each can be shown) the last watch saw.
     iphone_states: Option<std::collections::BTreeMap<DeviceId, bool>>,
+    /// Capture helpers still starting (perhaps waiting in the Camera prompt),
+    /// one per iPhone: set to give the start up.
+    capture_starts: HashMap<DeviceId, Arc<AtomicBool>>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -666,6 +669,12 @@ impl SimulatorHub {
             match effect {
                 Effect::Boot { udid, generation, cancel } => self.boot(udid, generation, cancel, cx),
                 Effect::StartSession { udid, generation } => self.start_session(udid, generation, cx),
+                // An iPhone's helper records itself: its movie is finished
+                // before it goes (a simulator's `simctl` recording outlives
+                // the stream).
+                Effect::StopSession { udid, session } if session.ios_device().is_some() && self.recordings.contains_key(&udid) => {
+                    self.stop_recording_then(&udid, cx, move |_, _| session.shutdown());
+                }
                 Effect::StopSession { session, .. } => session.shutdown(),
                 Effect::Pause(session) => drop(session.pause()),
                 Effect::Resume(session) => drop(session.resume()),
@@ -690,6 +699,7 @@ impl SimulatorHub {
                 Effect::Persist => sim_state_keys::save_snapshot(&self.repo, &self.registry.snapshot()),
             }
         }
+        self.cancel_stale_capture_starts();
     }
 
     fn boot(&mut self, udid: DeviceId, generation: Generation, cancel: Arc<AtomicBool>, cx: &mut Context<Self>) {

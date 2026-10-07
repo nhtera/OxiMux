@@ -12,7 +12,8 @@
 //!   (the simulator drops keys sent back-to-back).
 //!
 //! Dropping the session closes stdin, which is the helper's signal to exit;
-//! a helper that has not exited a second later is killed. Neither `Drop`
+//! a helper that has not exited a second later is killed (twelve, for a
+//! capture helper that may be finishing a movie: `HelperKind::exit_grace`). Neither `Drop`
 //! nor [`HelperSession::shutdown`] waits for that.
 
 pub use crate::stream::{FrameData, StreamSession};
@@ -35,9 +36,6 @@ use crate::{DeviceId, Orientation, Result, SimError};
 
 /// Pause between consecutive key commands.
 pub const KEY_PACING: Duration = Duration::from_millis(4);
-
-/// How long a closed helper gets to exit before it is killed.
-const EXIT_GRACE: Duration = Duration::from_secs(1);
 
 /// Something the UI should react to. Frames are not events: poll
 /// [`HelperSession::latest_frame`] when woken.
@@ -161,7 +159,8 @@ impl HelperSession {
         {
             return Err(abandon(&mut child, e.into()));
         }
-        let (hello, early) = match Handshake::run_with(&rx, true, helper::HANDSHAKE_TIMEOUT, opts.kind.ready_timeout()) {
+        let cancel = opts.cancel.as_deref();
+        let (hello, early) = match Handshake::run_with(&rx, true, helper::HANDSHAKE_TIMEOUT, opts.kind.ready_timeout(), cancel) {
             Ok(done) => done,
             Err(e) => return Err(abandon(&mut child, e)),
         };
@@ -406,7 +405,7 @@ fn shutdown(inner: &Arc<Inner>) {
     let inner = Arc::clone(inner);
     let _ = std::thread::Builder::new()
         .name("oximux-sim-reaper".into())
-        .spawn(move || reap(&inner.child, EXIT_GRACE));
+        .spawn(move || reap(&inner.child, inner.kind.exit_grace()));
 }
 
 /// How long a killed helper may take to be reaped. A process wedged in
@@ -535,7 +534,7 @@ fn dispatch_loop(
     // waiting request now, refuse new ones, and stop accepting writes.
     inner.pending.lock().unwrap().take();
     inner.writer.lock().unwrap().take();
-    let code = reap(&inner.child, EXIT_GRACE);
+    let code = reap(&inner.child, inner.kind.exit_grace());
     forget(inner.ledger.as_deref(), inner.pid);
     inner.view.lock().unwrap().exited = Some(code);
     let _ = events.send(SessionEvent::Exited { code, fatal });
