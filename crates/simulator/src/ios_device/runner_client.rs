@@ -581,4 +581,24 @@ mod tests {
         assert_eq!(new_token().len(), 64);
         assert_ne!(new_token(), new_token());
     }
+
+    #[test]
+    fn a_reply_head_longer_than_16_kib_is_a_protocol_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                // Send a response with an extremely long header line (exceeds MAX_HEAD)
+                let long_header = "X-Long: ".to_string() + &"x".repeat(20 * 1024);
+                let response = format!("HTTP/1.1 200 OK\r\n{}\r\n\r\n", long_header);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let connect: Connector =
+            Arc::new(move || Ok(Box::new(TcpStream::connect(("127.0.0.1", port)).unwrap()) as Box<dyn RunnerStream>));
+        let error = RunnerClient::new(connect, "x").call("status", Value::Null).unwrap_err();
+        assert!(matches!(error, RunnerError::Protocol(_)), "got error: {:?}", error);
+    }
 }

@@ -314,6 +314,24 @@ mod tests {
     }
 
     #[test]
+    fn keypad_enter_and_right_shift_work() {
+        // Keypad Enter (USAGE_KEYPAD_ENTER = 0x58) works like Return
+        assert_eq!(
+            run(&[(key(KeyPhase::Down, USAGE_KEYPAD_ENTER), 0)]),
+            [Gesture::Return]
+        );
+        // Right shift (0xe5) works like left shift (0xe1)
+        let right_shift = 0xe5;
+        let gestures = run(&[
+            (key(KeyPhase::Down, right_shift), 0),
+            (key(KeyPhase::Down, 0x04), 1),  // 'A' when shifted
+            (key(KeyPhase::Up, right_shift), 2),
+        ]);
+        let texts: String = gestures.iter().filter_map(|g| if let Gesture::Text(t) = g { Some(t.as_str()) } else { None }).collect();
+        assert_eq!(texts, "A");
+    }
+
+    #[test]
     fn queued_gestures_merge_into_one_command() {
         let mut text = Gesture::Text("he".into());
         assert_eq!(text.merge(Gesture::Text("y".into())), None);

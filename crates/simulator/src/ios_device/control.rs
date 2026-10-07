@@ -547,4 +547,22 @@ mod tests {
         assert_eq!(hints, 1);
         control.stop();
     }
+
+    #[test]
+    fn a_held_tap_goes_at_once_when_an_agent_queues_behind_it() {
+        let exec = fake(10);
+        let (control, _events) = control(exec.clone(), (1290, 2796));
+        // Queue a panel tap (will wait DOUBLE_TAP for a second click)
+        click(&control, 0.5, 0.5);
+        // Immediately queue an agent gesture; it should not wait for double-tap
+        let start = Instant::now();
+        let _ = control.gesture(Gesture::Tap { at: (0.1, 0.1), taps: 1 });
+        let elapsed = start.elapsed();
+        // Well under the 250 ms a lone tap waits: the tap went at once.
+        assert!(elapsed < Duration::from_millis(240), "took {elapsed:?}, agent should bypass double-tap");
+        let calls = settle(&exec, 3);
+        // viewport, two taps
+        assert_eq!(calls.iter().filter(|(c, _)| c == "tap").count(), 2);
+        control.stop();
+    }
 }
