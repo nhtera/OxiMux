@@ -137,6 +137,11 @@ pub fn on_quit(cx: &mut App) {
         // Movies first: a recording killed by the device shutdown below would
         // be unplayable.
         hub.stop_recordings_blocking();
+        // A capture helper still in the Camera prompt is killed, prompt and
+        // all (the child ledger catches it next launch if we exit first).
+        for (_, cancel) in hub.capture_starts.drain() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
         let (sessions, owned) = hub.registry.quit();
         // Owned emulators by serial: the live sessions know theirs, a parked
         // one was seen by the watcher. No adb call on the quit path.

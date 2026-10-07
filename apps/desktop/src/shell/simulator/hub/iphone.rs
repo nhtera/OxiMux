@@ -33,6 +33,9 @@ pub const NO_CAPTURE_APP: &str = "This build of OxiMux cannot show an iPhone's s
 /// (the panel offers to open the Camera settings beside it).
 pub const CAMERA_DENIED: &str =
     "OxiMux Device Capture needs Camera access to show the iPhone's screen (macOS lists phone screens as cameras).";
+/// What the panel says when the Camera prompt went unanswered.
+pub const CAMERA_UNANSWERED: &str =
+    "macOS's Camera prompt for OxiMux Device Capture was not answered. Retry, then click Allow.";
 /// What the panel says when another app holds the iPhone's screen.
 pub const DEVICE_BUSY: &str = "Another app is showing this iPhone's screen. Close it and try again.";
 
@@ -62,6 +65,8 @@ fn start_error(e: &SimError) -> String {
     match e {
         SimError::CameraDenied(_) => CAMERA_DENIED.to_owned(),
         SimError::DeviceBusy(_) => DEVICE_BUSY.to_owned(),
+        // `ready` waits only on the Camera prompt (the phone is found in 8 s).
+        SimError::Timeout { what, .. } if what.ends_with("`ready`") => CAMERA_UNANSWERED.to_owned(),
         other => other.to_string(),
     }
 }
@@ -197,6 +202,10 @@ mod tests {
         assert_eq!(start_error(&SimError::CameraDenied("raw".into())), CAMERA_DENIED);
         assert_eq!(start_error(&SimError::DeviceBusy("raw".into())), DEVICE_BUSY);
         assert_eq!(start_error(&SimError::DeviceNotBooted), "device is not booted");
+        let unanswered = SimError::Timeout { what: "simulator helper `ready`".into(), secs: 180 };
+        assert_eq!(start_error(&unanswered), CAMERA_UNANSWERED);
+        let silent = SimError::Timeout { what: "simulator helper `hello`".into(), secs: 10 };
+        assert_ne!(start_error(&silent), CAMERA_UNANSWERED);
     }
 
     #[test]
