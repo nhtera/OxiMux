@@ -24,7 +24,7 @@ use oximux_simulator::caps::{self, ButtonSet, DeviceCaps};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::StreamSession;
 use oximux_simulator::simctl::SimUdid;
-use oximux_simulator::{Button, DeviceId, Orientation, Platform, keyboard, simctl};
+use oximux_simulator::{Button, DeviceId, Orientation, Platform, Source, keyboard, simctl};
 
 use super::Target;
 use crate::shell::simulator::hub::{InstallAnswer, SimulatorHub, Wake, home_button, paste_now};
@@ -219,12 +219,13 @@ pub(super) async fn run(
             let device = android_device(hub, udid, cx).await?;
             on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done)
         }
+        SimCmdWire::Launch { bundle_id, relaunch } if udid.source() == Source::Devicectl => {
+            check_bundle_id(&bundle_id)?;
+            let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
+            on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done)
+        }
         SimCmdWire::Launch { bundle_id, relaunch } => {
-            let well_formed = bundle_id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-                && bundle_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-            if !well_formed {
-                return Err(SimErrorWire::BadInput(format!("`{bundle_id}` is not a bundle identifier")));
-            }
+            check_bundle_id(&bundle_id)?;
             let udid = simctl_ready(hub, udid, cx).await?;
             on_own_thread(move || {
                 if relaunch {
@@ -240,6 +241,12 @@ pub(super) async fn run(
         SimCmdWire::OpenUrl { url } if udid.platform() == Platform::Android => {
             agent::check_url(&url).map_err(SimErrorWire::BadInput)?;
             let device = android_device(hub, udid, cx).await?;
+            on_own_thread(move || device.open_url(url.trim())).await?.map(|()| SimReplyWire::Done)
+        }
+        // A web link (checked above, as on every real device), in Safari.
+        SimCmdWire::OpenUrl { url } if udid.source() == Source::Devicectl => {
+            agent::check_url(&url).map_err(SimErrorWire::BadInput)?;
+            let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
             on_own_thread(move || device.open_url(url.trim())).await?.map(|()| SimReplyWire::Done)
         }
         SimCmdWire::OpenUrl { url } => {
@@ -260,6 +267,13 @@ pub(super) async fn run(
                 confirm_install(hub, udid, name, &apk, target, cx).await?;
             }
             on_own_thread(move || device.install(&apk)).await?.map(|()| SimReplyWire::Done)
+        }
+        SimCmdWire::Install { path } if udid.source() == Source::Devicectl => {
+            let app = super::iphone::device_build(install_path(&path, &target.worktree)?)?;
+            // Asked every time, once the phone is reachable (as on Android).
+            let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
+            confirm_install(hub, udid, name, &app, target, cx).await?;
+            on_own_thread(move || device.install(&app)).await?.map(|()| SimReplyWire::Done)
         }
         SimCmdWire::Install { path } => {
             let udid = simctl_ready(hub, udid, cx).await?;
@@ -356,11 +370,18 @@ async fn simctl_ready(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut Asyn
     Ok(sim)
 }
 
-/// `udid` as a `simctl` argument. A real iPhone's app verbs are not built
-/// yet: when they are, their arm must ask `confirm_install` like Android's.
+/// `udid` as a `simctl` argument (a real iPhone's app verbs have their own
+/// arms, through `devicectl`).
 fn simctl_udid(udid: &DeviceId) -> Result<SimUdid, SimErrorWire> {
-    udid.sim_udid()
-        .ok_or_else(|| SimErrorWire::Unavailable("app verbs on a real iPhone are not available in this version of OxiMux".into()))
+    udid.sim_udid().ok_or_else(|| SimErrorWire::Unavailable(format!("{udid} is not a simulator")))
+}
+
+/// A bundle identifier: letters, digits, `.`, `-`, `_`, starting with a
+/// letter or digit (nothing an option or a path could be made of).
+fn check_bundle_id(bundle_id: &str) -> Result<(), SimErrorWire> {
+    let well_formed = bundle_id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && bundle_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if well_formed { Ok(()) } else { Err(SimErrorWire::BadInput(format!("`{bundle_id}` is not a bundle identifier"))) }
 }
 
 /// The capability `cmd` needs that `caps` lacks, named for [`caps::refuse`].
@@ -634,13 +655,20 @@ mod tests {
         assert!(!needs_screen(&SimCmdWire::Install { path: "a.apk".into() }) && !needs_screen(&SimCmdWire::Status));
     }
 
-    /// An iPhone's install (and launch, open-url) never reaches `simctl`, and
-    /// is unavailable until its own arm exists — which must ask the user, as
-    /// Android's does. Changing this test means adding that question.
+    /// An iPhone's app verbs never reach `simctl` (they have `devicectl`
+    /// arms, whose install asks the user first, as Android's does).
     #[test]
-    fn an_iphones_app_verbs_are_unavailable_not_simctl() {
+    fn an_iphones_app_verbs_never_reach_simctl() {
         let iphone = DeviceId("iosdev:00008110-001A2C3E0A88401E".into());
         assert!(matches!(simctl_udid(&iphone), Err(SimErrorWire::Unavailable(_))));
         assert!(simctl_udid(&DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into())).is_ok());
+    }
+
+    #[test]
+    fn a_bundle_id_is_never_an_option_or_a_path() {
+        assert!(check_bundle_id("com.example.App-1_x").is_ok());
+        for bad in ["", "-x", "../a", "a b", "a/b"] {
+            assert!(check_bundle_id(bad).is_err(), "{bad}");
+        }
     }
 }

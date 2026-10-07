@@ -383,6 +383,50 @@ fn bundle_tools_path_from_exe(exe: &Path) -> Option<PathBuf> {
     Some(target_dir.join("bundle-tools").join(oximux_sibling_binary::sibling_file_name("oximux-sim-helper")))
 }
 
+/// The capture helper's app bundle, as it ships inside `OxiMux.app`
+/// (`Contents/Helpers/`, beside `Contents/MacOS/`).
+pub const CAPTURE_APP: &str = "OxiMux Device Capture.app";
+/// Its executable, inside [`CAPTURE_APP`].
+const CAPTURE_EXE: &str = "Contents/MacOS/oximux-device-capture";
+/// Points at a capture helper executable **inside its app bundle** (macOS
+/// grants the camera to a bundle, not to a bare binary), for local builds.
+pub const CAPTURE_OVERRIDE: &str = "OXIMUX_DEVICE_CAPTURE";
+
+/// Where the capture helper is: [`CAPTURE_OVERRIDE`], else the bundled app,
+/// else (debug builds) `target/bundle-tools/`, where a fetched release is
+/// staged for local runs — the same policy as the simulator helper's.
+pub fn default_capture_probe() -> HelperStatus {
+    if let Some(path) = std::env::var_os(CAPTURE_OVERRIDE).filter(|v| !v.is_empty()).map(PathBuf::from) {
+        return if path.is_file() {
+            HelperStatus::Found(path)
+        } else {
+            HelperStatus::Missing(format!("{CAPTURE_OVERRIDE} points at {}, which does not exist", path.display()))
+        };
+    }
+    let exe = std::env::current_exe().ok();
+    let bundled = exe.as_deref().and_then(bundled_capture_path);
+    if let Some(path) = bundled.as_ref().filter(|p| p.is_file()) {
+        return HelperStatus::Found(path.clone());
+    }
+    #[cfg(debug_assertions)]
+    if let Some(path) = exe.as_deref().and_then(dev_capture_path).filter(|p| p.is_file()) {
+        return HelperStatus::Found(path);
+    }
+    HelperStatus::Missing(format!("{CAPTURE_APP} is not installed beside OxiMux (set {CAPTURE_OVERRIDE} for a local build)"))
+}
+
+/// `…/OxiMux.app/Contents/MacOS/oximux` → `…/Contents/Helpers/<app>/<exe>`.
+fn bundled_capture_path(exe: &Path) -> Option<PathBuf> {
+    let contents = exe.parent()?.parent()?;
+    Some(contents.join("Helpers").join(CAPTURE_APP).join(CAPTURE_EXE))
+}
+
+/// `target/<profile>/<exe>` → `target/bundle-tools/<app>/<exe>`.
+#[cfg(debug_assertions)]
+fn dev_capture_path(exe: &Path) -> Option<PathBuf> {
+    Some(exe.parent()?.parent()?.join("bundle-tools").join(CAPTURE_APP).join(CAPTURE_EXE))
+}
+
 /// Reuses an [`Availability`] for [`CACHE_TTL`] instead of re-running
 /// `check`'s subprocesses on every call. `now` is a parameter rather than an
 /// internal `Instant::now()` so tests can move time forward without a real
@@ -694,6 +738,20 @@ mod tests {
         let avail = check(&runner, T, &missing_helper, &no_apps);
         assert!(!avail.is_ready());
         assert!(avail.blocking_reason().unwrap().contains("helper"));
+    }
+
+    #[test]
+    fn the_capture_app_ships_in_contents_helpers() {
+        let exe = PathBuf::from("/Applications/OxiMux.app/Contents/MacOS/oximux");
+        assert_eq!(
+            bundled_capture_path(&exe).unwrap(),
+            Path::new("/Applications/OxiMux.app/Contents/Helpers/OxiMux Device Capture.app/Contents/MacOS/oximux-device-capture")
+        );
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            dev_capture_path(&PathBuf::from("/repo/target/debug/oximux")).unwrap(),
+            Path::new("/repo/target/bundle-tools/OxiMux Device Capture.app/Contents/MacOS/oximux-device-capture")
+        );
     }
 
     #[test]

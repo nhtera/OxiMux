@@ -2,9 +2,10 @@
 //! screenshots and screen recordings. Results the user should hear about go
 //! out as [`HubEvent::Notice`]; the window turns them into toasts.
 //!
-//! Screenshots and recordings go through `simctl`, not the helper, so they
-//! work at full resolution and whether or not a stream is running (a parked
-//! device has no helper).
+//! A simulator's screenshots and recordings go through `simctl`, not the
+//! helper, so they work at full resolution and whether or not a stream is
+//! running (a parked device has no helper). A real iPhone has no `simctl`:
+//! its capture helper takes both (`iphone`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -178,10 +179,7 @@ impl SimulatorHub {
     fn start_recording(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         match udid.source() {
             oximux_simulator::Source::Adb => return self.start_android_recording(udid, cx),
-            oximux_simulator::Source::Devicectl => {
-                let why = "Recording a real iPhone is not available in this version of OxiMux.";
-                return self.notice(udid, NoticeKind::Error, why, cx);
-            }
+            oximux_simulator::Source::Devicectl => return self.start_iphone_recording(udid, cx),
             oximux_simulator::Source::Simctl => {}
         }
         if !self.xcode_ok() || !self.recording_starts.insert(udid.clone()) {

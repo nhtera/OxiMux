@@ -48,6 +48,10 @@ impl SimulatorPanel {
             PanelState::Empty { error } => self.render_empty(error.as_deref(), cx),
             PanelState::Attaching => self.centered_line("Finding a simulator…"),
             PanelState::Booting => self.centered_line(&format!("Booting {}…", self.device_name(cx))),
+            // A real iPhone's first stream waits on macOS's Camera prompt.
+            PanelState::Connecting if self.is_iphone(cx) => {
+                self.centered_line("Starting stream… If macOS asks, allow Camera access for OxiMux Device Capture.")
+            }
             PanelState::Connecting => self.centered_line("Starting stream…"),
             PanelState::Streaming if self.annotate.is_some() => {
                 self.annotate.clone().map(IntoElement::into_any_element).unwrap_or_else(|| self.centered_line(""))
@@ -86,6 +90,7 @@ impl SimulatorPanel {
             .children(banner)
             .child(phone(self.theme, &device, &self.area, cx.weak_entity(), screen))
             .child(if self.annotate.is_some() { self.render_annotate_controls(cx) } else { self.render_toolbar(state, cx) })
+            .children((matches!(state, PanelState::Streaming) && self.is_iphone(cx)).then(|| self.render_view_only()))
             .children(badge)
             .into_any_element()
     }
@@ -207,6 +212,25 @@ impl SimulatorPanel {
             .into_any_element()
     }
 
+    /// Whether the attached device is a real iPhone.
+    fn is_iphone(&self, cx: &App) -> bool {
+        self.device(cx).is_some_and(|udid| udid.source() == oximux_simulator::Source::Devicectl)
+    }
+
+    /// Under a real iPhone's toolbar: clicks on its screen do nothing here.
+    fn render_view_only(&self) -> AnyElement {
+        let (theme, density, ty) = (self.theme, self.density, &self.typography);
+        div()
+            .px(px(density.pad_panel))
+            .py(px(density.pad_row * 0.5))
+            .rounded(px(density.r_card))
+            .bg(theme.bg_panel_alt)
+            .text_size(px(ty.t_body_sm))
+            .text_color(theme.fg_muted)
+            .child("View only — control it on the phone")
+            .into_any_element()
+    }
+
     /// Whether the attached phone's screen is off (it then streams nothing).
     fn screen_off(&self, cx: &App) -> bool {
         let (Some(hub), Some(udid)) = (self.hub.as_ref(), self.device(cx)) else { return false };
@@ -246,7 +270,17 @@ impl SimulatorPanel {
                     .small()
                     .label(action)
                     .on_click(cx.listener(|this, _, _window, cx| this.reconnect(cx))),
-            );
+            )
+            // Camera access is granted in System Settings, not here.
+            .when(reason == crate::shell::simulator::hub::CAMERA_DENIED, |col| {
+                col.child(
+                    Button::new("sim-camera-settings")
+                        .ghost()
+                        .small()
+                        .label("Open Camera settings")
+                        .on_click(|_, _window, _cx| run_open(&[CAMERA_SETTINGS])),
+                )
+            });
         let hint = xcode_hint
             .then(|| self.hub.as_ref()?.read(cx).availability().map(|a| (a.best_effort_note(), a.switch_to_verified_hint())))
             .flatten();
@@ -351,6 +385,9 @@ fn setup_action(xcode: &Xcode) -> Button {
         }
     }
 }
+
+/// System Settings › Privacy & Security › Camera.
+const CAMERA_SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera";
 
 /// Xcode's Mac App Store page.
 const XCODE_APP_STORE: &str = "macappstore://apps.apple.com/app/id497799835";

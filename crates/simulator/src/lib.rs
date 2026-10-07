@@ -33,9 +33,13 @@ pub mod boot_watch;
 pub mod child_ledger;
 pub mod classify;
 pub mod consent;
+pub mod devicectl;
+#[cfg(target_os = "macos")]
+pub mod disclaim;
 pub mod geometry;
 pub mod gesture;
 pub mod helper;
+pub mod ios_device;
 pub mod keyboard;
 pub mod protocol;
 pub mod record;
@@ -287,6 +291,12 @@ pub enum SimError {
     DeviceNotFound(String),
     #[error("device is not booted")]
     DeviceNotBooted,
+    /// The capture helper may not use the camera (an iPhone's screen is one).
+    #[error("{0}")]
+    CameraDenied(String),
+    /// Another app is showing the iPhone's screen.
+    #[error("{0}")]
+    DeviceBusy(String),
     #[error("{program} failed{}: {stderr}", exit_code_suffix(*code))]
     CommandFailed { program: String, code: Option<i32>, stderr: String },
     #[error("{what} timed out after {secs}s")]

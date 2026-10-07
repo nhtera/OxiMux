@@ -104,6 +104,12 @@ pub enum FatalReason {
     DeviceNotFound,
     DeviceNotBooted,
     CaptureFailed,
+    /// Capture helper: the iPhone is not connected over USB (or was unplugged).
+    DeviceNotConnected,
+    /// Capture helper: macOS denied it the camera (phone screens are cameras).
+    CameraDenied,
+    /// Capture helper: another app holds the iPhone's screen.
+    DeviceBusy,
     Other(String),
 }
 
@@ -115,6 +121,9 @@ impl FatalReason {
             "device_not_found" => Self::DeviceNotFound,
             "device_not_booted" => Self::DeviceNotBooted,
             "capture_failed" => Self::CaptureFailed,
+            "device_not_connected" => Self::DeviceNotConnected,
+            "camera_denied" => Self::CameraDenied,
+            "device_busy" => Self::DeviceBusy,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -376,6 +385,12 @@ pub enum Command {
     AxDescribe,
     AxFrontmost,
     MemoryWarning,
+    /// Capture helper only: record the screen into `path` (a `.mov` in a
+    /// folder that exists), until [`Command::RecordStop`].
+    RecordStart { path: String },
+    /// Capture helper only: finish the recording; the reply carries its path
+    /// and `duration_ms`.
+    RecordStop,
 }
 
 impl Command {
@@ -569,6 +584,12 @@ mod tests {
              Event::Format { format: Some(StreamFormat::Jpeg), message: "m".into() }),
             (r#"{"event":"fatal","reason":"device_not_booted","message":"m"}"#,
              Event::Fatal { reason: FatalReason::DeviceNotBooted, message: "m".into() }),
+            (r#"{"event":"fatal","reason":"device_not_connected","message":"m"}"#,
+             Event::Fatal { reason: FatalReason::DeviceNotConnected, message: "m".into() }),
+            (r#"{"event":"fatal","reason":"camera_denied","message":"m"}"#,
+             Event::Fatal { reason: FatalReason::CameraDenied, message: "m".into() }),
+            (r#"{"event":"fatal","reason":"device_busy","message":"m"}"#,
+             Event::Fatal { reason: FatalReason::DeviceBusy, message: "m".into() }),
             (r#"{"event":"parsed","error":"bad"}"#, Event::Parsed { id: None, command: Err("bad".into()) }),
             (r#"{"event":"conformance_ready"}"#, Event::ConformanceReady),
         ];
@@ -598,6 +619,8 @@ mod tests {
              json!({"cmd":"configure","format":"avcc"})),
             (Command::AxDescribe, json!({"cmd":"ax_describe"})),
             (Command::MemoryWarning, json!({"cmd":"memory_warning"})),
+            (Command::RecordStart { path: "/tmp/a.mov".into() }, json!({"cmd":"record_start","path":"/tmp/a.mov"})),
+            (Command::RecordStop, json!({"cmd":"record_stop"})),
         ];
         for (command, want) in cases {
             assert_eq!(command.to_json(None), want);

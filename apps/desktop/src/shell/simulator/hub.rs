@@ -134,6 +134,8 @@ pub struct SimulatorHub {
     screen_off: HashSet<DeviceId>,
     /// The phones (and their adb states) the last phone watch saw.
     phone_states: Option<std::collections::BTreeMap<String, oximux_simulator::android::adb::AdbState>>,
+    /// The real iPhones (and whether each can be shown) the last watch saw.
+    iphone_states: Option<std::collections::BTreeMap<DeviceId, bool>>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -141,6 +143,7 @@ impl EventEmitter<HubEvent> for SimulatorHub {}
 mod agent;
 mod android;
 mod capture;
+mod iphone;
 mod lifecycle;
 mod wifi;
 
@@ -150,6 +153,7 @@ pub(crate) use wifi::can_submit;
 pub(crate) use agent::InstallAnswer;
 pub(crate) use android::list_all;
 pub use capture::NoticeKind;
+pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};
 pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
 
 pub use lifecycle::{install, on_quit};
@@ -729,10 +733,7 @@ impl SimulatorHub {
             Source::Adb => return self.start_android_session(udid, generation, cx),
             // Never the simulator helper: it would ask CoreSimulator for an
             // id it has never heard of.
-            Source::Devicectl => {
-                let why = "Streaming a real iPhone is not available in this version of OxiMux.".to_owned();
-                return self.finish_start(udid, generation, Err((why, false)), cx);
-            }
+            Source::Devicectl => return self.start_iphone_session(udid, generation, cx),
             Source::Simctl => {}
         }
         let helper = match self.availability.as_ref().map(|a| &a.helper) {

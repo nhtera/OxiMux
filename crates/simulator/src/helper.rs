@@ -1,4 +1,6 @@
-//! Spawning `oximux-sim-helper` and completing its handshake.
+//! Spawning a stream helper and completing its handshake: `oximux-sim-helper`
+//! for a simulator, or `oximux-device-capture` (inside its own app bundle)
+//! for a real iPhone — the same protocol, told apart by [`HelperKind`].
 //!
 //! The helper is a private-framework process, so it gets as little of our
 //! world as possible:
@@ -15,8 +17,9 @@
 //! `ready`, or a `fatal`, each bounded by a timeout.
 
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -30,6 +33,36 @@ pub const ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "TMPDIR", "LANG", "USER", "
 
 /// How long the helper may take to say `hello`, and then `ready`.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the capture helper may take to be `ready`: on first use it waits
+/// in macOS's Camera prompt for the user, and killing it there would take the
+/// prompt away with it.
+pub const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Which helper a session runs. Both speak protocol 2; what differs is the
+/// binary, its arguments, how it is spawned, and what its `size` means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HelperKind {
+    /// `oximux-sim-helper`: a simulator. Its frames are rotated to the
+    /// commanded orientation; `size` is the portrait framebuffer's.
+    #[default]
+    Simulator,
+    /// `oximux-device-capture`: a real iPhone's screen, view-only. Its frames
+    /// already show the phone the way it is held, and `size` is that shown
+    /// size: nothing is rotated here. Spawned responsible for itself, so the
+    /// camera grant stays the capture app's ([`crate::disclaim`]).
+    DeviceCapture,
+}
+
+impl HelperKind {
+    /// How long `ready` may take after `hello`.
+    pub fn ready_timeout(self) -> Duration {
+        match self {
+            Self::Simulator => HANDSHAKE_TIMEOUT,
+            Self::DeviceCapture => CAPTURE_READY_TIMEOUT,
+        }
+    }
+}
 
 /// Log files rotate past this size (one previous generation is kept).
 const LOG_ROTATE_BYTES: u64 = 1 << 20;
@@ -50,6 +83,7 @@ pub struct HelperOptions {
     /// Record the helper here while it runs, so the next launch can reap it
     /// if this process dies without cleaning up (see `child_ledger`).
     pub ledger: Option<std::sync::Arc<crate::child_ledger::Ledger>>,
+    pub kind: HelperKind,
 }
 
 impl Default for HelperOptions {
@@ -62,6 +96,7 @@ impl Default for HelperOptions {
             format: StreamFormat::Jpeg,
             log_path: None,
             ledger: None,
+            kind: HelperKind::Simulator,
         }
     }
 }
@@ -69,6 +104,9 @@ impl Default for HelperOptions {
 impl HelperOptions {
     /// The streaming invocation for `udid`.
     pub fn args(&self, udid: &DeviceId) -> Vec<String> {
+        if self.kind == HelperKind::DeviceCapture {
+            return self.capture_args(udid);
+        }
         vec![
             "--udid".into(),
             udid.0.clone(),
@@ -84,13 +122,97 @@ impl HelperOptions {
             self.format.as_str().into(),
         ]
     }
+
+    /// The capture helper's: the phone's hardware UDID, and no orientation
+    /// (the phone turns by itself). A malformed id is passed on as is, for
+    /// the helper to refuse (`bad_args`).
+    fn capture_args(&self, udid: &DeviceId) -> Vec<String> {
+        let device = crate::devicectl::hardware_udid(udid).unwrap_or(udid.as_str());
+        vec![
+            "--device".into(),
+            device.into(),
+            "--scale".into(),
+            self.scale.to_string(),
+            "--fps".into(),
+            self.fps.to_string(),
+            "--quality".into(),
+            self.quality.to_string(),
+            "--format".into(),
+            self.format.as_str().into(),
+        ]
+    }
 }
 
 /// A freshly spawned helper, before its streams are handed to a session.
 pub struct Spawned {
-    pub child: Child,
-    pub stdin: ChildStdin,
-    pub stdout: ChildStdout,
+    pub child: HelperChild,
+    pub stdin: Box<dyn Write + Send>,
+    pub stdout: Box<dyn Read + Send>,
+}
+
+/// A running helper process: an ordinary child, or one spawned responsible
+/// for itself.
+#[derive(Debug)]
+pub enum HelperChild {
+    Std(Child),
+    #[cfg(target_os = "macos")]
+    Disclaimed(crate::disclaim::DisclaimedChild),
+}
+
+impl HelperChild {
+    pub fn id(&self) -> u32 {
+        match self {
+            Self::Std(c) => c.id(),
+            #[cfg(target_os = "macos")]
+            Self::Disclaimed(c) => c.id(),
+        }
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Std(c) => c.kill(),
+            #[cfg(target_os = "macos")]
+            Self::Disclaimed(c) => c.kill(),
+        }
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Std(c) => c.try_wait(),
+            #[cfg(target_os = "macos")]
+            Self::Disclaimed(c) => c.try_wait(),
+        }
+    }
+
+    pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::Std(c) => c.wait(),
+            #[cfg(target_os = "macos")]
+            Self::Disclaimed(c) => c.wait(),
+        }
+    }
+}
+
+/// Spawn the `kind` of helper at `path`: the simulator helper as an ordinary
+/// child, the capture helper responsible for itself (macOS only).
+pub fn spawn_kind(kind: HelperKind, path: &Path, args: &[String], log_path: Option<&Path>) -> Result<Spawned> {
+    match kind {
+        HelperKind::Simulator => spawn(path, args, log_path),
+        #[cfg(target_os = "macos")]
+        HelperKind::DeviceCapture => {
+            let log = log_path.map(open_log).transpose()?;
+            let env: Vec<_> = ENV_ALLOWLIST.iter().filter_map(|k| std::env::var_os(k).map(|v| ((*k).to_owned(), v))).collect();
+            let spawned = crate::disclaim::spawn(path, args, &env, log.as_ref())
+                .map_err(|e| SimError::HelperNotFound(format!("{}: {e}", path.display())))?;
+            Ok(Spawned {
+                child: HelperChild::Disclaimed(spawned.child),
+                stdin: Box::new(spawned.stdin),
+                stdout: Box::new(spawned.stdout),
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        HelperKind::DeviceCapture => Err(SimError::Unsupported("a real iPhone is shown on macOS only".into())),
+    }
 }
 
 /// Spawn `path args…` with the allowlisted environment and piped stdio.
@@ -114,7 +236,7 @@ pub fn spawn(path: &Path, args: &[String], log_path: Option<&Path>) -> Result<Sp
         let _ = child.wait();
         return Err(SimError::HelperFailed("helper spawned without stdio pipes".into()));
     };
-    Ok(Spawned { child, stdin, stdout })
+    Ok(Spawned { child: HelperChild::Std(child), stdin: Box::new(stdin), stdout: Box::new(stdout) })
 }
 
 /// Open the helper's stderr log for appending, rotating it first when it has
@@ -153,6 +275,17 @@ impl Handshake {
         wait_for_ready: bool,
         timeout: Duration,
     ) -> Result<(Hello, Vec<Outbound>)> {
+        Self::run_with(rx, wait_for_ready, timeout, timeout)
+    }
+
+    /// [`run`](Self::run), with its own bound for `ready` (the capture helper
+    /// may wait in the Camera prompt: [`HelperKind::ready_timeout`]).
+    pub fn run_with(
+        rx: &mpsc::Receiver<Result<Outbound>>,
+        wait_for_ready: bool,
+        timeout: Duration,
+        ready_timeout: Duration,
+    ) -> Result<(Hello, Vec<Outbound>)> {
         let hello = match Self::next(rx, timeout, "hello")? {
             Outbound::Event(Event::Hello { proto, version, xcode }) => {
                 if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&proto) {
@@ -167,7 +300,7 @@ impl Handshake {
             return Ok((hello, rest));
         }
         loop {
-            match Self::next(rx, timeout, "ready")? {
+            match Self::next(rx, ready_timeout, "ready")? {
                 Outbound::Event(Event::Ready { .. }) => return Ok((hello, rest)),
                 Outbound::Event(Event::Fatal { reason, message }) => return Err(fatal_error(reason, message)),
                 other => rest.push(other),
@@ -195,13 +328,18 @@ pub fn fatal_error(reason: FatalReason, message: String) -> SimError {
         FatalReason::FrameworkLoadFailed => SimError::FrameworkLoadFailed(message),
         FatalReason::DeviceNotFound => SimError::DeviceNotFound(message),
         FatalReason::DeviceNotBooted => SimError::DeviceNotBooted,
+        // A real iPhone unplugged or locked away: gone, like a simulator shut
+        // down (the panel offers Reconnect).
+        FatalReason::DeviceNotConnected => SimError::DeviceNotBooted,
+        FatalReason::CameraDenied => SimError::CameraDenied(message),
+        FatalReason::DeviceBusy => SimError::DeviceBusy(message),
         FatalReason::BadArgs | FatalReason::CaptureFailed | FatalReason::Other(_) => SimError::HelperFailed(message),
     }
 }
 
 /// Read messages from the helper's stdout on the current thread, forwarding
 /// each to `tx` until EOF, a protocol error, or the receiver going away.
-pub fn pump(mut stdout: ChildStdout, tx: mpsc::Sender<Result<Outbound>>) {
+pub fn pump(mut stdout: impl Read, tx: mpsc::Sender<Result<Outbound>>) {
     loop {
         let message = protocol::read_message(&mut stdout);
         let stop = !matches!(message, Ok(Some(_)));
@@ -284,6 +422,34 @@ mod tests {
         assert!(matches!(Handshake::run(&rx, true, Duration::from_millis(20)), Err(SimError::Timeout { .. })));
         let rx = feed(vec![Ok(hello(PROTOCOL_VERSION))]); // sender dropped after hello
         assert!(matches!(Handshake::run(&rx, true, Duration::from_millis(50)), Err(SimError::HelperExited { .. })));
+    }
+
+    #[test]
+    fn the_capture_helper_gets_its_own_arguments() {
+        let opts = HelperOptions { kind: HelperKind::DeviceCapture, format: StreamFormat::Avcc, ..Default::default() };
+        let args = opts.args(&DeviceId("iosdev:00008130-0001".into()));
+        assert_eq!(args, ["--device", "00008130-0001", "--scale", "0.5", "--fps", "30", "--quality", "0.7", "--format", "avcc"]);
+        assert_eq!(HelperKind::DeviceCapture.ready_timeout(), CAPTURE_READY_TIMEOUT);
+        assert_eq!(HelperKind::Simulator.ready_timeout(), HANDSHAKE_TIMEOUT);
+    }
+
+    #[test]
+    fn the_capture_helper_may_take_its_time_to_be_ready() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(hello(PROTOCOL_VERSION))).unwrap();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            tx.send(Ok(Outbound::Event(Event::Ready { udid: "U".into(), pid: 1, orientation: None }))).unwrap();
+        });
+        assert!(Handshake::run_with(&rx, true, Duration::from_millis(20), Duration::from_secs(5)).is_ok());
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn capture_fatal_reasons_map_to_their_errors() {
+        assert!(matches!(fatal_error(FatalReason::DeviceNotConnected, "m".into()), SimError::DeviceNotBooted));
+        assert!(matches!(fatal_error(FatalReason::CameraDenied, "m".into()), SimError::CameraDenied(_)));
+        assert!(matches!(fatal_error(FatalReason::DeviceBusy, "m".into()), SimError::DeviceBusy(_)));
     }
 
     #[test]
