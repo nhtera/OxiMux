@@ -22,6 +22,7 @@ pub mod scrcpy_server;
 pub mod scrcpy_video;
 pub mod sdk;
 pub mod server_log;
+pub mod wifi;
 pub mod session;
 pub mod uiautomator;
 

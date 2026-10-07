@@ -106,6 +106,12 @@ impl<'a> Adb<'a> {
         Self { runner, program: adb.to_string_lossy().into_owned() }
     }
 
+    /// `adb args…` with `stdin`, whatever its exit status: for commands whose
+    /// words decide (adb exits 0 on some failures).
+    pub(super) fn raw(&self, args: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> Result<CmdOutput> {
+        self.runner.run(&self.program, args, stdin, timeout)
+    }
+
     fn run(&self, args: &[&str], timeout: Duration) -> Result<CmdOutput> {
         self.runner.run(&self.program, args, None, timeout)?.into_success("adb")
     }

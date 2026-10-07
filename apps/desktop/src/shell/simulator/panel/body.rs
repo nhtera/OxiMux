@@ -65,7 +65,12 @@ impl SimulatorPanel {
             PanelState::Disconnected { reason, xcode_hint } => self.render_stopped(reason, "Reconnect", *xcode_hint, cx),
             PanelState::Error { message, xcode_hint } => self.render_stopped(message, "Retry", *xcode_hint, cx),
         };
-        let (banner, badge) = (self.render_consent_banner(cx), self.render_agent_badge(cx));
+        // The pairing card, while open, takes the banner's place.
+        let banner = match self.render_pairing(window, cx) {
+            Some(card) => Some(card),
+            None => self.render_consent_banner(cx),
+        };
+        let badge = self.render_agent_badge(cx);
         div()
             .relative()
             .flex()

@@ -1,13 +1,12 @@
-//! Renders a pairing ticket as a scannable QR image.
+//! Renders a pairing secret as a scannable QR image: the remote-control
+//! ticket's `oximux://connect?ticket=…` deep link (Settings › Remote), and an
+//! Android phone's wireless-debugging pairing (the Mobile Emulator panel).
+//! Encoding is done here as raw PNG bytes rather than via `qrcode`'s own image
+//! renderer, so this crate's `image` version stays the only one in the graph.
 //!
-//! The payload is the ticket's `oximux://connect?ticket=…` deep link, so scanning
-//! it with the phone camera can hand off directly to the app. Encoding is done
-//! here as raw PNG bytes rather than via `qrcode`'s own image renderer, so this
-//! crate's `image` version stays the only one in the graph.
-//!
-//! The bytes carry the handshake secret (that is the point of the code — it is the
-//! bearer credential a phone proves possession of), so the rendered image is shown
-//! on screen and never written to disk or logged.
+//! The bytes carry a secret (that is the point of the code — it is the bearer
+//! credential a phone proves possession of), so the rendered image is shown on
+//! screen and never written to disk or logged.
 
 use image::{ImageFormat, Luma};
 use qrcode::{Color, QrCode};
@@ -21,7 +20,7 @@ const QUIET_ZONE: usize = 4;
 /// `None` when the payload is too large for any QR version, which for a pairing
 /// URL should not happen — the caller degrades to showing the endpoint id instead
 /// of panicking.
-pub(super) fn qr_png(data: &str, scale: usize) -> Option<Vec<u8>> {
+pub(crate) fn qr_png(data: &str, scale: usize) -> Option<Vec<u8>> {
     let scale = scale.max(1);
     let code = QrCode::new(data.as_bytes()).ok()?;
     let modules = code.to_colors();

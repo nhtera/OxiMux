@@ -111,3 +111,37 @@ fn the_device_menu_with_real_devices_renders(cx: &mut TestAppContext) {
         gpui::div().size_full().child(menu)
     });
 }
+
+/// The Wi-Fi pairing card renders on both tabs, and after a failure (no SDK
+/// here: the hub says so instead of pairing).
+#[gpui::test]
+fn the_pairing_card_renders_on_both_tabs(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let db = oximux_storage::open_memory().expect("db");
+    cx.update(|cx| {
+        crate::shell::simulator::hub::install_for_test(
+            cx,
+            oximux_storage::SettingsRepo::new(db.clone()),
+            oximux_storage::SimApprovalRepo::new(db),
+        )
+    });
+    let (panel, vcx) = cx.add_window_view(|_window, cx| {
+        SimulatorPanel::new(Theme::default(), Density::default(), Typography::default(), cx)
+    });
+    let draw = |vcx: &mut gpui::VisualTestContext| {
+        let panel = panel.clone();
+        vcx.draw(point(px(0.), px(0.)), size(AvailableSpace::Definite(px(360.)), AvailableSpace::Definite(px(800.))), |_, _| {
+            gpui::div().size_full().child(panel)
+        });
+    };
+    panel.update_in(vcx, |panel, window, cx| panel.open_pairing(window, cx));
+    draw(vcx);
+    panel.update_in(vcx, |panel, window, cx| panel.pairing_tab(super::pair_card::PairTab::Qr, window, cx));
+    draw(vcx);
+    panel.update(vcx, |panel, cx| {
+        let stage = panel.hub.as_ref().unwrap().read(cx).pair_stage(cx.entity_id());
+        assert!(matches!(stage, crate::shell::simulator::hub::PairStage::Failed(_)), "{stage:?}");
+    });
+    panel.update(vcx, |panel, cx| panel.close_pairing(cx));
+    draw(vcx);
+}

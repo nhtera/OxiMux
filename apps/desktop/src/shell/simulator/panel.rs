@@ -41,6 +41,7 @@ mod bezel;
 mod body;
 mod commands;
 mod consent;
+mod pair_card;
 mod header;
 mod toolbar;
 mod stream_row;
@@ -80,6 +81,8 @@ pub struct SimulatorPanel {
     /// The sidebar is maximized for the simulator (the ⤢ button's state).
     maximized: bool,
     attach_error: Option<String>,
+    /// The "Pair over Wi-Fi" card, while open.
+    pairing: Option<pair_card::PairCard>,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,
@@ -95,6 +98,17 @@ impl SimulatorPanel {
     pub fn new(theme: Theme, density: Density, typography: Typography, cx: &mut Context<Self>) -> Self {
         let hub = hub(cx);
         let subscription = hub.as_ref().map(|hub| cx.subscribe(hub, Self::on_hub_event));
+        // A window closing mid-pairing takes its pairing with it: no QR wait
+        // (and its secret) outliving the card.
+        let me = cx.entity_id();
+        cx.on_release(move |panel: &mut Self, cx| {
+            if panel.pairing.is_some()
+                && let Some(hub) = panel.hub.clone()
+            {
+                hub.update(cx, |hub, cx| hub.cancel_pairing(me, cx));
+            }
+        })
+        .detach();
         // The window is closing: stop counting this panel as a viewer, or its
         // helper keeps streaming for a window that no longer exists (macOS
         // keeps the app alive after the last window closes).
@@ -123,6 +137,7 @@ impl SimulatorPanel {
             attaching: false,
             maximized: false,
             attach_error: None,
+            pairing: None,
             theme,
             density,
             typography,
@@ -156,7 +171,7 @@ impl SimulatorPanel {
                     cx.notify();
                 }
             }
-            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged => cx.notify(),
+            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged | HubEvent::Pairing => cx.notify(),
             HubEvent::AgentActivity(udid) => {
                 if self.device(cx).as_ref() == Some(udid) {
                     cx.notify();
