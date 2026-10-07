@@ -106,7 +106,9 @@ const QUICK: Duration = Duration::ZERO;
 const SLOW: Duration = Duration::from_secs(90);
 /// Waking (≤ 60 s) plus a relaunch's terminate and launch (≤ 60 s each).
 const APP: Duration = Duration::from_secs(200);
-const INSTALL: Duration = Duration::from_secs(270);
+/// Waking (≤ 60 s), on a real device the user's yes (≤ 90 s), then the copy
+/// (≤ 180 s).
+const INSTALL: Duration = Duration::from_secs(360);
 /// A device listing: right after the app starts it first waits for the Xcode
 /// check (≤ 15 s), then lists (≤ 30 s).
 const LISTING: Duration = Duration::from_secs(45);
@@ -206,14 +208,21 @@ fn on_platform(device: &SimDeviceWire, platform: Option<SimPlatformArg>) -> bool
     }
 }
 
+/// A real device: an Android phone (`adb:`) or an iPhone (`iosdev:`).
+fn is_physical(device: &SimDeviceWire) -> bool {
+    device.udid.starts_with("adb:") || device.udid.starts_with("iosdev:")
+}
+
 /// The device `wanted` names (id, else name, case-insensitive) on
-/// `platform` — or, without a name, its booted one, else its first.
+/// `platform` — or, without a name, its booted one, else its first. Never a
+/// real device unless named: someone's phone is not picked for them (and the
+/// desktop refuses an agent's attach of one the user has not allowed).
 fn pick_on_platform(devices: &[SimDeviceWire], wanted: Option<&str>, platform: SimPlatformArg) -> Option<String> {
     let mut candidates = devices.iter().filter(|d| on_platform(d, Some(platform)));
     let found = match wanted.map(str::trim).filter(|w| !w.is_empty()) {
         Some(w) => candidates.find(|d| d.udid == w || d.name.eq_ignore_ascii_case(w)),
         None => {
-            let all: Vec<&SimDeviceWire> = candidates.collect();
+            let all: Vec<&SimDeviceWire> = candidates.filter(|d| !is_physical(d)).collect();
             all.iter().find(|d| d.state == "Booted").or(all.first()).copied()
         }
     };
@@ -498,6 +507,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// Without a name, a real device is never the pick (even a booted one);
+    /// named, it is resolved and the desktop decides.
+    #[test]
+    fn a_real_device_is_never_picked_unnamed() {
+        let devices = [
+            device("adb:R58M123", "Galaxy S24", "Booted"),
+            device("avd:Pixel", "Pixel", "Shutdown"),
+            device("iosdev:00008110-001A2C3E0A88401E", "iPhone", "Booted"),
+            device("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3", "iPhone 17", "Shutdown"),
+        ];
+        assert_eq!(pick_on_platform(&devices, None, SimPlatformArg::Android).as_deref(), Some("avd:Pixel"));
+        assert_eq!(pick_on_platform(&devices, None, SimPlatformArg::Ios).as_deref(), Some("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3"));
+        assert_eq!(pick_on_platform(&devices[..1], None, SimPlatformArg::Android), None);
+        assert_eq!(pick_on_platform(&devices, Some("galaxy s24"), SimPlatformArg::Android).as_deref(), Some("adb:R58M123"));
+        assert!(on_platform(&devices[2], Some(SimPlatformArg::Ios)), "an iPhone is iOS");
+    }
 
     #[test]
     fn consent_pending_is_its_own_exit_code() {

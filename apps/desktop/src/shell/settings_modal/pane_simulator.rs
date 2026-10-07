@@ -282,13 +282,15 @@ fn helper_summary(hub: Option<&Entity<SimulatorHub>>, cx: &Context<SettingsModal
 
 /// Automatic, or one of the listed devices, grouped like the panel's own
 /// menu (iOS then Android, running first). The list is the hub's last
-/// device listing (Refresh fetches one).
+/// device listing (Refresh fetches one). Never a real device: the default
+/// device attaches automatically, and a phone or an iPhone never does.
 fn device_menu(hub: Option<&Entity<SimulatorHub>>, current: Option<&str>, cx: &mut Context<SettingsModal>) -> AnyElement {
-    use crate::shell::simulator::panel::{device_groups, os_label};
+    use crate::shell::simulator::panel::{PHYSICAL_GROUP, device_groups, os_label};
     let groups: Vec<(&'static str, Vec<(String, String)>)> = hub
         .map(|h| {
             device_groups(h.read(cx).devices())
                 .into_iter()
+                .filter(|(title, _)| *title != PHYSICAL_GROUP)
                 .map(|(title, group)| (title, group.into_iter().map(|d| (d.udid.to_string(), format!("{} — {}", d.name, os_label(d)))).collect()))
                 .collect()
         })

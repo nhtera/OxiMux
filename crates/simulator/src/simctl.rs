@@ -19,6 +19,30 @@ use serde::Deserialize;
 use crate::runner::{CmdOutput, Runner};
 use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState, Result, SimError};
 
+/// A simulator's UDID, as a `simctl` argument. Only a [`DeviceId`] whose
+/// [`source`](DeviceId::source) is `simctl` converts to one, so a real
+/// device's id (`iosdev:`, `adb:`) can never reach a `simctl` command line:
+/// every lifecycle call below takes this, not a string.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SimUdid(String);
+
+impl SimUdid {
+    /// `None` unless `id` is a simulator's.
+    pub fn new(id: &DeviceId) -> Option<Self> {
+        (id.source() == crate::Source::Simctl && !id.as_str().is_empty()).then(|| Self(id.as_str().to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SimUdid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One entry from `simctl list runtimes -j`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeInfo {
@@ -61,6 +85,7 @@ pub fn list_devices(runner: &dyn Runner, timeout: Duration) -> Result<Vec<Device
                 os_version: os_version.clone(),
                 state: DeviceState::from_simctl(&d.state),
                 is_available: d.is_available,
+                note: None,
             });
         }
     }
@@ -98,7 +123,8 @@ pub enum BootOutcome {
 /// [`BOOT_POLL_TIMEOUT`] for the device to report `Booted`. Checks `cancel`
 /// before every poll, so a UI-driven boot can be abandoned without leaving the
 /// caller blocked for the full 30 s.
-pub fn boot(runner: &dyn Runner, udid: &str, cmd_timeout: Duration, cancel: &AtomicBool) -> Result<BootOutcome> {
+pub fn boot(runner: &dyn Runner, udid: &SimUdid, cmd_timeout: Duration, cancel: &AtomicBool) -> Result<BootOutcome> {
+    let udid = udid.as_str();
     let out = run(runner, &["simctl", "boot", udid], cmd_timeout)?;
     let mut outcome = BootOutcome::Booted;
     if !out.success() {
@@ -130,14 +156,16 @@ pub fn boot(runner: &dyn Runner, udid: &str, cmd_timeout: Duration, cancel: &Ato
     }
 }
 
-pub fn shutdown(runner: &dyn Runner, udid: &str, timeout: Duration) -> Result<()> {
+pub fn shutdown(runner: &dyn Runner, udid: &SimUdid, timeout: Duration) -> Result<()> {
+    let udid = udid.as_str();
     let out = run(runner, &["simctl", "shutdown", udid], timeout)?;
     require_success("simctl shutdown", Some(udid), out).map(drop)
 }
 
 /// `xcrun simctl io <udid> screenshot --type=png -`: the PNG bytes, written
 /// to stdout by the trailing `-`.
-pub fn screenshot_png(runner: &dyn Runner, udid: &str, timeout: Duration) -> Result<Vec<u8>> {
+pub fn screenshot_png(runner: &dyn Runner, udid: &SimUdid, timeout: Duration) -> Result<Vec<u8>> {
+    let udid = udid.as_str();
     let out = run(runner, &["simctl", "io", udid, "screenshot", "--type=png", "-"], timeout)?;
     let out = require_success("simctl io screenshot", Some(udid), out)?;
     if out.stdout.is_empty() {
@@ -146,22 +174,26 @@ pub fn screenshot_png(runner: &dyn Runner, udid: &str, timeout: Duration) -> Res
     Ok(out.stdout)
 }
 
-pub fn launch(runner: &dyn Runner, udid: &str, bundle_id: &str, timeout: Duration) -> Result<()> {
+pub fn launch(runner: &dyn Runner, udid: &SimUdid, bundle_id: &str, timeout: Duration) -> Result<()> {
+    let udid = udid.as_str();
     let out = run(runner, &["simctl", "launch", udid, bundle_id], timeout)?;
     require_success("simctl launch", Some(udid), out).map(drop)
 }
 
-pub fn terminate(runner: &dyn Runner, udid: &str, bundle_id: &str, timeout: Duration) -> Result<()> {
+pub fn terminate(runner: &dyn Runner, udid: &SimUdid, bundle_id: &str, timeout: Duration) -> Result<()> {
+    let udid = udid.as_str();
     let out = run(runner, &["simctl", "terminate", udid, bundle_id], timeout)?;
     require_success("simctl terminate", Some(udid), out).map(drop)
 }
 
-pub fn open_url(runner: &dyn Runner, udid: &str, url: &str, timeout: Duration) -> Result<()> {
+pub fn open_url(runner: &dyn Runner, udid: &SimUdid, url: &str, timeout: Duration) -> Result<()> {
+    let udid = udid.as_str();
     let out = run(runner, &["simctl", "openurl", udid, url], timeout)?;
     require_success("simctl openurl", Some(udid), out).map(drop)
 }
 
-pub fn install(runner: &dyn Runner, udid: &str, app_path: &Path, timeout: Duration) -> Result<()> {
+pub fn install(runner: &dyn Runner, udid: &SimUdid, app_path: &Path, timeout: Duration) -> Result<()> {
+    let udid = udid.as_str();
     let path = app_path.to_string_lossy();
     let out = run(runner, &["simctl", "install", udid, &path], timeout)?;
     require_success("simctl install", Some(udid), out).map(drop)
@@ -169,7 +201,8 @@ pub fn install(runner: &dyn Runner, udid: &str, app_path: &Path, timeout: Durati
 
 /// `xcrun simctl pbcopy <udid>`, feeding `text` on stdin: sets the
 /// simulator's pasteboard.
-pub fn pbcopy(runner: &dyn Runner, udid: &str, text: &str, timeout: Duration) -> Result<()> {
+pub fn pbcopy(runner: &dyn Runner, udid: &SimUdid, text: &str, timeout: Duration) -> Result<()> {
+    let udid = udid.as_str();
     let out = runner.run("xcrun", &["simctl", "pbcopy", udid], Some(text.as_bytes()), timeout)?;
     require_success("simctl pbcopy", Some(udid), out).map(drop)
 }
@@ -179,11 +212,12 @@ pub fn pbcopy(runner: &dyn Runner, udid: &str, text: &str, timeout: Duration) ->
 /// specific app-group identifier); `None` means `simctl`'s default (`app`).
 pub fn get_app_container(
     runner: &dyn Runner,
-    udid: &str,
+    udid: &SimUdid,
     bundle_id: &str,
     container: Option<&str>,
     timeout: Duration,
 ) -> Result<PathBuf> {
+    let udid = udid.as_str();
     let mut args = vec!["simctl", "get_app_container", udid, bundle_id];
     if let Some(c) = container {
         args.push(c);
@@ -298,6 +332,18 @@ mod tests {
 
     const T: Duration = Duration::from_secs(5);
 
+    fn sim(udid: &str) -> SimUdid {
+        DeviceId(udid.into()).sim_udid().expect("a simulator id")
+    }
+
+    #[test]
+    fn only_a_simulator_id_becomes_a_simctl_argument() {
+        assert!(DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into()).sim_udid().is_some());
+        for real in ["iosdev:00008110-001A2C3E0A88401E", "adb:R58M123", "avd:Pixel", "iosdev:", "adb:", ""] {
+            assert!(DeviceId(real.into()).sim_udid().is_none(), "{real}");
+        }
+    }
+
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(format!("{}/tests/fixtures/simctl/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
@@ -398,7 +444,7 @@ mod tests {
                 CmdOutput::ok(booted_device_json("ABCD")),
             );
         let cancel = AtomicBool::new(false);
-        assert_eq!(boot(&runner, "ABCD", T, &cancel).unwrap(), BootOutcome::AlreadyBooted);
+        assert_eq!(boot(&runner, &sim("ABCD"), T, &cancel).unwrap(), BootOutcome::AlreadyBooted);
     }
 
     #[test]
@@ -408,14 +454,14 @@ mod tests {
             .expect("xcrun simctl list devices -j", CmdOutput::ok(booting_device_json("ABCD")))
             .expect("xcrun simctl list devices -j", CmdOutput::ok(booted_device_json("ABCD")));
         let cancel = AtomicBool::new(false);
-        assert_eq!(boot(&runner, "ABCD", T, &cancel).unwrap(), BootOutcome::Booted);
+        assert_eq!(boot(&runner, &sim("ABCD"), T, &cancel).unwrap(), BootOutcome::Booted);
     }
 
     #[test]
     fn boot_reports_cancelled_without_more_polls() {
         let cancel = AtomicBool::new(true);
         let runner = ScriptedRunner::default().expect("xcrun simctl boot ABCD", CmdOutput::ok(""));
-        let err = boot(&runner, "ABCD", T, &cancel).unwrap_err();
+        let err = boot(&runner, &sim("ABCD"), T, &cancel).unwrap_err();
         assert!(matches!(err, SimError::Cancelled), "{err:?}");
     }
 
@@ -425,7 +471,7 @@ mod tests {
             "xcrun simctl shutdown NOPE",
             CmdOutput::failed(1, "Invalid device: NOPE\n"),
         );
-        let err = shutdown(&runner, "NOPE", T).unwrap_err();
+        let err = shutdown(&runner, &sim("NOPE"), T).unwrap_err();
         assert!(matches!(&err, SimError::DeviceNotFound(u) if u == "NOPE"), "{err:?}");
     }
 
@@ -435,7 +481,7 @@ mod tests {
             "xcrun simctl launch ABCD com.example.app",
             CmdOutput::failed(3, "The request to launch com.example.app failed.\n"),
         );
-        let err = launch(&runner, "ABCD", "com.example.app", T).unwrap_err();
+        let err = launch(&runner, &sim("ABCD"), "com.example.app", T).unwrap_err();
         assert!(matches!(err, SimError::CommandFailed { code: Some(3), .. }), "{err:?}");
     }
 
@@ -446,13 +492,13 @@ mod tests {
             "xcrun simctl io ABCD screenshot --type=png -",
             CmdOutput::ok(png_bytes.clone()),
         );
-        assert_eq!(screenshot_png(&runner, "ABCD", T).unwrap(), png_bytes);
+        assert_eq!(screenshot_png(&runner, &sim("ABCD"), T).unwrap(), png_bytes);
     }
 
     #[test]
     fn pbcopy_feeds_stdin_not_args() {
         let runner = ScriptedRunner::default().expect("xcrun simctl pbcopy ABCD", CmdOutput::ok(""));
-        pbcopy(&runner, "ABCD", "hello", T).unwrap();
+        pbcopy(&runner, &sim("ABCD"), "hello", T).unwrap();
         assert_eq!(runner.calls(), vec!["xcrun simctl pbcopy ABCD"]);
     }
 
@@ -462,7 +508,7 @@ mod tests {
             "xcrun simctl get_app_container ABCD com.example.app",
             CmdOutput::ok("/path/to/App.app\n"),
         );
-        let path = get_app_container(&runner, "ABCD", "com.example.app", None, T).unwrap();
+        let path = get_app_container(&runner, &sim("ABCD"), "com.example.app", None, T).unwrap();
         assert_eq!(path, PathBuf::from("/path/to/App.app"));
     }
 

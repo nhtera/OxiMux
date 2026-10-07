@@ -80,6 +80,14 @@ pub fn running_with(runner: &dyn Runner, sdk: &Sdk, timeout: Duration, known: &I
     Ok(out)
 }
 
+/// Every phone adb lists, by serial, in whatever state it is in — offline
+/// and unauthorized included (the watcher's cue that one was plugged in,
+/// unplugged, or approved this Mac). Emulators are left out.
+pub fn phone_states(runner: &dyn Runner, sdk: &Sdk, timeout: Duration) -> Result<BTreeMap<String, AdbState>> {
+    let adb = Adb::new(runner, &sdk.adb());
+    Ok(adb.devices(timeout)?.into_iter().filter(|d| !d.is_emulator()).map(|d| (d.serial, d.state)).collect())
+}
+
 /// The ids of every running Android device (the device watcher's view).
 pub fn booted_ids(runner: &dyn Runner, sdk: &Sdk, timeout: Duration) -> Result<BTreeSet<DeviceId>> {
     Ok(running(runner, sdk, timeout)?.into_keys().collect())
@@ -127,6 +135,7 @@ fn info(id: DeviceId, name: String, runtime: Option<String>, booted: bool) -> De
         state: if booted { DeviceState::Booted } else { DeviceState::Shutdown },
         kind: DeviceKind::Phone,
         is_available: true,
+        note: None,
     }
 }
 
@@ -290,6 +299,23 @@ R58 unauthorized usb:2 transport_id:3\n";
         assert_eq!(first, ["avd:Medium_Phone"], "the unreadable one is left out, not `adb:emulator-5556`");
         let second: Vec<String> = running_with(&runner, &sdk, QUICK, &known).unwrap().into_keys().map(|d| d.0).collect();
         assert_eq!(second, ["avd:Medium_Phone", "avd:Pixel_9"]);
+    }
+
+    /// The watcher's view of phones: every state, so a phone that has not
+    /// approved this Mac yet (or just did) is news; emulators are not phones.
+    #[test]
+    fn phone_states_keep_unauthorized_phones_and_skip_emulators() {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk = sdk(dir.path());
+        let adb = sdk.adb().display().to_string();
+        let listing = "List of devices attached
+emulator-5554 device transport_id:1
+R58 unauthorized usb:2 transport_id:3
+0A1B2C offline transport_id:4
+";
+        let runner = ScriptedRunner::default().expect(&format!("{adb} devices -l"), CmdOutput::ok(listing));
+        let states = phone_states(&runner, &sdk, QUICK).unwrap();
+        assert_eq!(states.into_iter().collect::<Vec<_>>(), [("0A1B2C".into(), AdbState::Offline), ("R58".into(), AdbState::Unauthorized)]);
     }
 
     #[test]

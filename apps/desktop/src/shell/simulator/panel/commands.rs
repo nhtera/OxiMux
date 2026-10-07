@@ -14,9 +14,10 @@ use crate::actions::{
     SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw, SimRotateCw,
     SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord,
 };
-use oximux_simulator::Platform;
+use oximux_simulator::Source;
+use oximux_simulator::caps::{ButtonSet, DeviceCaps};
 
-use crate::shell::simulator::hub::{SimulatorHub, is_udid};
+use crate::shell::simulator::hub::is_udid;
 use crate::shell::simulator::state::PanelState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +59,24 @@ impl SimCommand {
         }
     }
 
+    /// Whether a device with `caps` can do this at all (a real phone is never
+    /// rotated or shut down; an iPhone without its runner takes no input).
+    pub(crate) fn allowed(self, caps: &DeviceCaps) -> bool {
+        match self {
+            Self::Home => caps.buttons.contains(ButtonSet::HOME),
+            Self::Lock => caps.buttons.contains(ButtonSet::LOCK),
+            Self::Back => caps.buttons.contains(ButtonSet::BACK),
+            Self::Recents => caps.buttons.contains(ButtonSet::APP_SWITCHER),
+            Self::RotateCw | Self::RotateCcw => caps.rotate,
+            Self::Screenshot | Self::Annotate => caps.screenshot,
+            Self::ToggleRecord => caps.record,
+            Self::ToggleKeyboard => caps.keys,
+            Self::OpenLogs => caps.logs,
+            Self::Shutdown => caps.shutdown,
+            Self::Detach => true,
+        }
+    }
+
     /// Needs the live stream (the helper), not just a booted device.
     fn needs_stream(self) -> bool {
         matches!(self, Self::Home | Self::Lock | Self::Back | Self::Recents | Self::RotateCw | Self::RotateCcw | Self::Annotate | Self::ToggleKeyboard)
@@ -87,6 +106,11 @@ impl SimulatorPanel {
         let (Some(hub), Some(udid)) = (self.hub.clone(), self.device(cx)) else { return Outcome::NoDevice };
         if command == SimCommand::Detach {
             self.detach(cx);
+            return Outcome::Done;
+        }
+        // The toolbar greys these out; the palette and shortcuts land here.
+        // Phase 8: for_session — an iPhone's runner adds touch and keys.
+        if !command.allowed(&DeviceCaps::for_id(&udid)) {
             return Outcome::Done;
         }
         if command.needs_stream() && !matches!(self.state(cx), PanelState::Streaming) {
@@ -121,20 +145,17 @@ impl SimulatorPanel {
             SimCommand::OpenLogs => {
                 let Some(cwd) = self.worktree.clone() else { return Outcome::NoDevice };
                 let title = format!("{} log", self.device_name(cx));
-                let script = match udid.platform() {
+                let script = match udid.source() {
                     // The id lands in a shell command line: only a well-formed one.
-                    Platform::Ios if is_udid(udid.as_str()) => log_script(udid.as_str()),
-                    Platform::Ios => return Outcome::NoDevice,
-                    Platform::Android => match hub.read(cx).logcat_script(&udid) {
+                    Source::Simctl if is_udid(udid.as_str()) => log_script(udid.as_str()),
+                    Source::Simctl | Source::Devicectl => return Outcome::NoDevice,
+                    Source::Adb => match hub.read(cx).logcat_script(&udid) {
                         Some(script) => script,
                         None => return Outcome::NotStreaming,
                     },
                 };
                 return Outcome::OpenLogs { cwd, title, script };
             }
-            // OxiMux never shuts a phone down (the toolbar hides the button;
-            // the palette lands here).
-            SimCommand::Shutdown if SimulatorHub::is_phone(&udid) => return Outcome::Done,
             SimCommand::Shutdown => {
                 self.confirm_shutdown = true;
                 cx.notify();
@@ -167,6 +188,25 @@ mod tests {
     #[test]
     fn the_log_script_streams_the_device_log() {
         assert_eq!(log_script("ABCD"), "xcrun simctl spawn ABCD log stream --level info --style compact");
+    }
+
+    /// A real phone is never rotated or shut down from the panel; an iPhone
+    /// without its runner is only watched, recorded and screenshotted.
+    #[test]
+    fn real_devices_refuse_what_they_cannot_do() {
+        use oximux_simulator::DeviceId;
+        let phone = DeviceCaps::for_id(&DeviceId("adb:R58".into()));
+        for refused in [SimCommand::Shutdown, SimCommand::RotateCw, SimCommand::RotateCcw] {
+            assert!(!refused.allowed(&phone), "{refused:?}");
+        }
+        assert!(SimCommand::Back.allowed(&phone) && SimCommand::OpenLogs.allowed(&phone));
+        let iphone = DeviceCaps::for_id(&DeviceId("iosdev:00008110-001A2C3E0A88401E".into()));
+        for refused in [SimCommand::Home, SimCommand::Lock, SimCommand::ToggleKeyboard, SimCommand::OpenLogs, SimCommand::Shutdown] {
+            assert!(!refused.allowed(&iphone), "{refused:?}");
+        }
+        assert!(SimCommand::Screenshot.allowed(&iphone) && SimCommand::ToggleRecord.allowed(&iphone));
+        let sim = DeviceCaps::for_id(&DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into()));
+        assert!(SimCommand::Shutdown.allowed(&sim) && SimCommand::Home.allowed(&sim) && !SimCommand::Back.allowed(&sim));
     }
 
     #[test]

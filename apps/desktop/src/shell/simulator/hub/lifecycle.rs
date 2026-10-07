@@ -11,7 +11,7 @@ use oximux_simulator::boot_watch::{self, BootWatch, WatchGate};
 use oximux_simulator::child_ledger::{self, Ledger};
 use oximux_simulator::registry::Registry;
 use oximux_simulator::runner::SystemRunner;
-use oximux_simulator::{DeviceId, Platform};
+use oximux_simulator::{DeviceId, Platform, Source};
 use oximux_storage::{SettingsRepo, SimApprovalRepo};
 
 use super::{HubEvent, SimulatorHub, SimulatorService, TICK, hub};
@@ -75,6 +75,7 @@ fn new_hub(
 ) -> gpui::Entity<SimulatorHub> {
     let snapshot = sim_state_keys::load_snapshot(&repo);
     let feature_used = sim_state_keys::feature_used(&repo);
+    sim_state_keys::revoke_physical_approvals_once(&repo, &approvals);
     let mut agent = super::agent::AgentState::load(Some(approvals));
     agent.stopped = sim_state_keys::load_stopped(&repo);
     cx.new(|_| SimulatorHub {
@@ -101,6 +102,9 @@ fn new_hub(
         agent,
         boot_claims: HashSet::new(),
         android_sdk: None,
+        phone_watch_until: None,
+        physical_used: false,
+        phone_states: None,
     })
 }
 
@@ -267,24 +271,36 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                     .into_iter()
                     .chain(hub.registry.owned_devices())
                     .any(|d| d.platform() == Platform::Android);
+                // Phones are watched (every adb state) only while they matter:
+                // a device menu is open, or a real device was attached.
+                let phones = hub.android_sdk.clone().filter(|_| hub.watching_phones());
                 let sdk = hub.android_sdk.clone().filter(|_| android_in_use);
-                Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk))
+                Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk, phones))
             });
-            let (runner, listed_at, xcode_ok, sdk) = match gate {
+            let (runner, listed_at, xcode_ok, sdk, phones) = match gate {
                 Ok(Some(gate)) => gate,
                 Ok(None) => continue,
                 Err(_) => return, // the hub is gone
             };
-            // What this round lists: only those platforms' devices can be
-            // read as shut down.
-            let platforms: Vec<Platform> = [xcode_ok.then_some(Platform::Ios), sdk.is_some().then_some(Platform::Android)].into_iter().flatten().collect();
+            // What this round lists: only those sources' devices can be read
+            // as shut down (never a real iPhone: `devicectl` is not polled).
+            let sources: Vec<Source> = [xcode_ok.then_some(Source::Simctl), sdk.is_some().then_some(Source::Adb)].into_iter().flatten().collect();
             // The `simctl list` runs with no lock held: the UI thread reads
             // the watch state (reconnect, helper exit) and must never wait on
             // CoreSimulator.
-            let listed = cx
+            let (listed, phones) = cx
                 .background_executor()
-                .spawn(async move { super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref()) })
+                .spawn(async move {
+                    let phones = phones.and_then(|sdk| super::android::phone_states(runner.as_ref(), &sdk));
+                    (super::android::booted_all(runner.as_ref(), xcode_ok, sdk.as_ref()), phones)
+                })
                 .await;
+            if let Some(phones) = phones {
+                let alive = hub.update(cx, |hub, cx| hub.observe_phones(phones, cx));
+                if alive.is_err() {
+                    return;
+                }
+            }
             let booted = match listed {
                 Ok(booted) => booted,
                 Err(e) => {
@@ -295,22 +311,22 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
             let alive = hub.update(cx, |hub, cx| {
                 let (events, newly_listed) = {
                     let mut watch = hub.watch.lock().unwrap();
-                    if watch.listed() != platforms.as_slice() {
-                        tracing::info!(?platforms, booted = booted.len(), "simulator watcher: listing changed");
+                    if watch.listed() != sources.as_slice() {
+                        tracing::info!(?sources, booted = booted.len(), "simulator watcher: listing changed");
                     }
-                    // Platforms this round starts from a baseline for: every
+                    // Sources this round starts from a baseline for: every
                     // one on the first poll, else those the last did not list.
-                    let newly_listed: Vec<Platform> = platforms
+                    let newly_listed: Vec<Source> = sources
                         .iter()
                         .copied()
                         .filter(|p| !watch.has_baseline() || !watch.listed().contains(p))
                         .collect();
-                    (watch.observe_listed(booted.clone(), &platforms), newly_listed)
+                    (watch.observe_listed(booted.clone(), &sources), newly_listed)
                 };
                 // A baseline reports no boots, but a latched device already up
-                // (booted while OxiMux was closed, or while its platform was
-                // not polled) is not "stopped by the user" any more.
-                for udid in booted.iter().filter(|u| newly_listed.contains(&u.platform())) {
+                // (booted while OxiMux was closed, or while its source was not
+                // polled) is not "stopped by the user" any more.
+                for udid in booted.iter().filter(|u| newly_listed.contains(&u.source())) {
                     hub.clear_stopped_by_user(udid);
                 }
                 // A device OxiMux attached is already somebody's; one booted
@@ -323,9 +339,9 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                             // Up again, by whoever: the power button's "stop"
                             // is over.
                             hub.clear_stopped_by_user(&udid);
-                            // A phone plugged in is never taken over: phones
-                            // attach only when asked for.
-                            if !attached.contains(&udid) && !SimulatorHub::is_phone(&udid) {
+                            // A real device plugged in is never taken over:
+                            // it attaches only when asked for.
+                            if !attached.contains(&udid) && !udid.is_physical() {
                                 fresh.push(udid);
                             }
                         }
@@ -345,7 +361,7 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                     return;
                 }
                 let changed = hub.registry.attached_devices();
-                let effects = hub.registry.reconcile_booted(&booted, &platforms);
+                let effects = hub.registry.reconcile_booted(&booted, &sources);
                 if !effects.is_empty() {
                     hub.run(effects, cx);
                     for udid in changed {

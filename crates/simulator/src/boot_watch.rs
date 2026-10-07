@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::runner::Runner;
-use crate::{DeviceId, DeviceState, Platform, Result, simctl};
+use crate::{DeviceId, DeviceState, Result, Source, simctl};
 
 /// How often the caller should poll while the gate is open.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -52,9 +52,11 @@ pub struct BootWatch {
     /// `None` until the first poll: the first observation is a baseline, not
     /// a burst of "booted" events for every device already running.
     booted: Option<BTreeSet<DeviceId>>,
-    /// The platforms that observation listed: a device of any other is not
-    /// in `booted` because nobody asked, not because it is shut down.
-    listed: Vec<Platform>,
+    /// The sources that observation listed: a device of any other is not in
+    /// `booted` because nobody asked, not because it is shut down. Per source,
+    /// not per platform: a `simctl`-only round says nothing about a real
+    /// iPhone (`devicectl`), though both are iOS.
+    listed: Vec<Source>,
 }
 
 /// The booted set right now. Blocking (one `simctl list`); call it without
@@ -68,24 +70,25 @@ pub fn list_booted(runner: &dyn Runner) -> Result<BTreeSet<DeviceId>> {
 }
 
 impl BootWatch {
-    /// One poll: list devices and diff against the previous poll. Blocking.
+    /// One poll: list simulators and diff against the previous poll. Blocking.
     pub fn poll(&mut self, runner: &dyn Runner) -> Result<Vec<WatchEvent>> {
-        Ok(self.observe(list_booted(runner)?))
+        Ok(self.observe_listed(list_booted(runner)?, &[Source::Simctl]))
     }
 
-    /// Diff `now` against the last observation (pure; `poll` feeds it).
+    /// Diff `now`, a listing of every source, against the last observation
+    /// (pure).
     pub fn observe(&mut self, now: BTreeSet<DeviceId>) -> Vec<WatchEvent> {
-        self.observe_listed(now, &[Platform::Ios, Platform::Android])
+        self.observe_listed(now, &[Source::Simctl, Source::Adb, Source::Devicectl])
     }
 
-    /// [`Self::observe`] for a listing of `platforms` only. A platform this
-    /// round lists and the last did not starts from a baseline (its devices
-    /// already running are not news); one it no longer lists reports no
-    /// shutdowns (nobody asked).
-    pub fn observe_listed(&mut self, now: BTreeSet<DeviceId>, platforms: &[Platform]) -> Vec<WatchEvent> {
-        let before_listed = std::mem::replace(&mut self.listed, platforms.to_vec());
+    /// [`Self::observe`] for a listing of `sources` only. A source this round
+    /// lists and the last did not starts from a baseline (its devices already
+    /// running are not news); one it no longer lists reports no shutdowns
+    /// (nobody asked).
+    pub fn observe_listed(&mut self, now: BTreeSet<DeviceId>, sources: &[Source]) -> Vec<WatchEvent> {
+        let before_listed = std::mem::replace(&mut self.listed, sources.to_vec());
         let Some(before) = self.booted.replace(now.clone()) else { return Vec::new() };
-        let both = |udid: &&DeviceId| platforms.contains(&udid.platform()) && before_listed.contains(&udid.platform());
+        let both = |udid: &&DeviceId| sources.contains(&udid.source()) && before_listed.contains(&udid.source());
         let mut events: Vec<WatchEvent> = before.difference(&now).filter(both).cloned().map(WatchEvent::Shutdown).collect();
         events.extend(now.difference(&before).filter(both).cloned().map(WatchEvent::Booted));
         events
@@ -97,8 +100,8 @@ impl BootWatch {
         self.booted.is_some()
     }
 
-    /// The platforms the last observation listed.
-    pub fn listed(&self) -> &[Platform] {
+    /// The sources the last observation listed.
+    pub fn listed(&self) -> &[Source] {
         &self.listed
     }
 
@@ -108,9 +111,9 @@ impl BootWatch {
     }
 
     /// Whether `udid` was booted at the last poll (`None` before the first,
-    /// or when that poll did not list its platform).
+    /// or when that poll did not list its source).
     pub fn is_booted(&self, udid: &DeviceId) -> Option<bool> {
-        let booted = self.booted.as_ref().filter(|_| self.listed.contains(&udid.platform()))?;
+        let booted = self.booted.as_ref().filter(|_| self.listed.contains(&udid.source()))?;
         Some(booted.contains(udid))
     }
 }
@@ -150,13 +153,13 @@ mod tests {
         assert!(!watch.has_baseline(), "forgetting starts a fresh baseline");
     }
 
-    /// A round that did not list a platform says nothing about its devices:
+    /// A round that did not list a source says nothing about its devices:
     /// when it is listed again, the ones running are a baseline, not a burst
     /// of boots (a window would auto-attach one); while it is not, nothing
     /// reads as shut down.
     #[test]
-    fn a_platform_listed_again_starts_from_a_baseline() {
-        let (ios, android, both) = ([Platform::Ios], [Platform::Android], [Platform::Ios, Platform::Android]);
+    fn a_source_listed_again_starts_from_a_baseline() {
+        let (ios, android, both) = ([Source::Simctl], [Source::Adb], [Source::Simctl, Source::Adb]);
         let mut watch = BootWatch::default();
         // Xcode not known yet, Android SDK found: a round listing nothing.
         assert!(watch.observe_listed(set(&[]), &[]).is_empty());
@@ -170,6 +173,19 @@ mod tests {
         assert!(watch.observe_listed(set(&["A", "B"]), &ios).is_empty());
         assert_eq!(watch.is_booted(&DeviceId("avd:Pixel".into())), None);
         assert_eq!(watch.observe_listed(set(&["avd:Pixel"]), &android), Vec::<WatchEvent>::new(), "iOS not asked, Android new");
+    }
+
+    /// A real iPhone is iOS but not `simctl`'s: a `simctl`-only round never
+    /// reads it as shut down, and neither does an `adb` round a phone.
+    #[test]
+    fn a_simctl_round_never_shuts_down_a_real_device() {
+        let iphone = DeviceId("iosdev:00008110-001A2C3E0A88401E".into());
+        let mut watch = BootWatch::default();
+        let all = [Source::Simctl, Source::Adb, Source::Devicectl];
+        assert!(watch.observe_listed(set(&["A", "iosdev:00008110-001A2C3E0A88401E", "adb:R58"]), &all).is_empty());
+        assert!(watch.observe_listed(set(&["A"]), &[Source::Simctl]).is_empty(), "nobody asked devicectl or adb");
+        assert_eq!(watch.is_booted(&iphone), None);
+        assert_eq!(watch.is_booted(&DeviceId("A".into())), Some(true));
     }
 
     #[test]

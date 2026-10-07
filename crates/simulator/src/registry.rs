@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState, Platform};
+use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState, Source};
 
 /// An owned device is shut down this long after its last detach, unless
 /// Settings chose another delay (or never: [`Registry::set_idle_shutdown`]).
@@ -208,7 +208,9 @@ impl<S: Clone> Registry<S> {
             reg.device_mut(&udid).attached.insert(worktree.clone());
             reg.attachments.insert(worktree, udid);
         }
-        for udid in snapshot.owned_boots {
+        // A real device is never ours: an owned one in an old (or tampered)
+        // snapshot is dropped, never shut down.
+        for udid in snapshot.owned_boots.into_iter().filter(|u| !u.is_physical()) {
             let device = reg.device_mut(&udid);
             device.owned = true;
             if device.attached.is_empty() {
@@ -266,8 +268,8 @@ impl<S: Clone> Registry<S> {
                     _ => {
                         device.restarts = 0;
                         device.idle_since = None;
-                        let mut effects = vec![start_or_boot(device, &udid, booted, generation)];
-                        if !booted {
+                        let mut effects: Vec<Effect<S>> = start_or_boot(device, &udid, booted, generation).into_iter().collect();
+                        if !booted && device.owned {
                             // Now an owned boot: saved at once, so a crash
                             // before quit still leaves it ours to shut down.
                             effects.push(Effect::Persist);
@@ -296,7 +298,7 @@ impl<S: Clone> Registry<S> {
             Phase::Idle | Phase::Parked | Phase::Disconnected { .. } | Phase::Failed { .. } => {
                 device.restarts = 0;
                 device.paused = false;
-                effects.push(start_or_boot(device, &udid, booted, generation));
+                effects.extend(start_or_boot(device, &udid, booted, generation));
             }
         }
         effects.push(Effect::Persist);
@@ -380,8 +382,8 @@ impl<S: Clone> Registry<S> {
             effects.push(Effect::Persist);
         }
         // Ours for certain now, even if a watcher poll racing the boot
-        // cleared it in between.
-        if result == BootResult::Booted && !device.owned {
+        // cleared it in between. Never a real device, whatever was reported.
+        if result == BootResult::Booted && !device.owned && !udid.is_physical() {
             device.owned = true;
             effects.push(Effect::Persist);
         }
@@ -471,8 +473,8 @@ impl<S: Clone> Registry<S> {
         device.restarts = 0;
         device.paused = false;
         device.hidden_since = None;
-        effects.push(start_or_boot(device, udid, booted, generation));
-        if !booted {
+        effects.extend(start_or_boot(device, udid, booted, generation));
+        if !booted && device.owned {
             effects.push(Effect::Persist); // now an owned boot
         }
         effects
@@ -519,15 +521,16 @@ impl<S: Clone> Registry<S> {
     ///
     /// Only apply a set listed while [`Registry::generation`] stood still: a
     /// boot that finished during the listing would be misread as a shutdown.
-    /// And only for the platforms the set covers (`listed`): a round that
-    /// skipped Android (or iOS) says nothing about those devices, and reading
-    /// it as "shut down" would drop the ownership the idle rule needs.
-    pub fn reconcile_booted(&mut self, booted: &BTreeSet<DeviceId>, listed: &[Platform]) -> Vec<Effect<S>> {
+    /// And only for the sources the set covers (`listed`): a round that
+    /// skipped `adb` (or `simctl`, or `devicectl`) says nothing about those
+    /// devices, and reading it as "shut down" would drop the ownership the
+    /// idle rule needs — or disconnect a live phone.
+    pub fn reconcile_booted(&mut self, booted: &BTreeSet<DeviceId>, listed: &[Source]) -> Vec<Effect<S>> {
         let gone: Vec<DeviceId> = self
             .devices
             .iter()
             .filter(|(udid, d)| {
-                listed.contains(&udid.platform())
+                listed.contains(&udid.source())
                     && !booted.contains(*udid)
                     && !matches!(d.phase, Phase::Booting { .. })
                     && (d.owned || matches!(d.phase, Phase::Live { .. } | Phase::Starting { .. } | Phase::Parked))
@@ -613,11 +616,15 @@ impl<S: Clone> Registry<S> {
     }
 }
 
-/// Boot the device (we then own it) or, already booted, start a session.
-fn start_or_boot<S>(device: &mut Device<S>, udid: &DeviceId, booted: bool, generation: Generation) -> Effect<S> {
+/// Boot the device (we then own it) or, already booted, start a session. A
+/// real device is never booted or owned: one that is not connected fails.
+fn start_or_boot<S>(device: &mut Device<S>, udid: &DeviceId, booted: bool, generation: Generation) -> Option<Effect<S>> {
     if booted {
         device.phase = Phase::Starting { generation };
-        Effect::StartSession { udid: udid.clone(), generation }
+        Some(Effect::StartSession { udid: udid.clone(), generation })
+    } else if udid.is_physical() {
+        device.phase = Phase::Failed { error: not_connected(udid) };
+        None
     } else {
         let cancel = Arc::new(AtomicBool::new(false));
         device.boot_cancel = Some(cancel.clone());
@@ -625,7 +632,15 @@ fn start_or_boot<S>(device: &mut Device<S>, udid: &DeviceId, booted: bool, gener
         // still leaves a device we started, which the idle rule must stop.
         device.owned = true;
         device.phase = Phase::Booting { generation };
-        Effect::Boot { udid: udid.clone(), generation, cancel }
+        Some(Effect::Boot { udid: udid.clone(), generation, cancel })
+    }
+}
+
+/// Why a real device that is not listed as connected cannot start.
+fn not_connected(udid: &DeviceId) -> String {
+    match udid.source() {
+        Source::Devicectl => "The iPhone is not connected.".into(),
+        _ => "The phone is not connected (or USB debugging is not allowed on it).".into(),
     }
 }
 
@@ -646,15 +661,14 @@ fn pause_if_hidden<S: Clone>(device: &mut Device<S>, now: Option<Instant>) -> Op
 /// else the preferred device (Settings), else the iPhone on the newest
 /// runtime. Returns the device and whether it is already booted.
 pub fn auto_pick<'a>(devices: &'a [DeviceInfo], preferred: Option<&DeviceId>) -> Option<(&'a DeviceInfo, bool)> {
-    let usable = |d: &&DeviceInfo| d.is_available && d.kind != DeviceKind::Other;
-    // A USB phone is someone's own device: only ever picked by name (or as
-    // the default device the user chose), never automatically.
-    let automatic = |d: &&DeviceInfo| usable(d) && !matches!(crate::android::Target::from_id(&d.udid), Some(crate::android::Target::Serial(_)));
+    // A real device (a phone, an iPhone) is someone's own: only ever picked
+    // by name, never automatically — not even as the Settings default.
+    let automatic = |d: &&DeviceInfo| d.is_available && d.kind != DeviceKind::Other && !d.udid.is_physical();
     let booted = |d: &DeviceInfo| d.state == DeviceState::Booted;
     if let Some(d) = devices.iter().filter(automatic).find(|d| booted(d) && d.kind == DeviceKind::Phone) {
         return Some((d, true));
     }
-    if let Some(d) = preferred.and_then(|p| devices.iter().filter(usable).find(|d| &d.udid == p)) {
+    if let Some(d) = preferred.and_then(|p| devices.iter().filter(automatic).find(|d| &d.udid == p)) {
         return Some((d, booted(d)));
     }
     devices

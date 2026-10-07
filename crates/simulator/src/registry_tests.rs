@@ -303,6 +303,7 @@ fn auto_pick_prefers_a_booted_iphone_then_the_setting_then_the_newest_iphone() {
         state: if booted { DeviceState::Booted } else { DeviceState::Shutdown },
         kind,
         is_available: true,
+        note: None,
     };
     let list = vec![
         d("PAD", DeviceKind::Tablet, "26.3", true),
@@ -348,10 +349,10 @@ fn a_restored_owned_device_seen_shut_down_is_no_longer_ours() {
     let snap = Snapshot { attachments: vec![(wt("a"), dev("U"))], owned_boots: vec![dev("U")] };
     let mut reg = Reg::restore(snap, now);
     assert!(reg.is_owned(&dev("U")));
-    assert_eq!(kinds(&reg.reconcile_booted(&booted(&[]), &[Platform::Ios])), ["persist"]);
+    assert_eq!(kinds(&reg.reconcile_booted(&booted(&[]), &[Source::Simctl])), ["persist"]);
     assert!(!reg.is_owned(&dev("U")));
     // The user boots it (Xcode Cmd+R); nothing we do shuts it down.
-    assert!(reg.reconcile_booted(&booted(&["U"]), &[Platform::Ios]).is_empty());
+    assert!(reg.reconcile_booted(&booted(&["U"]), &[Source::Simctl]).is_empty());
     reg.detach(&wt("a"), now);
     assert!(reg.tick(now + IDLE_SHUTDOWN * 3).is_empty());
     assert!(reg.quit().1.is_empty());
@@ -375,14 +376,14 @@ fn a_round_that_skipped_android_keeps_an_owned_emulator_ours() {
     };
     let mut reg = booted_by_us();
     reg.detach(&wt("a"), now);
-    assert!(reg.reconcile_booted(&booted(&[]), &[Platform::Ios]).is_empty());
+    assert!(reg.reconcile_booted(&booted(&[]), &[Source::Simctl]).is_empty());
     assert!(reg.is_owned(&avd), "an iOS-only round says nothing about Android");
     assert_eq!(reg.owned_devices(), vec![avd.clone()]);
     let fx = reg.tick(now + IDLE_SHUTDOWN * 2);
     assert!(fx.iter().any(|e| matches!(e, Effect::ShutdownDevice { udid } if udid == &avd)), "the idle rule shuts it down");
     // A round that did list Android and did not see it: shut down by someone.
     let mut reg = booted_by_us();
-    reg.reconcile_booted(&booted(&[]), &[Platform::Ios, Platform::Android]);
+    reg.reconcile_booted(&booted(&[]), &[Source::Simctl, Source::Adb]);
     assert!(!reg.is_owned(&avd));
 }
 
@@ -392,7 +393,7 @@ fn reconcile_leaves_a_booting_device_alone_and_disconnects_a_dead_session() {
     let mut reg = Reg::default();
     reg.attach(wt("a"), dev("B"), false, now); // Booting, not yet booted
     live(&mut reg, &wt("b"), &dev("L"), "s", now);
-    let fx = reg.reconcile_booted(&booted(&[]), &[Platform::Ios]);
+    let fx = reg.reconcile_booted(&booted(&[]), &[Source::Simctl]);
     assert_eq!(kinds(&fx), ["stop L s"]);
     assert!(reg.is_owned(&dev("B")), "mid-boot devices keep their ownership");
     assert!(matches!(reg.phase(&dev("L")), Phase::Disconnected { .. }));
@@ -617,12 +618,70 @@ fn a_usb_phone_is_never_picked_automatically() {
         state: if booted { DeviceState::Booted } else { DeviceState::Shutdown },
         kind: DeviceKind::Phone,
         is_available: true,
+        note: None,
     };
     let devices = [device("adb:R58M123ABC", true), device("avd:Medium_Phone", false)];
     let (picked, booted) = auto_pick(&devices, None).expect("the emulator");
     assert_eq!((picked.udid.as_str(), booted), ("avd:Medium_Phone", false));
-    // Chosen as the default device by the user: that is asking for it.
+    // Not even as the Settings default (an older build could save one): a
+    // real device attaches only when picked by name.
     let preferred = DeviceId("adb:R58M123ABC".into());
-    assert_eq!(auto_pick(&devices, Some(&preferred)).map(|(d, _)| d.udid.as_str()), Some("adb:R58M123ABC"));
+    assert_eq!(auto_pick(&devices, Some(&preferred)).map(|(d, _)| d.udid.as_str()), Some("avd:Medium_Phone"));
     assert!(auto_pick(&devices[..1], None).is_none());
+    assert!(auto_pick(&devices[..1], Some(&preferred)).is_none());
+}
+
+/// A real device is never booted or owned: attaching or reconnecting one
+/// that is not connected fails at once instead of booting it, and nothing
+/// makes it ours.
+#[test]
+fn a_real_device_is_never_booted_or_owned() {
+    let now = Instant::now();
+    for id in ["iosdev:00008110-001A2C3E0A88401E", "adb:R58M123ABC"] {
+        let mut reg = Reg::default();
+        let fx = reg.attach(wt("a"), dev(id), false, now);
+        assert_eq!(kinds(&fx), ["persist"], "{id}: no boot");
+        assert!(matches!(reg.phase(&dev(id)), Phase::Failed { .. }), "{:?}", reg.phase(&dev(id)));
+        assert!(!reg.is_owned(&dev(id)));
+        // The user's Reconnect while it is still unplugged.
+        assert!(kinds(&reg.reconnect(&dev(id), false)).is_empty(), "{id}: no boot on reconnect");
+        assert!(!reg.is_owned(&dev(id)));
+        // Plugged in: it starts, still not ours.
+        let fx = reg.reconnect(&dev(id), true);
+        assert_eq!(kinds(&fx), [format!("start {id}")]);
+        assert!(!reg.is_owned(&dev(id)));
+        assert!(reg.snapshot().owned_boots.is_empty());
+    }
+}
+
+/// An owned real device in a saved snapshot (an older build, a tampered
+/// row) is dropped on load: never shut down at idle or quit.
+#[test]
+fn a_persisted_owned_real_device_is_dropped() {
+    let now = Instant::now();
+    let snap = Snapshot { attachments: vec![(wt("a"), dev("adb:R58"))], owned_boots: vec![dev("adb:R58"), dev("iosdev:X"), dev("U")] };
+    let mut reg = Reg::restore(snap, now);
+    assert_eq!(reg.owned_devices(), vec![dev("U")]);
+    assert_eq!(reg.device_for(&wt("a")), Some(&dev("adb:R58")), "the attachment stays");
+    reg.detach(&wt("a"), now);
+    let fx = reg.tick(now + IDLE_SHUTDOWN * 2);
+    assert!(fx.iter().all(|e| !matches!(e, Effect::ShutdownDevice { udid } if udid.is_physical())), "{:?}", kinds(&fx));
+    assert!(reg.quit().1.iter().all(|u| !u.is_physical()));
+}
+
+/// RT-1: the watcher reconciles per source. A `simctl`-only round never
+/// disconnects a live iPhone (iOS, but `devicectl`'s), and a round without
+/// `adb` never disconnects a live phone.
+#[test]
+fn a_round_without_a_devices_source_leaves_it_alone() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (iphone, phone) = (dev("iosdev:00008110-001A2C3E0A88401E"), dev("adb:R58"));
+    live(&mut reg, &wt("a"), &iphone, "i", now);
+    live(&mut reg, &wt("b"), &phone, "p", now);
+    assert!(reg.reconcile_booted(&booted(&[]), &[Source::Simctl]).is_empty());
+    assert!(matches!(reg.phase(&iphone), Phase::Live { .. }) && matches!(reg.phase(&phone), Phase::Live { .. }));
+    // The phone's own source answered without it: unplugged.
+    assert_eq!(kinds(&reg.reconcile_booted(&booted(&[]), &[Source::Simctl, Source::Adb])), ["stop adb:R58 p"]);
+    assert!(matches!(reg.phase(&iphone), Phase::Live { .. }));
 }

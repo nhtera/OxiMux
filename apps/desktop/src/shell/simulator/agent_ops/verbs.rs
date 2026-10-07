@@ -20,12 +20,14 @@ use oximux_simulator::agent::{self, InstallPathError};
 use oximux_simulator::ax::{self, AxNode, Query};
 use oximux_simulator::geometry::{self, Size};
 use oximux_simulator::protocol::{Command, KeyPhase, TouchPhase};
+use oximux_simulator::caps::{self, ButtonSet, DeviceCaps};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::StreamSession;
+use oximux_simulator::simctl::SimUdid;
 use oximux_simulator::{Button, DeviceId, Orientation, Platform, keyboard, simctl};
 
 use super::Target;
-use crate::shell::simulator::hub::{SimulatorHub, Wake, home_button, paste_now};
+use crate::shell::simulator::hub::{InstallAnswer, SimulatorHub, Wake, home_button, paste_now};
 
 /// How long a woken device may take to start streaming: a cold boot of a
 /// shut-down device measured 40-odd seconds on an M-series Mac.
@@ -63,6 +65,19 @@ pub(super) async fn run(
     target: &Target,
     cx: &mut AsyncApp,
 ) -> Out {
+    // A real device does only what its class can, and opens only web links:
+    // a custom scheme can dial, pay or message on someone's own phone.
+    // Phase 8: for_session — an iPhone's runner adds touch and keys.
+    if udid.is_physical() {
+        if let Some(what) = refused_on(&DeviceCaps::for_id(udid), &cmd) {
+            return Err(SimErrorWire::Refused(caps::refuse(what, udid)));
+        }
+        if let SimCmdWire::OpenUrl { url } = &cmd
+            && !is_web_url(url)
+        {
+            return Err(SimErrorWire::Refused("only http and https links open on a real device".into()));
+        }
+    }
     // Input takes turns per device: interleaved touch streams from parallel
     // calls would make gestures nobody asked for.
     let input = matches!(cmd, SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_));
@@ -208,9 +223,9 @@ pub(super) async fn run(
             on_own_thread(move || {
                 if relaunch {
                     // Not running is fine: launching is what matters.
-                    let _ = simctl::terminate(&SystemRunner, udid.as_str(), &bundle_id, APP_TIMEOUT);
+                    let _ = simctl::terminate(&SystemRunner, &udid, &bundle_id, APP_TIMEOUT);
                 }
-                simctl::launch(&SystemRunner, udid.as_str(), &bundle_id, APP_TIMEOUT)
+                simctl::launch(&SystemRunner, &udid, &bundle_id, APP_TIMEOUT)
             })
             .await?
                 .map(|()| SimReplyWire::Done)
@@ -224,14 +239,20 @@ pub(super) async fn run(
         SimCmdWire::OpenUrl { url } => {
             agent::check_url(&url).map_err(SimErrorWire::BadInput)?;
             let udid = simctl_ready(hub, udid, cx).await?;
-            on_own_thread(move || simctl::open_url(&SystemRunner, udid.as_str(), url.trim(), APP_TIMEOUT))
+            on_own_thread(move || simctl::open_url(&SystemRunner, &udid, url.trim(), APP_TIMEOUT))
                 .await?
                 .map(|()| SimReplyWire::Done)
                 .map_err(|e| SimErrorWire::Failed(format!("could not open the URL: {e}")))
         }
         SimCmdWire::Install { path } if udid.platform() == Platform::Android => {
             let apk = super::android::apk_path(&path, &target.worktree)?;
+            // Every real device's Install arm calls `confirm_install`, after
+            // the device is reachable: an unplugged phone is not worth a
+            // question.
             let device = android_device(hub, udid, cx).await?;
+            if udid.is_physical() {
+                confirm_install(hub, udid, name, &apk, target, cx).await?;
+            }
             on_own_thread(move || device.install(&apk)).await?.map(|()| SimReplyWire::Done)
         }
         SimCmdWire::Install { path } => {
@@ -239,14 +260,11 @@ pub(super) async fn run(
             let worktree = target.worktree.clone();
             on_own_thread(move || {
                 let app = install_path(&path, &worktree)?;
-                simctl::install(&SystemRunner, udid.as_str(), &app, INSTALL_TIMEOUT)
+                simctl::install(&SystemRunner, &udid, &app, INSTALL_TIMEOUT)
                     .map_err(|e| SimErrorWire::Failed(format!("install failed: {e}")))
             })
             .await?
             .map(|()| SimReplyWire::Done)
-        }
-        SimCmdWire::Shutdown { .. } if SimulatorHub::is_phone(udid) => {
-            Err(SimErrorWire::Refused("this is a phone; OxiMux never shuts one down".into()))
         }
         SimCmdWire::Shutdown { force } => {
             let refused = hub
@@ -321,14 +339,90 @@ async fn android_device(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut As
     super::android::Device::of(&session, adb)
 }
 
-/// `simctl` app verbs need Xcode and a booted device: wake it as the screen
-/// verbs do (a live stream means it is booted).
-async fn simctl_ready(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<DeviceId, SimErrorWire> {
+/// `simctl` app verbs need a simulator, Xcode and a booted device: wake it as
+/// the screen verbs do (a live stream means it is booted).
+async fn simctl_ready(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<SimUdid, SimErrorWire> {
+    let sim = simctl_udid(udid)?;
     if !hub.read_with(cx, |hub, _| hub.xcode_ok()) {
         return Err(SimErrorWire::Unavailable("Xcode was not found; see `oximux sim status`".into()));
     }
     live_session(hub, udid, cx).await?;
-    Ok(udid.clone())
+    Ok(sim)
+}
+
+/// `udid` as a `simctl` argument. A real iPhone's app verbs are not built
+/// yet: when they are, their arm must ask `confirm_install` like Android's.
+fn simctl_udid(udid: &DeviceId) -> Result<SimUdid, SimErrorWire> {
+    udid.sim_udid()
+        .ok_or_else(|| SimErrorWire::Unavailable("app verbs on a real iPhone are not available in this version of OxiMux".into()))
+}
+
+/// The capability `cmd` needs that `caps` lacks, named for [`caps::refuse`].
+fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static str> {
+    let (can, what) = match cmd {
+        SimCmdWire::Status | SimCmdWire::Devices | SimCmdWire::Attach { .. } | SimCmdWire::Detach => return None,
+        SimCmdWire::Screenshot { .. } => (caps.screenshot, "Screenshots"),
+        SimCmdWire::Ax { .. } => (caps.ax, "The accessibility tree"),
+        SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } => (caps.touch, "Touch input"),
+        SimCmdWire::Type { .. } => (caps.keys, "Typing"),
+        SimCmdWire::Button(button) => (caps.buttons.contains(button_set(*button)), "That button"),
+        SimCmdWire::Rotate(_) => (caps.rotate, "Rotation"),
+        SimCmdWire::Launch { .. } => (caps.launch, "Launching apps"),
+        SimCmdWire::OpenUrl { .. } => (caps.open_url, "Opening URLs"),
+        SimCmdWire::Install { .. } => (caps.install, "Installing apps"),
+        SimCmdWire::Shutdown { .. } => (caps.shutdown, "Shutting down"),
+    };
+    (!can).then_some(what)
+}
+
+fn button_set(button: SimButtonWire) -> ButtonSet {
+    match button {
+        SimButtonWire::Home => ButtonSet::HOME,
+        SimButtonWire::Lock => ButtonSet::LOCK,
+        SimButtonWire::Siri => ButtonSet::SIRI,
+        SimButtonWire::SideButton => ButtonSet::SIDE,
+        SimButtonWire::AppSwitcher => ButtonSet::APP_SWITCHER,
+        SimButtonWire::Back => ButtonSet::BACK,
+        SimButtonWire::VolumeUp => ButtonSet::VOLUME_UP,
+        SimButtonWire::VolumeDown => ButtonSet::VOLUME_DOWN,
+    }
+}
+
+/// An `http`/`https` URL (any case), the only kind a real device opens.
+fn is_web_url(url: &str) -> bool {
+    url.trim().split_once(':').is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+}
+
+/// Ask the user, in the worktree's panel, before an agent installs `app` on
+/// a real device — every time, whatever was allowed before — and wait (up
+/// to `INSTALL_ASK_TTL`) for the answer.
+async fn confirm_install(
+    hub: &Entity<SimulatorHub>,
+    udid: &DeviceId,
+    name: &str,
+    app: &Path,
+    target: &Target,
+    cx: &mut AsyncApp,
+) -> Result<(), SimErrorWire> {
+    let app_name = app.file_name().map_or_else(|| app.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let id = hub.update(cx, |hub, cx| hub.ask_install(udid, &target.worktree, name, &app_name, cx));
+    let (asked, what) = (target.clone(), format!("install {app_name} on {name}"));
+    super::with_root(cx, target, move |root, window, cx| {
+        let ids = (asked.project_id.clone(), asked.workspace_id.clone());
+        root.ask_simulator_consent(&asked.worktree, &asked.label, &what, ids, window, cx);
+    });
+    loop {
+        match hub.update(cx, |hub, _| hub.install_answer(id)) {
+            InstallAnswer::Allowed => return Ok(()),
+            InstallAnswer::Refused => return Err(SimErrorWire::Refused(format!("the user declined installing {app_name} on {name}"))),
+            InstallAnswer::Gone => {
+                return Err(SimErrorWire::Refused(format!(
+                    "the user did not confirm installing {app_name} on {name}; ask them, then retry"
+                )));
+            }
+            InstallAnswer::Pending => cx.background_executor().timer(Duration::from_millis(250)).await,
+        }
+    }
 }
 
 fn send(session: &StreamSession, command: Command) -> Result<(), SimErrorWire> {
@@ -476,4 +570,47 @@ fn install_path(path: &str, worktree: &Path) -> Result<PathBuf, SimErrorWire> {
         InstallPathError::NotAnApp => SimErrorWire::BadInput(format!("{} is not a built .app bundle", path.display())),
         InstallPathError::Outside => SimErrorWire::PathOutsideWorktree,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real device opens web links only: a custom scheme can dial, pay or
+    /// message on someone's own phone.
+    #[test]
+    fn only_web_links_open_on_a_real_device() {
+        for ok in ["https://example.com", "HTTP://localhost:3000/x", "  http://a"] {
+            assert!(is_web_url(ok), "{ok}");
+        }
+        for refused in ["tel:+15555550100", "sms:1", "myapp://pay?amount=1", "httpx://a", "file:///etc", "https"] {
+            assert!(!is_web_url(refused), "{refused}");
+        }
+    }
+
+    /// Each class refuses what it cannot do, named for one refusal wording;
+    /// an iPhone without its runner is not touched or typed into.
+    #[test]
+    fn real_devices_refuse_verbs_their_class_lacks() {
+        let phone = DeviceCaps::for_id(&DeviceId("adb:R58".into()));
+        assert_eq!(refused_on(&phone, &SimCmdWire::Shutdown { force: true }), Some("Shutting down"));
+        assert_eq!(refused_on(&phone, &SimCmdWire::Rotate(SimOrientationWire::LandscapeLeft)), Some("Rotation"));
+        assert_eq!(refused_on(&phone, &SimCmdWire::Button(SimButtonWire::Siri)), Some("That button"));
+        assert_eq!(refused_on(&phone, &SimCmdWire::Button(SimButtonWire::Back)), None);
+        assert_eq!(refused_on(&phone, &SimCmdWire::Install { path: "a.apk".into() }), None);
+        let iphone = DeviceCaps::for_id(&DeviceId("iosdev:00008110-001A2C3E0A88401E".into()));
+        assert_eq!(refused_on(&iphone, &SimCmdWire::Type { text: "hi".into(), paste: false }), Some("Typing"));
+        assert_eq!(refused_on(&iphone, &SimCmdWire::Ax { max: 10 }), Some("The accessibility tree"));
+        assert_eq!(refused_on(&iphone, &SimCmdWire::Screenshot { full: false }), None);
+    }
+
+    /// An iPhone's install (and launch, open-url) never reaches `simctl`, and
+    /// is unavailable until its own arm exists — which must ask the user, as
+    /// Android's does. Changing this test means adding that question.
+    #[test]
+    fn an_iphones_app_verbs_are_unavailable_not_simctl() {
+        let iphone = DeviceId("iosdev:00008110-001A2C3E0A88401E".into());
+        assert!(matches!(simctl_udid(&iphone), Err(SimErrorWire::Unavailable(_))));
+        assert!(simctl_udid(&DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into())).is_ok());
+    }
 }

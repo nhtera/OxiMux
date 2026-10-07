@@ -65,7 +65,7 @@ fn devices_text(hub: Option<&Entity<SimulatorHub>>, cx: &Context<SettingsModal>)
     }
     let groups = crate::shell::simulator::panel::device_groups(hub.devices());
     let count = |platform: Platform| -> usize {
-        groups.iter().flat_map(|(_, g)| g.iter()).filter(|d| d.udid.platform() == platform).count()
+        groups.iter().flat_map(|(_, g)| g.iter()).filter(|d| d.is_available && d.udid.platform() == platform).count()
     };
     let (ios, android) = (count(Platform::Ios), count(Platform::Android));
     match ios + android {

@@ -119,11 +119,13 @@ impl SimulatorHub {
     /// Save a full-resolution screenshot of `udid` to the Desktop and put it
     /// on the clipboard.
     pub fn screenshot(&self, udid: &DeviceId, cx: &mut Context<Self>) {
-        let android = udid.platform() == oximux_simulator::Platform::Android;
-        if !android && !self.xcode_ok() {
+        // Only a simulator has a `simctl` fallback: anything else needs its
+        // stream.
+        let sim = udid.sim_udid();
+        if sim.is_some() && !self.xcode_ok() {
             return;
         }
-        let (runner, target, session) = (self.runner.clone(), udid.clone(), self.session(udid));
+        let (runner, session) = (self.runner.clone(), self.session(udid));
         let (device, stamp) = (self.device_name(udid), stamp());
         let udid = udid.clone();
         cx.spawn(async move |this, cx| {
@@ -132,12 +134,11 @@ impl SimulatorHub {
                 .spawn(async move {
                     // The helper's is rotated like the stream; without one
                     // (parked, starting) simctl still has the device.
-                    let png = match session.map(|s| s.screenshot_png(SIMCTL_TIMEOUT)) {
-                        Some(Ok(png)) => png,
-                        Some(Err(e)) if android => return Err(e.to_string()),
-                        None if android => return Err("the device is not streaming".into()),
-                        _ => simctl::screenshot_png(runner.as_ref(), target.as_str(), SIMCTL_TIMEOUT)
-                            .map_err(|e| e.to_string())?,
+                    let png = match (session.map(|s| s.screenshot_png(SIMCTL_TIMEOUT)), sim) {
+                        (Some(Ok(png)), _) => png,
+                        (_, Some(sim)) => simctl::screenshot_png(runner.as_ref(), &sim, SIMCTL_TIMEOUT).map_err(|e| e.to_string())?,
+                        (Some(Err(e)), None) => return Err(e.to_string()),
+                        (None, None) => return Err("the device is not streaming".into()),
                     };
                     let path = capture_path(&capture_dir(), CaptureKind::Screenshot, &device, &stamp);
                     std::fs::write(&path, &png).map_err(|e| format!("could not write {}: {e}", path.display()))?;
@@ -171,9 +172,13 @@ impl SimulatorHub {
     }
 
     fn start_recording(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
-        if udid.platform() == oximux_simulator::Platform::Android {
-            self.start_android_recording(udid, cx);
-            return;
+        match udid.source() {
+            oximux_simulator::Source::Adb => return self.start_android_recording(udid, cx),
+            oximux_simulator::Source::Devicectl => {
+                let why = "Recording a real iPhone is not available in this version of OxiMux.";
+                return self.notice(udid, NoticeKind::Error, why, cx);
+            }
+            oximux_simulator::Source::Simctl => {}
         }
         if !self.xcode_ok() || !self.recording_starts.insert(udid.clone()) {
             return; // no Xcode, or a start is already in flight
@@ -339,7 +344,8 @@ impl SimulatorHub {
 /// before the first chord lands.
 pub(crate) fn paste_now(session: &StreamSession, udid: &DeviceId, text: &str, lock: &PasteLock) -> Result<(), String> {
     let _turn = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let keys = match simctl::pbcopy(&SystemRunner, udid.as_str(), text, SIMCTL_TIMEOUT) {
+    let sim = udid.sim_udid().ok_or_else(|| format!("{udid} is not a simulator"))?;
+    let keys = match simctl::pbcopy(&SystemRunner, &sim, text, SIMCTL_TIMEOUT) {
         Ok(()) => keyboard::paste_chord(),
         Err(e) if !keyboard::needs_paste(text) => {
             tracing::debug!(%udid, "simulator pbcopy failed ({e}); typing instead");

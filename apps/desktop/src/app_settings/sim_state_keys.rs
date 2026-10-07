@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use oximux_simulator::DeviceId;
 use oximux_simulator::registry::Snapshot;
-use oximux_storage::SettingsRepo;
+use oximux_storage::{SettingsRepo, SimApprovalRepo};
 
 /// JSON [`Snapshot`]: attachments + owned boots.
 pub const KEY_REGISTRY: &str = "sim_registry_v1";
@@ -22,6 +22,30 @@ pub const KEY_FEATURE_USED: &str = "sim_feature_used";
 /// JSON list of devices the user shut down from the panel (the power
 /// button's latch: agents may not boot them again).
 pub const KEY_STOPPED: &str = "sim_stopped_v1";
+
+/// `"1"` once approvals saved for real devices were revoked (agent access
+/// to a real device now lasts until OxiMux quits; it used to be saved).
+pub const KEY_PHYSICAL_CONSENT_MIGRATED: &str = "sim_physical_consent_migrated_v1";
+
+/// Revoke, once, every saved approval for a real device. Nothing reads them
+/// any more (see `AgentState::load`); this removes them from the database
+/// and from Settings' list. A failure is retried at the next launch.
+pub fn revoke_physical_approvals_once(repo: &SettingsRepo, approvals: &SimApprovalRepo) {
+    if matches!(repo.get(KEY_PHYSICAL_CONSENT_MIGRATED), Ok(Some(v)) if v == "1") {
+        return;
+    }
+    let Ok(saved) = approvals.list().inspect_err(|err| tracing::warn!(?err, "simulator approvals unreadable")) else { return };
+    for approval in saved.iter().filter(|a| DeviceId(a.udid.clone()).is_physical()) {
+        if let Err(err) = approvals.revoke(&approval.udid) {
+            tracing::warn!(?err, "a real device's saved approval was not revoked");
+            return;
+        }
+        tracing::info!(udid = %approval.udid, "revoked a saved approval: agent access to a real device lasts until OxiMux quits");
+    }
+    if let Err(err) = repo.set(KEY_PHYSICAL_CONSENT_MIGRATED, "1") {
+        tracing::warn!(?err, "physical consent migration not recorded");
+    }
+}
 
 /// The saved snapshot; empty when absent or unreadable (a lost attachment
 /// only costs one click, a panicking startup costs far more).
@@ -101,6 +125,25 @@ mod tests {
         assert_eq!(load_stopped(&repo), stopped);
         repo.set(KEY_STOPPED, "[oops").unwrap();
         assert!(load_stopped(&repo).is_empty());
+    }
+
+    /// Saved approvals for real devices are revoked once; simulators' and
+    /// emulators' stay, and a phone approved again later is not touched by a
+    /// second run (it is not saved anyway).
+    #[test]
+    fn physical_approvals_are_revoked_once() {
+        let db = open_memory().unwrap();
+        let (repo, approvals) = (SettingsRepo::new(db.clone()), SimApprovalRepo::new(db));
+        for udid in ["U-1", "avd:Pixel", "adb:R58M123", "iosdev:00008110-001A2C3E0A88401E"] {
+            approvals.grant(udid, "device").unwrap();
+        }
+        revoke_physical_approvals_once(&repo, &approvals);
+        let left: Vec<String> = approvals.list().unwrap().into_iter().map(|a| a.udid).collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left.iter().all(|u| !DeviceId(u.clone()).is_physical()));
+        approvals.grant("adb:R58M123", "phone").unwrap();
+        revoke_physical_approvals_once(&repo, &approvals);
+        assert_eq!(approvals.list().unwrap().len(), 3, "the migration ran once");
     }
 
     #[test]
