@@ -1,47 +1,50 @@
 #!/usr/bin/env bash
 #
-# Fetch the pinned, checksum-verified iOS Simulator helper for bundling into
-# OxiMux.app. The Simulator panel spawns `oximux-sim-helper`, a stdio-only
-# child that streams and drives one simulator.
+# Fetch the pinned, checksum-verified helpers of the Mobile Emulator panel for
+# bundling into OxiMux.app, both from one release:
+#   - `oximux-sim-helper`, a stdio-only child that streams and drives one
+#     iOS simulator;
+#   - `OxiMux Device Capture.app`, which streams a USB iPhone's screen. It is
+#     released unsigned: bundle-macos.sh signs it with the camera entitlement
+#     alone (assets/device-capture.entitlements).
 #
-# The helper is NOT built here and none of its source lives in this repo. It
-# is built and released by our fork of serve-sim (Apache-2.0):
+# Neither is built here and none of their source lives in this repo. They are
+# built and released by our fork of serve-sim (Apache-2.0):
 #   https://github.com/nhtera/serve-sim  (branch `oximux`, see oximux/README.md)
-# To use a locally built fork instead, point the OXIMUX_SIM_HELPER env override
-# at it (read by the simulator crate); this script is not involved.
+# To use a locally built fork instead, point the OXIMUX_SIM_HELPER /
+# OXIMUX_DEVICE_CAPTURE env overrides at it (read by the simulator crate);
+# this script is not involved.
 #
-# Output: target/bundle-tools/oximux-sim-helper (+ LICENSE, + .version stamp)
+# Output, in target/bundle-tools/:
+#   oximux-sim-helper (+ .LICENSE, + .version stamp)
+#   OxiMux Device Capture.app (+ oximux-device-capture.version stamp)
 #
-# The sha256 is pinned HERE, not read from the release's own .sha256 asset:
-# a replaced release asset must fail the build, not re-pin itself.
+# The sha256s are pinned HERE, not read from the release's own .sha256
+# assets: a replaced release asset must fail the build, not re-pin itself.
 #
-# Caching: if the output exists and the stamp matches the pinned version, this
-# is a no-op, so offline rebuilds keep working once fetched. A checksum
-# mismatch is always fatal.
+# Caching: an output whose stamp matches its pin is not fetched again, so
+# offline rebuilds keep working once fetched. A checksum mismatch is always
+# fatal.
 #
 # arm64 only: the OxiMux DMG is arm64-only and the helper release matches. On
 # any other host this warns and skips (exit 0) so an Intel dev bundle still
-# builds; the Simulator panel reports the missing helper as "unavailable".
+# builds; the panel reports the missing helpers as "unavailable".
 #
-# The fetched binary is never executed here: the pinned sha256 already fixes
-# its exact bytes, and running a freshly extracted binary during a build can
-# hang on a Mac whose XProtect scan is stuck.
+# The fetched binaries are never executed here: the pinned sha256 already
+# fixes their exact bytes, and running a freshly extracted binary during a
+# build can hang on a Mac whose XProtect scan is stuck.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-SIM_HELPER_VERSION="0.3.1"
-SIM_HELPER_SHA256="748cd346b977ef7cc4d9b1315a86745aa80c0c2b82eafc93b19673804ee04199"
+HELPER_VERSION="0.4.0"
+SIM_HELPER_SHA256="99123302115a6b303b8d39ba508bd04253b7d40f7485df7dc650366cac754fc4"
+CAPTURE_SHA256="02831df2bc8b45553bce7de7b64218a48285f00e16cf90d65a71c3621ee52b99"
 REPO="nhtera/serve-sim"
-
-NAME="oximux-sim-helper-${SIM_HELPER_VERSION}-macos-arm64"
-URL="https://github.com/${REPO}/releases/download/helper-v${SIM_HELPER_VERSION}/${NAME}.tar.gz"
+RELEASE="https://github.com/${REPO}/releases/download/helper-v${HELPER_VERSION}"
 
 OUT_DIR="target/bundle-tools"
-OUT_BIN="$OUT_DIR/oximux-sim-helper"
-OUT_LICENSE="$OUT_DIR/oximux-sim-helper.LICENSE"
-STAMP="$OUT_DIR/oximux-sim-helper.version"
-WANT="oximux-sim-helper ${SIM_HELPER_VERSION} [arm64] ${SIM_HELPER_SHA256}"
+CAPTURE_APP="OxiMux Device Capture.app"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "==> Simulator helper is macOS-only; skipping on $(uname -s)"
@@ -52,32 +55,66 @@ if [[ "$(uname -m)" != "arm64" ]]; then
     exit 0
 fi
 
-if [[ -x "$OUT_BIN" && -f "$OUT_LICENSE" && -f "$STAMP" && "$(cat "$STAMP")" == "$WANT" ]]; then
-    echo "==> Simulator helper up to date ($SIM_HELPER_VERSION), skipping fetch"
-    exit 0
-fi
-
 mkdir -p "$OUT_DIR"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/oximux-sim-helper.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-echo "==> Fetching ${NAME}.tar.gz"
-curl -fsSL --retry 3 -o "$WORK/${NAME}.tar.gz" "$URL"
+# Download `<name>.tar.gz`, check it against `sha`, and unpack it into $WORK.
+fetch() {
+    local name="$1" sha="$2"
+    echo "==> Fetching ${name}.tar.gz"
+    curl -fsSL --retry 3 -o "$WORK/${name}.tar.gz" "${RELEASE}/${name}.tar.gz"
+    # Pinned checksum: "<hex>  <file>" for shasum -c, run where the file sits.
+    echo "${sha}  ${name}.tar.gz" > "$WORK/${name}.tar.gz.sha256"
+    (cd "$WORK" && shasum -a 256 -c "${name}.tar.gz.sha256")
+    tar -xzf "$WORK/${name}.tar.gz" -C "$WORK"
+}
 
-# Pinned checksum: "<hex>  <file>" for shasum -c, run where the file sits.
-echo "${SIM_HELPER_SHA256}  ${NAME}.tar.gz" > "$WORK/${NAME}.tar.gz.sha256"
-(cd "$WORK" && shasum -a 256 -c "${NAME}.tar.gz.sha256")
-
-tar -xzf "$WORK/${NAME}.tar.gz" -C "$WORK"
-for f in oximux-sim-helper LICENSE; do
-    if [[ ! -f "$WORK/$NAME/$f" ]]; then
-        echo "error: ${NAME}.tar.gz did not contain $NAME/$f — release layout changed?" >&2
+# Fail loudly when the release's layout is not what this script expects.
+require() {
+    local archive="$1" path="$2"
+    if [[ ! -e "$WORK/$path" ]]; then
+        echo "error: ${archive}.tar.gz did not contain $path — release layout changed?" >&2
         exit 1
     fi
-done
+}
 
-cp -f "$WORK/$NAME/oximux-sim-helper" "$OUT_BIN"
-cp -f "$WORK/$NAME/LICENSE" "$OUT_LICENSE"
-chmod 755 "$OUT_BIN"
-echo "$WANT" > "$STAMP"
-echo "==> $OUT_BIN ready ($SIM_HELPER_VERSION)"
+# --- The simulator helper -----------------------------------------------------
+name="oximux-sim-helper-${HELPER_VERSION}-macos-arm64"
+bin="$OUT_DIR/oximux-sim-helper"
+license="$OUT_DIR/oximux-sim-helper.LICENSE"
+stamp="$OUT_DIR/oximux-sim-helper.version"
+want="oximux-sim-helper ${HELPER_VERSION} [arm64] ${SIM_HELPER_SHA256}"
+if [[ -x "$bin" && -f "$license" && -f "$stamp" && "$(cat "$stamp")" == "$want" ]]; then
+    echo "==> Simulator helper up to date ($HELPER_VERSION), skipping fetch"
+else
+    fetch "$name" "$SIM_HELPER_SHA256"
+    require "$name" "$name/oximux-sim-helper"
+    require "$name" "$name/LICENSE"
+    cp -f "$WORK/$name/oximux-sim-helper" "$bin"
+    cp -f "$WORK/$name/LICENSE" "$license"
+    chmod 755 "$bin"
+    echo "$want" > "$stamp"
+    echo "==> $bin ready ($HELPER_VERSION)"
+fi
+
+# --- The capture app -------------------------------------------------------------
+name="oximux-device-capture-${HELPER_VERSION}-macos-arm64"
+app="$OUT_DIR/$CAPTURE_APP"
+exe="$app/Contents/MacOS/oximux-device-capture"
+stamp="$OUT_DIR/oximux-device-capture.version"
+want="oximux-device-capture ${HELPER_VERSION} [arm64] ${CAPTURE_SHA256}"
+if [[ -x "$exe" && -f "$stamp" && "$(cat "$stamp")" == "$want" ]]; then
+    echo "==> Capture app up to date ($HELPER_VERSION), skipping fetch"
+else
+    fetch "$name" "$CAPTURE_SHA256"
+    require "$name" "$name/$CAPTURE_APP/Contents/MacOS/oximux-device-capture"
+    require "$name" "$name/$CAPTURE_APP/Contents/Info.plist"
+    rm -rf "$app"
+    # `ditto` keeps the bundle exactly as released (no signature yet: the
+    # bundle step signs it).
+    ditto "$WORK/$name/$CAPTURE_APP" "$app"
+    chmod 755 "$exe"
+    echo "$want" > "$stamp"
+    echo "==> $app ready ($HELPER_VERSION)"
+fi

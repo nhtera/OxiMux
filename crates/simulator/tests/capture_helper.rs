@@ -5,8 +5,9 @@
 //! each failure).
 //!
 //! The app is `$OXIMUX_DEVICE_CAPTURE` (a local build, e.g. the fork's
-//! `oximux/scripts/dev-app.sh`), else the release staged in
-//! `target/bundle-tools/`. When neither exists the tests skip loudly.
+//! `oximux/scripts/dev-app.sh`), else the release `scripts/fetch-sim-helper.sh`
+//! stages in `target/bundle-tools/`. When neither exists the tests skip
+//! loudly — except under CI, which fetches it first.
 #![cfg(target_os = "macos")]
 
 use std::io::Read as _;
@@ -35,7 +36,9 @@ macro_rules! require_capture_app {
         match capture_app() {
             Some(path) => path,
             None => {
-                eprintln!("SKIPPED: no capture app (set {CAPTURE_OVERRIDE}, or stage the release in target/bundle-tools)");
+                let why = format!("no capture app (run scripts/fetch-sim-helper.sh or set {CAPTURE_OVERRIDE})");
+                assert!(std::env::var_os("CI").is_none(), "{why}");
+                eprintln!("SKIPPED: {why}");
                 return;
             }
         }

@@ -167,6 +167,29 @@ jobs:
       - name: Build and sign OxiMux.app
         run: ./scripts/bundle-macos.sh --hardened --sign "$MACOS_SIGN_IDENTITY"
 
+      # Every run: the camera entitlement is the capture app's and nobody
+      # else's — the simulator helper carries none, and the capture app
+      # exactly the one (an iPhone's screen is a camera to macOS). No phone
+      # here, so this checks the signatures, not a stream.
+      - name: Check the helpers' entitlements
+        run: |
+          helper=dist/OxiMux.app/Contents/MacOS/oximux-sim-helper
+          capture="dist/OxiMux.app/Contents/Helpers/OxiMux Device Capture.app"
+          codesign --verify --strict "$helper"
+          if codesign -d --entitlements - "$helper" 2>/dev/null | grep -q .; then
+            echo "the simulator helper must carry no entitlements" >&2; exit 1
+          fi
+          codesign --verify --strict "$capture"
+          ents=$(codesign -d --entitlements - --xml "$capture" 2>/dev/null | plutil -convert json -o - -)
+          if [[ "$ents" != '{"com.apple.security.device.camera":true}' ]]; then
+            echo "the capture app must carry the camera entitlement alone, not: $ents" >&2; exit 1
+          fi
+          codesign -d --verbose=2 "$capture" 2>&1 | grep -q 'flags=.*runtime' \
+            || { echo "the capture app must have the hardened runtime" >&2; exit 1; }
+          if codesign -d --entitlements - --xml dist/OxiMux.app/Contents/MacOS/oximux 2>/dev/null | grep -q device.camera; then
+            echo "OxiMux itself must not carry the camera entitlement" >&2; exit 1
+          fi
+
       # Dry run only: prove the Developer-ID-signed, hardened-runtime helper
       # passes library validation when it dlopens Xcode's simulator
       # frameworks, by streaming real frames from a booted simulator.
