@@ -47,6 +47,29 @@ pub fn revoke_physical_approvals_once(repo: &SettingsRepo, approvals: &SimApprov
     }
 }
 
+/// JSON map of the phones OxiMux paired over Wi-Fi: mDNS instance
+/// (`adb-<id>`) → the phone's serial. In the database, not `simulator.toml`:
+/// it decides which network transport may join a phone's row (and its
+/// agent approval), and agents' tools write that file as a matter of course.
+pub const KEY_WIFI_PAIRED: &str = "sim_wifi_paired_v1";
+
+/// The phones paired over Wi-Fi; none when absent or unreadable (a lost map
+/// only shows a paired phone as "Not paired by OxiMux" until it pairs again).
+pub fn load_wifi_paired(repo: &SettingsRepo) -> std::collections::HashMap<String, String> {
+    match repo.get(KEY_WIFI_PAIRED) {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        _ => Default::default(),
+    }
+}
+
+pub fn save_wifi_paired(repo: &SettingsRepo, paired: &std::collections::HashMap<String, String>) {
+    let sorted: std::collections::BTreeMap<&String, &String> = paired.iter().collect();
+    let Ok(json) = serde_json::to_string(&sorted) else { return };
+    if let Err(err) = repo.set(KEY_WIFI_PAIRED, &json) {
+        tracing::warn!(?err, "paired Wi-Fi phones not saved");
+    }
+}
+
 /// The saved snapshot; empty when absent or unreadable (a lost attachment
 /// only costs one click, a panicking startup costs far more).
 pub fn load_snapshot(repo: &SettingsRepo) -> Snapshot {
@@ -144,6 +167,17 @@ mod tests {
         approvals.grant("adb:R58M123", "phone").unwrap();
         revoke_physical_approvals_once(&repo, &approvals);
         assert_eq!(approvals.list().unwrap().len(), 3, "the migration ran once");
+    }
+
+    #[test]
+    fn the_wifi_pairing_map_round_trips_and_a_corrupt_one_reads_as_empty() {
+        let repo = SettingsRepo::new(open_memory().unwrap());
+        assert!(load_wifi_paired(&repo).is_empty());
+        let paired = std::collections::HashMap::from([("adb-R58-x1".to_owned(), "R58".to_owned())]);
+        save_wifi_paired(&repo, &paired);
+        assert_eq!(load_wifi_paired(&repo), paired);
+        repo.set(KEY_WIFI_PAIRED, "{oops").unwrap();
+        assert!(load_wifi_paired(&repo).is_empty());
     }
 
     #[test]

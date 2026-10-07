@@ -28,6 +28,13 @@
 	<true/>
 	<key>NSInputMonitoringUsageDescription</key>
 	<string>OxiMux watches for the Escape key so you can stop an agent that is controlling your screen.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>OxiMux connects to Android phones on your network for wireless debugging.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_adb-tls-pairing._tcp</string>
+		<string>_adb-tls-connect._tcp</string>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>OxiMux uses the microphone for voice dictation.</string>
 	<key>NSRequiresAquaSystemAppearance</key>

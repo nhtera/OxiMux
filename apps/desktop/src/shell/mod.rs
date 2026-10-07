@@ -26,6 +26,7 @@ pub mod pane_group;
 pub mod panes;
 pub mod ports_panel;
 pub mod pr_dialog;
+pub mod qr;
 pub mod project_panes;
 pub mod right_sidebar;
 pub mod search_palette;

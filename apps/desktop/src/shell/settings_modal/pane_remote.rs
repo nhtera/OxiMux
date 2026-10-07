@@ -8,7 +8,7 @@
 //! **Pairing is its own act, not a side effect of binding.** The pane at rest holds
 //! no live code; "Pair a device" opens a sub-view, and opening that view is what
 //! mints the one-time secret it renders as a scannable QR (see
-//! [`pairing_qr`](super::pairing_qr)). Leaving the view — or closing the modal —
+//! [`qr`](crate::shell::qr)). Leaving the view — or closing the modal —
 //! retires the secret again.
 //!
 //! That split is what lets a second device pair without disturbing the first. The
@@ -363,7 +363,7 @@ fn pairing_qr_image(modal: &SettingsModal, ticket: &PairingTicket) -> Option<Arc
         return Some(image.clone());
     }
     // Render at 2x the on-screen size so the code stays crisp on a Retina display.
-    let png = super::pairing_qr::qr_png(&url, 8)?;
+    let png = crate::shell::qr::qr_png(&url, 8)?;
     let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
     *modal.qr_cache.borrow_mut() = Some((url, image.clone()));
     Some(image)

@@ -13,6 +13,7 @@ use super::Target;
 use super::adb::{Adb, AdbDevice, AdbState};
 use super::avd;
 use super::sdk::Sdk;
+use super::wifi;
 use crate::runner::Runner;
 use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState, Result, SimError};
 
@@ -26,6 +27,25 @@ pub type Identities = Mutex<HashMap<String, String>>;
 fn identities() -> &'static Identities {
     static IDENTITIES: OnceLock<Identities> = OnceLock::new();
     IDENTITIES.get_or_init(Identities::default)
+}
+
+/// Phones OxiMux paired over Wi-Fi: mDNS instance (`adb-<id>`) → the phone's
+/// own serial. Only these network transports join the phone's row; the app
+/// loads it from its database (never from a file agents can write) and
+/// keeps it current as phones are paired and forgotten.
+pub type PairedPhones = Mutex<HashMap<String, String>>;
+
+pub fn paired_phones() -> &'static PairedPhones {
+    static PAIRED: OnceLock<PairedPhones> = OnceLock::new();
+    PAIRED.get_or_init(PairedPhones::default)
+}
+
+/// `ip:port` transports OxiMux itself connected this run, → the serial it read
+/// over them. Memory only: an address is never remembered (its port changes),
+/// and nothing announced on the network can add to this.
+pub fn connected_here() -> &'static PairedPhones {
+    static CONNECTED: OnceLock<PairedPhones> = OnceLock::new();
+    CONNECTED.get_or_init(PairedPhones::default)
 }
 
 /// The serial an AVD was last seen running under (no adb call: for quitting).
@@ -46,12 +66,27 @@ pub fn running(runner: &dyn Runner, sdk: &Sdk, timeout: Duration) -> Result<BTre
 pub fn running_with(runner: &dyn Runner, sdk: &Sdk, timeout: Duration, known: &Identities) -> Result<BTreeMap<DeviceId, AdbDevice>> {
     let adb = Adb::new(runner, &sdk.adb());
     let all = adb.devices(timeout)?;
-    Ok(identify(&adb, all, known))
+    Ok(identify(&adb, all, known, paired_phones(), connected_here()))
 }
 
 /// The online devices of one `adb devices` listing, by the id the panel uses.
-fn identify(adb: &Adb<'_>, all: Vec<AdbDevice>, known: &Identities) -> BTreeMap<DeviceId, AdbDevice> {
-    let online: Vec<AdbDevice> = all.into_iter().filter(|d| d.state == AdbState::Device).collect();
+/// A phone is one id across its transports: USB first, then a Wi-Fi
+/// transport OxiMux paired — adb's reconnect under the instance in `paired`,
+/// or the address OxiMux connected this run (`connected`). Any other network
+/// transport keeps an id of its own: what the network announces never merges
+/// anything.
+fn identify(
+    adb: &Adb<'_>,
+    all: Vec<AdbDevice>,
+    known: &Identities,
+    paired: &PairedPhones,
+    connected: &PairedPhones,
+) -> BTreeMap<DeviceId, AdbDevice> {
+    let mut online: Vec<AdbDevice> = all.into_iter().filter(|d| d.state == AdbState::Device).collect();
+    // USB before Wi-Fi: a phone on both streams over the cable.
+    online.sort_by_key(|d| wifi::is_network_transport(&d.serial));
+    let paired = paired.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let connected = connected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let mut known = known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // A serial that went away (or is booting again, offline) may come back
     // as another AVD: forget it.
@@ -78,6 +113,19 @@ fn identify(adb: &Adb<'_>, all: Vec<AdbDevice>, known: &Identities) -> BTreeMap<
                     continue;
                 }
             }
+        } else if wifi::is_network_transport(&device.serial) {
+            let serial = match wifi::tls_instance(&device.serial) {
+                Some(instance) => paired.get(instance).cloned(),
+                None => connected.get(&device.serial).cloned(),
+            };
+            match serial {
+                // A phone this Mac paired: its own row (behind USB if both).
+                Some(serial) => {
+                    out.entry(Target::Serial(serial).id()).or_insert(device);
+                    continue;
+                }
+                None => Target::Serial(device.serial.clone()),
+            }
         } else {
             Target::Serial(device.serial.clone())
         };
@@ -86,12 +134,18 @@ fn identify(adb: &Adb<'_>, all: Vec<AdbDevice>, known: &Identities) -> BTreeMap<
     out
 }
 
+/// A network transport OxiMux did not pair (`adb tcpip`, another tool's
+/// pairing): listed on its own, never merged into a phone's row.
+pub const NOT_PAIRED_HERE: &str = "Not paired by OxiMux";
+
 /// Phones adb lists that cannot be used yet, as disabled rows with why: one
 /// that has not approved this Mac, or an offline one. Emulators are left
 /// out (an offline one is still booting).
 fn unavailable(all: &[AdbDevice]) -> Vec<DeviceInfo> {
     all.iter()
-        .filter(|d| !d.is_emulator())
+        // A Wi-Fi transport that is not online is a dead one (wireless
+        // debugging toggled, the port moved): no row, no "reconnect the cable".
+        .filter(|d| !d.is_emulator() && !wifi::is_network_transport(&d.serial))
         .filter_map(|d| {
             let (state, note) = match &d.state {
                 AdbState::Device => return None,
@@ -137,7 +191,7 @@ pub fn list(runner: &dyn Runner, sdk: &Sdk, avd_home: Option<&Path>, timeout: Du
 fn list_with(runner: &dyn Runner, sdk: &Sdk, avd_home: Option<&Path>, timeout: Duration, known: &Identities) -> Result<Vec<DeviceInfo>> {
     let all = Adb::new(runner, &sdk.adb()).devices(timeout)?;
     let waiting = unavailable(&all);
-    let running = identify(&Adb::new(runner, &sdk.adb()), all, known);
+    let running = identify(&Adb::new(runner, &sdk.adb()), all, known, paired_phones(), connected_here());
     let avds = if sdk.has_emulator() { avd::list_avds(runner, &sdk.emulator(), timeout).unwrap_or_default() } else { Vec::new() };
     let mut out: Vec<DeviceInfo> = avds
         .iter()
@@ -163,7 +217,13 @@ fn list_with(runner: &dyn Runner, sdk: &Sdk, avd_home: Option<&Path>, timeout: D
             _ => continue,
         };
         let release = adb.getprop(&device.serial, "ro.build.version.release", QUICK).ok().filter(|v| !v.is_empty());
-        out.push(info(id.clone(), name, release.map(|r| format!("Android {r}")), true));
+        let mut row = info(id.clone(), name, release.map(|r| format!("Android {r}")), true);
+        if let Some(Target::Serial(serial)) = Target::from_id(id)
+            && wifi::is_network_transport(&serial)
+        {
+            row.note = Some(NOT_PAIRED_HERE.into());
+        }
+        out.push(row);
     }
     out.extend(waiting);
     Ok(out)
@@ -367,6 +427,41 @@ R58 unauthorized usb:2 transport_id:3
         let runner = ScriptedRunner::default().expect(&format!("{adb} devices -l"), CmdOutput::ok(listing));
         let states = phone_states(&runner, &sdk, QUICK).unwrap();
         assert_eq!(states.into_iter().collect::<Vec<_>>(), [("0A1B2C".into(), AdbState::Offline), ("R58".into(), AdbState::Unauthorized)]);
+    }
+
+    /// One phone, one row: a Wi-Fi transport OxiMux paired joins the phone's
+    /// id (behind USB when both are up) — under adb's mDNS name, or as the
+    /// address OxiMux connected. Anything else, even an address the network
+    /// announces under a paired name, stays on its own; no mDNS is asked.
+    #[test]
+    fn a_paired_wifi_phone_shares_its_usb_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk = sdk(dir.path());
+        let paired = PairedPhones::new(HashMap::from([("adb-R58-x1Y2".to_owned(), "R58".to_owned())]));
+        let connected = PairedPhones::new(HashMap::from([("192.168.1.5:37123".to_owned(), "R58".to_owned())]));
+        let device = |serial: &str| AdbDevice { serial: serial.into(), state: AdbState::Device, model: None };
+        let runner = ScriptedRunner::default(); // no adb call at all
+        let adb = Adb::new(&runner, &sdk.adb());
+
+        let both = vec![device("adb-R58-x1Y2._adb-tls-connect._tcp"), device("R58"), device("192.168.1.9:5555")];
+        let ids = identify(&adb, both, &Identities::default(), &paired, &connected);
+        let got: Vec<(String, String)> = ids.iter().map(|(id, d)| (id.0.clone(), d.serial.clone())).collect();
+        assert_eq!(got, [("adb:192.168.1.9:5555".to_owned(), "192.168.1.9:5555".to_owned()), ("adb:R58".into(), "R58".into())], "USB wins; the tcpip one is its own");
+
+        // Wi-Fi only, by the address OxiMux connected: the phone's row.
+        let ids = identify(&adb, vec![device("192.168.1.5:37123")], &Identities::default(), &paired, &connected);
+        assert_eq!(ids.get(&DeviceId("adb:R58".into())).map(|d| d.serial.as_str()), Some("192.168.1.5:37123"));
+        // Any other address keeps its own row, whatever is announced for it.
+        let ids = identify(&adb, vec![device("192.168.1.66:5555")], &Identities::default(), &paired, &connected);
+        assert!(ids.contains_key(&DeviceId("adb:192.168.1.66:5555".into())) && !ids.contains_key(&DeviceId("adb:R58".into())));
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// A dead Wi-Fi transport (wireless debugging toggled) leaves no row.
+    #[test]
+    fn a_dead_wifi_transport_is_not_listed() {
+        let rows = unavailable(&[AdbDevice { serial: "192.168.1.5:37123".into(), state: AdbState::Offline, model: None }]);
+        assert!(rows.is_empty());
     }
 
     #[test]

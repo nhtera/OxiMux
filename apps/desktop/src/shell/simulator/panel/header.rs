@@ -226,7 +226,21 @@ pub(super) fn device_menu(
             );
         }
     }
-    let refresh = panel.clone();
+    let (refresh, pair) = (panel.clone(), panel.clone());
+    menu = menu.separator().item(PopupMenuItem::new("Pair over Wi-Fi…").on_click(move |_, window, cx| {
+        let _ = pair.update(cx, |panel, cx| panel.open_pairing(window, cx));
+    }));
+    if let Some(udid) = current.filter(|u| crate::shell::simulator::SimulatorHub::paired_over_wifi(u)).cloned() {
+        let forget = panel.clone();
+        menu = menu.item(PopupMenuItem::new("Forget Wi-Fi phone").on_click(move |_, _window, cx| {
+            let udid = udid.clone();
+            let _ = forget.update(cx, |panel, cx| {
+                if let Some(hub) = panel.hub.clone() {
+                    hub.update(cx, |hub, cx| hub.forget_wifi(&udid, cx));
+                }
+            });
+        }));
+    }
     menu.separator()
         .item(PopupMenuItem::new("Refresh").on_click(move |_, _window, cx| {
             let _ = refresh.update(cx, |panel, cx| panel.refresh(cx));
@@ -234,11 +248,12 @@ pub(super) fn device_menu(
         .item(PopupMenuItem::new("Open Xcode").on_click(|_, _window, _cx| super::body::open_xcode()))
 }
 
-/// "Pixel 8 — Android 16", and for a device that cannot be used yet, why
-/// ("… · Unlock the phone and tap Allow USB debugging").
+/// "Pixel 8 — Android 16", with the row's note when it has one: why it cannot
+/// be used yet ("… · Unlock the phone and tap Allow USB debugging"), or what
+/// it is ("… · Not paired by OxiMux").
 pub(super) fn menu_label(device: &DeviceInfo) -> String {
     let label = format!("{} — {}", device.name, os_label(device));
-    match device.note.as_deref().filter(|_| !device.is_available) {
+    match device.note.as_deref() {
         Some(note) => format!("{label} · {note}"),
         None => label,
     }

@@ -73,6 +73,8 @@ pub enum HubEvent {
     /// A phone was plugged in, unplugged, or approved this Mac (the device
     /// list is being refreshed): a row may enable, a Reconnect may apply.
     PhysicalChanged,
+    /// A Wi-Fi pairing moved on (see [`SimulatorHub::pair_stage`]).
+    Pairing,
 }
 
 pub struct SimulatorHub {
@@ -123,6 +125,8 @@ pub struct SimulatorHub {
     physical_used: bool,
     /// The SDK in use has no emulator (a standalone `adb`): phones only.
     android_phones_only: bool,
+    /// The Wi-Fi pairing in progress, if any.
+    wifi: wifi::WifiPairing,
     /// An SDK was found before and is gone now (a `brew upgrade` mid-way):
     /// the tick keeps looking.
     android_sdk_lost: bool,
@@ -138,8 +142,11 @@ mod agent;
 mod android;
 mod capture;
 mod lifecycle;
+mod wifi;
 
 pub use agent::Wake;
+pub use wifi::PairStage;
+pub(crate) use wifi::can_submit;
 pub(crate) use agent::InstallAnswer;
 pub(crate) use android::list_all;
 pub use capture::NoticeKind;

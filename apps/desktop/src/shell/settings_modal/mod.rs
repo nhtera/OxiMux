@@ -31,7 +31,6 @@ mod pane_git;
 mod pane_integrations;
 mod pane_keybindings;
 mod pane_notifications;
-mod pairing_qr;
 mod pane_remote;
 mod pane_schedules;
 mod pane_terminal;

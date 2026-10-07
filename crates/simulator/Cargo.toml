@@ -20,6 +20,8 @@ fd-lock = "4"
 oximux-no-window.workspace = true
 oximux-proc-tree.workspace = true
 oximux-sibling-binary.workspace = true
+# Wi-Fi pairing secrets (QR service name and password), from the OS RNG.
+rand.workspace = true
 roxmltree = "0.21"
 serde.workspace = true
 serde_json.workspace = true

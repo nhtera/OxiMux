@@ -76,6 +76,9 @@ fn new_hub(
     let snapshot = sim_state_keys::load_snapshot(&repo);
     let feature_used = sim_state_keys::feature_used(&repo);
     sim_state_keys::revoke_physical_approvals_once(&repo, &approvals);
+    // Which Wi-Fi transports may join a phone's row (see `wifi`).
+    *oximux_simulator::android::devices::paired_phones().lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        sim_state_keys::load_wifi_paired(&repo);
     let mut agent = super::agent::AgentState::load(Some(approvals));
     agent.stopped = sim_state_keys::load_stopped(&repo);
     cx.new(|_| SimulatorHub {
@@ -106,6 +109,7 @@ fn new_hub(
         screen_off: HashSet::new(),
         android_phones_only: false,
         android_sdk_lost: false,
+        wifi: Default::default(),
         physical_used: false,
         phone_states: None,
     })
