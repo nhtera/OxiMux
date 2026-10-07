@@ -191,6 +191,8 @@ impl Recording {
                 started_at_unix: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
                 udid: Some(udid.0.clone()),
                 owner_pid: std::process::id(),
+                argv: Vec::new(),
+                process_start: None,
             };
             if let Err(e) = ledger.record(entry) {
                 tracing::warn!("could not record the screen recording in the child ledger: {e}");
