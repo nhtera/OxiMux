@@ -13,6 +13,8 @@
 #[cfg(target_os = "macos")]
 pub mod runner_client;
 #[cfg(target_os = "macos")]
+pub mod team;
+#[cfg(target_os = "macos")]
 pub mod usbmux;
 
 use std::path::Path;
