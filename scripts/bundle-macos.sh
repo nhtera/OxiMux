@@ -386,6 +386,7 @@ bundle_sim_helper() {
         "$APP_DIR/Contents/Resources/licenses/serve-sim-LICENSE"
     echo "==> Bundled oximux-sim-helper"
     bundle_capture_app
+    bundle_runner_sources
 }
 
 # The iPhone capture app (same release, same licence), into Contents/Helpers.
@@ -397,6 +398,19 @@ bundle_capture_app() {
     rm -rf "$APP_DIR/Contents/Helpers/$CAPTURE_APP"
     ditto "target/bundle-tools/$CAPTURE_APP" "$APP_DIR/Contents/Helpers/$CAPTURE_APP"
     echo "==> Bundled $CAPTURE_APP"
+}
+
+# The iPhone control runner's sources (a tarball; OxiMux builds it on the
+# user's Mac), into Contents/Resources. Data, not code: nothing to sign.
+bundle_runner_sources() {
+    local tarball
+    for tarball in target/bundle-tools/oximux-ios-runner-src-*.tar.gz; do
+        [[ -f "$tarball" ]] || return 0
+        mkdir -p "$APP_DIR/Contents/Resources"
+        rm -f "$APP_DIR"/Contents/Resources/oximux-ios-runner-src-*.tar.gz
+        cp -f "$tarball" "$APP_DIR/Contents/Resources/"
+        echo "==> Bundled $(basename "$tarball")"
+    done
 }
 
 # Fast path: refresh the bundled binary in place. Fail loudly if there
@@ -442,6 +456,7 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
         cp -f "target/bundle-tools/oximux-sim-helper" "$APP_DIR/Contents/MacOS/oximux-sim-helper"
     fi
     bundle_capture_app
+    bundle_runner_sources
     # The fresh binary carries no rpath, so re-copy the dylibs + re-add it.
     bundle_dylibs debug
     sign_bundle

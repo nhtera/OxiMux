@@ -7,6 +7,10 @@
 #   - `OxiMux Device Capture.app`, which streams a USB iPhone's screen. It is
 #     released unsigned: bundle-macos.sh signs it with the camera entitlement
 #     alone (assets/device-capture.entitlements).
+# and, from its own release, the iPhone control runner's **sources** (an
+# XCUITest project OxiMux builds on the user's Mac, signed with their team):
+#   - `oximux-ios-runner-src-<v>.tar.gz`, kept as the tarball (the app checks
+#     its sha256 again before every build: `runner_build::RUNNER_SHA256`).
 #
 # Neither is built here and none of their source lives in this repo. They are
 # built and released by our fork of serve-sim (Apache-2.0):
@@ -18,6 +22,7 @@
 # Output, in target/bundle-tools/:
 #   oximux-sim-helper (+ .LICENSE, + .version stamp)
 #   OxiMux Device Capture.app (+ oximux-device-capture.version stamp)
+#   oximux-ios-runner-src-<v>.tar.gz
 #
 # The sha256s are pinned HERE, not read from the release's own .sha256
 # assets: a replaced release asset must fail the build, not re-pin itself.
@@ -40,6 +45,9 @@ cd "$(dirname "$0")/.."
 HELPER_VERSION="0.4.0"
 SIM_HELPER_SHA256="99123302115a6b303b8d39ba508bd04253b7d40f7485df7dc650366cac754fc4"
 CAPTURE_SHA256="02831df2bc8b45553bce7de7b64218a48285f00e16cf90d65a71c3621ee52b99"
+RUNNER_VERSION="0.1.0"
+# Must equal `RUNNER_SHA256` in crates/simulator/src/ios_device/runner_build.rs.
+RUNNER_SHA256="f72fed55b3f4b00c30f700d6030196afd13ad72b1d24bb72df835126a1ed6667"
 REPO="nhtera/serve-sim"
 RELEASE="https://github.com/${REPO}/releases/download/helper-v${HELPER_VERSION}"
 
@@ -117,4 +125,17 @@ else
     chmod 755 "$exe"
     echo "$want" > "$stamp"
     echo "==> $app ready ($HELPER_VERSION)"
+fi
+
+# --- The iPhone runner's sources ------------------------------------------------
+tarball="oximux-ios-runner-src-${RUNNER_VERSION}.tar.gz"
+out="$OUT_DIR/$tarball"
+if [[ -f "$out" ]] && echo "${RUNNER_SHA256}  ${out}" | shasum -a 256 -c --status; then
+    echo "==> iPhone runner sources up to date ($RUNNER_VERSION), skipping fetch"
+else
+    echo "==> Fetching ${tarball}"
+    curl -fsSL --retry 3 -o "$WORK/$tarball" "https://github.com/${REPO}/releases/download/ios-runner-v${RUNNER_VERSION}/${tarball}"
+    (cd "$WORK" && echo "${RUNNER_SHA256}  ${tarball}" | shasum -a 256 -c)
+    cp -f "$WORK/$tarball" "$out"
+    echo "==> $out ready ($RUNNER_VERSION)"
 fi
