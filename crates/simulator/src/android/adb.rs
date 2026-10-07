@@ -182,6 +182,13 @@ impl<'a> Adb<'a> {
     }
 }
 
+/// Whether `dumpsys power` says the screen is on: `Awake`, or `Dreaming` (a
+/// screensaver while charging, which still streams). `Asleep` and `Dozing`
+/// stream no frames.
+pub fn parse_awake(dumpsys_power: &str) -> Option<bool> {
+    dumpsys_power.lines().find_map(|l| l.trim().strip_prefix("mWakefulness=")).map(|w| matches!(w.trim(), "Awake" | "Dreaming"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +215,15 @@ emulator-5556          offline transport_id:4\n\n";
         assert!(!devices[2].is_emulator());
         assert_eq!(devices[3].state, AdbState::Offline);
         assert!(parse_devices("List of devices attached\n\n").is_empty());
+    }
+
+    #[test]
+    fn wakefulness_reads_from_dumpsys_power() {
+        assert_eq!(parse_awake("POWER MANAGER\n  mWakefulness=Awake\n  mWakefulnessChanging=false\n"), Some(true));
+        assert_eq!(parse_awake("  mWakefulness=Dozing\r\n"), Some(false));
+        assert_eq!(parse_awake("  mWakefulness=Asleep\n"), Some(false));
+        assert_eq!(parse_awake("  mWakefulness=Dreaming\n"), Some(true), "a screensaver streams");
+        assert_eq!(parse_awake("no such line"), None);
     }
 
     #[test]

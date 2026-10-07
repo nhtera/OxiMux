@@ -24,6 +24,9 @@ use super::{HubEvent, SimulatorHub, simulator_dir};
 use crate::app_settings::simulator_settings::Resolution;
 
 const ADB_TIMEOUT: Duration = Duration::from_secs(15);
+/// The screen probe runs inside the shared watcher round: a wedged phone must
+/// not hold up simulator and unplug detection for long.
+const SCREEN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Every device this Mac can show: the iOS simulators (only with a resolvable
 /// Xcode — never `xcrun` without one) and the Android devices (only with an
@@ -68,6 +71,18 @@ pub(crate) fn phone_states(runner: &dyn Runner, sdk: &Sdk) -> Option<BTreeMap<St
     devices::phone_states(runner, sdk, ADB_TIMEOUT).inspect_err(|e| tracing::debug!("phone watch: {e}")).ok()
 }
 
+/// Each phone's screen state, for the watcher (`None`: no answer).
+/// Side by side: one slow phone must not add its timeout to every other's.
+pub(crate) fn screens_awake(runner: &(dyn Runner + Sync), sdk: &Sdk, phones: Vec<(DeviceId, String)>) -> Vec<(DeviceId, Option<bool>)> {
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = phones
+            .into_iter()
+            .map(|(udid, serial)| (udid, scope.spawn(move || devices::screen_awake(runner, sdk, &serial, SCREEN_PROBE_TIMEOUT))))
+            .collect();
+        probes.into_iter().map(|(udid, probe)| (udid, probe.join().unwrap_or(None))).collect()
+    })
+}
+
 /// Every booted device, for the watcher.
 pub(crate) fn booted_all(runner: &dyn Runner, xcode_ok: bool, sdk: Option<&Sdk>) -> Result<BTreeSet<DeviceId>> {
     let mut all = if xcode_ok { oximux_simulator::boot_watch::list_booted(runner)? } else { BTreeSet::new() };
@@ -90,12 +105,43 @@ impl SimulatorHub {
         self.android_sdk.as_ref()
     }
 
+    /// The SDK in use is a standalone `adb` with no emulator: phones only.
+    pub fn android_phones_only(&self) -> bool {
+        self.android_sdk.is_some() && self.android_phones_only
+    }
+
+    /// The `adb` in use went away (a `brew upgrade` deletes the versioned
+    /// folder a standalone one resolved to): look again. A stat, from the tick.
+    pub(super) fn recheck_android_sdk(&mut self, cx: &mut Context<Self>) {
+        // Also while it is still missing: mid-upgrade neither the old nor the
+        // new adb exists, and the first look finds nothing.
+        let gone = match &self.android_sdk {
+            Some(sdk) => !sdk.adb().is_file(),
+            None => self.android_sdk_lost,
+        };
+        if gone {
+            tracing::info!("adb went away; looking for the Android SDK again");
+            self.refresh_android_sdk(cx);
+        }
+    }
+
     /// Look for the SDK again (Settings changed its folder), off the UI thread.
     pub fn refresh_android_sdk(&mut self, cx: &mut Context<Self>) {
         let configured = crate::shell::simulator::panel::settings(cx).android_sdk;
         cx.spawn(async move |this, cx| {
-            let found = cx.background_executor().spawn(async move { discover(configured.as_deref()) }).await;
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let sdk = discover(configured.as_deref());
+                    let phones_only = sdk.as_ref().is_some_and(|s| !s.has_emulator());
+                    (sdk, phones_only)
+                })
+                .await;
+            let (found, phones_only) = found;
             let _ = this.update(cx, |hub, cx| {
+                hub.android_phones_only = phones_only;
+                // Lost: it was there before and is not now. Keep looking.
+                hub.android_sdk_lost = found.is_none() && (hub.android_sdk.is_some() || hub.android_sdk_lost);
                 if hub.android_sdk != found {
                     hub.android_sdk = found;
                     hub.refresh_devices(cx);
@@ -219,6 +265,10 @@ impl SimulatorHub {
     pub(super) fn start_android_recording(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         let serial = self.session(udid).and_then(|s| s.android().map(|a| a.serial().to_owned()));
         let (Some(serial), Some(sdk)) = (serial, self.android_sdk.clone()) else { return };
+        if self.screen_off(udid) {
+            // A sleeping screen records an empty movie.
+            return cx.emit(HubEvent::Notice(udid.clone(), super::NoticeKind::Error, "Wake the phone first: its screen is off.".into()));
+        }
         if !self.recording_starts.insert(udid.clone()) {
             return;
         }
@@ -253,6 +303,61 @@ impl SimulatorHub {
             tracing::info!("phone watch: a phone was plugged in, unplugged or approved");
             self.refresh_devices(cx);
             cx.emit(HubEvent::PhysicalChanged);
+        }
+    }
+
+    /// Whether `udid`'s screen is off (a phone, as the watcher last saw it).
+    pub fn screen_off(&self, udid: &DeviceId) -> bool {
+        self.screen_off.contains(udid)
+    }
+
+    /// Phones the watcher should ask about their screen: attached and
+    /// streaming, by serial.
+    pub(super) fn screens_to_watch(&self) -> Vec<(DeviceId, String)> {
+        self.registry
+            .attached_devices()
+            .into_iter()
+            .filter(|udid| udid.is_physical())
+            .filter_map(|udid| {
+                let serial = self.session(&udid)?.android()?.serial().to_owned();
+                Some((udid, serial))
+            })
+            .collect()
+    }
+
+    /// The watcher's view of those screens (`None`: no answer, no change).
+    /// A phone no longer watched forgets its state.
+    pub(super) fn observe_screens(&mut self, seen: Vec<(DeviceId, Option<bool>)>, cx: &mut Context<Self>) {
+        let watched: Vec<DeviceId> = seen.iter().map(|(u, _)| u.clone()).collect();
+        let mut changed: Vec<DeviceId> = self.screen_off.iter().filter(|u| !watched.contains(u)).cloned().collect();
+        self.screen_off.retain(|u| watched.contains(u));
+        for (udid, awake) in seen {
+            let flipped = match awake {
+                Some(false) => self.screen_off.insert(udid.clone()),
+                Some(true) => self.screen_off.remove(&udid),
+                None => false,
+            };
+            if flipped {
+                tracing::info!(%udid, off = self.screen_off.contains(&udid), "phone screen changed");
+                changed.push(udid);
+            }
+        }
+        for udid in changed {
+            cx.emit(HubEvent::Changed(udid));
+        }
+    }
+
+    /// The panel's Wake: turn a sleeping phone's screen on. Shown awake at
+    /// once; the next watch corrects it if the phone did not wake.
+    pub fn wake_screen(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
+        let Some(session) = self.session(udid) else { return };
+        if let Err(e) = session.press_android(oximux_simulator::android::input::AndroidButton::Wake) {
+            tracing::debug!(%udid, "phone wake failed: {e}");
+            return;
+        }
+        tracing::info!(%udid, "phone screen woken by the user");
+        if self.screen_off.remove(udid) {
+            cx.emit(HubEvent::Changed(udid.clone()));
         }
     }
 
@@ -394,6 +499,30 @@ mod tests {
             assert!(!hub.watching_phones(), "the lease ran out");
         });
         assert_eq!(changes.get(), 3, "first seen, approved, then unplugged");
+    }
+
+    /// The watcher's screen answers: a sleeping phone is marked (panels
+    /// hear of it), a silent answer changes nothing, and a phone no longer
+    /// watched (detached) forgets its state.
+    #[gpui::test]
+    fn a_sleeping_phone_is_marked_and_forgotten_once_detached(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        let phone = oximux_simulator::DeviceId("adb:R58".into());
+        hub.update(cx, |hub, cx| {
+            hub.observe_screens(vec![(phone.clone(), Some(false))], cx);
+            assert!(hub.screen_off(&phone));
+            hub.observe_screens(vec![(phone.clone(), None)], cx);
+            assert!(hub.screen_off(&phone), "no answer is no news");
+            hub.observe_screens(vec![(phone.clone(), Some(true))], cx);
+            assert!(!hub.screen_off(&phone));
+            hub.observe_screens(vec![(phone.clone(), Some(false))], cx);
+            hub.observe_screens(Vec::new(), cx);
+            assert!(!hub.screen_off(&phone), "not watched any more");
+            assert!(hub.screens_to_watch().is_empty(), "nothing streams");
+        });
     }
 
     #[test]

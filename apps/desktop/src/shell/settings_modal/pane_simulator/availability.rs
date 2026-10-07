@@ -23,6 +23,8 @@ const DISC: f32 = 18.0;
 /// Whether each platform is ready, and the line that says so.
 struct Platforms {
     android: (bool, String),
+    /// The SDK found is a standalone `adb`: phones, no emulators.
+    phones_only: bool,
     ios: (bool, String),
     /// Availability not answered yet: neither verdict is final.
     checking: bool,
@@ -32,7 +34,7 @@ fn platforms(hub: Option<&Entity<SimulatorHub>>, chosen_sdk: Option<&str>, cx: &
     let found = hub.and_then(|h| h.read(cx).android_sdk().map(|s| s.root.clone()));
     let android = (found.is_some(), android_summary_text(found.as_deref(), chosen_sdk.map(std::path::Path::new)));
     let Some(hub) = hub.map(|h| h.read(cx)) else {
-        return Platforms { android, ios: (false, "Needs an Apple silicon Mac.".into()), checking: false };
+        return Platforms { android, phones_only: false, ios: (false, "Needs an Apple silicon Mac.".into()), checking: false };
     };
     let ios = match hub.availability() {
         None => (false, "Not checked yet.".to_owned()),
@@ -49,7 +51,7 @@ fn platforms(hub: Option<&Entity<SimulatorHub>>, chosen_sdk: Option<&str>, cx: &
             }
         },
     };
-    Platforms { android, ios, checking: hub.availability().is_none() }
+    Platforms { android, phones_only: hub.android_phones_only(), ios, checking: hub.availability().is_none() }
 }
 
 /// "N devices detected", split by platform, from the hub's last listing.
@@ -105,7 +107,7 @@ pub(super) fn block(
             p.android.0,
             false,
             "Android SDK",
-            android_detail(&p.android.1, theme, density, typography),
+            android_detail(&p.android.1, p.phones_only, theme, density, typography),
             android_actions(chosen_sdk.is_some(), theme, density, typography, cx),
             theme,
             typography,
@@ -221,8 +223,9 @@ fn detail_text(text: impl Into<SharedString>, theme: Theme, typography: &Typogra
     div().text_size(px(typography.t_body_sm)).text_color(theme.fg_subtle).child(text.into()).into_any_element()
 }
 
-/// "Detected at <path>" with the path set in mono, or the summary as is.
-fn android_detail(summary: &str, theme: Theme, density: Density, typography: &Typography) -> AnyElement {
+/// "Detected at <path>" with the path set in mono, or the summary as is;
+/// `phones_only`: the adb found has no emulator beside it.
+fn android_detail(summary: &str, phones_only: bool, theme: Theme, density: Density, typography: &Typography) -> AnyElement {
     let Some(path) = summary.strip_prefix(ANDROID_FOUND) else { return detail_text(summary.to_owned(), theme, typography) };
     // One line: a long path shortens to "…" rather than running off the card
     // (gpui truncates only text that does not fit, so a short path shows whole).
@@ -245,6 +248,7 @@ fn android_detail(summary: &str, theme: Theme, density: Density, typography: &Ty
                 .text_color(theme.fg_muted)
                 .child(path.to_owned()),
         )
+        .when(phones_only, |row| row.child(div().flex_none().child(detail_text("· phones only, no emulator", theme, typography))))
         .into_any_element()
 }
 

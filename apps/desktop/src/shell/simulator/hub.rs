@@ -121,6 +121,13 @@ pub struct SimulatorHub {
     phone_watch_until: Option<Instant>,
     /// A real device was attached this run: phones stay watched.
     physical_used: bool,
+    /// The SDK in use has no emulator (a standalone `adb`): phones only.
+    android_phones_only: bool,
+    /// An SDK was found before and is gone now (a `brew upgrade` mid-way):
+    /// the tick keeps looking.
+    android_sdk_lost: bool,
+    /// Attached phones whose screen is off (they stream nothing).
+    screen_off: HashSet<DeviceId>,
     /// The phones (and their adb states) the last phone watch saw.
     phone_states: Option<std::collections::BTreeMap<String, oximux_simulator::android::adb::AdbState>>,
 }
@@ -819,6 +826,9 @@ impl SimulatorHub {
                         Phase::Live { generation: g } | Phase::Starting { generation: g } if g == generation);
                     for event in drained {
                         if let SessionEvent::Exited { code, fatal } = &event {
+                            if let Some(why) = fatal {
+                                tracing::info!(%udid, "stream ended: {why}");
+                            }
                             let still_booted = hub.watch.lock().unwrap().is_booted(&udid).unwrap_or(true);
                             let reason = fatal.clone().unwrap_or_else(|| format!("The stream helper exited{}.", oximux_simulator::exit_code_suffix(*code)));
                             let effects = hub.registry.session_exited(&udid, generation, still_booted, reason);
@@ -831,6 +841,12 @@ impl SimulatorHub {
                             if let SessionEvent::EncodingFallback(why) = &event {
                                 let text = format!("{why}. Pick H.264 in the stream row to try again.");
                                 cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, text));
+                            }
+                            // A phone that refuses injected input: once per session.
+                            if let SessionEvent::Error(why) = &event
+                                && why == oximux_simulator::android::server_log::INPUT_BLOCKED
+                            {
+                                cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, why.clone()));
                             }
                             cx.emit(HubEvent::Session(udid.clone(), event));
                         }

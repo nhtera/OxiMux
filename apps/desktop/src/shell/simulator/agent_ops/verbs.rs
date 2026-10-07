@@ -77,6 +77,12 @@ pub(super) async fn run(
         {
             return Err(SimErrorWire::Refused("only http and https links open on a real device".into()));
         }
+        // A sleeping phone streams nothing: a screen verb would only wait.
+        if needs_screen(&cmd) && hub.read_with(cx, |hub, _| hub.screen_off(udid)) {
+            return Err(SimErrorWire::Unavailable(
+                "the phone's screen is off; ask the user to press Wake in the Mobile Emulator panel".into(),
+            ));
+        }
     }
     // Input takes turns per device: interleaved touch streams from parallel
     // calls would make gestures nobody asked for.
@@ -388,6 +394,21 @@ fn button_set(button: SimButtonWire) -> ButtonSet {
     }
 }
 
+/// Verbs that read or drive the live screen (not the app verbs, which go
+/// through adb whether the screen is on or not).
+fn needs_screen(cmd: &SimCmdWire) -> bool {
+    matches!(
+        cmd,
+        SimCmdWire::Screenshot { .. }
+            | SimCmdWire::Ax { .. }
+            | SimCmdWire::Tap(_)
+            | SimCmdWire::Swipe { .. }
+            | SimCmdWire::Type { .. }
+            | SimCmdWire::Button(_)
+            | SimCmdWire::Rotate(_)
+    )
+}
+
 /// An `http`/`https` URL (any case), the only kind a real device opens.
 fn is_web_url(url: &str) -> bool {
     url.trim().split_once(':').is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
@@ -602,6 +623,15 @@ mod tests {
         assert_eq!(refused_on(&iphone, &SimCmdWire::Type { text: "hi".into(), paste: false }), Some("Typing"));
         assert_eq!(refused_on(&iphone, &SimCmdWire::Ax { max: 10 }), Some("The accessibility tree"));
         assert_eq!(refused_on(&iphone, &SimCmdWire::Screenshot { full: false }), None);
+    }
+
+    /// While a phone sleeps only the screen verbs wait on it; app verbs go
+    /// through adb either way.
+    #[test]
+    fn only_screen_verbs_need_the_screen() {
+        assert!(needs_screen(&SimCmdWire::Screenshot { full: false }) && needs_screen(&SimCmdWire::Ax { max: 1 }));
+        assert!(!needs_screen(&SimCmdWire::Launch { bundle_id: "a.b".into(), relaunch: false }));
+        assert!(!needs_screen(&SimCmdWire::Install { path: "a.apk".into() }) && !needs_screen(&SimCmdWire::Status));
     }
 
     /// An iPhone's install (and launch, open-url) never reaches `simctl`, and

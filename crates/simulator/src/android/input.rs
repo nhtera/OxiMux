@@ -21,6 +21,9 @@ pub enum AndroidButton {
     Back,
     VolumeUp,
     VolumeDown,
+    /// Turn a sleeping phone's screen on (the user's own click: OxiMux never
+    /// wakes a phone by itself).
+    Wake,
 }
 
 /// Held modifiers, for the meta state each key event carries (injected
@@ -71,6 +74,7 @@ pub fn android_button(button: AndroidButton) -> Vec<ControlMsg> {
         AndroidButton::Back => k::BACK,
         AndroidButton::VolumeUp => k::VOLUME_UP,
         AndroidButton::VolumeDown => k::VOLUME_DOWN,
+        AndroidButton::Wake => k::WAKEUP,
     })
 }
 

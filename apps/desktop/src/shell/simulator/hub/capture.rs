@@ -119,6 +119,10 @@ impl SimulatorHub {
     /// Save a full-resolution screenshot of `udid` to the Desktop and put it
     /// on the clipboard.
     pub fn screenshot(&self, udid: &DeviceId, cx: &mut Context<Self>) {
+        if self.screen_off(udid) {
+            // A sleeping screen captures black.
+            return self.notice(udid, NoticeKind::Error, "Wake the phone first: its screen is off.", cx);
+        }
         // Only a simulator has a `simctl` fallback: anything else needs its
         // stream.
         let sim = udid.sim_udid();

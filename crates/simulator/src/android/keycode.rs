@@ -10,6 +10,8 @@ pub const DPAD_RIGHT: u32 = 22;
 pub const VOLUME_UP: u32 = 24;
 pub const VOLUME_DOWN: u32 = 25;
 pub const POWER: u32 = 26;
+/// Turns the screen on (never off, unlike `POWER`).
+pub const WAKEUP: u32 = 224;
 pub const TAB: u32 = 61;
 pub const ENTER: u32 = 66;
 pub const DEL: u32 = 67;
