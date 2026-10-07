@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use gpui::Context;
+use gpui::{Context, EntityId};
 use oximux_simulator::android::adb::Adb;
 use oximux_simulator::android::devices::{connected_here, paired_phones};
 use oximux_simulator::android::wifi::{self, Outcome, QrResult, QrSecret};
@@ -35,16 +35,20 @@ pub enum PairStage {
     Pairing,
     Connecting,
     /// Paired, but the phone never advertised its connect port: ask for it
-    /// (the port on the phone's Wireless debugging screen).
-    NeedConnectPort { host: String },
+    /// (the port on the phone's Wireless debugging screen). `error`: the last
+    /// port tried did not connect (the form stays, to try another).
+    NeedConnectPort { host: String, error: Option<String> },
     /// Connected; the phone is in the device menu.
     Done { name: String },
     Failed(String),
 }
 
-/// The one pairing in progress.
+/// The one pairing in progress, app-wide.
 #[derive(Default)]
 pub(crate) struct WifiPairing {
+    /// The panel whose card started it: only that card shows it, submits to
+    /// it or cancels it (another window's card leaves it alone).
+    owner: Option<EntityId>,
     stage: PairStage,
     cancel: Arc<AtomicBool>,
     /// The QR code's payload while QR pairing runs (a secret: shown, never logged).
@@ -62,6 +66,8 @@ enum Step {
     /// could not be read (the phone then works, as a row of its own).
     Connected { instance: String, serial: String, name: String, addr: String },
     NeedPort { host: String, guid: Option<String> },
+    /// The port the user typed did not connect: ask again, still paired.
+    PortFailed { host: String, guid: Option<String>, why: String },
     Failed(String),
 }
 
@@ -73,13 +79,14 @@ pub(crate) fn can_submit(stage: &PairStage) -> bool {
 }
 
 impl SimulatorHub {
-    pub fn pair_stage(&self) -> &PairStage {
-        &self.wifi.stage
+    /// Where `owner`'s pairing stands (`Idle` when another card's runs).
+    pub fn pair_stage(&self, owner: EntityId) -> PairStage {
+        if self.wifi.owner == Some(owner) { self.wifi.stage.clone() } else { PairStage::Idle }
     }
 
-    /// The QR payload to draw while QR pairing waits for a scan.
-    pub fn pair_qr(&self) -> Option<&str> {
-        self.wifi.qr.as_deref()
+    /// The QR payload to draw while `owner`'s QR pairing waits for a scan.
+    pub fn pair_qr(&self, owner: EntityId) -> Option<&str> {
+        self.wifi.qr.as_deref().filter(|_| self.wifi.owner == Some(owner))
     }
 
     /// `Some(false)`: adb's mDNS is off, so QR pairing cannot work.
@@ -89,8 +96,8 @@ impl SimulatorHub {
 
     /// Pair with the code the phone shows ("Pair device with pairing code"):
     /// `addr` is its `ip:port`. The code goes to adb on stdin.
-    pub fn pair_with_code(&mut self, addr: String, code: String, cx: &mut Context<Self>) {
-        let Some(adb) = self.begin_pairing(PairStage::Pairing, cx) else { return };
+    pub fn pair_with_code(&mut self, owner: EntityId, addr: String, code: String, cx: &mut Context<Self>) {
+        let Some(adb) = self.begin_pairing(owner, PairStage::Pairing, cx) else { return };
         let cancel = self.wifi.cancel.clone();
         self.run_pairing(cx, move || {
             let adb = Adb::new(&SystemRunner, &adb);
@@ -99,6 +106,10 @@ impl SimulatorHub {
                 (other, _) => return Ok(failed(other)),
             };
             let host = wifi::host_of(&addr).to_owned();
+            // Closed while pairing: connect nothing nobody will record.
+            if cancel.load(Ordering::Acquire) {
+                return Err(SimError::Cancelled);
+            }
             Ok(match wifi::connect_after_pairing(&adb, &host, &cancel)? {
                 Some((service, outcome)) => connected(&adb, &service.addr, outcome, guid.or(Some(service.instance))),
                 None => Step::NeedPort { host, guid },
@@ -108,8 +119,8 @@ impl SimulatorHub {
 
     /// Show a QR code for "Pair device with QR code" and pair once the phone
     /// scans it (≤ two minutes; closing the card cancels).
-    pub fn pair_with_qr(&mut self, cx: &mut Context<Self>) {
-        let Some(adb_path) = self.begin_pairing(PairStage::WaitingForScan, cx) else { return };
+    pub fn pair_with_qr(&mut self, owner: EntityId, cx: &mut Context<Self>) {
+        let Some(adb_path) = self.begin_pairing(owner, PairStage::WaitingForScan, cx) else { return };
         let secret = QrSecret::new();
         self.wifi.qr = Some(secret.payload());
         let cancel = self.wifi.cancel.clone();
@@ -126,20 +137,27 @@ impl SimulatorHub {
 
     /// Paired, but not connected: connect to `host:port` (the port the phone's
     /// Wireless debugging screen shows).
-    pub fn connect_wifi(&mut self, host: String, port: String, cx: &mut Context<Self>) {
+    pub fn connect_wifi(&mut self, owner: EntityId, host: String, port: String, cx: &mut Context<Self>) {
         // The instance adb named when it paired (this card's pairing).
-        let guid = self.wifi.guid.clone();
-        let Some(adb) = self.begin_pairing(PairStage::Connecting, cx) else { return };
+        let guid = self.wifi.guid.clone().filter(|_| self.wifi.owner == Some(owner));
+        let Some(adb) = self.begin_pairing(owner, PairStage::Connecting, cx) else { return };
         self.run_pairing(cx, move || {
             let adb = Adb::new(&SystemRunner, &adb);
             let addr = format!("{host}:{}", port.trim());
-            let outcome = adb.connect(&addr)?;
-            Ok(connected(&adb, &addr, outcome, guid))
+            // A wrong or stale port keeps the form, to try another.
+            Ok(match connected(&adb, &addr, adb.connect(&addr)?, guid.clone()) {
+                Step::Failed(why) => Step::PortFailed { host, guid, why },
+                step => step,
+            })
         });
     }
 
-    /// Close the pairing card: stop waiting, forget the QR secret.
-    pub fn cancel_pairing(&mut self, cx: &mut Context<Self>) {
+    /// `owner`'s card closed: stop its pairing, forget the QR secret. Another
+    /// card's pairing is left alone.
+    pub fn cancel_pairing(&mut self, owner: EntityId, cx: &mut Context<Self>) {
+        if self.wifi.owner.is_some_and(|o| o != owner) {
+            return;
+        }
         self.wifi.cancel.store(true, Ordering::Release);
         self.wifi = WifiPairing { mdns: self.wifi.mdns, ..WifiPairing::default() };
         cx.emit(HubEvent::Pairing);
@@ -192,14 +210,15 @@ impl SimulatorHub {
 
     /// Start a pairing at `stage` (cancelling one in flight). `None` without
     /// an SDK.
-    fn begin_pairing(&mut self, stage: PairStage, cx: &mut Context<Self>) -> Option<std::path::PathBuf> {
+    fn begin_pairing(&mut self, owner: EntityId, stage: PairStage, cx: &mut Context<Self>) -> Option<std::path::PathBuf> {
         self.wifi.cancel.store(true, Ordering::Release);
         let Some(adb) = self.android_sdk.as_ref().map(|s| s.adb()) else {
+            self.wifi = WifiPairing { owner: Some(owner), mdns: self.wifi.mdns, ..WifiPairing::default() };
             self.wifi.stage = PairStage::Failed("The Android SDK (adb) was not found.".into());
             cx.emit(HubEvent::Pairing);
             return None;
         };
-        self.wifi = WifiPairing { stage, mdns: self.wifi.mdns, ..WifiPairing::default() };
+        self.wifi = WifiPairing { owner: Some(owner), stage, mdns: self.wifi.mdns, ..WifiPairing::default() };
         cx.emit(HubEvent::Pairing);
         Some(adb)
     }
@@ -250,7 +269,11 @@ impl SimulatorHub {
             }
             Ok(Step::NeedPort { host, guid }) => {
                 self.wifi.guid = guid;
-                PairStage::NeedConnectPort { host }
+                PairStage::NeedConnectPort { host, error: None }
+            }
+            Ok(Step::PortFailed { host, guid, why }) => {
+                self.wifi.guid = guid;
+                PairStage::NeedConnectPort { host, error: Some(why) }
             }
             Ok(Step::Failed(why)) => PairStage::Failed(why),
             Err(SimError::Cancelled) => PairStage::Idle,
@@ -312,6 +335,7 @@ fn connected(adb: &Adb<'_>, addr: &str, outcome: Outcome, instance: Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext as _;
 
     /// An Enter pressed twice (the key handler and the focused button's own
     /// click) must not send the code to a second `adb pair`, nor re-send it
@@ -319,7 +343,7 @@ mod tests {
     #[test]
     fn a_pairing_is_submitted_once() {
         assert!(can_submit(&PairStage::Idle) && can_submit(&PairStage::Failed("x".into())));
-        assert!(can_submit(&PairStage::NeedConnectPort { host: "h".into() }));
+        assert!(can_submit(&PairStage::NeedConnectPort { host: "h".into(), error: None }));
         for busy in [PairStage::Pairing, PairStage::Connecting, PairStage::WaitingForScan, PairStage::Done { name: "x".into() }] {
             assert!(!can_submit(&busy), "{busy:?}");
         }
@@ -333,25 +357,37 @@ mod tests {
         let hub = cx.update(|cx| {
             super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), oximux_storage::SimApprovalRepo::new(db))
         });
+        // Two cards' owners (any two distinct entity ids).
+        let (me, other) = cx.update(|cx| (cx.new(|_| ()).entity_id(), cx.new(|_| ()).entity_id()));
         hub.update(cx, |hub, cx| {
             hub.android_sdk = Some(oximux_simulator::android::sdk::Sdk { root: "/nonexistent-sdk".into() });
             let late = || Ok(Step::Failed("late".into()));
             // Closed: the card's flag is set; the late result is dropped.
-            hub.begin_pairing(PairStage::Pairing, cx);
+            hub.begin_pairing(me, PairStage::Pairing, cx);
             let first = hub.wifi.cancel.clone();
-            hub.cancel_pairing(cx);
+            hub.cancel_pairing(me, cx);
             hub.land_if_current(&first, late(), cx);
-            assert_eq!(hub.pair_stage(), &PairStage::Idle);
+            assert_eq!(hub.pair_stage(me), PairStage::Idle);
             // Replaced: beginning a new pairing cancels the old one's flag.
-            hub.begin_pairing(PairStage::Pairing, cx);
+            hub.begin_pairing(me, PairStage::Pairing, cx);
             let old = hub.wifi.cancel.clone();
-            hub.begin_pairing(PairStage::Pairing, cx);
+            hub.begin_pairing(me, PairStage::Pairing, cx);
             assert!(old.load(Ordering::Acquire), "the old pairing is cancelled");
             hub.land_if_current(&old, late(), cx);
-            assert_eq!(hub.pair_stage(), &PairStage::Pairing, "only the current one lands");
+            assert_eq!(hub.pair_stage(me), PairStage::Pairing, "only the current one lands");
+            // Another window's card neither sees nor cancels it.
+            assert_eq!(hub.pair_stage(other), PairStage::Idle);
+            hub.cancel_pairing(other, cx);
+            assert_eq!(hub.pair_stage(me), PairStage::Pairing);
             let current = hub.wifi.cancel.clone();
             hub.land_if_current(&current, late(), cx);
-            assert_eq!(hub.pair_stage(), &PairStage::Failed("late".into()));
+            assert_eq!(hub.pair_stage(me), PairStage::Failed("late".into()));
+            // A port that did not connect keeps the form, with why.
+            hub.begin_pairing(me, PairStage::Connecting, cx);
+            let flag = hub.wifi.cancel.clone();
+            hub.land_if_current(&flag, Ok(Step::PortFailed { host: "h".into(), guid: Some("adb-x".into()), why: "refused".into() }), cx);
+            assert_eq!(hub.pair_stage(me), PairStage::NeedConnectPort { host: "h".into(), error: Some("refused".into()) });
+            assert_eq!(hub.wifi.guid.as_deref(), Some("adb-x"), "still paired as adb-x");
         });
     }
 }

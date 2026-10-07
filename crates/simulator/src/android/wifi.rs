@@ -181,6 +181,10 @@ pub fn connect_after_pairing(adb: &Adb<'_>, host: &str, cancel: &AtomicBool) -> 
     loop {
         let found = adb.mdns_services()?.into_iter().find(|s| s.service == CONNECT_SERVICE && host_of(&s.addr) == host);
         if let Some(service) = found {
+            // Closed meanwhile: no connection nobody will record.
+            if cancel.load(Ordering::Acquire) {
+                return Err(SimError::Cancelled);
+            }
             let outcome = adb.connect(&service.addr)?;
             return Ok(Some((service, outcome)));
         }

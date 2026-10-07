@@ -64,18 +64,14 @@ impl SimulatorPanel {
         // (and Esc only reaches the card) once its own handle has focus.
         window.focus(&card.addr.read(cx).focus_handle(cx), cx);
         self.pairing = Some(card);
-        // One pairing at a time, app-wide: a card opened here starts clean
-        // (another window's pairing, or a stale status, is dropped).
-        if let Some(hub) = self.hub.clone() {
-            hub.update(cx, |hub, cx| hub.cancel_pairing(cx));
-        }
         cx.notify();
     }
 
     pub(super) fn close_pairing(&mut self, cx: &mut Context<Self>) {
         self.pairing = None;
+        let me = cx.entity_id();
         if let Some(hub) = self.hub.clone() {
-            hub.update(cx, |hub, cx| hub.cancel_pairing(cx));
+            hub.update(cx, |hub, cx| hub.cancel_pairing(me, cx));
         }
         cx.notify();
     }
@@ -87,11 +83,12 @@ impl SimulatorPanel {
         }
         card.tab = tab;
         let focus = card.addr.read(cx).focus_handle(cx);
+        let me = cx.entity_id();
         if let Some(hub) = self.hub.clone() {
             match tab {
-                PairTab::Qr => hub.update(cx, |hub, cx| hub.pair_with_qr(cx)),
+                PairTab::Qr => hub.update(cx, |hub, cx| hub.pair_with_qr(me, cx)),
                 PairTab::Code => {
-                    hub.update(cx, |hub, cx| hub.cancel_pairing(cx));
+                    hub.update(cx, |hub, cx| hub.cancel_pairing(me, cx));
                     window.focus(&focus, cx);
                 }
             }
@@ -101,17 +98,18 @@ impl SimulatorPanel {
 
     fn submit_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(card), Some(hub)) = (self.pairing.as_ref(), self.hub.clone()) else { return };
-        let stage = hub.read(cx).pair_stage().clone();
+        let me = cx.entity_id();
+        let stage = hub.read(cx).pair_stage(me);
         // Once: an Enter reaches both the card and a focused button.
         if !can_submit(&stage) {
             return;
         }
         // The button is about to disable and drop focus: keep Esc working.
         window.focus(&card.focus, cx);
-        if let PairStage::NeedConnectPort { host } = stage {
+        if let PairStage::NeedConnectPort { host, .. } = stage {
             let port = card.port.read(cx).value().trim().to_owned();
             if !port.is_empty() {
-                hub.update(cx, |hub, cx| hub.connect_wifi(host, port, cx));
+                hub.update(cx, |hub, cx| hub.connect_wifi(me, host, port, cx));
             }
             return;
         }
@@ -120,15 +118,16 @@ impl SimulatorPanel {
         if addr.is_empty() || code.is_empty() {
             return;
         }
-        hub.update(cx, |hub, cx| hub.pair_with_code(addr, code, cx));
+        hub.update(cx, |hub, cx| hub.pair_with_code(me, addr, code, cx));
     }
 
     /// The card, above the phone, while it is open.
     pub(super) fn render_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let hub = self.hub.clone()?;
+        let me = cx.entity_id();
         let (stage, payload, mdns) = {
             let hub = hub.read(cx);
-            (hub.pair_stage().clone(), hub.pair_qr().map(str::to_owned), hub.pair_mdns())
+            (hub.pair_stage(me), hub.pair_qr(me).map(str::to_owned), hub.pair_mdns())
         };
         let card = self.pairing.as_mut()?;
         // The connect-port field takes focus as it appears (the field that had
@@ -158,12 +157,13 @@ impl SimulatorPanel {
 
         let mut body = div().flex().flex_col().gap(px(density.gap_inline)).w_full();
         match (&stage, tab) {
-            (PairStage::NeedConnectPort { host }, _) => {
+            (PairStage::NeedConnectPort { host, error }, _) => {
                 body = body
                     .child(small(format!(
                         "Paired. Enter the port shown under “IP address & Port” on the phone's Wireless debugging screen ({host}:…)."
                     )))
-                    .child(Input::new(&port).small());
+                    .child(Input::new(&port).small())
+                    .children(error.as_ref().map(|why| div().text_size(px(ty.t_body_sm)).text_color(theme.status_error).child(why.clone())));
             }
             (_, PairTab::Code) => {
                 body = body

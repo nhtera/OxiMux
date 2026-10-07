@@ -139,7 +139,7 @@ fn the_pairing_card_renders_on_both_tabs(cx: &mut TestAppContext) {
     panel.update_in(vcx, |panel, window, cx| panel.pairing_tab(super::pair_card::PairTab::Qr, window, cx));
     draw(vcx);
     panel.update(vcx, |panel, cx| {
-        let stage = panel.hub.as_ref().unwrap().read(cx).pair_stage().clone();
+        let stage = panel.hub.as_ref().unwrap().read(cx).pair_stage(cx.entity_id());
         assert!(matches!(stage, crate::shell::simulator::hub::PairStage::Failed(_)), "{stage:?}");
     });
     panel.update(vcx, |panel, cx| panel.close_pairing(cx));

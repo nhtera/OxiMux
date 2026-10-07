@@ -100,11 +100,12 @@ impl SimulatorPanel {
         let subscription = hub.as_ref().map(|hub| cx.subscribe(hub, Self::on_hub_event));
         // A window closing mid-pairing takes its pairing with it: no QR wait
         // (and its secret) outliving the card.
-        cx.on_release(|panel: &mut Self, cx| {
+        let me = cx.entity_id();
+        cx.on_release(move |panel: &mut Self, cx| {
             if panel.pairing.is_some()
                 && let Some(hub) = panel.hub.clone()
             {
-                hub.update(cx, |hub, cx| hub.cancel_pairing(cx));
+                hub.update(cx, |hub, cx| hub.cancel_pairing(me, cx));
             }
         })
         .detach();

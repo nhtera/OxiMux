@@ -82,11 +82,18 @@ fn identify(
     paired: &PairedPhones,
     connected: &PairedPhones,
 ) -> BTreeMap<DeviceId, AdbDevice> {
+    let all_serials: Vec<String> = all.iter().map(|d| d.serial.clone()).collect();
     let mut online: Vec<AdbDevice> = all.into_iter().filter(|d| d.state == AdbState::Device).collect();
     // USB before Wi-Fi: a phone on both streams over the cable.
     online.sort_by_key(|d| wifi::is_network_transport(&d.serial));
     let paired = paired.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    let connected = connected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let connected = {
+        let mut connected = connected.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An address adb no longer lists is forgotten: its port may go to
+        // another phone later this run.
+        connected.retain(|addr, _| all_serials.iter().any(|s| s == addr));
+        connected.clone()
+    };
     let mut known = known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // A serial that went away (or is booting again, offline) may come back
     // as another AVD: forget it.
@@ -438,23 +445,27 @@ R58 unauthorized usb:2 transport_id:3
         let dir = tempfile::tempdir().unwrap();
         let sdk = sdk(dir.path());
         let paired = PairedPhones::new(HashMap::from([("adb-R58-x1Y2".to_owned(), "R58".to_owned())]));
-        let connected = PairedPhones::new(HashMap::from([("192.168.1.5:37123".to_owned(), "R58".to_owned())]));
+        let connected = || PairedPhones::new(HashMap::from([("192.168.1.5:37123".to_owned(), "R58".to_owned())]));
         let device = |serial: &str| AdbDevice { serial: serial.into(), state: AdbState::Device, model: None };
         let runner = ScriptedRunner::default(); // no adb call at all
         let adb = Adb::new(&runner, &sdk.adb());
 
         let both = vec![device("adb-R58-x1Y2._adb-tls-connect._tcp"), device("R58"), device("192.168.1.9:5555")];
-        let ids = identify(&adb, both, &Identities::default(), &paired, &connected);
+        let ids = identify(&adb, both, &Identities::default(), &paired, &connected());
         let got: Vec<(String, String)> = ids.iter().map(|(id, d)| (id.0.clone(), d.serial.clone())).collect();
         assert_eq!(got, [("adb:192.168.1.9:5555".to_owned(), "192.168.1.9:5555".to_owned()), ("adb:R58".into(), "R58".into())], "USB wins; the tcpip one is its own");
 
         // Wi-Fi only, by the address OxiMux connected: the phone's row.
-        let ids = identify(&adb, vec![device("192.168.1.5:37123")], &Identities::default(), &paired, &connected);
+        let ids = identify(&adb, vec![device("192.168.1.5:37123")], &Identities::default(), &paired, &connected());
         assert_eq!(ids.get(&DeviceId("adb:R58".into())).map(|d| d.serial.as_str()), Some("192.168.1.5:37123"));
         // Any other address keeps its own row, whatever is announced for it.
-        let ids = identify(&adb, vec![device("192.168.1.66:5555")], &Identities::default(), &paired, &connected);
+        let known = connected();
+        let ids = identify(&adb, vec![device("192.168.1.66:5555")], &Identities::default(), &paired, &known);
         assert!(ids.contains_key(&DeviceId("adb:192.168.1.66:5555".into())) && !ids.contains_key(&DeviceId("adb:R58".into())));
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        // That listing no longer had 192.168.1.5:37123: forgotten, so another
+        // phone given that address later is not taken for this one.
+        assert!(known.lock().unwrap().is_empty());
     }
 
     /// A dead Wi-Fi transport (wireless debugging toggled) leaves no row.
