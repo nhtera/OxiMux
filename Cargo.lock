@@ -8764,6 +8764,7 @@ dependencies = [
  "oximux-no-window",
  "oximux-proc-tree",
  "oximux-sibling-binary",
+ "plist",
  "rand 0.8.6",
  "roxmltree 0.21.1",
  "serde",

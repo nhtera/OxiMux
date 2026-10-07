@@ -37,6 +37,8 @@ libc = "0.2"
 # Android video (P10): hardware H.264 decode into the `core_video` buffers
 # GPUI's `surface()` paints. Versions match what gpui / wry already pull in.
 [target.'cfg(target_os = "macos")'.dependencies]
+# usbmux messages (a real iPhone's control runner is reached through it).
+plist = "1.9"
 core-foundation = "0.10"
 core-video = "0.5"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase", "CFDictionary", "CFNumber", "CFString"] }

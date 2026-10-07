@@ -10,6 +10,9 @@
 //! [`StreamSession`]: crate::stream::StreamSession
 //! [`HelperKind::DeviceCapture`]: crate::helper::HelperKind::DeviceCapture
 
+#[cfg(target_os = "macos")]
+pub mod usbmux;
+
 use std::path::Path;
 use std::time::Duration;
 
