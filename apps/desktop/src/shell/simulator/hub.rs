@@ -607,6 +607,7 @@ impl SimulatorHub {
         self.run(effects, cx);
         // Switching device may have left the old one unattached.
         self.stop_unattached_recordings(cx);
+        self.stop_unattached_controls(cx);
         cx.emit(HubEvent::Changed(info.udid.clone()));
         Ok(info)
     }

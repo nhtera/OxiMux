@@ -3,12 +3,14 @@
 //! usbmux, and the shutdown. `#[ignore]`d like the other live tests:
 //!
 //! ```sh
-//! OXIMUX_LIVE_TEAM=<team id> OXIMUX_RUNNER_TARBALL=<oximux-ios-runner-src-*.tar.gz> \
-//!   cargo test -p oximux-simulator --test iphone_runner_live -- --ignored --nocapture
+//! ./scripts/fetch-sim-helper.sh   # stages the pinned runner sources
+//! OXIMUX_LIVE_TEAM=<team id> cargo test -p oximux-simulator --test iphone_runner_live -- --ignored --nocapture
 //! ```
 //!
-//! The build is kept under `target/iphone-runner-live/`, so a rerun only
-//! launches. It presses Home on the phone once.
+//! The sources are found as the app finds them (`OXIMUX_IOS_RUNNER`), else
+//! in the repo's `target/bundle-tools/`. The build is kept under
+//! `target/iphone-runner-live/`, so a rerun only launches. It presses Home
+//! on the phone once.
 #![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
@@ -30,7 +32,14 @@ const T: Duration = Duration::from_secs(30);
 #[ignore = "needs a cabled iPhone and a signing team; run with --ignored"]
 fn the_runner_builds_launches_and_answers_over_usbmux() {
     let team = std::env::var("OXIMUX_LIVE_TEAM").expect("OXIMUX_LIVE_TEAM");
-    let tarball = PathBuf::from(std::env::var("OXIMUX_RUNNER_TARBALL").expect("OXIMUX_RUNNER_TARBALL"));
+    // A test binary sits a level deeper than the app: its staging dir is
+    // the repo's `target/bundle-tools/`.
+    let staged = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bundle-tools").join(runner_build::tarball_name());
+    let tarball = match oximux_simulator::availability::default_runner_tarball(&runner_build::tarball_name()) {
+        oximux_simulator::availability::HelperStatus::Found(path) => path,
+        _ if staged.is_file() => staged,
+        oximux_simulator::availability::HelperStatus::Missing(why) => panic!("{why}"),
+    };
     let runner = SystemRunner;
     let phone = devicectl::list(&runner, T).expect("devicectl");
     let id = devicectl::connected(&phone).next().expect("a cabled, paired iPhone").clone();

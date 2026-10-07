@@ -164,6 +164,9 @@ impl RunnerClient {
                     lost = true;
                     continue;
                 }
+                // Gone after the request went out: it may have run, so this
+                // is a lost reply, never "it never ran".
+                Err(RunnerError::Refused | RunnerError::Unauthorized) if lost => return Err(gone_after_sending()),
                 Err(error) => return Err(error),
             };
             match (error.code(), &id) {
@@ -185,6 +188,8 @@ impl RunnerClient {
             let status = match self.post(&body, deadline) {
                 Ok(envelope) => decode(envelope)?,
                 Err(RunnerError::Lost(_)) => continue,
+                // The command was sent (it is running): not "never ran".
+                Err(RunnerError::Refused | RunnerError::Unauthorized) => return Err(gone_after_sending()),
                 Err(error) => return Err(error),
             };
             let command = status.data.get("command").cloned().unwrap_or(Value::Null);
@@ -232,6 +237,10 @@ pub fn timeout_for(command: &str, fields: &Map<String, Value>) -> Duration {
         .sum();
     let typing = fields.get("text").and_then(Value::as_str).map_or(0, |t| t.chars().count()) as f64 * 50.0;
     Duration::from_secs(45) + Duration::from_millis((ms + typing).min(300_000.0) as u64)
+}
+
+fn gone_after_sending() -> RunnerError {
+    RunnerError::Lost("the runner stopped after the command was sent".into())
 }
 
 /// When a call gives up, and how long it was given.
@@ -600,5 +609,33 @@ mod tests {
             Arc::new(move || Ok(Box::new(TcpStream::connect(("127.0.0.1", port)).unwrap()) as Box<dyn RunnerStream>));
         let error = RunnerClient::new(connect, "x").call("status", Value::Null).unwrap_err();
         assert!(matches!(error, RunnerError::Protocol(_)), "got error: {:?}", error);
+    }
+
+    /// A reply lost, then the runner gone: the command may have run, so
+    /// it must not read as one that never did (a relaunch would replay it).
+    #[test]
+    fn a_runner_gone_after_the_request_went_out_is_a_lost_reply_not_a_refusal() {
+        let attempts = Arc::new(Mutex::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Takes the first request and drops it; then nothing listens.
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+        });
+        let counted = attempts.clone();
+        let connect: Connector = Arc::new(move || {
+            let mut n = counted.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Ok(Box::new(TcpStream::connect(("127.0.0.1", port)).unwrap()) as Box<dyn RunnerStream>)
+            } else {
+                Err(RunnerError::Refused)
+            }
+        });
+        let error = RunnerClient::new(connect, "x").call("tap", json!({"x": 1, "y": 1})).unwrap_err();
+        assert!(matches!(error, RunnerError::Lost(_)), "{error:?}");
+        assert_eq!(*attempts.lock().unwrap(), 2);
     }
 }

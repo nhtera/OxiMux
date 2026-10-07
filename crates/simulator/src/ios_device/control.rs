@@ -43,7 +43,10 @@ const HINT_EVERY: Duration = Duration::from_secs(3);
 /// What runs the runner's commands (the supervisor; a fake in tests).
 pub trait Exec: Send + Sync {
     fn call(&self, command: &str, fields: Value) -> Result<Reply, ControlError>;
+    /// Shut down after the command in flight.
     fn stop(&self);
+    /// End now; the command in flight fails.
+    fn abort(&self);
 }
 
 impl Exec for RunnerSupervisor {
@@ -54,6 +57,10 @@ impl Exec for RunnerSupervisor {
     fn stop(&self) {
         RunnerSupervisor::stop(self);
     }
+
+    fn abort(&self) {
+        RunnerSupervisor::abort(self);
+    }
 }
 
 /// What the panel hears from a phone's control.
@@ -61,6 +68,10 @@ impl Exec for RunnerSupervisor {
 pub enum ControlEvent {
     /// Panel input failed.
     Error(String),
+    /// The runner cannot be used until the user acts (it gave up after a
+    /// relaunch, or would not start): control should show this and stop.
+    /// `expired`: its provisioning profile ran out (a rebuild cures it).
+    Failed { message: String, expired: bool },
     /// Input the phone does not take.
     Hint(&'static str),
     /// A gesture first brought `app` back to the front.
@@ -78,8 +89,9 @@ enum Job {
 struct State {
     queue: VecDeque<Job>,
     input: InputMap,
-    /// The screen in points, and whether it was read in landscape.
-    viewport: Option<(f64, f64)>,
+    /// The screen in points, and the captured screen's shape it was read
+    /// for (landscape or not; `None`: unknown).
+    viewport: Option<((f64, f64), Option<bool>)>,
     target: String,
     closed: bool,
     hinted: Option<(&'static str, Instant)>,
@@ -92,6 +104,8 @@ struct Shared {
     /// The captured screen's size, for its shape.
     frame: Box<dyn Fn() -> Option<(u32, u32)> + Send + Sync>,
     events: Sender<ControlEvent>,
+    /// The worker is running a job (so a stop must not wait on it).
+    working: std::sync::atomic::AtomicBool,
 }
 
 /// One phone's control: its queue and worker.
@@ -115,6 +129,7 @@ impl DeviceControl {
             wake: Condvar::new(),
             frame: Box::new(frame),
             events,
+            working: Default::default(),
         });
         let worker = {
             let shared = shared.clone();
@@ -187,18 +202,32 @@ impl DeviceControl {
         snapshot::tree(&reply.data).map(|(nodes, _)| nodes).map_err(|e| ControlError::Runner(e.to_string()))
     }
 
-    /// Ends the worker and the runner. Queued agent calls fail.
+    /// Ends the worker and the runner: politely when idle, at once when a
+    /// command is in flight (a long paste is not waited for). Queued agent
+    /// calls fail.
     pub fn stop(&self) {
-        {
-            let mut state = lock(&self.shared.state);
-            state.closed = true;
-            state.queue.clear();
+        self.close();
+        if self.shared.working.load(std::sync::atomic::Ordering::Acquire) {
+            self.shared.exec.abort();
         }
-        self.shared.wake.notify_all();
         if let Some(worker) = lock(&self.worker).take() {
             let _ = worker.join();
         }
         self.shared.exec.stop();
+    }
+
+    /// Ends everything now, without waiting (quit).
+    pub fn abort(&self) {
+        self.close();
+        self.shared.exec.abort();
+    }
+
+    fn close(&self) {
+        let mut state = lock(&self.shared.state);
+        state.closed = true;
+        fail_all(&mut state);
+        drop(state);
+        self.shared.wake.notify_all();
     }
 
     fn wait(&self, job: impl FnOnce(SyncSender<Result<Reply, ControlError>>) -> Job) -> Result<Reply, ControlError> {
@@ -251,7 +280,10 @@ fn work(shared: &Shared) {
                     fail_all(&mut state);
                     return;
                 }
-                while let Some(Job::Panel { queued, .. }) = state.queue.front()
+                // Typing is not aimed at a spot: a long paste's later pieces
+                // wait their turn.
+                while let Some(Job::Panel { queued, gesture }) = state.queue.front()
+                    && !matches!(gesture, Gesture::Text(_))
                     && queued.elapsed() > STALE
                 {
                     state.queue.pop_front();
@@ -278,7 +310,9 @@ fn work(shared: &Shared) {
             busy = true;
             let _ = shared.events.send(ControlEvent::Busy(true));
         }
+        shared.working.store(true, std::sync::atomic::Ordering::Release);
         run(shared, job);
+        shared.working.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -293,16 +327,45 @@ fn run(shared: &Shared, job: Job) {
                 // What was queued behind it was aimed at a screen that may
                 // not be there now.
                 lock(&shared.state).queue.retain(|j| !matches!(j, Job::Panel { .. }));
-                let _ = shared.events.send(ControlEvent::Error(error.to_string()));
+                if !report_failure(shared, &error) {
+                    let _ = shared.events.send(ControlEvent::Error(error.to_string()));
+                }
             }
         },
         Job::AgentGesture { gesture, reply } => {
-            let _ = reply.send(perform(shared, &gesture));
+            let result = perform(shared, &gesture);
+            if let Err(error) = &result {
+                report_failure(shared, error);
+            }
+            let _ = reply.send(result);
         }
         Job::Agent { command, fields, reply } => {
-            let _ = reply.send(shared.exec.call(&command, fields));
+            let result = shared.exec.call(&command, fields);
+            if let Err(error) = &result {
+                report_failure(shared, error);
+            }
+            let _ = reply.send(result);
         }
     }
+}
+
+/// Says so when `error` leaves the runner unusable until the user acts;
+/// whether it did.
+fn report_failure(shared: &Shared, error: &ControlError) -> bool {
+    let unusable = matches!(
+        error,
+        ControlError::GaveUp(_)
+            | ControlError::ProfileExpired
+            | ControlError::NotTrusted
+            | ControlError::DeveloperModeOff
+            | ControlError::Busy
+            | ControlError::LaunchFailed(_)
+    );
+    if unusable {
+        let expired = matches!(error, ControlError::ProfileExpired);
+        let _ = shared.events.send(ControlEvent::Failed { message: error.to_string(), expired });
+    }
+    unusable
 }
 
 /// `gesture` as a runner command, in points.
@@ -330,17 +393,17 @@ fn perform(shared: &Shared, gesture: &Gesture) -> Result<Reply, ControlError> {
 /// shape no longer matches it.
 fn viewport(shared: &Shared) -> Result<(f64, f64), ControlError> {
     let landscape = (shared.frame)().map(|(w, h)| w > h);
-    if let Some((w, h)) = lock(&shared.state).viewport
-        && landscape.is_none_or(|l| l == (w > h))
+    if let Some((size, shape)) = lock(&shared.state).viewport
+        && (shape == landscape || landscape.is_none())
     {
-        return Ok((w, h));
+        return Ok(size);
     }
     let reply = shared.exec.call("viewport", json!({"app": SPRINGBOARD}))?;
     let size = |k: &str| reply.data.get(k).and_then(Value::as_f64).filter(|v| *v > 0.0);
     let (Some(w), Some(h)) = (size("width"), size("height")) else {
         return Err(ControlError::Runner("the runner reported no screen size".into()));
     };
-    lock(&shared.state).viewport = Some((w, h));
+    lock(&shared.state).viewport = Some(((w, h), landscape));
     Ok((w, h))
 }
 
@@ -377,6 +440,7 @@ mod tests {
         viewport: Mutex<(f64, f64)>,
         fail: AtomicBool,
         stopped: AtomicBool,
+        aborted: AtomicBool,
     }
 
     impl Exec for Fake {
@@ -396,6 +460,10 @@ mod tests {
         fn stop(&self) {
             self.stopped.store(true, Ordering::Relaxed);
         }
+
+        fn abort(&self) {
+            self.aborted.store(true, Ordering::Relaxed);
+        }
     }
 
     fn fake(delay_ms: u64) -> Arc<Fake> {
@@ -405,6 +473,7 @@ mod tests {
             viewport: Mutex::new((430.0, 932.0)),
             fail: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
         })
     }
 
@@ -563,6 +632,59 @@ mod tests {
         let calls = settle(&exec, 3);
         // viewport, two taps
         assert_eq!(calls.iter().filter(|(c, _)| c == "tap").count(), 2);
+        control.stop();
+    }
+
+    #[test]
+    fn stop_does_not_wait_for_a_command_in_flight() {
+        let exec = fake(400);
+        let (busy, _events) = control(exec.clone(), (1290, 2796));
+        busy.type_text("a long paste");
+        std::thread::sleep(Duration::from_millis(50));
+        busy.stop();
+        assert!(exec.aborted.load(Ordering::Relaxed), "a busy runner is aborted, not waited for");
+        // Idle: a polite stop, no abort.
+        let exec = fake(0);
+        let (idle, _events) = control(exec.clone(), (1290, 2796));
+        idle.stop();
+        assert!(!exec.aborted.load(Ordering::Relaxed) && exec.stopped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_runner_that_gave_up_is_reported_as_failed_not_as_a_toast() {
+        struct GivingUp;
+        impl Exec for GivingUp {
+            fn call(&self, _: &str, _: Value) -> Result<Reply, ControlError> {
+                Err(ControlError::GaveUp("the runner stopped listening".into()))
+            }
+            fn stop(&self) {}
+            fn abort(&self) {}
+        }
+        let (tx, events) = mpsc::channel();
+        let control = DeviceControl::new(Arc::new(GivingUp), || Some((1290, 2796)), tx);
+        control.press(super::super::input_map::RunnerButton::Home);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline && !seen.iter().any(|e| matches!(e, ControlEvent::Failed { .. })) {
+            seen.extend(events.try_iter());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(seen.iter().any(|e| matches!(e, ControlEvent::Failed { expired: false, .. })), "{seen:?}");
+        assert!(!seen.iter().any(|e| matches!(e, ControlEvent::Error(_))), "{seen:?}");
+        control.stop();
+    }
+
+    #[test]
+    fn a_long_paste_is_not_dropped_as_stale() {
+        let exec = fake(0);
+        let (control, _events) = control(exec.clone(), (1290, 2796));
+        // Its second piece waits behind the first longer than STALE.
+        lock(&control.shared.state).queue.push_back(Job::Panel { gesture: Gesture::Text("late".into()), queued: Instant::now() - STALE * 2 });
+        lock(&control.shared.state).queue.push_back(Job::Panel { gesture: Gesture::Return, queued: Instant::now() - STALE * 2 });
+        control.shared.wake.notify_all();
+        let calls = settle(&exec, 1);
+        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["type"], "the text is typed, the stale Return dropped");
         control.stop();
     }
 }

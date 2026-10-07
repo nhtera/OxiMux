@@ -143,7 +143,8 @@ pub fn on_quit(cx: &mut App) {
         for (_, cancel) in hub.capture_starts.drain() {
             cancel.store(true, std::sync::atomic::Ordering::Release);
         }
-        // iPhone runners: shut down before their video goes.
+        // iPhone runners: ended at once (never waited on: a command in
+        // flight could hold the quit for minutes).
         hub.stop_controls_blocking();
         let (sessions, owned) = hub.registry.quit();
         // Owned emulators by serial: the live sessions know theirs, a parked

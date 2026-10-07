@@ -299,6 +299,19 @@ pub fn stop_group(pid: u32, grace: std::time::Duration) {
 #[cfg(not(unix))]
 pub fn stop_group(_pid: u32, _grace: std::time::Duration) {}
 
+/// `SIGTERM` to `pid`'s group (or `pid` alone when it does not lead one),
+/// without waiting: for quit, where [`reap_stale`] finishes the job next
+/// launch if it must.
+#[cfg(unix)]
+pub fn terminate_group(pid: u32) {
+    // SAFETY: `getpgid(2)` on a pid; it only reads.
+    let leads = unsafe { libc::getpgid(pid as libc::pid_t) } == pid as libc::pid_t;
+    send_signal_to(if leads { -(pid as i32) } else { pid as i32 }, libc::SIGTERM);
+}
+
+#[cfg(not(unix))]
+pub fn terminate_group(_pid: u32) {}
+
 /// Waits up to `grace` for `pid` to end, then `SIGKILL`s `target` (the pid,
 /// or a negated group id).
 #[cfg(unix)]
@@ -312,6 +325,9 @@ fn wait_then_kill(pid: u32, grace: std::time::Duration, target: i32) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    // A group's other members may outlive its leader, so the group gets the
+    // SIGKILL either way; its id cannot be another group's this soon (macOS
+    // hands pids out in sequence).
     if oximux_proc_tree::process(pid).is_some() || target < 0 {
         send_signal_to(target, libc::SIGKILL);
     }

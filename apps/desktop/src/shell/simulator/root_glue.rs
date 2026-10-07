@@ -62,6 +62,7 @@ impl RootSimulator {
             cx.subscribe(panel, |root: &mut WorkspaceRoot, _, event: &PanelEvent, cx| match event {
                 PanelEvent::Notice(kind, text) => {
                     let kind = match kind {
+                        NoticeKind::Info => ToastKind::Info,
                         NoticeKind::Success => ToastKind::Success,
                         NoticeKind::Error => ToastKind::Error,
                     };

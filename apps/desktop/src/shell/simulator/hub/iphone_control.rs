@@ -78,6 +78,10 @@ pub(crate) struct Controls {
     /// view of the screen's shape (the session restarts; the control stays).
     #[cfg(target_os = "macos")]
     screens: HashMap<DeviceId, Screen>,
+    /// Phones already rebuilt once for an expired profile this run (a second
+    /// expiry is the user's to look at).
+    #[cfg(target_os = "macos")]
+    rebuilt: std::collections::HashSet<DeviceId>,
     /// This Mac's signing teams, once listed (`Err`: why not).
     teams: Option<Result<Vec<TeamChoice>, String>>,
     teams_loading: bool,
@@ -94,8 +98,24 @@ type Screen = Arc<std::sync::Mutex<Option<DeviceSession>>>;
 impl SimulatorHub {
     /// What `udid` can do now: its session's view (a real iPhone takes
     /// input while its control is on), else its class default.
+    /// A controlled iPhone keeps its caps while its video is parked: the
+    /// runner is up, and an agent's verb wakes the video.
     pub fn caps(&self, udid: &DeviceId) -> oximux_simulator::caps::DeviceCaps {
+        if self.controlled(udid) {
+            return oximux_simulator::caps::DeviceCaps::for_session(udid, true);
+        }
         self.session(udid).map_or_else(|| oximux_simulator::caps::DeviceCaps::for_id(udid), |s| s.caps(udid))
+    }
+
+    /// Whether `udid`'s control is on (its runner up or relaunchable).
+    fn controlled(&self, udid: &DeviceId) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.controls.running.contains_key(udid);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = udid;
+            false
+        }
     }
 
     pub fn control_state(&self, udid: &DeviceId) -> ControlState {
@@ -151,6 +171,12 @@ impl SimulatorHub {
         if !oximux_simulator::ios_device::is_team_id(team) {
             return;
         }
+        #[cfg(target_os = "macos")]
+        self.controls.rebuilt.remove(udid);
+        // A failed attempt is let go: this is a fresh one.
+        if matches!(self.control_state(udid), ControlState::Failed(_)) {
+            self.stop_control(udid, cx);
+        }
         sim_state_keys::save_iphone_team(&self.repo, team);
         let mut controlled = sim_state_keys::load_iphone_controlled(&self.repo);
         if controlled.insert(udid.clone()) {
@@ -182,7 +208,9 @@ impl SimulatorHub {
                 return;
             }
             let wanted = sim_state_keys::load_iphone_controlled(&self.repo).contains(udid);
-            if wanted && self.chosen_team().is_some() && !self.control_state(udid).in_progress() {
+            // Only from Off: a failure waits for the user's Retry, not every
+            // unpark.
+            if wanted && self.chosen_team().is_some() && self.control_state(udid) == ControlState::Off {
                 self.start_control(udid, cx);
             }
         }
@@ -199,20 +227,17 @@ impl SimulatorHub {
         }
     }
 
-    /// Every phone's control, on quit (each runner is shut down in parallel;
-    /// the child ledger catches what outlives the quit).
+    /// Every phone's control, on quit: each runner's group is sent `SIGTERM`
+    /// at once (the child ledger catches whatever outlives the quit).
     pub(super) fn stop_controls_blocking(&mut self) {
         #[cfg(target_os = "macos")]
         {
             for (_, cancel) in self.controls.starts.drain() {
                 cancel.store(true, Ordering::Release);
             }
-            let running: Vec<Arc<DeviceControl>> = self.controls.running.drain().map(|(_, c)| c).collect();
-            std::thread::scope(|scope| {
-                for control in &running {
-                    scope.spawn(|| control.stop());
-                }
-            });
+            for (_, control) in self.controls.running.drain() {
+                control.abort();
+            }
         }
         self.controls.states.clear();
     }
@@ -353,7 +378,8 @@ impl SimulatorHub {
                             }
                         }
                         ControlEvent::Error(message) => cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, message)),
-                        ControlEvent::Hint(hint) => cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, hint.to_owned())),
+                        ControlEvent::Failed { message, expired } => hub.control_failed(&udid, message, expired, cx),
+                        ControlEvent::Hint(hint) => cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Info, hint.to_owned())),
                         ControlEvent::Reactivated(app) if app != oximux_simulator::ios_device::control::SPRINGBOARD => {
                             cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Success, format!("Brought {app} to the front")));
                         }
@@ -366,6 +392,27 @@ impl SimulatorHub {
             }
         })
         .detach();
+    }
+}
+
+impl SimulatorHub {
+    /// The runner is unusable: control stops and the row shows why, until
+    /// the user retries — except an expired profile, rebuilt once by itself.
+    #[cfg(target_os = "macos")]
+    fn control_failed(&mut self, udid: &DeviceId, message: String, expired: bool, cx: &mut Context<Self>) {
+        if !self.controls.running.contains_key(udid) {
+            return;
+        }
+        self.stop_control(udid, cx);
+        if expired && self.controls.rebuilt.insert(udid.clone()) {
+            let home = RunnerHome::new(simulator_dir().join("ios-runner"));
+            if let Some(hardware) = oximux_simulator::devicectl::hardware_udid(udid) {
+                runner_build::invalidate(&home, hardware);
+            }
+            self.start_control(udid, cx);
+            return;
+        }
+        self.set_control_state(udid, ControlState::Failed(message), cx);
     }
 }
 
@@ -430,7 +477,7 @@ fn launch(
     }
     let _ = progress.unbounded_send(ControlState::Starting);
     let supervisor = Arc::new(RunnerSupervisor::new(spec(&built)));
-    match supervisor.start() {
+    match supervisor.start_unless(cancel) {
         Ok(()) => Ok(supervisor),
         // A profile that ran out early (revoked, or the clock moved): one
         // rebuild.
@@ -438,7 +485,7 @@ fn launch(
             runner_build::invalidate(&home, udid);
             let built = build(&mut report)?;
             let supervisor = Arc::new(RunnerSupervisor::new(spec(&built)));
-            supervisor.start().map(|()| supervisor)
+            supervisor.start_unless(cancel).map(|()| supervisor)
         }
         Err(e) => Err(e),
     }

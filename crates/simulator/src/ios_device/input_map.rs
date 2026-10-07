@@ -30,6 +30,8 @@ const LONG_PRESS_MAX: Duration = Duration::from_secs(10);
 
 /// The most text one `type` takes (the runner's limit).
 pub const MAX_TEXT: usize = 4000;
+/// The most characters one `keyboardDelete` takes (the runner's limit).
+const MAX_DELETE: u32 = 500;
 
 const USAGE_RETURN: u32 = 0x28;
 const USAGE_BACKSPACE: u32 = 0x2a;
@@ -78,23 +80,27 @@ impl RunnerButton {
 impl Gesture {
     /// Folds `next` into `self` when both can be one runner command:
     /// characters into text, deletes into one count, a second tap on the
-    /// same spot into a double tap, and drags into one (their motions
-    /// added). `next` back when they cannot.
+    /// same spot into a double tap, and scroll drags into one — drags from
+    /// the same spot the same way (a wheel's), their motions added; two
+    /// swipes elsewhere or the other way stay two. `next` back when they
+    /// cannot.
     pub fn merge(&mut self, next: Gesture) -> Option<Gesture> {
         match (self, next) {
             (Gesture::Text(text), Gesture::Text(more)) if text.chars().count() + more.chars().count() <= MAX_TEXT => {
                 text.push_str(&more);
                 None
             }
-            (Gesture::Delete(count), Gesture::Delete(more)) => {
-                *count = count.saturating_add(more).min(500);
+            (Gesture::Delete(count), Gesture::Delete(more)) if *count + more <= MAX_DELETE => {
+                *count += more;
                 None
             }
             (Gesture::Tap { at, taps: taps @ 1 }, Gesture::Tap { at: again, taps: 1 }) if near(*at, again) => {
                 *taps = 2;
                 None
             }
-            (Gesture::Drag { to, ms, settle, hold: 0, .. }, Gesture::Drag { from: f2, to: t2, ms: m2, settle: s2, hold: 0 }) => {
+            (Gesture::Drag { from, to, ms, settle, hold: 0 }, Gesture::Drag { from: f2, to: t2, ms: m2, settle: s2, hold: 0 })
+                if near(*from, f2) && same_way((to.0 - from.0, to.1 - from.1), (t2.0 - f2.0, t2.1 - f2.1)) =>
+            {
                 let motion = (t2.0 - f2.0, t2.1 - f2.1);
                 *to = (clamp01(to.0 + motion.0), clamp01(to.1 + motion.1));
                 *ms = (*ms + m2).min(DRAG_MAX.as_millis() as u64);
@@ -216,6 +222,11 @@ fn typed(usage: u32, shift: bool) -> Option<char> {
 
 fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
     (a.0 - b.0).abs().max((a.1 - b.1).abs())
+}
+
+/// Two motions along the same line, the same way.
+fn same_way(a: (f64, f64), b: (f64, f64)) -> bool {
+    a.0 * b.0 + a.1 * b.1 > 0.0
 }
 
 fn near(a: (f64, f64), b: (f64, f64)) -> bool {
@@ -342,6 +353,9 @@ mod tests {
         let mut delete = Gesture::Delete(2);
         assert_eq!(delete.merge(Gesture::Delete(3)), None);
         assert_eq!(delete, Gesture::Delete(5));
+        // Past the runner's limit: a second command, not lost deletes.
+        let mut many = Gesture::Delete(499);
+        assert_eq!(many.merge(Gesture::Delete(2)), Some(Gesture::Delete(2)));
         let mut tap = Gesture::Tap { at: (0.5, 0.5), taps: 1 };
         assert_eq!(tap.merge(Gesture::Tap { at: (0.51, 0.5), taps: 1 }), None);
         assert_eq!(tap, Gesture::Tap { at: (0.5, 0.5), taps: 2 });
@@ -355,8 +369,12 @@ mod tests {
         let Gesture::Drag { to, ms: 500, settle: 150, .. } = drag else { panic!("{drag:?}") };
         assert!((to.1 - 0.1).abs() < 1e-9, "{to:?}");
         // Past the edge: it stops at the edge.
-        assert_eq!(drag.merge(Gesture::Drag { from: (0.5, 0.9), to: (0.5, 0.1), ms: 100, hold: 0, settle: 0 }), None);
+        assert_eq!(drag.merge(Gesture::Drag { from: (0.5, 0.6), to: (0.5, 0.0), ms: 100, hold: 0, settle: 0 }), None);
         assert!(matches!(drag, Gesture::Drag { to: (_, 0.0), .. }));
+        // A swipe back, or one from elsewhere, stays its own.
+        let mut down = Gesture::Drag { from: (0.5, 0.3), to: (0.5, 0.7), ms: 200, hold: 0, settle: 0 };
+        assert!(down.merge(Gesture::Drag { from: (0.5, 0.3), to: (0.5, 0.1), ms: 200, hold: 0, settle: 0 }).is_some());
+        assert!(down.merge(Gesture::Drag { from: (0.9, 0.3), to: (0.9, 0.7), ms: 200, hold: 0, settle: 0 }).is_some());
         // A pick-up-and-move is its own gesture.
         let lift = Gesture::Drag { from: (0.5, 0.5), to: (0.6, 0.6), ms: 300, hold: 800, settle: 0 };
         assert!(drag.merge(lift).is_some());

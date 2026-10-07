@@ -38,12 +38,12 @@ pub use super::is_team_id as valid_team_id;
 
 /// The teams of this Mac's valid development identities, by name.
 pub fn teams(runner: &dyn Runner, timeout: Duration) -> Result<Vec<Team>> {
-    let out = runner.run("security", &["find-identity", "-v", "-p", "codesigning"], None, timeout)?;
+    let out = runner.run("/usr/bin/security", &["find-identity", "-v", "-p", "codesigning"], None, timeout)?;
     let identities = development_identities(&out.into_success("security find-identity")?.stdout_str());
     if identities.is_empty() {
         return Ok(Vec::new());
     }
-    let out = runner.run("security", &["find-certificate", "-a", "-Z", "-p"], None, timeout)?;
+    let out = runner.run("/usr/bin/security", &["find-certificate", "-a", "-Z", "-p"], None, timeout)?;
     let certificates = certificates_by_sha1(&out.into_success("security find-certificate")?.stdout_str());
     let mut teams = BTreeMap::new();
     for sha1 in identities {
@@ -272,8 +272,8 @@ mod tests {
         let personal = certificate(&[(CN, 0x0C, "Apple Development: jo@example.com (FGHIJ67890)"), (OU, 0x0C, "PERS000002"), (O, 0x0C, "jo doe")]);
         let certificates = [pem(A, &team), pem(B, &personal), pem(C, &team), pem(D, &team)].concat();
         let runner = ScriptedRunner::new([])
-            .expect("security find-identity -v -p codesigning", CmdOutput::ok(identities))
-            .expect("security find-certificate -a -Z -p", CmdOutput::ok(certificates));
+            .expect("/usr/bin/security find-identity -v -p codesigning", CmdOutput::ok(identities))
+            .expect("/usr/bin/security find-certificate -a -Z -p", CmdOutput::ok(certificates));
         let teams = teams(&runner, Duration::from_secs(5)).unwrap();
         assert_eq!(
             teams,
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn no_development_identity_means_no_teams_and_no_second_call() {
-        let runner = ScriptedRunner::new([]).expect("security find-identity -v -p codesigning", CmdOutput::ok("     0 valid identities found\n"));
+        let runner = ScriptedRunner::new([]).expect("/usr/bin/security find-identity -v -p codesigning", CmdOutput::ok("     0 valid identities found\n"));
         assert_eq!(teams(&runner, Duration::from_secs(5)).unwrap(), Vec::new());
         assert_eq!(runner.calls().len(), 1);
     }

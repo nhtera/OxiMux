@@ -14,7 +14,7 @@ use crate::shell::simulator::hub::{ControlState, TeamChoice};
 
 /// What building the runner does, said before the user picks a team.
 const DISCLOSURE: &str = "OxiMux builds a small test runner on this Mac and runs it on the iPhone, signed with the team you pick. \
-Building registers this iPhone with that team and creates its App IDs (dev.oximux.runner.t<team>) in the team's account.";
+Building registers this iPhone with that team and creates its App IDs (dev.oximux.runner.t<team>, and Xcode's dev.oximux.runner.t<team>.uitests.xctrunner) in the team's account.";
 const NO_TEAMS: &str = "No Apple Development certificate on this Mac. Add your Apple ID in Xcode › Settings › Accounts, then check again.";
 
 impl SimulatorPanel {

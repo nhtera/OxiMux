@@ -30,8 +30,9 @@ use super::usbmux::Usbmux;
 use crate::child_ledger::{self, Entry, Ledger};
 
 /// How long a launch may take to listen (XCTest installs and starts the
-/// runner on the phone first).
-pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// runner on the phone first; a phone Xcode is still preparing for
+/// development takes longer).
+pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// A runner with no command for this long is shut down.
 pub const IDLE_STOP: Duration = Duration::from_secs(10 * 60);
 /// At most one automatic relaunch per failure class in this window.
@@ -108,6 +109,9 @@ pub enum ControlError {
     ProfileExpired,
     #[error("Another test runner is using this iPhone")]
     Busy,
+    /// Xcode is still preparing the phone for development (first use).
+    #[error("Xcode is still preparing the iPhone for development. Keep it unlocked and connected, then try again")]
+    Preparing,
     #[error("the iPhone is not connected over USB")]
     NotConnected,
     #[error("the iPhone's control runner did not start: {0}")]
@@ -146,7 +150,9 @@ pub fn classify_launch_failure(output: &[String]) -> ControlError {
         ControlError::ProfileExpired
     } else if lower.contains("is locked") || lower.contains("passcode protected") || lower.contains("unlock") {
         ControlError::Locked
-    } else if lower.contains("already running") || lower.contains("busy") {
+    } else if lower.contains("preparing") || lower.contains("device is busy") {
+        ControlError::Preparing
+    } else if lower.contains("already running") || lower.contains("another test") {
         ControlError::Busy
     } else {
         ControlError::LaunchFailed(super::runner_build::failure_summary(output))
@@ -276,9 +282,23 @@ impl RunnerSupervisor {
     /// Launches the runner now (the panel's "Enable control"), unless one is
     /// up already.
     pub fn start(&self) -> Result<(), ControlError> {
+        self.start_unless(&AtomicBool::new(false))
+    }
+
+    /// [`start`](Self::start), given up (`Cancelled`) once `cancel` is set.
+    pub fn start_unless(&self, cancel: &AtomicBool) -> Result<(), ControlError> {
         let _one = lock(&self.inner.in_flight);
         self.inner.stopping.store(false, Ordering::Relaxed);
-        self.client().map(drop)
+        let mut running = lock(&self.inner.running);
+        if running.as_ref().is_some_and(|r| !r.has_exited()) {
+            return Ok(());
+        }
+        let launched = launch(&self.inner.spec, &self.inner.stopping, Some(cancel))?;
+        let pid = launched.pid;
+        *running = Some(launched);
+        drop(running);
+        watch_idle(Arc::downgrade(&self.inner), pid);
+        Ok(())
     }
 
     /// Runs `command`, launching the runner first when none is up, and
@@ -315,11 +335,26 @@ impl RunnerSupervisor {
         }
     }
 
-    /// Shuts the runner down (detach, quit, control turned off).
+    /// Shuts the runner down (detach, control turned off), after the
+    /// command in flight.
     pub fn stop(&self) {
         self.inner.stopping.store(true, Ordering::Relaxed);
         let _one = lock(&self.inner.in_flight);
         self.shutdown_running(true);
+    }
+
+    /// Ends the runner now (quit, or a command that must not be waited
+    /// for): its group gets `SIGTERM` at once and the command in flight
+    /// fails; the rest happens off this thread.
+    pub fn abort(&self) {
+        self.inner.stopping.store(true, Ordering::Relaxed);
+        // A launch under way sees `stopping` within a tenth of a second.
+        let Some(running) = lock(&self.inner.running).take() else { return };
+        if !running.has_exited() {
+            child_ledger::terminate_group(running.pid);
+        }
+        let spec = self.inner.spec.clone();
+        std::thread::spawn(move || end_process(&spec, &running.child, running.pid, &running.exited));
     }
 
     /// The running runner's client, launching one when none is up.
@@ -332,11 +367,12 @@ impl RunnerSupervisor {
             let r = running.take().expect("checked");
             finish(&self.inner.spec, r, false);
         }
-        let launched = launch(&self.inner.spec, &self.inner.stopping)?;
+        let launched = launch(&self.inner.spec, &self.inner.stopping, None)?;
         let handles = (launched.client.clone(), launched.exited.clone());
+        let pid = launched.pid;
         *running = Some(launched);
         drop(running);
-        watch_idle(Arc::downgrade(&self.inner));
+        watch_idle(Arc::downgrade(&self.inner), pid);
         Ok(handles)
     }
 
@@ -383,7 +419,7 @@ fn end_process(spec: &RunnerSpec, child: &Mutex<Child>, pid: u32, exited: &Atomi
 const KEPT_RESULTS: usize = 3;
 
 /// Launches the runner and waits for it to listen.
-fn launch(spec: &RunnerSpec, stopping: &AtomicBool) -> Result<Running, ControlError> {
+fn launch(spec: &RunnerSpec, stopping: &AtomicBool, cancel: Option<&AtomicBool>) -> Result<Running, ControlError> {
     prune_results(&spec.derived.join("Logs/Test"), KEPT_RESULTS);
     let token = runner_client::new_token();
     let argv = spec.argv();
@@ -420,7 +456,7 @@ fn launch(spec: &RunnerSpec, stopping: &AtomicBool) -> Result<Running, ControlEr
             std::thread::sleep(Duration::from_millis(300));
             break classify_launch_failure(&output.tail());
         }
-        if stopping.load(Ordering::Relaxed) {
+        if stopping.load(Ordering::Relaxed) || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             break ControlError::Cancelled;
         }
         if Instant::now() >= deadline {
@@ -510,16 +546,17 @@ fn watch_exit(child: Arc<Mutex<Child>>, exited: Arc<AtomicBool>) {
     });
 }
 
-/// Shuts the runner down once it has been idle for `idle_stop`; ends with
-/// the runner (or the supervisor).
-fn watch_idle(inner: Weak<Inner>) {
+/// Shuts the runner `pid` down once it has been idle for `idle_stop`; ends
+/// with that runner (or the supervisor).
+fn watch_idle(inner: Weak<Inner>, pid: u32) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(1));
             let Some(inner) = inner.upgrade() else { return };
             let Ok(_one) = inner.in_flight.try_lock() else { continue };
             let mut running = lock(&inner.running);
-            let Some(r) = running.as_ref() else { return };
+            // Gone, or another launch's: not this watch's any more.
+            let Some(r) = running.as_ref().filter(|r| r.pid == pid) else { return };
             if r.has_exited() {
                 return;
             }
@@ -568,6 +605,8 @@ mod tests {
         assert_eq!(says("The provisioning profile has expired."), ControlError::ProfileExpired);
         assert_eq!(says("Unlock Jo’s iPhone to Continue"), ControlError::Locked);
         assert_eq!(says("A test runner is already running on this device"), ControlError::Busy);
+        // Xcode's first-connect wait is not another runner.
+        assert_eq!(says("Device is busy (Preparing Jo’s iPhone): waiting for the device"), ControlError::Preparing);
         let ControlError::LaunchFailed(why) = says("error: something else entirely") else { panic!() };
         assert_eq!(why, "error: something else entirely");
     }
@@ -749,5 +788,54 @@ mod tests {
         let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         assert_eq!(left, ["LogStoreManifest.plist", "Test-OximuxRunner-2026.10.09_09-00-00-+0700.xcresult", "Test-OximuxRunner-2026.10.10_10-00-00-+0700.xcresult"]);
+    }
+
+    #[test]
+    fn abort_ends_the_runner_without_waiting_for_the_command_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        // A runner that takes every request and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let ledger_dir = dir.path().to_owned();
+        let supervisor = Arc::new(RunnerSupervisor::new(launching(&ledger_dir, &[port])));
+        supervisor.start().unwrap();
+        let busy = {
+            let supervisor = supervisor.clone();
+            std::thread::spawn(move || supervisor.call("type", serde_json::json!({"text": "x".repeat(3000)})))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        supervisor.abort();
+        assert!(started.elapsed() < Duration::from_millis(500), "abort waited {:?}", started.elapsed());
+        assert!(!supervisor.is_running());
+        // The xcodebuild stand-in is gone within its grace.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !supervisor.inner.spec.ledger.as_ref().unwrap().entries().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(supervisor.inner.spec.ledger.as_ref().unwrap().entries().unwrap().is_empty());
+        drop(busy);
+    }
+
+    #[test]
+    fn a_start_given_up_by_its_caller_ends_its_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = fake_xcodebuild(dir.path(), "exec sleep 30");
+        let ledger = spec.ledger.clone().unwrap();
+        let supervisor = RunnerSupervisor::new(spec);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(supervisor.start_unless(&cancel), Err(ControlError::Cancelled));
+        assert!(ledger.entries().unwrap().is_empty());
     }
 }

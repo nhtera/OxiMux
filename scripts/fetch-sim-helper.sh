@@ -130,6 +130,10 @@ fi
 # --- The iPhone runner's sources ------------------------------------------------
 tarball="oximux-ios-runner-src-${RUNNER_VERSION}.tar.gz"
 out="$OUT_DIR/$tarball"
+# Only the pinned version is staged (the bundle step copies what is here).
+for stale in "$OUT_DIR"/oximux-ios-runner-src-*.tar.gz; do
+    [[ -f "$stale" && "$stale" != "$out" ]] && rm -f "$stale"
+done
 if [[ -f "$out" ]] && echo "${RUNNER_SHA256}  ${out}" | shasum -a 256 -c --status; then
     echo "==> iPhone runner sources up to date ($RUNNER_VERSION), skipping fetch"
 else

@@ -23,6 +23,8 @@ use super::{HubEvent, SIMCTL_TIMEOUT, SimulatorHub};
 /// How loud a notice is (the window picks the toast style).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
+    /// Something to know (a hint), not a result.
+    Info,
     Success,
     Error,
 }
