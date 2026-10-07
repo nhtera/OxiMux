@@ -71,6 +71,9 @@ struct View {
     size: Option<(u32, u32)>,
     orientation: Option<Orientation>,
     exited: Option<Option<i32>>,
+    /// Capture helper: a movie it finalized on its way out (an unplug in
+    /// the middle of a recording), from its `recorded` event.
+    recorded: Option<std::path::PathBuf>,
 }
 
 struct Inner {
@@ -280,6 +283,11 @@ impl HelperSession {
     /// `Some(code)` once the helper has exited.
     pub fn exited(&self) -> Option<Option<i32>> {
         self.inner.view.lock().unwrap().exited
+    }
+
+    /// Capture helper: the movie it finalized as it ended, if it did.
+    pub fn recorded(&self) -> Option<std::path::PathBuf> {
+        self.inner.view.lock().unwrap().recorded.clone()
     }
 
     /// Fire-and-forget input (touch, key, button, scroll, pause/resume). Key
@@ -500,6 +508,12 @@ fn dispatch_loop(
                 }
                 Event::Fatal { message, .. } => fatal = Some(message),
                 Event::Unknown(value) => {
+                    if inner.kind == HelperKind::DeviceCapture
+                        && value.get("event").and_then(Value::as_str) == Some("recorded")
+                        && let Some(path) = value.get("path").and_then(Value::as_str)
+                    {
+                        inner.view.lock().unwrap().recorded = Some(path.into());
+                    }
                     let _ = events.send(SessionEvent::Unknown(value));
                 }
                 Event::Malformed(why) => {

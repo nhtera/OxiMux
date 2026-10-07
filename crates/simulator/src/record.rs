@@ -272,9 +272,15 @@ impl Recording {
     }
 }
 
-/// Have the iPhone's helper finish the movie, then move it home.
+/// Have the iPhone's helper finish the movie, then move it home. A helper
+/// that already ended (the phone unplugged) finalized it on its way out when
+/// it says so.
 fn finish_capture(capture: &Capture, path: &Path) -> Result<PathBuf> {
-    capture.session.record_stop(CAPTURE_REPLY)?;
+    if let Err(e) = capture.session.record_stop(CAPTURE_REPLY)
+        && capture.session.video().recorded().as_deref() != Some(capture.staging.as_path())
+    {
+        return Err(e);
+    }
     move_file(&capture.staging, path)?;
     Ok(path.to_path_buf())
 }
