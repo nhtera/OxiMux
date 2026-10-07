@@ -34,10 +34,7 @@ pub struct Team {
     pub personal: bool,
 }
 
-/// A team id as Apple issues them: ten upper-case letters or digits.
-pub fn valid_team_id(id: &str) -> bool {
-    id.len() == 10 && id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-}
+pub use super::is_team_id as valid_team_id;
 
 /// The teams of this Mac's valid development identities, by name.
 pub fn teams(runner: &dyn Runner, timeout: Duration) -> Result<Vec<Team>> {

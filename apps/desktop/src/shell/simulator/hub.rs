@@ -139,6 +139,8 @@ pub struct SimulatorHub {
     /// Capture helpers still starting (perhaps waiting in the Camera prompt),
     /// one per iPhone: set to give the start up.
     capture_starts: HashMap<DeviceId, Arc<AtomicBool>>,
+    /// Real iPhones' control (see `iphone_control`).
+    controls: iphone_control::Controls,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -147,6 +149,7 @@ mod agent;
 mod android;
 mod capture;
 mod iphone;
+mod iphone_control;
 mod lifecycle;
 mod wifi;
 
@@ -157,6 +160,7 @@ pub(crate) use agent::InstallAnswer;
 pub(crate) use android::list_all;
 pub use capture::NoticeKind;
 pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};
+pub use iphone_control::{ControlState, TeamChoice};
 pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
 
 pub use lifecycle::{install, on_quit};
@@ -328,6 +332,12 @@ impl SimulatorHub {
     pub fn paste(&self, udid: &DeviceId, text: String, cx: &mut Context<Self>) {
         let Some(session) = self.session(udid) else { return };
         if text.is_empty() {
+            return;
+        }
+        // A controlled iPhone types it (any Unicode), in its queue's turn.
+        #[cfg(target_os = "macos")]
+        if let Some(control) = session.ios_device().and_then(|d| d.control()) {
+            control.type_text(&text);
             return;
         }
         // Android takes text as text (any Unicode), no clipboard round trip.
@@ -644,6 +654,8 @@ impl SimulatorHub {
         self.run(effects, cx);
         // A recording belongs to the device: it ends with its last attachment.
         self.stop_unattached_recordings(cx);
+        // So does an iPhone's control (its runner).
+        self.stop_unattached_controls(cx);
         if let Some(udid) = udid {
             cx.emit(HubEvent::Changed(udid));
         }
@@ -802,6 +814,7 @@ impl SimulatorHub {
         if let Ok(session) = &result {
             self.listen(udid.clone(), generation, session, cx);
         }
+        let started = result.is_ok() && udid.source() == Source::Devicectl;
         // Only for the attempt still current: a late answer must not
         // stop a newer session or clear ownership.
         if matches!(result, Err((_, true))) && self.starting(&udid, generation) {
@@ -811,6 +824,9 @@ impl SimulatorHub {
         let result = result.map_err(|(e, _)| e);
         let effects = self.registry.session_started(&udid, generation, result);
         self.run(effects, cx);
+        if started {
+            self.control_session_started(&udid, cx);
+        }
         cx.emit(HubEvent::Changed(udid));
     }
 

@@ -28,6 +28,9 @@ const STILL: f64 = 0.002;
 /// The longest long press sent.
 const LONG_PRESS_MAX: Duration = Duration::from_secs(10);
 
+/// The most text one `type` takes (the runner's limit).
+pub const MAX_TEXT: usize = 4000;
+
 const USAGE_RETURN: u32 = 0x28;
 const USAGE_BACKSPACE: u32 = 0x2a;
 const USAGE_KEYPAD_ENTER: u32 = 0x58;
@@ -79,7 +82,7 @@ impl Gesture {
     /// added). `next` back when they cannot.
     pub fn merge(&mut self, next: Gesture) -> Option<Gesture> {
         match (self, next) {
-            (Gesture::Text(text), Gesture::Text(more)) => {
+            (Gesture::Text(text), Gesture::Text(more)) if text.chars().count() + more.chars().count() <= MAX_TEXT => {
                 text.push_str(&more);
                 None
             }
@@ -128,7 +131,8 @@ impl InputMap {
             Command::Touch { phase, x, y, .. } => Ok(self.touch(phase, (x, y), now)),
             Command::Multitouch { .. } => Err(PINCH_HINT),
             Command::Key { phase, usage } => self.key(phase, usage),
-            Command::Button { name: crate::Button::Home } => Ok(Some(Gesture::Button(RunnerButton::Home))),
+            // Home, however the panel names it (a Face ID phone's is a swipe).
+            Command::Button { name: crate::Button::Home | crate::Button::SwipeHome } => Ok(Some(Gesture::Button(RunnerButton::Home))),
             _ => Err(KEYS_HINT),
         }
     }
@@ -306,6 +310,7 @@ mod tests {
         assert_eq!(map.feed(&Command::Multitouch { phase: TouchPhase::Begin, x1: 0.4, y1: 0.4, x2: 0.6, y2: 0.6 }, now), Err(PINCH_HINT));
         assert_eq!(map.feed(&Command::Button { name: crate::Button::Lock }, now), Err(KEYS_HINT));
         assert_eq!(map.feed(&Command::Button { name: crate::Button::Home }, now), Ok(Some(Gesture::Button(RunnerButton::Home))));
+        assert_eq!(map.feed(&Command::Button { name: crate::Button::SwipeHome }, now), Ok(Some(Gesture::Button(RunnerButton::Home))));
     }
 
     #[test]
@@ -313,6 +318,9 @@ mod tests {
         let mut text = Gesture::Text("he".into());
         assert_eq!(text.merge(Gesture::Text("y".into())), None);
         assert_eq!(text, Gesture::Text("hey".into()));
+        // Not past the runner's limit.
+        let mut long = Gesture::Text("x".repeat(MAX_TEXT - 1));
+        assert!(long.merge(Gesture::Text("yz".into())).is_some());
         let mut delete = Gesture::Delete(2);
         assert_eq!(delete.merge(Gesture::Delete(3)), None);
         assert_eq!(delete, Gesture::Delete(5));

@@ -109,8 +109,7 @@ impl SimulatorPanel {
             return Outcome::Done;
         }
         // The toolbar greys these out; the palette and shortcuts land here.
-        // Phase 8: for_session — an iPhone's runner adds touch and keys.
-        if !command.allowed(&DeviceCaps::for_id(&udid)) {
+        if !command.allowed(&hub.read(cx).caps(&udid)) {
             return Outcome::Done;
         }
         if command.needs_stream() && !matches!(self.state(cx), PanelState::Streaming) {

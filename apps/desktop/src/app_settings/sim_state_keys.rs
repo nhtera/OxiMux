@@ -111,6 +111,40 @@ pub fn save_stopped(repo: &SettingsRepo, stopped: &HashSet<DeviceId>) {
     }
 }
 
+/// The signing team the user chose for the iPhone control runner (a team
+/// id). In the database, not `simulator.toml`: it decides which Apple
+/// account OxiMux builds and registers with, and agents write that file.
+pub const KEY_IPHONE_TEAM: &str = "sim_iphone_team_v1";
+
+/// JSON list of the iPhones whose control the user turned on.
+pub const KEY_IPHONE_CONTROLLED: &str = "sim_iphone_controlled_v1";
+
+pub fn load_iphone_team(repo: &SettingsRepo) -> Option<String> {
+    repo.get(KEY_IPHONE_TEAM).ok().flatten().filter(|t| !t.is_empty())
+}
+
+pub fn save_iphone_team(repo: &SettingsRepo, team: &str) {
+    if let Err(err) = repo.set(KEY_IPHONE_TEAM, team) {
+        tracing::warn!(?err, "iPhone signing team not saved");
+    }
+}
+
+pub fn load_iphone_controlled(repo: &SettingsRepo) -> HashSet<DeviceId> {
+    match repo.get(KEY_IPHONE_CONTROLLED) {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        _ => HashSet::new(),
+    }
+}
+
+pub fn save_iphone_controlled(repo: &SettingsRepo, controlled: &HashSet<DeviceId>) {
+    let mut ids: Vec<&DeviceId> = controlled.iter().collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let Ok(json) = serde_json::to_string(&ids) else { return };
+    if let Err(err) = repo.set(KEY_IPHONE_CONTROLLED, &json) {
+        tracing::warn!(?err, "controlled iPhones not saved");
+    }
+}
+
 pub fn feature_used(repo: &SettingsRepo) -> bool {
     matches!(repo.get(KEY_FEATURE_USED), Ok(Some(v)) if v == "1")
 }
@@ -185,5 +219,20 @@ mod tests {
         let repo = SettingsRepo::new(open_memory().unwrap());
         repo.set(KEY_REGISTRY, "{not json").unwrap();
         assert_eq!(load_snapshot(&repo), Snapshot::default());
+    }
+
+    #[test]
+    fn the_iphone_team_and_controlled_phones_round_trip() {
+        let repo = SettingsRepo::new(open_memory().unwrap());
+        assert_eq!(load_iphone_team(&repo), None);
+        assert!(load_iphone_controlled(&repo).is_empty());
+        save_iphone_team(&repo, "TEAM000001");
+        let phones: HashSet<DeviceId> = [DeviceId("iosdev:00008130-0001".into()), DeviceId("iosdev:00008130-0002".into())].into();
+        save_iphone_controlled(&repo, &phones);
+        assert_eq!(load_iphone_team(&repo).as_deref(), Some("TEAM000001"));
+        assert_eq!(load_iphone_controlled(&repo), phones);
+        // Unreadable: none controlled (never a panic at startup).
+        repo.set(KEY_IPHONE_CONTROLLED, "{not json").unwrap();
+        assert!(load_iphone_controlled(&repo).is_empty());
     }
 }

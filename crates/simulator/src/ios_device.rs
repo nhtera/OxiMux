@@ -37,8 +37,14 @@ use crate::protocol::Command;
 use crate::session::HelperSession;
 use crate::{Result, SimError};
 
+/// A signing team id as Apple issues them: ten upper-case letters or digits
+/// (checked before one reaches an `xcodebuild` argument).
+pub fn is_team_id(id: &str) -> bool {
+    id.len() == 10 && id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 /// What to do instead, while OxiMux only shows an iPhone.
-pub const ENABLE_CONTROL_HINT: &str = "use the phone itself";
+pub const ENABLE_CONTROL_HINT: &str = "turn its control on in the Mobile Emulator panel (Control from OxiMux…), or use the phone itself";
 
 #[cfg(target_os = "macos")]
 type ControlSlot = Arc<Mutex<Option<Arc<control::DeviceControl>>>>;

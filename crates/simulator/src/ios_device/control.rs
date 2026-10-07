@@ -151,6 +151,18 @@ impl DeviceControl {
         }
     }
 
+    /// Pasted text, typed into whatever has the phone's keyboard focus (in
+    /// pieces the runner takes).
+    pub fn type_text(&self, text: &str) {
+        let chars: Vec<char> = text.chars().filter(|c| *c != '\r').collect();
+        let mut state = lock(&self.shared.state);
+        for piece in chars.chunks(super::input_map::MAX_TEXT) {
+            push(&mut state, Job::Panel { gesture: Gesture::Text(piece.iter().collect()), queued: Instant::now() });
+        }
+        drop(state);
+        self.shared.wake.notify_all();
+    }
+
     /// The panel's toolbar button (queued like a gesture).
     pub fn press(&self, button: super::input_map::RunnerButton) {
         let mut state = lock(&self.shared.state);
@@ -511,6 +523,17 @@ mod tests {
         assert_eq!(exec.calls.lock().unwrap().last().unwrap().1["app"], "com.example.app");
         control.stop();
         assert!(matches!(control.call("viewport", json!({})), Err(ControlError::Cancelled)));
+    }
+
+    #[test]
+    fn a_long_paste_is_typed_in_pieces_the_runner_takes() {
+        let exec = fake(0);
+        let (control, _events) = control(exec.clone(), (1290, 2796));
+        control.type_text(&"é".repeat(super::super::input_map::MAX_TEXT + 10));
+        let calls = settle(&exec, 2);
+        let lengths: Vec<usize> = calls.iter().map(|(_, f)| f["text"].as_str().unwrap().chars().count()).collect();
+        assert_eq!(lengths, [super::super::input_map::MAX_TEXT, 10]);
+        control.stop();
     }
 
     #[test]

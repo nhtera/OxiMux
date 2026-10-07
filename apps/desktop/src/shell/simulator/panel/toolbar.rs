@@ -84,9 +84,12 @@ impl SimulatorPanel {
         let recording = self.recording_since(cx);
         let device = self.device(cx);
         let android = device.as_ref().is_some_and(|d| d.platform() == oximux_simulator::Platform::Android);
-        // What this device can do: a real phone is never rotated or shut
-        // down from here. Phase 8: for_session — an iPhone's runner adds input.
-        let caps = device.as_ref().map(oximux_simulator::caps::DeviceCaps::for_id);
+        // What this device can do now: a real phone is never rotated or shut
+        // down from here, and an iPhone takes input while its control is on.
+        let caps = device.as_ref().map(|d| match &self.hub {
+            Some(hub) => hub.read(cx).caps(d),
+            None => oximux_simulator::caps::DeviceCaps::for_id(d),
+        });
         let can = |command: SimCommand| caps.as_ref().is_none_or(|caps| command.allowed(caps));
         let items: &[Option<(&str, &str, &str, SimCommand)>] = if android { &ANDROID_ITEMS } else { &ITEMS };
         let mut pill = self.pill();
