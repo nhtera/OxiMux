@@ -299,18 +299,19 @@ pub fn stop_group(pid: u32, grace: std::time::Duration) {
 #[cfg(not(unix))]
 pub fn stop_group(_pid: u32, _grace: std::time::Duration) {}
 
-/// `SIGTERM` to `pid`'s group (or `pid` alone when it does not lead one),
-/// without waiting: for quit, where [`reap_stale`] finishes the job next
-/// launch if it must.
+/// `SIGKILL` to `pid`'s group (or `pid` alone when it does not lead one),
+/// without waiting: for quit, where nothing is left to escalate a `SIGTERM`
+/// (measured live: `xcodebuild test-without-building` ignores one, and
+/// killing it also ends its runner on the phone).
 #[cfg(unix)]
-pub fn terminate_group(pid: u32) {
+pub fn kill_group(pid: u32) {
     // SAFETY: `getpgid(2)` on a pid; it only reads.
     let leads = unsafe { libc::getpgid(pid as libc::pid_t) } == pid as libc::pid_t;
-    send_signal_to(if leads { -(pid as i32) } else { pid as i32 }, libc::SIGTERM);
+    send_signal_to(if leads { -(pid as i32) } else { pid as i32 }, libc::SIGKILL);
 }
 
 #[cfg(not(unix))]
-pub fn terminate_group(_pid: u32) {}
+pub fn kill_group(_pid: u32) {}
 
 /// Waits up to `grace` for `pid` to end, then `SIGKILL`s `target` (the pid,
 /// or a negated group id).

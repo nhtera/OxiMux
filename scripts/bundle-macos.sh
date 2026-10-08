@@ -85,7 +85,10 @@
 # Same release; signed as its own bundle with the hardened runtime and ONLY
 # the camera entitlement (assets/device-capture.entitlements): macOS shows
 # an iPhone's screen as a camera, and OxiMux spawns this app responsible for
-# itself, so that grant is never OxiMux's terminals' or agents'.
+# itself, so that grant is never OxiMux's terminals' or agents'. Nested in
+# OxiMux.app it is still held to OxiMux.app's Info.plist for the usage
+# string: without NSCameraUsageDescription there (assets/Info.plist), macOS
+# kills it on its first camera call (measured 2026-10-08).
 
 set -euo pipefail
 

@@ -344,14 +344,15 @@ impl RunnerSupervisor {
     }
 
     /// Ends the runner now (quit, or a command that must not be waited
-    /// for): its group gets `SIGTERM` at once and the command in flight
-    /// fails; the rest happens off this thread.
+    /// for): its group is killed at once — on quit no thread survives to
+    /// escalate a `SIGTERM`, which `xcodebuild` ignores — and the command in
+    /// flight fails; the reaping happens off this thread.
     pub fn abort(&self) {
         self.inner.stopping.store(true, Ordering::Relaxed);
         // A launch under way sees `stopping` within a tenth of a second.
         let Some(running) = lock(&self.inner.running).take() else { return };
         if !running.has_exited() {
-            child_ledger::terminate_group(running.pid);
+            child_ledger::kill_group(running.pid);
         }
         let spec = self.inner.spec.clone();
         std::thread::spawn(move || end_process(&spec, &running.child, running.pid, &running.exited));

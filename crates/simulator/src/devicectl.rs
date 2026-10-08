@@ -120,6 +120,9 @@ fn parse_apps(bytes: &[u8]) -> Result<Vec<PhoneApp>> {
             let name = a.get("name").and_then(serde_json::Value::as_str).filter(|n| !n.is_empty()).unwrap_or(&bundle_id).to_owned();
             Some(PhoneApp { bundle_id, name })
         })
+        // A UI-test runner (ours, or any other project's) is no app to
+        // drive: aiming gestures at one would address the runner itself.
+        .filter(|a| !a.bundle_id.ends_with(".xctrunner") && !a.bundle_id.starts_with("dev.oximux.runner."))
         .filter(|a| seen.insert(a.bundle_id.clone()))
         .collect();
     apps.sort_by_key(|a| a.name.to_lowercase());
@@ -365,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn the_phones_apps_are_listed_by_name_without_hidden_ones() {
+    fn the_phones_apps_are_listed_by_name_without_hidden_ones_or_test_runners() {
         let out = br#"notice first
 {"info": {"outcome": "success"}, "result": {"apps": [
   {"bundleIdentifier": "com.example.zeta", "name": "Zeta", "hidden": false, "appClip": false, "removable": true},
@@ -374,6 +377,8 @@ mod tests {
   {"bundleIdentifier": "com.example.clip", "name": "Clip", "appClip": true},
   {"bundleIdentifier": "com.example.unnamed"},
   {"bundleIdentifier": "com.example.zeta", "name": "Zeta again"},
+  {"bundleIdentifier": "com.example.app.UITests.xctrunner", "name": "AppUITests-Runner"},
+  {"bundleIdentifier": "dev.oximux.runner.tABCDE12345", "name": "OximuxRunner"},
   {"name": "no id"}
 ]}}"#;
         let apps = parse_apps(out).unwrap();

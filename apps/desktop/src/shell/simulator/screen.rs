@@ -358,7 +358,7 @@ impl ScreenView {
                     .bg(self.theme.bg_overlay)
                     .text_size(px(ty.t_body_sm))
                     .text_color(self.theme.fg_base)
-                    .child("Typing goes to the simulator · ⌃Esc to release"),
+                    .child("Typing goes to the device · ⌃Esc to release"),
             )
             .into_any_element()
     }

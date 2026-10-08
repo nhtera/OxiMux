@@ -26,6 +26,8 @@
 	<string>13.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>OxiMux shows a connected iPhone's screen. macOS presents a phone's screen as a camera, so seeing it needs camera access; no camera is ever used.</string>
 	<key>NSInputMonitoringUsageDescription</key>
 	<string>OxiMux watches for the Escape key so you can stop an agent that is controlling your screen.</string>
 	<key>NSLocalNetworkUsageDescription</key>

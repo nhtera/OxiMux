@@ -474,7 +474,9 @@ impl SimulatorHub {
                         ControlEvent::Failed { message, expired } => hub.control_failed(&udid, message, expired, cx),
                         ControlEvent::Hint(hint) => cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Info, hint.to_owned())),
                         ControlEvent::Reactivated(app) if app != SPRINGBOARD_ID => {
-                            cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Success, format!("Brought {app} to the front")));
+                            // The picked app's name when it is the one, else its id.
+                            let name = hub.controls.targets.get(&udid).filter(|t| t.bundle_id == app).map_or(app.as_str(), |t| t.name.as_str());
+                            cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Success, format!("Brought {name} to the front")));
                         }
                         ControlEvent::Reactivated(_) => {}
                         ControlEvent::TargetReset => {
