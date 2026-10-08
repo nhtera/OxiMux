@@ -43,6 +43,12 @@ pub fn is_team_id(id: &str) -> bool {
     id.len() == 10 && id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+/// A capture session's phone gone mid-stream (the helper's
+/// `device_not_connected` after `ready`), in one phrase the registry knows:
+/// an iPhone briefly re-enumerating on USB comes straight back, so it gets
+/// one automatic restart (`Registry::session_exited`).
+pub const PHONE_DROPPED: &str = "the iPhone was unplugged";
+
 /// What to do instead, while OxiMux only shows an iPhone.
 pub const ENABLE_CONTROL_HINT: &str = "turn its control on in the Mobile Emulator panel (Control from OxiMux…), or use the phone itself";
 

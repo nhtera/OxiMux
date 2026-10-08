@@ -507,7 +507,10 @@ fn dispatch_loop(
                 Event::Format { message, .. } => {
                     let _ = events.send(SessionEvent::EncodingFallback(message));
                 }
-                Event::Fatal { message, .. } => fatal = Some(message),
+                Event::Fatal { reason, message } => {
+                    let dropped = inner.kind == HelperKind::DeviceCapture && reason == protocol::FatalReason::DeviceNotConnected;
+                    fatal = Some(if dropped { crate::ios_device::PHONE_DROPPED.to_owned() } else { message });
+                }
                 Event::Unknown(value) => {
                     if inner.kind == HelperKind::DeviceCapture
                         && value.get("event").and_then(Value::as_str) == Some("recorded")
