@@ -318,6 +318,11 @@ impl RunnerSupervisor {
                 }
                 Err(error) => error,
             };
+            // Turned off or quit while it ran: the failure is that stop's,
+            // and nothing is launched again behind it.
+            if self.inner.stopping.load(Ordering::Relaxed) {
+                return Err(ControlError::Cancelled);
+            }
             let ended = exited.load(Ordering::Relaxed);
             let Some(class) = RecoveryClass::of(&error, ended) else { return Err(error.into()) };
             tracing::info!(udid = %self.inner.spec.udid, ?class, "the iPhone control runner failed: {error}");
@@ -831,6 +836,42 @@ mod tests {
         }
         assert!(supervisor.inner.spec.ledger.as_ref().unwrap().entries().unwrap().is_empty(), "still running: SIGTERM only?");
         drop(busy);
+    }
+
+    #[test]
+    fn a_command_cut_by_an_abort_launches_nothing_again() {
+        let dir = tempfile::tempdir().unwrap();
+        // A runner that holds every request until it is gone, then drops
+        // each connection (the client's one resend included).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let gone = Arc::new(AtomicBool::new(false));
+        {
+            let (held, gone) = (held.clone(), gone.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    if !gone.load(Ordering::Relaxed) {
+                        lock(&held).push(stream);
+                    }
+                }
+            });
+        }
+        let supervisor = Arc::new(RunnerSupervisor::new(launching(dir.path(), &[port])));
+        supervisor.start().unwrap();
+        let call = {
+            let supervisor = supervisor.clone();
+            std::thread::spawn(move || supervisor.call("type", serde_json::json!({"text": "x"})))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        supervisor.abort();
+        // The connection drops, as the killed runner's would.
+        gone.store(true, Ordering::Relaxed);
+        lock(&held).clear();
+        assert_eq!(call.join().unwrap(), Err(ControlError::Cancelled));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(launches(dir.path()), 1, "relaunched after the abort");
+        assert!(!supervisor.is_running());
     }
 
     #[test]
