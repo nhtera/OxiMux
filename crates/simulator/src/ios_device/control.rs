@@ -37,6 +37,8 @@ pub const DOUBLE_TAP: Duration = Duration::from_millis(250);
 pub const STALE: Duration = Duration::from_secs(5);
 /// The home screen and system dialogs (the default target).
 pub const SPRINGBOARD: &str = "com.apple.springboard";
+/// The most `candidates` the runner takes (runner 0.1.2).
+pub const MAX_CANDIDATES: usize = 64;
 /// The same hint is not repeated sooner than this.
 const HINT_EVERY: Duration = Duration::from_secs(3);
 
@@ -96,6 +98,9 @@ struct State {
     /// for (landscape or not; `None`: unknown).
     viewport: Option<((f64, f64), Option<bool>)>,
     target: String,
+    /// The phone's own apps: where the keyboard focus may be when the target
+    /// does not hold it (an app opened from the home screen).
+    candidates: Vec<String>,
     closed: bool,
     hinted: Option<(&'static str, Instant)>,
 }
@@ -126,6 +131,7 @@ impl DeviceControl {
                 input: InputMap::default(),
                 viewport: None,
                 target: SPRINGBOARD.into(),
+                candidates: Vec::new(),
                 closed: false,
                 hinted: None,
             }),
@@ -148,6 +154,13 @@ impl DeviceControl {
 
     pub fn set_target(&self, bundle_id: &str) {
         lock(&self.shared.state).target = bundle_id.to_owned();
+    }
+
+    /// The phone's own apps, sent with typing as the runner's `candidates`
+    /// (at most [`MAX_CANDIDATES`]): one of them in front may hold the
+    /// keyboard focus while the target is the home screen.
+    pub fn set_candidates(&self, bundle_ids: impl IntoIterator<Item = String>) {
+        lock(&self.shared.state).candidates = bundle_ids.into_iter().take(MAX_CANDIDATES).collect();
     }
 
     /// The panel's input (never blocks).
@@ -373,7 +386,10 @@ fn report_failure(shared: &Shared, error: &ControlError) -> bool {
 
 /// `gesture` as a runner command, in points.
 fn perform(shared: &Shared, gesture: &Gesture) -> Result<Reply, ControlError> {
-    let app = lock(&shared.state).target.clone();
+    let (app, candidates) = {
+        let state = lock(&shared.state);
+        (state.target.clone(), state.candidates.clone())
+    };
     let needs_points = matches!(gesture, Gesture::Tap { .. } | Gesture::LongPress { .. } | Gesture::Drag { .. });
     let (w, h) = if needs_points { viewport(shared)? } else { (0.0, 0.0) };
     let pt = |(x, y): (f64, f64)| json!({"x": round(x * w), "y": round(y * h)});
@@ -383,9 +399,9 @@ fn perform(shared: &Shared, gesture: &Gesture) -> Result<Reply, ControlError> {
         Gesture::Drag { from, to, ms, hold, settle } => {
             ("drag", json!({"app": app, "from": pt(*from), "to": pt(*to), "durationMs": ms, "holdMs": hold, "settle": settle}))
         }
-        Gesture::Text(text) => ("type", json!({"app": app, "text": text})),
-        Gesture::Return => ("keyboardReturn", json!({"app": app})),
-        Gesture::Delete(count) => ("keyboardDelete", json!({"app": app, "count": count})),
+        Gesture::Text(text) => ("type", json!({"app": app, "text": text, "candidates": candidates})),
+        Gesture::Return => ("keyboardReturn", json!({"app": app, "candidates": candidates})),
+        Gesture::Delete(count) => ("keyboardDelete", json!({"app": app, "count": count, "candidates": candidates})),
         Gesture::Button(button) => ("button", json!({"name": button.wire_name()})),
     };
     let reply = shared.exec.call(command, fields)?;
@@ -552,6 +568,19 @@ mod tests {
         let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(names, ["button", "type", "keyboardReturn"]);
         assert_eq!(calls[1].1["text"], "hi");
+        control.stop();
+    }
+
+    #[test]
+    fn typing_names_the_phones_apps_as_where_the_focus_may_be() {
+        let exec = fake(0);
+        let (control, _events) = control(exec.clone(), (1290, 2796));
+        control.set_candidates((0..70).map(|i| format!("com.example.app{i}")));
+        control.type_text("hi");
+        let calls = settle(&exec, 1);
+        let candidates = calls[0].1["candidates"].as_array().expect("candidates");
+        assert_eq!(candidates.len(), MAX_CANDIDATES, "capped");
+        assert_eq!(candidates[0], "com.example.app0");
         control.stop();
     }
 

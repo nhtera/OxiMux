@@ -200,6 +200,7 @@ impl SimulatorHub {
                     let apps = listed
                         .map(|apps| apps.into_iter().map(|a| TargetApp { bundle_id: a.bundle_id, name: a.name }).collect())
                         .map_err(|e| e.to_string());
+                    hub.share_candidates(&target, &apps);
                     hub.controls.apps.insert(target.clone(), apps);
                     cx.emit(super::HubEvent::Changed(target));
                 });
@@ -315,7 +316,7 @@ impl SimulatorHub {
         }
     }
 
-    /// Every phone's control, on quit: each runner's group is sent `SIGTERM`
+    /// Every phone's control, on quit: each runner's group is killed
     /// at once (the child ledger catches whatever outlives the quit).
     pub(super) fn stop_controls_blocking(&mut self) {
         #[cfg(target_os = "macos")]
@@ -440,8 +441,21 @@ impl SimulatorHub {
         self.controls.running.insert(udid.clone(), control);
         self.set_control_state(udid, ControlState::On { busy: false }, cx);
         self.forward_control_events(udid.clone(), events_rx, cx);
-        // Listed now, so the target picker has them when it opens.
-        let _ = self.phone_apps(udid, cx);
+        // Listed now, so the target picker has them when it opens (and
+        // typing knows where the focus may be).
+        if let Some(apps) = self.phone_apps(udid, cx) {
+            self.share_candidates(udid, &apps);
+        }
+    }
+
+    /// The phone's apps to its running control, as typing's candidates.
+    fn share_candidates(&self, udid: &DeviceId, apps: &Result<Vec<TargetApp>, String>) {
+        #[cfg(target_os = "macos")]
+        if let (Some(control), Ok(apps)) = (self.controls.running.get(udid), apps) {
+            control.set_candidates(apps.iter().map(|a| a.bundle_id.clone()));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (udid, apps);
     }
 
     /// The control's events, to the panel: failures and hints as notices,
