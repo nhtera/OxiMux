@@ -119,8 +119,9 @@ pub enum ControlError {
     /// The runner failed the same way again within the recovery window.
     #[error("{0} (the control runner was already restarted for this)")]
     GaveUp(String),
-    /// The command itself failed (`code` is the runner's).
-    #[error("{message}")]
+    /// The command itself failed (`code` is the runner's), with what to do
+    /// when the runner says.
+    #[error("{message}{}", hint.as_deref().map(|h| format!(" ({h})")).unwrap_or_default())]
     Command { code: String, message: String, hint: Option<String> },
     #[error("{0}")]
     Runner(String),
@@ -465,6 +466,12 @@ fn launch(spec: &RunnerSpec, stopping: &AtomicBool, cancel: Option<&AtomicBool>)
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    if matches!(failure, ControlError::Cancelled) && !exited.load(Ordering::Relaxed) {
+        // Quit, Cancel or Turn off mid-launch: on quit nothing is left to
+        // escalate the SIGTERM `end_process` starts with, and xcodebuild
+        // ignores it.
+        child_ledger::kill_group(pid);
+    }
     end_process(spec, &child, pid, &exited);
     Err(failure)
 }
@@ -803,8 +810,10 @@ mod tests {
                 held.push(stream);
             }
         });
-        let ledger_dir = dir.path().to_owned();
-        let supervisor = Arc::new(RunnerSupervisor::new(launching(&ledger_dir, &[port])));
+        // Like xcodebuild, the stand-in ignores SIGTERM: only a SIGKILL ends
+        // it before `end_process`'s 5 s escalation (which a quit never sees).
+        let script = format!("trap '' TERM; echo \"OXIMUX_RUNNER_LISTENING port={port}\"; exec sleep 30");
+        let supervisor = Arc::new(RunnerSupervisor::new(RunnerSpec { transport: Transport::Loopback, ..fake_xcodebuild(dir.path(), &script) }));
         supervisor.start().unwrap();
         let busy = {
             let supervisor = supervisor.clone();
@@ -815,19 +824,21 @@ mod tests {
         supervisor.abort();
         assert!(started.elapsed() < Duration::from_millis(500), "abort waited {:?}", started.elapsed());
         assert!(!supervisor.is_running());
-        // The xcodebuild stand-in is gone within its grace.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The xcodebuild stand-in is gone well before a SIGTERM's grace.
+        let deadline = Instant::now() + Duration::from_secs(2);
         while !supervisor.inner.spec.ledger.as_ref().unwrap().entries().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(supervisor.inner.spec.ledger.as_ref().unwrap().entries().unwrap().is_empty());
+        assert!(supervisor.inner.spec.ledger.as_ref().unwrap().entries().unwrap().is_empty(), "still running: SIGTERM only?");
         drop(busy);
     }
 
     #[test]
     fn a_start_given_up_by_its_caller_ends_its_launch() {
         let dir = tempfile::tempdir().unwrap();
-        let spec = fake_xcodebuild(dir.path(), "exec sleep 30");
+        // Ignoring SIGTERM, as xcodebuild does: a cancel must not wait out
+        // the 5 s escalation (on quit, nothing would be left to do it).
+        let spec = fake_xcodebuild(dir.path(), "trap '' TERM; exec sleep 30");
         let ledger = spec.ledger.clone().unwrap();
         let supervisor = RunnerSupervisor::new(spec);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -836,7 +847,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             flag.store(true, Ordering::Relaxed);
         });
+        let started = Instant::now();
         assert_eq!(supervisor.start_unless(&cancel), Err(ControlError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(2), "the cancel waited {:?}", started.elapsed());
         assert!(ledger.entries().unwrap().is_empty());
     }
 }

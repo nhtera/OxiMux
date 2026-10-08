@@ -444,7 +444,8 @@ impl<S: Clone> Registry<S> {
     /// an iPhone whose capture lost it while it is still listed: a phone
     /// briefly re-enumerating on USB (measured, plugged in throughout) gets
     /// the one restart, and a real unplug is Disconnected once the watcher
-    /// sees it gone.
+    /// sees it gone. One per attachment, as for a simulator: attach,
+    /// unpark and Reconnect allow the next one.
     pub fn session_exited(&mut self, udid: &DeviceId, generation: Generation, still_booted: bool, reason: String) -> Vec<Effect<S>> {
         let next = self.bump();
         let Some(device) = self.devices.get_mut(udid) else { return Vec::new() };
