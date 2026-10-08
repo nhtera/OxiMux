@@ -36,9 +36,9 @@ use crate::runner::Runner;
 use crate::{Result, SimError};
 
 /// The runner release OxiMux drives (`ios-runner-v<VERSION>` in the fork).
-pub const RUNNER_VERSION: &str = "0.1.0";
+pub const RUNNER_VERSION: &str = "0.1.1";
 /// Its source tarball's SHA-256 (`oximux-ios-runner-src-<VERSION>.tar.gz`).
-pub const RUNNER_SHA256: &str = "f72fed55b3f4b00c30f700d6030196afd13ad72b1d24bb72df835126a1ed6667";
+pub const RUNNER_SHA256: &str = "0df5f8272c14ed283b47d799d12e9ac86c79d0a79107ffaea25582318ee65bd0";
 /// The tarball's file name, as bundled.
 pub fn tarball_name() -> String {
     format!("oximux-ios-runner-src-{RUNNER_VERSION}.tar.gz")

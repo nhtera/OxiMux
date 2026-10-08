@@ -45,9 +45,9 @@ cd "$(dirname "$0")/.."
 HELPER_VERSION="0.4.0"
 SIM_HELPER_SHA256="99123302115a6b303b8d39ba508bd04253b7d40f7485df7dc650366cac754fc4"
 CAPTURE_SHA256="02831df2bc8b45553bce7de7b64218a48285f00e16cf90d65a71c3621ee52b99"
-RUNNER_VERSION="0.1.0"
+RUNNER_VERSION="0.1.1"
 # Must equal `RUNNER_SHA256` in crates/simulator/src/ios_device/runner_build.rs.
-RUNNER_SHA256="f72fed55b3f4b00c30f700d6030196afd13ad72b1d24bb72df835126a1ed6667"
+RUNNER_SHA256="0df5f8272c14ed283b47d799d12e9ac86c79d0a79107ffaea25582318ee65bd0"
 REPO="nhtera/serve-sim"
 RELEASE="https://github.com/${REPO}/releases/download/helper-v${HELPER_VERSION}"
 
