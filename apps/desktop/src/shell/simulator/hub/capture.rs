@@ -29,6 +29,15 @@ pub enum NoticeKind {
     Error,
 }
 
+/// A real phone's side buttons (see [`SimulatorHub::press_hardware`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardwareButton {
+    VolumeUp,
+    VolumeDown,
+    /// An iPhone's Action button (the panel only: no agent verb names it).
+    Action,
+}
+
 /// What a capture is, for its file name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureKind {
@@ -107,6 +116,30 @@ impl SimulatorHub {
     pub fn back(&self, udid: &DeviceId) -> bool {
         let Some(session) = self.session(udid) else { return false };
         session.press_android(oximux_simulator::android::input::AndroidButton::Back).is_ok()
+    }
+
+    /// A real phone's volume or Action button: an Android phone's through
+    /// scrcpy, a controlled iPhone's through its runner. False when it has
+    /// no such button now.
+    pub fn press_hardware(&self, udid: &DeviceId, button: HardwareButton) -> bool {
+        use oximux_simulator::android::input::AndroidButton;
+        let Some(session) = self.session(udid) else { return false };
+        #[cfg(target_os = "macos")]
+        if let Some(control) = session.ios_device().and_then(|d| d.control()) {
+            use oximux_simulator::ios_device::input_map::RunnerButton;
+            control.press(match button {
+                HardwareButton::VolumeUp => RunnerButton::VolumeUp,
+                HardwareButton::VolumeDown => RunnerButton::VolumeDown,
+                HardwareButton::Action => RunnerButton::Action,
+            });
+            return true;
+        }
+        let android = match button {
+            HardwareButton::VolumeUp => AndroidButton::VolumeUp,
+            HardwareButton::VolumeDown => AndroidButton::VolumeDown,
+            HardwareButton::Action => return false,
+        };
+        session.press_android(android).is_ok()
     }
 
     /// Android's Recents (the app switcher).

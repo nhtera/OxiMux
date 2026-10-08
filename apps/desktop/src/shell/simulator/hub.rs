@@ -158,9 +158,9 @@ pub use wifi::PairStage;
 pub(crate) use wifi::can_submit;
 pub(crate) use agent::InstallAnswer;
 pub(crate) use android::list_all;
-pub use capture::NoticeKind;
+pub use capture::{HardwareButton, NoticeKind};
 pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};
-pub use iphone_control::{ControlState, TeamChoice};
+pub use iphone_control::{ControlState, TargetApp, TeamChoice};
 pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
 
 pub use lifecycle::{install, on_quit};

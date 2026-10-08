@@ -186,6 +186,21 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         make_action: || Box::new(crate::actions::SimRecents),
     },
     CommandEntry {
+        name: "Mobile Emulator: Volume Up (real phone)",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimVolumeUp),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Volume Down (real phone)",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimVolumeDown),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Action Button (iPhone)",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimActionButton),
+    },
+    CommandEntry {
         name: "Mobile Emulator: Toggle Keyboard Capture",
         action_id: None,
         make_action: || Box::new(crate::actions::SimToggleKeyboard),
@@ -357,13 +372,14 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_thirty_four_entries() {
+    fn palette_commands_has_thirty_seven_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
         // + "Reveal Active Workspace" + "Show Mobile Emulator"
         // + the Android "Back" and "Recents" simulator rows
-        // + "Restart Terminal Daemon" + "Kill All Terminal Sessions".
-        assert_eq!(PALETTE_COMMANDS.len(), 34);
+        // + "Restart Terminal Daemon" + "Kill All Terminal Sessions"
+        // + a real phone's Volume Up / Volume Down and the iPhone's Action.
+        assert_eq!(PALETTE_COMMANDS.len(), 37);
     }
 
     /// The daemon commands answer to what people call the thing.

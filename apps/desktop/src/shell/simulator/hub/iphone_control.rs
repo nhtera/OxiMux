@@ -85,6 +85,19 @@ pub(crate) struct Controls {
     /// This Mac's signing teams, once listed (`Err`: why not).
     teams: Option<Result<Vec<TeamChoice>, String>>,
     teams_loading: bool,
+    /// Each phone's apps, for the target picker (listed when it opens).
+    apps: HashMap<DeviceId, Vec<TargetApp>>,
+    apps_loading: std::collections::HashSet<DeviceId>,
+    /// The app each phone's gestures and typing address (absent: the home
+    /// screen), kept across a relaunch of its control.
+    targets: HashMap<DeviceId, TargetApp>,
+}
+
+/// An app control can address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetApp {
+    pub bundle_id: String,
+    pub name: String,
 }
 
 /// Build progress reaches the panel at most this often.
@@ -125,6 +138,72 @@ impl SimulatorHub {
     /// The team the user chose for the runner, if any.
     pub fn chosen_team(&self) -> Option<String> {
         sim_state_keys::load_iphone_team(&self.repo)
+    }
+
+    /// The app `udid`'s control addresses (`None`: the home screen).
+    pub fn control_target(&self, udid: &DeviceId) -> Option<TargetApp> {
+        self.controls.targets.get(udid).cloned()
+    }
+
+    /// Address `app` (`None`: the home screen and system dialogs).
+    pub fn set_control_target(&mut self, udid: &DeviceId, app: Option<TargetApp>, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if let Some(control) = self.controls.running.get(udid) {
+            let bundle = app.as_ref().map_or(oximux_simulator::ios_device::control::SPRINGBOARD, |a| a.bundle_id.as_str());
+            control.set_target(bundle);
+        }
+        match app {
+            Some(app) => self.controls.targets.insert(udid.clone(), app),
+            None => self.controls.targets.remove(udid),
+        };
+        cx.emit(super::HubEvent::Changed(udid.clone()));
+    }
+
+    /// An agent launched `bundle_id` on the phone: it is what typing and the
+    /// accessibility tree should address now.
+    pub(crate) fn note_launched(&mut self, udid: &DeviceId, bundle_id: &str, cx: &mut Context<Self>) {
+        let name = self
+            .controls
+            .apps
+            .get(udid)
+            .and_then(|apps| apps.iter().find(|a| a.bundle_id == bundle_id))
+            .map_or_else(|| bundle_id.to_owned(), |a| a.name.clone());
+        self.set_control_target(udid, Some(TargetApp { bundle_id: bundle_id.to_owned(), name }), cx);
+    }
+
+    /// The phone's apps, for the picker (listed on first ask; `None`
+    /// meanwhile; empty when there are none or devicectl cannot say).
+    pub fn phone_apps(&mut self, udid: &DeviceId, cx: &mut Context<Self>) -> Option<Vec<TargetApp>> {
+        if !self.controls.apps.contains_key(udid) && self.controls.apps_loading.insert(udid.clone()) {
+            let (runner, target) = (self.runner.clone(), udid.clone());
+            cx.spawn(async move |this, cx| {
+                let listed = cx
+                    .background_executor()
+                    .spawn({
+                        let target = target.clone();
+                        async move { oximux_simulator::devicectl::apps(runner.as_ref(), &target, std::time::Duration::from_secs(20)) }
+                    })
+                    .await;
+                let _ = this.update(cx, |hub, cx| {
+                    hub.controls.apps_loading.remove(&target);
+                    let apps = listed
+                        .inspect_err(|e| tracing::debug!("listing the iPhone's apps: {e}"))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| TargetApp { bundle_id: a.bundle_id, name: a.name })
+                        .collect();
+                    hub.controls.apps.insert(target.clone(), apps);
+                    cx.emit(super::HubEvent::Changed(target));
+                });
+            })
+            .detach();
+        }
+        self.controls.apps.get(udid).cloned()
+    }
+
+    /// List the phone's apps again (one was installed meanwhile).
+    pub fn forget_phone_apps(&mut self, udid: &DeviceId) {
+        self.controls.apps.remove(udid);
     }
 
     /// This Mac's signing teams (listed on first ask; `None` meanwhile).
@@ -342,6 +421,9 @@ impl SimulatorHub {
         let frame_of = move || shape.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.video().framebuffer_size());
         let (events_tx, events_rx) = std::sync::mpsc::channel::<ControlEvent>();
         let control = Arc::new(DeviceControl::new(supervisor, frame_of, events_tx));
+        if let Some(app) = self.controls.targets.get(udid) {
+            control.set_target(&app.bundle_id);
+        }
         if let Some(session) = session {
             session.set_control(Some(control.clone()));
         }
@@ -488,5 +570,55 @@ fn launch(
             supervisor.start_unless(cancel).map(|()| supervisor)
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hub(cx: &mut gpui::TestAppContext) -> gpui::Entity<SimulatorHub> {
+        let db = oximux_storage::open_memory().expect("db");
+        cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), oximux_storage::SimApprovalRepo::new(db))
+        })
+    }
+
+    /// What an agent launches becomes the target, named as the phone lists
+    /// it; the home screen is the target again once picked.
+    #[gpui::test]
+    fn a_launched_app_becomes_the_target(cx: &mut gpui::TestAppContext) {
+        let hub = hub(cx);
+        let phone = DeviceId("iosdev:00008130-0001".into());
+        hub.update(cx, |hub, cx| {
+            assert_eq!(hub.control_target(&phone), None, "the home screen by default");
+            hub.controls.apps.insert(phone.clone(), vec![TargetApp { bundle_id: "com.example.notes".into(), name: "Notes+".into() }]);
+            hub.note_launched(&phone, "com.example.notes", cx);
+            assert_eq!(hub.control_target(&phone).map(|a| a.name), Some("Notes+".into()));
+            // Not listed (yet): its id stands in for its name.
+            hub.note_launched(&phone, "com.example.fresh", cx);
+            assert_eq!(hub.control_target(&phone).map(|a| a.name), Some("com.example.fresh".into()));
+            hub.set_control_target(&phone, None, cx);
+            assert_eq!(hub.control_target(&phone), None);
+        });
+    }
+
+    /// Control is the user's choice per phone, with a team id checked first;
+    /// turning it off is remembered.
+    #[gpui::test]
+    fn turning_control_on_and_off_is_remembered(cx: &mut gpui::TestAppContext) {
+        let hub = hub(cx);
+        let phone = DeviceId("iosdev:00008130-0002".into());
+        hub.update(cx, |hub, cx| {
+            hub.enable_control(&phone, "not a team", cx);
+            assert_eq!(hub.chosen_team(), None, "a malformed team id is never saved");
+            assert!(!sim_state_keys::load_iphone_controlled(&hub.repo).contains(&phone));
+            hub.enable_control(&phone, "TEAM000001", cx);
+            assert_eq!(hub.chosen_team().as_deref(), Some("TEAM000001"));
+            assert!(sim_state_keys::load_iphone_controlled(&hub.repo).contains(&phone));
+            hub.disable_control(&phone, cx);
+            assert!(!sim_state_keys::load_iphone_controlled(&hub.repo).contains(&phone));
+            assert_eq!(hub.control_state(&phone), ControlState::Off);
+        });
     }
 }

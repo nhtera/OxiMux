@@ -4,13 +4,15 @@
 //! build's progress, and what went wrong.
 
 use gpui::{AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{
-    Sizable as _,
+    Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
+use oximux_simulator::DeviceId;
 
 use super::SimulatorPanel;
-use crate::shell::simulator::hub::{ControlState, TeamChoice};
+use crate::shell::simulator::hub::{ControlState, TargetApp, TeamChoice};
 
 /// What building the runner does, said before the user picks a team.
 const DISCLOSURE: &str = "OxiMux builds a small test runner on this Mac and runs it on the iPhone, signed with the team you pick. \
@@ -52,7 +54,8 @@ impl SimulatorPanel {
                 .into_any_element(),
             ControlState::On { busy } => self
                 .row()
-                .child(self.line(if busy { "Controlling this iPhone · working…" } else { "Controlling this iPhone" }, theme.fg_muted, ty.t_body_sm))
+                .child(self.line(if busy { "Controlling · working…" } else { "Controlling" }, theme.fg_muted, ty.t_body_sm))
+                .child(self.target_picker(&udid, cx))
                 .child(self.action("sim-control-off", "Turn off", cx, Self::turn_control_off))
                 .into_any_element(),
             ControlState::Failed(message) => self
@@ -76,6 +79,44 @@ impl SimulatorPanel {
                 )
                 .into_any_element(),
         }
+    }
+
+    /// Which app gestures and typing address: the home screen, or one of
+    /// the phone's apps (listed when the menu opens).
+    fn target_picker(&self, udid: &DeviceId, cx: &mut Context<Self>) -> AnyElement {
+        let Some(hub) = self.hub.clone() else { return div().into_any_element() };
+        let current = hub.read(cx).control_target(udid);
+        let label = current.as_ref().map_or_else(|| "Home screen".to_owned(), |a| a.name.clone());
+        let (udid, menu_hub) = (udid.clone(), hub.downgrade());
+        Button::new("sim-control-target")
+            .ghost()
+            .small()
+            .label(SharedString::from(label))
+            .icon(Icon::default().path("icons/chevron-down.svg"))
+            .tooltip("The app taps, typing and the accessibility tree address")
+            .dropdown_menu(move |menu, _window, cx| {
+                let Some(hub) = menu_hub.upgrade() else { return menu };
+                let apps = hub.update(cx, |hub, cx| hub.phone_apps(&udid, cx));
+                let pick = |app: Option<TargetApp>| {
+                    let (hub, udid) = (hub.downgrade(), udid.clone());
+                    move |_: &gpui::ClickEvent, _: &mut gpui::Window, cx: &mut gpui::App| {
+                        let _ = hub.update(cx, |hub, cx| hub.set_control_target(&udid, app.clone(), cx));
+                    }
+                };
+                let mut menu = menu.item(PopupMenuItem::new("Home screen").checked(current.is_none()).on_click(pick(None)));
+                let apps = match apps {
+                    None => return menu.label("Listing the phone's apps…"),
+                    Some(apps) if apps.is_empty() => return menu.label("No apps of yours on the phone"),
+                    Some(apps) => apps,
+                };
+                menu = menu.separator();
+                for app in apps {
+                    let checked = current.as_ref().is_some_and(|c| c.bundle_id == app.bundle_id);
+                    menu = menu.item(PopupMenuItem::new(SharedString::from(app.name.clone())).checked(checked).on_click(pick(Some(app))));
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     /// The setup card: what building does, then one button per team.

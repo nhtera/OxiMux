@@ -255,7 +255,13 @@ pub(super) async fn run(
         SimCmdWire::Launch { bundle_id, relaunch } if udid.source() == Source::Devicectl => {
             check_bundle_id(&bundle_id)?;
             let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
-            on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done)
+            let launched = bundle_id.clone();
+            let done = on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done);
+            // What it launched is what typing and the tree address next.
+            if done.is_ok() {
+                hub.update(cx, |hub, cx| hub.note_launched(udid, &launched, cx));
+            }
+            done
         }
         SimCmdWire::Launch { bundle_id, relaunch } => {
             check_bundle_id(&bundle_id)?;
@@ -306,7 +312,10 @@ pub(super) async fn run(
             // Asked every time, once the phone is reachable (as on Android).
             let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
             confirm_install(hub, udid, name, &app, target, cx).await?;
-            on_own_thread(move || device.install(&app)).await?.map(|()| SimReplyWire::Done)
+            let done = on_own_thread(move || device.install(&app)).await?.map(|()| SimReplyWire::Done);
+            // The target picker lists the new app next time it opens.
+            hub.update(cx, |hub, _| hub.forget_phone_apps(udid));
+            done
         }
         SimCmdWire::Install { path } => {
             let udid = simctl_ready(hub, udid, cx).await?;
