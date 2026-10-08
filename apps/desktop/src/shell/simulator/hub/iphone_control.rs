@@ -36,6 +36,9 @@ use super::SimulatorHub;
 use super::{HubEvent, NoticeKind, simulator_dir};
 use crate::app_settings::sim_state_keys;
 
+/// The home screen's bundle id (what "no target" means to the runner).
+const SPRINGBOARD_ID: &str = "com.apple.springboard";
+
 /// What the panel shows of a phone's control.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ControlState {
@@ -85,8 +88,9 @@ pub(crate) struct Controls {
     /// This Mac's signing teams, once listed (`Err`: why not).
     teams: Option<Result<Vec<TeamChoice>, String>>,
     teams_loading: bool,
-    /// Each phone's apps, for the target picker (listed when it opens).
-    apps: HashMap<DeviceId, Vec<TargetApp>>,
+    /// Each phone's apps, for the target picker (listed when control comes
+    /// on, and again after a failure or an install); `Err`: why not.
+    apps: HashMap<DeviceId, Result<Vec<TargetApp>, String>>,
     apps_loading: std::collections::HashSet<DeviceId>,
     /// The app each phone's gestures and typing address (absent: the home
     /// screen), kept across a relaunch of its control.
@@ -149,7 +153,7 @@ impl SimulatorHub {
     pub fn set_control_target(&mut self, udid: &DeviceId, app: Option<TargetApp>, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         if let Some(control) = self.controls.running.get(udid) {
-            let bundle = app.as_ref().map_or(oximux_simulator::ios_device::control::SPRINGBOARD, |a| a.bundle_id.as_str());
+            let bundle = app.as_ref().map_or(SPRINGBOARD_ID, |a| a.bundle_id.as_str());
             control.set_target(bundle);
         }
         match app {
@@ -162,19 +166,23 @@ impl SimulatorHub {
     /// An agent launched `bundle_id` on the phone: it is what typing and the
     /// accessibility tree should address now.
     pub(crate) fn note_launched(&mut self, udid: &DeviceId, bundle_id: &str, cx: &mut Context<Self>) {
+        if bundle_id == SPRINGBOARD_ID {
+            return self.set_control_target(udid, None, cx);
+        }
         let name = self
             .controls
             .apps
             .get(udid)
-            .and_then(|apps| apps.iter().find(|a| a.bundle_id == bundle_id))
+            .and_then(|apps| apps.as_ref().ok()?.iter().find(|a| a.bundle_id == bundle_id))
             .map_or_else(|| bundle_id.to_owned(), |a| a.name.clone());
         self.set_control_target(udid, Some(TargetApp { bundle_id: bundle_id.to_owned(), name }), cx);
     }
 
-    /// The phone's apps, for the picker (listed on first ask; `None`
-    /// meanwhile; empty when there are none or devicectl cannot say).
-    pub fn phone_apps(&mut self, udid: &DeviceId, cx: &mut Context<Self>) -> Option<Vec<TargetApp>> {
-        if !self.controls.apps.contains_key(udid) && self.controls.apps_loading.insert(udid.clone()) {
+    /// The phone's apps, for the picker (`None` while they are listed; a
+    /// failed listing is said, and tried again on the next ask).
+    pub fn phone_apps(&mut self, udid: &DeviceId, cx: &mut Context<Self>) -> Option<Result<Vec<TargetApp>, String>> {
+        let known = self.controls.apps.get(udid).cloned();
+        if !matches!(known, Some(Ok(_))) && self.controls.apps_loading.insert(udid.clone()) {
             let (runner, target) = (self.runner.clone(), udid.clone());
             cx.spawn(async move |this, cx| {
                 let listed = cx
@@ -185,25 +193,26 @@ impl SimulatorHub {
                     })
                     .await;
                 let _ = this.update(cx, |hub, cx| {
-                    hub.controls.apps_loading.remove(&target);
+                    // Forgotten meanwhile (an install): this list is stale.
+                    if !hub.controls.apps_loading.remove(&target) {
+                        return;
+                    }
                     let apps = listed
-                        .inspect_err(|e| tracing::debug!("listing the iPhone's apps: {e}"))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|a| TargetApp { bundle_id: a.bundle_id, name: a.name })
-                        .collect();
+                        .map(|apps| apps.into_iter().map(|a| TargetApp { bundle_id: a.bundle_id, name: a.name }).collect())
+                        .map_err(|e| e.to_string());
                     hub.controls.apps.insert(target.clone(), apps);
                     cx.emit(super::HubEvent::Changed(target));
                 });
             })
             .detach();
         }
-        self.controls.apps.get(udid).cloned()
+        known
     }
 
     /// List the phone's apps again (one was installed meanwhile).
     pub fn forget_phone_apps(&mut self, udid: &DeviceId) {
         self.controls.apps.remove(udid);
+        self.controls.apps_loading.remove(udid);
     }
 
     /// This Mac's signing teams (listed on first ask; `None` meanwhile).
@@ -431,6 +440,8 @@ impl SimulatorHub {
         self.controls.running.insert(udid.clone(), control);
         self.set_control_state(udid, ControlState::On { busy: false }, cx);
         self.forward_control_events(udid.clone(), events_rx, cx);
+        // Listed now, so the target picker has them when it opens.
+        let _ = self.phone_apps(udid, cx);
     }
 
     /// The control's events, to the panel: failures and hints as notices,
@@ -462,10 +473,15 @@ impl SimulatorHub {
                         ControlEvent::Error(message) => cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, message)),
                         ControlEvent::Failed { message, expired } => hub.control_failed(&udid, message, expired, cx),
                         ControlEvent::Hint(hint) => cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Info, hint.to_owned())),
-                        ControlEvent::Reactivated(app) if app != oximux_simulator::ios_device::control::SPRINGBOARD => {
+                        ControlEvent::Reactivated(app) if app != SPRINGBOARD_ID => {
                             cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Success, format!("Brought {app} to the front")));
                         }
                         ControlEvent::Reactivated(_) => {}
+                        ControlEvent::TargetReset => {
+                            if hub.controls.targets.remove(&udid).is_some() {
+                                cx.emit(HubEvent::Changed(udid.clone()));
+                            }
+                        }
                     })
                     .is_ok();
                 if !alive {
@@ -592,13 +608,17 @@ mod tests {
         let phone = DeviceId("iosdev:00008130-0001".into());
         hub.update(cx, |hub, cx| {
             assert_eq!(hub.control_target(&phone), None, "the home screen by default");
-            hub.controls.apps.insert(phone.clone(), vec![TargetApp { bundle_id: "com.example.notes".into(), name: "Notes+".into() }]);
+            hub.controls.apps.insert(phone.clone(), Ok(vec![TargetApp { bundle_id: "com.example.notes".into(), name: "Notes+".into() }]));
             hub.note_launched(&phone, "com.example.notes", cx);
             assert_eq!(hub.control_target(&phone).map(|a| a.name), Some("Notes+".into()));
             // Not listed (yet): its id stands in for its name.
             hub.note_launched(&phone, "com.example.fresh", cx);
             assert_eq!(hub.control_target(&phone).map(|a| a.name), Some("com.example.fresh".into()));
             hub.set_control_target(&phone, None, cx);
+            assert_eq!(hub.control_target(&phone), None);
+            // The home screen launched by id is the home screen.
+            hub.note_launched(&phone, "com.example.notes", cx);
+            hub.note_launched(&phone, "com.apple.springboard", cx);
             assert_eq!(hub.control_target(&phone), None);
         });
     }
@@ -608,7 +628,8 @@ mod tests {
     #[gpui::test]
     fn turning_control_on_and_off_is_remembered(cx: &mut gpui::TestAppContext) {
         let hub = hub(cx);
-        let phone = DeviceId("iosdev:00008130-0002".into());
+        // Not a hardware UDID: nothing is built or launched by the test.
+        let phone = DeviceId("iosdev:not-a-udid".into());
         hub.update(cx, |hub, cx| {
             hub.enable_control(&phone, "not a team", cx);
             assert_eq!(hub.chosen_team(), None, "a malformed team id is never saved");

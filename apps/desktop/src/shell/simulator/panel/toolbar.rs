@@ -58,7 +58,7 @@ const IPHONE_ITEMS: [Option<(&str, &str, &str, SimCommand)>; 10] = [
     Some(("sim-tb-home", "icons/house.svg", "Home  ⌘⇧H", SimCommand::Home)),
     Some(("sim-tb-vol-down", "icons/volume-1.svg", "Volume down", SimCommand::VolumeDown)),
     Some(("sim-tb-vol-up", "icons/volume-2.svg", "Volume up", SimCommand::VolumeUp)),
-    Some(("sim-tb-action", "icons/circle-dot.svg", "Action button", SimCommand::ActionButton)),
+    Some(("sim-tb-action", "icons/circle-dot.svg", "Action button (iPhone 15 Pro and later)", SimCommand::ActionButton)),
     None,
     Some(("sim-tb-annotate", "icons/pencil.svg", "Annotate for an agent", SimCommand::Annotate)),
     Some(("sim-tb-shot", "icons/camera.svg", "Screenshot to Desktop  ⌘S", SimCommand::Screenshot)),

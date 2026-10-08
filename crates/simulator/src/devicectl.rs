@@ -109,6 +109,7 @@ fn parse_apps(bytes: &[u8]) -> Result<Vec<PhoneApp>> {
     let raw: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| SimError::Parse { what: "devicectl device info apps".into(), detail: e.to_string() })?;
     let rows = raw.pointer("/result/apps").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
     let mut apps: Vec<PhoneApp> = rows
         .iter()
         // Leniently, a row at a time; hidden apps and App Clips are not targets.
@@ -119,9 +120,9 @@ fn parse_apps(bytes: &[u8]) -> Result<Vec<PhoneApp>> {
             let name = a.get("name").and_then(serde_json::Value::as_str).filter(|n| !n.is_empty()).unwrap_or(&bundle_id).to_owned();
             Some(PhoneApp { bundle_id, name })
         })
+        .filter(|a| seen.insert(a.bundle_id.clone()))
         .collect();
     apps.sort_by_key(|a| a.name.to_lowercase());
-    apps.dedup_by(|a, b| a.bundle_id == b.bundle_id);
     Ok(apps)
 }
 
@@ -372,6 +373,7 @@ mod tests {
   {"bundleIdentifier": "com.example.secret", "name": "Secret", "hidden": true},
   {"bundleIdentifier": "com.example.clip", "name": "Clip", "appClip": true},
   {"bundleIdentifier": "com.example.unnamed"},
+  {"bundleIdentifier": "com.example.zeta", "name": "Zeta again"},
   {"name": "no id"}
 ]}}"#;
         let apps = parse_apps(out).unwrap();

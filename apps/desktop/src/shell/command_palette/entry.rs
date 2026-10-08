@@ -186,12 +186,12 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         make_action: || Box::new(crate::actions::SimRecents),
     },
     CommandEntry {
-        name: "Mobile Emulator: Volume Up (real phone)",
+        name: "Mobile Emulator: Volume Up (Android, controlled iPhone)",
         action_id: None,
         make_action: || Box::new(crate::actions::SimVolumeUp),
     },
     CommandEntry {
-        name: "Mobile Emulator: Volume Down (real phone)",
+        name: "Mobile Emulator: Volume Down (Android, controlled iPhone)",
         action_id: None,
         make_action: || Box::new(crate::actions::SimVolumeDown),
     },

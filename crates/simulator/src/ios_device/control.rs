@@ -78,6 +78,9 @@ pub enum ControlEvent {
     Reactivated(String),
     /// The queue started (true) or ran dry (false).
     Busy(bool),
+    /// Home was pressed: gestures address the home screen again (the app
+    /// that was the target would be brought back by the next tap).
+    TargetReset,
 }
 
 enum Job {
@@ -385,7 +388,16 @@ fn perform(shared: &Shared, gesture: &Gesture) -> Result<Reply, ControlError> {
         Gesture::Delete(count) => ("keyboardDelete", json!({"app": app, "count": count})),
         Gesture::Button(button) => ("button", json!({"name": button.wire_name()})),
     };
-    shared.exec.call(command, fields)
+    let reply = shared.exec.call(command, fields)?;
+    if matches!(gesture, Gesture::Button(super::input_map::RunnerButton::Home)) {
+        let mut state = lock(&shared.state);
+        if state.target != SPRINGBOARD {
+            state.target = SPRINGBOARD.into();
+            drop(state);
+            let _ = shared.events.send(ControlEvent::TargetReset);
+        }
+    }
+    Ok(reply)
 }
 
 /// The screen in points: the runner's `viewport` of the home screen (an
@@ -685,6 +697,20 @@ mod tests {
         let calls = settle(&exec, 1);
         let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(names, ["type"], "the text is typed, the stale Return dropped");
+        control.stop();
+    }
+
+    #[test]
+    fn home_makes_the_home_screen_the_target_again() {
+        let exec = fake(0);
+        let (control, events) = control(exec.clone(), (1290, 2796));
+        control.set_target("com.example.app");
+        control.press(super::super::input_map::RunnerButton::Home);
+        click(&control, 0.5, 0.5);
+        let calls = settle(&exec, 3);
+        assert_eq!(calls.last().unwrap().1["app"], SPRINGBOARD, "the tap after Home is the home screen's");
+        assert_eq!(control.target(), SPRINGBOARD);
+        assert!(events.try_iter().any(|e| e == ControlEvent::TargetReset));
         control.stop();
     }
 }

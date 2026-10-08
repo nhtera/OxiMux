@@ -105,9 +105,10 @@ impl SimulatorPanel {
                 };
                 let mut menu = menu.item(PopupMenuItem::new("Home screen").checked(current.is_none()).on_click(pick(None)));
                 let apps = match apps {
-                    None => return menu.label("Listing the phone's apps…"),
-                    Some(apps) if apps.is_empty() => return menu.label("No apps of yours on the phone"),
-                    Some(apps) => apps,
+                    None => return menu.label("Listing the phone's apps… (reopen in a moment)"),
+                    Some(Err(_)) => return menu.label("Could not list the phone's apps (unlock it, then reopen)"),
+                    Some(Ok(apps)) if apps.is_empty() => return menu.label("No apps of yours on the phone"),
+                    Some(Ok(apps)) => apps,
                 };
                 menu = menu.separator();
                 for app in apps {
