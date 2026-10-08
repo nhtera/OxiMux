@@ -37,7 +37,7 @@ pub const DOUBLE_TAP: Duration = Duration::from_millis(250);
 pub const STALE: Duration = Duration::from_secs(5);
 /// The home screen and system dialogs (the default target).
 pub const SPRINGBOARD: &str = "com.apple.springboard";
-/// The most `candidates` the runner takes (runner 0.1.2).
+/// The most `candidates` the runner takes.
 pub const MAX_CANDIDATES: usize = 64;
 /// The same hint is not repeated sooner than this.
 const HINT_EVERY: Duration = Duration::from_secs(3);
