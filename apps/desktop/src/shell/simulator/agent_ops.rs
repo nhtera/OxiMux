@@ -363,10 +363,11 @@ fn device_wire(d: &DeviceInfo) -> SimDeviceWire {
     SimDeviceWire {
         udid: d.udid.to_string(),
         name: d.name.clone(),
-        // Android's runtime is already "Android 16" / "Android API 37.1".
-        runtime: match d.udid.platform() {
-            oximux_simulator::Platform::Android => d.runtime.clone(),
-            oximux_simulator::Platform::Ios => format!("{platform} {}", d.os_version),
+        // Only a simulator's runtime is an identifier; Android's is already
+        // "Android 16" / "Android API 37.1", and a real iPhone's "iOS 27.0".
+        runtime: match d.udid.source() {
+            oximux_simulator::Source::Simctl => format!("{platform} {}", d.os_version),
+            oximux_simulator::Source::Adb | oximux_simulator::Source::Devicectl => d.runtime.clone(),
         },
         state: state.to_owned(),
     }
@@ -413,6 +414,13 @@ mod tests {
     fn devices_read_as_platform_and_version() {
         let wire = device_wire(&info("A", "iPhone 17 Pro", "26.3", DeviceState::ShuttingDown));
         assert_eq!((wire.runtime.as_str(), wire.state.as_str()), ("iOS 26.3", "Shutting Down"));
+    }
+
+    /// A real iPhone's runtime is already readable (it read "0 27.0").
+    #[test]
+    fn a_real_iphone_keeps_its_runtime() {
+        let phone = DeviceInfo { runtime: "iOS 27.0".into(), ..info("iosdev:00008130-0001", "iPhone", "27.0", DeviceState::Booted) };
+        assert_eq!(device_wire(&phone).runtime, "iOS 27.0");
     }
 
     fn known(path: &str, window: &str, active: bool) -> Known {
