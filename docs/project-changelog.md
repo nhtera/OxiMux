@@ -4,6 +4,46 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-10-09 — Real phones in the Mobile Emulator panel (#50–#54)
+
+- **Agent access to a real device lasts until OxiMux quits.** The approval is
+  never saved. Approvals saved for Android phones by earlier builds are
+  revoked once on upgrade, so the first agent verb asks again. On a real
+  device, `oximux sim install` asks you every time, and `oximux sim open-url`
+  opens only `http`/`https` links. Simulators and emulators keep their saved
+  approvals.
+- **Real devices are never picked for you.** They are never booted, shut down
+  or attached automatically, whether by the host, `oximux sim attach` or the
+  Settings default device.
+- **Android phones over USB** show a hint for "Allow USB debugging" and come
+  live as soon as you allow it. They survive unplug and replug (#51).
+- **Android phones over Wi-Fi** pair in the panel with the six-digit code or
+  a QR code (Android 11+). The secret goes to `adb` on stdin, never on its
+  command line. A phone on both USB and Wi-Fi is one row (#52).
+- **USB iPhones** are listed under "Physical devices". They stream live
+  (H.264), and screenshots and recordings (`.mov`) work with nothing to set up.
+  The stream comes from a separate `OxiMux Device Capture.app`, the only part
+  that holds the camera grant, so terminals and agents never inherit it
+  (#53).
+- **Control an iPhone (opt-in, per phone).** Choose "Control from OxiMux…" and
+  pick an Apple Development team. OxiMux shows what building the runner
+  registers with that team, then builds a small XCUITest runner on this Mac
+  from pinned sources and runs it on the phone. The panel and agents then
+  share one queue:
+  - tap, double tap, long press, drag/scroll and typing
+  - Home, the volume buttons, and Action (Action from the panel only)
+  - an app picker for which app taps and typing address
+  - `oximux sim tap`/`swipe`/`type`/`button`/`ax`
+
+  The runner answers only a per-launch token over USB, and is given only
+  the token's SHA-256, so the test log XCTest keeps on the Mac holds no
+  usable secret. It stops after 10
+  minutes idle, on Turn off and on quit, and relaunches at most once per
+  failure kind every 10 minutes. Needs Xcode 26 and Developer Mode on the
+  phone (#54).
+
+---
+
 ### 2026-10-06 — v0.1.40: Find in the markdown preview and every editor (#49)
 
 - **⌘F works in the markdown preview.** Matches are highlighted in the
