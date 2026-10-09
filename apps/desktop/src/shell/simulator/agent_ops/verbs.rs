@@ -58,7 +58,62 @@ async fn on_own_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static
 
 type Out = Result<SimReplyWire, SimErrorWire>;
 
+/// How long the scrcpy server gets to refuse a session's first input.
+const INPUT_VERDICT: Duration = Duration::from_millis(300);
+
+/// What an agent hears when the phone refuses injected input.
+const INPUT_BLOCKED: &str = "the phone refuses injected input (on Xiaomi/HyperOS: \"USB debugging (Security settings)\" is off); \
+     ask the user to turn it on in Developer options and reconnect the phone";
+
 pub(super) async fn run(
+    hub: &Entity<SimulatorHub>,
+    udid: &DeviceId,
+    name: &str,
+    cmd: SimCmdWire,
+    target: &Target,
+    cx: &mut AsyncApp,
+) -> Out {
+    // An Android phone may drop injected input on the floor (an OEM setting):
+    // the server says so only on stderr, so an agent is told here rather
+    // than hearing "tapped" for a tap that never happened. Emulators never do.
+    let checked = is_input(&cmd) && udid.source() == Source::Adb && udid.is_physical();
+    let phone = |cx: &mut AsyncApp| hub.read_with(cx, |hub, _| hub.session(udid)).and_then(|s| s.android().cloned());
+    if checked && phone(cx).is_some_and(|s| s.input_blocked()) {
+        return Err(SimErrorWire::Refused(INPUT_BLOCKED.into()));
+    }
+    let reply = run_verb(hub, udid, name, cmd, target, cx).await;
+    // The session the verb used: it may have woken or reconnected the phone.
+    let Some(session) = phone(cx).filter(|_| checked && reply.is_ok()) else { return reply };
+    let timer = cx.background_executor().timer(INPUT_VERDICT);
+    input_verdict(|| session.input_blocked(), || session.input_proven(), || session.note_input_taken(), timer).await?;
+    reply
+}
+
+/// Whether input sent to a phone went through: refused if the phone blocks
+/// it; otherwise, the first time in a session, the server gets `wait` to
+/// say so before the session is trusted. The window is a heuristic: a
+/// slower refusal still latches, and the next verb is refused up front.
+async fn input_verdict(
+    blocked: impl Fn() -> bool,
+    proven: impl Fn() -> bool,
+    mark: impl Fn(),
+    wait: impl std::future::Future,
+) -> Result<(), SimErrorWire> {
+    if !blocked() && !proven() {
+        wait.await;
+    }
+    if blocked() {
+        return Err(SimErrorWire::Refused(INPUT_BLOCKED.into()));
+    }
+    mark();
+    Ok(())
+}
+
+fn is_input(cmd: &SimCmdWire) -> bool {
+    matches!(cmd, SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_))
+}
+
+async fn run_verb(
     hub: &Entity<SimulatorHub>,
     udid: &DeviceId,
     name: &str,
@@ -91,7 +146,7 @@ pub(super) async fn run(
     }
     // Input takes turns per device: interleaved touch streams from parallel
     // calls would make gestures nobody asked for.
-    let input = matches!(cmd, SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_));
+    let input = is_input(&cmd);
     let lock = input.then(|| hub.update(cx, |hub, _| hub.input_lock(udid)));
     let _turn = match &lock {
         Some(lock) => Some(lock.lock().await),
@@ -372,7 +427,7 @@ async fn live_session(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut Asyn
             (Wake::Starting, _) if Instant::now() >= deadline => {
                 let booting = matches!(hub.read_with(cx, |hub, _| hub.phase(udid)), oximux_simulator::registry::Phase::Booting { .. });
                 return Err(if booting {
-                    SimErrorWire::Unavailable("the simulator is still booting; retry in a few seconds".into())
+                    SimErrorWire::Unavailable("it is still starting; retry in a few seconds".into())
                 } else {
                     SimErrorWire::NotStreaming
                 });
@@ -679,6 +734,36 @@ fn install_path(path: &str, worktree: &Path) -> Result<PathBuf, SimErrorWire> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verdict on a phone's input: refused when it blocks input (before
+    /// or during the wait); otherwise trusted once, and not waited on again.
+    #[test]
+    fn a_phone_that_blocks_input_is_refused_and_one_that_takes_it_is_trusted() {
+        use std::cell::Cell;
+        let run = |blocked_before: bool, blocked_during: bool, proven: bool| {
+            let (blocked, waited, marked) = (Cell::new(blocked_before), Cell::new(false), Cell::new(false));
+            let wait = async {
+                waited.set(true);
+                if blocked_during {
+                    blocked.set(true);
+                }
+            };
+            let out = futures::executor::block_on(input_verdict(|| blocked.get(), || proven, || marked.set(true), wait));
+            (out.is_ok(), waited.get(), marked.get())
+        };
+        assert_eq!(run(true, false, false), (false, false, false), "known blocked: refused, no wait");
+        assert_eq!(run(false, true, false), (false, true, false), "refused during the wait");
+        assert_eq!(run(false, false, false), (true, true, true), "taken: trusted from now on");
+        assert_eq!(run(false, false, true), (true, false, true), "already trusted: no wait");
+    }
+
+    /// The verbs that inject input (and take the per-device input turn).
+    #[test]
+    fn only_input_verbs_count_as_input() {
+        assert!(is_input(&SimCmdWire::Type { text: "a".into(), paste: false }));
+        assert!(!is_input(&SimCmdWire::Screenshot { full: false }));
+        assert!(!is_input(&SimCmdWire::Ax { max: 10 }));
+    }
 
     /// A real device opens web links only: a custom scheme can dial, pay or
     /// message on someone's own phone.
