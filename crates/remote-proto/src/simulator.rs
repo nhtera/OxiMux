@@ -221,16 +221,16 @@ pub enum SimErrorWire {
 impl std::fmt::Display for SimErrorWire {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ConsentPending => f.write_str("waiting for the user to allow agent control of this simulator"),
+            Self::ConsentPending => f.write_str("waiting for the user to allow agent control of this device"),
             Self::ConsentDenied { retry_after_secs } => write!(
                 f,
-                "the user did not allow agent control of this simulator (ask again in {} min)",
+                "the user did not allow agent control of this device (ask again in {} min)",
                 retry_after_secs.div_ceil(60)
             ),
-            Self::AgentControlDisabled => f.write_str("agent control of the simulator is turned off in OxiMux Settings"),
-            Self::NoDevice => f.write_str("no simulator is attached to this worktree"),
-            Self::NotStreaming => f.write_str("the simulator's screen is not streaming yet"),
-            Self::Unavailable(why) => write!(f, "the simulator is unavailable: {why}"),
+            Self::AgentControlDisabled => f.write_str("agent control of devices is turned off in OxiMux Settings"),
+            Self::NoDevice => f.write_str("no device is attached to this worktree"),
+            Self::NotStreaming => f.write_str("the device's screen is not streaming yet"),
+            Self::Unavailable(why) => write!(f, "the device is unavailable: {why}"),
             Self::PathOutsideWorktree => {
                 f.write_str("the app must be inside this worktree or Xcode's DerivedData")
             }
