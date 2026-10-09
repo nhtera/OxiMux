@@ -72,6 +72,14 @@ pub fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// What the runner is given instead of `token`: its SHA-256, as hex. XCTest
+/// writes the test's environment into the result bundle's session log, which
+/// any process of the user's can read, so the token itself never goes there.
+pub fn token_digest(token: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
     /// Nothing listens on the runner's port: it has ended.
@@ -373,6 +381,16 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// The runner gets the token's SHA-256 as lower-case hex (its
+    /// `HTTP.digest(hex:)` reads exactly this), never the token.
+    #[test]
+    fn the_runner_is_given_the_tokens_digest() {
+        assert_eq!(token_digest("secret"), "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b");
+        let token = new_token();
+        assert_eq!(token_digest(&token).len(), 64);
+        assert_ne!(token_digest(&token), token);
+    }
 
     enum Answer {
         Envelope(Value),

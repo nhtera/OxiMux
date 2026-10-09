@@ -36,9 +36,9 @@ use crate::runner::Runner;
 use crate::{Result, SimError};
 
 /// The runner release OxiMux drives (`ios-runner-v<VERSION>` in the fork).
-pub const RUNNER_VERSION: &str = "0.1.2";
+pub const RUNNER_VERSION: &str = "0.1.3";
 /// Its source tarball's SHA-256 (`oximux-ios-runner-src-<VERSION>.tar.gz`).
-pub const RUNNER_SHA256: &str = "3b0ea76aa086a27df9234022d6f5d92caace4da60f19f7811d19f38d819022e3";
+pub const RUNNER_SHA256: &str = "60016d72d6c4ec73a1d46226b06ce305e89b34722f5ba98e899cbbb006a2e2d7";
 /// The tarball's file name, as bundled.
 pub fn tarball_name() -> String {
     format!("oximux-ios-runner-src-{RUNNER_VERSION}.tar.gz")
@@ -160,6 +160,9 @@ fn build(runner: &dyn Runner, request: &BuildRequest, progress: &mut dyn FnMut(&
     let source = extract(runner, home, request.tarball)?;
     let derived = home.derived(request.udid);
     fs::create_dir_all(&derived)?;
+    // Tidy: result bundles of runners before 0.1.3 hold their (spent)
+    // tokens, as XCTest logs the environment; a new build starts with none.
+    let _ = fs::remove_dir_all(derived.join("Logs/Test"));
     let argv = build_argv(request.xcodebuild, &source, request.team, request.udid, &derived);
     run_build(&argv, &source, request, progress)?;
     let (built, stamp) = inspect(runner, request)?;

@@ -1,17 +1,21 @@
 //! Keeping an iPhone's control runner up while OxiMux drives the phone.
 //!
 //! A launch is `xcodebuild test-without-building -xctestrun <build>` for the
-//! phone, as its own process group, recorded in the child ledger, with a
-//! fresh token in `TEST_RUNNER_OXIMUX_TOKEN` (xcodebuild hands it to the
-//! runner; it is never logged). The runner prints `OXIMUX_RUNNER_LISTENING
+//! phone, as its own process group, recorded in the child ledger, with the
+//! SHA-256 of a fresh token in `TEST_RUNNER_OXIMUX_TOKEN_SHA256` (xcodebuild
+//! hands it to the runner and XCTest writes it into the result bundle, so
+//! only the digest goes there; the token stays in memory, for the requests'
+//! `Authorization` header). The runner prints `OXIMUX_RUNNER_LISTENING
 //! port=N` once it listens on the phone's loopback (the first such line
 //! wins: the system log repeats it with a prefix); commands then go to that
 //! port through usbmux.
 //!
 //! Recovery is bounded: a runner that refuses the token, wedges, stops
 //! listening or ends is relaunched — with a new token — at most once per
-//! [`RecoveryClass`] in [`RECOVERY_WINDOW`]. After that the error stands and
-//! the panel's checklist shows it. A runner idle for [`IDLE_STOP`] is shut
+//! [`RecoveryClass`] in [`RECOVERY_WINDOW`] — a runner that ended between
+//! commands included. After that the call fails with `GaveUp`, and the hub
+//! turns control off and shows the error until the user retries (a new
+//! supervisor, a new budget). A runner idle for [`IDLE_STOP`] is shut
 //! down, and launched again by the next command.
 
 use std::collections::{HashMap, VecDeque};
@@ -373,6 +377,11 @@ impl RunnerSupervisor {
             }
             let r = running.take().expect("checked");
             finish(&self.inner.spec, r, false);
+            // It ended on its own (a stop takes it out of `running` first):
+            // launching again is a recovery, bounded like any other.
+            if !lock(&self.inner.recovery).allow(RecoveryClass::Exited, Instant::now()) {
+                return Err(ControlError::GaveUp("the iPhone's control runner ended".into()));
+            }
         }
         let launched = launch(&self.inner.spec, &self.inner.stopping, None)?;
         let handles = (launched.client.clone(), launched.exited.clone());
@@ -433,7 +442,7 @@ fn launch(spec: &RunnerSpec, stopping: &AtomicBool, cancel: Option<&AtomicBool>)
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .env("TEST_RUNNER_OXIMUX_TOKEN", &token)
+        .env("TEST_RUNNER_OXIMUX_TOKEN_SHA256", runner_client::token_digest(&token))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -678,12 +687,12 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_gets_a_token_in_its_environment_and_the_port_it_prints() {
+    fn a_launch_gets_only_the_tokens_digest_in_its_environment_and_the_port_it_prints() {
         let dir = tempfile::tempdir().unwrap();
         let seen = dir.path().join("seen");
         let spec = fake_xcodebuild(
             dir.path(),
-            &format!("echo \"$@\" > {0}; [ ${{#TEST_RUNNER_OXIMUX_TOKEN}} -eq 64 ] && echo ok >> {0}; echo 'OXIMUX_RUNNER_LISTENING port=50755'; exec sleep 30", seen.display()),
+            &format!("echo \"$@\" > {0}; [ ${{#TEST_RUNNER_OXIMUX_TOKEN_SHA256}} -eq 64 ] && [ -z \"$TEST_RUNNER_OXIMUX_TOKEN\" ] && echo ok >> {0}; echo 'OXIMUX_RUNNER_LISTENING port=50755'; exec sleep 30", seen.display()),
         );
         let ledger = spec.ledger.clone().unwrap();
         let supervisor = RunnerSupervisor::new(spec);
@@ -788,6 +797,32 @@ mod tests {
         // The next command launches, and is refused without a relaunch.
         let Err(ControlError::GaveUp(_)) = supervisor.call("tap", serde_json::json!({"x": 1, "y": 2})) else { panic!() };
         assert_eq!(launches(dir.path()), 3);
+    }
+
+    /// A runner that ends between commands (killed, crashed) is relaunched
+    /// by the next one once; ending again within the window is given up on.
+    #[test]
+    fn a_runner_that_keeps_ending_between_commands_is_given_up_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = launching(dir.path(), &[answering_runner()]);
+        let ledger = spec.ledger.clone().unwrap();
+        let supervisor = RunnerSupervisor::new(spec);
+        let kill = |supervisor: &RunnerSupervisor| {
+            let pid = ledger.entries().unwrap()[0].pid;
+            child_ledger::kill_group(pid);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while supervisor.is_running() {
+                assert!(Instant::now() < deadline, "the killed runner never ended");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        supervisor.call("tap", serde_json::json!({"x": 1, "y": 2})).unwrap();
+        kill(&supervisor);
+        supervisor.call("tap", serde_json::json!({"x": 1, "y": 2})).unwrap();
+        assert_eq!(launches(dir.path()), 2);
+        kill(&supervisor);
+        let Err(ControlError::GaveUp(_)) = supervisor.call("tap", serde_json::json!({"x": 1, "y": 2})) else { panic!() };
+        assert_eq!(launches(dir.path()), 2, "no third launch within the window");
     }
 
     #[test]
