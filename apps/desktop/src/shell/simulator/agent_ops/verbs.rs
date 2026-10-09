@@ -221,8 +221,9 @@ async fn run_verb(
                 return Err(SimErrorWire::BadInput(format!("at most {MAX_TYPED} characters at a time")));
             }
             let session = live_session(hub, udid, cx).await?;
-            // A controlled iPhone types text as text, any Unicode.
-            let pieces: Vec<char> = text.chars().filter(|c| *c != '\r').collect();
+            // A controlled iPhone types text as text, any Unicode; a CR (alone
+            // or before LF) is a newline, never dropped into an empty batch.
+            let pieces: Vec<char> = text.replace("\r\n", "\n").replace('\r', "\n").chars().collect();
             let typed = pieces.chunks(MAX_TEXT).map(|p| Gesture::Text(p.iter().collect())).collect();
             if let Some(done) = on_iphone(&session, typed).await {
                 return done;
