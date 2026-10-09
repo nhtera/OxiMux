@@ -220,7 +220,7 @@ plans/            implementation plans + reports — gitignored
 - **Computer use** — opt-in, per-project screen control for agents, gated by a separate driver process and an explicit consent lifetime.
 - **Voice dictation** — offline speech-to-text (sherpa-onnx) into any text field.
 - **Remote control** — pair a phone to a desktop host over an iroh P2P link; the `apps/mobile` client mirrors chats, terminals, and the Git panel.
-- **Mobile Emulator (Beta)** — a live iOS simulator or Android emulator in the right sidebar, driven by hand or by agents through `oximux sim`, with per-device consent.
+- **Mobile Emulator (Beta)** — a live iOS simulator or Android emulator in the right sidebar, driven by hand or by agents through `oximux sim`, with per-device consent. Real devices work too: Android phones over USB or Wi-Fi (pair by code or QR), and USB iPhones, which you can view straight away and control once you turn it on. Control builds a small test runner signed with an Apple Development team you pick (Xcode 26, Developer Mode on the phone). An agent's access to a real device lasts until OxiMux quits.
 - **Ports** — a panel listing the local TCP ports the processes you spawned are listening on.
 - **Design system** — charcoal dark theme, cockpit density, typography scale (`oximux-settings`; see `docs/design-guidelines.md`).
 - **Updates** — signature-verified in-app auto-update for the bundle, and `oximux update` for the CLI pair.

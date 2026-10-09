@@ -427,6 +427,31 @@ fn dev_capture_path(exe: &Path) -> Option<PathBuf> {
     Some(exe.parent()?.parent()?.join("bundle-tools").join(CAPTURE_APP).join(CAPTURE_EXE))
 }
 
+/// Overrides where the iPhone runner's source tarball is (a local pack).
+pub const RUNNER_OVERRIDE: &str = "OXIMUX_IOS_RUNNER";
+
+/// The iPhone control runner's sources (`name`: the pinned tarball's file
+/// name): [`RUNNER_OVERRIDE`], else the app's `Resources/`, else (debug
+/// builds) `target/bundle-tools/`, where the fetch script stages it.
+pub fn default_runner_tarball(name: &str) -> HelperStatus {
+    if let Some(path) = std::env::var_os(RUNNER_OVERRIDE).filter(|v| !v.is_empty()).map(PathBuf::from) {
+        return if path.is_file() {
+            HelperStatus::Found(path)
+        } else {
+            HelperStatus::Missing(format!("{RUNNER_OVERRIDE} points at {}, which does not exist", path.display()))
+        };
+    }
+    let exe = std::env::current_exe().ok();
+    if let Some(path) = exe.as_deref().and_then(|e| Some(e.parent()?.parent()?.join("Resources").join(name))).filter(|p| p.is_file()) {
+        return HelperStatus::Found(path);
+    }
+    #[cfg(debug_assertions)]
+    if let Some(path) = exe.as_deref().and_then(|e| Some(e.parent()?.parent()?.join("bundle-tools").join(name))).filter(|p| p.is_file()) {
+        return HelperStatus::Found(path);
+    }
+    HelperStatus::Missing(format!("this build of OxiMux has no iPhone runner sources ({name}; set {RUNNER_OVERRIDE} for a local pack)"))
+}
+
 /// Reuses an [`Availability`] for [`CACHE_TTL`] instead of re-running
 /// `check`'s subprocesses on every call. `now` is a parameter rather than an
 /// internal `Instant::now()` so tests can move time forward without a real

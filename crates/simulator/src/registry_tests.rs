@@ -718,3 +718,32 @@ fn a_real_devices_exit_is_never_restarted() {
     let g = live(&mut reg, &wt("a"), &dev("U"), "s", now);
     assert_eq!(kinds(&reg.session_exited(&dev("U"), g, true, "x".into())), ["stop U s", "start U"]);
 }
+
+/// An iPhone that drops off USB for a moment while still listed (it
+/// re-enumerates, plugged in throughout) gets one automatic restart; a
+/// second drop, an unlisted phone or any other failure waits for Reconnect.
+#[test]
+fn an_iphone_still_listed_after_a_drop_restarts_once() {
+    let now = Instant::now();
+    let iphone = dev("iosdev:00008110-001A2C3E0A88401E");
+    let dropped = || crate::ios_device::PHONE_DROPPED.to_owned();
+    let mut reg = Reg::default();
+    let g = live(&mut reg, &wt("a"), &iphone, "s", now);
+    assert_eq!(kinds(&reg.session_exited(&iphone, g, true, dropped())), ["stop iosdev:00008110-001A2C3E0A88401E s", "start iosdev:00008110-001A2C3E0A88401E"]);
+    let Phase::Starting { generation: g2 } = reg.phase(&iphone) else { panic!("{:?}", reg.phase(&iphone)) };
+    reg.session_started(&iphone, g2, Ok("s2"));
+    assert_eq!(kinds(&reg.session_exited(&iphone, g2, true, dropped())), ["stop iosdev:00008110-001A2C3E0A88401E s2"], "once");
+    assert!(matches!(reg.phase(&iphone), Phase::Disconnected { reason } if reason == crate::ios_device::PHONE_DROPPED), "{:?}", reg.phase(&iphone));
+
+    // No longer listed: unplugged, no restart.
+    let mut reg = Reg::default();
+    let g = live(&mut reg, &wt("a"), &iphone, "s", now);
+    assert_eq!(kinds(&reg.session_exited(&iphone, g, false, dropped())), ["stop iosdev:00008110-001A2C3E0A88401E s"]);
+    assert!(matches!(reg.phase(&iphone), Phase::Disconnected { reason } if reason.contains("unplugged")));
+
+    // Any other capture failure keeps its words and waits for the user.
+    let mut reg = Reg::default();
+    let g = live(&mut reg, &wt("a"), &iphone, "s", now);
+    assert_eq!(kinds(&reg.session_exited(&iphone, g, true, "capture failed".into())), ["stop iosdev:00008110-001A2C3E0A88401E s"]);
+    assert!(matches!(reg.phase(&iphone), Phase::Disconnected { reason } if reason == "capture failed"));
+}

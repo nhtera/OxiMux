@@ -90,7 +90,7 @@ impl SimulatorPanel {
             .children(banner)
             .child(phone(self.theme, &device, &self.area, cx.weak_entity(), screen))
             .child(if self.annotate.is_some() { self.render_annotate_controls(cx) } else { self.render_toolbar(state, cx) })
-            .children((matches!(state, PanelState::Streaming) && self.is_iphone(cx)).then(|| self.render_view_only()))
+            .children((matches!(state, PanelState::Streaming) && self.is_iphone(cx)).then(|| self.render_iphone_control(cx)))
             .children(badge)
             .into_any_element()
     }
@@ -215,20 +215,6 @@ impl SimulatorPanel {
     /// Whether the attached device is a real iPhone.
     fn is_iphone(&self, cx: &App) -> bool {
         self.device(cx).is_some_and(|udid| udid.source() == oximux_simulator::Source::Devicectl)
-    }
-
-    /// Under a real iPhone's toolbar: clicks on its screen do nothing here.
-    fn render_view_only(&self) -> AnyElement {
-        let (theme, density, ty) = (self.theme, self.density, &self.typography);
-        div()
-            .px(px(density.pad_panel))
-            .py(px(density.pad_row * 0.5))
-            .rounded(px(density.r_card))
-            .bg(theme.bg_panel_alt)
-            .text_size(px(ty.t_body_sm))
-            .text_color(theme.fg_muted)
-            .child("View only — control it on the phone")
-            .into_any_element()
     }
 
     /// Whether the attached phone's screen is off (it then streams nothing).

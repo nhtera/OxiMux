@@ -2,15 +2,32 @@
 //!
 //! Its video is the capture helper ([`HelperKind::DeviceCapture`]): a
 //! [`HelperSession`] like a simulator's, minus everything a screen-capture
-//! device cannot do. Without its control runner (Phase 8) it is view-only:
-//! input and the accessibility tree are refused here, with the one wording
-//! every path uses ([`crate::caps::refuse`]), rather than sent to a helper
-//! that would only answer "unsupported".
+//! device cannot do. Without its control runner it is view-only: input and
+//! the accessibility tree are refused here, with the one wording every path
+//! uses ([`crate::caps::refuse`]), rather than sent to a helper that would
+//! only answer "unsupported". With it ([`DeviceSession::set_control`]),
+//! they go to the runner, through the phone's [`control::DeviceControl`].
 //!
 //! [`StreamSession`]: crate::stream::StreamSession
 //! [`HelperKind::DeviceCapture`]: crate::helper::HelperKind::DeviceCapture
 
+#[cfg(target_os = "macos")]
+pub mod control;
+pub mod input_map;
+#[cfg(target_os = "macos")]
+pub mod runner_build;
+#[cfg(target_os = "macos")]
+pub mod runner_client;
+#[cfg(target_os = "macos")]
+pub mod runner_supervisor;
+pub mod snapshot;
+#[cfg(target_os = "macos")]
+pub mod team;
+#[cfg(target_os = "macos")]
+pub mod usbmux;
+
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -20,17 +37,54 @@ use crate::protocol::Command;
 use crate::session::HelperSession;
 use crate::{Result, SimError};
 
+/// A signing team id as Apple issues them: ten upper-case letters or digits
+/// (checked before one reaches an `xcodebuild` argument).
+pub fn is_team_id(id: &str) -> bool {
+    id.len() == 10 && id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// A capture session's phone gone mid-stream (the helper's
+/// `device_not_connected` after `ready`), in one phrase the registry knows:
+/// an iPhone briefly re-enumerating on USB comes straight back, so it gets
+/// one automatic restart (`Registry::session_exited`).
+pub const PHONE_DROPPED: &str = "the iPhone was unplugged";
+
 /// What to do instead, while OxiMux only shows an iPhone.
-pub const ENABLE_CONTROL_HINT: &str = "use the phone itself";
+pub const ENABLE_CONTROL_HINT: &str = "turn its control on in the Mobile Emulator panel (Control from OxiMux…), or use the phone itself";
+
+#[cfg(target_os = "macos")]
+type ControlSlot = Arc<Mutex<Option<Arc<control::DeviceControl>>>>;
+/// No runner off macOS: the slot is always empty.
+#[cfg(not(target_os = "macos"))]
+type ControlSlot = Arc<Mutex<Option<std::convert::Infallible>>>;
 
 #[derive(Clone)]
 pub struct DeviceSession {
     video: HelperSession,
+    /// The runner's control, while it is on (shared by every clone).
+    control: ControlSlot,
 }
 
 impl DeviceSession {
     pub fn new(video: HelperSession) -> Self {
-        Self { video }
+        Self { video, control: Arc::default() }
+    }
+
+    /// Whether input reaches the phone (its control is on).
+    pub fn controlled(&self) -> bool {
+        self.control.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// The phone's control, while it is on.
+    #[cfg(target_os = "macos")]
+    pub fn control(&self) -> Option<Arc<control::DeviceControl>> {
+        self.control.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Turns control on (`Some`) or off; the one it replaces, if any.
+    #[cfg(target_os = "macos")]
+    pub fn set_control(&self, control: Option<Arc<control::DeviceControl>>) -> Option<Arc<control::DeviceControl>> {
+        std::mem::replace(&mut *self.control.lock().unwrap_or_else(|e| e.into_inner()), control)
     }
 
     /// Screen pixels per point, from the screen's width: 3 on every iPhone
@@ -46,10 +100,17 @@ impl DeviceSession {
         &self.video
     }
 
-    /// Input: refused until the control runner exists.
+    /// Input: to the runner while control is on, else refused.
     pub fn send(&self, command: &Command) -> Result<()> {
         match command {
             Command::Pause | Command::Resume => self.video.send(command),
+            #[cfg(target_os = "macos")]
+            Command::Touch { .. } | Command::Multitouch { .. } | Command::Key { .. } | Command::Button { .. } if self.controlled() => {
+                if let Some(control) = self.control() {
+                    control.send(command);
+                }
+                Ok(())
+            }
             _ => Err(self.refused(command)),
         }
     }
@@ -66,8 +127,12 @@ impl DeviceSession {
         }
     }
 
-    /// The accessibility tree: refused until the control runner exists.
+    /// The accessibility tree: the runner's, while control is on.
     pub fn describe(&self) -> Result<Vec<crate::ax::AxNode>> {
+        #[cfg(target_os = "macos")]
+        if let Some(control) = self.control() {
+            return control.describe().map_err(control_failed);
+        }
         Err(self.refused(&Command::AxDescribe))
     }
 
@@ -81,6 +146,16 @@ impl DeviceSession {
 
     fn refused(&self, command: &Command) -> SimError {
         refusal(command, self.video.udid())
+    }
+}
+
+/// A runner failure, as this crate's error.
+#[cfg(target_os = "macos")]
+pub fn control_failed(error: runner_supervisor::ControlError) -> SimError {
+    match error {
+        runner_supervisor::ControlError::Cancelled => SimError::Cancelled,
+        runner_supervisor::ControlError::NotConnected => SimError::DeviceNotFound("the iPhone is not connected over USB".into()),
+        other => SimError::CommandFailed { program: "the iPhone's control runner".into(), code: None, stderr: other.to_string() },
     }
 }
 

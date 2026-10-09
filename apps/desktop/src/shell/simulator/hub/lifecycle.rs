@@ -114,6 +114,7 @@ fn new_hub(
         phone_states: None,
         iphone_states: None,
         capture_starts: Default::default(),
+        controls: Default::default(),
     })
 }
 
@@ -142,6 +143,9 @@ pub fn on_quit(cx: &mut App) {
         for (_, cancel) in hub.capture_starts.drain() {
             cancel.store(true, std::sync::atomic::Ordering::Release);
         }
+        // iPhone runners: ended at once (never waited on: a command in
+        // flight could hold the quit for minutes).
+        hub.stop_controls_blocking();
         let (sessions, owned) = hub.registry.quit();
         // Owned emulators by serial: the live sessions know theirs, a parked
         // one was seen by the watcher. No adb call on the quit path.

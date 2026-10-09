@@ -81,6 +81,11 @@ struct Inner {
     native: Option<(u32, u32)>,
     /// Display pixels per dp (`wm density` / 160): an agent's "points".
     density: Option<f64>,
+    /// The server said the phone refuses injected input (an OEM setting).
+    input_blocked: AtomicBool,
+    /// Input went through with no refusal from the server: the phone takes
+    /// it, for this session's life (the setting needs a reconnect).
+    input_proven: AtomicBool,
 }
 
 /// A streaming Android device. Cheap to clone; shut down when the last clone
@@ -141,6 +146,8 @@ impl AndroidSession {
             paused: AtomicBool::new(false),
             need_key: AtomicBool::new(true),
             closing: AtomicBool::new(false),
+            input_blocked: AtomicBool::new(false),
+            input_proven: AtomicBool::new(false),
             server_pid: pending.server.as_ref().map_or(0, Child::id),
             server: Mutex::new(pending.server.take()),
             video: Mutex::new(video.try_clone().ok()),
@@ -155,6 +162,7 @@ impl AndroidSession {
         let told = Arc::downgrade(&inner);
         *on_input_blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
             if let Some(inner) = told.upgrade() {
+                inner.input_blocked.store(true, Ordering::Release);
                 if let Some(tx) = inner.events_tx.lock().unwrap().as_ref() {
                     let _ = tx.send(SessionEvent::Error(super::server_log::INPUT_BLOCKED.into()));
                 }
@@ -233,6 +241,22 @@ impl AndroidSession {
         };
         let msgs = input::translate(command, screen, &mut self.inner.mods.lock().unwrap_or_else(PoisonError::into_inner));
         self.queue(&msgs)
+    }
+
+    /// Whether the phone refused injected input this session (the server
+    /// logs it for each attempt; the first is enough).
+    pub fn input_blocked(&self) -> bool {
+        self.inner.input_blocked.load(Ordering::Acquire)
+    }
+
+    /// Whether input has gone through unrefused this session.
+    pub fn input_proven(&self) -> bool {
+        self.inner.input_proven.load(Ordering::Acquire)
+    }
+
+    /// Input went through and the server raised no refusal in time.
+    pub fn note_input_taken(&self) {
+        self.inner.input_proven.store(true, Ordering::Release);
     }
 
     /// Back, volume up, volume down.

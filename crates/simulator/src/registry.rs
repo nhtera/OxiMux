@@ -439,8 +439,13 @@ impl<S: Clone> Registry<S> {
     /// The session for `generation` ended (helper exited). One automatic
     /// restart while the device is still booted and attached; after that the
     /// panel shows Disconnected and waits for the user. A real device is
-    /// never restarted behind the user's back (an unplug ends a session too):
-    /// it shows Disconnected at once, and Reconnect brings it back.
+    /// not restarted behind the user's back (an unplug ends a session too):
+    /// it shows Disconnected at once, and Reconnect brings it back — except
+    /// an iPhone whose capture lost it while it is still listed: a phone
+    /// briefly re-enumerating on USB (measured, plugged in throughout) gets
+    /// the one restart, and a real unplug is Disconnected once the watcher
+    /// sees it gone. One per attachment, as for a simulator: attach,
+    /// unpark and Reconnect allow the next one.
     pub fn session_exited(&mut self, udid: &DeviceId, generation: Generation, still_booted: bool, reason: String) -> Vec<Effect<S>> {
         let next = self.bump();
         let Some(device) = self.devices.get_mut(udid) else { return Vec::new() };
@@ -453,7 +458,8 @@ impl<S: Clone> Registry<S> {
             .map(|session| Effect::StopSession { udid: udid.clone(), session })
             .into_iter()
             .collect();
-        if still_booted && !device.attached.is_empty() && device.restarts == 0 && !udid.is_physical() {
+        let iphone_blip = udid.source() == Source::Devicectl && reason == crate::ios_device::PHONE_DROPPED;
+        if still_booted && !device.attached.is_empty() && device.restarts == 0 && (!udid.is_physical() || iphone_blip) {
             device.restarts += 1;
             device.phase = Phase::Starting { generation: next };
             effects.push(Effect::StartSession { udid: udid.clone(), generation: next });

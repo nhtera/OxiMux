@@ -43,6 +43,7 @@ mod commands;
 mod consent;
 mod pair_card;
 mod header;
+mod iphone_control;
 mod toolbar;
 mod stream_row;
 #[cfg(test)]
@@ -70,6 +71,8 @@ pub struct SimulatorPanel {
     area: Rc<Cell<Option<(f32, f32)>>>,
     /// The toolbar is asking "Shut down …?".
     confirm_shutdown: bool,
+    /// A real iPhone's control setup (the team picker) is open.
+    control_setup: bool,
     /// Annotate mode: the frozen screenshot being marked up.
     annotate: Option<Entity<AnnotateView>>,
     /// Re-renders once a second while a recording's timer shows.
@@ -131,6 +134,7 @@ impl SimulatorPanel {
             screen: None,
             area: Rc::default(),
             confirm_shutdown: false,
+            control_setup: false,
             annotate: None,
             _record_tick: None,
             command_sink: None,

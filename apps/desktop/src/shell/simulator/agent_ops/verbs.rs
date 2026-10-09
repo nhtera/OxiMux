@@ -21,6 +21,7 @@ use oximux_simulator::ax::{self, AxNode, Query};
 use oximux_simulator::geometry::{self, Size};
 use oximux_simulator::protocol::{Command, KeyPhase, TouchPhase};
 use oximux_simulator::caps::{self, ButtonSet, DeviceCaps};
+use oximux_simulator::ios_device::input_map::{Gesture, MAX_TEXT, RunnerButton};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::StreamSession;
 use oximux_simulator::simctl::SimUdid;
@@ -57,6 +58,13 @@ async fn on_own_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static
 
 type Out = Result<SimReplyWire, SimErrorWire>;
 
+/// How long the scrcpy server gets to refuse a session's first input.
+const INPUT_VERDICT: Duration = Duration::from_millis(300);
+
+/// What an agent hears when the phone refuses injected input.
+const INPUT_BLOCKED: &str = "the phone refuses injected input (on Xiaomi/HyperOS: \"USB debugging (Security settings)\" is off); \
+     ask the user to turn it on in Developer options and reconnect the phone";
+
 pub(super) async fn run(
     hub: &Entity<SimulatorHub>,
     udid: &DeviceId,
@@ -65,12 +73,64 @@ pub(super) async fn run(
     target: &Target,
     cx: &mut AsyncApp,
 ) -> Out {
-    // A real device does only what its class can, and opens only web links:
+    // An Android phone may drop injected input on the floor (an OEM setting):
+    // the server says so only on stderr, so an agent is told here rather
+    // than hearing "tapped" for a tap that never happened. Emulators never do.
+    let checked = is_input(&cmd) && udid.source() == Source::Adb && udid.is_physical();
+    let phone = |cx: &mut AsyncApp| hub.read_with(cx, |hub, _| hub.session(udid)).and_then(|s| s.android().cloned());
+    if checked && phone(cx).is_some_and(|s| s.input_blocked()) {
+        return Err(SimErrorWire::Refused(INPUT_BLOCKED.into()));
+    }
+    let reply = run_verb(hub, udid, name, cmd, target, cx).await;
+    // The session the verb used: it may have woken or reconnected the phone.
+    let Some(session) = phone(cx).filter(|_| checked && reply.is_ok()) else { return reply };
+    let timer = cx.background_executor().timer(INPUT_VERDICT);
+    input_verdict(|| session.input_blocked(), || session.input_proven(), || session.note_input_taken(), timer).await?;
+    reply
+}
+
+/// Whether input sent to a phone went through: refused if the phone blocks
+/// it; otherwise, the first time in a session, the server gets `wait` to
+/// say so before the session is trusted. The window is a heuristic: a
+/// slower refusal still latches, and the next verb is refused up front.
+async fn input_verdict(
+    blocked: impl Fn() -> bool,
+    proven: impl Fn() -> bool,
+    mark: impl Fn(),
+    wait: impl std::future::Future,
+) -> Result<(), SimErrorWire> {
+    if !blocked() && !proven() {
+        wait.await;
+    }
+    if blocked() {
+        return Err(SimErrorWire::Refused(INPUT_BLOCKED.into()));
+    }
+    mark();
+    Ok(())
+}
+
+fn is_input(cmd: &SimCmdWire) -> bool {
+    matches!(cmd, SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_))
+}
+
+async fn run_verb(
+    hub: &Entity<SimulatorHub>,
+    udid: &DeviceId,
+    name: &str,
+    cmd: SimCmdWire,
+    target: &Target,
+    cx: &mut AsyncApp,
+) -> Out {
+    // A real device does only what it can now, and opens only web links:
     // a custom scheme can dial, pay or message on someone's own phone.
-    // Phase 8: for_session — an iPhone's runner adds touch and keys.
     if udid.is_physical() {
-        if let Some(what) = refused_on(&DeviceCaps::for_id(udid), &cmd) {
-            return Err(SimErrorWire::Refused(caps::refuse(what, udid)));
+        if let Some(what) = refused_on(&hub.read_with(cx, |hub, _| hub.caps(udid)), &cmd) {
+            let mut why = caps::refuse(what, udid);
+            // Input reaches an iPhone once the user turns its control on.
+            if udid.source() == Source::Devicectl && refused_on(&DeviceCaps::for_session(udid, true), &cmd).is_none() {
+                why = format!("{why}; ask the user to turn its control on in the Mobile Emulator panel (Control from OxiMux…)");
+            }
+            return Err(SimErrorWire::Refused(why));
         }
         if let SimCmdWire::OpenUrl { url } = &cmd
             && !is_web_url(url)
@@ -86,7 +146,7 @@ pub(super) async fn run(
     }
     // Input takes turns per device: interleaved touch streams from parallel
     // calls would make gestures nobody asked for.
-    let input = matches!(cmd, SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_));
+    let input = is_input(&cmd);
     let lock = input.then(|| hub.update(cx, |hub, _| hub.input_lock(udid)));
     let _turn = match &lock {
         Some(lock) => Some(lock.lock().await),
@@ -114,6 +174,9 @@ pub(super) async fn run(
                 SimTargetWire::Label(label) => element(&session, Query::Label(&label), &label, cx).await?,
                 SimTargetWire::Id(id) => element(&session, Query::Id(&id), &id, cx).await?,
             };
+            if let Some(done) = on_iphone(&session, vec![Gesture::Tap { at, taps: 1 }]).await {
+                return done;
+            }
             send(&session, Command::Touch { phase: TouchPhase::Begin, x: at.0, y: at.1, edge: 0 })?;
             cx.background_executor().timer(TAP_HOLD).await;
             send(&session, Command::Touch { phase: TouchPhase::End, x: at.0, y: at.1, edge: 0 })?;
@@ -127,7 +190,12 @@ pub(super) async fn run(
                 agent::points_to_portrait(o, (x, y), portrait, scale).ok_or_else(|| off_screen((x, y), o, portrait, scale))
             };
             let start = map((from.x, from.y))?;
-            map((to.x, to.y))?;
+            let end = map((to.x, to.y))?;
+            // A real iPhone takes the swipe whole (its runner paces it).
+            let ms = u64::from(duration_ms.clamp(50, 5000));
+            if let Some(done) = on_iphone(&session, vec![Gesture::Drag { from: start, to: end, ms, hold: 0, settle: 0 }]).await {
+                return done;
+            }
             // A swipe that starts in the home-indicator band is the system's
             // edge gesture, and keeps that edge for its whole length.
             let pts = agent::display_points(o, portrait, scale);
@@ -153,6 +221,12 @@ pub(super) async fn run(
                 return Err(SimErrorWire::BadInput(format!("at most {MAX_TYPED} characters at a time")));
             }
             let session = live_session(hub, udid, cx).await?;
+            // A controlled iPhone types text as text, any Unicode.
+            let pieces: Vec<char> = text.chars().filter(|c| *c != '\r').collect();
+            let typed = pieces.chunks(MAX_TEXT).map(|p| Gesture::Text(p.iter().collect())).collect();
+            if let Some(done) = on_iphone(&session, typed).await {
+                return done;
+            }
             // Android takes text as text, any Unicode.
             if let Some(android) = session.android().cloned() {
                 return on_own_thread(move || android.type_text(&text))
@@ -174,6 +248,20 @@ pub(super) async fn run(
                 send(&session, Command::Key { phase, usage: key.usage })?;
             }
             Ok(SimReplyWire::Done)
+        }
+        // A controlled iPhone's own buttons (caps checked above).
+        SimCmdWire::Button(button @ (SimButtonWire::Home | SimButtonWire::VolumeUp | SimButtonWire::VolumeDown))
+            if udid.source() == Source::Devicectl =>
+        {
+            let session = live_session(hub, udid, cx).await?;
+            let pressed = match button {
+                SimButtonWire::Home => RunnerButton::Home,
+                SimButtonWire::VolumeUp => RunnerButton::VolumeUp,
+                _ => RunnerButton::VolumeDown,
+            };
+            on_iphone(&session, vec![Gesture::Button(pressed)])
+                .await
+                .unwrap_or_else(|| Err(SimErrorWire::Refused(caps::refuse("That button", udid))))
         }
         SimCmdWire::Button(button @ (SimButtonWire::Back | SimButtonWire::VolumeUp | SimButtonWire::VolumeDown)) => {
             use oximux_simulator::android::input::AndroidButton;
@@ -222,7 +310,13 @@ pub(super) async fn run(
         SimCmdWire::Launch { bundle_id, relaunch } if udid.source() == Source::Devicectl => {
             check_bundle_id(&bundle_id)?;
             let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
-            on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done)
+            let launched = bundle_id.clone();
+            let done = on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done);
+            // What it launched is what typing and the tree address next.
+            if done.is_ok() {
+                hub.update(cx, |hub, cx| hub.note_launched(udid, &launched, cx));
+            }
+            done
         }
         SimCmdWire::Launch { bundle_id, relaunch } => {
             check_bundle_id(&bundle_id)?;
@@ -273,7 +367,10 @@ pub(super) async fn run(
             // Asked every time, once the phone is reachable (as on Android).
             let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
             confirm_install(hub, udid, name, &app, target, cx).await?;
-            on_own_thread(move || device.install(&app)).await?.map(|()| SimReplyWire::Done)
+            let done = on_own_thread(move || device.install(&app)).await?.map(|()| SimReplyWire::Done);
+            // The target picker lists the new app next time it opens.
+            hub.update(cx, |hub, _| hub.forget_phone_apps(udid));
+            done
         }
         SimCmdWire::Install { path } => {
             let udid = simctl_ready(hub, udid, cx).await?;
@@ -330,7 +427,7 @@ async fn live_session(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut Asyn
             (Wake::Starting, _) if Instant::now() >= deadline => {
                 let booting = matches!(hub.read_with(cx, |hub, _| hub.phase(udid)), oximux_simulator::registry::Phase::Booting { .. });
                 return Err(if booting {
-                    SimErrorWire::Unavailable("the simulator is still booting; retry in a few seconds".into())
+                    SimErrorWire::Unavailable("it is still starting; retry in a few seconds".into())
                 } else {
                     SimErrorWire::NotStreaming
                 });
@@ -464,6 +561,26 @@ async fn confirm_install(
             }
             InstallAnswer::Pending => cx.background_executor().timer(Duration::from_millis(250)).await,
         }
+    }
+}
+
+/// Drives a real iPhone whose control is on with whole gestures, in its
+/// queue's turn; `None` for any other device (it takes the touch stream).
+async fn on_iphone(session: &StreamSession, gestures: Vec<Gesture>) -> Option<Out> {
+    #[cfg(target_os = "macos")]
+    {
+        let control = session.ios_device().and_then(|d| d.control())?;
+        let done = on_own_thread(move || gestures.into_iter().try_for_each(|g| control.gesture(g).map(drop))).await;
+        Some(match done {
+            Ok(Ok(())) => Ok(SimReplyWire::Done),
+            Ok(Err(e)) => Err(SimErrorWire::Failed(format!("the iPhone did not take it: {e}"))),
+            Err(e) => Err(e),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, gestures);
+        None
     }
 }
 
@@ -618,6 +735,36 @@ fn install_path(path: &str, worktree: &Path) -> Result<PathBuf, SimErrorWire> {
 mod tests {
     use super::*;
 
+    /// The verdict on a phone's input: refused when it blocks input (before
+    /// or during the wait); otherwise trusted once, and not waited on again.
+    #[test]
+    fn a_phone_that_blocks_input_is_refused_and_one_that_takes_it_is_trusted() {
+        use std::cell::Cell;
+        let run = |blocked_before: bool, blocked_during: bool, proven: bool| {
+            let (blocked, waited, marked) = (Cell::new(blocked_before), Cell::new(false), Cell::new(false));
+            let wait = async {
+                waited.set(true);
+                if blocked_during {
+                    blocked.set(true);
+                }
+            };
+            let out = futures::executor::block_on(input_verdict(|| blocked.get(), || proven, || marked.set(true), wait));
+            (out.is_ok(), waited.get(), marked.get())
+        };
+        assert_eq!(run(true, false, false), (false, false, false), "known blocked: refused, no wait");
+        assert_eq!(run(false, true, false), (false, true, false), "refused during the wait");
+        assert_eq!(run(false, false, false), (true, true, true), "taken: trusted from now on");
+        assert_eq!(run(false, false, true), (true, false, true), "already trusted: no wait");
+    }
+
+    /// The verbs that inject input (and take the per-device input turn).
+    #[test]
+    fn only_input_verbs_count_as_input() {
+        assert!(is_input(&SimCmdWire::Type { text: "a".into(), paste: false }));
+        assert!(!is_input(&SimCmdWire::Screenshot { full: false }));
+        assert!(!is_input(&SimCmdWire::Ax { max: 10 }));
+    }
+
     /// A real device opens web links only: a custom scheme can dial, pay or
     /// message on someone's own phone.
     #[test]
@@ -644,6 +791,20 @@ mod tests {
         assert_eq!(refused_on(&iphone, &SimCmdWire::Type { text: "hi".into(), paste: false }), Some("Typing"));
         assert_eq!(refused_on(&iphone, &SimCmdWire::Ax { max: 10 }), Some("The accessibility tree"));
         assert_eq!(refused_on(&iphone, &SimCmdWire::Screenshot { full: false }), None);
+        // With its control on, an iPhone takes input and gives its tree, but
+        // never turns or shuts down from here.
+        let controlled = DeviceCaps::for_session(&DeviceId("iosdev:00008110-001A2C3E0A88401E".into()), true);
+        for cmd in [
+            SimCmdWire::Type { text: "hi".into(), paste: false },
+            SimCmdWire::Ax { max: 10 },
+            SimCmdWire::Button(SimButtonWire::Home),
+            SimCmdWire::Button(SimButtonWire::VolumeUp),
+        ] {
+            assert_eq!(refused_on(&controlled, &cmd), None, "{cmd:?}");
+        }
+        assert_eq!(refused_on(&controlled, &SimCmdWire::Rotate(SimOrientationWire::Portrait)), Some("Rotation"));
+        assert_eq!(refused_on(&controlled, &SimCmdWire::Button(SimButtonWire::Lock)), Some("That button"));
+        assert_eq!(refused_on(&controlled, &SimCmdWire::Shutdown { force: false }), Some("Shutting down"));
     }
 
     /// While a phone sleeps only the screen verbs wait on it; app verbs go

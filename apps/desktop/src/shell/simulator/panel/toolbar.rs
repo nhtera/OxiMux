@@ -52,6 +52,21 @@ const ANDROID_ITEMS: [Option<(&str, &str, &str, SimCommand)>; 14] = [
     Some(("sim-tb-detach", "icons/log-out.svg", "Detach", SimCommand::Detach)),
 ];
 
+/// A real iPhone's pill: its buttons (live with control on), then the
+/// captures; never rotated, shut down or logged from here.
+const IPHONE_ITEMS: [Option<(&str, &str, &str, SimCommand)>; 10] = [
+    Some(("sim-tb-home", "icons/house.svg", "Home  ⌘⇧H", SimCommand::Home)),
+    Some(("sim-tb-vol-down", "icons/volume-1.svg", "Volume down", SimCommand::VolumeDown)),
+    Some(("sim-tb-vol-up", "icons/volume-2.svg", "Volume up", SimCommand::VolumeUp)),
+    Some(("sim-tb-action", "icons/circle-dot.svg", "Action button (iPhone 15 Pro and later)", SimCommand::ActionButton)),
+    None,
+    Some(("sim-tb-annotate", "icons/pencil.svg", "Annotate for an agent", SimCommand::Annotate)),
+    Some(("sim-tb-shot", "icons/camera.svg", "Screenshot to Desktop  ⌘S", SimCommand::Screenshot)),
+    Some(("sim-tb-record", "icons/video.svg", "Record screen  ⌘R", SimCommand::ToggleRecord)),
+    None,
+    Some(("sim-tb-detach", "icons/log-out.svg", "Detach", SimCommand::Detach)),
+];
+
 /// `m:ss` for a recording's running time.
 pub(crate) fn elapsed_label(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
@@ -84,11 +99,21 @@ impl SimulatorPanel {
         let recording = self.recording_since(cx);
         let device = self.device(cx);
         let android = device.as_ref().is_some_and(|d| d.platform() == oximux_simulator::Platform::Android);
-        // What this device can do: a real phone is never rotated or shut
-        // down from here. Phase 8: for_session — an iPhone's runner adds input.
-        let caps = device.as_ref().map(oximux_simulator::caps::DeviceCaps::for_id);
+        // What this device can do now: a real phone is never rotated or shut
+        // down from here, and an iPhone takes input while its control is on.
+        let caps = device.as_ref().map(|d| match &self.hub {
+            Some(hub) => hub.read(cx).caps(d),
+            None => oximux_simulator::caps::DeviceCaps::for_id(d),
+        });
         let can = |command: SimCommand| caps.as_ref().is_none_or(|caps| command.allowed(caps));
-        let items: &[Option<(&str, &str, &str, SimCommand)>] = if android { &ANDROID_ITEMS } else { &ITEMS };
+        let iphone = device.as_ref().is_some_and(|d| d.source() == oximux_simulator::Source::Devicectl);
+        let items: &[Option<(&str, &str, &str, SimCommand)>] = if android {
+            &ANDROID_ITEMS
+        } else if iphone {
+            &IPHONE_ITEMS
+        } else {
+            &ITEMS
+        };
         let mut pill = self.pill();
         for &item in items {
             let Some((id, icon, tip, command)) = item else {

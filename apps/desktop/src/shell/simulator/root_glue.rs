@@ -17,8 +17,8 @@ use super::hub::NoticeKind;
 use super::panel::{Outcome, PanelEvent, RootRequest, SimCommand, SimulatorPanel};
 use super::widths;
 use crate::actions::{
-    SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw, SimRotateCw,
-    SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord,
+    SimActionButton, SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw, SimRotateCw,
+    SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord, SimVolumeDown, SimVolumeUp,
 };
 use crate::shell::chrome::toast::{ToastAction, ToastKind};
 use crate::shell::right_sidebar::tab::RightTab;
@@ -62,6 +62,7 @@ impl RootSimulator {
             cx.subscribe(panel, |root: &mut WorkspaceRoot, _, event: &PanelEvent, cx| match event {
                 PanelEvent::Notice(kind, text) => {
                     let kind = match kind {
+                        NoticeKind::Info => ToastKind::Info,
                         NoticeKind::Success => ToastKind::Success,
                         NoticeKind::Error => ToastKind::Error,
                     };
@@ -314,6 +315,9 @@ pub(crate) fn simulator_actions<E: InteractiveElement>(el: E, cx: &mut Context<W
     let el = on::<SimLock, _>(el, SimCommand::Lock, cx);
     let el = on::<SimBack, _>(el, SimCommand::Back, cx);
     let el = on::<SimRecents, _>(el, SimCommand::Recents, cx);
+    let el = on::<SimVolumeUp, _>(el, SimCommand::VolumeUp, cx);
+    let el = on::<SimVolumeDown, _>(el, SimCommand::VolumeDown, cx);
+    let el = on::<SimActionButton, _>(el, SimCommand::ActionButton, cx);
     let el = on::<SimRotateCw, _>(el, SimCommand::RotateCw, cx);
     let el = on::<SimRotateCcw, _>(el, SimCommand::RotateCcw, cx);
     let el = on::<SimScreenshot, _>(el, SimCommand::Screenshot, cx);

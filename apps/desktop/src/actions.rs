@@ -667,6 +667,12 @@ actions!(
         SimBack,
         /// Simulator (Android): the Recents (app switcher) button.
         SimRecents,
+        /// A real phone: the volume-up button.
+        SimVolumeUp,
+        /// A real phone: the volume-down button.
+        SimVolumeDown,
+        /// A real iPhone (with control on): the Action button.
+        SimActionButton,
         /// Simulator: rotate a quarter turn clockwise (⌘→ while typing into it).
         SimRotateCw,
         /// Simulator: rotate a quarter turn counter-clockwise (⌘←).

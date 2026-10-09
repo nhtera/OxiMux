@@ -11,13 +11,13 @@ use gpui::{Action, Context, Window};
 
 use super::SimulatorPanel;
 use crate::actions::{
-    SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw, SimRotateCw,
-    SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord,
+    SimActionButton, SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw,
+    SimRotateCw, SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord, SimVolumeDown, SimVolumeUp,
 };
 use oximux_simulator::Source;
 use oximux_simulator::caps::{ButtonSet, DeviceCaps};
 
-use crate::shell::simulator::hub::is_udid;
+use crate::shell::simulator::hub::{HardwareButton, is_udid};
 use crate::shell::simulator::state::PanelState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +28,11 @@ pub enum SimCommand {
     Back,
     /// Android only: the app switcher.
     Recents,
+    /// A real phone's volume buttons.
+    VolumeUp,
+    VolumeDown,
+    /// A controlled iPhone's Action button.
+    ActionButton,
     RotateCw,
     RotateCcw,
     Screenshot,
@@ -47,6 +52,9 @@ impl SimCommand {
             Self::Lock => Box::new(SimLock),
             Self::Back => Box::new(SimBack),
             Self::Recents => Box::new(SimRecents),
+            Self::VolumeUp => Box::new(SimVolumeUp),
+            Self::VolumeDown => Box::new(SimVolumeDown),
+            Self::ActionButton => Box::new(SimActionButton),
             Self::RotateCw => Box::new(SimRotateCw),
             Self::RotateCcw => Box::new(SimRotateCcw),
             Self::Screenshot => Box::new(SimScreenshot),
@@ -67,6 +75,9 @@ impl SimCommand {
             Self::Lock => caps.buttons.contains(ButtonSet::LOCK),
             Self::Back => caps.buttons.contains(ButtonSet::BACK),
             Self::Recents => caps.buttons.contains(ButtonSet::APP_SWITCHER),
+            Self::VolumeUp => caps.buttons.contains(ButtonSet::VOLUME_UP),
+            Self::VolumeDown => caps.buttons.contains(ButtonSet::VOLUME_DOWN),
+            Self::ActionButton => caps.buttons.contains(ButtonSet::ACTION),
             Self::RotateCw | Self::RotateCcw => caps.rotate,
             Self::Screenshot | Self::Annotate => caps.screenshot,
             Self::ToggleRecord => caps.record,
@@ -79,7 +90,7 @@ impl SimCommand {
 
     /// Needs the live stream (the helper), not just a booted device.
     fn needs_stream(self) -> bool {
-        matches!(self, Self::Home | Self::Lock | Self::Back | Self::Recents | Self::RotateCw | Self::RotateCcw | Self::Annotate | Self::ToggleKeyboard)
+        matches!(self, Self::Home | Self::Lock | Self::Back | Self::Recents | Self::VolumeUp | Self::VolumeDown | Self::ActionButton | Self::RotateCw | Self::RotateCcw | Self::Annotate | Self::ToggleKeyboard)
     }
 }
 
@@ -109,8 +120,7 @@ impl SimulatorPanel {
             return Outcome::Done;
         }
         // The toolbar greys these out; the palette and shortcuts land here.
-        // Phase 8: for_session — an iPhone's runner adds touch and keys.
-        if !command.allowed(&DeviceCaps::for_id(&udid)) {
+        if !command.allowed(&hub.read(cx).caps(&udid)) {
             return Outcome::Done;
         }
         if command.needs_stream() && !matches!(self.state(cx), PanelState::Streaming) {
@@ -121,6 +131,9 @@ impl SimulatorPanel {
             SimCommand::Lock => hub.read(cx).lock(&udid),
             SimCommand::Back => hub.read(cx).back(&udid),
             SimCommand::Recents => hub.read(cx).recents(&udid),
+            SimCommand::VolumeUp => hub.read(cx).press_hardware(&udid, HardwareButton::VolumeUp),
+            SimCommand::VolumeDown => hub.read(cx).press_hardware(&udid, HardwareButton::VolumeDown),
+            SimCommand::ActionButton => hub.read(cx).press_hardware(&udid, HardwareButton::Action),
             SimCommand::RotateCw | SimCommand::RotateCcw => {
                 hub.update(cx, |hub, cx| hub.rotate(&udid, command == SimCommand::RotateCw, cx))
             }

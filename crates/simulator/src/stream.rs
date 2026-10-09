@@ -105,6 +105,12 @@ impl StreamSession {
         }
     }
 
+    /// What `id` (this session's device) can do now: a real iPhone takes
+    /// input only while its control is on.
+    pub fn caps(&self, id: &crate::DeviceId) -> crate::caps::DeviceCaps {
+        crate::caps::DeviceCaps::for_session(id, self.ios_device().is_some_and(DeviceSession::controlled))
+    }
+
     /// The real iPhone's session (`None` for anything else).
     pub fn ios_device(&self) -> Option<&DeviceSession> {
         match self {

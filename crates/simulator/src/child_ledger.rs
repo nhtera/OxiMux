@@ -37,6 +37,12 @@ pub enum Kind {
     /// `simctl`'s own documented way to stop a recording cleanly) and a
     /// longer grace period before `SIGKILL`.
     Record,
+    /// `xcodebuild` building or running the iPhone control runner. Started
+    /// as its own process group (it spawns helpers of its own), stopped with
+    /// `SIGTERM` to the group and a longer grace before `SIGKILL`. Matched on
+    /// its whole argument vector **and** its start time: other xcodebuilds
+    /// (the user's own) look alike, and are never touched.
+    Xcodebuild,
     /// A kind a newer OxiMux recorded (a rollback reading its ledger). Kept,
     /// not an error: the ledger must stay readable, and an orphan of an
     /// unknown kind still gets the generic stop — `SIGTERM`, then `SIGKILL`
@@ -63,6 +69,32 @@ pub struct Entry {
     /// unknown, which is treated as a dead owner.
     #[serde(default)]
     pub owner_pid: u32,
+    /// The child's whole argument vector, when its `argv[0]` alone does not
+    /// identify it ([`Kind::Xcodebuild`]); empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+    /// When the kernel says the child started (see
+    /// [`oximux_proc_tree::start_time_of_pid`]), for a kind matched on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start: Option<u64>,
+}
+
+impl Entry {
+    /// An entry for an `xcodebuild` just spawned as `pid` with `argv`
+    /// (`argv[0]` its resolved path), read back from the kernel so a reap
+    /// can tell it from any other.
+    pub fn xcodebuild(pid: u32, argv: Vec<String>, udid: Option<String>) -> Self {
+        Self {
+            pid,
+            kind: Kind::Xcodebuild,
+            exe: argv.first().map(PathBuf::from).unwrap_or_default(),
+            started_at_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+            udid,
+            owner_pid: std::process::id(),
+            argv,
+            process_start: oximux_proc_tree::start_time_of_pid(pid),
+        }
+    }
 }
 
 /// A JSON-file-backed set of [`Entry`], safe to share across processes (the
@@ -202,7 +234,7 @@ pub fn reap_stale(ledger: &Ledger) -> ReapReport {
         .unwrap_or_default();
     let mut report = ReapReport::default();
     for entry in claimed {
-        if matches_recorded_exe(entry.pid, &entry.exe) {
+        if is_recorded_process(&entry) {
             kill_entry(&entry);
             report.killed.push(entry.pid);
         } else {
@@ -219,6 +251,19 @@ fn owner_is_alive(owner: u32, me: u32) -> bool {
     owner != 0 && owner != me && oximux_proc_tree::process(owner).is_some()
 }
 
+/// Whether `entry.pid` is still the process `entry` recorded.
+pub fn is_recorded_process(entry: &Entry) -> bool {
+    match entry.kind {
+        Kind::Xcodebuild => {
+            entry.process_start.is_some()
+                && !entry.argv.is_empty()
+                && oximux_proc_tree::start_time_of_pid(entry.pid) == entry.process_start
+                && oximux_proc_tree::argv_of_pid(entry.pid).as_ref() == Some(&entry.argv)
+        }
+        _ => matches_recorded_exe(entry.pid, &entry.exe),
+    }
+}
+
 fn matches_recorded_exe(pid: u32, exe: &Path) -> bool {
     let Some(argv) = oximux_proc_tree::argv_of_pid(pid) else {
         return false;
@@ -228,35 +273,81 @@ fn matches_recorded_exe(pid: u32, exe: &Path) -> bool {
 
 #[cfg(unix)]
 fn kill_entry(entry: &Entry) {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let (first_signal, grace) = match entry.kind {
         Kind::Record => (libc::SIGINT, Duration::from_secs(5)),
+        Kind::Xcodebuild => return stop_group(entry.pid, Duration::from_secs(5)),
         Kind::Helper | Kind::Unknown => (libc::SIGTERM, Duration::from_secs(1)),
     };
     send_signal(entry.pid, first_signal);
+    wait_then_kill(entry.pid, grace, entry.pid as i32);
+}
+
+/// Stops `pid` and, when it leads its own process group (spawned with
+/// `setsid`), everything in that group: `SIGTERM`, then `SIGKILL` once
+/// `grace` passes with the leader still there.
+#[cfg(unix)]
+pub fn stop_group(pid: u32, grace: std::time::Duration) {
+    // SAFETY: `getpgid(2)` on a pid; it only reads.
+    let leads = unsafe { libc::getpgid(pid as libc::pid_t) } == pid as libc::pid_t;
+    let target = if leads { -(pid as i32) } else { pid as i32 };
+    send_signal_to(target, libc::SIGTERM);
+    wait_then_kill(pid, grace, target);
+}
+
+#[cfg(not(unix))]
+pub fn stop_group(_pid: u32, _grace: std::time::Duration) {}
+
+/// `SIGKILL` to `pid`'s group (or `pid` alone when it does not lead one),
+/// without waiting: for quit, where nothing is left to escalate a `SIGTERM`
+/// (measured live: `xcodebuild test-without-building` ignores one, and
+/// killing it also ends its runner on the phone).
+#[cfg(unix)]
+pub fn kill_group(pid: u32) {
+    // SAFETY: `getpgid(2)` on a pid; it only reads.
+    let leads = unsafe { libc::getpgid(pid as libc::pid_t) } == pid as libc::pid_t;
+    send_signal_to(if leads { -(pid as i32) } else { pid as i32 }, libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub fn kill_group(_pid: u32) {}
+
+/// Waits up to `grace` for `pid` to end, then `SIGKILL`s `target` (the pid,
+/// or a negated group id).
+#[cfg(unix)]
+fn wait_then_kill(pid: u32, grace: std::time::Duration, target: i32) {
+    use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        if oximux_proc_tree::process(entry.pid).is_none() {
-            return;
+        if oximux_proc_tree::process(pid).is_none() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if oximux_proc_tree::process(entry.pid).is_some() {
-        send_signal(entry.pid, libc::SIGKILL);
+    // A group's other members may outlive its leader, so the group gets the
+    // SIGKILL either way; its id cannot be another group's this soon (macOS
+    // hands pids out in sequence).
+    if oximux_proc_tree::process(pid).is_some() || target < 0 {
+        send_signal_to(target, libc::SIGKILL);
     }
 }
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) {
+    send_signal_to(pid as i32, signal);
+}
+
+#[cfg(unix)]
+fn send_signal_to(target: i32, signal: i32) {
     // SAFETY: `kill(2)` with a pid this ledger recorded and a standard
     // signal number. A failure here (the process already gone, or — should
     // pid reuse somehow slip past `matches_recorded_exe`'s check right
     // before this call — a permission error) is not fatal to reaping the
     // rest of the ledger.
     unsafe {
-        libc::kill(pid as libc::pid_t, signal);
+        libc::kill(target as libc::pid_t, signal);
     }
 }
 
@@ -279,7 +370,7 @@ mod tests {
     }
 
     fn entry(pid: u32, exe: &str) -> Entry {
-        Entry { pid, kind: Kind::Helper, exe: PathBuf::from(exe), started_at_unix: 0, udid: None, owner_pid: 0 }
+        Entry { pid, kind: Kind::Helper, exe: PathBuf::from(exe), started_at_unix: 0, udid: None, owner_pid: 0, argv: Vec::new(), process_start: None }
     }
 
     #[test]
@@ -307,7 +398,7 @@ mod tests {
     #[test]
     fn a_ledger_with_an_unknown_kind_still_works() {
         let (dir, ledger) = temp_ledger();
-        let newer = r#"[{"pid":4294967290,"kind":"xcodebuild","exe":"/usr/bin/xcodebuild","started_at_unix":0,"udid":null,"owner_pid":0}]"#;
+        let newer = r#"[{"pid":4294967290,"kind":"from_the_future","exe":"/usr/bin/true","started_at_unix":0,"udid":null,"owner_pid":0}]"#;
         std::fs::write(dir.path().join("children.json"), newer).unwrap();
         assert_eq!(ledger.entries().unwrap()[0].kind, Kind::Unknown);
         ledger.record(entry(111, "/bin/sleep")).unwrap();
@@ -402,5 +493,82 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(oximux_proc_tree::process(sleep_pid).is_none(), "sleep should have been killed");
+    }
+
+    #[cfg(unix)]
+    fn spawn_group_leader(args: &[&str]) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        // SAFETY: `setsid` only, between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn wait_for(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_xcodebuild_is_matched_on_its_argv_and_start_time_never_its_name() {
+        let mut child = spawn_group_leader(&["-c", "sleep 30; :", "oximux-ledger-test"]);
+        let pid = child.id();
+        let argv: Vec<String> = ["/bin/sh", "-c", "sleep 30; :", "oximux-ledger-test"].map(String::from).to_vec();
+        // The kernel may take a moment to show the exec'd argv.
+        wait_for(|| oximux_proc_tree::argv_of_pid(pid).as_ref() == Some(&argv));
+        let ours = Entry::xcodebuild(pid, argv.clone(), Some("iosdev:x".into()));
+        assert!(is_recorded_process(&ours));
+        // Same program, other arguments: someone else's.
+        let mut other = ours.clone();
+        other.argv[2] = "sleep 31".into();
+        assert!(!is_recorded_process(&other));
+        // Same argv, another start: a reused pid.
+        let mut later = ours.clone();
+        later.process_start = later.process_start.map(|t| t + 1);
+        assert!(!is_recorded_process(&later));
+        // No start time recorded: never matched.
+        assert!(!is_recorded_process(&Entry { process_start: None, ..ours.clone() }));
+        stop_group(pid, std::time::Duration::from_secs(1));
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_reaped_xcodebuild_takes_its_process_group_with_it() {
+        let (dir, ledger) = temp_ledger();
+        let marker = dir.path().join("grandchild.pid");
+        let script = format!("sleep 60 & echo $! > {}; wait", marker.display());
+        let mut child = spawn_group_leader(&["-c", &script]);
+        let pid = child.id();
+        wait_for(|| std::fs::read_to_string(&marker).is_ok_and(|s| s.ends_with('\n')));
+        let grandchild: u32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        let argv = oximux_proc_tree::argv_of_pid(pid).unwrap();
+        ledger.record(Entry { owner_pid: 0, ..Entry::xcodebuild(pid, argv, None) }).unwrap();
+        let report = reap_stale(&ledger);
+        assert_eq!(report.killed, vec![pid]);
+        let _ = child.wait();
+        wait_for(|| oximux_proc_tree::process(grandchild).is_none());
+        assert!(oximux_proc_tree::process(grandchild).is_none(), "the group's other process outlived the reap");
+    }
+
+    #[test]
+    fn a_ledger_from_before_xcodebuild_entries_still_reads() {
+        let (_dir, ledger) = temp_ledger();
+        std::fs::write(&ledger.path, r#"[{"pid":5,"kind":"helper","exe":"/x","started_at_unix":0,"udid":null,"owner_pid":0}]"#).unwrap();
+        let entries = ledger.entries().unwrap();
+        assert!(entries[0].argv.is_empty() && entries[0].process_start.is_none());
+        // And a helper entry is written as before (no new keys).
+        ledger.record(entry(6, "/y")).unwrap();
+        assert!(!std::fs::read_to_string(&ledger.path).unwrap().contains("argv"));
     }
 }
