@@ -315,6 +315,11 @@ impl RunnerSupervisor {
         let mut relaunched = false;
         loop {
             let (client, exited) = self.client()?;
+            // Turned off or quit while the runner was relaunched: the command
+            // is not sent again.
+            if relaunched && self.inner.stopping.load(Ordering::Relaxed) {
+                return Err(ControlError::Cancelled);
+            }
             let error = match client.call(command, fields.clone()) {
                 Ok(reply) => {
                     *lock(&self.inner.last_used) = Instant::now();
@@ -436,6 +441,12 @@ const KEPT_RESULTS: usize = 3;
 
 /// Launches the runner and waits for it to listen.
 fn launch(spec: &RunnerSpec, stopping: &AtomicBool, cancel: Option<&AtomicBool>) -> Result<Running, ControlError> {
+    let cancelled = || stopping.load(Ordering::Relaxed) || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+    // Turned off or quit before it began (a recovery racing `abort`):
+    // nothing is spawned.
+    if cancelled() {
+        return Err(ControlError::Cancelled);
+    }
     prune_results(&spec.derived.join("Logs/Test"), KEPT_RESULTS);
     let token = runner_client::new_token();
     let argv = spec.argv();
@@ -462,6 +473,11 @@ fn launch(spec: &RunnerSpec, stopping: &AtomicBool, cancel: Option<&AtomicBool>)
     watch_exit(child.clone(), exited.clone());
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
     let failure = loop {
+        // Before the port: a runner that comes up as the user turns control
+        // off (or quits) is never handed a command.
+        if cancelled() {
+            break ControlError::Cancelled;
+        }
         if let Some(port) = output.port() {
             let connector = spec.transport.connector(&spec.udid, port);
             let client = RunnerClient::new(connector, &token);
@@ -471,9 +487,6 @@ fn launch(spec: &RunnerSpec, stopping: &AtomicBool, cancel: Option<&AtomicBool>)
             // Whatever it printed on the way out.
             std::thread::sleep(Duration::from_millis(300));
             break classify_launch_failure(&output.tail());
-        }
-        if stopping.load(Ordering::Relaxed) || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            break ControlError::Cancelled;
         }
         if Instant::now() >= deadline {
             break ControlError::LaunchFailed(format!("it did not start listening within {}s", LAUNCH_TIMEOUT.as_secs()));
@@ -797,6 +810,21 @@ mod tests {
         // The next command launches, and is refused without a relaunch.
         let Err(ControlError::GaveUp(_)) = supervisor.call("tap", serde_json::json!({"x": 1, "y": 2})) else { panic!() };
         assert_eq!(launches(dir.path()), 3);
+    }
+
+    /// Turned off or quit just as a recovery relaunches: nothing is spawned,
+    /// and a runner that is already listening is not taken.
+    #[test]
+    fn a_launch_after_stop_spawns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = launching(dir.path(), &[answering_runner()]);
+        let ledger = spec.ledger.clone().unwrap();
+        let stopping = AtomicBool::new(true);
+        assert!(matches!(launch(&spec, &stopping, None), Err(ControlError::Cancelled)));
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(launch(&spec, &AtomicBool::new(false), Some(&cancel)), Err(ControlError::Cancelled)));
+        assert_eq!(launches(dir.path()), 0);
+        assert!(ledger.entries().unwrap().is_empty());
     }
 
     /// A runner that ends between commands (killed, crashed) is relaunched
