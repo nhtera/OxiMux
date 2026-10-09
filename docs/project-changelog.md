@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-10-09 — Real phones in the Mobile Emulator panel (#50–#54)
+### 2026-10-10 — v0.1.41: Real phones in the Mobile Emulator panel (#50–#54)
 
 - **Agent access to a real device lasts until OxiMux quits.** The approval is
   never saved. Approvals saved for Android phones by earlier builds are
@@ -17,6 +17,9 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
   Settings default device.
 - **Android phones over USB** show a hint for "Allow USB debugging" and come
   live as soon as you allow it. They survive unplug and replug (#51).
+  A phone that blocks injected input (Xiaomi/HyperOS with "USB debugging
+  (Security settings)" off) says so in the panel, and agents are told
+  instead of hearing "tapped".
 - **Android phones over Wi-Fi** pair in the panel with the six-digit code or
   a QR code (Android 11+). The secret goes to `adb` on stdin, never on its
   command line. A phone on both USB and Wi-Fi is one row (#52).
