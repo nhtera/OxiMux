@@ -1,3 +1,6 @@
+use gpui::StatefulInteractiveElement as _;
+
+use super::command_badge_hover::badge_in_gutter;
 use super::*;
 
 impl Render for TerminalView {
@@ -87,6 +90,16 @@ impl Render for TerminalView {
         // borrows). Clone is cheap: snapshot is a Vec<Vec<Cell>> already
         // sized to the visible grid, buckets are tiny per-row vecs of
         // MatchHit (Copy), theme/typography/cursor are POD-sized.
+        // The label follows the pointer's position NOW, not the badge recorded
+        // at the last mouse-move: a scroll, `clear`, mode change, resize, or
+        // keyboard tab switch since then moves or removes the mark under a
+        // pointer that hasn't moved. Mouse-move still gates it, so only the
+        // pane the pointer actually entered shows a label.
+        let command_badges = self.visible_command_badges(s.exit_badges);
+        let hovered_badge = self.hovered_badge.and_then(|_| {
+            let line_h = CellMetrics::measure(&self.typography, window).line_height;
+            badge_in_gutter(window.mouse_position(), self.canvas_bounds.get(), pad, line_h, &command_badges)
+        });
         let paint_params = PaintParams {
             snapshot: self.snapshot.clone(),
             theme,
@@ -99,7 +112,8 @@ impl Render for TerminalView {
             pad,
             hovered_link: self.underlinable_hover(cx),
             selection: self.selection,
-            command_badges: self.visible_command_badges(),
+            command_badges,
+            hovered_badge,
             alphas,
         };
 
@@ -339,6 +353,13 @@ impl Render for TerminalView {
                     cx.notify();
                 }),
             )
+            // Leaving the pane drops the exit-code label: mouse-move stops
+            // arriving once the pointer is outside, so it would otherwise stick.
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    this.set_hovered_badge(None, cx);
+                }
+            }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
                 // A scrollbar-thumb drag owns the gesture: map travel to offset
                 // and skip hover/selection until the button is released.

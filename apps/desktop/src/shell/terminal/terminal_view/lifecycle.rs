@@ -167,6 +167,7 @@ impl TerminalView {
             selecting: None,
             opener: None,
             hovered_link: None,
+            hovered_badge: None,
             last_bell_banner: None,
             link_exists: ExistenceCache::new(),
             link_stat_inflight: 0,
@@ -298,6 +299,7 @@ impl TerminalView {
         self.selection = None;
         self.selecting = None;
         self.hovered_link = None;
+        self.hovered_badge = None;
         self.scrollbar_drag = None;
         let old_backend = std::mem::replace(&mut self.backend, backend);
         let old_id = std::mem::replace(&mut self.session_id, session_id);
@@ -439,6 +441,7 @@ impl TerminalView {
             selecting: None,
             opener: None,
             hovered_link: None,
+            hovered_badge: None,
             last_bell_banner: None,
             link_exists: ExistenceCache::new(),
             link_stat_inflight: 0,

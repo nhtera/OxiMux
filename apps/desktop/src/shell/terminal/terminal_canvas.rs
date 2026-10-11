@@ -63,6 +63,14 @@ impl Default for Alphas {
     }
 }
 
+/// A finished command's status mark on a visible prompt row. `exit` is kept
+/// (not just failed/succeeded) so hovering the mark can name the code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandBadge {
+    pub row: usize,
+    pub exit: i32,
+}
+
 /// Owned inputs for the canvas paint closure. `TerminalView::render`
 /// builds one of these per frame and moves it into the closure so the
 /// canvas API's `FnOnce + 'static` requirement is satisfied.
@@ -99,10 +107,14 @@ pub struct PaintParams {
     /// theme.selection bg overlay BEHIND text but ON TOP of cell bg so
     /// the user can still read the underlying styled content through it.
     pub selection: Option<(usize, usize, usize, usize)>,
-    /// Shell-integration command-mark badges as `(screen_row, is_error)`. A
-    /// thin bar in the left padding gutter of each prompt row — green for a
-    /// zero exit, red for non-zero. Empty unless the shell emits OSC 133/633.
-    pub command_badges: Vec<(usize, bool)>,
+    /// Shell-integration command-mark badges, already filtered by the
+    /// `exit_badges` setting. A thin bar in the left padding gutter of each
+    /// prompt row — red for a non-zero exit, muted grey for zero. Empty unless
+    /// the shell emits OSC 133/633.
+    pub command_badges: Vec<CommandBadge>,
+    /// The badge under the pointer, if any: its exit code is labelled beside
+    /// the gutter so the mark explains itself.
+    pub hovered_badge: Option<CommandBadge>,
     /// Live alpha multipliers (dim / unfocused / unfocused-cursor) from
     /// `TerminalSettings`.
     pub alphas: Alphas,
@@ -450,13 +462,15 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         }
 
         // Shell-integration command-mark badge: a thin bar in the left padding
-        // gutter of the prompt row. Green for a zero exit, red otherwise.
-        for &(badge_row, is_error) in &p.command_badges {
-            if badge_row == row_idx {
-                let color = if is_error {
+        // gutter of the prompt row. Red for a failure; a success (painted only
+        // in the `all` mode) is a muted grey — never green, which reads as a
+        // diff's "added line" marker.
+        for badge in &p.command_badges {
+            if badge.row == row_idx {
+                let color = if badge.exit != 0 {
                     p.theme.status_error
                 } else {
-                    p.theme.status_ok
+                    p.theme.status_muted
                 };
                 let rect = Bounds {
                     origin: point(bounds.origin.x + px(2.0), row_y),
@@ -469,6 +483,57 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             }
         }
     }
+
+    // After every row, so a later row's background can't paint over it.
+    if let Some(badge) = p.hovered_badge {
+        let row_y = origin.y + line_h * badge.row as f32;
+        paint_exit_label(badge, point(bounds.origin.x + px(6.0), row_y), line_h, p, window, cx);
+    }
+}
+
+/// The hover label for a command-status mark: "Exit <code>" in a small chip
+/// just right of the bar, on the mark's own row. Red text for a failure,
+/// muted for a success (shown only when every command is marked).
+fn paint_exit_label(
+    badge: CommandBadge,
+    origin: Point<Pixels>,
+    line_h: Pixels,
+    p: &PaintParams,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text = format!("Exit {}", badge.exit);
+    let color = if badge.exit != 0 {
+        p.theme.status_error
+    } else {
+        p.theme.fg_muted
+    };
+    let run = TextRun {
+        len: text.len(),
+        font: p.typography.mono_font(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(SharedString::from(text), px(p.typography.t_body_sm), &[run], None);
+    let pad_x = px(6.0);
+    let chip = Bounds {
+        origin,
+        size: Size {
+            width: shaped.width + pad_x * 2.0,
+            height: line_h,
+        },
+    };
+    window.paint_quad(
+        fill(chip, p.theme.bg_overlay)
+            .corner_radii(px(3.0))
+            .border_widths(px(1.0))
+            .border_color(p.theme.border_inactive),
+    );
+    let _ = shaped.paint(point(origin.x + pad_x, origin.y), line_h, TextAlign::Left, None, window, cx);
 }
 
 /// Paint the IME composition ("marked"/preedit) text as an underlined overlay

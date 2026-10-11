@@ -34,7 +34,7 @@ use oximux_pty::{
     CommandMarkKind, PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent,
     TerminalSessionId, TerminalSnapshot,
 };
-use oximux_settings::{BellStyle, Density, TerminalSettings, Theme, Typography};
+use oximux_settings::{BellStyle, Density, ExitBadges, TerminalSettings, Theme, Typography};
 
 use crate::actions::{
     FindNextMatch, FindPrevMatch, OpenTerminalContextMenuAt, Search, SendLastCommandOutputToAgent,
@@ -48,7 +48,7 @@ use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_scrollbar::{ScrollbarDrag, drag_to_offset, thumb_geometry};
 use crate::shell::terminal_links::{Existence, ExistenceCache, LinkMatch, LinkTarget, detect_at};
 use crate::shell::terminal_canvas::{
-    Alphas, PaintParams, cell_bounds, grid_dims_for, paint_grid, point_to_cell,
+    Alphas, CommandBadge, PaintParams, cell_bounds, grid_dims_for, paint_grid, point_to_cell,
 };
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
@@ -651,6 +651,9 @@ pub struct TerminalView {
     /// held, so the canvas can underline it. Cleared when the pointer leaves a
     /// link or Cmd is released.
     hovered_link: Option<(usize, usize, usize)>,
+    /// The command-status mark whose gutter the pointer is in, labelled with
+    /// its exit code. Set on mouse-move, dropped when the pointer leaves.
+    hovered_badge: Option<CommandBadge>,
     /// Last bell-banner dispatch instant, rate-limiting BEL storms (a
     /// misbehaving child can emit thousands per second) to one banner
     /// request per window. The dispatcher's per-workspace burst gate
@@ -769,10 +772,13 @@ mod render;
 mod restore_notice;
 mod state;
 mod daemon_recovery;
+mod command_badge_hover;
 #[cfg(test)]
 mod daemon_loss_tests;
 #[cfg(test)]
 mod ime_alt_screen_tests;
+#[cfg(test)]
+mod command_badge_tests;
 
 impl Drop for TerminalView {
     /// Tear down the PTY session when the entity is dropped (tab close,
@@ -1734,7 +1740,7 @@ mod command_mark_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    fn mount_view(cx: &mut TestAppContext) -> gpui::WindowHandle<TerminalView> {
+    pub(super) fn mount_view(cx: &mut TestAppContext) -> gpui::WindowHandle<TerminalView> {
         let (backend, sid) = spawn_local_pty_dormant(80, 24).expect("dormant spawn (PTY fallback)");
         cx.add_window(|win, cx| {
             TerminalView::mount_pending(
@@ -1769,16 +1775,16 @@ mod command_mark_tests {
                     view.apply_command_mark(CommandMarkKind::CommandEnd, Some(0), line);
                 }
                 let rows: Vec<usize> = view
-                    .visible_command_badges()
+                    .visible_command_badges(ExitBadges::All)
                     .into_iter()
-                    .map(|(row, _)| row)
+                    .map(|badge| badge.row)
                     .collect();
                 assert_eq!(rows, vec![1, 4, 15], "precondition: badges track their marks");
 
                 // `clear` → history back to zero → the PTY reports the reset.
                 view.drop_command_marks();
                 assert!(
-                    view.visible_command_badges().is_empty(),
+                    view.visible_command_badges(ExitBadges::All).is_empty(),
                     "stale marks must not badge rows of the wiped grid"
                 );
 
@@ -1786,9 +1792,9 @@ mod command_mark_tests {
                 view.apply_command_mark(CommandMarkKind::PromptStart, None, 0);
                 view.apply_command_mark(CommandMarkKind::CommandEnd, Some(0), 0);
                 let rows: Vec<usize> = view
-                    .visible_command_badges()
+                    .visible_command_badges(ExitBadges::All)
                     .into_iter()
-                    .map(|(row, _)| row)
+                    .map(|badge| badge.row)
                     .collect();
                 assert_eq!(rows, vec![0], "the post-clear prompt keeps its badge");
             })

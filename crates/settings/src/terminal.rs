@@ -46,6 +46,22 @@ pub enum PerTerminalHistory {
     Off,
 }
 
+/// Which finished commands get a status mark in the terminal's left margin.
+/// Needs shell integration (OSC 133/633) to know exit codes; the marks are
+/// recorded in every mode, so this only changes what is painted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExitBadges {
+    /// Only commands that exited non-zero (red). A green mark on every
+    /// successful prompt read as a diff marker, so success stays unmarked.
+    #[default]
+    Failures,
+    /// Every finished command: failures red, successes a muted grey.
+    All,
+    /// No marks.
+    Off,
+}
+
 /// All user-tunable terminal knobs. `#[serde(default)]` lets a partial TOML
 /// override only the keys it sets; unknown keys are ignored for forward-compat.
 // Not `Copy`: the shell override is a `String`. The render path reads this
@@ -103,6 +119,8 @@ pub struct TerminalSettings {
     pub bell: BellStyle,
     /// Per-terminal shell history. Sourced at spawn: applies to new terminals.
     pub per_terminal_history: PerTerminalHistory,
+    /// Which finished commands get a left-margin status mark.
+    pub exit_badges: ExitBadges,
 }
 
 impl Default for TerminalSettings {
@@ -129,6 +147,7 @@ impl Default for TerminalSettings {
             windows_powershell: WindowsPowerShell::default(),
             bell: BellStyle::Visual,
             per_terminal_history: PerTerminalHistory::Auto,
+            exit_badges: ExitBadges::Failures,
         }
     }
 }
@@ -204,6 +223,15 @@ mod tests {
         assert!(!off.shell_integration);
         // Untouched keys keep their defaults.
         assert_eq!(off.scrollback_lines, 5000);
+    }
+
+    #[test]
+    fn exit_badges_default_to_failures_and_parse_every_mode() {
+        assert_eq!(TerminalSettings::default().exit_badges, ExitBadges::Failures);
+        for (text, mode) in [("failures", ExitBadges::Failures), ("all", ExitBadges::All), ("off", ExitBadges::Off)] {
+            let s = TerminalSettings::from_toml_str(&format!("exit_badges = \"{text}\"\n")).expect("parse");
+            assert_eq!(s.exit_badges, mode);
+        }
     }
 
     #[test]

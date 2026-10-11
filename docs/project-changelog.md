@@ -4,6 +4,18 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-10-11 — Terminal: command status marks show failures only
+
+- **A successful command no longer gets a green bar** beside its prompt. The
+  bar read as a diff's "added line" marker on an ordinary `ls`. By default
+  only a command that exited non-zero is marked, in red.
+- **Settings → Terminal → Command status marks**: Failures (default), All, or
+  Off (`exit_badges = "failures" | "all" | "off"` in `terminal.toml`). All
+  marks successes in a muted grey, never green.
+- **Hovering a mark shows its exit code** ("Exit 1") beside the margin.
+- The marks are still recorded in every mode, so Send Last Output to Agent
+  works with them off.
+
 ### 2026-10-10 — v0.1.41: Real phones in the Mobile Emulator panel (#50–#54)
 
 - **Agent access to a real device lasts until OxiMux quits.** The approval is
