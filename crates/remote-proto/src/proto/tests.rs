@@ -19,8 +19,9 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 26,
-        "v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
+        PROTOCOL_VERSION, 27,
+        "v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
+         SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
          + Simulator reply, the verb set in its own append-only enums)"
     );
@@ -640,6 +641,114 @@ fn simulator_verbs_round_trip_and_keep_their_ordinals() {
         let resp = Response::Simulator(reply);
         assert_eq!(Response::from_bytes(&resp.to_bytes().expect("encode")).expect("decode"), resp);
     }
+}
+
+/// v27 appends the verify loop after every older variant: the verbs from 15,
+/// `Ref` after `Id`, the replies after `Ax`, the errors after `Refused`.
+#[test]
+fn the_verify_loop_appends_and_round_trips() {
+    let tap = Box::new(SimCmdWire::Tap(SimTargetWire::Ref(7)));
+    let cmds = [
+        (15usize, SimCmdWire::Settled { action: tap.clone(), timeout_ms: 3000 }),
+        (16, SimCmdWire::AxRefs { max: 100 }),
+        (17, SimCmdWire::Wait { target: SimTargetWire::Label("Home".into()), gone: false, timeout_ms: 5000 }),
+        (18, SimCmdWire::Assert { target: SimTargetWire::Id("title".into()), check: SimCheckWire::Text("Hi".into()) }),
+        (19, SimCmdWire::AsCaller { caller: u64::MAX, cmd: Box::new(SimCmdWire::Settled { action: tap, timeout_ms: 0 }) }),
+    ];
+    for (ordinal, cmd) in cmds {
+        let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: cmd.clone() });
+        let bytes = req.to_bytes().expect("encode");
+        assert_eq!(bytes[5] as usize, ordinal, "{cmd:?}");
+        assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
+    }
+    // `Tap(Ref(7))`: the verb (6), the target (3), the ref.
+    let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: SimCmdWire::Tap(SimTargetWire::Ref(7)) });
+    assert_eq!(&req.to_bytes().expect("encode")[5..], [6, 3, 7]);
+
+    let node = SimAxNodeWire {
+        depth: 0,
+        role: "TextField".into(),
+        label: Some("Email".into()),
+        identifier: None,
+        value: None,
+        enabled: true,
+        frame: [16.0, 300.0, 370.0, 44.0],
+    };
+    let settled = SimSettleWire {
+        outcome: Some(SimSettleOutcomeWire::SettledFrame),
+        elapsed_ms: 900,
+        diff: vec![SimDiffLineWire { op: SimDiffOpWire::Added, r: Some(31), node: node.clone() }],
+        unchanged: 12,
+        warnings: vec!["moved".into()],
+        target: Some(node.clone()),
+        at: Some(SimPointWire { x: 201.0, y: 322.0 }),
+    };
+    let replies = [
+        (6u8, Ok(SimReplyWire::Settled(settled))),
+        (7, Ok(SimReplyWire::AxRefs(vec![SimRefNodeWire { r: 1, node: node.clone() }]))),
+        (8, Ok(SimReplyWire::Matched { node: Some(node), elapsed_ms: 250 })),
+        (11, Err(SimErrorWire::StaleRef("stale".into()))),
+        (12, Err(SimErrorWire::AssertFailed("found nothing".into()))),
+        (13, Err(SimErrorWire::TimedOut("5 s".into()))),
+    ];
+    for (ordinal, reply) in replies {
+        let resp = Response::Simulator(reply);
+        let bytes = resp.to_bytes().expect("encode");
+        // The envelope, then `Ok`/`Err`, then the variant's ordinal.
+        assert_eq!(bytes[2], ordinal, "{resp:?}");
+        assert_eq!(Response::from_bytes(&bytes).expect("decode"), resp);
+    }
+}
+
+/// Nested envelopes are bounded on decode: a frame of a hundred thousand
+/// `AsCaller`s is refused, not a stack overflow before authentication — while
+/// the deepest legal shape (caller → settle → verb) still decodes.
+#[test]
+fn nested_verbs_are_bounded_on_decode() {
+    let legal = Request::Simulator(SimRequestWire {
+        worktree: None,
+        cmd: SimCmdWire::AsCaller {
+            caller: 1,
+            cmd: Box::new(SimCmdWire::Settled { action: Box::new(SimCmdWire::Detach), timeout_ms: 0 }),
+        },
+    });
+    assert_eq!(Request::from_bytes(&legal.to_bytes().unwrap()).unwrap(), legal);
+    let three = SimCmdWire::AsCaller { caller: 1, cmd: Box::new(SimCmdWire::AsCaller { caller: 2, cmd: Box::new(SimCmdWire::AsCaller { caller: 3, cmd: Box::new(SimCmdWire::Detach) }) }) };
+    let bytes = Request::Simulator(SimRequestWire { worktree: None, cmd: three }).to_bytes().unwrap();
+    assert!(Request::from_bytes(&bytes).is_err(), "three deep");
+    // The envelope, `None`, then 100k × (AsCaller = 19, caller 0), then Detach.
+    let mut hostile = Request::Simulator(SimRequestWire { worktree: None, cmd: SimCmdWire::Detach }).to_bytes().unwrap();
+    let tail = hostile.split_off(2);
+    for _ in 0..100_000 {
+        hostile.extend_from_slice(&[19, 0]);
+    }
+    hostile.extend_from_slice(&tail);
+    assert!(Request::from_bytes(&hostile).is_err());
+    // The counter unwinds on failure: a legal frame still decodes after.
+    assert_eq!(Request::from_bytes(&legal.to_bytes().unwrap()).unwrap(), legal);
+}
+
+/// A v26 client cannot decode the v27 errors, so a verb it could have sent
+/// never gets one: it hears `Failed`, with the same words.
+#[test]
+fn only_v27_verbs_get_the_v27_errors() {
+    let old = [
+        SimCmdWire::Tap(SimTargetWire::Label("OK".into())),
+        SimCmdWire::Ax { max: 10 },
+        SimCmdWire::Type { text: "a".into(), paste: false },
+    ];
+    for cmd in &old {
+        assert!(!cmd.uses_verify(), "{cmd:?}");
+        for err in [SimErrorWire::StaleRef("a".into()), SimErrorWire::AssertFailed("b".into()), SimErrorWire::TimedOut("c".into())] {
+            let said = err.to_string();
+            assert_eq!(err.for_verb(cmd), SimErrorWire::Failed(said));
+        }
+        assert_eq!(SimErrorWire::NoDevice.for_verb(cmd), SimErrorWire::NoDevice);
+    }
+    let new = SimCmdWire::Tap(SimTargetWire::Ref(1));
+    assert_eq!(SimErrorWire::StaleRef("x".into()).for_verb(&new), SimErrorWire::StaleRef("x".into()));
+    let wait = SimCmdWire::Wait { target: SimTargetWire::Id("a".into()), gone: true, timeout_ms: 1 };
+    assert_eq!(SimErrorWire::TimedOut("x".into()).for_verb(&wait), SimErrorWire::TimedOut("x".into()));
 }
 
 /// The v10 schedule shape is frozen, byte for byte.

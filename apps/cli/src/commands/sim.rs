@@ -15,16 +15,18 @@ use std::time::Duration;
 
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 use oximux_remote_proto::simulator::{
-    SimAxNodeWire, SimButtonWire, SimCmdWire, SimConsentWire, SimDeviceWire, SimErrorWire, SimOrientationWire,
-    SimPointWire, SimReplyWire, SimRequestWire, SimStatusWire, SimTargetWire,
+    SimButtonWire, SimCmdWire, SimConsentWire, SimDeviceWire, SimErrorWire, SimOrientationWire, SimPointWire,
+    SimReplyWire, SimRequestWire, SimStatusWire, SimTargetWire,
 };
 use serde_json::{Value, json};
 
-use crate::cli::{SimButtonArg, SimCommand, SimOrientationArg, SimPlatformArg, exit};
+use super::sim_render::{ax_json, ax_line};
+use super::sim_verify;
+use crate::cli::{SimButtonArg, SimCommand, SimOrientationArg, SimPlatformArg, TapArg, exit};
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
 
-type Outcome = Result<(Value, String), Failure>;
+pub(super) type Outcome = Result<(Value, String), Failure>;
 
 /// The folder a screenshot lands in by default, under `$TMPDIR`. Transcripts
 /// mirrored to a phone scrub reads of it (see `agent-core`'s redaction).
@@ -75,7 +77,11 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
             let human = format!("{}  {width}×{height} px ({note})", path.display());
             Ok((json!({ "path": path, "width": width, "height": height, "scale": scale }), human))
         }
-        SimCommand::Ax { flat, max } => {
+        SimCommand::Ax { max, interactive: true, .. } => sim_verify::ax_refs(client, &worktree, max).await,
+        SimCommand::Wait(args) => sim_verify::wait(client, &worktree, args).await,
+        SimCommand::Assert(args) => sim_verify::assert(client, &worktree, args).await,
+        SimCommand::Type { text, paste, settle } if text.len() > 1 => sim_verify::type_into(client, &worktree, text, paste, &settle).await,
+        SimCommand::Ax { flat, max, interactive: false } => {
             let SimReplyWire::Ax(nodes) = call(client, &worktree, SimCmdWire::Ax { max }, SLOW).await? else {
                 return Err(unexpected("Ax"));
             };
@@ -89,11 +95,15 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
         other => {
             let cwd = std::env::current_dir()
                 .map_err(|e| Failure::new("cwd", exit::ERROR, format!("cannot read the current directory: {e}")))?;
+            let settle = other.settle_args().cloned().unwrap_or_default();
+            // The verb already names its element: a report need not repeat it.
+            let named = matches!(other, SimCommand::Tap { label: Some(_), .. } | SimCommand::Tap { id: Some(_), .. });
             let (cmd, floor, said) = request_for(other, &cwd)?;
+            let (cmd, floor) = sim_verify::wrap(cmd, floor, &settle);
             let reply = call(client, &worktree, cmd, floor).await?;
             match reply {
                 reply @ SimReplyWire::Attached(_) => attached(reply),
-                SimReplyWire::Done => Ok((json!({ "ok": true }), said)),
+                reply @ (SimReplyWire::Done | SimReplyWire::Settled(_)) => sim_verify::acted(reply, &said, named),
                 other => Err(unexpected_reply("Simulator", &Response::Simulator(Ok(other)))),
             }
         }
@@ -103,7 +113,7 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
 /// How long a verb may take on the host: a parked device wakes in seconds, a
 /// shut-down one boots for up to a minute, an install copies a whole app.
 const QUICK: Duration = Duration::ZERO;
-const SLOW: Duration = Duration::from_secs(90);
+pub(super) const SLOW: Duration = Duration::from_secs(90);
 /// Waking (≤ 60 s) plus a relaunch's terminate and launch (≤ 60 s each).
 const APP: Duration = Duration::from_secs(200);
 /// Waking (≤ 60 s), on a real device the user's yes (≤ 90 s), then the copy
@@ -119,25 +129,28 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
     Ok(match command {
         SimCommand::Attach { device, .. } => (SimCmdWire::Attach { device }, LISTING + Duration::from_secs(15), String::new()),
         SimCommand::Detach => (SimCmdWire::Detach, QUICK, "detached".into()),
-        SimCommand::Tap { x, y, label, id } => {
+        SimCommand::Tap { x, y, label, id, .. } => {
             let (target, said) = match (x, y, label, id) {
                 (_, _, Some(label), _) => (SimTargetWire::Label(label.clone()), format!("tapped “{label}”")),
                 (_, _, _, Some(id)) => (SimTargetWire::Id(id.clone()), format!("tapped #{id}")),
-                (Some(x), Some(y), None, None) => (SimTargetWire::Point(SimPointWire { x, y }), format!("tapped ({x}, {y})")),
-                _ => return Err(usage("`sim tap` wants X Y (points), or --label TEXT, or --id AXID")),
+                (Some(TapArg::Ref(r)), None, None, None) => (SimTargetWire::Ref(r), format!("tapped @e{r}")),
+                (Some(TapArg::X(x)), Some(y), None, None) => (SimTargetWire::Point(SimPointWire { x, y }), format!("tapped ({x}, {y})")),
+                _ => return Err(usage("`sim tap` wants X Y (points), an @eN ref, --label TEXT, or --id AXID")),
             };
             (SimCmdWire::Tap(target), SLOW, said)
         }
-        SimCommand::Swipe { x1, y1, x2, y2, duration } => (
+        SimCommand::Swipe { x1, y1, x2, y2, duration, .. } => (
             SimCmdWire::Swipe { from: SimPointWire { x: x1, y: y1 }, to: SimPointWire { x: x2, y: y2 }, duration_ms: duration },
             SLOW,
             format!("swiped ({x1}, {y1}) → ({x2}, {y2})"),
         ),
-        SimCommand::Type { text, paste } => {
+        SimCommand::Type { text, paste, .. } => {
+            // `type @eN TEXT` (two words) is `sim_verify::type_into`'s.
+            let [text] = <[String; 1]>::try_from(text).map_err(|_| usage("`sim type` takes TEXT, or an @eN ref then TEXT"))?;
             let said = format!("typed {} characters", text.chars().count());
             (SimCmdWire::Type { text, paste }, SLOW, said)
         }
-        SimCommand::Button { button } => {
+        SimCommand::Button { button, .. } => {
             let wire = match button {
                 SimButtonArg::Home => SimButtonWire::Home,
                 SimButtonArg::Lock => SimButtonWire::Lock,
@@ -150,7 +163,7 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
             };
             (SimCmdWire::Button(wire), SLOW, format!("pressed {button:?}").to_lowercase())
         }
-        SimCommand::Rotate { to } => {
+        SimCommand::Rotate { to, .. } => {
             let wire = match to {
                 SimOrientationArg::Portrait => SimOrientationWire::Portrait,
                 SimOrientationArg::LandscapeLeft => SimOrientationWire::LandscapeLeft,
@@ -159,11 +172,11 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
             };
             (SimCmdWire::Rotate(wire), SLOW, "rotated".into())
         }
-        SimCommand::Launch { bundle_id, relaunch } => {
+        SimCommand::Launch { bundle_id, relaunch, .. } => {
             let said = format!("launched {bundle_id}");
             (SimCmdWire::Launch { bundle_id, relaunch }, APP, said)
         }
-        SimCommand::OpenUrl { url } => {
+        SimCommand::OpenUrl { url, .. } => {
             let said = format!("opened {url}");
             (SimCmdWire::OpenUrl { url }, APP, said)
         }
@@ -179,6 +192,8 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
         | SimCommand::WaitConsent { .. }
         | SimCommand::Screenshot { .. }
         | SimCommand::Ax { .. }
+        | SimCommand::Wait(_)
+        | SimCommand::Assert(_)
         | SimCommand::Devices { .. } => {
             unreachable!("answered with a reply of their own")
         }
@@ -243,7 +258,7 @@ fn absolute(path: &Path, base: &Path) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { base.join(path) }
 }
 
-async fn call(client: &Client, worktree: &Path, cmd: SimCmdWire, floor: Duration) -> Result<SimReplyWire, Failure> {
+pub(super) async fn call(client: &Client, worktree: &Path, cmd: SimCmdWire, floor: Duration) -> Result<SimReplyWire, Failure> {
     let req = Request::Simulator(SimRequestWire { worktree: Some(worktree.to_string_lossy().into_owned()), cmd });
     match client.call_at_least(req, floor).await? {
         Response::Simulator(Ok(reply)) => Ok(reply),
@@ -368,14 +383,19 @@ fn sim_failure(e: SimErrorWire) -> Failure {
             .with_steps(["`oximux sim status` shows what is missing".into()]),
         SimErrorWire::Failed(_) => Failure::new("failed", exit::ERROR, message),
         SimErrorWire::Refused(_) => Failure::new("refused", exit::DENIED, message),
+        SimErrorWire::StaleRef(_) => Failure::new("stale-ref", exit::ERROR, message)
+            .with_steps(["run `oximux sim ax -i` and use the refs it prints".into()]),
+        SimErrorWire::AssertFailed(_) => Failure::new("assert-failed", exit::ERROR, message),
+        SimErrorWire::TimedOut(_) => Failure::new("timeout", exit::TIMEOUT, message)
+            .with_steps(["`oximux sim ax -i` shows what is on screen now".into()]),
     }
 }
 
-fn usage(message: &str) -> Failure {
+pub(super) fn usage(message: &str) -> Failure {
     Failure::new("usage", exit::USAGE, message.to_string())
 }
 
-fn unexpected(verb: &str) -> Failure {
+pub(super) fn unexpected(verb: &str) -> Failure {
     Failure::new("protocol", exit::ERROR, format!("the host answered `sim` with the wrong reply for {verb}"))
 }
 
@@ -449,38 +469,6 @@ fn status_human(s: &SimStatusWire) -> String {
     lines.join("\n")
 }
 
-fn ax_json(n: &SimAxNodeWire) -> Value {
-    json!({
-        "depth": n.depth,
-        "role": n.role,
-        "label": n.label,
-        "identifier": n.identifier,
-        "value": n.value,
-        "enabled": n.enabled,
-        "frame": { "x": n.frame[0], "y": n.frame[1], "width": n.frame[2], "height": n.frame[3] },
-    })
-}
-
-fn ax_line(n: &SimAxNodeWire, flat: bool) -> String {
-    let indent = if flat { String::new() } else { "  ".repeat(n.depth as usize) };
-    let mut line = format!("{indent}{}", n.role);
-    if let Some(label) = n.label.as_deref().filter(|l| !l.is_empty()) {
-        line.push_str(&format!(" “{label}”"));
-    }
-    if let Some(id) = n.identifier.as_deref().filter(|i| !i.is_empty()) {
-        line.push_str(&format!(" #{id}"));
-    }
-    if let Some(value) = n.value.as_deref().filter(|v| !v.is_empty()) {
-        line.push_str(&format!(" = {value}"));
-    }
-    if !n.enabled {
-        line.push_str(" (disabled)");
-    }
-    let [x, y, w, h] = n.frame;
-    line.push_str(&format!("  [{x:.0},{y:.0} {w:.0}×{h:.0}]"));
-    line
-}
-
 #[cfg(test)]
 mod tests {
     fn device(udid: &str, name: &str, state: &str) -> SimDeviceWire {
@@ -539,12 +527,15 @@ mod tests {
     fn a_tap_needs_a_point_or_an_element() {
         let w = Path::new("/w");
         let tap = |x, y, label: Option<&str>, id: Option<&str>| {
-            request_for(SimCommand::Tap { x, y, label: label.map(Into::into), id: id.map(Into::into) }, w)
+            let settle = Default::default();
+            request_for(SimCommand::Tap { x, y, label: label.map(Into::into), id: id.map(Into::into), settle }, w)
         };
-        assert!(matches!(tap(Some(1.0), Some(2.0), None, None).unwrap().0, SimCmdWire::Tap(SimTargetWire::Point(_))));
+        assert!(matches!(tap(Some(TapArg::X(1.0)), Some(2.0), None, None).unwrap().0, SimCmdWire::Tap(SimTargetWire::Point(_))));
         assert!(matches!(tap(None, None, Some("OK"), None).unwrap().0, SimCmdWire::Tap(SimTargetWire::Label(_))));
         assert!(matches!(tap(None, None, None, Some("ok")).unwrap().0, SimCmdWire::Tap(SimTargetWire::Id(_))));
-        assert_eq!(tap(Some(1.0), None, None, None).unwrap_err().exit, exit::USAGE);
+        assert_eq!(tap(Some(TapArg::Ref(7)), None, None, None).unwrap().0, SimCmdWire::Tap(SimTargetWire::Ref(7)));
+        assert_eq!(tap(Some(TapArg::Ref(7)), Some(2.0), None, None).unwrap_err().exit, exit::USAGE);
+        assert_eq!(tap(Some(TapArg::X(1.0)), None, None, None).unwrap_err().exit, exit::USAGE);
         assert_eq!(tap(None, None, None, None).unwrap_err().exit, exit::USAGE);
     }
 
@@ -572,20 +563,5 @@ mod tests {
         let joined = Path::new("/w").join("Build/App.app").to_string_lossy().into_owned();
         assert_eq!(cmd, SimCmdWire::Install { path: joined });
         assert_eq!(floor, INSTALL);
-    }
-
-    #[test]
-    fn ax_lines_read_like_the_tree() {
-        let node = SimAxNodeWire {
-            depth: 2,
-            role: "Button".into(),
-            label: Some("Settings".into()),
-            identifier: Some("settings".into()),
-            value: None,
-            enabled: false,
-            frame: [10.0, 20.5, 100.0, 44.0],
-        };
-        assert_eq!(ax_line(&node, false), "    Button “Settings” #settings (disabled)  [10,20 100×44]");
-        assert!(ax_line(&node, true).starts_with("Button"));
     }
 }

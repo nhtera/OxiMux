@@ -13,42 +13,41 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{AsyncApp, Entity};
-use oximux_remote_proto::simulator::{
-    SimAxNodeWire, SimButtonWire, SimCmdWire, SimErrorWire, SimOrientationWire, SimReplyWire, SimTargetWire,
-};
+use oximux_remote_proto::simulator::{SimButtonWire, SimCmdWire, SimErrorWire, SimOrientationWire, SimReplyWire, SimTargetWire};
 use oximux_simulator::agent::{self, InstallPathError};
-use oximux_simulator::ax::{self, AxNode, Query};
-use oximux_simulator::geometry::{self, Size};
+use oximux_simulator::ax::{self, Query};
+use oximux_simulator::ax_refs::TableKey;
+use oximux_simulator::geometry;
 use oximux_simulator::protocol::{Command, KeyPhase, TouchPhase};
-use oximux_simulator::caps::{self, ButtonSet, DeviceCaps};
+use oximux_simulator::caps::{self, DeviceCaps};
 use oximux_simulator::ios_device::input_map::{Gesture, MAX_TEXT, RunnerButton};
+use oximux_simulator::registry::WorktreeKey;
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::StreamSession;
 use oximux_simulator::simctl::SimUdid;
 use oximux_simulator::{Button, DeviceId, Orientation, Platform, Source, keyboard, simctl};
 
 use super::Target;
+use super::ax_lookup::{self, HELPER_TIMEOUT, Shown, off_screen, point_to_portrait, scale, screen};
+use super::guards::{Verb, is_input, is_web_url, unwrap};
+use super::settle::{self, Acted};
 use crate::shell::simulator::hub::{InstallAnswer, SimulatorHub, Wake, home_button, paste_now};
 
 /// How long a woken device may take to start streaming: a cold boot of a
 /// shut-down device measured 40-odd seconds on an M-series Mac.
 const START_WAIT: Duration = Duration::from_secs(60);
-/// Helper requests (screenshot, AX tree, rotation).
-const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 /// `simctl launch` / `openurl`.
 const APP_TIMEOUT: Duration = Duration::from_secs(60);
 /// `simctl install` (a large app copies for a while).
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 /// Finger down to finger up, for a tap.
 const TAP_HOLD: Duration = Duration::from_millis(60);
-/// How long a just-booted device may take to have an accessibility tree.
-const AX_SETTLE: Duration = Duration::from_secs(8);
 /// The longest text one `type` takes (it goes key by key).
 const MAX_TYPED: usize = 10_000;
 
 /// Run a blocking call on a thread of its own: an install copies for minutes,
 /// and the background executor's few threads are shared by the whole app.
-async fn on_own_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, SimErrorWire> {
+pub(super) async fn on_own_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, SimErrorWire> {
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
@@ -56,8 +55,7 @@ async fn on_own_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static
     rx.await.map_err(|_| SimErrorWire::Failed("the operation stopped unexpectedly".into()))
 }
 
-type Out = Result<SimReplyWire, SimErrorWire>;
-
+pub(super) type Out = Result<SimReplyWire, SimErrorWire>;
 /// How long the scrcpy server gets to refuse a session's first input.
 const INPUT_VERDICT: Duration = Duration::from_millis(300);
 
@@ -73,15 +71,17 @@ pub(super) async fn run(
     target: &Target,
     cx: &mut AsyncApp,
 ) -> Out {
+    // Envelopes off first: every guard below reads the verb inside.
+    let verb = unwrap(cmd)?;
     // An Android phone may drop injected input on the floor (an OEM setting):
     // the server says so only on stderr, so an agent is told here rather
     // than hearing "tapped" for a tap that never happened. Emulators never do.
-    let checked = is_input(&cmd) && udid.source() == Source::Adb && udid.is_physical();
+    let checked = is_input(&verb.inner) && udid.source() == Source::Adb && udid.is_physical();
     let phone = |cx: &mut AsyncApp| hub.read_with(cx, |hub, _| hub.session(udid)).and_then(|s| s.android().cloned());
     if checked && phone(cx).is_some_and(|s| s.input_blocked()) {
         return Err(SimErrorWire::Refused(INPUT_BLOCKED.into()));
     }
-    let reply = run_verb(hub, udid, name, cmd, target, cx).await;
+    let reply = run_verb(hub, udid, name, verb, target, cx).await;
     // The session the verb used: it may have woken or reconnected the phone.
     let Some(session) = phone(cx).filter(|_| checked && reply.is_ok()) else { return reply };
     let timer = cx.background_executor().timer(INPUT_VERDICT);
@@ -109,70 +109,87 @@ async fn input_verdict(
     Ok(())
 }
 
-fn is_input(cmd: &SimCmdWire) -> bool {
-    matches!(cmd, SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_))
-}
-
-async fn run_verb(
-    hub: &Entity<SimulatorHub>,
-    udid: &DeviceId,
-    name: &str,
-    cmd: SimCmdWire,
-    target: &Target,
-    cx: &mut AsyncApp,
-) -> Out {
+async fn run_verb(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str, verb: Verb, target: &Target, cx: &mut AsyncApp) -> Out {
     // A real device does only what it can now, and opens only web links:
     // a custom scheme can dial, pay or message on someone's own phone.
     if udid.is_physical() {
-        if let Some(what) = refused_on(&hub.read_with(cx, |hub, _| hub.caps(udid)), &cmd) {
+        if let Some(what) = verb.refused_on(&hub.read_with(cx, |hub, _| hub.caps(udid))) {
             let mut why = caps::refuse(what, udid);
             // Input reaches an iPhone once the user turns its control on.
-            if udid.source() == Source::Devicectl && refused_on(&DeviceCaps::for_session(udid, true), &cmd).is_none() {
+            if udid.source() == Source::Devicectl && verb.refused_on(&DeviceCaps::for_session(udid, true)).is_none() {
                 why = format!("{why}; ask the user to turn its control on in the Mobile Emulator panel (Control from OxiMux…)");
             }
             return Err(SimErrorWire::Refused(why));
         }
-        if let SimCmdWire::OpenUrl { url } = &cmd
+        if let SimCmdWire::OpenUrl { url } = &verb.inner
             && !is_web_url(url)
         {
             return Err(SimErrorWire::Refused("only http and https links open on a real device".into()));
         }
         // A sleeping phone streams nothing: a screen verb would only wait.
-        if needs_screen(&cmd) && hub.read_with(cx, |hub, _| hub.screen_off(udid)) {
+        if verb.needs_screen() && hub.read_with(cx, |hub, _| hub.screen_off(udid)) {
             return Err(SimErrorWire::Unavailable(
                 "the phone's screen is off; ask the user to press Wake in the Mobile Emulator panel".into(),
             ));
         }
     }
     // Input takes turns per device: interleaved touch streams from parallel
-    // calls would make gestures nobody asked for.
-    let input = is_input(&cmd);
-    let lock = input.then(|| hub.update(cx, |hub, _| hub.input_lock(udid)));
+    // calls would make gestures nobody asked for. A settle keeps the turn
+    // until the screen it reports on is idle.
+    let lock = is_input(&verb.inner).then(|| hub.update(cx, |hub, _| hub.input_lock(udid)));
     let _turn = match &lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
+    let refs: TableKey = (WorktreeKey::from_path(&target.worktree), udid.clone(), verb.caller);
+    if let Some(timeout_ms) = verb.settle {
+        return settle::settled(hub, udid, name, verb.inner, timeout_ms, &refs, target, cx).await;
+    }
+    // A bare tap by ref still reports where it landed (and whether its
+    // element had moved).
+    let by_ref = matches!(verb.inner, SimCmdWire::Tap(SimTargetWire::Ref(_)));
+    let (started, mut acted) = (Instant::now(), Acted::default());
+    let reply = execute(hub, udid, name, verb.inner, &refs, &mut acted, target, cx).await?;
+    Ok(if by_ref { SimReplyWire::Settled(acted.report(None, started)) } else { reply })
+}
+
+/// Carry out one verb, its envelopes already off and its guards passed.
+/// `acted` hears what a tap aimed at (for a settle's report).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn execute(
+    hub: &Entity<SimulatorHub>,
+    udid: &DeviceId,
+    name: &str,
+    cmd: SimCmdWire,
+    refs: &TableKey,
+    acted: &mut Acted,
+    target: &Target,
+    cx: &mut AsyncApp,
+) -> Out {
     match cmd {
         // Answered before consent in `agent_ops::run`.
         SimCmdWire::Status | SimCmdWire::Devices | SimCmdWire::Attach { .. } | SimCmdWire::Detach => Ok(SimReplyWire::Done),
+        // Taken off by `unwrap` before anything runs.
+        SimCmdWire::Settled { .. } | SimCmdWire::AsCaller { .. } => Err(SimErrorWire::BadInput("a wrapped verb inside a verb".into())),
+        SimCmdWire::AxRefs { max } => settle::ax_refs(hub, udid, max, refs, cx).await,
+        SimCmdWire::Wait { target: aim, gone, timeout_ms } => super::checks::wait(hub, udid, aim, gone, timeout_ms, refs, cx).await,
+        SimCmdWire::Assert { target: aim, check } => super::checks::assert(hub, udid, aim, check, refs, cx).await,
         SimCmdWire::Screenshot { full } => screenshot(hub, udid, full, cx).await,
         SimCmdWire::Ax { max } => {
             let session = live_session(hub, udid, cx).await?;
-            let nodes = describe(&session, cx).await?;
-            let scale = scale_from(hub, udid, &session, &nodes, cx)?;
+            let nodes = ax_lookup::read(hub, udid, &session, cx).await?;
             // Frames in the screenshot's space, whichever way the app is turned.
-            let (o, portrait) = screen(&session)?;
-            let (root, pts) = (root_size(&nodes), agent::display_points(o, portrait, scale));
+            let shown = Shown::new(hub, udid, &session, &nodes, cx)?;
             let flat = ax::flatten(&nodes, max.clamp(1, 5000) as usize);
-            let shown = |r| agent::ax_rect_to_display(ax_space(&session), o, root, r, pts);
-            Ok(SimReplyWire::Ax(flat.iter().map(|f| ax_wire(f.node, f.depth, shown(f.node.frame))).collect()))
+            Ok(SimReplyWire::Ax(flat.iter().map(|f| shown.wire(f.node, f.depth)).collect()))
         }
         SimCmdWire::Tap(aim) => {
             let session = live_session(hub, udid, cx).await?;
             let at = match aim {
                 SimTargetWire::Point(p) => point_to_portrait(hub, udid, &session, (p.x, p.y), cx).await?,
-                SimTargetWire::Label(label) => element(&session, Query::Label(&label), &label, cx).await?,
-                SimTargetWire::Id(id) => element(&session, Query::Id(&id), &id, cx).await?,
+                SimTargetWire::Label(label) => settle::aim(hub, udid, &session, Query::Label(&label), &label, acted, cx).await?,
+                SimTargetWire::Id(id) => settle::aim(hub, udid, &session, Query::Id(&id), &id, acted, cx).await?,
+                SimTargetWire::Ref(r) => settle::aim_ref(hub, udid, &session, r, refs, acted, cx).await?,
             };
             if let Some(done) = on_iphone(&session, vec![Gesture::Tap { at, taps: 1 }]).await {
                 return done;
@@ -410,7 +427,7 @@ const STOPPED_BY_USER: &str =
 
 /// The device's helper session, waking the device if it is parked, was never
 /// started this run, or dropped its stream.
-async fn live_session(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<StreamSession, SimErrorWire> {
+pub(super) async fn live_session(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<StreamSession, SimErrorWire> {
     let deadline = Instant::now() + START_WAIT;
     let mut woke = false;
     loop {
@@ -482,57 +499,6 @@ fn check_bundle_id(bundle_id: &str) -> Result<(), SimErrorWire> {
     if well_formed { Ok(()) } else { Err(SimErrorWire::BadInput(format!("`{bundle_id}` is not a bundle identifier"))) }
 }
 
-/// The capability `cmd` needs that `caps` lacks, named for [`caps::refuse`].
-fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static str> {
-    let (can, what) = match cmd {
-        SimCmdWire::Status | SimCmdWire::Devices | SimCmdWire::Attach { .. } | SimCmdWire::Detach => return None,
-        SimCmdWire::Screenshot { .. } => (caps.screenshot, "Screenshots"),
-        SimCmdWire::Ax { .. } => (caps.ax, "The accessibility tree"),
-        SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } => (caps.touch, "Touch input"),
-        SimCmdWire::Type { .. } => (caps.keys, "Typing"),
-        SimCmdWire::Button(button) => (caps.buttons.contains(button_set(*button)), "That button"),
-        SimCmdWire::Rotate(_) => (caps.rotate, "Rotation"),
-        SimCmdWire::Launch { .. } => (caps.launch, "Launching apps"),
-        SimCmdWire::OpenUrl { .. } => (caps.open_url, "Opening URLs"),
-        SimCmdWire::Install { .. } => (caps.install, "Installing apps"),
-        SimCmdWire::Shutdown { .. } => (caps.shutdown, "Shutting down"),
-    };
-    (!can).then_some(what)
-}
-
-fn button_set(button: SimButtonWire) -> ButtonSet {
-    match button {
-        SimButtonWire::Home => ButtonSet::HOME,
-        SimButtonWire::Lock => ButtonSet::LOCK,
-        SimButtonWire::Siri => ButtonSet::SIRI,
-        SimButtonWire::SideButton => ButtonSet::SIDE,
-        SimButtonWire::AppSwitcher => ButtonSet::APP_SWITCHER,
-        SimButtonWire::Back => ButtonSet::BACK,
-        SimButtonWire::VolumeUp => ButtonSet::VOLUME_UP,
-        SimButtonWire::VolumeDown => ButtonSet::VOLUME_DOWN,
-    }
-}
-
-/// Verbs that read or drive the live screen (not the app verbs, which go
-/// through adb whether the screen is on or not).
-fn needs_screen(cmd: &SimCmdWire) -> bool {
-    matches!(
-        cmd,
-        SimCmdWire::Screenshot { .. }
-            | SimCmdWire::Ax { .. }
-            | SimCmdWire::Tap(_)
-            | SimCmdWire::Swipe { .. }
-            | SimCmdWire::Type { .. }
-            | SimCmdWire::Button(_)
-            | SimCmdWire::Rotate(_)
-    )
-}
-
-/// An `http`/`https` URL (any case), the only kind a real device opens.
-fn is_web_url(url: &str) -> bool {
-    url.trim().split_once(':').is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-}
-
 /// Ask the user, in the worktree's panel, before an agent installs `app` on
 /// a real device — every time, whatever was allowed before — and wait (up
 /// to `INSTALL_ASK_TTL`) for the answer.
@@ -589,110 +555,6 @@ fn send(session: &StreamSession, command: Command) -> Result<(), SimErrorWire> {
     session.send(&command).map_err(|e| SimErrorWire::Failed(format!("the simulator did not take the input: {e}")))
 }
 
-/// Orientation and portrait framebuffer size, in pixels.
-fn screen(session: &StreamSession) -> Result<(Orientation, Size), SimErrorWire> {
-    let (w, h) = session.framebuffer_size().ok_or(SimErrorWire::NotStreaming)?;
-    Ok((session.orientation(), Size::new(f64::from(w), f64::from(h))))
-}
-
-/// The accessibility tree. Retried for a few seconds while it is not there
-/// yet: right after a boot SpringBoard has no frontmost app to describe.
-async fn describe(session: &StreamSession, cx: &mut AsyncApp) -> Result<Vec<AxNode>, SimErrorWire> {
-    let deadline = Instant::now() + AX_SETTLE;
-    loop {
-        let session = session.clone();
-        let tree = cx
-            .background_executor()
-            .spawn(async move { session.describe(HELPER_TIMEOUT).map_err(|e| e.to_string()) })
-            .await;
-        match tree {
-            Ok(nodes) if !nodes.is_empty() => return Ok(nodes),
-            _ if Instant::now() < deadline => cx.background_executor().timer(Duration::from_millis(500)).await,
-            Ok(_) => return Err(SimErrorWire::Failed("the accessibility tree is empty".into())),
-            Err(e) => return Err(SimErrorWire::Failed(format!("could not read the accessibility tree: {e}"))),
-        }
-    }
-}
-
-/// The AX root frame's size: the whole screen, in the app's orientation.
-fn root_size(nodes: &[AxNode]) -> Size {
-    nodes.first().map_or(Size::new(0.0, 0.0), |n| Size::new(n.frame.w, n.frame.h))
-}
-
-/// Pixels per point, read once per device from the AX root frame.
-async fn scale(hub: &Entity<SimulatorHub>, udid: &DeviceId, session: &StreamSession, cx: &mut AsyncApp) -> Result<f64, SimErrorWire> {
-    if let Some(scale) = hub.read_with(cx, |hub, _| hub.scale(udid)).or_else(|| session.point_scale()) {
-        return Ok(scale);
-    }
-    let nodes = describe(session, cx).await?;
-    scale_from(hub, udid, session, &nodes, cx)
-}
-
-/// [`scale`], from a tree already read.
-fn scale_from(
-    hub: &Entity<SimulatorHub>,
-    udid: &DeviceId,
-    session: &StreamSession,
-    nodes: &[AxNode],
-    cx: &mut AsyncApp,
-) -> Result<f64, SimErrorWire> {
-    if let Some(scale) = hub.read_with(cx, |hub, _| hub.scale(udid)).or_else(|| session.point_scale()) {
-        return Ok(scale);
-    }
-    let (o, portrait) = screen(session)?;
-    let scale = agent::device_scale(geometry::display_size(o, portrait), root_size(nodes))
-        .ok_or_else(|| SimErrorWire::Failed("could not work out the screen's scale from the accessibility tree".into()))?;
-    hub.update(cx, |hub, _| hub.set_scale(udid, scale));
-    Ok(scale)
-}
-
-async fn point_to_portrait(
-    hub: &Entity<SimulatorHub>,
-    udid: &DeviceId,
-    session: &StreamSession,
-    at: (f64, f64),
-    cx: &mut AsyncApp,
-) -> Result<(f64, f64), SimErrorWire> {
-    let scale = scale(hub, udid, session, cx).await?;
-    let (o, portrait) = screen(session)?;
-    agent::points_to_portrait(o, at, portrait, scale).ok_or_else(|| off_screen(at, o, portrait, scale))
-}
-
-fn off_screen(at: (f64, f64), o: Orientation, portrait: Size, scale: f64) -> SimErrorWire {
-    let pts = agent::display_points(o, portrait, scale);
-    SimErrorWire::BadInput(format!(
-        "({}, {}) is off the screen, which is {}×{} points (x right, y down, from the top-left)",
-        at.0, at.1, pts.w, pts.h
-    ))
-}
-
-/// The centre of the element `query` finds, as a touch coordinate.
-async fn element(session: &StreamSession, query: Query<'_>, what: &str, cx: &mut AsyncApp) -> Result<(f64, f64), SimErrorWire> {
-    let nodes = describe(session, cx).await?;
-    let node = ax::find(&nodes, query).ok_or_else(|| {
-        SimErrorWire::NotFound(format!("no on-screen element matches “{what}” (list them with `oximux sim ax`)"))
-    })?;
-    Ok(agent::ax_point_to_portrait(ax_space(session), session.orientation(), root_size(&nodes), ax::center(node)))
-}
-
-/// Android's uiautomator reports frames in the display's space (the video's);
-/// iOS's AX tree follows the app.
-fn ax_space(session: &StreamSession) -> agent::AxSpace {
-    if session.android().is_some() { agent::AxSpace::Display } else { agent::AxSpace::App }
-}
-
-fn ax_wire(node: &AxNode, depth: usize, frame: geometry::Rect) -> SimAxNodeWire {
-    SimAxNodeWire {
-        depth: depth as u32,
-        role: node.role.clone(),
-        label: node.label.clone(),
-        identifier: node.identifier.clone(),
-        value: node.value.clone(),
-        enabled: node.enabled,
-        frame: [frame.x, frame.y, frame.w, frame.h],
-    }
-}
-
 async fn screenshot(hub: &Entity<SimulatorHub>, udid: &DeviceId, full: bool, cx: &mut AsyncApp) -> Out {
     let session = live_session(hub, udid, cx).await?;
     let scale = scale(hub, udid, &session, cx).await?;
@@ -733,104 +595,5 @@ fn install_path(path: &str, worktree: &Path) -> Result<PathBuf, SimErrorWire> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The verdict on a phone's input: refused when it blocks input (before
-    /// or during the wait); otherwise trusted once, and not waited on again.
-    #[test]
-    fn a_phone_that_blocks_input_is_refused_and_one_that_takes_it_is_trusted() {
-        use std::cell::Cell;
-        let run = |blocked_before: bool, blocked_during: bool, proven: bool| {
-            let (blocked, waited, marked) = (Cell::new(blocked_before), Cell::new(false), Cell::new(false));
-            let wait = async {
-                waited.set(true);
-                if blocked_during {
-                    blocked.set(true);
-                }
-            };
-            let out = futures::executor::block_on(input_verdict(|| blocked.get(), || proven, || marked.set(true), wait));
-            (out.is_ok(), waited.get(), marked.get())
-        };
-        assert_eq!(run(true, false, false), (false, false, false), "known blocked: refused, no wait");
-        assert_eq!(run(false, true, false), (false, true, false), "refused during the wait");
-        assert_eq!(run(false, false, false), (true, true, true), "taken: trusted from now on");
-        assert_eq!(run(false, false, true), (true, false, true), "already trusted: no wait");
-    }
-
-    /// The verbs that inject input (and take the per-device input turn).
-    #[test]
-    fn only_input_verbs_count_as_input() {
-        assert!(is_input(&SimCmdWire::Type { text: "a".into(), paste: false }));
-        assert!(!is_input(&SimCmdWire::Screenshot { full: false }));
-        assert!(!is_input(&SimCmdWire::Ax { max: 10 }));
-    }
-
-    /// A real device opens web links only: a custom scheme can dial, pay or
-    /// message on someone's own phone.
-    #[test]
-    fn only_web_links_open_on_a_real_device() {
-        for ok in ["https://example.com", "HTTP://localhost:3000/x", "  http://a"] {
-            assert!(is_web_url(ok), "{ok}");
-        }
-        for refused in ["tel:+15555550100", "sms:1", "myapp://pay?amount=1", "httpx://a", "file:///etc", "https"] {
-            assert!(!is_web_url(refused), "{refused}");
-        }
-    }
-
-    /// Each class refuses what it cannot do, named for one refusal wording;
-    /// an iPhone without its runner is not touched or typed into.
-    #[test]
-    fn real_devices_refuse_verbs_their_class_lacks() {
-        let phone = DeviceCaps::for_id(&DeviceId("adb:R58".into()));
-        assert_eq!(refused_on(&phone, &SimCmdWire::Shutdown { force: true }), Some("Shutting down"));
-        assert_eq!(refused_on(&phone, &SimCmdWire::Rotate(SimOrientationWire::LandscapeLeft)), Some("Rotation"));
-        assert_eq!(refused_on(&phone, &SimCmdWire::Button(SimButtonWire::Siri)), Some("That button"));
-        assert_eq!(refused_on(&phone, &SimCmdWire::Button(SimButtonWire::Back)), None);
-        assert_eq!(refused_on(&phone, &SimCmdWire::Install { path: "a.apk".into() }), None);
-        let iphone = DeviceCaps::for_id(&DeviceId("iosdev:00008110-001A2C3E0A88401E".into()));
-        assert_eq!(refused_on(&iphone, &SimCmdWire::Type { text: "hi".into(), paste: false }), Some("Typing"));
-        assert_eq!(refused_on(&iphone, &SimCmdWire::Ax { max: 10 }), Some("The accessibility tree"));
-        assert_eq!(refused_on(&iphone, &SimCmdWire::Screenshot { full: false }), None);
-        // With its control on, an iPhone takes input and gives its tree, but
-        // never turns or shuts down from here.
-        let controlled = DeviceCaps::for_session(&DeviceId("iosdev:00008110-001A2C3E0A88401E".into()), true);
-        for cmd in [
-            SimCmdWire::Type { text: "hi".into(), paste: false },
-            SimCmdWire::Ax { max: 10 },
-            SimCmdWire::Button(SimButtonWire::Home),
-            SimCmdWire::Button(SimButtonWire::VolumeUp),
-        ] {
-            assert_eq!(refused_on(&controlled, &cmd), None, "{cmd:?}");
-        }
-        assert_eq!(refused_on(&controlled, &SimCmdWire::Rotate(SimOrientationWire::Portrait)), Some("Rotation"));
-        assert_eq!(refused_on(&controlled, &SimCmdWire::Button(SimButtonWire::Lock)), Some("That button"));
-        assert_eq!(refused_on(&controlled, &SimCmdWire::Shutdown { force: false }), Some("Shutting down"));
-    }
-
-    /// While a phone sleeps only the screen verbs wait on it; app verbs go
-    /// through adb either way.
-    #[test]
-    fn only_screen_verbs_need_the_screen() {
-        assert!(needs_screen(&SimCmdWire::Screenshot { full: false }) && needs_screen(&SimCmdWire::Ax { max: 1 }));
-        assert!(!needs_screen(&SimCmdWire::Launch { bundle_id: "a.b".into(), relaunch: false }));
-        assert!(!needs_screen(&SimCmdWire::Install { path: "a.apk".into() }) && !needs_screen(&SimCmdWire::Status));
-    }
-
-    /// An iPhone's app verbs never reach `simctl` (they have `devicectl`
-    /// arms, whose install asks the user first, as Android's does).
-    #[test]
-    fn an_iphones_app_verbs_never_reach_simctl() {
-        let iphone = DeviceId("iosdev:00008110-001A2C3E0A88401E".into());
-        assert!(matches!(simctl_udid(&iphone), Err(SimErrorWire::Unavailable(_))));
-        assert!(simctl_udid(&DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into())).is_ok());
-    }
-
-    #[test]
-    fn a_bundle_id_is_never_an_option_or_a_path() {
-        assert!(check_bundle_id("com.example.App-1_x").is_ok());
-        for bad in ["", "-x", "../a", "a b", "a/b"] {
-            assert!(check_bundle_id(bad).is_err(), "{bad}");
-        }
-    }
-}
+#[path = "verbs_tests.rs"]
+mod tests;

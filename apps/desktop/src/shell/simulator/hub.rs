@@ -141,6 +141,10 @@ pub struct SimulatorHub {
     capture_starts: HashMap<DeviceId, Arc<AtomicBool>>,
     /// Real iPhones' control (see `iphone_control`).
     controls: iphone_control::Controls,
+    /// Accessibility reads in flight, one per device (see `snapshot`).
+    snapshots: snapshot::Coalescer<DeviceId, snapshot::Tree>,
+    /// Agents' `@eN` refs, per worktree, device and caller.
+    refs: oximux_simulator::ax_refs::RefStore,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -151,6 +155,7 @@ mod capture;
 mod iphone;
 mod iphone_control;
 mod lifecycle;
+mod snapshot;
 mod wifi;
 
 pub use agent::Wake;
@@ -600,8 +605,10 @@ impl SimulatorHub {
         // An attach (the user's pick, `sim attach`) boots it on purpose.
         self.clear_stopped_by_user(&info.udid);
         if self.registry.device_for(key) != Some(&info.udid) {
-            // Questions about the device it is leaving are moot.
+            // Questions about the device it is leaving are moot, and so are
+            // the refs that numbered its elements.
             self.forget_consent_requests(key.path(), cx);
+            self.forget_refs(key);
         }
         let effects = self.registry.attach(key.clone(), info.udid.clone(), booted, Instant::now());
         self.run(effects, cx);
@@ -651,6 +658,7 @@ impl SimulatorHub {
         self.attach_seq.insert(key.clone(), self.next_attach);
         let udid = self.registry.device_for(&key).cloned();
         self.forget_consent_requests(worktree, cx);
+        self.forget_refs(&key);
         let effects = self.registry.detach(&key, Instant::now());
         self.run(effects, cx);
         // A recording belongs to the device: it ends with its last attachment.

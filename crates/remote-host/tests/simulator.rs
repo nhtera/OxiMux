@@ -26,18 +26,38 @@ async fn call(client: &dyn Transport, req: Request) -> Response {
     Response::from_bytes(&frame).unwrap()
 }
 
-/// Records the worktree each call was about.
+/// Records the worktree and the verb of each call.
 #[derive(Default)]
 struct Spy {
     worktrees: Mutex<Vec<String>>,
+    cmds: Mutex<Vec<SimCmdWire>>,
 }
 
 #[async_trait::async_trait]
 impl SimulatorControl for Spy {
-    async fn run(&self, worktree: &str, _cmd: SimCmdWire) -> Result<SimReplyWire, SimErrorWire> {
+    async fn run(&self, worktree: &str, cmd: SimCmdWire) -> Result<SimReplyWire, SimErrorWire> {
         self.worktrees.lock().unwrap().push(worktree.to_string());
+        self.cmds.lock().unwrap().push(cmd);
         Ok(SimReplyWire::Done)
     }
+}
+
+/// A v27 verb — a caller's envelope around a settled tap by ref — crosses
+/// the dispatcher untouched, and a confined agent's still lands on its own
+/// worktree: the envelope names a caller, never a worktree.
+#[test]
+fn a_verify_loop_verb_reaches_the_simulator_as_sent() {
+    use oximux_remote_proto::simulator::SimTargetWire;
+    let spy = Arc::new(Spy::default());
+    let cmd = SimCmdWire::AsCaller {
+        caller: 42,
+        cmd: Box::new(SimCmdWire::Settled { action: Box::new(SimCmdWire::Tap(SimTargetWire::Ref(7))), timeout_ms: 0 }),
+    };
+    let req = Request::Simulator(SimRequestWire { worktree: Some("/work/other".into()), cmd: cmd.clone() });
+    let got = local(&host(Some(spy.clone())), LocalScope::Session("sess-1".into()), vec![req]);
+    assert_eq!(got, vec![Response::Simulator(Ok(SimReplyWire::Done))]);
+    assert_eq!(*spy.worktrees.lock().unwrap(), ["/work/mine"]);
+    assert_eq!(*spy.cmds.lock().unwrap(), [cmd]);
 }
 
 fn sim(worktree: Option<&str>) -> Request {

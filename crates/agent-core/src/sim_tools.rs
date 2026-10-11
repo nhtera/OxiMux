@@ -4,9 +4,10 @@
 //! Two shapes, whatever the agent's tool is called (Claude's `Bash`, Codex's
 //! `shell`/`exec_command` with an argv array, an ACP `execute`, a `Read`):
 //!
-//! - a command that runs `oximux sim screenshot` or `oximux sim ax` — the
-//!   screen's contents come back as its output (the AX tree is the screen's
-//!   text);
+//! - a command that runs `oximux sim screenshot`, `ax`, `wait` or `assert` —
+//!   the screen's contents come back as its output (the AX tree is the
+//!   screen's text) — or any `oximux sim` command carrying `--settle`, `-i`
+//!   or an `@eN` ref, whose reply prints elements read off the screen;
 //! - anything that names a file under an `oximux-sim/` folder — where
 //!   `oximux sim screenshot` saves its PNGs, so a `Read` of one is the
 //!   screenshot itself.
@@ -25,7 +26,11 @@ use serde_json::Value;
 pub const CAPTURE_DIR: &str = "oximux-sim";
 
 /// The `oximux sim` verbs whose output is the screen's contents.
-const CAPTURE_VERBS: [&str; 2] = ["screenshot", "ax"];
+const CAPTURE_VERBS: [&str; 4] = ["screenshot", "ax", "wait", "assert"];
+
+/// Flags that make any `oximux sim` verb print the screen's elements (a
+/// settle's diff, `ax -i`'s list), wherever they stand in the command.
+const CAPTURE_FLAGS: [&str; 3] = ["--settle", "-i", "--interactive"];
 
 /// Does this tool input capture the simulator's screen?
 pub fn is_simulator_capture(input: &Value) -> bool {
@@ -61,7 +66,8 @@ fn names_capture_file(s: &str) -> bool {
 /// Flags of the CLI that take a value, so the value is not read as the verb.
 const VALUE_FLAGS: [&str; 4] = ["--worktree", "--timeout", "--host", "--dir"];
 
-/// `oximux … sim … screenshot|ax` as words of one command.
+/// `oximux … sim … screenshot|ax|wait|assert` as words of one command, or
+/// any `oximux sim` verb followed by a capture flag or an `@eN` ref.
 fn runs_capture_verb(command: &str) -> bool {
     let words: Vec<&str> = command
         .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`' | '"' | '\''))
@@ -72,9 +78,17 @@ fn runs_capture_verb(command: &str) -> bool {
             return false;
         }
         let mut at = i + 1;
-        next_word(&words, &mut at) == Some("sim")
-            && next_word(&words, &mut at).is_some_and(|verb| CAPTURE_VERBS.contains(&verb))
+        if next_word(&words, &mut at) != Some("sim") {
+            return false;
+        }
+        next_word(&words, &mut at).is_some_and(|verb| CAPTURE_VERBS.contains(&verb))
+            || words[at.min(words.len())..].iter().any(|w| CAPTURE_FLAGS.contains(w) || is_ref(w))
     })
+}
+
+/// An `@eN` ref: the element it names is printed back.
+fn is_ref(word: &str) -> bool {
+    word.strip_prefix("@e").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The next word from `*at` that is not a flag (or a flag's value).
@@ -108,6 +122,13 @@ mod tests {
             json!({"command": ["oximux", "sim", "ax"]}),
             json!({"cmd": "sleep 1; oximux sim screenshot"}),
             json!({"args": ["sim", "ax"], "command": "oximux"}),
+            json!({"command": "oximux sim wait --label Home --timeout-ms 5000"}),
+            json!({"command": "oximux sim assert @e3 --text Hi"}),
+            json!({"command": "oximux sim tap --label 'Sign in' --settle"}),
+            json!({"command": ["oximux", "sim", "swipe", "1", "2", "3", "4", "--settle-timeout", "900", "--settle"]}),
+            json!({"command": "oximux sim --worktree . ax -i"}),
+            json!({"command": "oximux sim tap @e7"}),
+            json!({"command": "oximux sim type @e2 hello"}),
         ] {
             assert!(is_simulator_capture(&input), "{input}");
         }
@@ -135,6 +156,9 @@ mod tests {
             json!({"file_path": "/work/oximux-simulator/notes.md"}),
             json!({"file_path": "/work/app/screenshot.png"}),
             json!({"command": "grep -r 'sim ax' docs/"}),
+            json!({"command": "oximux sim tap --label Settle"}),
+            json!({"command": "oximux sim type '@email'"}),
+            json!({"command": "oximux ls --settle"}),
         ] {
             assert!(!is_simulator_capture(&input), "{input}");
         }

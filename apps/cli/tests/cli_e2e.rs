@@ -200,6 +200,7 @@ fn serve_dispatcher(rt: &tokio::runtime::Runtime, runtime_dir: &Path, dispatcher
 struct StubSimulator {
     allowed: std::sync::atomic::AtomicBool,
     worktrees: std::sync::Mutex<Vec<String>>,
+    cmds: std::sync::Mutex<Vec<oximux_remote_proto::simulator::SimCmdWire>>,
 }
 
 #[async_trait::async_trait]
@@ -211,11 +212,51 @@ impl oximux_remote_host::SimulatorControl for StubSimulator {
     ) -> Result<oximux_remote_proto::simulator::SimReplyWire, oximux_remote_proto::simulator::SimErrorWire> {
         use oximux_remote_proto::simulator::*;
         self.worktrees.lock().unwrap().push(worktree.to_string());
+        self.cmds.lock().unwrap().push(cmd.clone());
         let allowed = self.allowed.load(Ordering::SeqCst);
         if cmd.is_control() && !allowed {
             return Err(SimErrorWire::ConsentPending);
         }
+        let button = SimAxNodeWire {
+            depth: 0,
+            role: "Button".into(),
+            label: Some("Sign in".into()),
+            identifier: None,
+            value: None,
+            enabled: true,
+            frame: [16.0, 590.0, 370.0, 44.0],
+        };
+        let report = |outcome| SimSettleWire {
+            outcome,
+            elapsed_ms: 640,
+            diff: vec![SimDiffLineWire {
+                op: SimDiffOpWire::Added,
+                r: Some(2),
+                node: SimAxNodeWire { role: "TextField".into(), label: Some("Email".into()), ..button.clone() },
+            }],
+            unchanged: 3,
+            warnings: vec![],
+            target: Some(button.clone()),
+            at: Some(SimPointWire { x: 201.0, y: 612.0 }),
+        };
+        // A caller's envelope changes nothing a stub answers.
+        let cmd = match cmd {
+            SimCmdWire::AsCaller { cmd, .. } => *cmd,
+            other => other,
+        };
         Ok(match cmd {
+            SimCmdWire::Settled { .. } => SimReplyWire::Settled(report(Some(SimSettleOutcomeWire::Settled))),
+            SimCmdWire::AxRefs { .. } => SimReplyWire::AxRefs(vec![SimRefNodeWire { r: 1, node: button }]),
+            SimCmdWire::Tap(SimTargetWire::Ref(9)) => return Err(SimErrorWire::StaleRef("stale ref @e9, run `oximux sim ax -i`".into())),
+            SimCmdWire::Tap(SimTargetWire::Ref(_)) => SimReplyWire::Settled(SimSettleWire { diff: vec![], unchanged: 0, ..report(None) }),
+            SimCmdWire::Wait { gone: true, timeout_ms, .. } => {
+                return Err(SimErrorWire::TimedOut(format!("“Sign in” did not go away within {timeout_ms} ms")));
+            }
+            SimCmdWire::Wait { .. } => SimReplyWire::Matched { node: Some(button), elapsed_ms: 250 },
+            SimCmdWire::Assert { check: SimCheckWire::Text(text), .. } if text != "Sign in" => {
+                return Err(SimErrorWire::AssertFailed(format!("“Sign in” reads “Sign in”, not “{text}”")));
+            }
+            SimCmdWire::Assert { .. } => SimReplyWire::Matched { node: Some(button), elapsed_ms: 90 },
             SimCmdWire::Status => SimReplyWire::Status(SimStatusWire {
                 available: true,
                 reason: None,
@@ -252,7 +293,7 @@ fn sim_verbs_against_a_live_host() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let runtime_dir = dir.path().join("host");
-    let sim = Arc::new(StubSimulator { allowed: Default::default(), worktrees: Default::default() });
+    let sim = Arc::new(StubSimulator { allowed: Default::default(), worktrees: Default::default(), cmds: Default::default() });
     let registry = Arc::new(SessionRegistry::new());
     let dispatcher = Dispatcher::new(registry, Arc::new(AuthStore::new())).with_simulator(sim.clone());
     serve_dispatcher(&rt, &runtime_dir, dispatcher);
@@ -306,6 +347,55 @@ fn sim_verbs_against_a_live_host() {
     let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "install", "/elsewhere/App.app"]).output().unwrap();
     assert_eq!(out.status.code(), Some(5));
     assert_eq!(json_stdout(&out)["error"]["code"], "path-outside-worktree");
+
+    // v27, the verify loop. `--settle` wraps the action and prints the diff.
+    let sim_out = |args: &[&str]| {
+        let mut argv = vec!["sim", "--worktree", wt];
+        argv.extend_from_slice(args);
+        bin(&runtime_dir).args(argv).output().unwrap()
+    };
+    let out = sim_out(&["tap", "--label", "Sign in", "--settle", "--settle-timeout", "4000"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "ok tapped “Sign in” (201,612) settled 640ms\n+ @e2 TextField “Email”\n= 3 unchanged"
+    );
+    let sent = sim.cmds.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        sent,
+        oximux_remote_proto::simulator::SimCmdWire::Settled {
+            action: Box::new(oximux_remote_proto::simulator::SimCmdWire::Tap(
+                oximux_remote_proto::simulator::SimTargetWire::Label("Sign in".into())
+            )),
+            timeout_ms: 4000,
+        },
+        "outside an agent session: no caller envelope"
+    );
+    // `ax -i` lists refs; a ref taps; a stale one says how to recover.
+    let out = sim_out(&["ax", "-i"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "@e1 Button “Sign in”  [16,590 370×44]");
+    let out = sim_out(&["tap", "@e1"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok tapped @e1 “Sign in” (201,612)");
+    let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "tap", "@e9"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json_stdout(&out)["error"]["code"], "stale-ref");
+    // `wait` holds (exit 0) or runs out (exit 4); `assert` holds or says why.
+    let out = sim_out(&["wait", "--label", "Sign in", "--timeout-ms", "500"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "wait", "@e1", "--gone", "--timeout-ms", "500"]).output().unwrap();
+    assert_eq!((out.status.code(), json_stdout(&out)["error"]["code"].as_str()), (Some(4), Some("timeout")));
+    let out = sim_out(&["assert", "@e1", "--text", "Sign in"]);
+    assert_eq!(out.status.code(), Some(0));
+    let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "assert", "@e1", "--text", "Log in"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "assert-failed");
+    assert!(v["error"]["message"].as_str().unwrap().contains("not “Log in”"));
+    // `type @eN TEXT` taps the element, then types.
+    let before = sim.cmds.lock().unwrap().len();
+    let out = sim_out(&["type", "@e1", "hello"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(sim.cmds.lock().unwrap().len(), before + 2, "a tap and a type");
 
     assert!(sim.worktrees.lock().unwrap().iter().all(|w| w == wt), "{:?}", sim.worktrees.lock().unwrap());
 

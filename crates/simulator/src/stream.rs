@@ -166,6 +166,16 @@ impl StreamSession {
         }
     }
 
+    /// When pictures last arrived, and last carried change on screen (see
+    /// [`crate::keyframe`]): what an action's settle waits on.
+    pub fn frame_clock(&self) -> crate::keyframe::FrameClock {
+        match self {
+            Self::Ios(s) => s.frame_clock(),
+            Self::IosDevice(s) => s.video().frame_clock(),
+            Self::Android(s) => s.frame_clock(),
+        }
+    }
+
     pub fn framebuffer_size(&self) -> Option<(u32, u32)> {
         match self {
             Self::Ios(s) => s.framebuffer_size(),
