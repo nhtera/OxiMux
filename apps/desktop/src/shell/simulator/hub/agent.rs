@@ -423,8 +423,8 @@ impl SimulatorHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::InstallAnswer;
-    use super::super::per_call::INSTALL_ASK_TTL;
+    use super::super::per_call::ASK_TTL;
+    use super::super::{AskKind, PerCallAnswer};
     use crate::app_settings::simulator_settings::SimulatorSettings;
     use oximux_simulator::consent::Verdict;
 
@@ -622,25 +622,25 @@ mod tests {
         let (phone, w, other) = (DeviceId("adb:R58M123".into()), Path::new("/nonexistent/w"), Path::new("/nonexistent/o"));
         hub.update(cx, |hub, cx| {
             drop(hub.registry.attach(WorktreeKey::from_path(w), phone.clone(), true, Instant::now()));
-            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
-            assert_eq!(hub.install_answer(id), InstallAnswer::Pending);
-            assert_eq!(hub.install_request(w), Some((id, "Galaxy".into(), "app-debug.apk".into())));
-            assert_eq!(hub.install_request(other), None, "never over another worktree's panel");
-            hub.answer_install(id, true, cx);
-            assert_eq!(hub.install_answer(id), InstallAnswer::Allowed);
-            assert_eq!(hub.install_answer(id), InstallAnswer::Gone, "read once");
+            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
+            assert_eq!(hub.per_call_answer(id), PerCallAnswer::Pending);
+            assert_eq!(hub.per_call_request(w), Some((id, "Galaxy".into(), AskKind::Install { app: "app-debug.apk".into() })));
+            assert_eq!(hub.per_call_request(other), None, "never over another worktree's panel");
+            hub.answer_per_call(id, true, cx);
+            assert_eq!(hub.per_call_answer(id), PerCallAnswer::Allowed);
+            assert_eq!(hub.per_call_answer(id), PerCallAnswer::Gone, "read once");
 
-            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
-            hub.answer_install(id, false, cx);
-            assert_eq!(hub.install_answer(id), InstallAnswer::Refused);
+            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
+            hub.answer_per_call(id, false, cx);
+            assert_eq!(hub.per_call_answer(id), PerCallAnswer::Refused);
 
-            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
-            hub.agent.per_call.age_for_test(INSTALL_ASK_TTL);
-            assert_eq!(hub.install_answer(id), InstallAnswer::Gone, "expired: not allowed");
+            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
+            hub.agent.per_call.age_for_test(ASK_TTL);
+            assert_eq!(hub.per_call_answer(id), PerCallAnswer::Gone, "expired: not allowed");
 
-            let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
+            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
             hub.detach(w, cx);
-            assert_eq!(hub.install_answer(id), InstallAnswer::Gone, "the worktree moved on");
+            assert_eq!(hub.per_call_answer(id), PerCallAnswer::Gone, "the worktree moved on");
         });
     }
 

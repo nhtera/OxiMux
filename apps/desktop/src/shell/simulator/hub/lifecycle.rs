@@ -117,6 +117,7 @@ fn new_hub(
         controls: Default::default(),
         snapshots: Default::default(),
         refs: Default::default(),
+        device_state: Default::default(),
     })
 }
 

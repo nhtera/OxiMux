@@ -41,6 +41,7 @@ mod bezel;
 mod body;
 mod commands;
 mod consent;
+mod device_menu;
 mod pair_card;
 mod header;
 mod iphone_control;
@@ -71,6 +72,8 @@ pub struct SimulatorPanel {
     area: Rc<Cell<Option<(f32, f32)>>>,
     /// The toolbar is asking "Shut down …?".
     confirm_shutdown: bool,
+    /// The toolbar is asking about the Device menu's erase or location.
+    device_prompt: Option<device_menu::DevicePrompt>,
     /// A real iPhone's control setup (the team picker) is open.
     control_setup: bool,
     /// Annotate mode: the frozen screenshot being marked up.
@@ -134,6 +137,7 @@ impl SimulatorPanel {
             screen: None,
             area: Rc::default(),
             confirm_shutdown: false,
+            device_prompt: None,
             control_setup: false,
             annotate: None,
             _record_tick: None,
@@ -216,6 +220,7 @@ impl SimulatorPanel {
         self.worktree = worktree;
         // Both were about the old worktree's device.
         self.confirm_shutdown = false;
+        self.device_prompt = None;
         self.annotate = None;
         self.attaching = false;
         self.attach_error = None;

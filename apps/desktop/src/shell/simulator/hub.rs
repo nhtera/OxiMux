@@ -145,6 +145,8 @@ pub struct SimulatorHub {
     snapshots: snapshot::Coalescer<DeviceId, snapshot::Tree>,
     /// Agents' `@eN` refs, per worktree, device and caller.
     refs: oximux_simulator::ax_refs::RefStore,
+    /// Erases in progress and demo-mode status bars (see `device_state`).
+    device_state: device_state::Memo,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -152,6 +154,7 @@ impl EventEmitter<HubEvent> for SimulatorHub {}
 mod agent;
 mod android;
 mod capture;
+mod device_state;
 mod iphone;
 mod iphone_control;
 mod lifecycle;
@@ -162,7 +165,7 @@ mod wifi;
 pub use agent::Wake;
 pub use wifi::PairStage;
 pub(crate) use wifi::can_submit;
-pub(crate) use per_call::InstallAnswer;
+pub(crate) use per_call::{AskKind, PerCallAnswer};
 pub(crate) use android::list_all;
 pub use capture::{HardwareButton, NoticeKind};
 pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};
@@ -660,6 +663,10 @@ impl SimulatorHub {
         let udid = self.registry.device_for(&key).cloned();
         self.forget_consent_requests(worktree, cx);
         self.forget_refs(&key);
+        // Before its session goes: the serial is only known while it streams.
+        if let Some(udid) = &udid {
+            self.leave_demo_mode(udid, cx);
+        }
         let effects = self.registry.detach(&key, Instant::now());
         self.run(effects, cx);
         // A recording belongs to the device: it ends with its last attachment.

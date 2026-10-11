@@ -285,14 +285,15 @@ pub enum BootOutcome {
 /// reports `sys.boot_completed`. The emulator runs on its own (OxiMux shuts it
 /// down when it owns it); a thread reaps it when it exits. A boot we started
 /// that fails or times out is killed — a windowless emulator nobody owns
-/// would run on unseen.
-pub fn boot_avd(runner: &dyn Runner, sdk: &Sdk, name: &str, cancel: &AtomicBool) -> Result<BootOutcome> {
+/// would run on unseen. `wipe`: erase it as it boots (see
+/// [`avd::boot_args`]); an emulator already running is not wiped.
+pub fn boot_avd(runner: &dyn Runner, sdk: &Sdk, name: &str, wipe: bool, cancel: &AtomicBool) -> Result<BootOutcome> {
     let target = Target::Avd(name.to_owned());
     if let Some(serial) = serial_of(runner, sdk, &target, QUICK)? {
         return wait_booted(runner, sdk, &target, Some(serial), cancel).map(BootOutcome::AlreadyBooted);
     }
     let mut child = Command::new(sdk.emulator())
-        .args(avd::boot_args(name))
+        .args(avd::boot_args(name, wipe))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

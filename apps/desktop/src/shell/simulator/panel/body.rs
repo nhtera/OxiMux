@@ -33,6 +33,7 @@ impl SimulatorPanel {
             // The stream went away under an annotation or a question.
             self.annotate = None;
             self.confirm_shutdown &= self.device(cx).is_some();
+            self.device_prompt = None;
         }
         if !matches!(state, PanelState::Streaming)
             && let Some(screen) = self.screen.clone()

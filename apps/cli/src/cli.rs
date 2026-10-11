@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub use crate::cli_sim::{AssertArgs, SettleArgs, TapArg, WaitArgs};
+pub use crate::cli_sim_state::{AppearanceArg, LocationCommand, PrivacyArgs, PushArgs, StatusBarArg};
 
 /// Exit codes, stated once. `2` is what clap itself exits with on a usage
 /// error, so the contract holds without wrapping the parser.
@@ -922,6 +923,29 @@ pub enum SimCommand {
     /// Shut the simulator down. One the user booted is refused without
     /// --force.
     Shutdown {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Set or clear where the device says it is.
+    #[command(subcommand)]
+    Location(LocationCommand),
+    /// Light or dark mode.
+    Appearance {
+        #[arg(value_enum)]
+        mode: AppearanceArg,
+    },
+    /// Grant, revoke or reset an app's permission (the app may restart).
+    Privacy(PrivacyArgs),
+    /// Deliver a push notification to an app (asked every time).
+    Push(PushArgs),
+    /// A clean status bar for screenshots, or the real one back.
+    StatusBar {
+        #[arg(value_enum)]
+        mode: StatusBarArg,
+    },
+    /// Wipe the device to factory settings and boot it again (asked every
+    /// time). One the user booted is refused without --force.
+    Erase {
         #[arg(long)]
         force: bool,
     },

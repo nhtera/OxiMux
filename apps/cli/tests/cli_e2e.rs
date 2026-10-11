@@ -408,6 +408,25 @@ fn sim_verbs_against_a_live_host() {
     assert_eq!(last, SimCmdWire::TypeInto { target: SimTargetWire::Ref(1), text: "hello".into(), paste: false });
     drop(cmds);
 
+    // Device state (v28): south and west are negative numbers, not flags,
+    // and reach the host by name.
+    let out = sim_out(&["location", "set", "-33.86", "151.21"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "location set to -33.86, 151.21");
+    {
+        use oximux_remote_proto::simulator::{SimCmdWire, SimLocationWire, SimStateCmdWire};
+        let last = sim.cmds.lock().unwrap().last().cloned();
+        assert_eq!(last, Some(SimCmdWire::DeviceState(SimStateCmdWire::Location(SimLocationWire::Set { lat: -33.86, lon: 151.21 }))));
+    }
+    assert_eq!(String::from_utf8_lossy(&sim_out(&["appearance", "dark"]).stdout).trim(), "switched to dark mode");
+    // Nothing changes for every app at once: `--app` is required.
+    let before = sim.cmds.lock().unwrap().len();
+    assert_eq!(sim_out(&["privacy", "reset", "photos"]).status.code(), Some(2), "usage");
+    // A payload that cannot be read is the caller's mistake, found before
+    // anything is sent.
+    assert_eq!(sim_out(&["push", "--app", "com.a.b", "missing.json"]).status.code(), Some(2));
+    assert_eq!(sim.cmds.lock().unwrap().len(), before, "nothing reached the host");
+
     assert!(sim.worktrees.lock().unwrap().iter().all(|w| w == wt), "{:?}", sim.worktrees.lock().unwrap());
 
     // No simulator on this host (headless `serve`): said plainly, exit 1.

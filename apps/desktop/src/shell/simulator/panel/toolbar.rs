@@ -73,7 +73,7 @@ pub(crate) fn elapsed_label(secs: u64) -> String {
 }
 
 impl SimulatorPanel {
-    fn pill(&self) -> gpui::Div {
+    pub(super) fn pill(&self) -> gpui::Div {
         let (theme, density) = (self.theme, self.density);
         div()
             .flex()
@@ -92,6 +92,9 @@ impl SimulatorPanel {
     pub(super) fn render_toolbar(&self, state: &PanelState, cx: &mut Context<Self>) -> AnyElement {
         if self.confirm_shutdown {
             return self.render_shutdown_confirm(cx);
+        }
+        if let Some(prompt) = self.render_device_prompt(cx) {
+            return prompt;
         }
         let (theme, density) = (self.theme, self.density);
         let live = matches!(state, PanelState::Streaming);
@@ -142,6 +145,11 @@ impl SimulatorPanel {
                 Some(sink) => sink(RootRequest::Run(command), window, cx),
                 None => window.dispatch_action(command.action(), cx),
             }));
+        }
+        let state = caps.as_ref().map_or(oximux_simulator::caps::StateSet::NONE, |caps| caps.state);
+        let sim = device.as_ref().is_some_and(|d| d.source() == oximux_simulator::Source::Simctl);
+        if let Some(menu) = self.render_device_menu(state, sim, live, cx) {
+            pill = pill.child(div().w(px(1.0)).h(px(density.h_row * 0.6)).bg(theme.border_inactive)).child(menu);
         }
         pill.into_any_element()
     }

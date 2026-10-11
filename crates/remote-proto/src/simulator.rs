@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::simulator_state::{SimLocationWire, SimNetWire, SimPrivacyActionWire, SimStateCmdWire};
 pub use crate::simulator_verify::{
     SimCheckWire, SimDiffLineWire, SimDiffOpWire, SimRefNodeWire, SimSettleOutcomeWire, SimSettleWire,
 };
@@ -98,6 +99,10 @@ pub enum SimCmdWire {
     /// Tap `target`, then type `text` into it, in one turn: no other input
     /// lands between the two (`type @eN TEXT`).
     TypeInto { target: SimTargetWire, text: String, paste: bool },
+    // v28: device state.
+    /// Change the device's state (location, appearance, privacy, push, status
+    /// bar, erase): see [`SimStateCmdWire`].
+    DeviceState(SimStateCmdWire),
 }
 
 impl SimCmdWire {

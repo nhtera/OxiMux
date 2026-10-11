@@ -115,7 +115,7 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
 const QUICK: Duration = Duration::ZERO;
 pub(super) const SLOW: Duration = Duration::from_secs(90);
 /// Waking (≤ 60 s) plus a relaunch's terminate and launch (≤ 60 s each).
-const APP: Duration = Duration::from_secs(200);
+pub(super) const APP: Duration = Duration::from_secs(200);
 /// Waking (≤ 60 s), on a real device the user's yes (≤ 90 s), then the copy
 /// (≤ 180 s).
 const INSTALL: Duration = Duration::from_secs(360);
@@ -126,6 +126,9 @@ const LISTING: Duration = Duration::from_secs(45);
 /// The request for a verb without a reply of its own, its time floor, and what
 /// to say when it is done.
 fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration, String), Failure> {
+    if let Some(request) = super::sim_state::request(&command, cwd) {
+        return request;
+    }
     Ok(match command {
         SimCommand::Attach { device, .. } => (SimCmdWire::Attach { device }, LISTING + Duration::from_secs(15), String::new()),
         SimCommand::Detach => (SimCmdWire::Detach, QUICK, "detached".into()),
@@ -197,6 +200,12 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
         | SimCommand::Devices { .. } => {
             unreachable!("answered with a reply of their own")
         }
+        SimCommand::Location(_)
+        | SimCommand::Appearance { .. }
+        | SimCommand::Privacy(_)
+        | SimCommand::Push(_)
+        | SimCommand::StatusBar { .. }
+        | SimCommand::Erase { .. } => unreachable!("built by `sim_state::request` above"),
     })
 }
 

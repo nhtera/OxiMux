@@ -163,12 +163,13 @@ impl SimulatorHub {
             return;
         };
         let runner = self.runner.clone();
+        let wipe = self.take_wipe(&udid);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     match &target {
-                        Target::Avd(name) => match devices::boot_avd(runner.as_ref(), &sdk, name, &cancel) {
+                        Target::Avd(name) => match devices::boot_avd(runner.as_ref(), &sdk, name, wipe, &cancel) {
                             Ok(devices::BootOutcome::Booted(_)) => BootResult::Booted,
                             // Someone else started it meanwhile: not ours to shut down.
                             Ok(devices::BootOutcome::AlreadyBooted(_)) => BootResult::AlreadyBooted,

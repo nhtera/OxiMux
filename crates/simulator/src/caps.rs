@@ -35,6 +35,33 @@ impl ButtonSet {
     }
 }
 
+/// Device-state changes (`sim location`, `appearance`, …), as a small set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StateSet(u8);
+
+impl StateSet {
+    pub const NONE: Self = Self(0);
+    pub const LOCATION: Self = Self(1);
+    pub const APPEARANCE: Self = Self(1 << 1);
+    pub const PRIVACY: Self = Self(1 << 2);
+    pub const PUSH: Self = Self(1 << 3);
+    pub const STATUS_BAR: Self = Self(1 << 4);
+    pub const ERASE: Self = Self(1 << 5);
+    pub const ALL: Self = Self(0b11_1111);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
 /// Everything the panel and the agent verbs may ask of a device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceCaps {
@@ -52,6 +79,8 @@ pub struct DeviceCaps {
     pub install: bool,
     pub launch: bool,
     pub open_url: bool,
+    /// The device-state changes it takes.
+    pub state: StateSet,
 }
 
 const SIMULATOR_BUTTONS: ButtonSet =
@@ -80,6 +109,7 @@ impl DeviceCaps {
         install: true,
         launch: true,
         open_url: true,
+        state: StateSet::ALL,
     };
 
     /// A real iPhone without its runner: the screen-capture device and
@@ -99,6 +129,7 @@ impl DeviceCaps {
         install: true,
         launch: true,
         open_url: true,
+        state: StateSet::NONE,
     };
 
     /// The class default for `id` (an iPhone reads as view-only: whether its
@@ -113,8 +144,16 @@ impl DeviceCaps {
             Source::Simctl => Self::ALL,
             // A phone is the user's own: OxiMux never rotates (it follows
             // the phone) or shuts it down.
-            Source::Adb if id.is_physical() => Self { buttons: ANDROID_BUTTONS, rotate: false, shutdown: false, ..Self::ALL },
-            Source::Adb => Self { buttons: ANDROID_BUTTONS, ..Self::ALL },
+            // Nor fakes its location (that needs an app) or erases it; FCM,
+            // not OxiMux, delivers an Android push.
+            Source::Adb if id.is_physical() => Self {
+                buttons: ANDROID_BUTTONS,
+                rotate: false,
+                shutdown: false,
+                state: StateSet::APPEARANCE.union(StateSet::PRIVACY).union(StateSet::STATUS_BAR),
+                ..Self::ALL
+            },
+            Source::Adb => Self { buttons: ANDROID_BUTTONS, state: StateSet::ALL.without(StateSet::PUSH), ..Self::ALL },
             Source::Devicectl if runner => Self {
                 touch: true,
                 keys: true,
@@ -163,6 +202,17 @@ mod tests {
         assert!(iphone.screenshot && iphone.record && iphone.launch && iphone.install && iphone.open_url);
         assert!(!iphone.touch && !iphone.keys && !iphone.rotate && !iphone.ax && !iphone.shutdown && !iphone.logs);
         assert_eq!(iphone.buttons, ButtonSet::NONE);
+    }
+
+    #[test]
+    fn device_state_by_class() {
+        assert_eq!(DeviceCaps::for_id(&id("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3")).state, StateSet::ALL);
+        let avd = DeviceCaps::for_id(&id("avd:Pixel")).state;
+        assert!(avd.contains(StateSet::LOCATION.union(StateSet::ERASE)) && !avd.contains(StateSet::PUSH));
+        let phone = DeviceCaps::for_id(&id("adb:R58")).state;
+        assert!(phone.contains(StateSet::APPEARANCE.union(StateSet::PRIVACY).union(StateSet::STATUS_BAR)));
+        assert!(!phone.contains(StateSet::LOCATION) && !phone.contains(StateSet::ERASE) && !phone.contains(StateSet::PUSH));
+        assert_eq!(DeviceCaps::for_session(&id("iosdev:X"), true).state, StateSet::NONE, "an iPhone, even controlled");
     }
 
     #[test]

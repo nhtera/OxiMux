@@ -193,6 +193,37 @@ oximux sim open-url "myapp://settings"
 `home` is the swipe-up gesture on Face ID devices and the button on the rest.
 `open-url` takes `http(s)` and app schemes, never `file:`.
 
+## Device state: location, appearance, privacy, push, status bar, erase
+
+Change the device instead of shelling out to `simctl` or `adb`:
+
+```sh
+oximux sim location set 10.77 106.70        # latitude, then longitude
+oximux sim location set -33.86 151.21       # south and west are negative
+oximux sim location clear                   # a simulator only
+oximux sim appearance dark
+oximux sim privacy grant photos --app com.example.app
+oximux sim privacy reset location --app com.example.app
+oximux sim push --app com.example.app notification.json
+oximux sim status-bar clean                 # 9:41, full battery: for screenshots
+oximux sim status-bar clear
+oximux sim erase                            # wipe and boot again
+```
+
+- `privacy` always names one app (`--app`); nothing changes for every app at
+  once. The app may restart. A grant can hide a missing usage description in
+  the app's Info.plist: check the real prompt before shipping. A simulator
+  cannot grant `camera` or `notifications`: tap the system alert instead.
+- `push` takes a JSON file: an object with `aps`, at most 4096 bytes.
+- `erase` deletes every app and its data. It is asked in the panel every
+  time, as is `push`; a device the user booted is refused without `--force`.
+- What each device takes: a simulator, everything; an Android emulator,
+  everything but `push`; an Android phone, `appearance`, `privacy` and
+  `status-bar`, each asked in the panel every time; a real iPhone, none. A
+  gap exits 5 (`refused`) and says why; nothing is ever skipped silently.
+- An Android phone's demo-mode status bar goes back to normal when the
+  worktree detaches.
+
 ## Android
 
 The same verbs drive an Android emulator (an AVD) or a phone with USB

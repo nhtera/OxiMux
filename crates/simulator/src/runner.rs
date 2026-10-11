@@ -151,11 +151,12 @@ pub struct Scripted {
 pub struct ScriptedRunner {
     script: Mutex<VecDeque<Scripted>>,
     calls: Mutex<Vec<String>>,
+    stdins: Mutex<Vec<Option<Vec<u8>>>>,
 }
 
 impl ScriptedRunner {
     pub fn new(script: impl IntoIterator<Item = Scripted>) -> Self {
-        Self { script: Mutex::new(script.into_iter().collect()), calls: Mutex::default() }
+        Self { script: Mutex::new(script.into_iter().collect()), calls: Mutex::default(), stdins: Mutex::default() }
     }
 
     /// Expect `command` next and answer with `output`.
@@ -177,6 +178,11 @@ impl ScriptedRunner {
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// What call `n` (from 0) was fed on stdin.
+    pub fn stdin_of(&self, n: usize) -> Option<Vec<u8>> {
+        self.stdins.lock().unwrap().get(n).cloned().flatten()
+    }
 }
 
 impl Runner for ScriptedRunner {
@@ -184,11 +190,12 @@ impl Runner for ScriptedRunner {
         &self,
         program: &str,
         args: &[&str],
-        _stdin: Option<&[u8]>,
+        stdin: Option<&[u8]>,
         _timeout: Duration,
     ) -> Result<CmdOutput> {
         let command = std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" ");
         self.calls.lock().unwrap().push(command.clone());
+        self.stdins.lock().unwrap().push(stdin.map(<[u8]>::to_vec));
         let next = self.script.lock().unwrap().pop_front();
         match next {
             Some(step) if step.command == command => step.result.map_err(|message| {

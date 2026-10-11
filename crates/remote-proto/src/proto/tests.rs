@@ -19,8 +19,9 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 27,
-        "v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
+        PROTOCOL_VERSION, 28,
+        "v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+         status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
          + Simulator reply, the verb set in its own append-only enums)"
@@ -640,6 +641,30 @@ fn simulator_verbs_round_trip_and_keep_their_ordinals() {
     for reply in replies {
         let resp = Response::Simulator(reply);
         assert_eq!(Response::from_bytes(&resp.to_bytes().expect("encode")).expect("decode"), resp);
+    }
+}
+
+/// v28 appends device state after the verify loop (verb 21), each change in
+/// its own append-only enum.
+#[test]
+fn device_state_appends_and_round_trips() {
+    let state = |s| SimCmdWire::DeviceState(s);
+    let cmds = [
+        (0u8, state(SimStateCmdWire::Location(SimLocationWire::Set { lat: 10.77, lon: 106.7 }))),
+        (0, state(SimStateCmdWire::Location(SimLocationWire::Clear))),
+        (1, state(SimStateCmdWire::Appearance { dark: true })),
+        (2, state(SimStateCmdWire::Privacy { action: SimPrivacyActionWire::Reset, service: "photos".into(), app: "a.b".into() })),
+        (3, state(SimStateCmdWire::Push { app: "a.b".into(), payload: r#"{"aps":{}}"#.into() })),
+        (4, state(SimStateCmdWire::StatusBar { clean: false })),
+        (5, state(SimStateCmdWire::Erase { force: true })),
+        (6, state(SimStateCmdWire::Net(SimNetWire::Speed("lte".into())))),
+    ];
+    for (ordinal, cmd) in cmds {
+        let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: cmd.clone() });
+        let bytes = req.to_bytes().expect("encode");
+        assert_eq!((bytes[5], bytes[6]), (21, ordinal), "{cmd:?}");
+        assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
+        assert!(!cmd.uses_verify(), "not a verify-loop verb: never answered with its errors");
     }
 }
 

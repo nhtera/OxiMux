@@ -1,6 +1,8 @@
 //! Questions asked every time an agent wants something done to a device,
 //! whatever was allowed before: approval to control a phone is not approval
-//! to put apps on it.
+//! to put apps on it, and approval to drive a simulator is not approval to
+//! wipe it. Installing on a real device, erasing, a push notification, and
+//! every change to a real device's state ask here.
 //!
 //! Each belongs to the worktree whose agent asked, like a consent request: it
 //! shows in that worktree's panel and nowhere else, and is dropped when the
@@ -15,24 +17,73 @@ use oximux_simulator::registry::WorktreeKey;
 
 use super::{HubEvent, SimulatorHub};
 
-/// How long an "Install … on this phone?" question waits for the user.
-pub(crate) const INSTALL_ASK_TTL: Duration = Duration::from_secs(90);
+/// How long a question waits for the user.
+pub(crate) const ASK_TTL: Duration = Duration::from_secs(90);
 
-/// An agent's install on a real device, waiting for the user's yes. Asked
-/// every time: approval to control a phone is not approval to put apps on it.
-struct InstallAsk {
+/// What an agent asks to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AskKind {
+    /// Put an app (named by its file) on a real device.
+    Install { app: String },
+    Erase,
+    /// Deliver a push notification to an app.
+    Push { app: String },
+    /// Change a real device's state, in words ("switch to dark mode").
+    PhysicalState { what: String },
+}
+
+impl AskKind {
+    /// What the agent wants, for the toast ("An agent in … wants to …").
+    pub(crate) fn what(&self, device: &str) -> String {
+        match self {
+            Self::Install { app } => format!("install {app} on {device}"),
+            Self::Erase => format!("erase {device}"),
+            Self::Push { app } => format!("send a notification to {app} on {device}"),
+            Self::PhysicalState { what } => format!("{what} on {device}"),
+        }
+    }
+
+    /// The banner: its title, why it is asked, and its two answers.
+    pub(crate) fn question(&self, device: &str) -> (String, &'static str, (&'static str, &'static str)) {
+        match self {
+            Self::Install { app } => (
+                format!("Install {app} on {device}?"),
+                "An agent in this worktree wants to install this app on your real device. Allow it only if you expected this build.",
+                ("Don't install", "Install"),
+            ),
+            Self::Erase => (
+                format!("Erase {device}?"),
+                "An agent in this worktree wants to erase this device: every app and its data are deleted, and it starts again from factory settings.",
+                ("Don't erase", "Erase"),
+            ),
+            Self::Push { app } => (
+                format!("Send a notification to {app}?"),
+                "An agent in this worktree wants to deliver a push notification to this app on the device.",
+                ("Don't send", "Send"),
+            ),
+            Self::PhysicalState { what } => (
+                format!("Let an agent {what} on {device}?"),
+                "An agent in this worktree wants to change a setting on your real device. Asked every time.",
+                ("Don't allow", "Allow"),
+            ),
+        }
+    }
+}
+
+/// An agent's question, waiting for the user's yes.
+struct Ask {
     id: u64,
     udid: DeviceId,
     worktree: WorktreeKey,
     device_name: String,
-    app: String,
+    kind: AskKind,
     asked: Instant,
     answer: Option<bool>,
 }
 
-/// Where an install question stands, for the waiting agent.
+/// Where a question stands, for the waiting agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InstallAnswer {
+pub(crate) enum PerCallAnswer {
     Pending,
     Allowed,
     Refused,
@@ -40,54 +91,54 @@ pub(crate) enum InstallAnswer {
     Gone,
 }
 
-/// The open questions (see [`InstallAsk`]).
+/// The open questions (see [`Ask`]).
 #[derive(Default)]
 pub(crate) struct PerCall {
-    installs: Vec<InstallAsk>,
-    next_install: u64,
+    asks: Vec<Ask>,
+    next: u64,
 }
 
 impl PerCall {
     /// Drop `worktree`'s questions. Returns whether any went.
     pub(super) fn forget_worktree(&mut self, worktree: &WorktreeKey) -> bool {
-        let asks = self.installs.len();
-        self.installs.retain(|a| a.worktree != *worktree);
-        self.installs.len() != asks
+        let asks = self.asks.len();
+        self.asks.retain(|a| a.worktree != *worktree);
+        self.asks.len() != asks
     }
 
     /// Drop questions nobody answered in time — or whose answer no agent
     /// came back for (its CLI gave up). Returns whether any went.
     pub(super) fn expire(&mut self) -> bool {
-        let asks = self.installs.len();
+        let asks = self.asks.len();
         // An answer gets a little longer than the question: the waiting agent
         // reads it within a quarter second.
-        let grace = |a: &InstallAsk| if a.answer.is_some() { Duration::from_secs(15) } else { Duration::ZERO };
-        self.installs.retain(|a| a.asked.elapsed() < INSTALL_ASK_TTL + grace(a));
-        self.installs.len() != asks
+        let grace = |a: &Ask| if a.answer.is_some() { Duration::from_secs(15) } else { Duration::ZERO };
+        self.asks.retain(|a| a.asked.elapsed() < ASK_TTL + grace(a));
+        self.asks.len() != asks
     }
 
     /// Every open question, asked `by` earlier than it was.
     #[cfg(test)]
     pub(super) fn age_for_test(&mut self, by: Duration) {
-        for ask in &mut self.installs {
+        for ask in &mut self.asks {
             ask.asked -= by;
         }
     }
 }
 
 impl SimulatorHub {
-    /// Ask the user whether an agent may install `app` on the real device
-    /// `udid`. Returns the question's number, for [`Self::install_answer`].
-    pub(crate) fn ask_install(&mut self, udid: &DeviceId, worktree: &Path, device_name: &str, app: &str, cx: &mut Context<Self>) -> u64 {
+    /// Ask the user, in `worktree`'s panel, whether an agent may do `kind` to
+    /// `udid`. Returns the question's number, for [`Self::per_call_answer`].
+    pub(crate) fn ask_per_call(&mut self, udid: &DeviceId, worktree: &Path, device_name: &str, kind: AskKind, cx: &mut Context<Self>) -> u64 {
         let per_call = &mut self.agent.per_call;
-        per_call.next_install += 1;
-        let id = per_call.next_install;
-        per_call.installs.push(InstallAsk {
+        per_call.next += 1;
+        let id = per_call.next;
+        per_call.asks.push(Ask {
             id,
             udid: udid.clone(),
             worktree: WorktreeKey::from_path(worktree),
             device_name: device_name.to_owned(),
-            app: app.to_owned(),
+            kind,
             asked: Instant::now(),
             answer: None,
         });
@@ -95,34 +146,50 @@ impl SimulatorHub {
         id
     }
 
-    /// The user's answer to install question `id`, once (an answered or
-    /// expired question is dropped as it is read).
-    pub(crate) fn install_answer(&mut self, id: u64) -> InstallAnswer {
-        let installs = &mut self.agent.per_call.installs;
-        let Some(at) = installs.iter().position(|a| a.id == id) else { return InstallAnswer::Gone };
-        let answer = match installs[at].answer {
-            Some(true) => InstallAnswer::Allowed,
-            Some(false) => InstallAnswer::Refused,
-            None if installs[at].asked.elapsed() >= INSTALL_ASK_TTL => InstallAnswer::Gone,
-            None => return InstallAnswer::Pending,
+    /// The user's answer to question `id`, once (an answered or expired
+    /// question is dropped as it is read).
+    pub(crate) fn per_call_answer(&mut self, id: u64) -> PerCallAnswer {
+        let asks = &mut self.agent.per_call.asks;
+        let Some(at) = asks.iter().position(|a| a.id == id) else { return PerCallAnswer::Gone };
+        let answer = match asks[at].answer {
+            Some(true) => PerCallAnswer::Allowed,
+            Some(false) => PerCallAnswer::Refused,
+            None if asks[at].asked.elapsed() >= ASK_TTL => PerCallAnswer::Gone,
+            None => return PerCallAnswer::Pending,
         };
-        installs.remove(at);
+        asks.remove(at);
         answer
     }
 
-    /// The install question `worktree`'s agent is waiting on about the device
-    /// attached there now: its number, the device's name and the app's.
-    pub fn install_request(&self, worktree: &Path) -> Option<(u64, String, String)> {
+    /// The question `worktree`'s agent is waiting on about the device
+    /// attached there now: its number, the device's name, and what it asks.
+    pub(crate) fn per_call_request(&self, worktree: &Path) -> Option<(u64, String, AskKind)> {
         let (udid, key) = (self.device_for(worktree)?, WorktreeKey::from_path(worktree));
-        let ask = self.agent.per_call.installs.iter().find(|a| a.worktree == key && a.udid == udid && a.answer.is_none())?;
-        Some((ask.id, ask.device_name.clone(), ask.app.clone()))
+        let ask = self.agent.per_call.asks.iter().find(|a| a.worktree == key && a.udid == udid && a.answer.is_none())?;
+        Some((ask.id, ask.device_name.clone(), ask.kind.clone()))
     }
 
-    /// The banner's Install / Don't install.
-    pub fn answer_install(&mut self, id: u64, allow: bool, cx: &mut Context<Self>) {
-        if let Some(ask) = self.agent.per_call.installs.iter_mut().find(|a| a.id == id) {
+    /// The banner's two answers.
+    pub(crate) fn answer_per_call(&mut self, id: u64, allow: bool, cx: &mut Context<Self>) {
+        if let Some(ask) = self.agent.per_call.asks.iter_mut().find(|a| a.id == id) {
             ask.answer = Some(allow);
             cx.emit(HubEvent::Consent);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_question_says_what_it_asks() {
+        assert_eq!(AskKind::Erase.what("iPhone 17"), "erase iPhone 17");
+        let (title, body, (deny, allow)) = AskKind::Erase.question("iPhone 17");
+        assert_eq!((title.as_str(), deny, allow), ("Erase iPhone 17?", "Don't erase", "Erase"));
+        assert!(body.contains("factory settings"));
+        let dark = AskKind::PhysicalState { what: "switch to dark mode".into() };
+        assert_eq!(dark.question("Pixel 8").0, "Let an agent switch to dark mode on Pixel 8?");
+        assert_eq!(AskKind::Install { app: "a.apk".into() }.question("Pixel 8").0, "Install a.apk on Pixel 8?");
     }
 }

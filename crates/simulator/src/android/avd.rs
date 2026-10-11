@@ -24,9 +24,14 @@ pub fn list_avds(runner: &dyn Runner, emulator: &Path, timeout: Duration) -> Res
 }
 
 /// The emulator's arguments for a headless boot: no window (the panel is the
-/// screen), no audio, no boot animation.
-pub fn boot_args(name: &str) -> Vec<String> {
-    ["-avd", name, "-no-window", "-no-audio", "-no-boot-anim"].into_iter().map(str::to_owned).collect()
+/// screen), no audio, no boot animation. `wipe`: back to factory settings
+/// first (an erase), which also skips the quick-boot snapshot.
+pub fn boot_args(name: &str, wipe: bool) -> Vec<String> {
+    let mut args: Vec<String> = ["-avd", name, "-no-window", "-no-audio", "-no-boot-anim"].into_iter().map(str::to_owned).collect();
+    if wipe {
+        args.push("-wipe-data".into());
+    }
+    args
 }
 
 #[cfg(test)]
@@ -42,6 +47,7 @@ mod tests {
 
     #[test]
     fn a_boot_is_headless() {
-        assert_eq!(boot_args("Medium_Phone"), ["-avd", "Medium_Phone", "-no-window", "-no-audio", "-no-boot-anim"]);
+        assert_eq!(boot_args("Medium_Phone", false), ["-avd", "Medium_Phone", "-no-window", "-no-audio", "-no-boot-anim"]);
+        assert_eq!(boot_args("Medium_Phone", true).last().map(String::as_str), Some("-wipe-data"));
     }
 }
