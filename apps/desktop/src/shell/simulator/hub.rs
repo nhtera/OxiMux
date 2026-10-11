@@ -155,13 +155,14 @@ mod capture;
 mod iphone;
 mod iphone_control;
 mod lifecycle;
+mod per_call;
 mod snapshot;
 mod wifi;
 
 pub use agent::Wake;
 pub use wifi::PairStage;
 pub(crate) use wifi::can_submit;
-pub(crate) use agent::InstallAnswer;
+pub(crate) use per_call::InstallAnswer;
 pub(crate) use android::list_all;
 pub use capture::{HardwareButton, NoticeKind};
 pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};

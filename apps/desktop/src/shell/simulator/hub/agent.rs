@@ -19,36 +19,12 @@ use oximux_simulator::consent::{Consent, State, Verdict};
 use oximux_simulator::registry::{Phase, WorktreeKey};
 use oximux_storage::{SimApproval, SimApprovalRepo};
 
+use super::per_call::PerCall;
 use super::{HubEvent, SimulatorHub};
 use crate::app_settings::sim_state_keys;
 
 /// How long the badge stays after an agent's last verb.
 pub(crate) const AGENT_BADGE: Duration = Duration::from_secs(2);
-
-/// How long an "Install … on this phone?" question waits for the user.
-pub(crate) const INSTALL_ASK_TTL: Duration = Duration::from_secs(90);
-
-/// An agent's install on a real device, waiting for the user's yes. Asked
-/// every time: approval to control a phone is not approval to put apps on it.
-struct InstallAsk {
-    id: u64,
-    udid: DeviceId,
-    worktree: WorktreeKey,
-    device_name: String,
-    app: String,
-    asked: Instant,
-    answer: Option<bool>,
-}
-
-/// Where an install question stands, for the waiting agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InstallAnswer {
-    Pending,
-    Allowed,
-    Refused,
-    /// Expired or dropped (the worktree moved on): not allowed.
-    Gone,
-}
 
 /// Agent-control state the hub keeps.
 pub(crate) struct AgentState {
@@ -74,9 +50,8 @@ pub(crate) struct AgentState {
     input: HashMap<DeviceId, Arc<futures::lock::Mutex<()>>>,
     /// Orders the approval writes (see [`LatestWrites`]).
     writes: LatestWrites,
-    /// Install questions about real devices (see [`InstallAsk`]).
-    installs: Vec<InstallAsk>,
-    next_install: u64,
+    /// Questions asked every time (see [`super::per_call`]).
+    pub(super) per_call: PerCall,
 }
 
 /// Approval writes land in the order the user decided them. The writes run
@@ -139,8 +114,7 @@ impl AgentState {
             scales: HashMap::new(),
             input: HashMap::new(),
             writes: LatestWrites::default(),
-            installs: Vec::new(),
-            next_install: 0,
+            per_call: PerCall::default(),
         }
     }
 
@@ -221,9 +195,8 @@ impl SimulatorHub {
     /// `worktree` detached or changed device: drop its open questions.
     pub(super) fn forget_consent_requests(&mut self, worktree: &Path, cx: &mut Context<Self>) {
         let key = WorktreeKey::from_path(worktree);
-        let asks = self.agent.installs.len();
-        self.agent.installs.retain(|a| a.worktree != key);
-        if self.agent.consent.forget_worktree(&key) || self.agent.installs.len() != asks {
+        let asked = self.agent.per_call.forget_worktree(&key);
+        if self.agent.consent.forget_worktree(&key) || asked {
             cx.emit(HubEvent::Consent);
         }
     }
@@ -239,54 +212,6 @@ impl SimulatorHub {
         Err(format!(
             "{udid} is a real device: agents may attach it only after the user attached it in the Mobile Emulator panel and allowed agents on it"
         ))
-    }
-
-    /// Ask the user whether an agent may install `app` on the real device
-    /// `udid`. Returns the question's number, for [`Self::install_answer`].
-    pub(crate) fn ask_install(&mut self, udid: &DeviceId, worktree: &Path, device_name: &str, app: &str, cx: &mut Context<Self>) -> u64 {
-        self.agent.next_install += 1;
-        let id = self.agent.next_install;
-        self.agent.installs.push(InstallAsk {
-            id,
-            udid: udid.clone(),
-            worktree: WorktreeKey::from_path(worktree),
-            device_name: device_name.to_owned(),
-            app: app.to_owned(),
-            asked: Instant::now(),
-            answer: None,
-        });
-        cx.emit(HubEvent::Consent);
-        id
-    }
-
-    /// The user's answer to install question `id`, once (an answered or
-    /// expired question is dropped as it is read).
-    pub(crate) fn install_answer(&mut self, id: u64) -> InstallAnswer {
-        let Some(at) = self.agent.installs.iter().position(|a| a.id == id) else { return InstallAnswer::Gone };
-        let answer = match self.agent.installs[at].answer {
-            Some(true) => InstallAnswer::Allowed,
-            Some(false) => InstallAnswer::Refused,
-            None if self.agent.installs[at].asked.elapsed() >= INSTALL_ASK_TTL => InstallAnswer::Gone,
-            None => return InstallAnswer::Pending,
-        };
-        self.agent.installs.remove(at);
-        answer
-    }
-
-    /// The install question `worktree`'s agent is waiting on about the device
-    /// attached there now: its number, the device's name and the app's.
-    pub fn install_request(&self, worktree: &Path) -> Option<(u64, String, String)> {
-        let (udid, key) = (self.device_for(worktree)?, WorktreeKey::from_path(worktree));
-        let ask = self.agent.installs.iter().find(|a| a.worktree == key && a.udid == udid && a.answer.is_none())?;
-        Some((ask.id, ask.device_name.clone(), ask.app.clone()))
-    }
-
-    /// The banner's Install / Don't install.
-    pub fn answer_install(&mut self, id: u64, allow: bool, cx: &mut Context<Self>) {
-        if let Some(ask) = self.agent.installs.iter_mut().find(|a| a.id == id) {
-            ask.answer = Some(allow);
-            cx.emit(HubEvent::Consent);
-        }
     }
 
     /// The turn-taking lock for input on `udid` (see `AgentState::input`).
@@ -382,12 +307,8 @@ impl SimulatorHub {
     /// nobody answered in time — or whose answer no agent came back for (its
     /// CLI gave up) — from the tick.
     pub(super) fn expire_consent(&mut self, cx: &mut Context<Self>) {
-        let asks = self.agent.installs.len();
-        // An answer gets a little longer than the question: the waiting agent
-        // reads it within a quarter second.
-        let grace = |a: &InstallAsk| if a.answer.is_some() { Duration::from_secs(15) } else { Duration::ZERO };
-        self.agent.installs.retain(|a| a.asked.elapsed() < INSTALL_ASK_TTL + grace(a));
-        if self.agent.consent.expire(Instant::now()) || self.agent.installs.len() != asks {
+        let asked = self.agent.per_call.expire();
+        if self.agent.consent.expire(Instant::now()) || asked {
             cx.emit(HubEvent::Consent);
         }
     }
@@ -502,6 +423,8 @@ impl SimulatorHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::InstallAnswer;
+    use super::super::per_call::INSTALL_ASK_TTL;
     use crate::app_settings::simulator_settings::SimulatorSettings;
     use oximux_simulator::consent::Verdict;
 
@@ -712,7 +635,7 @@ mod tests {
             assert_eq!(hub.install_answer(id), InstallAnswer::Refused);
 
             let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
-            hub.agent.installs[0].asked -= INSTALL_ASK_TTL;
+            hub.agent.per_call.age_for_test(INSTALL_ASK_TTL);
             assert_eq!(hub.install_answer(id), InstallAnswer::Gone, "expired: not allowed");
 
             let id = hub.ask_install(&phone, w, "Galaxy", "app-debug.apk", cx);
