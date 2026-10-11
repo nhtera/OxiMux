@@ -23,6 +23,19 @@ impl TerminalView {
         badge_in_gutter(pos, bounds, pad, line_h, &self.visible_command_badges(mode))
     }
 
+    /// The badge to label this frame. It follows the pointer's position NOW,
+    /// not the badge recorded at the last mouse-move: a scroll, `clear`, mode
+    /// change, resize, or tab switch since then moves a mark under (or out
+    /// from under) a pointer that hasn't moved. Only the pane the pointer is
+    /// over shows a label.
+    pub(super) fn label_badge(&self, badges: &[CommandBadge], window: &Window) -> Option<CommandBadge> {
+        if !self.pointer_in_view {
+            return None;
+        }
+        let line_h = CellMetrics::measure(&self.typography, window).line_height;
+        badge_in_gutter(window.mouse_position(), self.canvas_bounds.get(), self.density.pad_panel, line_h, badges)
+    }
+
     /// Record the hovered badge, repainting only when it changed.
     pub(super) fn set_hovered_badge(&mut self, badge: Option<CommandBadge>, cx: &mut Context<Self>) {
         if badge != self.hovered_badge {

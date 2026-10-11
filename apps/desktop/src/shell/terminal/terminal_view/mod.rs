@@ -654,6 +654,8 @@ pub struct TerminalView {
     /// The command-status mark whose gutter the pointer is in, labelled with
     /// its exit code. Set on mouse-move, dropped when the pointer leaves.
     hovered_badge: Option<CommandBadge>,
+    /// The pointer is over this pane: gates the exit-code label, re-hit-tested each render.
+    pointer_in_view: bool,
     /// Last bell-banner dispatch instant, rate-limiting BEL storms (a
     /// misbehaving child can emit thousands per second) to one banner
     /// request per window. The dispatcher's per-workspace burst gate

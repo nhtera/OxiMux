@@ -3,7 +3,7 @@
 //! successful prompt read as a diff's "added line", so the default marks
 //! failures only.
 
-use gpui::{Bounds, TestAppContext, point, px, size};
+use gpui::{Bounds, Modifiers, TestAppContext, VisualTestContext, point, px, size};
 
 use super::command_badge_hover::badge_in_gutter;
 use super::command_mark_tests::mount_view;
@@ -100,4 +100,33 @@ fn an_unpainted_canvas_hits_nothing() {
     let unpainted = Bounds::default();
     let hit = badge_in_gutter(point(px(3.0), px(90.0)), unpainted, PAD, LINE_H, &[FAILED_ROW_4]);
     assert_eq!(hit, None);
+}
+
+// A mark can arrive under a pointer that is not moving: a scroll, or output
+// that finishes a command on the row the pointer rests on. The label must
+// follow on that redraw, not wait for the next mouse-move.
+#[gpui::test]
+async fn a_mark_arriving_under_a_still_pointer_is_labelled(cx: &mut TestAppContext) {
+    let window = mount_view(cx);
+    let view = window.root(cx).expect("view");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    cx.run_until_parked();
+
+    let (bounds, pad, line_h) = cx.update(|win, cx| {
+        let v = view.read(cx);
+        (v.canvas_bounds.get(), v.density.pad_panel, CellMetrics::measure(&v.typography, win).line_height)
+    });
+    assert!(bounds.size.width > px(0.0), "the canvas painted");
+    // The gutter of row 4, which carries no mark yet.
+    let gutter_row_4 = point(bounds.origin.x + px(pad / 2.0), bounds.origin.y + px(pad + line_h * 4.5));
+    cx.simulate_mouse_move(gutter_row_4, None, Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert_eq!(v.hovered_badge, None, "nothing under the pointer when it moved"));
+
+    view.update(cx, |v, _| seed_marks(v));
+    let label = cx.update(|win, cx| {
+        let v = view.read(cx);
+        v.label_badge(&v.visible_command_badges(ExitBadges::Failures), win)
+    });
+    assert_eq!(label, Some(FAILED_ROW_4));
 }
