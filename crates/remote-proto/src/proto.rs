@@ -144,7 +144,7 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// cannot decode the new buttons: see [`SIMULATOR_ANDROID_BUTTONS_MIN_VERSION`].
 ///
 /// v27: appended the simulator **verify loop** (`SimCmdWire::{Settled, AxRefs,
-/// Wait, Assert, AsCaller}`, `SimTargetWire::Ref`, the replies and errors they
+/// Wait, Assert, AsCaller, TypeInto}`, `SimTargetWire::Ref`, the replies and errors they
 /// bring): an action that waits for the screen to go idle and reports what
 /// changed, stable `@eN` refs, and `wait`/`assert` in place of sleep-polling.
 /// A v26 host cannot decode them: see [`SIMULATOR_VERIFY_MIN_VERSION`].

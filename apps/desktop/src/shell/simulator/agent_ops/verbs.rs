@@ -29,7 +29,7 @@ use oximux_simulator::{Button, DeviceId, Orientation, Platform, Source, keyboard
 
 use super::Target;
 use super::ax_lookup::{self, HELPER_TIMEOUT, Shown, off_screen, point_to_portrait, scale, screen};
-use super::guards::{Verb, is_input, is_web_url, unwrap};
+use super::guards::{Verb, check_bundle_id, check_text, is_input, is_web_url, unwrap};
 use super::settle::{self, Acted};
 use crate::shell::simulator::hub::{InstallAnswer, SimulatorHub, Wake, home_button, paste_now};
 
@@ -42,8 +42,8 @@ const APP_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 /// Finger down to finger up, for a tap.
 const TAP_HOLD: Duration = Duration::from_millis(60);
-/// The longest text one `type` takes (it goes key by key).
-const MAX_TYPED: usize = 10_000;
+/// A tapped field taking focus (and its keyboard coming up) before typing.
+const FOCUS_WAIT: Duration = Duration::from_millis(300);
 
 /// Run a blocking call on a thread of its own: an install copies for minutes,
 /// and the background executor's few threads are shared by the whole app.
@@ -145,9 +145,8 @@ async fn run_verb(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str, verb:
     if let Some(timeout_ms) = verb.settle {
         return settle::settled(hub, udid, name, verb.inner, timeout_ms, &refs, target, cx).await;
     }
-    // A bare tap by ref still reports where it landed (and whether its
-    // element had moved).
-    let by_ref = matches!(verb.inner, SimCmdWire::Tap(SimTargetWire::Ref(_)));
+    // A ref's tap reports what it aimed at (and whether it had moved).
+    let by_ref = matches!(verb.inner, SimCmdWire::Tap(SimTargetWire::Ref(_)) | SimCmdWire::TypeInto { .. });
     let (started, mut acted) = (Instant::now(), Acted::default());
     let reply = execute(hub, udid, name, verb.inner, &refs, &mut acted, target, cx).await?;
     Ok(if by_ref { SimReplyWire::Settled(acted.report(None, started)) } else { reply })
@@ -230,13 +229,16 @@ pub(super) async fn execute(
             send(&session, Command::Touch { phase: TouchPhase::End, x: last.0, y: last.1, edge })?;
             Ok(SimReplyWire::Done)
         }
+        // One turn of the input lock: no other input lands between the two.
+        // The text is checked before the tap, which cannot be taken back.
+        SimCmdWire::TypeInto { target: aim, text, paste } => {
+            check_text(&text)?;
+            Box::pin(execute(hub, udid, name, SimCmdWire::Tap(aim), refs, acted, target, cx)).await?;
+            cx.background_executor().timer(FOCUS_WAIT).await;
+            Box::pin(execute(hub, udid, name, SimCmdWire::Type { text, paste }, refs, acted, target, cx)).await
+        }
         SimCmdWire::Type { text, paste } => {
-            if text.is_empty() {
-                return Err(SimErrorWire::BadInput("nothing to type".into()));
-            }
-            if text.chars().count() > MAX_TYPED {
-                return Err(SimErrorWire::BadInput(format!("at most {MAX_TYPED} characters at a time")));
-            }
+            check_text(&text)?;
             let session = live_session(hub, udid, cx).await?;
             // A controlled iPhone types text as text, any Unicode; a CR (alone
             // or before LF) is a newline, never dropped into an empty batch.
@@ -489,14 +491,6 @@ async fn simctl_ready(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut Asyn
 /// arms, through `devicectl`).
 fn simctl_udid(udid: &DeviceId) -> Result<SimUdid, SimErrorWire> {
     udid.sim_udid().ok_or_else(|| SimErrorWire::Unavailable(format!("{udid} is not a simulator")))
-}
-
-/// A bundle identifier: letters, digits, `.`, `-`, `_`, starting with a
-/// letter or digit (nothing an option or a path could be made of).
-fn check_bundle_id(bundle_id: &str) -> Result<(), SimErrorWire> {
-    let well_formed = bundle_id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && bundle_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-    if well_formed { Ok(()) } else { Err(SimErrorWire::BadInput(format!("`{bundle_id}` is not a bundle identifier"))) }
 }
 
 /// Ask the user, in the worktree's panel, before an agent installs `app` on

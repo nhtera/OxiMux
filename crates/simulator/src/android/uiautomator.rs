@@ -38,7 +38,16 @@ fn node(n: roxmltree::Node<'_, '_>) -> AxNode {
     let role = role(class, n.attribute("clickable") == Some("true"));
     // The description is what TalkBack reads; the text is what is shown.
     let label = desc.clone().or_else(|| text.clone());
-    let value = if desc.is_some() || role == "TextField" { text } else { None };
+    // A field's value is its text, empty when cleared — and an empty field
+    // shows its hint as its text, which is no value either.
+    let value = if role == "TextField" {
+        let showing_hint = text.is_some() && attr("hint") == text;
+        Some(if showing_hint { String::new() } else { text.unwrap_or_default() })
+    } else if desc.is_some() {
+        text
+    } else {
+        None
+    };
     AxNode {
         label,
         identifier: attr("resource-id"),
@@ -118,5 +127,18 @@ mod tests {
         assert_eq!((tree[1].role.as_str(), tree[1].label.as_deref(), tree[1].enabled), ("Button", Some("Search"), false));
         assert_eq!((tree[2].role.as_str(), tree[2].frame), ("Group", Rect::new(0.0, 0.0, 0.0, 0.0)));
         assert!(parse_dump("ERROR: could not get idle state.").is_err());
+    }
+
+    /// A cleared field's value is empty — also when it shows its hint,
+    /// which then names it.
+    #[test]
+    fn a_cleared_field_has_an_empty_value() {
+        let xml = r#"<?xml version='1.0' ?><hierarchy rotation="0">
+<node class="android.widget.EditText" text="" content-desc="Email" clickable="true" bounds="[0,0][100,50]"/>
+<node class="android.widget.EditText" text="Search" hint="Search" content-desc="" clickable="true" bounds="[0,60][100,110]"/>
+</hierarchy>"#;
+        let tree = parse_dump(xml).unwrap();
+        assert_eq!((tree[0].label.as_deref(), tree[0].value.as_deref()), (Some("Email"), Some("")));
+        assert_eq!((tree[1].label.as_deref(), tree[1].value.as_deref()), (Some("Search"), Some("")));
     }
 }

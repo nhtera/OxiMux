@@ -169,6 +169,13 @@ pub fn find<'a>(nodes: &'a [AxNode], query: Query<'_>) -> Option<&'a AxNode> {
     find_where(nodes, query, is_on_screen).or_else(|| find_where(nodes, query, |_| true))
 }
 
+/// [`find`], among elements on screen only: what `wait` and `assert` see,
+/// where a hidden twin must neither pass for the element nor keep it from
+/// being gone.
+pub fn find_on_screen<'a>(nodes: &'a [AxNode], query: Query<'_>) -> Option<&'a AxNode> {
+    find_where(nodes, query, is_on_screen)
+}
+
 /// Whether `node` has an area (a zero-size frame is never on screen).
 pub fn is_on_screen(node: &AxNode) -> bool {
     node.frame.w > 0.0 && node.frame.h > 0.0

@@ -50,6 +50,26 @@ fn alike_elements_are_told_apart_by_their_place() {
     let one = screen(vec![node("Button", "Delete", (0.0, 100.0))]);
     assert_eq!(table.resolve(2, &one, 1.0).unwrap_err(), RefError::Gone);
     assert_eq!(table.resolve(1, &one, 1.0).unwrap_err(), RefError::Ambiguous);
+    // Read again (a settle does): neither old number passes on — the
+    // survivor gets a new one, and both old ones name nothing.
+    assert_eq!(table.assign(&one).iter().map(|(r, _)| *r).collect::<Vec<_>>(), [3]);
+    assert_eq!(table.resolve(1, &one, 1.0).unwrap_err(), RefError::Unknown);
+    assert_eq!(table.resolve(2, &one, 1.0).unwrap_err(), RefError::Unknown);
+    assert!(table.resolve(3, &one, 1.0).is_ok());
+}
+
+/// Three look-alike rows; one is deleted, then one is added: the third
+/// row's old number never passes to the new row, though it was off screen
+/// when the group shrank.
+#[test]
+fn a_look_alike_off_screen_retires_with_its_group() {
+    let rows = |ys: &[f64]| screen(ys.iter().map(|&y| node("Button", "Delete", (0.0, y))).collect());
+    let mut table = RefTable::default();
+    assert_eq!(table.assign(&rows(&[100.0, 200.0, 300.0])).iter().map(|(r, _)| *r).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(table.assign(&rows(&[100.0, 200.0])).iter().map(|(r, _)| *r).collect::<Vec<_>>(), [4, 5]);
+    let three = rows(&[100.0, 200.0, 300.0]);
+    assert_eq!(table.resolve(3, &three, 1.0).unwrap_err(), RefError::Unknown, "never the new row");
+    assert_eq!(table.assign(&three).iter().map(|(r, _)| *r).collect::<Vec<_>>(), [6, 7, 8]);
 }
 
 #[test]
@@ -142,8 +162,16 @@ fn tables_belong_to_a_caller_and_outlive_the_session() {
     }
     assert_eq!(store.len(), MAX_CALLERS);
     assert!(store.table(&(worktree.clone(), device.clone(), Some(2))).key_of(1).is_none(), "caller 2 was the oldest");
+    // A returning caller's table counts on: its old @e1 and @e2 name
+    // nothing rather than whatever is numbered first now.
+    let back = store.table(&(worktree.clone(), device.clone(), Some(1)));
+    assert!(back.key_of(1).is_none() && back.key_of(2).is_none());
+    assert_eq!(back.assign(&nodes).iter().map(|(r, _)| *r).collect::<Vec<_>>(), [3, 4]);
     store.forget_worktree(&worktree);
     assert!(store.is_empty());
+    // So does one made after a detach.
+    let again = store.table(&(worktree.clone(), device.clone(), Some(1)));
+    assert_eq!(again.assign(&nodes).iter().map(|(r, _)| *r).collect::<Vec<_>>(), [5, 6]);
 }
 
 /// A real iPhone's home screen: a zero-size twin of each icon comes first in
@@ -162,4 +190,7 @@ fn zero_size_twins_are_not_on_screen() {
     // Nothing visible matches: the zero-size node is still found.
     let hidden = screen(vec![twin]);
     assert!(crate::ax::find(&hidden, crate::ax::Query::Label("Settings")).is_some());
+    // …but not by wait and assert: a hidden element is not on screen.
+    assert!(crate::ax::find_on_screen(&hidden, crate::ax::Query::Label("Settings")).is_none());
+    assert_eq!(crate::ax::find_on_screen(&home, crate::ax::Query::Label("Settings")).map(|n| n.frame.x), Some(228.0));
 }

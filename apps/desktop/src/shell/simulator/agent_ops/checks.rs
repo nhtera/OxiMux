@@ -94,13 +94,23 @@ fn verdict(check: &SimCheckWire, found: Option<&AxNode>, what: &str) -> Result<(
     }
 }
 
-/// A field's text is its value; anything else's is its label.
+/// A field's text is its value — empty when it is cleared, never its label
+/// (the label names the field: “Email”); anything else's is its value or,
+/// without one, its label.
 fn text_of(n: &AxNode) -> Option<&str> {
-    [n.value.as_deref(), n.label.as_deref()].into_iter().flatten().map(str::trim).find(|s| !s.is_empty())
+    let value = n.value.as_deref().map(str::trim);
+    if is_text_entry(&n.role) && value.is_some() {
+        return value;
+    }
+    [value, n.label.as_deref().map(str::trim)].into_iter().flatten().find(|s| !s.is_empty())
+}
+
+fn is_text_entry(role: &str) -> bool {
+    matches!(role, "TextField" | "SecureTextField" | "SearchField" | "TextView")
 }
 
 fn summary(n: &AxNode) -> String {
-    match text_of(n) {
+    match text_of(n).filter(|t| !t.is_empty()) {
         Some(text) => format!("{} “{text}”", n.role),
         None => n.role.clone(),
     }
@@ -129,8 +139,8 @@ fn locate(hub: &Entity<SimulatorHub>, aim: &SimTargetWire, read: &Read, pt: f64,
     hub.update(cx, |hub, _| {
         let table = hub.ref_table(refs);
         let found = match aim {
-            SimTargetWire::Label(label) => ax::find(&read.nodes, Query::Label(label)).cloned(),
-            SimTargetWire::Id(id) => ax::find(&read.nodes, Query::Id(id)).cloned(),
+            SimTargetWire::Label(label) => ax::find_on_screen(&read.nodes, Query::Label(label)).cloned(),
+            SimTargetWire::Id(id) => ax::find_on_screen(&read.nodes, Query::Id(id)).cloned(),
             SimTargetWire::Ref(r) => match table.resolve(*r, &read.nodes, pt) {
                 Ok(found) => Some(found.node.clone()),
                 Err(RefError::Gone) => None,
@@ -175,6 +185,18 @@ mod tests {
         assert_eq!(verdict(&SimCheckWire::Enabled, Some(&off), "#next").unwrap_err(), "#next is disabled: Button “Next”");
         assert_eq!(verdict(&SimCheckWire::Gone, Some(&off), "@e3").unwrap_err(), "@e3 is on screen: Button “Next”");
         assert!(verdict(&SimCheckWire::Exists, None, "x").unwrap_err().contains("no on-screen element"));
+    }
+
+    /// A cleared field reads as empty, never as its label; a button whose
+    /// value is empty still reads as its label.
+    #[test]
+    fn a_cleared_field_reads_empty() {
+        let cleared = node("TextField", Some("Email"), Some(""), true);
+        assert!(verdict(&SimCheckWire::Text(String::new()), Some(&cleared), "x").is_ok());
+        assert_eq!(verdict(&SimCheckWire::Text("Email".into()), Some(&cleared), "x").unwrap_err(), "x reads “”, not “Email”");
+        let button = node("Button", Some("Sign in"), Some(""), true);
+        assert!(verdict(&SimCheckWire::Text("Sign in".into()), Some(&button), "x").is_ok());
+        assert_eq!(summary(&cleared), "TextField");
     }
 
     #[test]
