@@ -24,11 +24,13 @@ pub const MIN_FORCED_GAP: Duration = Duration::from_secs(1);
 pub const REQUESTED_WINDOW: Duration = Duration::from_millis(500);
 /// A delta frame above this many bits per pixel is a change on screen.
 ///
-/// Provisional until measured (the verify loop's spike, phase 1 step 1): an
-/// idle H.264 delta is a few hundred bytes on a ~3 Mpx stream (≈ 0.0005), a
-/// scroll tens of kilobytes (≈ 0.05+). The `trace` log in
-/// [`FrameSignal::frame`] prints each delta's figure for that measurement.
-pub const STATIC_BPPF: f64 = 0.004;
+/// Measured live (the `trace` log in [`FrameSignal::frame`] prints each
+/// delta's figure): an iOS simulator's idle deltas are ≈ 0.002; after any
+/// change an Android emulator's encoder sends 1–4 s of refinement deltas at
+/// 0.0041–0.0045 (also after each accessibility dump), while the smallest
+/// real change seen there, a status-bar clock tick, is 0.0052. Animation and
+/// taps run 0.01–0.6.
+pub const STATIC_BPPF: f64 = 0.005;
 /// A JPEG frame whose size differs from the last by more than this fraction
 /// is a change on screen (a static screen re-encodes to within a few bytes).
 pub const JPEG_DELTA: f64 = 0.02;
@@ -247,6 +249,13 @@ mod tests {
         assert_eq!(signal.clock().last_motion_at, Some(t0 + 32 * MS), "no size yet: assume change");
         signal.dropped(t0 + 48 * MS);
         assert_eq!(signal.clock().last_motion_at, Some(t0 + 48 * MS));
+        // An Android emulator's 720×1024 stream, as measured: the encoder's
+        // refinement tail is quiet, a status-bar clock tick is not.
+        const AVD: Option<u64> = Some(737_280);
+        signal.frame(t0 + 100 * MS, Ingress::Delta { bytes: 413, pixels: AVD });
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 48 * MS), "a refinement tail frame");
+        signal.frame(t0 + 200 * MS, Ingress::Delta { bytes: 481, pixels: AVD });
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 200 * MS), "the clock ticked");
     }
 
     #[test]
