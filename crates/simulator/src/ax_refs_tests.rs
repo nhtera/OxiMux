@@ -145,3 +145,21 @@ fn tables_belong_to_a_caller_and_outlive_the_session() {
     store.forget_worktree(&worktree);
     assert!(store.is_empty());
 }
+
+/// A real iPhone's home screen: a zero-size twin of each icon comes first in
+/// the tree. Only the visible one is keyed, numbered and found.
+#[test]
+fn zero_size_twins_are_not_on_screen() {
+    let mut twin = node("Icon", "Settings", (0.0, 0.0));
+    twin.frame = Rect::new(0.0, 0.0, 0.0, 0.0);
+    let shown = node("Icon", "Settings", (228.0, 508.0));
+    let home = screen(vec![twin.clone(), shown]);
+    let icons: Vec<_> = keyed(&home).into_iter().filter(|k| k.key.role == "Icon").collect();
+    assert_eq!((icons.len(), icons[0].key.nth, icons[0].group), (1, 0, 1));
+    let mut table = RefTable::default();
+    assert_eq!(table.assign(&home).iter().map(|(_, n)| n.frame.y).collect::<Vec<_>>(), [508.0], "an icon gets a ref");
+    assert_eq!(crate::ax::find(&home, crate::ax::Query::Label("Settings")).map(|n| n.frame.x), Some(228.0));
+    // Nothing visible matches: the zero-size node is still found.
+    let hidden = screen(vec![twin]);
+    assert!(crate::ax::find(&hidden, crate::ax::Query::Label("Settings")).is_some());
+}

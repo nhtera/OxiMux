@@ -40,6 +40,9 @@ pub fn is_interactive(role: &str) -> bool {
         "Button" | "TextField" | "SecureTextField" | "SearchField" | "TextView" | "Switch" | "Toggle" | "CheckBox" | "RadioButton"
             | "Slider" | "Stepper" | "Incrementor" | "Link" | "Cell" | "Tab" | "SegmentedControl" | "PopUpButton" | "ComboBox"
             | "MenuItem" | "Picker" | "PickerWheel" | "Key"
+            // A real iPhone's runner names `XCUIElement` types: an app icon is
+            // an `Icon`, and these act like buttons too.
+            | "Icon" | "MenuButton" | "ToolbarButton" | "DisclosureTriangle" | "PageIndicator" | "DatePicker" | "IncrementArrow"
     )
 }
 
@@ -67,16 +70,16 @@ pub struct Keyed<'a> {
 }
 
 /// The elements of a read that count, keyed, in tree order: anything with a
-/// label, identifier or value, and anything interactive — less what changes
-/// on its own (progress roles, and the status bar: elements wholly in the top
-/// 5% of the screen).
+/// label, identifier or value, and anything interactive — less what is not on
+/// screen (a zero-size frame) and what changes on its own (progress roles,
+/// and the status bar: elements wholly in the top 5% of the screen).
 pub fn keyed(nodes: &[AxNode]) -> Vec<Keyed<'_>> {
     let top = nodes.first().map_or(0.0, |root| root.frame.y + root.frame.h * 0.05);
     let mut seen: HashMap<(String, String), u32> = HashMap::new();
     let mut out: Vec<Keyed<'_>> = ax::flatten(nodes, MAX_NODES)
         .into_iter()
         .map(|f| f.node)
-        .filter(|n| !is_progress(&n.role) && n.frame.y + n.frame.h > top)
+        .filter(|n| ax::is_on_screen(n) && !is_progress(&n.role) && n.frame.y + n.frame.h > top)
         .filter(|n| is_interactive(&n.role) || has_text(n.label.as_deref()) || has_text(n.identifier.as_deref()) || has_text(n.value.as_deref()))
         .map(|node| {
             let name = [node.identifier.as_deref(), node.label.as_deref()].into_iter().flatten().find(|s| has_text(Some(s))).unwrap_or("");
