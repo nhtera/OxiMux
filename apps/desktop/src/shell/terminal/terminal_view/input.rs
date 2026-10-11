@@ -585,6 +585,9 @@ impl TerminalView {
             self.hovered_link = next;
             cx.notify();
         }
+        let mode = cx.try_global::<TerminalSettings>().map_or_else(ExitBadges::default, |s| s.exit_badges);
+        let badge = self.badge_under(ev.position, mode, window);
+        self.set_hovered_badge(badge, cx);
     }
 
     /// Wheel handling, in priority order: forward to a mouse-reporting app;
@@ -1329,6 +1332,7 @@ impl TerminalView {
         }
         self.selection = None;
         self.hovered_link = None;
+        self.hovered_badge = None;
         self.scroll_px = 0.0;
         // The wipe reset the grid's history to zero; the gutter badges are
         // anchored to absolute history lines, so they no longer point at the

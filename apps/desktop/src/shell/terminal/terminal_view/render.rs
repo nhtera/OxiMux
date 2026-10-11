@@ -1,3 +1,5 @@
+use gpui::StatefulInteractiveElement as _;
+
 use super::*;
 
 impl Render for TerminalView {
@@ -87,6 +89,8 @@ impl Render for TerminalView {
         // borrows). Clone is cheap: snapshot is a Vec<Vec<Cell>> already
         // sized to the visible grid, buckets are tiny per-row vecs of
         // MatchHit (Copy), theme/typography/cursor are POD-sized.
+        let command_badges = self.visible_command_badges(s.exit_badges);
+        let hovered_badge = self.label_badge(&command_badges, window);
         let paint_params = PaintParams {
             snapshot: self.snapshot.clone(),
             theme,
@@ -99,7 +103,8 @@ impl Render for TerminalView {
             pad,
             hovered_link: self.underlinable_hover(cx),
             selection: self.selection,
-            command_badges: self.visible_command_badges(),
+            command_badges,
+            hovered_badge,
             alphas,
         };
 
@@ -339,6 +344,14 @@ impl Render for TerminalView {
                     cx.notify();
                 }),
             )
+            // Leaving the pane drops the exit-code label: mouse-move stops
+            // arriving once the pointer is outside, so it would otherwise stick.
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                this.pointer_in_view = *hovered;
+                if !*hovered {
+                    this.set_hovered_badge(None, cx);
+                }
+            }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
                 // A scrollbar-thumb drag owns the gesture: map travel to offset
                 // and skip hover/selection until the button is released.

@@ -305,22 +305,27 @@ impl TerminalView {
         self.command_marks.clear();
     }
 
-    /// Command-mark badges for the rows currently visible: `(screen_row,
-    /// is_error)`. Maps each mark's absolute history line through the live
-    /// snapshot's `history_len`/`display_offset`, dropping marks scrolled out
-    /// of view. Only finished commands (a known exit code) get a badge.
-    pub(super) fn visible_command_badges(&self) -> Vec<(usize, bool)> {
+    /// Command-mark badges for the rows currently visible, as the `mode`
+    /// setting wants them painted. Maps each mark's absolute history line
+    /// through the live snapshot's `history_len`/`display_offset`, dropping
+    /// marks scrolled out of view. Only finished commands (a known exit code)
+    /// get a badge, and `Failures` keeps only the non-zero ones. The marks
+    /// themselves are untouched: "send last output" reads them in every mode.
+    pub(super) fn visible_command_badges(&self, mode: ExitBadges) -> Vec<CommandBadge> {
         let rows = self.snapshot.rows as i64;
-        if rows == 0 {
+        if rows == 0 || mode == ExitBadges::Off {
             return Vec::new();
         }
         let base = self.snapshot.history_len as i64 - self.snapshot.display_offset as i64;
         let mut out = Vec::new();
         for mark in &self.command_marks {
             let Some(exit) = mark.exit else { continue };
+            if mode == ExitBadges::Failures && exit == 0 {
+                continue;
+            }
             let screen_row = mark.line as i64 - base;
             if (0..rows).contains(&screen_row) {
-                out.push((screen_row as usize, exit != 0));
+                out.push(CommandBadge { row: screen_row as usize, exit });
             }
         }
         out

@@ -4,7 +4,7 @@
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use oximux_settings::{
-    BellStyle, Density, PerTerminalHistory, Theme, Typography, WindowsPowerShell, WindowsShell,
+    BellStyle, Density, ExitBadges, PerTerminalHistory, Theme, Typography, WindowsPowerShell, WindowsShell,
 };
 
 use super::SettingsModal;
@@ -217,6 +217,15 @@ fn settings_entries(
         cx,
     );
 
+    let exit_badges = segmented(
+        "term-exitbadges",
+        exit_badge_segments(t.exit_badges),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
     let history = segmented(
         "term-history",
         history_segments(t.per_terminal_history),
@@ -304,6 +313,12 @@ fn settings_entries(
         ),
         entry("Bell", "Visual flash on the terminal bell, or off.", bell),
         entry(
+            "Command status marks",
+            "Mark finished commands in the left margin. Failures marks only commands that exited with an error; \
+             All also marks successful ones in grey. Hover a mark to see its exit code.",
+            exit_badges,
+        ),
+        entry(
             "Shell history",
             "Up-arrow recalls each terminal's own commands, and every command still reaches your history file. \
              Auto keeps history shared when your shell already shares it live (zsh share_history, on in oh-my-zsh); \
@@ -358,13 +373,37 @@ fn history_segments(mode: PerTerminalHistory) -> Vec<Segment> {
     .collect()
 }
 
+/// The Command status marks picker: failures only (default), every finished
+/// command, or none.
+fn exit_badge_segments(mode: ExitBadges) -> Vec<Segment> {
+    [
+        ("Failures", ExitBadges::Failures),
+        ("All", ExitBadges::All),
+        ("Off", ExitBadges::Off),
+    ]
+    .into_iter()
+    .map(|(label, value)| {
+        Segment::new(label, mode == value, move |this, _w, cx| {
+            this.terminal.exit_badges = value;
+            this.persist_terminal(cx);
+        })
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
 
+    /// Both pickers write the whole settings struct to the one `terminal.toml`
+    /// the test process shares, so in parallel each could read back the
+    /// other's write. Each test holds this for its whole write-and-read.
+    static TERMINAL_TOML: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[gpui::test]
     fn the_history_picker_writes_the_mode_to_terminal_toml(cx: &mut TestAppContext) {
+        let _toml_lock = TERMINAL_TOML.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (w, m) = super::super::env_editor_tests::modal(cx);
         let toml = crate::terminal_settings::app_data_dir().expect("test data dir").join("terminal.toml");
         let segments = history_segments(PerTerminalHistory::Auto);
@@ -382,5 +421,27 @@ mod tests {
         // Back to the default, so the shared test data dir keeps defaults.
         w.update(cx, |_, window, cx| m.update(cx, |m, cx| (segments[0].on_select)(m, window, cx))).unwrap();
         assert_eq!(m.read_with(cx, |m, _| m.terminal.per_terminal_history), PerTerminalHistory::Auto);
+    }
+
+    #[gpui::test]
+    fn the_status_mark_picker_writes_the_mode_to_terminal_toml(cx: &mut TestAppContext) {
+        let _toml_lock = TERMINAL_TOML.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (w, m) = super::super::env_editor_tests::modal(cx);
+        let toml = crate::terminal_settings::app_data_dir().expect("test data dir").join("terminal.toml");
+        let segments = exit_badge_segments(ExitBadges::Failures);
+        let labels: Vec<&str> = segments.iter().map(|s| s.label.as_ref()).collect();
+        assert_eq!(labels, ["Failures", "All", "Off"]);
+        let selected: Vec<bool> = segments.iter().map(|s| s.selected).collect();
+        assert_eq!(selected, [true, false, false]);
+        for (idx, mode, text) in [(1, ExitBadges::All, "all"), (2, ExitBadges::Off, "off")] {
+            w.update(cx, |_, window, cx| m.update(cx, |m, cx| (segments[idx].on_select)(m, window, cx)))
+                .unwrap();
+            assert_eq!(m.read_with(cx, |m, _| m.terminal.exit_badges), mode);
+            let written = std::fs::read_to_string(&toml).expect("terminal.toml");
+            assert!(written.contains(&format!("exit_badges = \"{text}\"")), "{written}");
+        }
+        // Back to the default, so the shared test data dir keeps defaults.
+        w.update(cx, |_, window, cx| m.update(cx, |m, cx| (segments[0].on_select)(m, window, cx))).unwrap();
+        assert_eq!(m.read_with(cx, |m, _| m.terminal.exit_badges), ExitBadges::Failures);
     }
 }
