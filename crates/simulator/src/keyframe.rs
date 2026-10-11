@@ -134,7 +134,11 @@ impl FrameSignal {
         state.clock.seq += 1;
         state.clock.last_frame_at = Some(now);
         let motion = match ingress {
-            Ingress::Key { .. } => !state.keyframes.is_requested(now),
+            Ingress::Key { bytes } => {
+                let requested = state.keyframes.is_requested(now);
+                tracing::trace!(bytes, requested, "video key frame");
+                !requested
+            }
             Ingress::Delta { bytes, pixels } => match pixels.filter(|&p| p > 0) {
                 Some(pixels) => {
                     let bppf = bytes as f64 * 8.0 / pixels as f64;
@@ -144,6 +148,7 @@ impl FrameSignal {
                 None => true,
             },
             Ingress::Jpeg { bytes } => {
+                tracing::trace!(bytes, "jpeg frame");
                 let moved = state.last_jpeg.is_none_or(|last| (bytes as f64 - last as f64).abs() > last as f64 * JPEG_DELTA);
                 state.last_jpeg = Some(bytes);
                 moved
@@ -162,6 +167,7 @@ impl FrameSignal {
     /// A picture was dropped before the decoder: what it showed is unknown,
     /// so it counts as change.
     pub fn dropped(&self, now: Instant) {
+        tracing::trace!("video picture dropped before the decoder");
         self.lock().clock.last_motion_at = Some(now);
     }
 

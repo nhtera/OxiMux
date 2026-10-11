@@ -103,7 +103,7 @@ oximux sim tap --label "Sign In" --settle
 - A simulator says `settled`; Android and a real iPhone say `settled (frame)`
   (their accessibility reads are slow, so one read follows the screen going
   quiet).
-- The wait is capped (3 s on a simulator, 6 s on Android or an iPhone, 8 s
+- The wait is capped (5 s on a simulator, 6 s on Android or an iPhone, 8 s
   for `launch` and `open-url`; `--settle-timeout MS` changes it). When the
   cap runs out the verb still exits 0 and says why:
   `settle: timeout (frame-busy)` (the screen kept moving: a spinner, a video)

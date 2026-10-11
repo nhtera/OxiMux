@@ -13,7 +13,7 @@ pub struct SettleArgs {
     /// `-` went, with `@eN` refs to act on next.
     #[arg(long)]
     pub settle: bool,
-    /// The longest to wait for it (default 3000 on a simulator, 6000 on
+    /// The longest to wait for it (default 5000 on a simulator, 6000 on
     /// Android or an iPhone, 8000 for launch and open-url; at most 60000).
     #[arg(long, value_name = "MS", requires = "settle")]
     pub settle_timeout: Option<u32>,

@@ -41,7 +41,10 @@ const AX_GAP: Duration = Duration::from_millis(150);
 /// How often the frame clock is looked at while the screen moves.
 const TICK: Duration = Duration::from_millis(50);
 /// Settle caps: a simulator, Android or a real iPhone, and app verbs.
-const SIMULATOR_CAP: Duration = Duration::from_millis(3000);
+/// The simulator's 5 s, not 3: measured live, a tap that opens an app goes
+/// still about 2.7 s later (its animation, then the encoder's refresh key
+/// frame), and two agreeing reads come after that.
+const SIMULATOR_CAP: Duration = Duration::from_millis(5000);
 const SLOW_CAP: Duration = Duration::from_millis(6000);
 const APP_CAP: Duration = Duration::from_millis(8000);
 /// The longest an agent may ask any wait to be.
@@ -347,14 +350,14 @@ mod tests {
     use super::*;
     use oximux_remote_proto::simulator::SimTargetWire;
 
-    /// 3 s on a simulator, 6 s where reads are slow, 8 s for app verbs on
+    /// 5 s on a simulator, 6 s where reads are slow, 8 s for app verbs on
     /// any class; an explicit ask is clamped to 0.5–60 s.
     #[test]
     fn caps_follow_the_class_the_verb_and_the_ask() {
         let tap = SimCmdWire::Tap(SimTargetWire::Ref(1));
         let launch = SimCmdWire::Launch { bundle_id: "a.b".into(), relaunch: false };
         let url = SimCmdWire::OpenUrl { url: "https://a".into() };
-        assert_eq!(cap_for(&tap, false, 0), Duration::from_millis(3000));
+        assert_eq!(cap_for(&tap, false, 0), Duration::from_millis(5000));
         assert_eq!(cap_for(&tap, true, 0), Duration::from_millis(6000));
         assert_eq!((cap_for(&launch, false, 0), cap_for(&url, true, 0)), (APP_CAP, APP_CAP));
         assert_eq!(cap_for(&tap, true, 100), Duration::from_millis(500));
