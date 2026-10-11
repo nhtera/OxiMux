@@ -160,7 +160,21 @@ pub enum Query<'a> {
 /// exact match. `Query::Label` tries an exact match first, then falls back
 /// to a case-insensitive substring match — AX labels are often longer than
 /// what an agent or a human types (e.g. "Return to Settings" for "Settings").
+///
+/// An element on screen wins over one that is not: a real iPhone's home
+/// screen carries a zero-size twin of every icon ahead of the visible one,
+/// and tapping that twin's centre taps the top-left corner. Only when nothing
+/// on screen matches is a zero-size node returned.
 pub fn find<'a>(nodes: &'a [AxNode], query: Query<'_>) -> Option<&'a AxNode> {
+    find_where(nodes, query, is_on_screen).or_else(|| find_where(nodes, query, |_| true))
+}
+
+/// Whether `node` has an area (a zero-size frame is never on screen).
+pub fn is_on_screen(node: &AxNode) -> bool {
+    node.frame.w > 0.0 && node.frame.h > 0.0
+}
+
+fn find_where<'a>(nodes: &'a [AxNode], query: Query<'_>, shown: fn(&AxNode) -> bool) -> Option<&'a AxNode> {
     fn walk<'a>(nodes: &'a [AxNode], pred: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNode> {
         for n in nodes {
             if pred(n) {
@@ -173,10 +187,10 @@ pub fn find<'a>(nodes: &'a [AxNode], query: Query<'_>) -> Option<&'a AxNode> {
         None
     }
     match query {
-        Query::Id(id) => walk(nodes, &|n| n.identifier.as_deref() == Some(id)),
-        Query::Label(label) => walk(nodes, &|n| n.label.as_deref() == Some(label)).or_else(|| {
+        Query::Id(id) => walk(nodes, &|n| shown(n) && n.identifier.as_deref() == Some(id)),
+        Query::Label(label) => walk(nodes, &|n| shown(n) && n.label.as_deref() == Some(label)).or_else(|| {
             let needle = label.to_lowercase();
-            walk(nodes, &|n| n.label.as_deref().is_some_and(|l| l.to_lowercase().contains(&needle)))
+            walk(nodes, &|n| shown(n) && n.label.as_deref().is_some_and(|l| l.to_lowercase().contains(&needle)))
         }),
     }
 }

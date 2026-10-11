@@ -143,12 +143,18 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// through the attachment, so nothing else changed on the wire. A v25 host
 /// cannot decode the new buttons: see [`SIMULATOR_ANDROID_BUTTONS_MIN_VERSION`].
 ///
+/// v27: appended the simulator **verify loop** (`SimCmdWire::{Settled, AxRefs,
+/// Wait, Assert, AsCaller}`, `SimTargetWire::Ref`, the replies and errors they
+/// bring): an action that waits for the screen to go idle and reports what
+/// changed, stable `@eN` refs, and `wait`/`assert` in place of sleep-polling.
+/// A v26 host cannot decode them: see [`SIMULATOR_VERIFY_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -228,6 +234,13 @@ pub const SIMULATOR_MIN_VERSION: u32 = 25;
 /// command asks for: every other `sim` verb, and the iOS buttons, still work
 /// against a v25 host.
 pub const SIMULATOR_ANDROID_BUTTONS_MIN_VERSION: u32 = 26;
+
+/// The oldest host that serves the verify loop (`sim … --settle`, `ax -i`,
+/// `@eN` refs, `wait`, `assert`). Read by the **client** and gated on what the
+/// command asks for: the same verbs without those still work against a v25
+/// host. The host answers the v27 errors (`StaleRef`, `AssertFailed`,
+/// `TimedOut`) only to v27 verbs, so an older client never meets one.
+pub const SIMULATOR_VERIFY_MIN_VERSION: u32 = 27;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the

@@ -13,13 +13,14 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::adb::Adb;
 use super::input::{self, AndroidButton, Modifiers, Screen};
 use super::scrcpy_control::ControlMsg;
 use super::scrcpy_server::{self, StreamOptions};
 use super::scrcpy_video::{self, VideoEvent};
+use crate::keyframe::{FrameClock, FrameSignal, Ingress};
 use crate::protocol::Command;
 use crate::runner::SystemRunner;
 use crate::session::SessionEvent;
@@ -59,6 +60,9 @@ struct Inner {
     /// Decoded pictures so far (macOS decodes; elsewhere nothing is shown).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     frame_seq: AtomicU64,
+    /// When packets arrive and carry change (counted at the socket, paused
+    /// or not), and the key-frame gate.
+    frames: FrameSignal,
     wake: RwLock<Option<Wake>>,
     events_tx: Mutex<Option<mpsc::Sender<SessionEvent>>>,
     events: Mutex<Option<mpsc::Receiver<SessionEvent>>>,
@@ -138,6 +142,7 @@ impl AndroidSession {
             adb: adb.to_path_buf(),
             view: Mutex::new(View::default()),
             frame_seq: AtomicU64::new(0),
+            frames: FrameSignal::default(),
             wake: RwLock::new(None),
             events_tx: Mutex::new(Some(events_tx)),
             events: Mutex::new(Some(events)),
@@ -195,6 +200,12 @@ impl AndroidSession {
 
     pub fn take_events(&self) -> Option<mpsc::Receiver<SessionEvent>> {
         self.inner.events.lock().unwrap().take()
+    }
+
+    /// When packets last arrived, and last carried change (measured as they
+    /// arrive, before decoding, whether or not the session is paused).
+    pub fn frame_clock(&self) -> FrameClock {
+        self.inner.frames.clock()
     }
 
     /// The newest decoded picture, when newer than `seen`.
@@ -307,12 +318,17 @@ impl AndroidSession {
 
     /// Stop decoding (a hidden panel). Packets keep arriving and are dropped.
     pub fn pause(&self) -> Result<()> {
+        self.inner.frames.interrupted();
         self.inner.paused.store(true, Ordering::Release);
         Ok(())
     }
 
-    /// Decode again, starting from a key frame the encoder is asked for now.
+    /// Decode again, starting from a key frame the encoder is asked for now
+    /// (forced whatever the limiter says, but counted and tagged by it, so
+    /// it never reads as change on screen).
     pub fn resume(&self) -> Result<()> {
+        self.inner.frames.interrupted();
+        self.inner.frames.forced_key(Instant::now());
         self.inner.need_key.store(true, Ordering::Release);
         self.inner.paused.store(false, Ordering::Release);
         self.queue(&[ControlMsg::ResetVideo])
@@ -394,6 +410,18 @@ fn read_loop(inner: Arc<Inner>, mut video: TcpStream) {
             }
             Err(e) => break e.to_string(),
         };
+        if let VideoEvent::Media(packet) = &event
+            && !packet.config
+        {
+            let bytes = packet.data.len();
+            let ingress = if packet.key_frame {
+                Ingress::Key { bytes }
+            } else {
+                let pixels = inner.view.lock().unwrap().size.map(|(w, h)| u64::from(w) * u64::from(h));
+                Ingress::Delta { bytes, pixels }
+            };
+            inner.frames.frame(Instant::now(), ingress);
+        }
         match event {
             VideoEvent::Session { width, height, .. } => {
                 inner.view.lock().unwrap().size = Some((width, height));

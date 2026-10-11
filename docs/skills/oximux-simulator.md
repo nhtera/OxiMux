@@ -71,11 +71,9 @@ the screen instead: that goes around the user's decision.
 UDID=$(oximux sim status --json | jq -r .data.device.udid)
 xcodebuild -scheme MyApp -destination "platform=iOS Simulator,id=$UDID" -derivedDataPath build build
 oximux sim install build/Build/Products/Debug-iphonesimulator/MyApp.app
-oximux sim launch com.example.MyApp --relaunch
-oximux sim screenshot
-oximux sim ax
-oximux sim tap --label "Sign In"
-sleep 1
+oximux sim launch com.example.MyApp --relaunch --settle
+oximux sim ax -i
+oximux sim tap @e4 --settle
 oximux sim screenshot
 ```
 
@@ -84,8 +82,68 @@ oximux sim screenshot
 - `screenshot` saves a PNG under `$TMPDIR/oximux-sim/` and prints its path;
   open it to look. Keep that default: OxiMux hides those files from a phone
   mirroring your chat, but not a copy saved elsewhere with `--out PATH`.
-- Verbs return once the input is sent. The app then animates: wait a moment
-  (`sleep 1`) before the screenshot that checks the result.
+- A bare verb returns once the input is sent, before the app has reacted.
+  Add `--settle` (below) instead of `sleep`: it waits for the screen to go
+  idle and prints what changed.
+
+## Act and see what changed: `--settle`, refs, `wait`, `assert`
+
+`--settle` on `tap`, `swipe`, `type`, `button`, `rotate`, `launch` and
+`open-url` waits for the screen to stop changing, then prints the elements
+that appeared (`+`) and went (`-`), each with an `@eN` ref:
+
+```sh
+oximux sim tap --label "Sign In" --settle
+# ok tapped “Sign In” (201,612) settled 640ms
+# + @e31 TextField “Email”
+# + @e32 SecureTextField “Password”
+# = 12 unchanged
+```
+
+- A simulator says `settled`; Android and a real iPhone say `settled (frame)`
+  (their accessibility reads are slow, so one read follows the screen going
+  quiet).
+- The wait is capped (5 s on a simulator, 6 s on Android or an iPhone, 8 s
+  for `launch` and `open-url`; `--settle-timeout MS` changes it). When the
+  cap runs out the verb still exits 0 and says why:
+  `settle: timeout (frame-busy)` (the screen kept moving: a spinner, a video)
+  or `settle: timeout (ax-unstable)`, followed by the diff so far.
+
+**Refs.** `ax -i` lists only what can be acted on, each with a ref; a ref also
+appears on every `+` line of a settle. Use it instead of coordinates:
+
+```sh
+oximux sim ax -i
+oximux sim tap @e31
+oximux sim type @e31 "hello@example.com"
+oximux sim type @e32 "secret" --settle
+```
+
+- A ref keeps its number while its element is on screen, across settles and
+  across the device sleeping and waking. New elements get new numbers; a
+  number is never reused for another element.
+- A tap by ref finds the element where it is now. If it moved more than 8
+  points you get a `moved` warning (exit 0).
+- An element that is gone, or can no longer be told apart from a look-alike,
+  exits 1 with `stale-ref`: run `oximux sim ax -i` again.
+- Refs are your own when you run inside an OxiMux agent session; other agents
+  on the same worktree number their own.
+
+**Wait and check, no sleeping:**
+
+```sh
+oximux sim wait --label "Welcome" --timeout-ms 8000
+oximux sim wait @e7 --gone
+oximux sim assert --id title --text "Home"
+oximux sim assert @e12 --enabled
+oximux sim assert --label "Error" --gone
+```
+
+`wait` exits 0 once the element appears (or, `--gone`, goes away) and 4
+(`timeout`) when time runs out (default 10000 ms, at most 60000). `assert`
+checks once: exit 0, or 1 (`assert-failed`) with what it found. `--text`
+compares a field's value, else the element's label, exactly (surrounding
+spaces aside).
 
 ## Coordinates are points
 
@@ -179,6 +237,9 @@ oximux sim button volume-down
 | 1 | `no-device` | `oximux sim attach` |
 | 1 | `not-streaming` | the device is starting; retry in a few seconds |
 | 1 | `not-found` | `oximux sim ax` to see what is on screen |
+| 1 | `stale-ref` | the ref's element is gone; `oximux sim ax -i` for fresh refs |
+| 1 | `assert-failed` | the message says what was found instead |
+| 4 | `timeout` | `wait` ran out; `oximux sim ax -i` shows what is on screen |
 | 2 | `bad-input` | the message says what was wrong |
 | 3 | `unreachable` | the desktop app is not running, or local CLI access is off |
 
@@ -192,6 +253,9 @@ oximux sim button volume-down
   select Xcode 26. The Mobile Emulator panel shows the exact command for an
   Xcode 26 it finds; the general form, with their own app path, quoted, is
   `sudo xcode-select -s '/Applications/Xcode.app/Contents/Developer'`.
+- `--settle`, `ax -i`, `wait`, `assert` and a tap by ref print what is on
+  screen, like `ax`: OxiMux hides their output from a phone mirroring your
+  chat.
 - Screenshots and the AX tree go to your model provider. The user was told when
   they allowed it; do not sign in to real accounts on the simulator.
 - `oximux sim shutdown` refuses a device the user booted themselves. Do not add

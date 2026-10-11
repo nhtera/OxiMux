@@ -195,6 +195,8 @@ pub mod send;
 pub mod session_ctl;
 pub mod sessions;
 pub mod sim;
+pub mod sim_render;
+pub mod sim_verify;
 pub mod skills;
 pub mod state;
 pub mod status;

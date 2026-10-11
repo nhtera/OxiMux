@@ -31,6 +31,7 @@ use serde_json::Value;
 
 use crate::child_ledger::{Entry, Kind, Ledger};
 use crate::helper::{self, Handshake, Hello, HelperChild, HelperKind, HelperOptions};
+use crate::keyframe::{FrameClock, FrameSignal, Ingress};
 use crate::protocol::{self, AVCC_MIN_VERSION, Command, Event, Outbound, StreamFormat};
 use crate::{DeviceId, Orientation, Result, SimError};
 
@@ -80,6 +81,8 @@ struct Inner {
     hello: Hello,
     view: Mutex<View>,
     frame_seq: AtomicU64,
+    /// When pictures arrive and carry change, and the key-frame gate.
+    frames: FrameSignal,
     /// Bumped by every [`HelperSession::set_format`], so a JPEG fallback
     /// ends when the user asks for H.264 again.
     format_requests: AtomicU64,
@@ -187,6 +190,7 @@ impl HelperSession {
                 ..View::default()
             }),
             frame_seq: AtomicU64::new(0),
+            frames: FrameSignal::default(),
             format_requests: AtomicU64::new(0),
             video_dropped: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
@@ -266,6 +270,12 @@ impl HelperSession {
         Some((seq, frame))
     }
 
+    /// When pictures last arrived, and last carried change (measured as they
+    /// arrive, before decoding).
+    pub fn frame_clock(&self) -> FrameClock {
+        self.inner.frames.clock()
+    }
+
     /// Whether this helper can stream H.264 ([`StreamFormat::Avcc`]).
     pub fn supports_avcc(&self) -> bool {
         self.inner.hello.proto >= AVCC_MIN_VERSION
@@ -332,10 +342,15 @@ impl HelperSession {
     }
 
     pub fn pause(&self) -> Result<()> {
+        self.inner.frames.interrupted();
         self.send(&Command::Pause)
     }
 
+    /// Stream again. A key frame the restart brings is tagged by the
+    /// limiter, so it never reads as change on screen.
     pub fn resume(&self) -> Result<()> {
+        self.inner.frames.interrupted();
+        self.inner.frames.forced_key(Instant::now());
         self.send(&Command::Resume)
     }
 
@@ -469,15 +484,27 @@ fn dispatch_loop(
     for message in early.into_iter().map(Ok).chain(rx.iter()) {
         match message {
             Ok(Outbound::Frame(frame)) => {
+                inner.frames.frame(Instant::now(), Ingress::Jpeg { bytes: frame.jpeg.len() });
                 inner.view.lock().unwrap().shown = Some(FrameData::Jpeg(Arc::new(frame)));
                 inner.frame_seq.fetch_add(1, Ordering::AcqRel);
             }
             Ok(Outbound::Video(message)) => {
+                let now = Instant::now();
+                let bytes = message.data.len();
+                match message.tag {
+                    protocol::VideoTag::Description => {}
+                    protocol::VideoTag::Keyframe => inner.frames.frame(now, Ingress::Key { bytes }),
+                    protocol::VideoTag::Delta => {
+                        let pixels = Some(u64::from(message.width) * u64::from(message.height));
+                        inner.frames.frame(now, Ingress::Delta { bytes, pixels });
+                    }
+                }
                 // Never wait on the decoder: replies and events behind this
                 // picture must keep flowing. Decoded pictures wake the UI
                 // from the decoder's callback.
                 if let Err(mpsc::TrySendError::Full(_)) = video.try_send(message) {
                     inner.video_dropped.store(true, Ordering::Release);
+                    inner.frames.dropped(now);
                 }
                 continue;
             }

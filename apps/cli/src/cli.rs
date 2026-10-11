@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+pub use crate::cli_sim::{AssertArgs, SettleArgs, TapArg, WaitArgs};
+
 /// Exit codes, stated once. `2` is what clap itself exits with on a usage
 /// error, so the contract holds without wrapping the parser.
 pub mod exit {
@@ -837,11 +839,14 @@ pub enum SimCommand {
         /// At most this many elements.
         #[arg(long, default_value_t = 300, value_name = "N")]
         max: u32,
+        /// Only elements that can be acted on, each with an @eN ref.
+        #[arg(short = 'i', long)]
+        interactive: bool,
     },
-    /// Tap a point (x y, in points from the top-left), or the element with an
-    /// accessibility label or identifier.
+    /// Tap a point (x y, in points from the top-left), an @eN ref, or the
+    /// element with an accessibility label or identifier.
     Tap {
-        x: Option<f64>,
+        x: Option<TapArg>,
         y: Option<f64>,
         /// An accessibility label: exact match first, then a case-insensitive
         /// substring.
@@ -850,6 +855,8 @@ pub enum SimCommand {
         /// An accessibility identifier, exact.
         #[arg(long, value_name = "AXID", conflicts_with_all = ["x", "y"])]
         id: Option<String>,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
     /// Swipe from (x1, y1) to (x2, y2), in points. Starting at the very
     /// bottom edge is the home gesture.
@@ -860,23 +867,33 @@ pub enum SimCommand {
         y2: f64,
         #[arg(long, default_value_t = 300, value_name = "MS")]
         duration: u32,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
-    /// Type text into the focused field. Non-ASCII text is pasted.
+    /// Type text into the focused field (or, after an @eN ref, into that
+    /// element). Non-ASCII text is pasted.
     Type {
-        text: String,
+        #[arg(value_name = "[@eN] TEXT", num_args = 1..=2, required = true)]
+        text: Vec<String>,
         /// Paste through the device clipboard instead of typing key by key.
         #[arg(long)]
         paste: bool,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
     /// Press a hardware button.
     Button {
         #[arg(value_enum)]
         button: SimButtonArg,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
     /// Rotate the device.
     Rotate {
         #[arg(value_enum)]
         to: SimOrientationArg,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
     /// Launch an installed app by bundle id (Android: package name).
     Launch {
@@ -884,9 +901,21 @@ pub enum SimCommand {
         /// Terminate it first, so it starts fresh.
         #[arg(long)]
         relaunch: bool,
+        #[command(flatten)]
+        settle: SettleArgs,
     },
     /// Open a URL (http, https, or an app's own scheme; not file:).
-    OpenUrl { url: String },
+    OpenUrl {
+        url: String,
+        #[command(flatten)]
+        settle: SettleArgs,
+    },
+    /// Wait for an element to appear (or, --gone, to go): exit 0 once it
+    /// does, 4 when time runs out.
+    Wait(WaitArgs),
+    /// Check an element once: exit 0 if it holds, 1 (assert-failed) saying
+    /// what was found if not.
+    Assert(AssertArgs),
     /// Install a built .app (inside this worktree or Xcode's DerivedData) or,
     /// on Android, an .apk inside this worktree.
     Install { path: PathBuf },

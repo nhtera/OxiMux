@@ -115,6 +115,8 @@ fn new_hub(
         iphone_states: None,
         capture_starts: Default::default(),
         controls: Default::default(),
+        snapshots: Default::default(),
+        refs: Default::default(),
     })
 }
 

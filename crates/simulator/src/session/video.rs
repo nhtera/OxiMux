@@ -15,6 +15,9 @@ use std::sync::{Arc, mpsc};
 use super::{Inner, SessionEvent, notify};
 use crate::protocol::{self, Command, StreamFormat, Video};
 
+/// Any `configure` makes the helper's next picture a key frame.
+const KEY_FRAME: Command = Command::Configure { scale: None, fps: None, orientation: None, format: None };
+
 /// Pictures the dispatcher may queue ahead of the decoder.
 pub(super) const QUEUE: usize = 8;
 
@@ -23,12 +26,26 @@ pub(super) const QUEUE: usize = 8;
 #[cfg(target_os = "macos")]
 const MAX_DECODE_FAILURES: u32 = 3;
 
+/// How often a quiet stream checks for a key-frame request the limiter held
+/// (a helper that sends pictures only on change may send none to carry it).
+const HELD_KEY_CHECK: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub(super) fn decode_loop(inner: &Arc<Inner>, rx: &mpsc::Receiver<Video>, events: &mpsc::Sender<SessionEvent>) {
     let mut state = VideoState::default();
-    for message in rx {
-        if let Some(why) = state.handle(inner, message) {
-            let _ = events.send(SessionEvent::EncodingFallback(why));
-            notify(inner);
+    loop {
+        match rx.recv_timeout(HELD_KEY_CHECK) {
+            Ok(message) => {
+                if let Some(why) = state.handle(inner, message) {
+                    let _ = events.send(SessionEvent::EncodingFallback(why));
+                    notify(inner);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if inner.frames.poll_key(std::time::Instant::now()) {
+                    send_now(inner, &KEY_FRAME);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -55,6 +72,10 @@ impl VideoState {
         use std::sync::PoisonError;
         if !self.accepting(inner) {
             return None;
+        }
+        // A key frame held back by the limiter, now that its turn came.
+        if inner.frames.poll_key(std::time::Instant::now()) {
+            send_now(inner, &KEY_FRAME);
         }
         if inner.video_dropped.swap(false, Ordering::AcqRel) {
             self.want_key(inner);
@@ -127,13 +148,17 @@ impl VideoState {
         }
     }
 
-    /// Ask the helper for a key frame, once per break.
+    /// Ask the helper for a key frame, once per break, through the
+    /// session's limiter (one forced key frame a second, whoever asks): a
+    /// request too soon is held, and the next picture's [`Self::handle`]
+    /// sends it once allowed.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn want_key(&mut self, inner: &Inner) {
         if !self.need_key {
             self.need_key = true;
-            // Any `configure` makes the helper's next picture a key frame.
-            send_now(inner, &Command::Configure { scale: None, fps: None, orientation: None, format: None });
+            if inner.frames.request_key(std::time::Instant::now()) {
+                send_now(inner, &KEY_FRAME);
+            }
         }
     }
 
@@ -197,6 +222,7 @@ mod tests {
             hello: Hello { proto: 2, version: "test".into(), xcode: None },
             view: Mutex::default(),
             frame_seq: AtomicU64::new(0),
+            frames: crate::keyframe::FrameSignal::default(),
             format_requests: AtomicU64::new(0),
             video_dropped: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
@@ -262,12 +288,20 @@ mod tests {
             assert_eq!(state.handle(&inner, message(VideoTag::Delta, vec![0, 0, 0, 1, 0x41])), None);
         }
         assert_eq!(sent(&rx), [json!({"cmd": "configure"})]);
-        // A picture dropped at the full queue asks again, once.
+        // A picture dropped at the full queue asks again, once — held by the
+        // limiter while it is within a second of the last forced key frame...
         state.need_key = false;
         inner.video_dropped.store(true, Ordering::Release);
         let (record, _) = fixture();
-        state.handle(&inner, message(VideoTag::Description, record));
+        state.handle(&inner, message(VideoTag::Description, record.clone()));
+        assert!(sent(&rx).is_empty(), "too soon after the last: held");
+        // ...and sent by the next picture once a second has passed.
+        let past = std::time::Instant::now() - crate::keyframe::MIN_FORCED_GAP * 2;
+        inner.frames.forced_key(past);
+        state.handle(&inner, message(VideoTag::Description, record.clone()));
         assert_eq!(sent(&rx), [json!({"cmd": "configure"})]);
+        state.handle(&inner, message(VideoTag::Description, record));
+        assert!(sent(&rx).is_empty(), "released once");
         stop(&inner);
     }
 
@@ -279,7 +313,8 @@ mod tests {
         let bad = || message(VideoTag::Description, vec![1, 2, 3]);
         assert_eq!(state.handle(&inner, bad()), None);
         assert_eq!(state.handle(&inner, bad()), None);
-        assert_eq!(sent(&rx), [json!({"cmd": "configure"}), json!({"cmd": "configure"})]);
+        // The second ask comes within a second of the first: the limiter holds it.
+        assert_eq!(sent(&rx), [json!({"cmd": "configure"})]);
         let why = state.handle(&inner, bad()).expect("the third failure falls back");
         assert!(why.contains("streaming JPEG"), "{why}");
         assert_eq!(sent(&rx), [json!({"cmd": "configure", "format": "jpeg"})]);

@@ -23,6 +23,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::simulator_verify::{
+    SimCheckWire, SimDiffLineWire, SimDiffOpWire, SimRefNodeWire, SimSettleOutcomeWire, SimSettleWire,
+};
+
 /// [`Request::Simulator`](crate::proto::Request::Simulator) payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimRequestWire {
@@ -68,6 +72,29 @@ pub enum SimCmdWire {
     /// Shut the device down. A device the user booted is refused unless
     /// `force`.
     Shutdown { force: bool },
+    // v27: the verify loop.
+    /// Run `action` (tap, swipe, type, button, rotate, launch, open-url), wait
+    /// up to `timeout_ms` (0: the device class's default) for the screen to go
+    /// idle, and report what changed.
+    Settled {
+        #[serde(deserialize_with = "crate::simulator_verify::nested")]
+        action: Box<SimCmdWire>,
+        timeout_ms: u32,
+    },
+    /// The elements that can be acted on, at most `max`, each with its `@eN`
+    /// ref.
+    AxRefs { max: u32 },
+    /// Wait up to `timeout_ms` for an element to appear (or, `gone`, to go).
+    Wait { target: SimTargetWire, gone: bool, timeout_ms: u32 },
+    /// Check an element once.
+    Assert { target: SimTargetWire, check: SimCheckWire },
+    /// `cmd` on behalf of one caller (a hash of its agent session), whose
+    /// refs are its own. Outermost only.
+    AsCaller {
+        caller: u64,
+        #[serde(deserialize_with = "crate::simulator_verify::nested")]
+        cmd: Box<SimCmdWire>,
+    },
 }
 
 impl SimCmdWire {
@@ -94,6 +121,8 @@ pub enum SimTargetWire {
     Label(String),
     /// An accessibility identifier, exact.
     Id(String),
+    /// v27: an `@eN` ref from `ax -i` or a settle diff, re-resolved when used.
+    Ref(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +158,11 @@ pub enum SimReplyWire {
     /// screenshot).
     Screenshot { png: Vec<u8>, width: u32, height: u32, scale: f64 },
     Ax(Vec<SimAxNodeWire>),
+    // v27: the verify loop.
+    Settled(SimSettleWire),
+    AxRefs(Vec<SimRefNodeWire>),
+    /// A `wait` or `assert` held: the element (`None` once gone).
+    Matched { node: Option<SimAxNodeWire>, elapsed_ms: u32 },
 }
 
 /// One simulator device.
@@ -216,6 +250,13 @@ pub enum SimErrorWire {
     /// Not done on the user's behalf without being asked (shutting down a
     /// device the user booted): the message says how to ask explicitly.
     Refused(String),
+    // v27: the verify loop's failures (only ever for v27 verbs).
+    /// An `@eN` ref whose element is gone, or no longer told apart.
+    StaleRef(String),
+    /// `assert` did not hold: the message says what was found.
+    AssertFailed(String),
+    /// `wait` ran out.
+    TimedOut(String),
 }
 
 impl std::fmt::Display for SimErrorWire {
@@ -237,6 +278,7 @@ impl std::fmt::Display for SimErrorWire {
             Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::BadInput(why) => f.write_str(why),
             Self::Failed(why) | Self::Refused(why) => f.write_str(why),
+            Self::StaleRef(why) | Self::AssertFailed(why) | Self::TimedOut(why) => f.write_str(why),
         }
     }
 }

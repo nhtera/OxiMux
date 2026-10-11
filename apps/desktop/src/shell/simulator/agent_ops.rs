@@ -33,7 +33,11 @@ use crate::platform::window_registry;
 use crate::workspace_root::WorkspaceRoot;
 
 mod android;
+mod ax_lookup;
+mod checks;
+mod guards;
 mod iphone;
+mod settle;
 mod verbs;
 
 /// `simctl` listing timeout.
@@ -97,7 +101,9 @@ pub async fn run(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Sim
             hub.update(cx, |hub, cx| hub.agent_verb_started(&udid, cx));
             let worktree = target.worktree.clone();
             with_root(cx, &target, move |root, _, cx| root.reveal_simulator_for(&worktree, Trigger::Verb, cx));
-            let out = verbs::run(&hub, &udid, &name, control, &target, cx).await;
+            // A v27 error never reaches a verb an older client could send.
+            let asked = control.clone();
+            let out = verbs::run(&hub, &udid, &name, control, &target, cx).await.map_err(|e| e.for_verb(&asked));
             hub.update(cx, |hub, cx| hub.agent_verb_finished(&udid, cx));
             out
         }
