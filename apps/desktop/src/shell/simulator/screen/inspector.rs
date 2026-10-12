@@ -161,8 +161,9 @@ impl ScreenView {
                     let held = this.update_in(cx, |view, window, cx| {
                         // Released, OxiMux left meanwhile (a release then
                         // reaches nothing), or the pointer left the screen
-                        // (its moves then reach no listener).
-                        let on_screen = view.display_point(window.mouse_position(), false).is_some();
+                        // (its moves then reach no listener) — unless a press
+                        // is held: it may yet become a pinch from the edge.
+                        let on_screen = view.inspector.press.is_some() || view.display_point(window.mouse_position(), false).is_some();
                         let held = window.modifiers().alt && window.is_window_active() && on_screen;
                         if !held {
                             view.disarm(cx);
