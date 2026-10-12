@@ -159,9 +159,11 @@ impl ScreenView {
                 loop {
                     cx.background_executor().timer(RELEASE_POLL).await;
                     let held = this.update_in(cx, |view, window, cx| {
-                        // Released, or OxiMux left meanwhile (a release then
-                        // reaches nothing).
-                        let held = window.modifiers().alt && window.is_window_active();
+                        // Released, OxiMux left meanwhile (a release then
+                        // reaches nothing), or the pointer left the screen
+                        // (its moves then reach no listener).
+                        let on_screen = view.display_point(window.mouse_position(), false).is_some();
+                        let held = window.modifiers().alt && window.is_window_active() && on_screen;
                         if !held {
                             view.disarm(cx);
                         }
@@ -213,31 +215,49 @@ impl ScreenView {
     /// from another orientation).
     fn refresh_tree(&mut self, device: &DeviceId, cx: &mut Context<Self>) {
         let Some(session) = self.session(cx) else { return };
-        let fresh = if session.android().is_some() || session.ios_device().is_some() { FRESH_SLOW } else { FRESH };
+        let fresh = Self::fresh_for(&session);
         let usable = self.usable_tree(cx).is_some();
-        let current = usable && self.inspector.tree.as_ref().is_some_and(|t| t.read_at.elapsed() < fresh);
+        let current = self.tree_current(cx);
         let tried = self.inspector.attempted.as_ref().is_some_and(|(d, at)| d == device && at.elapsed() < fresh);
         // A real iPhone's runner does one job at a time: while it is busy
         // (an agent's verb, a tap), the tree in hand is kept, marked cached.
-        let busy = matches!(self.hub.read(cx).control_state(device), ControlState::On { busy: true });
-        self.inspector.cached = busy && usable;
+        let busy = self.runner_busy(device, cx);
+        if self.inspector.cached != (busy && usable) {
+            self.inspector.cached = busy && usable;
+            cx.notify();
+        }
         if current || tried || busy || self.inspector.reading {
             return;
         }
         self.inspector.reading = true;
         self.inspector.attempted = Some((device.clone(), Instant::now()));
+        // The way the screen is turned as the read starts: a tree read one
+        // way is never placed on a screen turned the other.
+        let orientation = session.orientation();
         let read = self.hub.update(cx, |hub, cx| hub.read_tree(device, &session, None, READ_TIMEOUT, cx));
         let (device, hub) = (device.clone(), self.hub.clone());
         cx.spawn(async move |this, cx| {
             let tree = read.await;
             let _ = this.update(cx, |view, cx| {
                 view.inspector.reading = false;
+                cx.notify();
                 // A tree for a device switched away from is dropped.
                 if view.binding.device.as_ref() != Some(&device) {
                     return;
                 }
+                let session = view.session(cx);
+                if session.as_ref().is_some_and(|s| s.orientation() != orientation) {
+                    // Turned mid-read: read again, the pending click (made
+                    // on the other screen) dropped.
+                    view.inspector.attempted = None;
+                    view.inspector.pending_pick = None;
+                    if view.inspector.armed {
+                        view.refresh_tree(&device, cx);
+                    }
+                    return view.retest(cx);
+                }
                 match tree {
-                    Ok(nodes) => match view.session(cx).and_then(|s| mapping(&hub, &device, &s, &nodes, cx)) {
+                    Ok(nodes) => match session.and_then(|s| mapping(&hub, &device, &s, orientation, &nodes, cx)) {
                         Some(map) => {
                             view.inspector.unavailable = None;
                             view.inspector.tree = Some(Tree { device, read_at: Instant::now(), nodes, map });
@@ -258,6 +278,22 @@ impl ScreenView {
         .detach();
     }
 
+    /// How long a tree read from `session` stays current.
+    fn fresh_for(session: &oximux_simulator::session::StreamSession) -> Duration {
+        if session.android().is_some() || session.ios_device().is_some() { FRESH_SLOW } else { FRESH }
+    }
+
+    /// A real iPhone's runner is busy with another job.
+    fn runner_busy(&self, device: &DeviceId, cx: &Context<Self>) -> bool {
+        matches!(self.hub.read(cx).control_state(device), ControlState::On { busy: true })
+    }
+
+    /// The tree in hand is usable and young enough to stand for the screen.
+    fn tree_current(&self, cx: &Context<Self>) -> bool {
+        let Some(session) = self.session(cx) else { return false };
+        self.usable_tree(cx).is_some_and(|t| t.read_at.elapsed() < Self::fresh_for(&session))
+    }
+
     /// The tree in hand, if it is the shown device's in its current
     /// orientation (else its outlines would land on the wrong things).
     fn usable_tree(&self, cx: &Context<Self>) -> Option<&Tree> {
@@ -272,7 +308,11 @@ impl ScreenView {
             (Some(tree), Some(pt), true) => picked_at(tree, pt),
             _ => None,
         };
-        let changed = hover.as_ref().map(|h| h.rect) != self.inspector.hover.as_ref().map(|h| h.rect);
+        // What the outline and its chip show.
+        let changed = match (&hover, &self.inspector.hover) {
+            (Some(a), Some(b)) => a.rect != b.rect || a.node != b.node || a.selector != b.selector,
+            (a, b) => a.is_some() != b.is_some(),
+        };
         self.inspector.hover = hover;
         if changed {
             cx.notify();
@@ -283,7 +323,14 @@ impl ScreenView {
     /// its tree lands.
     pub(super) fn pick_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(pt) = self.display_point(pos, false) else { return };
-        match self.usable_tree(cx).and_then(|t| picked_at(t, pt)) {
+        let Some(device) = self.binding.device.clone() else { return };
+        // An old tree may be another screen's (the app moved on): the click
+        // waits for a new one — but a busy iPhone's cached tree stands.
+        let stands = self.tree_current(cx) || self.runner_busy(&device, cx);
+        if !stands {
+            self.refresh_tree(&device, cx);
+        }
+        match self.usable_tree(cx).filter(|_| stands).and_then(|t| picked_at(t, pt)) {
             Some(picked) => cx.emit(super::ScreenEvent::Picked(picked)),
             None if self.inspector.reading => self.inspector.pending_pick = Some(pt),
             None => {}
@@ -334,7 +381,7 @@ impl ScreenView {
             .h(px(r.h as f32))
             .border_2()
             .border_color(theme.status_info)
-            .rounded(px(2.));
+            .rounded(px(self.density.r_chip));
         // Kept on the screen: a tall element (a map, the app's root) would
         // push it below the frame.
         let chip_top = (if above { r.y - 24.0 } else { r.y + r.h + 4.0 }).clamp(fit.y + 2.0, (fit.y + fit.h - 24.0).max(fit.y + 2.0));
@@ -362,18 +409,19 @@ fn picked_at(tree: &Tree, pt: (f64, f64)) -> Option<Picked> {
     })
 }
 
-/// How `nodes`' frames map onto `session`'s screen; `None` before its size
-/// or scale is known.
+/// How `nodes`' frames map onto `session`'s screen, turned `orientation`;
+/// `None` before its size or scale is known.
 fn mapping(
     hub: &gpui::Entity<crate::shell::simulator::hub::SimulatorHub>,
     device: &DeviceId,
     session: &oximux_simulator::session::StreamSession,
+    orientation: Orientation,
     nodes: &[AxNode],
     cx: &gpui::App,
 ) -> Option<Mapping> {
     let root = nodes.first().map(|n| Size::new(n.frame.w, n.frame.h)).filter(|s| s.w > 0.0 && s.h > 0.0)?;
     let (w, h) = session.framebuffer_size()?;
-    let (orientation, portrait) = (session.orientation(), Size::new(f64::from(w), f64::from(h)));
+    let portrait = Size::new(f64::from(w), f64::from(h));
     let scale = hub
         .read(cx)
         .scale(device)

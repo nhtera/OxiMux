@@ -127,7 +127,9 @@ pub fn crop(png: &[u8], rect: (f64, f64, f64, f64), pad: u32) -> Result<Vec<u8>,
     if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
         return Err("the element is off the screen".into());
     }
-    let cut = image.crop_imm(x0 as u32, y0 as u32, (x1 - x0).round() as u32, (y1 - y0).round() as u32);
+    // Whole pixels that cover the element: start down, end up.
+    let (x0, y0, x1, y1) = (x0.floor(), y0.floor(), x1.ceil().min(w), y1.ceil().min(h));
+    let cut = image.crop_imm(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
     let mut out = Vec::new();
     cut.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| e.to_string())?;
     Ok(out)
@@ -169,6 +171,8 @@ mod tests {
         // At the top-left corner the padding stops at the image.
         assert_eq!(size_of(&crop(&shot, (0.0, 0.0, 0.25, 0.0625), 10).unwrap()), (110, 60));
         assert!(crop(&shot, (2.0, 2.0, 0.1, 0.1), 0).is_err(), "off the image");
+        // x 100.9 → 150.2 covers pixels 100 to 150: 51 wide, none clipped.
+        assert_eq!(size_of(&crop(&shot, (100.9 / 400.0, 0.5, 49.3 / 400.0, 0.0625), 0).unwrap()).0, 51);
     }
 
     fn white(w: u32, h: u32) -> RgbaImage {

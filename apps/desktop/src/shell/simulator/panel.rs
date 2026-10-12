@@ -101,6 +101,10 @@ pub struct SimulatorPanel {
     /// The element the user ⌥-clicked, and its crop once taken.
     picked: Option<super::screen::Picked>,
     picked_png: Option<Vec<u8>>,
+    /// Counts picks: a crop is kept only for the pick it was taken for.
+    pick_seq: u64,
+    /// The picked element's crop is being taken (Send waits for it).
+    cropping: bool,
     _screen_events: Option<Subscription>,
     /// Devices whose "still no picture" hint the user dismissed.
     recovery_dismissed: std::collections::HashSet<DeviceId>,
@@ -170,6 +174,8 @@ impl SimulatorPanel {
             recovery_dismissed: Default::default(),
             picked: None,
             picked_png: None,
+            pick_seq: 0,
+            cropping: false,
             _screen_events: None,
             theme,
             density,

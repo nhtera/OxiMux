@@ -1,7 +1,8 @@
 //! The element the user ⌥-clicked on the screen (see `screen::inspector`):
 //! a card with what it is, the command that reaches it, and Send to agent /
-//! Copy selector. The crop is taken when the element is picked, so Send
-//! dispatches at once, to the chat active at the click.
+//! Copy selector. The crop is taken when the element is picked; Send waits
+//! for it (a moment), then dispatches at once, to the chat active at the
+//! click.
 
 use std::time::Duration;
 
@@ -24,8 +25,14 @@ impl SimulatorPanel {
     /// An ⌥-click picked `picked`: show it, and take its crop now.
     pub(super) fn picked(&mut self, picked: Picked, cx: &mut Context<Self>) {
         self.picked_png = None;
-        if let Some(session) = self.hub.as_ref().and_then(|hub| hub.read(cx).session(&picked.device)) {
-            let (rect, id) = (picked.rect, picked.node.clone());
+        // Each pick its own: a crop landing late (an earlier pick of the same
+        // element, or another device's) never attaches to this one.
+        self.pick_seq += 1;
+        let seq = self.pick_seq;
+        let session = self.hub.as_ref().and_then(|hub| hub.read(cx).session(&picked.device));
+        self.cropping = session.is_some();
+        if let Some(session) = session {
+            let rect = picked.rect;
             // Points to pixels: the element is `rect.w` of the screen's
             // width and `points.w` points wide.
             let points_w = picked.points.w.max(1.0);
@@ -41,11 +48,11 @@ impl SimulatorPanel {
                     })
                     .await;
                 let _ = this.update(cx, |panel, cx| {
-                    // Still the element it was taken for.
-                    if let Some(crop) = crop
-                        && panel.picked.as_ref().is_some_and(|p| p.node == id)
-                    {
-                        panel.picked_png = Some(crop);
+                    // Still the pick it was taken for; failed, Send goes
+                    // without it.
+                    if panel.pick_seq == seq && panel.picked.is_some() {
+                        panel.cropping = false;
+                        panel.picked_png = crop;
                         cx.notify();
                     }
                 });
@@ -75,7 +82,15 @@ impl SimulatorPanel {
                 cx.notify();
             })))
             .child(Button::new("sim-pick-copy").small().label("Copy selector").on_click(cx.listener(|this, _, _, cx| this.copy_selector(cx))))
-            .child(Button::new("sim-pick-send").primary().small().label("Send to agent").on_click(cx.listener(|this, _, window, cx| this.send_picked(window, cx))));
+            .child(
+                Button::new("sim-pick-send")
+                    .primary()
+                    .small()
+                    .label("Send to agent")
+                    // The crop is on its way.
+                    .loading(self.cropping)
+                    .on_click(cx.listener(|this, _, window, cx| this.send_picked(window, cx))),
+            );
         Some(
             div()
                 .flex()
