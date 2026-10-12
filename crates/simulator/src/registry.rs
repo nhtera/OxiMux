@@ -512,6 +512,11 @@ impl<S: Clone> Registry<S> {
         out
     }
 
+    /// A visible panel shows `udid`, streaming or not.
+    pub fn is_shown(&self, udid: &DeviceId) -> bool {
+        self.devices.get(udid).is_some_and(|d| !d.visible.is_empty())
+    }
+
     /// Every device a visible panel shows while it streams.
     pub fn shown_live(&self) -> Vec<DeviceId> {
         let mut out: Vec<_> = self

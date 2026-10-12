@@ -64,6 +64,9 @@ pub enum Action {
 pub struct Seen {
     /// A panel shows it and its stream is live (so not paused).
     pub shown_live: bool,
+    /// Its stream is (re)starting — booting, or the helper handshaking —
+    /// as after the ladder's own restart: progress is kept meanwhile.
+    pub starting: bool,
     /// The stream it is ([`Phase::Live`]'s generation).
     pub generation: u64,
     /// Pictures since the stream started.
@@ -119,11 +122,19 @@ impl Recovery {
         self.clock = None;
     }
 
-    /// The boot did not finish in time (a slow first boot, say): rebooting
-    /// it now would only interrupt it, so the ladder ends at the hint.
-    pub fn boot_wait_failed(&mut self) {
+    /// The boot did not finish in time (a slow first boot, say), or the
+    /// shutdown was never confirmed: going on would only interrupt it, so
+    /// the ladder ends at the hint.
+    pub fn give_up(&mut self) {
         self.finished();
         self.step = Step::Hint;
+    }
+
+    /// The stream a step was for is gone (replaced, hidden, stopped) or
+    /// showed a picture: back to watching, for whatever comes next.
+    pub fn reset(&mut self) {
+        self.finished();
+        self.step = Step::Watching;
     }
 
     /// One look at the device; what to do now.
@@ -138,9 +149,10 @@ impl Recovery {
         }
         if !seen.shown_live {
             // Not shown (hidden, detached, stopped, failed): no clock, and
-            // no stale "waiting…" line; a running step finishes on its own.
+            // no stale "waiting…" line; a running step finishes on its own,
+            // and a restart (the ladder's own) keeps the progress made.
             self.clock = None;
-            if self.busy.is_none() && matches!(self.step, Step::WaitingForBoot | Step::Rebooting) {
+            if self.busy.is_none() && !seen.starting && matches!(self.step, Step::WaitingForBoot | Step::Rebooting) {
                 self.step = Step::Watching;
             }
             return Action::None;
@@ -189,11 +201,15 @@ impl SimulatorHub {
         self.recovery.entry(udid.clone()).or_default().decoder_trouble(generation);
     }
 
-    /// What the hub sees of `udid` now (`None`: no live stream).
-    fn seen(&self, udid: &DeviceId, shown: &[DeviceId]) -> Option<Seen> {
-        let (Phase::Live { generation }, Some(session)) = (self.registry.phase(udid), self.session(udid)) else { return None };
+    /// What the hub sees of `udid` now.
+    fn seen(&self, udid: &DeviceId, shown: &[DeviceId]) -> Seen {
+        let phase = self.registry.phase(udid);
+        let starting = matches!(phase, Phase::Booting { .. } | Phase::Starting { .. });
+        let (Phase::Live { generation }, Some(session)) = (phase, self.session(udid)) else {
+            return Seen { shown_live: false, starting, generation: 0, seq: 0, epoch: 0, owned: false };
+        };
         let clock = session.frame_clock();
-        Some(Seen { shown_live: shown.contains(udid), generation, seq: clock.seq, epoch: clock.epoch, owned: self.is_owned(udid) })
+        Seen { shown_live: shown.contains(udid), starting, generation, seq: clock.seq, epoch: clock.epoch, owned: self.is_owned(udid) }
     }
 
     /// A step's ending may act on `udid` only if nothing changed meanwhile:
@@ -201,7 +217,8 @@ impl SimulatorHub {
     /// erased, not stopped by the user.
     fn still_blank(&self, udid: &DeviceId, generation: u64) -> bool {
         let shown = self.registry.shown_live();
-        let unchanged = self.seen(udid, &shown).is_some_and(|s| s.shown_live && s.generation == generation && !s.shown_a_picture());
+        let seen = self.seen(udid, &shown);
+        let unchanged = seen.shown_live && seen.generation == generation && !seen.shown_a_picture();
         unchanged && !self.erasing(udid) && !self.is_stopped_by_user(udid)
     }
 
@@ -216,7 +233,7 @@ impl SimulatorHub {
         let mut udids: Vec<DeviceId> = shown.iter().filter(|u| u.source() == Source::Simctl).cloned().collect();
         udids.extend(self.recovery.keys().filter(|u| !shown.contains(u)).cloned());
         for udid in udids {
-            let seen = self.seen(&udid, &shown).unwrap_or(Seen { shown_live: false, generation: 0, seq: 0, epoch: 0, owned: false });
+            let seen = self.seen(&udid, &shown);
             tracing::trace!(%udid, shown = seen.shown_live, generation = seen.generation, epoch = seen.epoch, seq = seen.seq, "recovery look");
             let recovery = self.recovery.entry(udid.clone()).or_default();
             let before = recovery.step();
@@ -248,17 +265,22 @@ impl SimulatorHub {
         cx.spawn(async move |this, cx| {
             let booted = cx.background_executor().spawn(async move { simctl::bootstatus(runner.as_ref(), &sim, BOOT_WAIT) }).await;
             let _ = this.update(cx, |hub, cx| {
-                if let Err(e) = booted {
-                    tracing::info!(%udid, "bootstatus: {e}");
-                    if let Some(recovery) = hub.recovery.get_mut(&udid) {
-                        recovery.boot_wait_failed();
+                let blank = hub.still_blank(&udid, generation);
+                let Some(recovery) = hub.recovery.get_mut(&udid) else { return };
+                match booted {
+                    // The stream it was for is gone or fine: start over for
+                    // whatever comes next.
+                    _ if !blank => recovery.reset(),
+                    Err(e) => {
+                        tracing::info!(%udid, "bootstatus: {e}");
+                        recovery.give_up();
                     }
-                    return cx.emit(HubEvent::Changed(udid.clone()));
+                    Ok(()) => {
+                        recovery.finished();
+                        hub.reconnect(&udid, cx);
+                    }
                 }
-                if hub.still_blank(&udid, generation) {
-                    hub.reconnect(&udid, cx);
-                }
-                hub.finish_step(&udid, cx);
+                cx.emit(HubEvent::Changed(udid.clone()));
             });
         })
         .detach();
@@ -270,26 +292,35 @@ impl SimulatorHub {
     /// stopped it, an erase began or nothing shows it any more.
     fn reboot_blank(&mut self, udid: &DeviceId, generation: u64, cx: &mut Context<Self>) {
         if !self.still_blank(udid, generation) {
-            return self.finish_step(udid, cx);
+            if let Some(recovery) = self.recovery.get_mut(udid) {
+                recovery.reset();
+            }
+            return cx.emit(HubEvent::Changed(udid.clone()));
         }
         tracing::info!(%udid, "still no picture: rebooting the simulator once");
         self.shutdown_after_recording(udid, cx);
         let udid = udid.clone();
         cx.spawn(async move |this, cx| {
             let deadline = Instant::now() + BOOT_WAIT;
-            loop {
+            let off = loop {
                 cx.background_executor().timer(Duration::from_millis(500)).await;
                 let Ok(off) = this.update(cx, |hub, _| hub.watch.lock().unwrap().is_booted(&udid) == Some(false)) else { return };
                 if off || Instant::now() >= deadline {
-                    break;
+                    break off;
                 }
-            }
+            };
             let _ = this.update(cx, |hub, cx| {
-                let wanted = hub.registry.attached_devices().contains(&udid);
-                if wanted && !hub.is_stopped_by_user(&udid) && !hub.erasing(&udid) {
+                // Booted again only once it is off, and only for a panel
+                // that still shows it: hidden, stopped by the user or being
+                // erased, it stays as it is.
+                let wanted = hub.registry.is_shown(&udid) && !hub.is_stopped_by_user(&udid) && !hub.erasing(&udid);
+                if off && wanted {
                     hub.reconnect_as(&udid, false, cx);
                 }
-                hub.finish_step(&udid, cx);
+                if let Some(recovery) = hub.recovery.get_mut(&udid) {
+                    if off { recovery.finished() } else { recovery.give_up() }
+                }
+                cx.emit(HubEvent::Changed(udid.clone()));
             });
         })
         .detach();
@@ -313,7 +344,7 @@ mod tests {
     use super::*;
 
     fn seen(seq: u64, epoch: u64, owned: bool) -> Seen {
-        Seen { shown_live: true, generation: 1, seq, epoch, owned }
+        Seen { shown_live: true, starting: false, generation: 1, seq, epoch, owned }
     }
 
     /// Looks every 2 s for `secs`, as the hub does; the actions asked for.
@@ -359,7 +390,7 @@ mod tests {
     fn a_boot_that_does_not_finish_is_never_rebooted() {
         let (mut r, t) = (Recovery::default(), Instant::now());
         assert_eq!(run(&mut r, t, 12, seen(0, 0, true)), [Action::WaitForBoot]);
-        r.boot_wait_failed();
+        r.give_up();
         assert!(run(&mut r, t + Duration::from_secs(70), 30, seen(0, 0, true)).is_empty());
         assert_eq!(r.step(), Step::Hint);
     }
@@ -391,6 +422,19 @@ mod tests {
         r.finished();
         r.observe(t + Duration::from_secs(20), Seen { shown_live: false, ..seen(0, 0, true) });
         assert_eq!(r.step(), Step::Watching);
+    }
+
+    #[test]
+    fn the_ladders_own_restart_keeps_its_progress() {
+        let (mut r, t) = (Recovery::default(), Instant::now());
+        assert_eq!(run(&mut r, t, 12, seen(0, 0, true)), [Action::WaitForBoot]);
+        r.finished();
+        // The restarted stream handshakes for a while: still on the first rung.
+        r.observe(t + Duration::from_secs(20), Seen { shown_live: false, starting: true, ..seen(0, 0, true) });
+        assert_eq!(r.step(), Step::WaitingForBoot);
+        // Live again and still blank: the next rung, not the first again.
+        let next = Seen { generation: 2, ..seen(0, 0, true) };
+        assert_eq!(run(&mut r, t + Duration::from_secs(30), 12, next), [Action::Reboot]);
     }
 
     #[test]
