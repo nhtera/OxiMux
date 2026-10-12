@@ -668,10 +668,11 @@ The accessibility tree: every element's role, label, identifier and frame (point
 | --- | --- | --- |
 | `--flat` | no | One line per element, without the tree's indentation |
 | `--max` | yes | At most this many elements |
+| `--interactive` | no | Only elements that can be acted on, each with an @eN ref |
 
 #### `oximux sim tap`
 
-Tap a point (x y, in points from the top-left), or the element with an accessibility label or identifier
+Tap a point (x y, in points from the top-left), an @eN ref, or the element with an accessibility label or identifier
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -679,6 +680,8 @@ Tap a point (x y, in points from the top-left), or the element with an accessibi
 | `<Y>` | yes |  |
 | `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring |
 | `--id` | yes | An accessibility identifier, exact |
+| `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
+| `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
 
 #### `oximux sim swipe`
 
@@ -691,15 +694,19 @@ Swipe from (x1, y1) to (x2, y2), in points. Starting at the very bottom edge is 
 | `<X2>` | yes |  |
 | `<Y2>` | yes |  |
 | `--duration` | yes |  |
+| `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
+| `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
 
 #### `oximux sim type`
 
-Type text into the focused field. Non-ASCII text is pasted
+Type text into the focused field (or, after an @eN ref, into that element). Non-ASCII text is pasted
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<TEXT>` | yes |  |
 | `--paste` | no | Paste through the device clipboard instead of typing key by key |
+| `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
+| `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
 
 #### `oximux sim button`
 
@@ -708,6 +715,8 @@ Press a hardware button
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<BUTTON>` | yes |  |
+| `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
+| `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
 
 #### `oximux sim rotate`
 
@@ -716,6 +725,8 @@ Rotate the device
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<TO>` | yes |  |
+| `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
+| `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
 
 #### `oximux sim launch`
 
@@ -725,6 +736,8 @@ Launch an installed app by bundle id (Android: package name)
 | --- | --- | --- |
 | `<BUNDLE_ID>` | yes |  |
 | `--relaunch` | no | Terminate it first, so it starts fresh |
+| `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
+| `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
 
 #### `oximux sim open-url`
 
@@ -733,6 +746,33 @@ Open a URL (http, https, or an app's own scheme; not file:)
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<URL>` | yes |  |
+| `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
+| `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
+
+#### `oximux sim wait`
+
+Wait for an element to appear (or, --gone, to go): exit 0 once it does, 4 when time runs out
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<R>` | yes | An `@eN` ref |
+| `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring |
+| `--id` | yes | An accessibility identifier, exact |
+| `--gone` | no | Wait for it to go away instead |
+| `--timeout-ms` | yes | Give up after this long (at most 60000) |
+
+#### `oximux sim assert`
+
+Check an element once: exit 0 if it holds, 1 (assert-failed) saying what was found if not
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<R>` | yes | An `@eN` ref |
+| `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring |
+| `--id` | yes | An accessibility identifier, exact |
+| `--gone` | no | It is not on screen |
+| `--text` | yes | Its text (a field's value, else its label) is exactly this |
+| `--enabled` | no | It is on screen and enabled |
 
 #### `oximux sim install`
 

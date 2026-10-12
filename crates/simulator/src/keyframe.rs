@@ -34,6 +34,15 @@ pub const STATIC_BPPF: f64 = 0.005;
 /// A JPEG frame whose size differs from the last by more than this fraction
 /// is a change on screen (a static screen re-encodes to within a few bytes).
 pub const JPEG_DELTA: f64 = 0.02;
+/// The scrcpy server's encoder repeats the last picture after 100 ms without
+/// a new one, refining it: a delta this long after the previous one, the same
+/// size within [`REPEAT_SIZE`], is that repeat, whatever its bits per pixel
+/// (measured on an Android emulator with its keyboard up: 732–738 B every
+/// 100 ms, 0.008 bpp, for as long as its caret blinks). A change on screen
+/// comes at the display's own times, in sizes of its own.
+pub const REPEAT_GAP: std::ops::RangeInclusive<Duration> = Duration::from_millis(90)..=Duration::from_millis(130);
+/// See [`REPEAT_GAP`].
+pub const REPEAT_SIZE: f64 = 0.01;
 
 /// When pictures last arrived, and when one last carried change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,6 +132,8 @@ struct State {
     clock: FrameClock,
     keyframes: KeyframeLimiter,
     last_jpeg: Option<usize>,
+    /// The last delta: when, and its size.
+    last_delta: Option<(Instant, usize)>,
 }
 
 /// The frame clock and key-frame gate of one session, shared by its threads.
@@ -141,14 +152,20 @@ impl FrameSignal {
                 tracing::trace!(bytes, requested, "video key frame");
                 !requested
             }
-            Ingress::Delta { bytes, pixels } => match pixels.filter(|&p| p > 0) {
-                Some(pixels) => {
-                    let bppf = bytes as f64 * 8.0 / pixels as f64;
-                    tracing::trace!(bytes, pixels, bppf, "video delta");
-                    bppf > STATIC_BPPF
+            Ingress::Delta { bytes, pixels } => {
+                let repeat = state.last_delta.is_some_and(|(at, size)| {
+                    REPEAT_GAP.contains(&now.saturating_duration_since(at)) && (bytes as f64 - size as f64).abs() <= size as f64 * REPEAT_SIZE
+                });
+                state.last_delta = Some((now, bytes));
+                match pixels.filter(|&p| p > 0) {
+                    Some(pixels) => {
+                        let bppf = bytes as f64 * 8.0 / pixels as f64;
+                        tracing::trace!(bytes, pixels, bppf, repeat, "video delta");
+                        bppf > STATIC_BPPF && !repeat
+                    }
+                    None => true,
                 }
-                None => true,
-            },
+            }
             Ingress::Jpeg { bytes } => {
                 tracing::trace!(bytes, "jpeg frame");
                 let moved = state.last_jpeg.is_none_or(|last| (bytes as f64 - last as f64).abs() > last as f64 * JPEG_DELTA);
@@ -256,6 +273,26 @@ mod tests {
         assert_eq!(signal.clock().last_motion_at, Some(t0 + 48 * MS), "a refinement tail frame");
         signal.frame(t0 + 200 * MS, Ingress::Delta { bytes: 481, pixels: AVD });
         assert_eq!(signal.clock().last_motion_at, Some(t0 + 200 * MS), "the clock ticked");
+    }
+
+    /// Measured: an emulator with its keyboard up streams 732–738 B repeats
+    /// every 100 ms; its caret's blinks (909, 995 B) and a scroll still move.
+    #[test]
+    fn the_encoders_repeats_are_not_motion() {
+        let t0 = Instant::now();
+        let signal = FrameSignal::default();
+        const AVD: Option<u64> = Some(737_280);
+        signal.frame(t0, Ingress::Delta { bytes: 734, pixels: AVD });
+        let first = signal.clock().last_motion_at;
+        assert_eq!(first, Some(t0), "nothing before it to repeat");
+        for (i, bytes) in [734, 732, 738, 734].into_iter().enumerate() {
+            signal.frame(t0 + (i as u32 + 1) * 100 * MS, Ingress::Delta { bytes, pixels: AVD });
+        }
+        assert_eq!(signal.clock().last_motion_at, first, "repeats");
+        signal.frame(t0 + 500 * MS, Ingress::Delta { bytes: 995, pixels: AVD });
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 500 * MS), "a blink: another size");
+        signal.frame(t0 + 516 * MS, Ingress::Delta { bytes: 995, pixels: AVD });
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 516 * MS), "the same size at the display's pace");
     }
 
     #[test]

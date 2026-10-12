@@ -120,7 +120,12 @@ impl SimCmdWire {
     /// with the v27 errors (see [`SimErrorWire::is_verify_error`]).
     pub fn uses_verify(&self) -> bool {
         match self {
-            Self::Settled { .. } | Self::AxRefs { .. } | Self::Wait { .. } | Self::Assert { .. } | Self::AsCaller { .. } => true,
+            Self::Settled { .. }
+            | Self::AxRefs { .. }
+            | Self::Wait { .. }
+            | Self::Assert { .. }
+            | Self::AsCaller { .. }
+            | Self::TypeInto { .. } => true,
             Self::Tap(target) => matches!(target, SimTargetWire::Ref(_)),
             Self::Status
             | Self::Devices

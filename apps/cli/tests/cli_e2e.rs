@@ -248,7 +248,9 @@ impl oximux_remote_host::SimulatorControl for StubSimulator {
             SimCmdWire::Settled { .. } => SimReplyWire::Settled(report(Some(SimSettleOutcomeWire::Settled))),
             SimCmdWire::AxRefs { .. } => SimReplyWire::AxRefs(vec![SimRefNodeWire { r: 1, node: button }]),
             SimCmdWire::Tap(SimTargetWire::Ref(9)) => return Err(SimErrorWire::StaleRef("stale ref @e9, run `oximux sim ax -i`".into())),
-            SimCmdWire::Tap(SimTargetWire::Ref(_)) => SimReplyWire::Settled(SimSettleWire { diff: vec![], unchanged: 0, ..report(None) }),
+            SimCmdWire::Tap(SimTargetWire::Ref(_)) | SimCmdWire::TypeInto { .. } => {
+                SimReplyWire::Settled(SimSettleWire { diff: vec![], unchanged: 0, ..report(None) })
+            }
             SimCmdWire::Wait { gone: true, timeout_ms, .. } => {
                 return Err(SimErrorWire::TimedOut(format!("“Sign in” did not go away within {timeout_ms} ms")));
             }
@@ -391,11 +393,20 @@ fn sim_verbs_against_a_live_host() {
     let v = json_stdout(&out);
     assert_eq!(v["error"]["code"], "assert-failed");
     assert!(v["error"]["message"].as_str().unwrap().contains("not “Log in”"));
-    // `type @eN TEXT` taps the element, then types.
+    // `type @eN TEXT` taps the element, then types — one request, so no
+    // other input lands between.
     let before = sim.cmds.lock().unwrap().len();
     let out = sim_out(&["type", "@e1", "hello"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(sim.cmds.lock().unwrap().len(), before + 2, "a tap and a type");
+    use oximux_remote_proto::simulator::{SimCmdWire, SimTargetWire};
+    let cmds = sim.cmds.lock().unwrap();
+    assert_eq!(cmds.len(), before + 1, "one request");
+    let last = match cmds.last().unwrap() {
+        SimCmdWire::AsCaller { cmd, .. } => (**cmd).clone(),
+        other => other.clone(),
+    };
+    assert_eq!(last, SimCmdWire::TypeInto { target: SimTargetWire::Ref(1), text: "hello".into(), paste: false });
+    drop(cmds);
 
     assert!(sim.worktrees.lock().unwrap().iter().all(|w| w == wt), "{:?}", sim.worktrees.lock().unwrap());
 

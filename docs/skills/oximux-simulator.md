@@ -121,7 +121,9 @@ oximux sim type @e32 "secret" --settle
 
 - A ref keeps its number while its element is on screen, across settles and
   across the device sleeping and waking. New elements get new numbers; a
-  number is never reused for another element.
+  number is never reused for another element. When look-alikes (same role
+  and name, e.g. a list's "Delete" buttons) come or go, all of them get new
+  numbers: the old ones exit 1 with `stale-ref` rather than tap a twin.
 - A tap by ref finds the element where it is now. If it moved more than 8
   points you get a `moved` warning (exit 0).
 - An element that is gone, or can no longer be told apart from a look-alike,

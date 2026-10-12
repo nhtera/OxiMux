@@ -53,7 +53,8 @@ pub(super) fn is_action(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Button(_)
         | SimCmdWire::Rotate(_)
         | SimCmdWire::Launch { .. }
-        | SimCmdWire::OpenUrl { .. } => true,
+        | SimCmdWire::OpenUrl { .. }
+        | SimCmdWire::TypeInto { .. } => true,
         SimCmdWire::Status
         | SimCmdWire::Devices
         | SimCmdWire::Attach { .. }
@@ -73,7 +74,7 @@ pub(super) fn is_action(cmd: &SimCmdWire) -> bool {
 /// The verbs that inject input (and take the per-device input turn).
 pub(super) fn is_input(cmd: &SimCmdWire) -> bool {
     match cmd {
-        SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_) => true,
+        SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } | SimCmdWire::Type { .. } | SimCmdWire::Button(_) | SimCmdWire::TypeInto { .. } => true,
         SimCmdWire::Settled { action, .. } => is_input(action),
         SimCmdWire::AsCaller { cmd, .. } => is_input(cmd),
         SimCmdWire::Status
@@ -108,7 +109,8 @@ pub(super) fn needs_screen(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Settled { .. }
         | SimCmdWire::AxRefs { .. }
         | SimCmdWire::Wait { .. }
-        | SimCmdWire::Assert { .. } => true,
+        | SimCmdWire::Assert { .. }
+        | SimCmdWire::TypeInto { .. } => true,
         SimCmdWire::AsCaller { cmd, .. } => needs_screen(cmd),
         SimCmdWire::Status
         | SimCmdWire::Devices
@@ -143,6 +145,8 @@ pub(super) fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static
         // The action's own needs, then the tree the settle reads.
         SimCmdWire::Settled { action, .. } => return refused_on(caps, action).or((!caps.ax).then_some(AX)),
         SimCmdWire::AsCaller { cmd, .. } => return refused_on(caps, cmd),
+        // The tap's needs, then typing's.
+        SimCmdWire::TypeInto { target, .. } => return refused_on(caps, &SimCmdWire::Tap(target.clone())).or((!caps.keys).then_some("Typing")),
     };
     (!can).then_some(what)
 }
@@ -170,6 +174,26 @@ fn button_set(button: SimButtonWire) -> ButtonSet {
         SimButtonWire::VolumeUp => ButtonSet::VOLUME_UP,
         SimButtonWire::VolumeDown => ButtonSet::VOLUME_DOWN,
     }
+}
+
+/// The longest text one `type` takes (it goes key by key).
+const MAX_TYPED: usize = 10_000;
+
+/// Text for `type`: something, and not more than it takes.
+pub(super) fn check_text(text: &str) -> Result<(), SimErrorWire> {
+    match text.chars().count() {
+        0 => Err(SimErrorWire::BadInput("nothing to type".into())),
+        n if n > MAX_TYPED => Err(SimErrorWire::BadInput(format!("at most {MAX_TYPED} characters at a time"))),
+        _ => Ok(()),
+    }
+}
+
+/// A bundle identifier: letters, digits, `.`, `-`, `_`, starting with a
+/// letter or digit (nothing an option or a path could be made of).
+pub(super) fn check_bundle_id(bundle_id: &str) -> Result<(), SimErrorWire> {
+    let well_formed = bundle_id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && bundle_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if well_formed { Ok(()) } else { Err(SimErrorWire::BadInput(format!("`{bundle_id}` is not a bundle identifier"))) }
 }
 
 /// An `http`/`https` URL (any case), the only kind a real device opens.
@@ -268,6 +292,9 @@ mod tests {
         assert_eq!(refused_on(&iphone, &SimCmdWire::Type { text: "hi".into(), paste: false }), Some("Typing"));
         assert_eq!(refused_on(&iphone, &SimCmdWire::Ax { max: 10 }), Some(AX));
         assert_eq!(refused_on(&iphone, &SimCmdWire::Screenshot { full: false }), None);
+        let type_into = SimCmdWire::TypeInto { target: SimTargetWire::Ref(2), text: "hi".into(), paste: false };
+        assert_eq!(refused_on(&iphone, &type_into), Some("Touch input"), "the tap's needs first");
+        assert!(is_input(&type_into) && is_action(&type_into));
         // With its control on, an iPhone takes input and gives its tree, but
         // never turns or shuts down from here.
         let controlled = DeviceCaps::for_session(&DeviceId("iosdev:00008110-001A2C3E0A88401E".into()), true);
@@ -278,6 +305,7 @@ mod tests {
             SimCmdWire::Button(SimButtonWire::VolumeUp),
             SimCmdWire::Tap(SimTargetWire::Ref(2)),
             settled(SimCmdWire::Tap(SimTargetWire::Label("OK".into()))),
+            type_into.clone(),
         ] {
             assert_eq!(refused_on(&controlled, &cmd), None, "{cmd:?}");
         }

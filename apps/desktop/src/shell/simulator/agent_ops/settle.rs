@@ -25,6 +25,7 @@ use oximux_remote_proto::simulator::{
 use oximux_simulator::DeviceId;
 use oximux_simulator::ax::{self, AxNode, Query};
 use oximux_simulator::ax_refs::{self, DiffOp, MOVED_PT, RefError, Snapshot, TableKey};
+use oximux_simulator::keyframe::FrameClock;
 use oximux_simulator::session::StreamSession;
 
 use super::Target;
@@ -160,6 +161,14 @@ pub(super) async fn settled(
     let deadline = acted_at + cap;
     cx.background_executor().timer(MIN_WAIT).await;
     let quiet = |now| session.frame_clock().quiet_for(acted_at, now, FRAME_QUIET);
+    // The screen moved while a read ran (a read takes a second or more on
+    // Android and an iPhone): that read may show a transition, not a rest —
+    // unless the next read agrees with it (an idle iPhone sends a pair of
+    // frames every 2 s; a cosmetic change moves no element).
+    let moved_during = |start: FrameClock| {
+        let now = session.frame_clock();
+        now.epoch != start.epoch || now.last_motion_at != start.last_motion_at
+    };
     let (mut after, mut failed): (Option<Read>, Option<SimErrorWire>) = (None, None);
     let mut last_hash: Option<(u64, Instant)> = None;
     let outcome = loop {
@@ -171,9 +180,18 @@ pub(super) async fn settled(
             cx.background_executor().timer(TICK).await;
             continue;
         }
+        let start = session.frame_clock();
         if slow {
             match read_now(hub, udid, &session, Some(now), false, cx).await {
-                Ok(read) => after = Some(read),
+                Ok(read) => {
+                    let (moved, hash) = (moved_during(start), ax_refs::ax_hash(&read.nodes, pt));
+                    let agreed = last_hash.is_some_and(|(h, _)| h == hash);
+                    // Kept as the diff so far if time runs out.
+                    (last_hash, after) = (Some((hash, now)), Some(read));
+                    if moved && !agreed {
+                        continue;
+                    }
+                }
                 Err(e) => failed = Some(e),
             }
             break SimSettleOutcomeWire::SettledFrame;
@@ -192,7 +210,8 @@ pub(super) async fn settled(
             }
         };
         let hash = ax_refs::ax_hash(&read.nodes, pt);
-        let agreed = last_hash.is_some_and(|(h, _)| h == hash);
+        // A read the screen moved under may open a pair, never close one.
+        let agreed = !moved_during(start) && last_hash.is_some_and(|(h, _)| h == hash);
         (last_hash, after) = (Some((hash, now)), Some(read));
         if agreed {
             break SimSettleOutcomeWire::Settled;
@@ -325,7 +344,7 @@ fn note_target(hub: &Entity<SimulatorHub>, udid: &DeviceId, session: &StreamSess
 
 pub(super) fn stale(r: u32, e: RefError) -> SimErrorWire {
     SimErrorWire::StaleRef(match e {
-        RefError::Unknown => format!("no element has ref @e{r}; run `oximux sim ax -i`"),
+        RefError::Unknown => format!("ref @e{r} names nothing now (look-alikes came or went, or it was never given); run `oximux sim ax -i`"),
         RefError::Gone | RefError::Ambiguous => format!("stale ref @e{r}, run `oximux sim ax -i`"),
     })
 }

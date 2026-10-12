@@ -654,6 +654,7 @@ fn the_verify_loop_appends_and_round_trips() {
         (17, SimCmdWire::Wait { target: SimTargetWire::Label("Home".into()), gone: false, timeout_ms: 5000 }),
         (18, SimCmdWire::Assert { target: SimTargetWire::Id("title".into()), check: SimCheckWire::Text("Hi".into()) }),
         (19, SimCmdWire::AsCaller { caller: u64::MAX, cmd: Box::new(SimCmdWire::Settled { action: tap, timeout_ms: 0 }) }),
+        (20, SimCmdWire::TypeInto { target: SimTargetWire::Ref(3), text: "a@b.co".into(), paste: false }),
     ];
     for (ordinal, cmd) in cmds {
         let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: cmd.clone() });

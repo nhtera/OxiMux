@@ -5,7 +5,8 @@
 //! label), and which of the elements sharing both it is, in tree order. A
 //! [`RefTable`] gives each key that can be acted on a number the first time it
 //! is seen and keeps it: a surviving key keeps its ref, only new keys get new
-//! numbers, and a number never moves to another key. Nothing here knows about
+//! numbers, and a number never moves to another key — when look-alikes come or
+//! go, their numbers retire and they are numbered afresh. Nothing here knows about
 //! sessions, so a ref outlives the stream restarting under it (a park, a
 //! reconnect); a table goes only when its worktree detaches or changes device
 //! ([`RefStore::forget_worktree`]).
@@ -214,12 +215,29 @@ impl RefTable {
     /// key's number) and return them with their refs, in tree order.
     pub fn assign<'a>(&mut self, nodes: &'a [AxNode]) -> Vec<(u32, &'a AxNode)> {
         self.reads += 1;
+        let read = keyed(nodes);
+        // Look-alikes (one role and name) came or went: which of them a
+        // number named can no longer be told, so every number of that role
+        // and name retires — on screen or not — rather than pass to a twin.
+        // Its holder's next use fails as unknown, and asks for a fresh read.
+        let sizes: HashMap<(&str, &str), u32> = read.iter().map(|k| ((k.key.role.as_str(), k.key.name.as_str()), k.group)).collect();
+        let changed: Vec<NodeKey> = self
+            .by_key
+            .iter()
+            .filter(|(key, e)| sizes.get(&(key.role.as_str(), key.name.as_str())).is_some_and(|&n| n != e.group && n.max(e.group) > 1))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in changed {
+            if let Some(entry) = self.by_key.remove(&key) {
+                self.by_ref.remove(&entry.r);
+            }
+        }
         let mut out = Vec::new();
-        for k in keyed(nodes).into_iter().filter(|k| is_interactive(&k.node.role)) {
+        for k in read.into_iter().filter(|k| is_interactive(&k.node.role)) {
             let center = k.node.frame.center();
             let r = match self.by_key.get_mut(&k.key) {
                 Some(entry) => {
-                    (entry.center, entry.group, entry.seen) = (center, k.group, self.reads);
+                    (entry.center, entry.seen) = (center, self.reads);
                     entry.r
                 }
                 None => {
@@ -277,6 +295,10 @@ pub type TableKey = (WorktreeKey, DeviceId, Option<u64>);
 pub struct RefStore {
     tables: HashMap<TableKey, (RefTable, u64)>,
     tick: u64,
+    /// The highest number a dropped table had given out: a new table counts
+    /// on from here, so a returning caller's old refs never name something
+    /// else.
+    floor: u32,
 }
 
 impl RefStore {
@@ -289,18 +311,27 @@ impl RefStore {
             while self.tables.keys().filter(|k| same(k)).count() >= MAX_CALLERS {
                 let oldest = self.tables.iter().filter(|(k, _)| same(k)).min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone());
                 let Some(oldest) = oldest else { break };
-                self.tables.remove(&oldest);
+                self.drop_table(&oldest);
             }
         }
-        let tick = self.tick;
-        let (table, used) = self.tables.entry(key.clone()).or_default();
+        let (tick, floor) = (self.tick, self.floor);
+        let (table, used) = self.tables.entry(key.clone()).or_insert_with(|| (RefTable { next: floor, ..RefTable::default() }, 0));
         *used = tick;
         table
     }
 
     /// Drop every table of `worktree` (it detached, or changed device).
     pub fn forget_worktree(&mut self, worktree: &WorktreeKey) {
-        self.tables.retain(|k, _| &k.0 != worktree);
+        let gone: Vec<TableKey> = self.tables.keys().filter(|k| &k.0 == worktree).cloned().collect();
+        for key in gone {
+            self.drop_table(&key);
+        }
+    }
+
+    fn drop_table(&mut self, key: &TableKey) {
+        if let Some((table, _)) = self.tables.remove(key) {
+            self.floor = self.floor.max(table.next);
+        }
     }
 
     pub fn len(&self) -> usize {

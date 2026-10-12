@@ -95,6 +95,9 @@ pub enum SimCmdWire {
         #[serde(deserialize_with = "crate::simulator_verify::nested")]
         cmd: Box<SimCmdWire>,
     },
+    /// Tap `target`, then type `text` into it, in one turn: no other input
+    /// lands between the two (`type @eN TEXT`).
+    TypeInto { target: SimTargetWire, text: String, paste: bool },
 }
 
 impl SimCmdWire {

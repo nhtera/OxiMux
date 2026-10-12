@@ -105,18 +105,15 @@ fn matched(reply: SimReplyWire, what: &str) -> Outcome {
     }
 }
 
-/// `type @eN TEXT`: tap the element (by its ref), then type — settled, when
-/// asked, after the typing.
+/// `type @eN TEXT`: tap the element (by its ref), then type, in one request
+/// (so no other input lands between) — settled, when asked, after the
+/// typing.
 pub async fn type_into(client: &Client, worktree: &Path, words: Vec<String>, paste: bool, settle: &SettleArgs) -> Outcome {
     let [aim, text] = <[String; 2]>::try_from(words).map_err(|_| usage("`sim type` takes TEXT, or an @eN ref then TEXT"))?;
     let r = parse_ref(&aim).ok_or_else(|| usage("`sim type` takes TEXT, or an @eN ref then TEXT (see `oximux sim ax -i`)"))?;
-    let tapped = call(client, worktree, as_caller(SimCmdWire::Tap(SimTargetWire::Ref(r))), SLOW).await?;
-    let (tap_json, tap_human) = acted(tapped, &format!("tapped @e{r}"), false)?;
-    let said = format!("typed {} characters", text.chars().count());
-    let (cmd, floor) = wrap(SimCmdWire::Type { text, paste }, SLOW, settle);
-    let (mut data, typed) = acted(call(client, worktree, cmd, floor).await?, &said, false)?;
-    data["tap"] = tap_json;
-    Ok((data, format!("{tap_human}\n{typed}")))
+    let said = format!("typed {} characters into @e{r}", text.chars().count());
+    let (cmd, floor) = wrap(SimCmdWire::TypeInto { target: SimTargetWire::Ref(r), text, paste }, SLOW, settle);
+    acted(call(client, worktree, cmd, floor).await?, &said, false)
 }
 
 fn name(target: &SimTargetWire) -> String {
