@@ -1,7 +1,9 @@
 //! The crash row: an app on the shown device crashed (see the hub's
 //! `crash_watch`). The user may hand it to the agent — a short summary,
-//! secrets scrubbed, and the screen as it is now — or dismiss it. Nothing is
-//! ever sent without that click.
+//! secrets scrubbed, and the screen as the row came up — or dismiss it.
+//! Nothing is ever sent without that click, and a click sends at once, to
+//! the chat active then (the screen is taken when the row appears, so
+//! nothing is waited for after the click).
 
 use std::time::Duration;
 
@@ -23,8 +25,13 @@ impl SimulatorPanel {
     /// back one dismissed or sent. Scrubbed once, here, for the row and
     /// whatever is sent.
     pub(super) fn crashed(&mut self, udid: &DeviceId, crash: &Crash, cx: &mut Context<Self>) {
-        let showing = self.crash.as_ref().is_some_and(|(_, shown)| shown.id == crash.id);
-        if self.device(cx).as_ref() == Some(udid) && (showing || self.crash_ids.insert(crash.id.clone())) {
+        let showing = self.crash.as_ref().is_some_and(|(shown_on, shown)| shown_on == udid && shown.id == crash.id);
+        // An id is a device's own (Android's is a pid and a device-local
+        // time): keyed with the device.
+        if self.device(cx).as_ref() == Some(udid) && (showing || self.crash_ids.insert((udid.clone(), crash.id.clone()))) {
+            if !showing {
+                self.take_crash_screen(udid, &crash.id, cx);
+            }
             let crash = Crash {
                 app: clamp(&scrub_text(&crash.app), 256),
                 exception: clamp(&scrub_text(&crash.exception), 300),
@@ -52,34 +59,46 @@ impl SimulatorPanel {
             ("sim-crash-send", "Send to agent"),
             cx.listener(|this, _, _window, cx| {
                 this.crash = None;
+                this.crash_png = None;
                 cx.notify();
             }),
             cx.listener(|this, _, window, cx| this.send_crash(window, cx)),
         ))
     }
 
-    /// Hand the crash to the agent, with the screen as it is now.
-    fn send_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((udid, crash)) = self.crash.take() else { return };
-        cx.notify();
-        let markdown = summary(&self.device_name(cx), &crash);
-        let session = self.hub.as_ref().and_then(|hub| hub.read(cx).session(&udid));
-        cx.spawn_in(window, async move |this, cx| {
-            // The screen is a bonus: the summary goes without it.
-            let png = match session {
-                Some(session) => cx
-                    .background_executor()
-                    .spawn(async move {
-                        let png = session.screenshot_png(Duration::from_secs(5)).ok()?;
-                        export::fit_long_edge(&png, export::AGENT_LONG_EDGE).ok()
-                    })
-                    .await
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
-            let _ = this.update_in(cx, |panel, window, cx| panel.send_to_agent(markdown, png, window, cx));
+    /// The screen as the row comes up, kept for Send (a bonus: the summary
+    /// goes without it if it is not there yet).
+    fn take_crash_screen(&mut self, udid: &DeviceId, id: &str, cx: &mut Context<Self>) {
+        self.crash_png = None;
+        let Some(session) = self.hub.as_ref().and_then(|hub| hub.read(cx).session(udid)) else { return };
+        let id = id.to_owned();
+        cx.spawn(async move |this, cx| {
+            let png = cx
+                .background_executor()
+                .spawn(async move {
+                    let png = session.screenshot_png(Duration::from_secs(5)).ok()?;
+                    export::fit_long_edge(&png, export::AGENT_LONG_EDGE).ok()
+                })
+                .await;
+            let _ = this.update(cx, |panel, _| {
+                // Still the row it was taken for.
+                if let Some(png) = png
+                    && panel.crash.as_ref().is_some_and(|(_, c)| c.id == id)
+                {
+                    panel.crash_png = Some((id, png));
+                }
+            });
         })
         .detach();
+    }
+
+    /// Hand the crash to the agent now, to the chat active now.
+    fn send_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, crash)) = self.crash.take() else { return };
+        cx.notify();
+        let markdown = summary(&self.device_name(cx), &crash);
+        let png = self.crash_png.take().filter(|(id, _)| *id == crash.id).map(|(_, png)| png).unwrap_or_default();
+        self.send_to_agent(markdown, png, window, cx);
     }
 }
 

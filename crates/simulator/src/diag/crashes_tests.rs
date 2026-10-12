@@ -235,7 +235,7 @@ fn the_buffer_watch_ignores_what_was_there_first() {
 fn android_crashes_read_both_buffers_from_the_devices_clock() {
     let anrs = "10-12 16:07:00.000  900  950 E ActivityManager: ANR in com.example.app (com.example.app/.Main)\n\
                 10-12 16:07:01.000  900  950 E ActivityManager: ANR in com.example.app.other (x)\n\
-                10-12 16:07:02.000  900  950 E ActivityManager: ANR in com.example.app:remote (y)\n";
+                10-12 16:07:09.000  900  950 E ActivityManager: ANR in com.example.app:remote (y)\n";
     let runner = ScriptedRunner::default()
         .expect("adb -s S shell date +%s", CmdOutput::ok("1760000600\n"))
         .expect("adb -s S logcat -d -v threadtime -T 1760000000.000 -b crash", CmdOutput::ok(LOGCAT))
@@ -253,7 +253,9 @@ fn android_crashes_read_both_buffers_from_the_devices_clock() {
     // it wrote itself.
     assert_eq!(list.warnings.len(), 3, "{:?}", list.warnings);
     assert!(!list.warnings.iter().any(|w| w.contains("com.example.app.other")));
-    assert!(list.warnings[2].contains("Unhandled Promise Rejection"));
+    // Back in time order across the two reads: the newest last.
+    assert!(list.warnings[1].contains("Unhandled Promise Rejection"), "{:?}", list.warnings);
+    assert!(list.warnings[2].contains("com.example.app:remote"));
 }
 
 #[test]
@@ -278,6 +280,17 @@ fn a_crash_named_late_is_announced_once_its_app_is_known() {
     assert_eq!(update.len(), 1);
     assert_eq!(update[0].frames.len(), 1);
     assert!(scan.take(parse_crash_buffer(&framed)).is_empty());
+}
+
+#[test]
+fn a_forgotten_crash_is_announced_again() {
+    let mut scan = BufferScan::default();
+    assert!(scan.take(vec![]).is_empty(), "baseline");
+    let new = scan.take(parse_crash_buffer(LOGCAT));
+    assert_eq!(new.len(), 2);
+    scan.forget(&new);
+    assert_eq!(scan.take(parse_crash_buffer(LOGCAT)).len(), 2, "looked at again, as new");
+    assert!(scan.take(parse_crash_buffer(LOGCAT)).is_empty());
 }
 
 #[test]

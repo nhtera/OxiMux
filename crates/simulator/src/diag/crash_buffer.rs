@@ -178,6 +178,9 @@ pub fn android_crashes(adb: &Adb, serial: &str, since_secs: u32, app: Option<&st
             }
         }
     }
+    // The two reads, back in time order (a threadtime line starts with its
+    // `MM-DD hh:mm:ss.mmm`), so the newest survive the cut.
+    warnings.sort_by(|a, b| a.get(..18).cmp(&b.get(..18)));
     let (crashes, left_out) = keep_newest(crashes);
     Ok(CrashList { crashes, warnings: newest(warnings, left_out) })
 }
@@ -199,6 +202,15 @@ impl BufferScan {
     pub fn poll(&mut self, adb: &Adb, serial: &str) -> crate::Result<Vec<Crash>> {
         let text = adb.logcat(serial, &["-d", "-b", "crash", "-v", "threadtime", "-t", "500"], Duration::from_secs(10))?;
         Ok(self.take(parse_crash_buffer(&text)))
+    }
+
+    /// Look at `crashes` again next time, as new (the caller could not tell
+    /// yet whether they matter).
+    pub fn forget(&mut self, crashes: &[Crash]) {
+        for crash in crashes {
+            self.seen.as_mut().map(|seen| seen.remove(&crash.id));
+            self.announced.remove(&crash.id);
+        }
     }
 
     pub(crate) fn take(&mut self, crashes: Vec<Crash>) -> Vec<Crash> {

@@ -164,20 +164,40 @@ impl SystemRunner {
             });
         }
         let deadline = Instant::now() + timeout;
-        let timed_out = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok(bytes) => line(String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r'])),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break true,
-            }
-        };
-        if timed_out {
+        let timeout_error = || SimError::Timeout { what: format!("{program} {}", args.join(" ")), secs: timeout.as_secs() };
+        let kill = |child: &mut std::process::Child| {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(SimError::Timeout { what: format!("{program} {}", args.join(" ")), secs: timeout.as_secs() });
+        };
+        // The deadline is checked on every line, so a log that keeps coming
+        // cannot outlast it.
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                kill(&mut child);
+                return Err(timeout_error());
+            }
+            match rx.recv_timeout(left) {
+                Ok(bytes) => line(String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r'])),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    kill(&mut child);
+                    return Err(timeout_error());
+                }
+            }
         }
-        let status = child.wait()?;
+        // Stdout closed; the child may still be running: waited for under
+        // the same deadline.
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                kill(&mut child);
+                return Err(timeout_error());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         Ok(CmdOutput { status: status.code(), stdout: Vec::new(), stderr: err.join().unwrap_or_default() })
     }
 }
@@ -282,6 +302,14 @@ mod tests {
         assert_eq!((out.status, out.stdout.len(), out.stderr.as_slice()), (Some(2), 0, b"err\n".as_slice()));
         let slow = SystemRunner.run_lines("/bin/sh", &["-c", "echo first; sleep 5"], Duration::from_millis(300), &mut |_| {});
         assert!(matches!(slow, Err(SimError::Timeout { .. })), "{slow:?}");
+        // A child that closes its stdout and keeps running.
+        let started = Instant::now();
+        let quiet = SystemRunner.run_lines("/bin/sh", &["-c", "exec >&-; sleep 5"], Duration::from_millis(300), &mut |_| {});
+        assert!(matches!(quiet, Err(SimError::Timeout { .. })), "{quiet:?}");
+        // An endless stream.
+        let endless = SystemRunner.run_lines("/usr/bin/yes", &[], Duration::from_millis(300), &mut |_| {});
+        assert!(matches!(endless, Err(SimError::Timeout { .. })), "{endless:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "both stopped at their deadline: {:?}", started.elapsed());
     }
 
     #[test]

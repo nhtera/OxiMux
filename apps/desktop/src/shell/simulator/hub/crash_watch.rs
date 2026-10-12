@@ -106,7 +106,16 @@ fn look(job: &Job, home: &std::path::Path) -> Vec<Crash> {
             }
             let mut apps = job.launched.clone();
             if !job.udid.is_physical() {
-                apps.extend(crash_buffer::user_apps(&adb, serial).unwrap_or_default());
+                match crash_buffer::user_apps(&adb, serial) {
+                    Ok(installed) => apps.extend(installed),
+                    // Whose they are is not known yet: looked at again next
+                    // time rather than dropped.
+                    Err(e) => {
+                        tracing::debug!(udid = %job.udid, "installed apps unreadable: {e}");
+                        scan.forget(&new);
+                        return Vec::new();
+                    }
+                }
             }
             new.into_iter().filter(|c| apps.iter().any(|app| crash_buffer::is_app(c, app))).collect()
         }

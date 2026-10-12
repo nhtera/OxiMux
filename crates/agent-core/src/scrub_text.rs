@@ -171,9 +171,10 @@ fn redact_auth_schemes(text: &mut String) {
             let word_start = pos == 0 || !bytes[pos - 1].is_ascii_alphanumeric();
             let at = pos + scheme.len();
             let len = bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')).count();
-            // `basic usage` is prose: a credential is long, and base64 has a
-            // digit, a capital or padding somewhere.
-            let credential = len >= 8 && bytes[at..at + len].iter().any(|b| b.is_ascii_digit() || b.is_ascii_uppercase() || *b == b'=');
+            // A bearer token is any long word. `basic usage` is prose: a
+            // Basic credential is base64, with a digit, a capital or padding.
+            let base64ish = bytes[at..at + len].iter().any(|b| b.is_ascii_digit() || b.is_ascii_uppercase() || *b == b'=');
+            let credential = len >= 8 && (scheme == "bearer " || base64ish);
             if word_start && credential && &text[at..at + len] != REDACTED {
                 text.replace_range(at..at + len, REDACTED);
             }
@@ -246,6 +247,7 @@ mod tests {
         assert_eq!(scrub_text("authorization: bearer ya29.a0AfB_byC"), "authorization: bearer [redacted]");
         assert_eq!(scrub_text("Authorization: Basic dXNlcjpwYXNzd29yZA=="), "Authorization: Basic [redacted]");
         assert_eq!(scrub_text("the basic usage is shown below"), "the basic usage is shown below");
+        assert_eq!(scrub_text("Authorization: Bearer abcdefghijklmnopqrstuvwxyz"), "Authorization: Bearer [redacted]");
     }
 
     #[test]
