@@ -114,6 +114,25 @@ pub fn fit_long_edge(png: &[u8], max: u32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// `png` cut to `rect` — `(x, y, w, h)` as fractions of the image — grown by
+/// `pad` pixels on every side and clamped to the image, re-encoded as PNG.
+pub fn crop(png: &[u8], rect: (f64, f64, f64, f64), pad: u32) -> Result<Vec<u8>, String> {
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    let (w, h) = (f64::from(image.width()), f64::from(image.height()));
+    let pad = f64::from(pad);
+    let x0 = (rect.0 * w - pad).clamp(0.0, w);
+    let y0 = (rect.1 * h - pad).clamp(0.0, h);
+    let x1 = ((rect.0 + rect.2) * w + pad).clamp(0.0, w);
+    let y1 = ((rect.1 + rect.3) * h + pad).clamp(0.0, h);
+    if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+        return Err("the element is off the screen".into());
+    }
+    let cut = image.crop_imm(x0 as u32, y0 as u32, (x1 - x0).round() as u32, (y1 - y0).round() as u32);
+    let mut out = Vec::new();
+    cut.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 /// Composite `strokes` onto the PNG `screenshot` and encode the result.
 pub fn annotate_png(screenshot: &[u8], strokes: &[Stroke]) -> Result<Vec<u8>, String> {
     let mut image = image::load_from_memory_with_format(screenshot, image::ImageFormat::Png)
@@ -130,6 +149,27 @@ pub fn annotate_png(screenshot: &[u8], strokes: &[Stroke]) -> Result<Vec<u8>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(white(w, h)).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        out
+    }
+
+    fn size_of(png: &[u8]) -> (u32, u32) {
+        let image = image::load_from_memory_with_format(png, image::ImageFormat::Png).unwrap();
+        (image.width(), image.height())
+    }
+
+    #[test]
+    fn a_crop_takes_the_frame_with_padding_clamped_at_the_edges() {
+        let shot = png(400, 800);
+        // A 100×50 element in the middle, 10 px of padding each side.
+        assert_eq!(size_of(&crop(&shot, (0.25, 0.5, 0.25, 0.0625), 10).unwrap()), (120, 70));
+        // At the top-left corner the padding stops at the image.
+        assert_eq!(size_of(&crop(&shot, (0.0, 0.0, 0.25, 0.0625), 10).unwrap()), (110, 60));
+        assert!(crop(&shot, (2.0, 2.0, 0.1, 0.1), 0).is_err(), "off the image");
+    }
 
     fn white(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]))

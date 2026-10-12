@@ -45,6 +45,7 @@ mod crash_row;
 mod device_menu;
 mod pair_card;
 mod header;
+mod inspector;
 mod recovery_row;
 mod iphone_control;
 mod toolbar;
@@ -97,6 +98,10 @@ pub struct SimulatorPanel {
     /// Every crash a row was raised for, by device (a dismissed one stays
     /// gone).
     crash_ids: std::collections::HashSet<(DeviceId, String)>,
+    /// The element the user ⌥-clicked, and its crop once taken.
+    picked: Option<super::screen::Picked>,
+    picked_png: Option<Vec<u8>>,
+    _screen_events: Option<Subscription>,
     /// Devices whose "still no picture" hint the user dismissed.
     recovery_dismissed: std::collections::HashSet<DeviceId>,
     /// The screen as the crash row came up, by device and crash id (sent
@@ -163,6 +168,9 @@ impl SimulatorPanel {
             crash_ids: Default::default(),
             crash_png: None,
             recovery_dismissed: Default::default(),
+            picked: None,
+            picked_png: None,
+            _screen_events: None,
             theme,
             density,
             typography,
@@ -335,10 +343,14 @@ impl SimulatorPanel {
     fn live_screen(&mut self, binding: super::screen::Binding, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<ScreenView>> {
         let hub = self.hub.clone()?;
         let (theme, typography) = (self.theme, self.typography.clone());
-        let screen = self
-            .screen
-            .get_or_insert_with(|| cx.new(|cx| ScreenView::new(hub, theme, typography.clone(), window, cx)))
-            .clone();
+        if self.screen.is_none() {
+            let screen = cx.new(|cx| ScreenView::new(hub, theme, typography.clone(), window, cx));
+            self._screen_events = Some(cx.subscribe(&screen, |panel, _, event: &super::screen::ScreenEvent, cx| match event {
+                super::screen::ScreenEvent::Picked(picked) => panel.picked(picked.clone(), cx),
+            }));
+            self.screen = Some(screen);
+        }
+        let screen = self.screen.clone()?;
         screen.update(cx, |screen, cx| screen.bind(binding, theme, &typography, window, cx));
         Some(screen)
     }
