@@ -75,6 +75,8 @@ pub enum HubEvent {
     PhysicalChanged,
     /// A Wi-Fi pairing moved on (see [`SimulatorHub::pair_stage`]).
     Pairing,
+    /// An app on a device a panel shows crashed (see `crash_watch`).
+    Crash(DeviceId, oximux_simulator::diag::Crash),
 }
 
 pub struct SimulatorHub {
@@ -147,6 +149,8 @@ pub struct SimulatorHub {
     refs: oximux_simulator::ax_refs::RefStore,
     /// Erases in progress and demo-mode status bars (see `device_state`).
     device_state: device_state::Memo,
+    /// Shown devices watched for crashes (see `crash_watch`).
+    crash_watch: crash_watch::CrashWatch,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -154,6 +158,7 @@ impl EventEmitter<HubEvent> for SimulatorHub {}
 mod agent;
 mod android;
 mod capture;
+mod crash_watch;
 mod device_state;
 mod iphone;
 mod iphone_control;

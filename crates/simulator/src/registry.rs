@@ -512,6 +512,18 @@ impl<S: Clone> Registry<S> {
         out
     }
 
+    /// Every device a visible panel shows while it streams.
+    pub fn shown_live(&self) -> Vec<DeviceId> {
+        let mut out: Vec<_> = self
+            .devices
+            .iter()
+            .filter(|(_, d)| !d.visible.is_empty() && matches!(d.phase, Phase::Live { .. }))
+            .map(|(u, _)| u.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// The devices OxiMux booted and still owns (the idle rule shuts them down).
     pub fn owned_devices(&self) -> Vec<DeviceId> {
         let mut out: Vec<_> = self.devices.iter().filter(|(_, d)| d.owned).map(|(u, _)| u.clone()).collect();

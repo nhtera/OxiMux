@@ -55,6 +55,7 @@ pub fn install(cx: &mut App, repo: SettingsRepo, approvals: SimApprovalRepo) {
     hub.update(cx, |hub, cx| hub.refresh_android_sdk(cx));
     spawn_tick(cx, hub.downgrade());
     spawn_watch(cx, hub.downgrade());
+    super::crash_watch::spawn_crash_watch(cx, hub.downgrade());
 }
 
 /// A hub for tests: no child ledger (it lives in the real app data dir), no
@@ -118,6 +119,7 @@ fn new_hub(
         snapshots: Default::default(),
         refs: Default::default(),
         device_state: Default::default(),
+        crash_watch: Default::default(),
     })
 }
 

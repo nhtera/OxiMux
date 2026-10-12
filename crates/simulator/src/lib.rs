@@ -35,6 +35,7 @@ pub mod child_ledger;
 pub mod classify;
 pub mod consent;
 pub mod devicectl;
+pub mod diag;
 #[cfg(target_os = "macos")]
 pub mod disclaim;
 pub mod geometry;

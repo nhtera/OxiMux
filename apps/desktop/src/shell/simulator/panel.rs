@@ -41,11 +41,13 @@ mod bezel;
 mod body;
 mod commands;
 mod consent;
+mod crash_row;
 mod device_menu;
 mod pair_card;
 mod header;
 mod iphone_control;
 mod toolbar;
+mod send_to_agent;
 mod stream_row;
 #[cfg(test)]
 mod tests;
@@ -89,6 +91,14 @@ pub struct SimulatorPanel {
     attach_error: Option<String>,
     /// The "Pair over Wi-Fi" card, while open.
     pairing: Option<pair_card::PairCard>,
+    /// The shown device's last crash, until dismissed or sent.
+    crash: Option<(DeviceId, oximux_simulator::diag::Crash)>,
+    /// Every crash a row was raised for, by device (a dismissed one stays
+    /// gone).
+    crash_ids: std::collections::HashSet<(DeviceId, String)>,
+    /// The screen as the crash row came up, by device and crash id (sent
+    /// with it).
+    crash_png: Option<(DeviceId, String, Vec<u8>)>,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,
@@ -146,6 +156,9 @@ impl SimulatorPanel {
             maximized: false,
             attach_error: None,
             pairing: None,
+            crash: None,
+            crash_ids: Default::default(),
+            crash_png: None,
             theme,
             density,
             typography,
@@ -192,6 +205,7 @@ impl SimulatorPanel {
                 }
             }
             HubEvent::DeviceBooted(udids) => cx.emit(PanelEvent::DeviceBooted(udids.clone())),
+            HubEvent::Crash(udid, crash) => self.crashed(udid, crash, cx),
             // Frames repaint the screen view, not the whole panel.
             HubEvent::Frame(_) | HubEvent::Session(..) => {}
         }

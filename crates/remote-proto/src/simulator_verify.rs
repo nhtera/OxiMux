@@ -141,7 +141,9 @@ impl SimCmdWire {
             | Self::OpenUrl { .. }
             | Self::Install { .. }
             | Self::Shutdown { .. }
-            | Self::DeviceState(_) => false,
+            | Self::DeviceState(_)
+            | Self::Logs(_)
+            | Self::Crashes(_) => false,
         }
     }
 }

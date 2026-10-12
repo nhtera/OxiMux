@@ -134,6 +134,22 @@ impl<'a> Adb<'a> {
         Ok(self.on(serial, &all, timeout)?.stdout_str())
     }
 
+    /// `adb -s S logcat <args…>`: stdout. (adb quotes each word for the
+    /// device's shell itself.)
+    pub fn logcat(&self, serial: &str, args: &[&str], timeout: Duration) -> Result<String> {
+        let mut all = vec!["logcat"];
+        all.extend_from_slice(args);
+        Ok(self.on(serial, &all, timeout)?.stdout_str())
+    }
+
+    /// [`Self::logcat`], each line handed to `line` as it comes (a long log
+    /// is never held whole).
+    pub fn logcat_lines(&self, serial: &str, args: &[&str], timeout: Duration, line: &mut dyn FnMut(&str)) -> Result<()> {
+        let mut all = vec!["-s", serial, "logcat"];
+        all.extend_from_slice(args);
+        self.runner.run_lines(&self.program, &all, timeout, line)?.into_success("adb").map(drop)
+    }
+
     pub fn getprop(&self, serial: &str, key: &str, timeout: Duration) -> Result<String> {
         Ok(self.shell(serial, &["getprop", key], timeout)?.trim().to_owned())
     }

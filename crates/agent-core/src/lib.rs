@@ -25,3 +25,7 @@ pub mod screen_tools;
 /// (`oximux sim screenshot|ax`, or a read of a saved screenshot) — the other
 /// thing `redact` removes.
 pub mod sim_tools;
+
+/// Secret-shaped values (env secrets, API keys, JWTs, `token=` values) out of
+/// free text: diagnostics, device logs, crash summaries.
+pub mod scrub_text;

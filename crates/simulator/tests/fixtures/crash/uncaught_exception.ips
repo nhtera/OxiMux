@@ -1,0 +1,18 @@
+{"app_name":"Shop","timestamp":"2026-10-12 16:01:10.00 +0700","bundleID":"com.example.shop","bug_type":"309","name":"Shop","incident_id":"0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"}
+{
+  "procPath" : "\/Users\/USER\/Library\/Developer\/CoreSimulator\/Devices\/E0E0A1DD-2DAC-448E-86D3-07B7F809BCD2\/data\/Containers\/Bundle\/Application\/11111111-2222-3333-4444-555555555555\/Shop.app\/Shop",
+  "procName" : "Shop",
+  "pid" : 70001,
+  "captureTime" : "2026-10-12 16:00:50.1000 +0700",
+  "exception" : {"type":"EXC_CRASH","signal":"SIGABRT"},
+  "termination" : {"namespace":"SIGNAL","indicator":"Abort trap: 6"},
+  "asi" : {"CoreFoundation":["*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: '-[Shop buy:]: unrecognized selector sent to instance 0x600000c04000'"]},
+  "lastExceptionBacktrace" : [
+    {"imageOffset":10,"symbol":"__exceptionPreprocess","imageIndex":1},
+    {"imageOffset":20,"symbol":"objc_exception_throw","imageIndex":2},
+    {"imageOffset":30,"imageIndex":0}
+  ],
+  "faultingThread" : 0,
+  "threads" : [{"frames":[{"imageOffset":1,"symbol":"__pthread_kill","imageIndex":2}]}],
+  "usedImages" : [{"name":"Shop"},{"name":"CoreFoundation"},{"name":"libobjc.A.dylib"}]
+}

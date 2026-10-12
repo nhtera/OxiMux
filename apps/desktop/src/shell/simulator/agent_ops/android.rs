@@ -1,12 +1,17 @@
 //! The app verbs on an Android device (`adb`, where iOS uses `simctl`):
-//! launch a package, open a URL, install an APK. Everything else — touch,
-//! keys, the AX tree, screenshots — goes through the session, as on iOS.
+//! launch a package, open a URL, install an APK, read its log and crashes.
+//! Everything else — touch, keys, the AX tree, screenshots — goes through the
+//! session, as on iOS.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use oximux_remote_proto::simulator::SimErrorWire;
 use oximux_simulator::android::adb::Adb;
+use oximux_simulator::diag::crash_buffer;
+use oximux_simulator::diag::crashes::CrashList;
+use oximux_simulator::diag::logs::{self, LogLines, LogQuery};
+use oximux_simulator::diag::DiagResult;
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::session::StreamSession;
 
@@ -56,6 +61,16 @@ impl Device {
         self.shell(&["am", "start", "-a", "android.intent.action.VIEW", "-d", &quoted], APP_TIMEOUT)
             .map(drop)
             .map_err(|e| SimErrorWire::Failed(format!("could not open the URL: {e}")))
+    }
+
+    /// A bounded read of the device's log.
+    pub(super) fn logs(&self, query: &LogQuery) -> DiagResult<LogLines> {
+        logs::android_logs(&Adb::new(&SystemRunner, &self.adb), &self.serial, query)
+    }
+
+    /// The device's crashes (and warnings) over the last `since_secs`.
+    pub(super) fn crashes(&self, since_secs: u32, app: Option<&str>) -> DiagResult<CrashList> {
+        crash_buffer::android_crashes(&Adb::new(&SystemRunner, &self.adb), &self.serial, since_secs, app)
     }
 
     /// Install (or replace) the APK at `path`.

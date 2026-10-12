@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::simulator_diag::{SimCrashListWire, SimCrashWire, SimCrashesWire, SimLogLevelWire, SimLogsWire};
 pub use crate::simulator_state::{SimLocationWire, SimNetWire, SimPrivacyActionWire, SimStateCmdWire};
 pub use crate::simulator_verify::{
     SimCheckWire, SimDiffLineWire, SimDiffOpWire, SimRefNodeWire, SimSettleOutcomeWire, SimSettleWire,
@@ -103,6 +104,11 @@ pub enum SimCmdWire {
     /// Change the device's state (location, appearance, privacy, push, status
     /// bar, erase): see [`SimStateCmdWire`].
     DeviceState(SimStateCmdWire),
+    // v29: diagnostics.
+    /// A bounded read of the device's log: see [`SimLogsWire`].
+    Logs(SimLogsWire),
+    /// The device's recent crashes, summarised: see [`SimCrashesWire`].
+    Crashes(SimCrashesWire),
 }
 
 impl SimCmdWire {
@@ -171,6 +177,10 @@ pub enum SimReplyWire {
     AxRefs(Vec<SimRefNodeWire>),
     /// A `wait` or `assert` held: the element (`None` once gone).
     Matched { node: Option<SimAxNodeWire>, elapsed_ms: u32 },
+    // v29: diagnostics.
+    /// Log lines, oldest first; `truncated` when older ones were left out.
+    Logs { lines: Vec<String>, truncated: bool },
+    Crashes(SimCrashListWire),
 }
 
 /// One simulator device.

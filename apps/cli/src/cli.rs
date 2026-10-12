@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub use crate::cli_sim::{AssertArgs, SettleArgs, TapArg, WaitArgs};
+pub use crate::cli_sim_diag::{CrashesArgs, LogsArgs};
 pub use crate::cli_sim_state::{AppearanceArg, LocationCommand, PrivacyArgs, PushArgs, StatusBarArg};
 
 /// Exit codes, stated once. `2` is what clap itself exits with on a usage
@@ -949,6 +950,13 @@ pub enum SimCommand {
         #[arg(long)]
         force: bool,
     },
+    /// The device's recent log, one bounded read (default: the last 30s, 200
+    /// lines). A real Android phone needs --app.
+    Logs(LogsArgs),
+    /// The device's recent crashes, each with its exception and top frames
+    /// (default: the last 10m), and warnings short of a crash. A real Android
+    /// phone needs --app.
+    Crashes(CrashesArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

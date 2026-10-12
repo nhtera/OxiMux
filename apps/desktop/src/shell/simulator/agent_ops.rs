@@ -36,6 +36,8 @@ mod android;
 mod ax_lookup;
 mod checks;
 mod device_state;
+mod diagnostics;
+pub(crate) use diagnostics::clamp;
 mod guards;
 mod iphone;
 mod settle;

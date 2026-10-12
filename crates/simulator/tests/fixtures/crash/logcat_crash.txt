@@ -1,0 +1,16 @@
+--------- beginning of crash
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: FATAL EXCEPTION: main
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: Process: com.example.app, PID: 4321
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: java.lang.IllegalStateException: Checkout failed: token=abc123secret
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: 	at com.example.app.Checkout.pay(Checkout.kt:42)
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: 	at com.example.app.MainActivity.onClick(MainActivity.kt:17)
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: 	at android.view.View.performClick(View.java:7659)
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: Caused by: java.io.IOException: timeout
+10-12 16:05:01.120  4321  4321 E AndroidRuntime: 	at okhttp3.Call.execute(Call.kt:9)
+10-12 16:06:12.500  5555  5570 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0 in tid 5570 (RenderThread), pid 5555 (com.example.game)
+10-12 16:06:12.700  5600  5600 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+10-12 16:06:12.700  5600  5600 F DEBUG   : pid: 5555, tid: 5570, name: RenderThread  >>> com.example.game <<<
+10-12 16:06:12.701  5600  5600 F DEBUG   : backtrace:
+10-12 16:06:12.701  5600  5600 F DEBUG   :       #00 pc 000000000004e1a8  /data/app/com.example.game/lib/arm64/libgame.so (Renderer::draw()+40)
+10-12 16:06:12.701  5600  5600 F DEBUG   :       #01 pc 000000000004d000  /data/app/com.example.game/lib/arm64/libgame.so (Renderer::frame()+12)
+10-12 16:06:12.701  5600  5600 F DEBUG   :       #02 pc 00000000000c2b4c  /apex/com.android.runtime/lib64/bionic/libc.so (__pthread_start(void*)+204)

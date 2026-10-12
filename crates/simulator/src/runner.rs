@@ -60,6 +60,15 @@ pub trait Runner: Send + Sync {
     /// `timeout`. A timeout kills the child and returns [`SimError::Timeout`].
     fn run(&self, program: &str, args: &[&str], stdin: Option<&[u8]>, timeout: Duration)
     -> Result<CmdOutput>;
+
+    /// [`Runner::run`] without stdin, its stdout handed to `line` one line
+    /// at a time as it comes, so a long output is never held whole. The
+    /// returned output has the exit status and stderr; its stdout is empty.
+    fn run_lines(&self, program: &str, args: &[&str], timeout: Duration, line: &mut dyn FnMut(&str)) -> Result<CmdOutput> {
+        let out = self.run(program, args, None, timeout)?;
+        out.stdout_str().lines().for_each(&mut *line);
+        Ok(CmdOutput { stdout: Vec::new(), ..out })
+    }
 }
 
 /// The real thing: `std::process` with a polling timeout.
@@ -67,6 +76,10 @@ pub trait Runner: Send + Sync {
 pub struct SystemRunner;
 
 impl Runner for SystemRunner {
+    fn run_lines(&self, program: &str, args: &[&str], timeout: Duration, line: &mut dyn FnMut(&str)) -> Result<CmdOutput> {
+        Self::stream_lines(program, args, timeout, line)
+    }
+
     fn run(
         &self,
         program: &str,
@@ -122,6 +135,70 @@ impl Runner for SystemRunner {
             stdout: out.join().unwrap_or_default(),
             stderr: err.join().unwrap_or_default(),
         })
+    }
+}
+
+impl SystemRunner {
+    /// [`Runner::run_lines`], streamed: stdout is read on its own thread and
+    /// each line handed over as it arrives, under the one deadline.
+    fn stream_lines(program: &str, args: &[&str], timeout: Duration, line: &mut dyn FnMut(&str)) -> Result<CmdOutput> {
+        use std::io::BufRead as _;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .no_window()
+            .spawn()?;
+        let err = drain(child.stderr.take());
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(out);
+                let mut buf = Vec::new();
+                while reader.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+                    if tx.send(std::mem::take(&mut buf)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        let deadline = Instant::now() + timeout;
+        let timeout_error = || SimError::Timeout { what: format!("{program} {}", args.join(" ")), secs: timeout.as_secs() };
+        let kill = |child: &mut std::process::Child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        // The deadline is checked on every line, so a log that keeps coming
+        // cannot outlast it.
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                kill(&mut child);
+                return Err(timeout_error());
+            }
+            match rx.recv_timeout(left) {
+                Ok(bytes) => line(String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r'])),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    kill(&mut child);
+                    return Err(timeout_error());
+                }
+            }
+        }
+        // Stdout closed; the child may still be running: waited for under
+        // the same deadline.
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                kill(&mut child);
+                return Err(timeout_error());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Ok(CmdOutput { status: status.code(), stdout: Vec::new(), stderr: err.join().unwrap_or_default() })
     }
 }
 
@@ -213,6 +290,27 @@ impl Runner for ScriptedRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn system_runner_streams_lines_under_its_deadline() {
+        let mut lines = Vec::new();
+        let out = SystemRunner
+            .run_lines("/bin/sh", &["-c", "printf 'a\\nb\\r\\nc'; echo err >&2; exit 2"], Duration::from_secs(5), &mut |l| lines.push(l.to_owned()))
+            .unwrap();
+        assert_eq!(lines, ["a", "b", "c"]);
+        assert_eq!((out.status, out.stdout.len(), out.stderr.as_slice()), (Some(2), 0, b"err\n".as_slice()));
+        let slow = SystemRunner.run_lines("/bin/sh", &["-c", "echo first; sleep 5"], Duration::from_millis(300), &mut |_| {});
+        assert!(matches!(slow, Err(SimError::Timeout { .. })), "{slow:?}");
+        // A child that closes its stdout and keeps running.
+        let started = Instant::now();
+        let quiet = SystemRunner.run_lines("/bin/sh", &["-c", "exec >&-; sleep 5"], Duration::from_millis(300), &mut |_| {});
+        assert!(matches!(quiet, Err(SimError::Timeout { .. })), "{quiet:?}");
+        // An endless stream.
+        let endless = SystemRunner.run_lines("/usr/bin/yes", &[], Duration::from_millis(300), &mut |_| {});
+        assert!(matches!(endless, Err(SimError::Timeout { .. })), "{endless:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "both stopped at their deadline: {:?}", started.elapsed());
+    }
 
     #[test]
     #[cfg(unix)]

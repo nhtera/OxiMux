@@ -154,12 +154,17 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// and erase, plus the shape of network shaping (served later). A v27 host
 /// cannot decode them: see [`SIMULATOR_DEVICE_STATE_MIN_VERSION`].
 ///
+/// v29: appended **diagnostics** (`SimCmdWire::{Logs, Crashes}`, their
+/// replies, and the `simulator_diag` types): a bounded read of the device's
+/// log and its recent crashes, summarised. A v28 host cannot decode them: see
+/// [`SIMULATOR_DIAG_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -251,6 +256,10 @@ pub const SIMULATOR_VERIFY_MIN_VERSION: u32 = 27;
 /// `appearance`, `privacy`, `push`, `status-bar`, `erase`). Read by the
 /// **client** and gated on what the command asks for.
 pub const SIMULATOR_DEVICE_STATE_MIN_VERSION: u32 = 28;
+
+/// The oldest host that serves `sim logs` and `sim crashes`. Read by the
+/// **client** and gated on what the command asks for.
+pub const SIMULATOR_DIAG_MIN_VERSION: u32 = 29;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
