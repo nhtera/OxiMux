@@ -114,6 +114,7 @@ impl ScreenView {
         let Some(events) = key_events(&keystroke.key, keystroke.key_char.as_deref(), m.shift) else { return };
         cx.stop_propagation();
         self.send_keys(&events, cx);
+        self.rec_key(&keystroke.key, keystroke.key_char.as_deref(), cx);
     }
 
     fn send_keys(&self, events: &[KeyEvent], cx: &Context<Self>) {
@@ -131,6 +132,7 @@ impl ScreenView {
     pub(super) fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(udid) = self.binding.device.clone() else { return };
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
+        self.rec_paste(&text, cx);
         self.hub.update(cx, |hub, cx| hub.paste(&udid, text, cx));
     }
 }

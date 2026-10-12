@@ -48,10 +48,12 @@ fn parse_lat_lon(text: &str) -> Option<(f64, f64)> {
 }
 
 impl SimulatorPanel {
-    /// The menu button, for a device that takes any state change; `sim`: a
-    /// simulator (the only kind that can forget its location).
-    pub(super) fn render_device_menu(&self, state: StateSet, sim: bool, live: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if state == StateSet::NONE {
+    /// The menu button, for a device that takes any state change or can
+    /// record a flow; `sim`: a simulator (the only kind that can forget its
+    /// location); `flow`: whether a flow is being recorded (`None`: the
+    /// device cannot record one).
+    pub(super) fn render_device_menu(&self, state: StateSet, sim: bool, live: bool, flow: Option<bool>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if state == StateSet::NONE && flow.is_none() {
             return None;
         }
         let weak = cx.weak_entity();
@@ -90,6 +92,13 @@ impl SimulatorPanel {
                     menu = menu.separator();
                     menu = menu.item(item("Clean status bar (9:41)", StateChange::StatusBar { clean: true }));
                     menu = menu.item(item("Restore status bar", StateChange::StatusBar { clean: false }));
+                }
+                if let Some(recording) = flow {
+                    let weak = weak.clone();
+                    let (label, start) = if recording { ("Stop recording flow", false) } else { ("Record flow", true) };
+                    menu = menu.separator().item(PopupMenuItem::new(label).on_click(move |_, _window, cx| {
+                        let _ = weak.update(cx, |panel, cx| if start { panel.start_flow(cx) } else { panel.stop_flow(cx) });
+                    }));
                 }
                 if state.contains(StateSet::ERASE) {
                     let weak = weak.clone();

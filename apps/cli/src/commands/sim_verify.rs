@@ -122,6 +122,15 @@ fn name(target: &SimTargetWire) -> String {
         SimTargetWire::Id(id) => format!("#{id}"),
         SimTargetWire::Ref(r) => format!("@e{r}"),
         SimTargetWire::Point(p) => format!("({}, {})", p.x, p.y),
+        SimTargetWire::Exact(sel) => {
+            let what = match (&sel.label, &sel.id, &sel.role) {
+                (Some(label), _, _) => format!("“{label}”"),
+                (_, Some(id), _) => format!("#{id}"),
+                (_, _, Some(role)) => format!("a {role}"),
+                _ => "the element".into(),
+            };
+            if sel.nth > 0 { format!("{what} (#{} of those)", sel.nth) } else { what }
+        }
     }
 }
 

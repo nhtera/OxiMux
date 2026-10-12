@@ -23,7 +23,7 @@ use oximux_remote_proto::simulator::{
     SimSettleOutcomeWire, SimSettleWire,
 };
 use oximux_simulator::DeviceId;
-use oximux_simulator::ax::{self, AxNode, Query};
+use oximux_simulator::ax::AxNode;
 use oximux_simulator::ax_refs::{self, DiffOp, MOVED_PT, RefError, Snapshot, TableKey};
 use oximux_simulator::keyframe::FrameClock;
 use oximux_simulator::session::StreamSession;
@@ -287,18 +287,18 @@ pub(super) async fn aim(
     hub: &Entity<SimulatorHub>,
     udid: &DeviceId,
     session: &StreamSession,
-    query: Query<'_>,
+    lookup: ax_lookup::Lookup<'_>,
     what: &str,
     acted: &mut Acted,
     cx: &mut AsyncApp,
 ) -> Result<(f64, f64), SimErrorWire> {
     if let Some(prior) = acted.prior.clone()
-        && let Some(node) = ax::find(&prior, query).cloned()
+        && let Some(node) = lookup.find(&prior).cloned()
     {
         note_target(hub, udid, session, &prior, &node, acted, cx);
         return Ok(touch_point(session, &prior, &node));
     }
-    let (node, nodes) = ax_lookup::element(hub, udid, session, query, what, cx).await?;
+    let (node, nodes) = ax_lookup::element(hub, udid, session, lookup, what, cx).await?;
     note_target(hub, udid, session, &nodes, &node, acted, cx);
     Ok(touch_point(session, &nodes, &node))
 }

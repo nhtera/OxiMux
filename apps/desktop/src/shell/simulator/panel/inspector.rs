@@ -171,6 +171,7 @@ mod tests {
                 role: "Button".into(),
                 role_description: String::new(),
                 enabled: true,
+                secure: false,
                 frame: Rect::new(0.0, 0.0, 1.0, 1.0),
                 children: vec![],
             },

@@ -1,0 +1,39 @@
+appId: "com.example.app"
+---
+- launchApp:
+    appId: "com.example.app"
+    stopApp: true
+- waitForAnimationToEnd
+- tapOn:
+    text: "Sign in"
+- waitForAnimationToEnd
+- tapOn:
+    id: "email_field"
+- inputText: "ada@example.com"
+- tapOn:
+    id: "password"
+- inputText: "${SECRET_1}"
+- tapOn:
+    text: "Price \\(USD\\)"
+    index: 1
+- swipe:
+    start: "50.0%,80.1%"
+    end: "50.0%,22.9%"
+    duration: 400
+- extendedWaitUntil:
+    visible:
+      text: "Welcome"
+    timeout: 8000
+- assertVisible:
+    text: "Welcome"
+- assertNotVisible:
+    id: "spinner"
+- tapOn:
+    point: "50.0%,50.0%"
+- pressKey: "Home"
+# unsupported: rotate landscape-left
+- setLocation:
+    latitude: "37.3349"
+    longitude: "-122.009"
+- openLink: "https://example.com/a?b=1"
+# unsupported: assert --label Total --exact --text "$5"

@@ -79,6 +79,7 @@ fn node(flat: Flat) -> AxNode {
         role_description: words(&flat.role),
         role: capitalized(&flat.role),
         enabled: flat.enabled,
+        secure: flat.role.eq_ignore_ascii_case("secureTextField"),
         frame: Rect::new(x, y, w, h),
         children: Vec::new(),
     }

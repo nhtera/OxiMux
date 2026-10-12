@@ -9,6 +9,7 @@ fn node(role: &str, label: &str, frame: (f64, f64)) -> AxNode {
         role: role.to_owned(),
         role_description: String::new(),
         enabled: true,
+        secure: false,
         frame: Rect::new(frame.0, frame.1, 100.0, 44.0),
         children: Vec::new(),
     }

@@ -8,6 +8,7 @@ mod build_info;
 mod cli;
 mod cli_sim;
 mod cli_sim_diag;
+mod cli_sim_flow;
 mod cli_sim_state;
 mod client;
 mod client_identity;
@@ -30,7 +31,7 @@ use cli::{
 use client::Client;
 use oximux_remote_proto::proto::{
     CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
-    SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
+    SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_FLOW_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
 
@@ -283,6 +284,11 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         Command::Worktree {
             command: WorktreeCommand::Create { branch: Some(_), .. },
         } => Some((CREATE_WORKTREE_BASE_MIN_VERSION, "worktree create --branch")),
+        // v30: flows (`flow start|stop|status`) and exact selectors. Above
+        // every other `Sim` arm: `tap --exact --settle` needs v30, not v27.
+        Command::Sim { command, .. } if command.flow_feature().is_some() => {
+            command.flow_feature().map(|feature| (SIMULATOR_FLOW_MIN_VERSION, feature))
+        }
         // v29: diagnostics (`logs`, `crashes`). Above the `Sim` arm.
         Command::Sim { command, .. } if command.is_diag() => Some((SIMULATOR_DIAG_MIN_VERSION, "sim logs/crashes")),
         // v28: device state (`location`, `appearance`, `privacy`, `push`,
@@ -420,6 +426,10 @@ fn host_verb(mut args: Cli) -> u8 {
                 }
                 Command::Ls { all_hosts: true, strict } => {
                     return commands::hosts::fleet_ls(strict, timeout, dir).await;
+                }
+                // A file to a file: no host involved.
+                Command::Sim { command: cli::SimCommand::Flow(cli::FlowCommand::Export { file, out, app_id, .. }), .. } => {
+                    return commands::sim_flow::export(&file, out.as_deref(), app_id.as_deref());
                 }
                 _ => {}
             }

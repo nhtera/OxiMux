@@ -293,6 +293,20 @@ impl oximux_remote_host::SimulatorControl for StubSimulator {
                 SimReplyWire::Screenshot { png, width: 402, height: 874, scale: 1.0 }
             }
             SimCmdWire::Install { path } if !path.starts_with(worktree) => return Err(SimErrorWire::PathOutsideWorktree),
+            SimCmdWire::Flow(SimFlowCmdWire::ApproveRun { lines }) if lines.iter().any(|l| l.starts_with("erase")) => {
+                return Err(SimErrorWire::Refused("the user declined to let an agent run 1 step that change iPhone 17 Pro".into()));
+            }
+            SimCmdWire::Flow(SimFlowCmdWire::ApproveRun { .. }) => SimReplyWire::Done,
+            SimCmdWire::Flow(flow) => {
+                let save = matches!(flow, SimFlowCmdWire::Stop { save: true });
+                SimReplyWire::Flow(SimFlowWire {
+                    recording: !matches!(flow, SimFlowCmdWire::Stop { .. }),
+                    steps: "# oximux-flow v1\n# platform ios\ntap --label \"Sign in\" --exact\n".into(),
+                    count: 1,
+                    warnings: vec![],
+                    saved: save.then(|| "/data/flows/flow-1.flow".into()),
+                })
+            }
             _ => SimReplyWire::Done,
         })
     }
@@ -459,6 +473,64 @@ fn sim_verbs_against_a_live_host() {
     assert_eq!(v["data"]["crashes"][0]["reason"], "Fatal error: Index out of range");
     let out = sim_out(&["crashes", "--since", "1h"]);
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("2026-10-12 15:54:29  dev.oximux.crashy crashed: EXC_BREAKPOINT (SIGTRAP)"));
+
+    // Flows (v30). A run stops at the first step that fails, with that
+    // step's exit code, and sends nothing after it.
+    {
+        use oximux_remote_proto::simulator::{SimCmdWire, SimFlowCmdWire, SimSelectorWire, SimTargetWire};
+        let flow = dir.path().join("login.flow");
+        let steps = "# oximux-flow v1\ntap --label \"Sign in\" --exact\nassert --label \"Sign in\" --text \"Log in\"\ntap 1 2\n";
+        std::fs::write(&flow, steps).unwrap();
+        let flow = flow.to_str().unwrap();
+        let before = sim.cmds.lock().unwrap().len();
+        let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "run", flow]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let v = json_stdout(&out);
+        assert_eq!((v["error"]["code"].as_str(), v["error"]["data"]["step"].as_u64()), (Some("assert-failed"), Some(2)));
+        assert!(v["error"]["message"].as_str().unwrap().starts_with("step 2 failed: assert"), "{v}");
+        let cmds: Vec<SimCmdWire> = sim.cmds.lock().unwrap()[before..].to_vec();
+        assert_eq!(cmds.len(), 2, "step 3 never ran: {cmds:?}");
+        let exact = SimTargetWire::Exact(SimSelectorWire { label: Some("Sign in".into()), id: None, role: None, nth: 0 });
+        assert_eq!(cmds[0], SimCmdWire::Tap(exact));
+        // `--from` resumes there.
+        let before = sim.cmds.lock().unwrap().len();
+        let out = sim_out(&["run", flow, "--from", "3"]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).trim_end().ends_with("ran 1 step"));
+        assert_eq!(sim.cmds.lock().unwrap().len(), before + 1);
+        // A line that does not parse fails before anything is sent.
+        std::fs::write(dir.path().join("bad.flow"), "tap 1 2\ntap --bogus\n").unwrap();
+        let before = sim.cmds.lock().unwrap().len();
+        let out = sim_out(&["run", dir.path().join("bad.flow").to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(sim.cmds.lock().unwrap().len(), before, "nothing ran");
+        // State changes are put to the user once, before step 1; a no runs
+        // nothing.
+        std::fs::write(dir.path().join("grant.flow"), "privacy grant camera --app com.a.b\ntap 1 2\n").unwrap();
+        let before = sim.cmds.lock().unwrap().len();
+        let out = sim_out(&["run", dir.path().join("grant.flow").to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let cmds: Vec<SimCmdWire> = sim.cmds.lock().unwrap()[before..].to_vec();
+        assert_eq!(cmds[0], SimCmdWire::Flow(SimFlowCmdWire::ApproveRun { lines: vec!["privacy grant camera --app com.a.b".into()] }));
+        assert_eq!(cmds.len(), 3);
+        std::fs::write(dir.path().join("erase.flow"), "tap 1 2\nerase\n").unwrap();
+        let before = sim.cmds.lock().unwrap().len();
+        let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "run", dir.path().join("erase.flow").to_str().unwrap()]).output().unwrap();
+        assert_eq!(out.status.code(), Some(5), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(sim.cmds.lock().unwrap().len(), before + 1, "only the question was sent");
+        // An agent's recording: stopped into a file, or saved by the host.
+        let file = dir.path().join("rec.flow");
+        let out = sim_out(&["flow", "stop", "--out", file.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(std::fs::read_to_string(&file).unwrap().contains("tap --label \"Sign in\" --exact"));
+        assert_eq!(sim.cmds.lock().unwrap().last(), Some(&SimCmdWire::Flow(SimFlowCmdWire::Stop { save: false })));
+        let out = sim_out(&["flow", "stop"]);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("saved 1 step to /data/flows/flow-1.flow"), "{}", String::from_utf8_lossy(&out.stdout));
+        // Export needs no host at all.
+        let out = bin(&dir.path().join("nobody")).args(["sim", "flow", "export", file.to_str().unwrap(), "--maestro", "--app-id", "com.a.b"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "appId: \"com.a.b\"\n---\n- tapOn:\n    text: \"Sign in\"");
+    }
 
     assert!(sim.worktrees.lock().unwrap().iter().all(|w| w == wt), "{:?}", sim.worktrees.lock().unwrap());
 

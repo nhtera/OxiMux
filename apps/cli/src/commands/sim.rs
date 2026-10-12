@@ -79,6 +79,8 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
         }
         SimCommand::Ax { max, interactive: true, .. } => sim_verify::ax_refs(client, &worktree, max).await,
         SimCommand::Logs(args) => super::sim_diag::logs(client, &worktree, args).await,
+        SimCommand::Run(args) => super::sim_flow::run::run(client, &worktree, args).await,
+        SimCommand::Flow(command) => super::sim_flow::flow(client, &worktree, command).await,
         SimCommand::Crashes(args) => super::sim_diag::crashes(client, &worktree, args).await,
         SimCommand::Wait(args) => sim_verify::wait(client, &worktree, args).await,
         SimCommand::Assert(args) => sim_verify::assert(client, &worktree, args).await,
@@ -99,7 +101,8 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
                 .map_err(|e| Failure::new("cwd", exit::ERROR, format!("cannot read the current directory: {e}")))?;
             let settle = other.settle_args().cloned().unwrap_or_default();
             // The verb already names its element: a report need not repeat it.
-            let named = matches!(other, SimCommand::Tap { label: Some(_), .. } | SimCommand::Tap { id: Some(_), .. });
+            let named = matches!(other, SimCommand::Tap { label: Some(_), .. } | SimCommand::Tap { id: Some(_), .. })
+                || matches!(&other, SimCommand::Tap { exact, .. } if exact.role.is_some());
             let (cmd, floor, said) = request_for(other, &cwd)?;
             let (cmd, floor) = sim_verify::wrap(cmd, floor, &settle);
             let reply = call(client, &worktree, cmd, floor).await?;
@@ -127,14 +130,32 @@ const LISTING: Duration = Duration::from_secs(45);
 
 /// The request for a verb without a reply of its own, its time floor, and what
 /// to say when it is done.
-fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration, String), Failure> {
+pub(super) fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration, String), Failure> {
     if let Some(request) = super::sim_state::request(&command, cwd) {
         return request;
     }
     Ok(match command {
         SimCommand::Attach { device, .. } => (SimCmdWire::Attach { device }, LISTING + Duration::from_secs(15), String::new()),
         SimCommand::Detach => (SimCmdWire::Detach, QUICK, "detached".into()),
-        SimCommand::Tap { x, y, label, id, .. } => {
+        SimCommand::Tap { x, y, label, id, exact, .. } => {
+            if exact.used() {
+                if x.is_some() || y.is_some() {
+                    return Err(usage("--exact, --role and --nth name an element, not a point"));
+                }
+                if exact.exact && label.is_none() && id.is_none() {
+                    return Err(usage("--exact needs --label or --id"));
+                }
+            }
+            let named = |label: &Option<String>, id: &Option<String>, role: &Option<String>| match (label, id, role) {
+                (Some(l), _, _) => format!("tapped “{l}”"),
+                (_, Some(i), _) => format!("tapped #{i}"),
+                (_, _, Some(r)) => format!("tapped a {r}"),
+                _ => "tapped".into(),
+            };
+            if let Some(target) = exact.target(label.as_ref(), id.as_ref()) {
+                let said = named(&label, &id, &exact.role);
+                return Ok((SimCmdWire::Tap(target), SLOW, said));
+            }
             let (target, said) = match (x, y, label, id) {
                 (_, _, Some(label), _) => (SimTargetWire::Label(label.clone()), format!("tapped “{label}”")),
                 (_, _, _, Some(id)) => (SimTargetWire::Id(id.clone()), format!("tapped #{id}")),
@@ -208,7 +229,9 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
         | SimCommand::Push(_)
         | SimCommand::StatusBar { .. }
         | SimCommand::Erase { .. } => unreachable!("built by `sim_state::request` above"),
-        SimCommand::Logs(_) | SimCommand::Crashes(_) => unreachable!("answered with a reply of their own"),
+        SimCommand::Logs(_) | SimCommand::Crashes(_) | SimCommand::Run(_) | SimCommand::Flow(_) => {
+            unreachable!("answered with a reply of their own")
+        }
     })
 }
 
@@ -540,7 +563,7 @@ mod tests {
         let w = Path::new("/w");
         let tap = |x, y, label: Option<&str>, id: Option<&str>| {
             let settle = Default::default();
-            request_for(SimCommand::Tap { x, y, label: label.map(Into::into), id: id.map(Into::into), settle }, w)
+            request_for(SimCommand::Tap { x, y, label: label.map(Into::into), id: id.map(Into::into), exact: Default::default(), settle }, w)
         };
         assert!(matches!(tap(Some(TapArg::X(1.0)), Some(2.0), None, None).unwrap().0, SimCmdWire::Tap(SimTargetWire::Point(_))));
         assert!(matches!(tap(None, None, Some("OK"), None).unwrap().0, SimCmdWire::Tap(SimTargetWire::Label(_))));

@@ -43,6 +43,7 @@ mod commands;
 mod consent;
 mod crash_row;
 mod device_menu;
+mod flow_rec;
 mod pair_card;
 mod header;
 mod inspector;
@@ -210,7 +211,9 @@ impl SimulatorPanel {
                     cx.notify();
                 }
             }
-            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged | HubEvent::Pairing => cx.notify(),
+            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged | HubEvent::Pairing | HubEvent::Flow => {
+                cx.notify()
+            }
             HubEvent::AgentActivity(udid) => {
                 if self.device(cx).as_ref() == Some(udid) {
                     cx.notify();
@@ -353,11 +356,16 @@ impl SimulatorPanel {
             let screen = cx.new(|cx| ScreenView::new(hub, theme, typography.clone(), window, cx));
             self._screen_events = Some(cx.subscribe(&screen, |panel, _, event: &super::screen::ScreenEvent, cx| match event {
                 super::screen::ScreenEvent::Picked(picked) => panel.picked(picked.clone(), cx),
+                super::screen::ScreenEvent::Recorded(step) => panel.record_panel(step.clone(), cx),
             }));
             self.screen = Some(screen);
         }
         let screen = self.screen.clone()?;
-        screen.update(cx, |screen, cx| screen.bind(binding, theme, &typography, window, cx));
+        let recording = self.flow_steps(cx).is_some();
+        screen.update(cx, |screen, cx| {
+            screen.bind(binding, theme, &typography, window, cx);
+            screen.set_recording(recording);
+        });
         Some(screen)
     }
 
