@@ -954,7 +954,8 @@ pub enum SimCommand {
     /// lines). A real Android phone needs --app.
     Logs(LogsArgs),
     /// The device's recent crashes, each with its exception and top frames
-    /// (default: the last 10m), and warnings short of a crash.
+    /// (default: the last 10m), and warnings short of a crash. A real Android
+    /// phone needs --app.
     Crashes(CrashesArgs),
 }
 

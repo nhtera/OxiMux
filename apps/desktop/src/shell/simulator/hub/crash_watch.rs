@@ -7,8 +7,14 @@
 //! showed it never raises a row. A device no panel shows any more is
 //! forgotten, so showing it again starts from a fresh baseline. Read-only:
 //! it never touches the device.
+//!
+//! Only the user's own work counts: on a simulator, a report is matched to
+//! an app installed on that device (system apps never are); on an Android
+//! emulator, to an app the user installed or an agent launched; on a real
+//! phone — the user's personal apps live there — only to an app an agent
+//! launched this run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +22,7 @@ use std::time::Duration;
 use gpui::{App, WeakEntity};
 use oximux_simulator::android::adb::Adb;
 use oximux_simulator::diag::Crash;
-use oximux_simulator::diag::crashes::{BufferScan, ReportScan};
+use oximux_simulator::diag::crashes::{self, BufferScan, ReportScan};
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::{DeviceId, Source};
 
@@ -35,6 +41,8 @@ enum Scan {
 #[derive(Default)]
 pub(super) struct CrashWatch {
     scans: HashMap<DeviceId, Arc<Mutex<Scan>>>,
+    /// The apps agents launched this run, per Android device.
+    launched: HashMap<DeviceId, HashSet<String>>,
 }
 
 /// One device to look at, off the UI thread.
@@ -43,9 +51,17 @@ struct Job {
     scan: Arc<Mutex<Scan>>,
     /// An Android device's `adb` and serial.
     adb: Option<(PathBuf, String)>,
+    /// The apps agents launched on it.
+    launched: HashSet<String>,
 }
 
 impl SimulatorHub {
+    /// An agent launched `app` on `udid`: its crashes count (see the module
+    /// docs).
+    pub(crate) fn note_crash_app(&mut self, udid: &DeviceId, app: &str) {
+        self.crash_watch.launched.entry(udid.clone()).or_default().insert(app.to_owned());
+    }
+
     /// The devices to look at now; the rest are forgotten.
     fn crash_jobs(&mut self) -> Vec<Job> {
         let shown = self.registry.shown_live();
@@ -66,7 +82,8 @@ impl SimulatorHub {
                 let scan = self.crash_watch.scans.entry(udid.clone()).or_insert_with(|| {
                     Arc::new(Mutex::new(if android.is_some() { Scan::Android(BufferScan::default()) } else { Scan::Sim(ReportScan::default()) }))
                 });
-                Some(Job { udid, scan: scan.clone(), adb: android })
+                let launched = self.crash_watch.launched.get(&udid).cloned().unwrap_or_default();
+                Some(Job { udid, scan: scan.clone(), adb: android, launched })
             })
             .collect()
     }
@@ -77,13 +94,21 @@ fn look(job: &Job, home: &std::path::Path) -> Vec<Crash> {
     let mut scan = job.scan.lock().unwrap_or_else(|e| e.into_inner());
     match (&mut *scan, &job.adb) {
         (Scan::Sim(scan), _) => job.udid.sim_udid().map(|sim| scan.poll(home, sim.as_str())).unwrap_or_default(),
-        (Scan::Android(scan), Some((adb, serial))) => match scan.poll(&Adb::new(&SystemRunner, adb), serial) {
-            Ok(crashes) => crashes,
-            Err(e) => {
+        (Scan::Android(scan), Some((adb, serial))) => {
+            let adb = Adb::new(&SystemRunner, adb);
+            let new = scan.poll(&adb, serial).unwrap_or_else(|e| {
                 tracing::debug!(udid = %job.udid, "crash buffer unreadable: {e}");
                 Vec::new()
+            });
+            if new.is_empty() {
+                return new;
             }
-        },
+            let mut apps = job.launched.clone();
+            if !job.udid.is_physical() {
+                apps.extend(crashes::user_apps(&adb, serial).unwrap_or_default());
+            }
+            new.into_iter().filter(|c| apps.iter().any(|app| crashes::is_app(c, app))).collect()
+        }
         (Scan::Android(_), None) => Vec::new(),
     }
 }

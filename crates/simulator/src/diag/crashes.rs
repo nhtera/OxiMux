@@ -157,7 +157,10 @@ pub fn sim_crashes(runner: &dyn Runner, home: &Path, udid: &SimUdid, since_secs:
             for line in lines {
                 match markers::classify(&line) {
                     Some(Kind::Warning) => warnings.push(line),
-                    Some(Kind::Fatal) => give_reason(&mut crashes, &line),
+                    Some(Kind::Fatal) => {
+                        give_reason(&mut crashes, &line);
+                        unreported(&mut crashes, &line);
+                    }
                     None => {}
                 }
             }
@@ -196,9 +199,33 @@ fn give_reason(crashes: &mut [Crash], line: &str) {
     let Some(pid) = compact_pid(line) else { return };
     let Some((marker, _)) = markers::MARKERS.iter().find(|(m, _)| line.contains(m)) else { return };
     let words = &line[line.find(marker).unwrap_or(0)..];
-    for crash in crashes.iter_mut().filter(|c| c.pid == Some(pid)) {
+    // The report's own words win (an uncaught exception's reason).
+    for crash in crashes.iter_mut().filter(|c| c.pid == Some(pid) && markers::classify(&c.reason).is_none()) {
         crash.reason = words.trim().to_owned();
     }
+}
+
+/// A fatal line whose process has no report yet (macOS writes it a few
+/// seconds to ~20 s after the crash): listed as a crash without frames,
+/// saying so, rather than not at all.
+fn unreported(crashes: &mut Vec<Crash>, line: &str) {
+    let Some(pid) = compact_pid(line) else { return };
+    if crashes.iter().any(|c| c.pid == Some(pid)) {
+        return;
+    }
+    let Some((marker, _)) = markers::MARKERS.iter().find(|(m, _)| line.contains(m)) else { return };
+    // `2026-10-12 15:54:29.797 Df Crashy[61726:59a99a] …`.
+    let time = line.get(..23).unwrap_or_default().to_owned();
+    let process = line.split_whitespace().nth(3).and_then(|w| w.split('[').next()).unwrap_or_default().to_owned();
+    crashes.push(Crash {
+        id: format!("log:{pid}"),
+        time,
+        app: process,
+        exception: "crashed (its report is still being written: run `oximux sim crashes` again in ~20 s for the frames)".into(),
+        reason: line[line.find(marker).unwrap_or(0)..].trim().to_owned(),
+        frames: Vec::new(),
+        pid: Some(pid),
+    });
 }
 
 /// The panel's watch on a simulator's reports: new `.ips` files since the
@@ -269,12 +296,6 @@ pub fn parse_threadtime(line: &str) -> Option<LogLine<'_>> {
     Some(LogLine { time, pid: pid.parse().ok()?, level, tag: tag.trim(), msg })
 }
 
-/// A short, stable hash (FNV-1a) of the first frames, so one crash read twice
-/// keeps its id.
-fn frames_hash(frames: &[String]) -> u64 {
-    frames.iter().take(3).flat_map(|f| f.bytes().chain([0])).fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
-}
-
 /// `pid 4321 (com.example.app)` at the end of a fatal signal line.
 fn signal_process(msg: &str) -> Option<(u32, String)> {
     let at = msg.rfind("pid ")?;
@@ -291,7 +312,8 @@ pub fn parse_crash_buffer(text: &str) -> Vec<Crash> {
     let mut open: Option<(usize, Reading)> = None;
     for line in text.lines().filter_map(parse_threadtime) {
         let msg = line.msg.trim_end();
-        if line.tag == "AndroidRuntime" && msg.starts_with("FATAL EXCEPTION") {
+        // `FATAL EXCEPTION: main`, or `*** FATAL EXCEPTION IN SYSTEM PROCESS`.
+        if line.tag == "AndroidRuntime" && msg.contains("FATAL EXCEPTION") {
             crashes.push(Crash { id: String::new(), time: line.time.into(), app: String::new(), exception: String::new(), reason: String::new(), frames: Vec::new(), pid: Some(line.pid) });
             open = Some((crashes.len() - 1, Reading::Java));
             continue;
@@ -315,6 +337,13 @@ pub fn parse_crash_buffer(text: &str) -> Vec<Crash> {
         let crash = &mut crashes[at];
         let text = msg.trim();
         if reading == Reading::Native {
+            // debuggerd names the process it dumps: another one's lines are
+            // not this crash's.
+            let dumped = text.strip_prefix("pid: ").and_then(|t| t.split(',').next()).and_then(|p| p.trim().parse::<u32>().ok());
+            if line.tag == "DEBUG" && dumped.is_some_and(|p| Some(p) != crash.pid) {
+                open = None;
+                continue;
+            }
             // `#00 pc 000000000004e1a8  /apex/…/libc.so (abort+164)`.
             if line.tag == "DEBUG" && text.starts_with('#') && text.contains(" pc ") && crash.frames.len() < FRAMES {
                 crash.frames.push(text.split_whitespace().skip(3).collect::<Vec<_>>().join(" "));
@@ -343,8 +372,11 @@ pub fn parse_crash_buffer(text: &str) -> Vec<Crash> {
             open = Some((at, Reading::JavaCause));
         }
     }
+    // The process and the millisecond: never the frames, which a native
+    // crash's backtrace adds lines later (a read in between would give the
+    // same crash a second id).
     for crash in &mut crashes {
-        crash.id = format!("{}@{}#{:016x}", crash.pid.unwrap_or(0), crash.time, frames_hash(&crash.frames));
+        crash.id = format!("{}@{}", crash.pid.unwrap_or(0), crash.time);
     }
     crashes
 }
@@ -360,8 +392,15 @@ enum Reading {
     Native,
 }
 
+/// The apps the user installed on an Android device (`pm list packages -3`):
+/// a crash of anything else is the system's.
+pub fn user_apps(adb: &Adb, serial: &str) -> crate::Result<HashSet<String>> {
+    let out = adb.shell(serial, &["pm", "list", "packages", "-3"], Duration::from_secs(10))?;
+    Ok(out.lines().filter_map(|l| l.trim().strip_prefix("package:")).map(str::to_owned).collect())
+}
+
 /// `app`'s crash: its package, or one of its processes (`com.x:remote`).
-fn is_app(crash: &Crash, app: &str) -> bool {
+pub fn is_app(crash: &Crash, app: &str) -> bool {
     crash.app == app || crash.app.strip_prefix(app).is_some_and(|rest| rest.starts_with(':'))
 }
 

@@ -91,6 +91,21 @@ fn a_fatal_errors_words_become_its_reports_reason() {
     assert_eq!(crashes[0].reason, "Fatal error: Index out of range");
     give_reason(&mut crashes, "2026-10-12 15:54:29.797 Df Other[1:2] Fatal error: not this one");
     assert_eq!(crashes[0].reason, "Fatal error: Index out of range", "another process's words");
+    let mut thrown = vec![parse_ips(UNCAUGHT).unwrap().crash];
+    give_reason(&mut thrown, "2026-10-12 16:00:50.000 E  Shop[70001:1] Fatal error: later words");
+    assert!(thrown[0].reason.contains("NSInvalidArgumentException"), "the report's own reason wins");
+}
+
+#[test]
+fn a_fatal_line_without_a_report_yet_is_listed_as_such() {
+    let mut crashes = Vec::new();
+    unreported(&mut crashes, "2026-10-12 16:20:25.311 Df Crashy[61886:5d9f3b] Swift/A.swift:1: Fatal error: Index out of range");
+    assert_eq!(crashes.len(), 1);
+    assert_eq!((crashes[0].app.as_str(), crashes[0].time.as_str()), ("Crashy", "2026-10-12 16:20:25.311"));
+    assert_eq!(crashes[0].reason, "Fatal error: Index out of range");
+    assert!(crashes[0].exception.contains("still being written"));
+    unreported(&mut crashes, "2026-10-12 16:20:25.400 Df Crashy[61886:5d9f3b] Fatal error: again");
+    assert_eq!(crashes.len(), 1, "one per process");
 }
 
 #[test]
@@ -139,6 +154,28 @@ fn the_crash_buffer_reads_as_a_java_and_a_native_crash() {
     assert_eq!(native.frames[0], "/data/app/com.example.game/lib/arm64/libgame.so (Renderer::draw()+40)");
     assert_eq!(native.frames.len(), 3);
     assert_eq!(parse_crash_buffer(LOGCAT), crashes, "the same crash keeps its id");
+}
+
+#[test]
+fn a_native_crash_keeps_its_id_while_its_backtrace_arrives() {
+    let signal_only: String = LOGCAT.lines().take_while(|l| !l.contains("F DEBUG")).map(|l| format!("{l}\n")).collect();
+    let early = parse_crash_buffer(&signal_only);
+    let late = parse_crash_buffer(LOGCAT);
+    assert_eq!(early[1].frames.len(), 0);
+    assert_eq!(early[1].id, late[1].id, "the frames do not change the id");
+}
+
+#[test]
+fn another_processs_backtrace_is_not_this_crashs() {
+    let text = "10-12 16:06:12.500  5555  5570 F libc    : Fatal signal 6 (SIGABRT), code -1 in tid 5570 (main), pid 5555 (com.a.b)\n\
+                10-12 16:06:12.700  5600  5600 F DEBUG   : pid: 7777, tid: 7777, name: other  >>> com.other <<<\n\
+                10-12 16:06:12.701  5600  5600 F DEBUG   :       #00 pc 000000000004e1a8  /system/lib64/libother.so (x+1)\n\
+                10-12 16:06:13.000  1200  1200 E AndroidRuntime: *** FATAL EXCEPTION IN SYSTEM PROCESS: main\n\
+                10-12 16:06:13.000  1200  1200 E AndroidRuntime: java.lang.IllegalStateException: boom\n";
+    let crashes = parse_crash_buffer(text);
+    assert_eq!(crashes.len(), 2);
+    assert!(crashes[0].frames.is_empty(), "{:?}", crashes[0].frames);
+    assert_eq!(crashes[1].exception, "java.lang.IllegalStateException");
 }
 
 #[test]

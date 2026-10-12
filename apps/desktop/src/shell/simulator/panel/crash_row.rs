@@ -17,10 +17,17 @@ use crate::shell::simulator::annotate::export;
 const MAX_SUMMARY: usize = 4096;
 
 impl SimulatorPanel {
-    /// A crash on `udid`: the newest replaces any shown before.
+    /// A crash on `udid`: the newest replaces any shown before. Scrubbed
+    /// once, here, for the row and whatever is sent.
     pub(super) fn crashed(&mut self, udid: &DeviceId, crash: &Crash, cx: &mut Context<Self>) {
         if self.device(cx).as_ref() == Some(udid) {
-            self.crash = Some((udid.clone(), crash.clone()));
+            let crash = Crash {
+                exception: clamp(&scrub_text(&crash.exception), 300),
+                reason: clamp(&scrub_text(&crash.reason), 1500),
+                frames: crash.frames.iter().map(|f| clamp(&scrub_text(f), 200)).collect(),
+                ..crash.clone()
+            };
+            self.crash = Some((udid.clone(), crash));
             cx.notify();
         }
     }
@@ -32,9 +39,10 @@ impl SimulatorPanel {
             return None;
         }
         let why = [crash.exception.as_str(), crash.reason.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(": ");
+        let title = if crash.app.is_empty() { "An app crashed".to_owned() } else { format!("{} crashed", crash.app) };
         Some(self.render_question(
-            format!("{} crashed", crash.app),
-            scrub_text(&why),
+            title,
+            why,
             ("sim-crash-dismiss", "Dismiss"),
             ("sim-crash-send", "Send to agent"),
             cx.listener(|this, _, _window, cx| {
@@ -70,23 +78,29 @@ impl SimulatorPanel {
     }
 }
 
-/// What the agent reads: the app, the exception, the reason and the frames,
-/// scrubbed and at most [`MAX_SUMMARY`] bytes.
+/// At most `max` bytes of `s` (on a character boundary), `…` when cut.
+fn clamp(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let cut = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+    format!("{}…", &s[..cut])
+}
+
+/// What the agent reads: the app, the exception, the reason and the frames
+/// (each already scrubbed and clamped by [`SimulatorPanel::crashed`], so the
+/// whole stays under [`MAX_SUMMARY`] with its fence closed).
 pub(super) fn summary(device: &str, crash: &Crash) -> String {
-    let mut text = format!("{} crashed on {device} at {}.\n\n```\n{}", crash.app, crash.time, crash.exception);
+    let app = if crash.app.is_empty() { "An app" } else { crash.app.as_str() };
+    let mut text = format!("{app} crashed on {} at {}.\n\n```\n{}", clamp(device, 100), clamp(&crash.time, 40), crash.exception);
     if !crash.reason.is_empty() {
         text.push_str(&format!("\n{}", crash.reason));
     }
-    for (i, frame) in crash.frames.iter().enumerate() {
+    for (i, frame) in crash.frames.iter().take(oximux_simulator::diag::FRAMES).enumerate() {
         text.push_str(&format!("\n  {i} {frame}"));
     }
     text.push_str("\n```\nFind the cause and fix it (`oximux sim crashes` and `oximux sim logs` show more).");
-    let mut text = scrub_text(&text);
-    if text.len() > MAX_SUMMARY {
-        let cut = (0..=MAX_SUMMARY - 4).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
-        text.truncate(cut);
-        text.push_str("\n…");
-    }
+    debug_assert!(text.len() <= MAX_SUMMARY, "{}", text.len());
     text
 }
 
@@ -106,18 +120,32 @@ mod tests {
         }
     }
 
+    /// As the row keeps it: scrubbed and clamped on arrival.
+    fn kept(crash: Crash) -> Crash {
+        Crash {
+            exception: clamp(&scrub_text(&crash.exception), 300),
+            reason: clamp(&scrub_text(&crash.reason), 1500),
+            frames: crash.frames.iter().map(|f| clamp(&scrub_text(f), 200)).collect(),
+            ..crash
+        }
+    }
+
     #[test]
     fn the_summary_names_what_why_and_where_scrubbed() {
-        let text = summary("iPhone 17", &crash("Fatal error: login failed token=abc123secret", 2));
+        let text = summary("iPhone 17", &kept(crash("Fatal error: login failed token=abc123secret", 2)));
         assert!(text.starts_with("dev.oximux.crashy crashed on iPhone 17 at 2026-10-12 15:54:29.\n\n```\nEXC_BREAKPOINT (SIGTRAP)\n"));
         assert!(text.contains("token=[redacted]") && !text.contains("abc123secret"));
         assert!(text.contains("\n  1 Crashy frame 1\n```"));
     }
 
     #[test]
-    fn a_long_summary_is_cut_to_four_kib() {
-        let text = summary("iPhone 17", &crash(&"é".repeat(5000), 8));
+    fn a_long_summary_stays_under_four_kib_with_its_fence_closed() {
+        let mut long = crash(&"é".repeat(5000), 8);
+        long.frames = (0..8).map(|_| "f".repeat(1000)).collect();
+        let text = summary(&"d".repeat(500), &kept(long));
         assert!(text.len() <= MAX_SUMMARY, "{}", text.len());
-        assert!(text.ends_with('…'));
+        assert!(text.contains("…\n```\nFind the cause"), "the fence closes");
+        assert_eq!(clamp("abc", 5), "abc");
+        assert_eq!(clamp("ééé", 3), "é…");
     }
 }

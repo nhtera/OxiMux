@@ -326,7 +326,13 @@ pub(super) async fn execute(
         }
         SimCmdWire::Launch { bundle_id, relaunch } if udid.platform() == Platform::Android => {
             let device = android_device(hub, udid, cx).await?;
-            on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done)
+            let launched = bundle_id.clone();
+            let done = on_own_thread(move || device.launch(&bundle_id, relaunch)).await?.map(|()| SimReplyWire::Done);
+            // Its crashes now raise the panel's row, even on a real phone.
+            if done.is_ok() {
+                hub.update(cx, |hub, _| hub.note_crash_app(udid, &launched));
+            }
+            done
         }
         SimCmdWire::Launch { bundle_id, relaunch } if udid.source() == Source::Devicectl => {
             check_bundle_id(&bundle_id)?;

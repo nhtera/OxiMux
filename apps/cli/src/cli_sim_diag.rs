@@ -11,7 +11,8 @@ pub struct LogsArgs {
     #[arg(long, value_name = "TIME", default_value = "30s", value_parser = parse_since)]
     pub since: u32,
     /// One app's messages (bundle id; Android: package name). Required on a
-    /// real Android phone.
+    /// real Android phone; on a simulator, without it (or --grep) at most
+    /// 10m (5m with info or debug).
     #[arg(long, value_name = "ID")]
     pub app: Option<String>,
     /// Only messages containing TEXT (ignoring case).
@@ -37,7 +38,8 @@ pub struct CrashesArgs {
     /// How far back: 30s, 10m, 1h (at most 1h).
     #[arg(long, value_name = "TIME", default_value = "10m", value_parser = parse_since)]
     pub since: u32,
-    /// One app's crashes (bundle id; Android: package name).
+    /// One app's crashes (bundle id; Android: package name). Required on a
+    /// real Android phone.
     #[arg(long, value_name = "ID")]
     pub app: Option<String>,
 }

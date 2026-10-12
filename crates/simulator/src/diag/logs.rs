@@ -22,8 +22,13 @@ pub const MAX_BYTES: usize = 64 * 1024;
 pub const LOG_TIMEOUT: Duration = Duration::from_secs(30);
 const SHORT: Duration = Duration::from_secs(10);
 
+/// The longest window a simulator's whole log (no `--app`, no `--grep`) is
+/// read over; with info or debug messages, shorter.
+const WHOLE_SIM_SECS: u32 = 600;
+const WHOLE_SIM_DETAILED_SECS: u32 = 300;
+
 /// Which messages, from least to most.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     /// Errors and faults only.
     Error,
@@ -133,6 +138,15 @@ pub fn sim_executable(runner: &dyn Runner, udid: &SimUdid, app: &str) -> DiagRes
 
 /// A simulator's log for `query`.
 pub fn sim_logs(runner: &dyn Runner, udid: &SimUdid, query: &LogQuery) -> DiagResult<LogLines> {
+    // `log show` hands back everything before the tail is cut: the whole
+    // device's chatter over a long window is too much to hold.
+    let whole = if query.level >= Level::Info { WHOLE_SIM_DETAILED_SECS } else { WHOLE_SIM_SECS };
+    if query.app.is_none() && query.grep.is_none() && query.since_secs > whole {
+        return Err(DiagError::BadInput(format!(
+            "a simulator's whole log is read {}m at a time at this level: add --app or --grep, or narrow --since",
+            whole / 60
+        )));
+    }
     let process = query.app.as_deref().map(|app| sim_executable(runner, udid, app)).transpose()?;
     let predicate = predicate(process.as_deref(), query.level, query.grep.as_deref());
     let args = sim_args(udid, query.since_secs, query.level, predicate.as_deref());
@@ -167,6 +181,9 @@ pub fn logcat_args(start: u64, only: Option<Only>, level: Level) -> Vec<String> 
     args
 }
 
+/// Android's first app uid: below it, uids are the system's, shared.
+const FIRST_APP_UID: u32 = 10_000;
+
 /// Whose lines `logcat` keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Only {
@@ -182,17 +199,19 @@ pub fn device_now(adb: &Adb, serial: &str) -> Result<u64> {
     out.trim().parse().map_err(|_| SimError::Parse { what: "date +%s".into(), detail: out })
 }
 
-/// `package:com.example.app uid:10123` → 10123.
-pub fn parse_uid(out: &str, package: &str) -> Option<u32> {
+/// `package:com.example.app uid:10123` → `Some(Some(10123))`; the package
+/// listed without a uid (an older `pm`) → `Some(None)`; not listed → `None`.
+pub fn parse_uid(out: &str, package: &str) -> Option<Option<u32>> {
     out.lines().find_map(|line| {
         let mut words = line.split_whitespace();
         let name = words.next()?.strip_prefix("package:")?;
-        (name == package).then(|| words.find_map(|w| w.strip_prefix("uid:")?.parse().ok()))?
+        (name == package).then(|| words.find_map(|w| w.strip_prefix("uid:")?.parse().ok()))
     })
 }
 
-/// The app's uid, `None` when the package is not installed.
-pub fn app_uid(adb: &Adb, serial: &str, package: &str) -> Result<Option<u32>> {
+/// The app's uid (`None` inside: installed, uid unknown); `None` when the
+/// package is not installed.
+pub fn app_uid(adb: &Adb, serial: &str, package: &str) -> Result<Option<Option<u32>>> {
     Ok(parse_uid(&adb.shell(serial, &["pm", "list", "packages", "-U", package], SHORT)?, package))
 }
 
@@ -216,10 +235,22 @@ pub fn android_logs(adb: &Adb, serial: &str, query: &LogQuery) -> DiagResult<Log
                 return Err(DiagError::BadInput(format!("`{app}` is not an Android package name")));
             }
             let uid = app_uid(adb, serial, app)?.ok_or_else(|| DiagError::NotFound(format!("{app} is not installed on this device")))?;
-            match read(Some(Only::Uid(uid))) {
-                Ok(text) => text,
-                // An Android without `--uid`: the running process only.
-                Err(_) => match app_pid(adb, serial, app)? {
+            // A system app shares its uid with the system (Settings runs as
+            // uid 1000, as system_server does): only its own process is its.
+            let by_uid = match uid.filter(|uid| *uid >= FIRST_APP_UID) {
+                Some(uid) => match read(Some(Only::Uid(uid))) {
+                    Ok(text) => Some(text),
+                    // An Android without `--uid` refuses the option; a
+                    // timeout is an answer, not a reason to read again.
+                    Err(SimError::CommandFailed { .. }) => None,
+                    Err(e) => return Err(e.into()),
+                },
+                None => None,
+            };
+            match by_uid {
+                Some(text) => text,
+                // Or an Android without `--uid`: the running process only.
+                None => match app_pid(adb, serial, app)? {
                     Some(pid) => read(Some(Only::Pid(pid)))?,
                     None => String::new(),
                 },
@@ -313,8 +344,9 @@ mod tests {
         assert_eq!(logcat_args(1_760_000_000, Some(Only::Uid(10123)), Level::Error), ["-d", "-v", "threadtime", "-T", "1760000000.000", "--uid=10123", "*:E"]);
         assert_eq!(logcat_args(5, None, Level::Debug).last().unwrap(), "*:V");
         let pm = "package:com.example.app.debug uid:10124\npackage:com.example.app uid:10123\n";
-        assert_eq!(parse_uid(pm, "com.example.app"), Some(10123));
+        assert_eq!(parse_uid(pm, "com.example.app"), Some(Some(10123)));
         assert_eq!(parse_uid(pm, "com.other"), None);
+        assert_eq!(parse_uid("package:com.old\n", "com.old"), Some(None), "installed, uid unknown");
     }
 
     #[test]
@@ -329,6 +361,18 @@ mod tests {
         let adb = Adb::new(&runner, std::path::Path::new("adb"));
         let q = LogQuery { since_secs: 60, app: Some("com.example.app".into()), grep: Some("boom".into()), ..query() };
         assert_eq!(android_logs(&adb, "S", &q).unwrap().lines, ["10-12 15:54:01.000 1 1 E App: BOOM here"]);
+    }
+
+    #[test]
+    fn a_system_app_is_read_by_its_process_not_its_shared_uid() {
+        let runner = ScriptedRunner::default()
+            .expect("adb -s S shell date +%s", CmdOutput::ok("1760000100\n"))
+            .expect("adb -s S shell pm list packages -U com.android.settings", CmdOutput::ok("package:com.android.settings uid:1000\n"))
+            .expect("adb -s S shell pidof -s com.android.settings", CmdOutput::ok("4242\n"))
+            .expect("adb -s S logcat -d -v threadtime -T 1760000070.000 --pid=4242 *:I", CmdOutput::ok("10-12 15:54:00.000 4242 4242 I Settings: open\n"));
+        let adb = Adb::new(&runner, std::path::Path::new("adb"));
+        let q = LogQuery { app: Some("com.android.settings".into()), ..query() };
+        assert_eq!(android_logs(&adb, "S", &q).unwrap().lines.len(), 1);
     }
 
     #[test]
@@ -350,6 +394,16 @@ mod tests {
         assert!(check(&LogQuery { lines: 5000, ..query() }).is_err());
         assert!(check(&LogQuery { app: Some("x;rm -rf /".into()), ..query() }).is_err());
         assert!(check(&LogQuery { grep: Some("a\nb".into()), ..query() }).is_err());
+    }
+
+    #[test]
+    fn a_simulators_whole_log_is_read_over_a_short_window() {
+        let runner = ScriptedRunner::default();
+        let long = LogQuery { since_secs: 3600, ..query() };
+        assert!(matches!(sim_logs(&runner, &udid(), &long), Err(DiagError::BadInput(_))));
+        let debug = LogQuery { since_secs: 600, level: Level::Debug, ..query() };
+        assert!(matches!(sim_logs(&runner, &udid(), &debug), Err(DiagError::BadInput(_))));
+        assert!(runner.calls().is_empty(), "nothing ran");
     }
 
     #[test]

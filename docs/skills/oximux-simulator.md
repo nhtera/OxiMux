@@ -239,15 +239,17 @@ oximux sim crashes --app com.example.app --since 1h
 
 - `--since` takes `30s`, `5m` or `1h` (at most `1h`); `--lines` at most 2000,
   and the output is cut to 64 KiB, newest kept. A slow read (over 30 s) fails:
-  narrow `--since` or add `--app`.
+  narrow `--since` or add `--app`. A simulator's whole log (no `--app`, no
+  `--grep`) is read at most `10m` back (`5m` with `info` or `debug`).
 - `--level error` keeps errors and faults; `info` and `debug` add more.
 - `crashes` lists each crash with its exception, its reason and the top 8
   frames of the crashing thread, then `warnings:` — lines that warn of trouble
   short of a crash (an ANR, an unhandled promise rejection). A simulator's
-  crash report appears about 20 s after the app dies: if `crashes` finds
-  nothing right after a crash, wait and run it again.
-- A real Android phone's log is read one app at a time: `--app` is required
-  (exit 2 without it). A real iPhone has neither (exit 5).
+  crash report is written a few seconds (up to ~20 s) after the app dies;
+  until then `crashes` lists the crash without frames and says so — run it
+  again for them.
+- A real Android phone is read one app at a time: `--app` is required for
+  both (exit 2 without it). A real iPhone has neither (exit 5).
 - Secret-looking values (API keys, tokens, `token=…`) are replaced with
   `[redacted]` before you see them.
 
