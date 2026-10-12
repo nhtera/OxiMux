@@ -148,7 +148,13 @@ impl SimCommand {
             | Self::Install { .. }
             | Self::Shutdown { .. } => None,
             Self::Location(_) | Self::Appearance { .. } | Self::Privacy(_) | Self::Push(_) | Self::StatusBar { .. } | Self::Erase { .. } => None,
+            Self::Logs(_) | Self::Crashes(_) => None,
         }
+    }
+
+    /// The v29 diagnostics verbs (`logs`, `crashes`).
+    pub fn is_diag(&self) -> bool {
+        matches!(self, Self::Logs(_) | Self::Crashes(_))
     }
 
     /// The v28 device-state verbs (`location`, `appearance`, …).
@@ -185,7 +191,9 @@ impl SimCommand {
             | Self::Privacy(_)
             | Self::Push(_)
             | Self::StatusBar { .. }
-            | Self::Erase { .. } => None,
+            | Self::Erase { .. }
+            | Self::Logs(_)
+            | Self::Crashes(_) => None,
         }
     }
 }

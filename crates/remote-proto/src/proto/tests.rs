@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 28,
-        "v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+        PROTOCOL_VERSION, 29,
+        "v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
          status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
@@ -665,6 +665,40 @@ fn device_state_appends_and_round_trips() {
         assert_eq!((bytes[5], bytes[6]), (21, ordinal), "{cmd:?}");
         assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
         assert!(!cmd.uses_verify(), "not a verify-loop verb: never answered with its errors");
+    }
+}
+
+/// v29 appends diagnostics after device state (verbs 22 and 23, replies 9
+/// and 10).
+#[test]
+fn diagnostics_append_and_round_trip() {
+    let logs = SimCmdWire::Logs(SimLogsWire { since_secs: 30, app: Some("a.b".into()), grep: Some("boom".into()), level: SimLogLevelWire::Error, lines: 200 });
+    let crashes = SimCmdWire::Crashes(SimCrashesWire { since_secs: 600, app: None });
+    for (ordinal, cmd) in [(22u8, logs), (23, crashes)] {
+        let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: cmd.clone() });
+        let bytes = req.to_bytes().expect("encode");
+        assert_eq!(bytes[5], ordinal, "{cmd:?}");
+        assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
+        assert!(!cmd.uses_verify() && cmd.is_control(), "a control verb, never answered with the v27 errors");
+    }
+    let crash = SimCrashWire {
+        id: "B8E1C770".into(),
+        time: "2026-10-12 15:54:29".into(),
+        app: "a.b".into(),
+        exception: "EXC_BREAKPOINT (SIGTRAP)".into(),
+        reason: "Fatal error: Index out of range".into(),
+        frames: vec!["libswiftCore.dylib _assertionFailure".into()],
+    };
+    let replies = [
+        (9u8, SimReplyWire::Logs { lines: vec!["one".into(), "two".into()], truncated: true }),
+        (10, SimReplyWire::Crashes(SimCrashListWire { crashes: vec![crash], warnings: vec!["ANR in a.b".into()] })),
+    ];
+    for (ordinal, reply) in replies {
+        let resp = Response::Simulator(Ok(reply.clone()));
+        let bytes = resp.to_bytes().expect("encode");
+        assert_eq!(Response::from_bytes(&bytes).expect("decode"), resp);
+        // The reply's ordinal follows the envelope's and `Ok`'s.
+        assert_eq!(bytes[2], ordinal, "{reply:?}");
     }
 }
 

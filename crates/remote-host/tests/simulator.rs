@@ -74,6 +74,20 @@ fn a_device_state_change_reaches_the_simulator_as_sent() {
     assert_eq!(*spy.cmds.lock().unwrap(), [cmd]);
 }
 
+/// A diagnostics read (v29) is forwarded as sent, confined to the session's
+/// worktree like every other verb.
+#[test]
+fn a_log_read_reaches_the_simulator_as_sent() {
+    use oximux_remote_proto::simulator::{SimLogLevelWire, SimLogsWire};
+    let spy = Arc::new(Spy::default());
+    let cmd = SimCmdWire::Logs(SimLogsWire { since_secs: 30, app: Some("com.a.b".into()), grep: None, level: SimLogLevelWire::Error, lines: 200 });
+    let req = Request::Simulator(SimRequestWire { worktree: Some("/work/other".into()), cmd: cmd.clone() });
+    let got = local(&host(Some(spy.clone())), LocalScope::Session("sess-1".into()), vec![req]);
+    assert_eq!(got, vec![Response::Simulator(Ok(SimReplyWire::Done))]);
+    assert_eq!(*spy.worktrees.lock().unwrap(), ["/work/mine"]);
+    assert_eq!(*spy.cmds.lock().unwrap(), [cmd]);
+}
+
 fn sim(worktree: Option<&str>) -> Request {
     Request::Simulator(SimRequestWire { worktree: worktree.map(Into::into), cmd: SimCmdWire::Screenshot { full: false } })
 }

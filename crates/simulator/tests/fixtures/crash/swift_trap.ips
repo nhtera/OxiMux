@@ -1,0 +1,25 @@
+{"app_name":"Crashy","timestamp":"2026-10-12 15:54:49.00 +0700","app_version":"1.0","bundleID":"dev.oximux.crashy","bug_type":"309","os_version":"macOS 15.7.3 (24G419)","name":"Crashy","incident_id":"B8E1C770-FF0E-4937-B31D-3412678C6258"}
+{
+  "procPath" : "\/Users\/USER\/Library\/Developer\/CoreSimulator\/Devices\/E0E0A1DD-2DAC-448E-86D3-07B7F809BCD2\/data\/Containers\/Bundle\/Application\/83EE9948-8300-459B-B1F6-4E247B9E37CB\/Crashy.app\/Crashy",
+  "procName" : "Crashy",
+  "pid" : 61726,
+  "bundleInfo" : {"CFBundleShortVersionString":"1.0","CFBundleVersion":"1","CFBundleIdentifier":"dev.oximux.crashy"},
+  "incident" : "B8E1C770-FF0E-4937-B31D-3412678C6258",
+  "captureTime" : "2026-10-12 15:54:29.8027 +0700",
+  "exception" : {"codes":"0x0000000000000001, 0x000000019785c5b0","rawCodes":[1,6837093808],"type":"EXC_BREAKPOINT","signal":"SIGTRAP"},
+  "termination" : {"flags":0,"code":5,"namespace":"SIGNAL","indicator":"Trace\/BPT trap: 5","byProc":"exc handler","byPid":61726},
+  "faultingThread" : 0,
+  "threads" : [{"triggered":true,"id":5876123,"queue":"com.apple.main-thread","frames":[
+    {"imageOffset":1066416,"symbol":"_assertionFailure(_:_:file:line:flags:)","symbolLocation":176,"imageIndex":1},
+    {"imageOffset":968064,"symbol":"Array._checkSubscript(_:wasNativeTypeChecked:)","imageIndex":1},
+    {"imageOffset":970020,"symbol":"Array.subscript.getter","imageIndex":1},
+    {"imageOffset":8112,"symbol":"closure #1 in AppDelegate.application(_:didFinishLaunchingWithOptions:)","imageIndex":0},
+    {"imageOffset":8180,"symbol":"thunk for @escaping @callee_guaranteed () -> ()","imageIndex":0},
+    {"imageOffset":115888,"symbol":"_dispatch_client_callout","imageIndex":2},
+    {"imageOffset":25972,"symbol":"_dispatch_continuation_pop","imageIndex":2},
+    {"imageOffset":103816,"symbol":"_dispatch_source_invoke","imageIndex":2},
+    {"imageOffset":69900,"symbol":"_dispatch_main_queue_drain","imageIndex":2},
+    {"imageOffset":4242,"imageIndex":2}
+  ]},{"id":5876124,"frames":[{"imageOffset":1,"imageIndex":2}]}],
+  "usedImages" : [{"name":"Crashy","base":4305616896},{"name":"libswiftCore.dylib","base":6836027392},{"name":"libdispatch.dylib","base":6440000000}]
+}

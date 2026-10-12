@@ -134,6 +134,14 @@ impl<'a> Adb<'a> {
         Ok(self.on(serial, &all, timeout)?.stdout_str())
     }
 
+    /// `adb -s S logcat <args…>`: stdout. (adb quotes each word for the
+    /// device's shell itself.)
+    pub fn logcat(&self, serial: &str, args: &[&str], timeout: Duration) -> Result<String> {
+        let mut all = vec!["logcat"];
+        all.extend_from_slice(args);
+        Ok(self.on(serial, &all, timeout)?.stdout_str())
+    }
+
     pub fn getprop(&self, serial: &str, key: &str, timeout: Duration) -> Result<String> {
         Ok(self.shell(serial, &["getprop", key], timeout)?.trim().to_owned())
     }

@@ -224,6 +224,33 @@ oximux sim erase                            # wipe and boot again
 - An Android device's demo-mode status bar goes back to normal when the last
   worktree attached to it detaches, and when OxiMux quits.
 
+## Logs and crashes
+
+Read what the app said, or why it died, instead of running `log stream` or
+`adb logcat` yourself. Each is one bounded read, never a stream:
+
+```sh
+oximux sim logs                                    # the last 30s, 200 lines
+oximux sim logs --app com.example.app --level error --since 5m
+oximux sim logs --grep "checkout" --lines 500
+oximux sim crashes                                 # the last 10m
+oximux sim crashes --app com.example.app --since 1h
+```
+
+- `--since` takes `30s`, `5m` or `1h` (at most `1h`); `--lines` at most 2000,
+  and the output is cut to 64 KiB, newest kept. A slow read (over 30 s) fails:
+  narrow `--since` or add `--app`.
+- `--level error` keeps errors and faults; `info` and `debug` add more.
+- `crashes` lists each crash with its exception, its reason and the top 8
+  frames of the crashing thread, then `warnings:` — lines that warn of trouble
+  short of a crash (an ANR, an unhandled promise rejection). A simulator's
+  crash report appears about 20 s after the app dies: if `crashes` finds
+  nothing right after a crash, wait and run it again.
+- A real Android phone's log is read one app at a time: `--app` is required
+  (exit 2 without it). A real iPhone has neither (exit 5).
+- Secret-looking values (API keys, tokens, `token=…`) are replaced with
+  `[redacted]` before you see them.
+
 ## Android
 
 The same verbs drive an Android emulator (an AVD) or a phone with USB

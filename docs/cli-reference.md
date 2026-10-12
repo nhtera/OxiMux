@@ -854,6 +854,27 @@ Wipe the device to factory settings and boot it again (asked every time). A devi
 | --- | --- | --- |
 | `--force` | no |  |
 
+#### `oximux sim logs`
+
+The device's recent log, one bounded read (default: the last 30s, 200 lines). A real Android phone needs --app
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--since` | yes | How far back: 30s, 5m, 1h (at most 1h) |
+| `--app` | yes | One app's messages (bundle id; Android: package name). Required on a real Android phone |
+| `--grep` | yes | Only messages containing TEXT (ignoring case) |
+| `--level` | yes | error: errors and faults only; info and debug add more |
+| `--lines` | yes | The last N lines (at most 2000; the output is also cut to 64 KiB) |
+
+#### `oximux sim crashes`
+
+The device's recent crashes, each with its exception and top frames (default: the last 10m), and warnings short of a crash
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--since` | yes | How far back: 30s, 10m, 1h (at most 1h) |
+| `--app` | yes | One app's crashes (bundle id; Android: package name) |
+
 ### `oximux serve`
 
 Run this machine as a headless OxiMux host.

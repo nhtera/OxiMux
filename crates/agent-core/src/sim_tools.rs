@@ -6,8 +6,9 @@
 //!
 //! - a command that runs `oximux sim screenshot`, `ax`, `wait` or `assert` —
 //!   the screen's contents come back as its output (the AX tree is the
-//!   screen's text) — or any `oximux sim` command carrying `--settle`, `-i`
-//!   or an `@eN` ref, whose reply prints elements read off the screen;
+//!   screen's text) — or `logs` or `crashes`, whose output is what the
+//!   device's apps wrote, or any `oximux sim` command carrying `--settle`,
+//!   `-i` or an `@eN` ref, whose reply prints elements read off the screen;
 //! - anything that names a file under an `oximux-sim/` folder — where
 //!   `oximux sim screenshot` saves its PNGs, so a `Read` of one is the
 //!   screenshot itself.
@@ -25,8 +26,9 @@ use serde_json::Value;
 /// The folder `oximux sim screenshot` saves into (under `$TMPDIR`).
 pub const CAPTURE_DIR: &str = "oximux-sim";
 
-/// The `oximux sim` verbs whose output is the screen's contents.
-const CAPTURE_VERBS: [&str; 4] = ["screenshot", "ax", "wait", "assert"];
+/// The `oximux sim` verbs whose output is the screen's contents, or the
+/// device's log (which can carry anything an app printed).
+const CAPTURE_VERBS: [&str; 6] = ["screenshot", "ax", "wait", "assert", "logs", "crashes"];
 
 /// Flags that make any `oximux sim` verb print the screen's elements (a
 /// settle's diff, `ax -i`'s list), wherever they stand in the command.
@@ -129,6 +131,8 @@ mod tests {
             json!({"command": "oximux sim --worktree . ax -i"}),
             json!({"command": "oximux sim tap @e7"}),
             json!({"command": "oximux sim type @e2 hello"}),
+            json!({"command": "oximux sim logs --app com.a.b --since 5m"}),
+            json!({"command": ["oximux", "--json", "sim", "crashes"]}),
         ] {
             assert!(is_simulator_capture(&input), "{input}");
         }

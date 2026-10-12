@@ -78,6 +78,8 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
             Ok((json!({ "path": path, "width": width, "height": height, "scale": scale }), human))
         }
         SimCommand::Ax { max, interactive: true, .. } => sim_verify::ax_refs(client, &worktree, max).await,
+        SimCommand::Logs(args) => super::sim_diag::logs(client, &worktree, args).await,
+        SimCommand::Crashes(args) => super::sim_diag::crashes(client, &worktree, args).await,
         SimCommand::Wait(args) => sim_verify::wait(client, &worktree, args).await,
         SimCommand::Assert(args) => sim_verify::assert(client, &worktree, args).await,
         SimCommand::Type { text, paste, settle } if text.len() > 1 => sim_verify::type_into(client, &worktree, text, paste, &settle).await,
@@ -206,6 +208,7 @@ fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration,
         | SimCommand::Push(_)
         | SimCommand::StatusBar { .. }
         | SimCommand::Erase { .. } => unreachable!("built by `sim_state::request` above"),
+        SimCommand::Logs(_) | SimCommand::Crashes(_) => unreachable!("answered with a reply of their own"),
     })
 }
 

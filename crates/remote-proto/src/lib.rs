@@ -28,6 +28,7 @@ pub mod messages;
 pub mod pairing;
 pub mod proto;
 pub mod simulator;
+mod simulator_diag;
 mod simulator_state;
 mod simulator_verify;
 #[cfg(any(test, feature = "testing"))]

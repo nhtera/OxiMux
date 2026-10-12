@@ -405,6 +405,8 @@ pub(super) async fn execute(
             .map(|()| SimReplyWire::Done)
         }
         SimCmdWire::DeviceState(change) => super::device_state::run(hub, udid, name, change, target, cx).await,
+        SimCmdWire::Logs(query) => super::diagnostics::logs(hub, udid, query, cx).await,
+        SimCmdWire::Crashes(query) => super::diagnostics::crashes(hub, udid, query, cx).await,
         SimCmdWire::Shutdown { force } => {
             let refused = hub
                 .update(cx, |hub, cx| {
@@ -472,7 +474,7 @@ fn phase_wake(hub: &SimulatorHub, udid: &DeviceId) -> Wake {
 
 /// An Android device's `adb` handle, once it streams (the serial is only
 /// known then).
-async fn android_device(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<super::android::Device, SimErrorWire> {
+pub(super) async fn android_device(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<super::android::Device, SimErrorWire> {
     let session = live_session(hub, udid, cx).await?;
     let adb = hub.read_with(cx, |hub, _| hub.android_sdk().map(|s| s.adb()));
     super::android::Device::of(&session, adb)
@@ -480,7 +482,7 @@ async fn android_device(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut As
 
 /// `simctl` app verbs need a simulator, Xcode and a booted device: wake it as
 /// the screen verbs do (a live stream means it is booted).
-async fn simctl_ready(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<SimUdid, SimErrorWire> {
+pub(super) async fn simctl_ready(hub: &Entity<SimulatorHub>, udid: &DeviceId, cx: &mut AsyncApp) -> Result<SimUdid, SimErrorWire> {
     let sim = simctl_udid(udid)?;
     if !hub.read_with(cx, |hub, _| hub.xcode_ok()) {
         return Err(SimErrorWire::Unavailable("Xcode was not found; see `oximux sim status`".into()));

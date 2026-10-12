@@ -68,7 +68,9 @@ pub(super) fn is_action(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Wait { .. }
         | SimCmdWire::Assert { .. }
         | SimCmdWire::AsCaller { .. }
-        | SimCmdWire::DeviceState(_) => false,
+        | SimCmdWire::DeviceState(_)
+        | SimCmdWire::Logs(_)
+        | SimCmdWire::Crashes(_) => false,
     }
 }
 
@@ -92,7 +94,9 @@ pub(super) fn is_input(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::AxRefs { .. }
         | SimCmdWire::Wait { .. }
         | SimCmdWire::Assert { .. }
-        | SimCmdWire::DeviceState(_) => false,
+        | SimCmdWire::DeviceState(_)
+        | SimCmdWire::Logs(_)
+        | SimCmdWire::Crashes(_) => false,
     }
 }
 
@@ -122,7 +126,9 @@ pub(super) fn needs_screen(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::OpenUrl { .. }
         | SimCmdWire::Install { .. }
         | SimCmdWire::Shutdown { .. }
-        | SimCmdWire::DeviceState(_) => false,
+        | SimCmdWire::DeviceState(_)
+        | SimCmdWire::Logs(_)
+        | SimCmdWire::Crashes(_) => false,
     }
 }
 
@@ -151,6 +157,9 @@ pub(super) fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static
         // Checked per change, on every class of device (an emulator takes
         // no push), by `device_state`.
         SimCmdWire::DeviceState(_) => return None,
+        // Checked by `diagnostics`, with words of their own for a real
+        // iPhone (and a phone's whole log).
+        SimCmdWire::Logs(_) | SimCmdWire::Crashes(_) => return None,
         // The tap's needs, then typing's.
         SimCmdWire::TypeInto { target, .. } => return refused_on(caps, &SimCmdWire::Tap(target.clone())).or((!caps.keys).then_some("Typing")),
     };

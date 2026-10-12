@@ -7,6 +7,7 @@
 mod build_info;
 mod cli;
 mod cli_sim;
+mod cli_sim_diag;
 mod cli_sim_state;
 mod client;
 mod client_identity;
@@ -29,7 +30,7 @@ use cli::{
 use client::Client;
 use oximux_remote_proto::proto::{
     CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
-    SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
+    SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
 
@@ -282,6 +283,8 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         Command::Worktree {
             command: WorktreeCommand::Create { branch: Some(_), .. },
         } => Some((CREATE_WORKTREE_BASE_MIN_VERSION, "worktree create --branch")),
+        // v29: diagnostics (`logs`, `crashes`). Above the `Sim` arm.
+        Command::Sim { command, .. } if command.is_diag() => Some((SIMULATOR_DIAG_MIN_VERSION, "sim logs/crashes")),
         // v28: device state (`location`, `appearance`, `privacy`, `push`,
         // `status-bar`, `erase`). Above the `Sim` arm.
         Command::Sim { command, .. } if command.is_device_state() => Some((SIMULATOR_DEVICE_STATE_MIN_VERSION, "sim device state")),

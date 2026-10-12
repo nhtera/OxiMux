@@ -259,6 +259,18 @@ impl oximux_remote_host::SimulatorControl for StubSimulator {
                 return Err(SimErrorWire::AssertFailed(format!("“Sign in” reads “Sign in”, not “{text}”")));
             }
             SimCmdWire::Assert { .. } => SimReplyWire::Matched { node: Some(button), elapsed_ms: 90 },
+            SimCmdWire::Logs(q) => SimReplyWire::Logs { lines: vec![format!("{}s of {}", q.since_secs, q.app.unwrap_or_default())], truncated: true },
+            SimCmdWire::Crashes(_) => SimReplyWire::Crashes(SimCrashListWire {
+                crashes: vec![SimCrashWire {
+                    id: "B8E1".into(),
+                    time: "2026-10-12 15:54:29".into(),
+                    app: "dev.oximux.crashy".into(),
+                    exception: "EXC_BREAKPOINT (SIGTRAP)".into(),
+                    reason: "Fatal error: Index out of range".into(),
+                    frames: vec!["Crashy closure #1".into()],
+                }],
+                warnings: vec![],
+            }),
             SimCmdWire::Status => SimReplyWire::Status(SimStatusWire {
                 available: true,
                 reason: None,
@@ -426,6 +438,27 @@ fn sim_verbs_against_a_live_host() {
     // anything is sent.
     assert_eq!(sim_out(&["push", "--app", "com.a.b", "missing.json"]).status.code(), Some(2));
     assert_eq!(sim.cmds.lock().unwrap().len(), before, "nothing reached the host");
+
+    // Diagnostics (v29): a window in words, one bounded read each.
+    let out = sim_out(&["logs", "--since", "5m", "--app", "com.a.b", "--level", "error"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("300s of com.a.b\n(1 lines shown"), "{}", String::from_utf8_lossy(&out.stdout));
+    {
+        use oximux_remote_proto::simulator::{SimCmdWire, SimLogLevelWire, SimLogsWire};
+        let last = sim.cmds.lock().unwrap().last().cloned();
+        let want = SimLogsWire { since_secs: 300, app: Some("com.a.b".into()), grep: None, level: SimLogLevelWire::Error, lines: 200 };
+        assert_eq!(last, Some(SimCmdWire::Logs(want)));
+    }
+    let before = sim.cmds.lock().unwrap().len();
+    assert_eq!(sim_out(&["logs", "--since", "2h"]).status.code(), Some(2), "at most an hour");
+    assert_eq!(sim_out(&["logs", "--lines", "5000"]).status.code(), Some(2));
+    assert_eq!(sim.cmds.lock().unwrap().len(), before, "nothing reached the host");
+    let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "crashes"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v = json_stdout(&out);
+    assert_eq!(v["data"]["crashes"][0]["reason"], "Fatal error: Index out of range");
+    let out = sim_out(&["crashes", "--since", "1h"]);
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("2026-10-12 15:54:29  dev.oximux.crashy crashed: EXC_BREAKPOINT (SIGTRAP)"));
 
     assert!(sim.worktrees.lock().unwrap().iter().all(|w| w == wt), "{:?}", sim.worktrees.lock().unwrap());
 
