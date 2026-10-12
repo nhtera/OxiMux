@@ -151,6 +151,8 @@ pub struct SimulatorHub {
     device_state: device_state::Memo,
     /// Shown devices watched for crashes (see `crash_watch`).
     crash_watch: crash_watch::CrashWatch,
+    /// Blank screens climbing the recovery ladder (see `recovery`).
+    recovery: HashMap<DeviceId, recovery::Recovery>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -164,6 +166,7 @@ mod iphone;
 mod iphone_control;
 mod lifecycle;
 mod per_call;
+mod recovery;
 mod snapshot;
 mod wifi;
 
@@ -175,6 +178,7 @@ pub(crate) use android::list_all;
 pub use capture::{HardwareButton, NoticeKind};
 pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};
 pub use iphone_control::{ControlState, TargetApp, TeamChoice};
+pub use recovery::Step as RecoveryStep;
 pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
 
 pub use lifecycle::{install, on_quit};
@@ -899,6 +903,7 @@ impl SimulatorHub {
                             // Visible, or the Encoding menu would say H.264
                             // over a JPEG stream with no hint why.
                             if let SessionEvent::EncodingFallback(why) = &event {
+                                hub.note_decoder_trouble(&udid, generation);
                                 let text = format!("{why}. Pick H.264 in the stream row to try again.");
                                 cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, text));
                             }
