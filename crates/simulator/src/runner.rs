@@ -124,7 +124,7 @@ impl Runner for SystemRunner {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(SimError::Timeout {
-                    what: format!("{program} {}", args.join(" ")),
+                    what: redact_argv(program, args),
                     secs: timeout.as_secs(),
                 });
             }
@@ -164,7 +164,7 @@ impl SystemRunner {
             });
         }
         let deadline = Instant::now() + timeout;
-        let timeout_error = || SimError::Timeout { what: format!("{program} {}", args.join(" ")), secs: timeout.as_secs() };
+        let timeout_error = || SimError::Timeout { what: redact_argv(program, args), secs: timeout.as_secs() };
         let kill = |child: &mut std::process::Child| {
             let _ = child.kill();
             let _ = child.wait();
@@ -200,6 +200,38 @@ impl SystemRunner {
         };
         Ok(CmdOutput { status: status.code(), stdout: Vec::new(), stderr: err.join().unwrap_or_default() })
     }
+}
+
+/// `program` and its first two arguments, the rest counted: what an error
+/// or a log line may say about a command. A later argument can be a payload,
+/// a path with a person's name in it, or a secret.
+pub fn redact_argv(program: &str, args: &[&str]) -> String {
+    let mut out = std::iter::once(program).chain(args.iter().take(2).copied()).collect::<Vec<_>>().join(" ");
+    match args.len().saturating_sub(2) {
+        0 => {}
+        1 => out.push_str(" …(1 arg)"),
+        rest => out.push_str(&format!(" …({rest} args)")),
+    }
+    out
+}
+
+/// `xcrun --find <tool>`: the tool's path inside the selected Xcode.
+/// Never cached: the developer dir changes at runtime (Settings' Xcode
+/// switch), and a stale path would run the old Xcode's tool. Long-lived
+/// children (`record.rs`, `helper.rs`, the scrcpy server, the emulator,
+/// the runner build and supervisor) spawn their program directly, as they
+/// need the `Child`.
+pub fn xcrun_find(runner: &dyn Runner, tool: &str, timeout: Duration) -> Result<std::path::PathBuf> {
+    let out = runner.run("xcrun", &["--find", tool], None, timeout)?;
+    let path = out.stdout_str().trim().to_owned();
+    if !out.success() || path.is_empty() {
+        return Err(SimError::CommandFailed {
+            program: format!("xcrun --find {tool}"),
+            code: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        });
+    }
+    Ok(std::path::PathBuf::from(path))
 }
 
 /// Read a pipe to EOF on its own thread, so a chatty child can never fill one
@@ -290,6 +322,40 @@ impl Runner for ScriptedRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_names_the_program_and_two_arguments_only() {
+        assert_eq!(redact_argv("xcrun", &["simctl", "push", "U", "com.x", "-"]), "xcrun simctl push …(3 args)");
+        assert_eq!(redact_argv("adb", &["-s", "S", "shell"]), "adb -s S …(1 arg)");
+        assert_eq!(redact_argv("xcrun", &["--find", "simctl"]), "xcrun --find simctl");
+        assert_eq!(redact_argv("sw_vers", &[]), "sw_vers");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_timeout_says_no_more_than_that() {
+        let slow = SystemRunner.run("/bin/sh", &["-c", "sleep 5", "sh", "secret-token-value"], None, Duration::from_millis(200));
+        let text = slow.unwrap_err().to_string();
+        assert!(text.contains("/bin/sh -c sleep 5 …(2 args)"), "{text}");
+        assert!(!text.contains("secret-token-value"), "{text}");
+        let streamed = SystemRunner.run_lines("/bin/sh", &["-c", "sleep 5", "sh", "secret-token-value"], Duration::from_millis(200), &mut |_| {});
+        assert!(!streamed.unwrap_err().to_string().contains("secret-token-value"));
+    }
+
+    #[test]
+    fn xcrun_find_asks_every_time() {
+        // The developer dir changed between the two calls (an Xcode switch):
+        // the second answer is the one used.
+        let runner = ScriptedRunner::default()
+            .expect("xcrun --find simctl", CmdOutput::ok("/Applications/Xcode-26.0.app/Contents/Developer/usr/bin/simctl\n"))
+            .expect("xcrun --find simctl", CmdOutput::ok("/Applications/Xcode.app/Contents/Developer/usr/bin/simctl\n"));
+        let first = xcrun_find(&runner, "simctl", Duration::from_secs(1)).unwrap();
+        let second = xcrun_find(&runner, "simctl", Duration::from_secs(1)).unwrap();
+        assert_ne!(first, second);
+        assert!(second.starts_with("/Applications/Xcode.app"));
+        let missing = ScriptedRunner::default().expect("xcrun --find nope", CmdOutput::failed(1, "unable to find utility"));
+        assert!(matches!(xcrun_find(&missing, "nope", Duration::from_secs(1)), Err(SimError::CommandFailed { .. })));
+    }
 
     #[test]
     #[cfg(unix)]

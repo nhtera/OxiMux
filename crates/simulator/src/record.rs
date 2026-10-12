@@ -78,16 +78,7 @@ impl OnDevice {
 
 /// `simctl`'s path inside the selected Xcode (`xcrun --find simctl`).
 pub fn simctl_path(runner: &dyn Runner, timeout: Duration) -> Result<PathBuf> {
-    let out = runner.run("xcrun", &["--find", "simctl"], None, timeout)?;
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if !out.success() || path.is_empty() {
-        return Err(SimError::CommandFailed {
-            program: "xcrun --find simctl".into(),
-            code: out.status,
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-        });
-    }
-    Ok(PathBuf::from(path))
+    crate::runner::xcrun_find(runner, "simctl", timeout)
 }
 
 /// A recording in progress.
