@@ -416,7 +416,7 @@ impl Render for ScreenView {
                 let on_modifiers = weak;
                 window.on_modifiers_changed(move |e, window, cx| {
                     let pos = window.mouse_position();
-                    let _ = on_modifiers.update(cx, |view, cx| view.inspect(pos, e.modifiers.alt, cx));
+                    let _ = on_modifiers.update(cx, |view, cx| view.inspect(pos, e.modifiers.alt, window, cx));
                 });
             },
         )
@@ -435,9 +435,9 @@ impl Render for ScreenView {
             .bg(gpui::black())
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_move(cx.listener(|view, e: &MouseMoveEvent, _window, cx| {
+            .on_mouse_move(cx.listener(|view, e: &MouseMoveEvent, window, cx| {
                 if e.pressed_button.is_none() {
-                    view.inspect(e.position, e.modifiers.alt, cx);
+                    view.inspect(e.position, e.modifiers.alt, window, cx);
                 }
             }))
             .on_mouse_down_out(cx.listener(|view, _, window, cx| {

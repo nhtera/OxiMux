@@ -108,16 +108,18 @@ impl ScreenView {
 
     pub(super) fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        // With the inspector up, an ⌥-press waits: a click picks the
+        // element (typing stays where it was), a drag of a few points
+        // becomes the pinch.
+        if event.modifiers.alt && self.inspector.armed() && self.display_point(event.position, false).is_some() {
+            self.release_input(cx);
+            self.inspector.press = Some(event.position);
+            return;
+        }
         self.capture_keyboard(window, cx);
         let Some(p) = self.display_point(event.position, false) else { return };
         let Some(pid) = self.session(cx).map(|s| s.pid()) else { return };
         self.release_input(cx);
-        // With the inspector up, an ⌥-press waits: a click picks the
-        // element, a drag of a few points becomes the pinch.
-        if event.modifiers.alt && self.inspector.armed() {
-            self.inspector.press = Some(event.position);
-            return;
-        }
         let pinch = event.modifiers.alt;
         let edge = if pinch { 0 } else { self.edge_at(p, cx) };
         self.send_touch(TouchPhase::Begin, p, edge, pinch, cx);

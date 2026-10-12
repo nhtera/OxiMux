@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{AnyElement, Context, IntoElement, ParentElement as _, Pixels, Point, Styled as _, div, px};
+use gpui::{AnyElement, Context, IntoElement, ParentElement as _, Pixels, Point, Styled as _, Task, Window, div, px};
 use oximux_simulator::agent::{self, AxSpace};
 use oximux_simulator::ax::{self, AxNode, Selector};
 use oximux_simulator::geometry::{self, Rect, Size};
@@ -26,6 +26,9 @@ const FRESH_SLOW: Duration = Duration::from_secs(2);
 /// Less movement than this between press and release is a click (a pick).
 pub(super) const CLICK_SLOP: f32 = 4.0;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// While ⌥ is held, how often its release is looked for: a release with the
+/// pointer still reaches no listener unless the screen has focus.
+const RELEASE_POLL: Duration = Duration::from_millis(100);
 
 /// An element the user picked (or points at).
 #[derive(Clone, Debug)]
@@ -107,6 +110,8 @@ pub(super) struct Inspector {
     unavailable: Option<String>,
     /// An ⌥-press not yet a click or a drag: where it went down.
     pub(super) press: Option<Point<Pixels>>,
+    /// Looks for ⌥'s release while armed.
+    _release: Option<Task<()>>,
 }
 
 impl Inspector {
@@ -117,18 +122,30 @@ impl Inspector {
 
 impl ScreenView {
     /// The pointer moved, or ⌥ changed, at `pos`.
-    pub(super) fn inspect(&mut self, pos: Point<Pixels>, alt: bool, cx: &mut Context<Self>) {
+    pub(super) fn inspect(&mut self, pos: Point<Pixels>, alt: bool, window: &mut Window, cx: &mut Context<Self>) {
         let point = self.display_point(pos, false);
         if !alt || point.is_none() {
-            if self.inspector.armed {
-                self.inspector.armed = false;
-                self.inspector.hover = None;
-                self.inspector.press = None;
-                cx.notify();
-            }
+            self.disarm(cx);
             return;
         }
         let Some(device) = self.binding.device.clone() else { return };
+        if !self.inspector.armed {
+            self.inspector._release = Some(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(RELEASE_POLL).await;
+                    let held = this.update_in(cx, |view, window, cx| {
+                        let held = window.modifiers().alt;
+                        if !held {
+                            view.disarm(cx);
+                        }
+                        held
+                    });
+                    if !matches!(held, Ok(true)) {
+                        return;
+                    }
+                }
+            }));
+        }
         self.inspector.armed = true;
         self.inspector.pointer = point;
         if !self.hub.read(cx).caps(&device).ax {
@@ -138,6 +155,17 @@ impl ScreenView {
         }
         self.refresh_tree(&device, cx);
         self.retest(cx);
+    }
+
+    /// ⌥ released (or the pointer left the screen): no outline.
+    fn disarm(&mut self, cx: &mut Context<Self>) {
+        if self.inspector.armed {
+            self.inspector.armed = false;
+            self.inspector.hover = None;
+            self.inspector.press = None;
+            self.inspector._release = None;
+            cx.notify();
+        }
     }
 
     /// Read the tree when the one in hand is stale (or another device's, or
