@@ -350,9 +350,11 @@ mod tests {
 
     #[test]
     fn an_app_is_read_by_its_executable_and_the_header_is_dropped() {
+        // Joined as the code joins it (`\` on Windows).
+        let plist = std::path::Path::new("/data/Crashy.app").join("Info.plist");
         let runner = ScriptedRunner::default()
             .expect("xcrun simctl get_app_container U dev.oximux.crashy app", CmdOutput::ok("/data/Crashy.app\n"))
-            .expect("plutil -extract CFBundleExecutable raw -o - /data/Crashy.app/Info.plist", CmdOutput::ok("Crashy\n"))
+            .expect(&format!("plutil -extract CFBundleExecutable raw -o - {}", plist.display()), CmdOutput::ok("Crashy\n"))
             .expect(
                 "xcrun simctl spawn U log show --last 60s --style compact --predicate process == \"Crashy\" AND (messageType == error OR messageType == fault)",
                 CmdOutput::ok("Filtering the log data using \"process == \\\"Crashy\\\"\"\nTimestamp               Ty Process[PID:TID]\n2026-10-12 15:54:29.797 E  Crashy[61726:59a99a] boom\n"),
