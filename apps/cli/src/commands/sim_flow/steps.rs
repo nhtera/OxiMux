@@ -149,6 +149,21 @@ pub fn substitute(command: &mut SimCommand) -> Result<Vec<String>, String> {
     Ok(used.into_inner())
 }
 
+/// `value` with each of `secrets` blanked in every string it holds (keys
+/// too): on the values themselves, not their escaped JSON text.
+pub fn redact_json(value: serde_json::Value, secrets: &[String]) -> serde_json::Value {
+    use serde_json::Value;
+    if secrets.is_empty() {
+        return value;
+    }
+    match value {
+        Value::String(s) => Value::String(redact(&s, secrets)),
+        Value::Array(items) => Value::Array(items.into_iter().map(|v| redact_json(v, secrets)).collect()),
+        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (redact(&k, secrets), redact_json(v, secrets))).collect()),
+        other => other,
+    }
+}
+
 /// `message` with each of `secrets` blanked.
 pub fn redact(message: &str, secrets: &[String]) -> String {
     secrets.iter().filter(|s| !s.is_empty()).fold(message.to_owned(), |m, s| m.replace(s.as_str(), "[redacted]"))
@@ -273,6 +288,10 @@ mod tests {
         let mut cmd = command(&words("type \"${SECRET_STEPS_TEST}\"")).unwrap();
         assert_eq!(substitute(&mut cmd).unwrap(), ["--paste"]);
         assert_eq!(redact("cannot read --paste/x", &["--paste".into()]), "cannot read [redacted]/x");
+        let tricky = "a \"b\"\nc\\".to_owned();
+        let value = serde_json::json!({ "node": { "value": format!("x{tricky}y"), "list": [tricky.clone()] } });
+        let clean = redact_json(value, std::slice::from_ref(&tricky));
+        assert_eq!(clean, serde_json::json!({ "node": { "value": "x[redacted]y", "list": ["[redacted]"] } }), "quotes, newlines, backslashes");
         match cmd {
             SimCommand::Type { text, paste, .. } => assert_eq!((text, paste), (vec!["--paste".to_owned()], false), "a value, not a flag"),
             other => panic!("{other:?}"),

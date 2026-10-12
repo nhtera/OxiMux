@@ -74,7 +74,7 @@ pub async fn run(client: &Client, worktree: &Path, args: RunArgs) -> Outcome {
             Ok((value, said)) => {
                 // A report can repeat what was typed or tapped ("opened …").
                 let said = steps::redact(&said, &secrets);
-                let value = if secrets.is_empty() { value } else { serde_json::from_str(&steps::redact(&value.to_string(), &secrets)).unwrap_or(value) };
+                let value = steps::redact_json(value, &secrets);
                 human.push(format!("{:>3}  {}\n     {}", step.n, step.text, said.replace('\n', "\n     ")));
                 ran.push(json!({ "step": step.n, "line": step.text, "result": value }));
             }
