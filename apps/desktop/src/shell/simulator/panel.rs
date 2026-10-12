@@ -96,8 +96,9 @@ pub struct SimulatorPanel {
     /// Every crash a row was raised for, by device (a dismissed one stays
     /// gone).
     crash_ids: std::collections::HashSet<(DeviceId, String)>,
-    /// The screen as the crash row came up, by crash id (sent with it).
-    crash_png: Option<(String, Vec<u8>)>,
+    /// The screen as the crash row came up, by device and crash id (sent
+    /// with it).
+    crash_png: Option<(DeviceId, String, Vec<u8>)>,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,

@@ -71,7 +71,7 @@ impl SimulatorPanel {
     fn take_crash_screen(&mut self, udid: &DeviceId, id: &str, cx: &mut Context<Self>) {
         self.crash_png = None;
         let Some(session) = self.hub.as_ref().and_then(|hub| hub.read(cx).session(udid)) else { return };
-        let id = id.to_owned();
+        let key = (udid.clone(), id.to_owned());
         cx.spawn(async move |this, cx| {
             let png = cx
                 .background_executor()
@@ -81,11 +81,12 @@ impl SimulatorPanel {
                 })
                 .await;
             let _ = this.update(cx, |panel, _| {
-                // Still the row it was taken for.
+                // Still the row it was taken for: the same device and crash
+                // (an Android id is only its device's own).
                 if let Some(png) = png
-                    && panel.crash.as_ref().is_some_and(|(_, c)| c.id == id)
+                    && panel.crash.as_ref().is_some_and(|(udid, c)| *udid == key.0 && c.id == key.1)
                 {
-                    panel.crash_png = Some((id, png));
+                    panel.crash_png = Some((key.0, key.1, png));
                 }
             });
         })
@@ -94,10 +95,10 @@ impl SimulatorPanel {
 
     /// Hand the crash to the agent now, to the chat active now.
     fn send_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, crash)) = self.crash.take() else { return };
+        let Some((udid, crash)) = self.crash.take() else { return };
         cx.notify();
         let markdown = summary(&self.device_name(cx), &crash);
-        let png = self.crash_png.take().filter(|(id, _)| *id == crash.id).map(|(_, png)| png).unwrap_or_default();
+        let png = self.crash_png.take().filter(|(on, id, _)| *on == udid && *id == crash.id).map(|(_, _, png)| png).unwrap_or_default();
         self.send_to_agent(markdown, png, window, cx);
     }
 }
