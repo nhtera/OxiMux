@@ -221,8 +221,8 @@ oximux sim erase                            # wipe and boot again
   everything but `push`; an Android phone, `appearance`, `privacy` and
   `status-bar`, each asked in the panel every time; a real iPhone, none. A
   gap exits 5 (`refused`) and says why; nothing is ever skipped silently.
-- An Android phone's demo-mode status bar goes back to normal when the
-  worktree detaches.
+- An Android device's demo-mode status bar goes back to normal when the last
+  worktree attached to it detaches, and when OxiMux quits.
 
 ## Android
 
