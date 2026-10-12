@@ -102,7 +102,7 @@ impl SimulatorPanel {
     }
 
     /// One question card: a title, why it is asked, and two answers.
-    fn render_question(
+    pub(super) fn render_question(
         &self,
         title: String,
         body: String,

@@ -14,8 +14,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
 };
 
-use super::{PanelEvent, RootRequest, SimulatorPanel};
-use crate::actions::SendPickToActiveChat;
+use super::{PanelEvent, SimulatorPanel};
 use crate::shell::simulator::annotate::{AnnotateView, Frozen};
 use crate::shell::simulator::annotate::export::{self, Tool};
 use crate::shell::simulator::hub::{CaptureKind, NoticeKind, capture_dir, capture_path, simulator_dir, stamp};
@@ -96,13 +95,10 @@ impl SimulatorPanel {
                     Ok::<_, String>((out, path))
                 })
                 .await;
-            let send = this.update(cx, |panel, cx| {
+            let _ = this.update_in(cx, |panel, window, cx| {
                 let (png, path) = match made {
                     Ok(made) => made,
-                    Err(e) => {
-                        cx.emit(PanelEvent::Notice(NoticeKind::Error, format!("Annotation failed: {e}")));
-                        return None;
-                    }
+                    Err(e) => return cx.emit(PanelEvent::Notice(NoticeKind::Error, format!("Annotation failed: {e}"))),
                 };
                 match how {
                     Finish::Send => {
@@ -110,8 +106,7 @@ impl SimulatorPanel {
                         if let Some(path) = &path {
                             markdown.push_str(&format!("\nImage: {}", path.display()));
                         }
-                        let pick = SendPickToActiveChat { markdown, selector: "Mobile Emulator".into(), png };
-                        return panel.command_sink.clone().map(|sink| (sink, pick));
+                        panel.send_to_agent(markdown, png, window, cx);
                     }
                     Finish::Copy => {
                         cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Png, png)));
@@ -123,12 +118,7 @@ impl SimulatorPanel {
                         cx.emit(PanelEvent::Notice(NoticeKind::Success, text));
                     }
                 }
-                None
             });
-            // Outside the panel's update: the root may update the panel.
-            if let Ok(Some((sink, pick))) = send {
-                let _ = cx.update(|window, cx| sink(RootRequest::SendToAgent(pick), window, cx));
-            }
         })
         .detach();
     }

@@ -173,6 +173,21 @@ fn two_worktrees_share_one_session_and_refcount_visibility() {
 }
 
 #[test]
+fn only_a_shown_streaming_device_is_watched_for_crashes() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    assert!(reg.shown_live().is_empty());
+    let g = live(&mut reg, &w, &u, "s", now);
+    assert_eq!(reg.shown_live(), std::slice::from_ref(&u));
+    reg.set_visible(&w, false, now);
+    assert!(reg.shown_live().is_empty(), "hidden");
+    reg.set_visible(&w, true, now);
+    reg.session_exited(&u, g, true, "gone".into());
+    assert!(reg.shown_live().is_empty(), "restarting, not streaming");
+}
+
+#[test]
 fn a_session_that_starts_while_hidden_is_paused_at_once() {
     let now = Instant::now();
     let mut reg = Reg::default();
