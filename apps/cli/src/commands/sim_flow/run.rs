@@ -35,8 +35,11 @@ pub async fn run(client: &Client, worktree: &Path, args: RunArgs) -> Outcome {
     let mut todo = Vec::new();
     for step in &all[args.from - 1..] {
         let bad = |why: String| Failure::new("usage", exit::USAGE, format!("step {} (line {}): {why}: {}", step.n, step.line, step.text));
-        let words = steps::substitute(&step.words).map_err(bad)?;
-        let mut command = steps::command(&words).map_err(bad)?;
+        // Parsed and checked as written (placeholders and all), then the
+        // secrets put in: a value never becomes a flag, and no error shows one.
+        steps::check(steps::command(&step.words).map_err(bad)?).map_err(bad)?;
+        let mut command = steps::command(&step.words).map_err(bad)?;
+        steps::substitute(&mut command).map_err(bad)?;
         if args.settle
             && let Some(settle) = command.settle_args_mut()
         {

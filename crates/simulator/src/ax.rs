@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::geometry::Rect;
-pub use crate::ax_exact::{Exact, exact_selector, find_exact};
+pub use crate::ax_exact::{Exact, exact_selector, field_kind, find_exact};
 use crate::{Result, SimError};
 
 /// One accessibility node. Field names follow this crate's convention

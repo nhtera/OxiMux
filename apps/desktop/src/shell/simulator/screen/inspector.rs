@@ -310,7 +310,7 @@ impl ScreenView {
 
     /// The exact selector of the element at `pt` (display-normalized) in the
     /// tree in hand — what a recording takes for a real iPhone's tap.
-    pub(super) fn target_in_cached_tree(&self, pt: (f64, f64), cx: &Context<Self>) -> Option<(oximux_remote_proto::simulator::SimSelectorWire, bool)> {
+    pub(super) fn target_in_cached_tree(&self, pt: (f64, f64), cx: &Context<Self>) -> Option<(oximux_remote_proto::simulator::SimSelectorWire, Option<bool>)> {
         // Only a current tree: an old one may be another screen's.
         let tree = self.usable_tree(cx).filter(|_| self.tree_current(cx))?;
         super::recording::selector_at(&tree.nodes, pt, &|n| tree.map.to_screen(n.frame))

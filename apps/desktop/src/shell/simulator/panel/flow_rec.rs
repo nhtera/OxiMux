@@ -45,6 +45,12 @@ impl SimulatorPanel {
     /// Stop: save it privately, copy the steps, and say where it went.
     pub(super) fn stop_flow(&mut self, cx: &mut Context<Self>) {
         let (Some(hub), Some(key)) = (self.hub.clone(), self.rec_key(cx)) else { return };
+        // What the screen still holds in line (a tap reading its element,
+        // typing behind it) goes in before the stop.
+        let pending = self.screen.clone().map(|s| s.update(cx, |s, _| s.drain_recording())).unwrap_or_default();
+        for step in pending {
+            self.record_panel(step, cx);
+        }
         let stopped = hub.update(cx, |hub, cx| {
             let stopped = hub.flows_mut().stop(&key);
             cx.emit(HubEvent::Flow);

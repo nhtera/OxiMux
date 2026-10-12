@@ -30,6 +30,16 @@ impl Exact {
     }
 }
 
+/// What typing after a tap on `node` goes into: `Some(true)` a password
+/// field, `Some(false)` a plain text field, `None` anything else (a label, a
+/// field's hint, a button — where the typing lands is not known).
+pub fn field_kind(node: &AxNode) -> Option<bool> {
+    if node.secure {
+        return Some(true);
+    }
+    matches!(node.role.as_str(), "TextField" | "SearchField" | "TextView" | "TextArea").then_some(false)
+}
+
 /// The `sel.nth`-th element on screen matching `sel` exactly.
 pub fn find_exact<'a>(nodes: &'a [AxNode], sel: &Exact) -> Option<&'a AxNode> {
     if sel.is_empty() {

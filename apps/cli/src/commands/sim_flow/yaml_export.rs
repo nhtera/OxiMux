@@ -36,7 +36,7 @@ enum Skip {
 }
 
 pub fn export(header: &Header, steps: &[Input<'_>], app_id: Option<&str>) -> Result<Exported, String> {
-    let first_launch = steps.iter().find_map(|s| match s.cmd.as_ref().map(unwrap) {
+    let first_launch = steps.iter().find_map(|s| match s.cmd.as_ref().map(unwrap).map(unsettled) {
         Some(SimCmdWire::Launch { bundle_id, .. }) => Some(bundle_id.clone()),
         _ => None,
     });
@@ -63,6 +63,14 @@ pub fn export(header: &Header, steps: &[Input<'_>], app_id: Option<&str>) -> Res
         }
     }
     Ok(Exported { yaml, warnings })
+}
+
+/// The action inside a settle.
+fn unsettled(cmd: &SimCmdWire) -> &SimCmdWire {
+    match cmd {
+        SimCmdWire::Settled { action, .. } => action,
+        other => other,
+    }
 }
 
 /// Envelopes off (a settle stays: it adds a wait).
@@ -242,7 +250,8 @@ mod tests {
     #[test]
     fn the_login_flow_matches_its_golden() {
         let out = exported(include_str!("../../../tests/fixtures/flows/login.flow"), None).unwrap();
-        assert_eq!(out.yaml, include_str!("../../../tests/fixtures/flows/login.yaml"));
+        // A Windows checkout may hand the golden over with CRLF endings.
+        assert_eq!(out.yaml, include_str!("../../../tests/fixtures/flows/login.yaml").replace("\r\n", "\n"));
         assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
         assert!(!out.yaml.contains("clearState"), "app data is never cleared");
     }
@@ -254,6 +263,12 @@ mod tests {
         assert_eq!(regex("a.b*"), r"a\.b\*");
         assert_eq!(q("a\u{2028}b"), r#""a\u2028b""#, "a line separator stays inside the scalar");
         assert_eq!(comment("tap\u{2028}- tapOn: x"), "tap - tapOn: x");
+    }
+
+    #[test]
+    fn a_settled_launch_still_names_the_app() {
+        let out = exported("launch com.a.b --settle\n", None).unwrap();
+        assert!(out.yaml.starts_with("appId: \"com.a.b\"\n"), "{}", out.yaml);
     }
 
     #[test]

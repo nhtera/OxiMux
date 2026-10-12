@@ -38,9 +38,18 @@ pub(super) struct Recorder {
     on: bool,
     press: Option<Press>,
     /// Steps in the order they happened; a tap still reading its element
-    /// holds back what came after it (`None` until it is known).
-    queue: VecDeque<(u64, Option<Option<PanelStep>>)>,
+    /// holds back what came after it.
+    queue: VecDeque<(u64, Slot)>,
     next: u64,
+}
+
+/// A place in [`Recorder::queue`].
+enum Slot {
+    /// Still being worked out; what to keep if recording stops first (a
+    /// tap as a point, when the screen's size is known).
+    Waiting(Option<PanelStep>),
+    /// Known (`None`: nothing to record after all).
+    Done(Option<PanelStep>),
 }
 
 impl Recorder {
@@ -49,17 +58,18 @@ impl Recorder {
         self.press = None;
     }
 
-    /// A place in line for a step still being worked out.
-    fn wait_turn(&mut self) -> u64 {
+    /// A place in line for a step still being worked out (`fallback`: what
+    /// to keep if recording stops first).
+    fn wait_turn(&mut self, fallback: Option<PanelStep>) -> u64 {
         self.next += 1;
-        self.queue.push_back((self.next, None));
+        self.queue.push_back((self.next, Slot::Waiting(fallback)));
         self.next
     }
 
     /// The step for place `seq` (`None`: nothing to record after all).
     fn resolve(&mut self, seq: u64, step: Option<PanelStep>, cx: &mut Context<ScreenView>) {
         if let Some(slot) = self.queue.iter_mut().find(|(s, _)| *s == seq) {
-            slot.1 = Some(step);
+            slot.1 = Slot::Done(step);
         }
         self.flush(cx);
     }
@@ -67,18 +77,29 @@ impl Recorder {
     /// A step known now, after any still being worked out.
     fn ready(&mut self, step: PanelStep, cx: &mut Context<ScreenView>) {
         self.next += 1;
-        self.queue.push_back((self.next, Some(Some(step))));
+        self.queue.push_back((self.next, Slot::Done(Some(step))));
         self.flush(cx);
     }
 
     fn flush(&mut self, cx: &mut Context<ScreenView>) {
-        while let Some((_, Some(_))) = self.queue.front() {
-            if let Some((_, Some(Some(step)))) = self.queue.pop_front()
+        while let Some((_, Slot::Done(_))) = self.queue.front() {
+            if let Some((_, Slot::Done(Some(step)))) = self.queue.pop_front()
                 && self.on
             {
                 cx.emit(ScreenEvent::Recorded(step));
             }
         }
+    }
+
+    /// Everything still in line, in order, a tap still reading its element
+    /// as its fallback: what a stop keeps.
+    fn drain(&mut self) -> Vec<PanelStep> {
+        self.queue
+            .drain(..)
+            .filter_map(|(_, slot)| match slot {
+                Slot::Waiting(step) | Slot::Done(step) => step,
+            })
+            .collect()
     }
 }
 
@@ -125,7 +146,14 @@ impl ScreenView {
         // The screen in points: known once a scale is (an agent verb, an
         // earlier read), else from this press's read.
         let known = self.hub.read_with(cx, |hub, _| crate::shell::simulator::agent_ops::screen_points(hub, &device));
-        let seq = self.recorder.wait_turn();
+        let fallback = known.map(|screen @ (w, h)| {
+            let to_pt = |(x, y): (f64, f64)| (x * w, y * h);
+            match swipe {
+                Some((end, duration_ms)) => PanelStep::Swipe { from: to_pt(press.at), to: to_pt(end), screen, duration_ms },
+                None => PanelStep::Tap { at: to_pt(press.at), screen, target: None },
+            }
+        });
+        let seq = self.recorder.wait_turn(fallback);
         let (left, read) = (READ_BUDGET.saturating_sub(press.started.elapsed()), press.tree.clone());
         let (hub, session) = (self.hub.clone(), self.session(cx));
         cx.spawn(async move |this, cx| {
@@ -187,6 +215,12 @@ impl ScreenView {
         self.recorder.ready(step, cx);
     }
 
+    /// Recording stops: the steps still in line, in order (a tap still
+    /// reading its element as a point), handed over rather than dropped.
+    pub(crate) fn drain_recording(&mut self) -> Vec<PanelStep> {
+        self.recorder.drain()
+    }
+
     /// A step from outside the screen (a toolbar button), in line with the
     /// screen's own.
     pub(crate) fn record_step(&mut self, step: PanelStep, cx: &mut Context<Self>) {
@@ -203,11 +237,22 @@ impl ScreenView {
     }
 }
 
-/// The exact selector of the element under `pt`, and whether it is a
-/// password field.
-pub(super) fn selector_at(nodes: &[ax::AxNode], pt: (f64, f64), rect_of: &dyn Fn(&ax::AxNode) -> oximux_simulator::geometry::Rect) -> Option<(SimSelectorWire, bool)> {
+/// The exact selector of the element under `pt`, and what typing there goes
+/// into (`ax::field_kind`) — a password field when any password field on
+/// screen holds the point (a tap on its hint is a tap on it).
+pub(super) fn selector_at(
+    nodes: &[ax::AxNode],
+    pt: (f64, f64),
+    rect_of: &dyn Fn(&ax::AxNode) -> oximux_simulator::geometry::Rect,
+) -> Option<(SimSelectorWire, Option<bool>)> {
     let node = ax::hit_test(nodes, pt, rect_of)?;
     let sel = ax::exact_selector(nodes, node)?;
     let nth = u32::try_from(sel.nth).unwrap_or(u32::MAX);
-    Some((SimSelectorWire { label: sel.label, id: sel.id, role: sel.role, nth }, node.secure))
+    let inside = |n: &ax::AxNode| {
+        let r = rect_of(n);
+        (r.x..=r.x + r.w).contains(&pt.0) && (r.y..=r.y + r.h).contains(&pt.1)
+    };
+    let in_password = ax::flatten(nodes, usize::MAX).iter().any(|f| f.node.secure && ax::is_on_screen(f.node) && inside(f.node));
+    let kind = if in_password { Some(true) } else { ax::field_kind(node) };
+    Some((SimSelectorWire { label: sel.label, id: sel.id, role: sel.role, nth }, kind))
 }

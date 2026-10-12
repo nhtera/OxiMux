@@ -95,12 +95,63 @@ pub fn command(words: &[String]) -> Result<SimCommand, String> {
     }
 }
 
-/// `words` with each `${SECRET_…}` replaced by that environment variable:
-/// how a recorded secret (`type "${SECRET_1}"`) is supplied at replay.
-/// Only `SECRET_` names are read — a flow file cannot reach any other
-/// variable (a token in an `open-url`) — and `$${` is a literal `${`.
-pub fn substitute(words: &[String]) -> Result<Vec<String>, String> {
-    words.iter().map(|w| substitute_word(w, &|name| std::env::var(name).ok())).collect()
+/// `command`'s text values with each `${SECRET_…}` replaced by that
+/// environment variable: how a recorded secret (`type "${SECRET_1}"`) is
+/// supplied at replay. After parsing, so a value stays a value whatever it
+/// holds (a password starting with `-` is no flag), and a parse error can
+/// only ever show the placeholder. Only `SECRET_` names are read — a flow
+/// file cannot reach any other variable (a token in an `open-url`) — and
+/// `$${` is a literal `${`.
+pub fn substitute(command: &mut SimCommand) -> Result<(), String> {
+    let var = |name: &str| std::env::var(name).ok();
+    let sub = |s: &mut String| -> Result<(), String> {
+        *s = substitute_word(s, &var)?;
+        Ok(())
+    };
+    let element = |e: &mut crate::cli_sim::ElementArgs| -> Result<(), String> {
+        [&mut e.label, &mut e.id, &mut e.exact.role].into_iter().flatten().try_for_each(sub)
+    };
+    match command {
+        SimCommand::Type { text, .. } => text.iter_mut().try_for_each(sub),
+        SimCommand::Tap { label, id, exact, .. } => [label, id, &mut exact.role].into_iter().flatten().try_for_each(sub),
+        SimCommand::Wait(w) => element(&mut w.element),
+        SimCommand::Assert(a) => {
+            element(&mut a.element)?;
+            a.text.iter_mut().try_for_each(sub)
+        }
+        SimCommand::OpenUrl { url, .. } => sub(url),
+        SimCommand::Launch { bundle_id, .. } => sub(bundle_id),
+        // No other verb takes a secret: a placeholder there stays as written.
+        _ => Ok(()),
+    }
+}
+
+/// What the CLI checks of `command` before sending it (argument shapes
+/// clap cannot express, a payload file that must exist), so a bad step 9
+/// fails before step 1 runs.
+pub fn check(command: SimCommand) -> Result<(), String> {
+    match command {
+        SimCommand::Type { text, .. } if text.len() > 1 => match crate::cli_sim::parse_ref(&text[0]) {
+            Some(_) => Ok(()),
+            None => Err("`type` takes TEXT, or an @eN ref then TEXT".into()),
+        },
+        SimCommand::Status
+        | SimCommand::Devices { .. }
+        | SimCommand::Screenshot { .. }
+        | SimCommand::Ax { .. }
+        | SimCommand::Wait(_)
+        | SimCommand::Assert(_)
+        | SimCommand::Logs(_)
+        | SimCommand::Crashes(_)
+        | SimCommand::WaitConsent { .. }
+        | SimCommand::Run(_)
+        | SimCommand::Flow(_) => Ok(()),
+        SimCommand::Attach { platform: Some(_), .. } => Ok(()),
+        other => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            super::super::sim::request_for(other, &cwd).map(drop).map_err(|f| f.message)
+        }
+    }
 }
 
 fn substitute_word(word: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
@@ -185,6 +236,22 @@ mod tests {
         for refused in ["run x.flow", "flow start", "wait-consent", "--json tap 1 2", "tap 1 2 --worktree /w", "tap 1 2 --timeout 5"] {
             assert!(command(&words(refused)).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn a_secret_is_put_in_after_parsing_and_a_bad_step_is_caught_before_any_runs() {
+        // SAFETY: a variable only this test reads.
+        unsafe { std::env::set_var("SECRET_STEPS_TEST", "--paste") };
+        let mut cmd = command(&words("type \"${SECRET_STEPS_TEST}\"")).unwrap();
+        substitute(&mut cmd).unwrap();
+        match cmd {
+            SimCommand::Type { text, paste, .. } => assert_eq!((text, paste), (vec!["--paste".to_owned()], false), "a value, not a flag"),
+            other => panic!("{other:?}"),
+        }
+        assert!(check(command(&words("tap 1 2 --exact")).unwrap()).is_err(), "--exact on a point");
+        assert!(check(command(&words("type hello world")).unwrap()).is_err());
+        assert!(check(command(&words("tap 1 2")).unwrap()).is_ok());
+        assert!(check(command(&words("push --app com.a.b /no/such/payload.json")).unwrap()).is_err());
     }
 
     #[test]

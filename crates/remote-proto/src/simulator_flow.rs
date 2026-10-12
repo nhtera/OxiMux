@@ -163,7 +163,8 @@ pub mod words {
 struct Line {
     words: Vec<String>,
     flags: Vec<String>,
-    args: Vec<String>,
+    /// Each quoted, and whether the value itself starts with `-`.
+    args: Vec<(String, bool)>,
 }
 
 impl Line {
@@ -190,7 +191,7 @@ impl Line {
     }
 
     fn arg(mut self, value: &str) -> Result<Self, String> {
-        self.args.push(words::quote(value)?);
+        self.args.push((words::quote(value)?, value.starts_with('-')));
         Ok(self)
     }
 
@@ -202,12 +203,15 @@ impl Line {
     /// with `-` (a negative coordinate, a text like "-5").
     fn done(self) -> String {
         let mut out = self.words;
-        if self.args.iter().any(|a| a.starts_with('-')) {
+        // The value, not its quoting: `"-5 items"` is a dash value too.
+        let dash = self.args.iter().any(|(_, dash)| *dash);
+        let args = self.args.into_iter().map(|(a, _)| a);
+        if dash {
             out.extend(self.flags);
             out.push("--".into());
-            out.extend(self.args);
+            out.extend(args);
         } else {
-            out.extend(self.args);
+            out.extend(args);
             out.extend(self.flags);
         }
         out.join(" ")
@@ -441,6 +445,7 @@ mod tests {
         let nth = SimTargetWire::Exact(SimSelectorWire { label: None, id: None, role: Some("Button".into()), nth: 2 });
         assert_eq!(one(SimCmdWire::Tap(nth)), "tap --role Button --nth 2");
         assert_eq!(one(SimCmdWire::Type { text: "-5".into(), paste: false }), "type -- -5");
+        assert_eq!(one(SimCmdWire::Type { text: "-5 items".into(), paste: false }), "type -- \"-5 items\"", "a quoted dash value too");
         assert_eq!(one(SimCmdWire::Type { text: "ada@example.com".into(), paste: true }), "type ada@example.com --paste");
         let swipe = SimCmdWire::Swipe { from: SimPointWire { x: 200.0, y: 700.0 }, to: SimPointWire { x: 200.0, y: 200.0 }, duration_ms: 500 };
         assert_eq!(one(swipe), "swipe 200 700 200 200 --duration 500");

@@ -32,9 +32,9 @@ pub(crate) type RecKey = (WorktreeKey, DeviceId, RecSource);
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PanelStep {
     /// A tap at `at` (points, on a `screen` that size), on the element
-    /// `target` names exactly when one was read in time (`secure`: a
-    /// password field).
-    Tap { at: (f64, f64), screen: (f64, f64), target: Option<(SimSelectorWire, bool)> },
+    /// `target` names exactly when one was read in time, with what typing
+    /// there goes into (see `ax::field_kind`).
+    Tap { at: (f64, f64), screen: (f64, f64), target: Option<(SimSelectorWire, Option<bool>)> },
     Swipe { from: (f64, f64), to: (f64, f64), screen: (f64, f64), duration_ms: u32 },
     /// Typed characters.
     Text(String),
@@ -58,6 +58,9 @@ struct Typing {
 /// One recording in progress.
 #[derive(Debug, Default)]
 pub(crate) struct Recording {
+    /// Which recording this is (a verb planned for one never lands in the
+    /// next).
+    id: u64,
     platform: &'static str,
     /// The screen in points when it started (what a point step is scaled by
     /// on export).
@@ -84,6 +87,10 @@ impl Recording {
             out.push('\n');
         }
         out
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     pub(crate) fn count(&self) -> u32 {
@@ -113,7 +120,7 @@ impl Recording {
         let cmd = match step {
             PanelStep::Tap { at, screen, target } => {
                 self.fill_screen(Some(screen));
-                self.field = target.as_ref().map(|(_, secure)| *secure);
+                self.field = target.as_ref().and_then(|(_, kind)| *kind);
                 let aim = match target {
                     Some((sel, _)) => SimTargetWire::Exact(sel),
                     None => {
@@ -136,7 +143,9 @@ impl Recording {
             PanelStep::Text(text) => return self.typed(Some(&text)),
             PanelStep::Backspace => return self.typed(None),
             PanelStep::Return => {
-                if self.typing.is_some() {
+                // Into plain typing; after a placeholder (a password, then
+                // Return to submit), a step of its own.
+                if self.typing.as_ref().is_some_and(|t| !t.secret) {
                     self.typed(Some("\n"));
                 } else {
                     self.add(&settled(SimCmdWire::Type { text: "\n".into(), paste: false }));
@@ -145,7 +154,13 @@ impl Recording {
                 self.field = None;
                 return;
             }
-            PanelStep::Skipped(what) => return self.warn(format!("not recorded: {what}")),
+            PanelStep::Skipped(what) => {
+                // A Tab or an arrow may have moved focus: typing after it
+                // goes into a field not known.
+                self.typing = None;
+                self.field = None;
+                return self.warn(format!("not recorded: {what}"));
+            }
         };
         self.add(&cmd);
     }
@@ -194,7 +209,7 @@ impl Recording {
     /// password field, else the next placeholder.
     fn guard_secret(&mut self, text: String, field: Option<bool>) -> String {
         if field == Some(false) {
-            return text;
+            return text.replace("${", "$${");
         }
         let name = self.next_secret();
         self.warn(secret_warning(&name, field));
@@ -226,7 +241,9 @@ impl Recording {
             return;
         }
         match text {
-            Some(text) => typing.text.push_str(text),
+            // A `${` typed is kept literal (`$${`): only a placeholder is
+            // read from the environment at replay.
+            Some(text) => typing.text.push_str(&text.replace("${", "$${")),
             None => {
                 typing.text.pop();
             }
@@ -285,6 +302,7 @@ fn secret_warning(name: &str, field: Option<bool>) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct FlowRecorder {
     recordings: HashMap<RecKey, Recording>,
+    next: u64,
 }
 
 impl FlowRecorder {
@@ -293,8 +311,15 @@ impl FlowRecorder {
         if self.recordings.contains_key(&key) {
             return false;
         }
-        self.recordings.insert(key, Recording { platform, screen, ..Recording::default() });
+        self.next += 1;
+        self.recordings.insert(key, Recording { id: self.next, platform, screen, ..Recording::default() });
         true
+    }
+
+    /// Put back a stopped recording whose save failed (unless another
+    /// started meanwhile).
+    pub(crate) fn restore(&mut self, key: RecKey, recording: Recording) {
+        self.recordings.entry(key).or_insert(recording);
     }
 
     pub(crate) fn get(&self, key: &RecKey) -> Option<&Recording> {
@@ -420,13 +445,13 @@ mod tests {
     fn panel_input_becomes_settled_steps_with_typing_kept_together() {
         let mut r = Recording { platform: "ios", ..Recording::default() };
         let screen = (402.0, 874.0);
-        r.panel(PanelStep::Tap { at: (100.0, 200.0), screen, target: Some((exact("Email"), false)) });
+        r.panel(PanelStep::Tap { at: (100.0, 200.0), screen, target: Some((exact("Email"), Some(false))) });
         for c in ["a", "d", "x"] {
             r.panel(PanelStep::Text(c.into()));
         }
         r.panel(PanelStep::Backspace);
         r.panel(PanelStep::Text("a@b.c".into()));
-        r.panel(PanelStep::Tap { at: (100.0, 260.0), screen, target: Some((exact("Password"), true)) });
+        r.panel(PanelStep::Tap { at: (100.0, 260.0), screen, target: Some((exact("Password"), Some(true))) });
         r.panel(PanelStep::Text("hunter2".into()));
         r.panel(PanelStep::Text("!".into()));
         r.panel(PanelStep::Tap { at: (201.0, 700.4), screen, target: None });
@@ -453,7 +478,7 @@ mod tests {
     fn typing_into_an_unknown_field_is_kept_as_a_secret() {
         let mut r = Recording::default();
         let screen = (402.0, 874.0);
-        r.panel(PanelStep::Tap { at: (100.0, 200.0), screen, target: Some((exact("Email"), false)) });
+        r.panel(PanelStep::Tap { at: (100.0, 200.0), screen, target: Some((exact("Email"), Some(false))) });
         r.panel(PanelStep::Text("ada@b.c".into()));
         r.panel(PanelStep::Return);
         r.panel(PanelStep::Text("hunter2".into()));
@@ -487,10 +512,30 @@ mod tests {
         assert!(text.contains("tap --label Code --exact\ntype \"${SECRET_2}\" --settle"), "{text}");
     }
 
+    /// Return after a password submits: its own step. A Tab may move focus:
+    /// typing after it is a secret. A `${` typed stays literal.
+    #[test]
+    fn return_tab_and_a_typed_dollar_brace() {
+        let mut r = Recording::default();
+        let screen = (402.0, 874.0);
+        r.panel(PanelStep::Tap { at: (1.0, 1.0), screen, target: Some((exact("Password"), Some(true))) });
+        r.panel(PanelStep::Text("hunter2".into()));
+        r.panel(PanelStep::Return);
+        r.panel(PanelStep::Tap { at: (1.0, 1.0), screen, target: Some((exact("Note"), Some(false))) });
+        r.panel(PanelStep::Text("cost ${X}".into()));
+        r.panel(PanelStep::Skipped("arrow, tab, delete, home and end keys".into()));
+        r.panel(PanelStep::Text("next-field".into()));
+        let steps = r.steps.clone();
+        assert_eq!(steps[1], "type \"${SECRET_1}\" --settle");
+        assert_eq!(steps[2], "type \"\\n\" --settle", "Return submits on replay");
+        assert_eq!(steps[4], "type \"cost $${X}\" --settle");
+        assert_eq!(steps[5], "type \"${SECRET_2}\" --settle", "after a Tab the field is not known");
+    }
+
     #[test]
     fn backspacing_everything_typed_leaves_no_step() {
         let mut r = Recording::default();
-        r.panel(PanelStep::Tap { at: (1.0, 1.0), screen: (402.0, 874.0), target: Some((exact("Name"), false)) });
+        r.panel(PanelStep::Tap { at: (1.0, 1.0), screen: (402.0, 874.0), target: Some((exact("Name"), Some(false))) });
         r.steps.clear();
         r.panel(PanelStep::Text("x".into()));
         r.panel(PanelStep::Backspace);
