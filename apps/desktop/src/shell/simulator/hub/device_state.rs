@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use futures::channel::oneshot;
 use gpui::{Context, Task};
 use oximux_simulator::android::adb::Adb;
 use oximux_simulator::android::{Target, avd, devices};
@@ -32,6 +33,8 @@ pub(crate) struct Memo {
     demo: HashMap<DeviceId, String>,
     /// Devices being erased: nothing else boots them meanwhile.
     erasing: HashSet<DeviceId>,
+    /// An emulator erase waiting for its wiping boot's outcome.
+    wipe_waiters: HashMap<DeviceId, oneshot::Sender<Result<(), String>>>,
 }
 
 impl SimulatorHub {
@@ -59,21 +62,25 @@ impl SimulatorHub {
                     StateChange::StatusBar { clean } => Some(*clean),
                     _ => None,
                 };
+                // Noted before it is turned on: a half-applied demo mode, or
+                // a detach while the commands run, still gets it left.
+                if demo == Some(true) {
+                    self.device_state.demo.insert(target.clone(), serial.clone());
+                }
                 let adb_path = sdk.adb();
-                let noted = serial.clone();
                 let job = Box::new(move || {
                     let adb = Adb::new(runner.as_ref(), &adb_path);
                     android::state::apply(&adb, &serial, &android, &change, STATE_TIMEOUT).map_err(|e| e.to_string())
                 });
                 return cx.spawn(async move |this, cx| {
                     let done = cx.background_executor().spawn(async move { job() }).await;
-                    if let (Ok(()), Some(on)) = (&done, demo) {
-                        let _ = this.update(cx, |hub, _| {
-                            if on {
-                                hub.device_state.demo.insert(target, noted);
-                            } else {
+                    if demo.is_some() {
+                        let _ = this.update(cx, |hub, cx| {
+                            if demo == Some(false) && done.is_ok() {
                                 hub.device_state.demo.remove(&target);
                             }
+                            // Detached while the commands ran.
+                            hub.leave_unattached_demo_modes(cx);
                         });
                     }
                     done
@@ -98,9 +105,10 @@ impl SimulatorHub {
     }
 
     /// Erase `udid` and boot it again: shut down (after a recording is
-    /// finalized), wipe, reconnect. Resolves once the wipe is done and the
-    /// boot has started. A real device is never erased, and one erase at a
-    /// time runs per device.
+    /// finalized), wipe, reconnect. Resolves once the wipe is done: for a
+    /// simulator once `simctl erase` is and the boot has started, for an
+    /// emulator (wiped as it boots) once that boot has finished. A real
+    /// device is never erased, and one erase at a time runs per device.
     pub(crate) fn erase(&mut self, udid: &DeviceId, cx: &mut Context<Self>) -> Task<Result<(), String>> {
         if udid.is_physical() {
             return Task::ready(Err("a real device is never erased by OxiMux".into()));
@@ -134,12 +142,15 @@ impl SimulatorHub {
         let target = udid.clone();
         cx.spawn(async move |this, cx| {
             let wiped = cx.background_executor().spawn(async move { wipe() }).await;
-            let done = this.update(cx, |hub, cx| {
+            let reconnected = this.update(cx, |hub, cx| {
                 hub.device_state.erasing.remove(&target);
                 hub.device_state.demo.remove(&target);
-                let android = target.source() == Source::Adb;
-                if wiped.is_ok() && android {
+                let mut wiping = None;
+                if wiped.is_ok() && target.source() == Source::Adb {
                     hub.device_state.wipe_next.insert(target.clone());
+                    let (tx, rx) = oneshot::channel();
+                    hub.device_state.wipe_waiters.insert(target.clone(), tx);
+                    wiping = Some(rx);
                 }
                 // Booted again either way: a failed wipe must not leave the
                 // device off under its panel. After a wipe it is known to be
@@ -151,19 +162,29 @@ impl SimulatorHub {
                 // The boot that wipes an emulator takes the mark at once;
                 // one still here had no boot (detached meanwhile, say), and
                 // must not wipe some later one.
-                let wiped = match wiped {
-                    Ok(()) if android && hub.device_state.wipe_next.remove(&target) => {
-                        Err("the emulator was not booted again, so it was not wiped".to_owned())
-                    }
-                    other => other,
-                };
-                if let Err(e) = &wiped {
-                    hub.notice(&target, NoticeKind::Error, format!("The device was not erased: {e}"), cx);
+                if wiping.is_some() && hub.device_state.wipe_next.remove(&target) {
+                    hub.device_state.wipe_waiters.remove(&target);
+                    return Err("the emulator was not booted again, so it was not wiped".to_owned());
                 }
-                wiped
+                wiped.map(|()| wiping)
             });
-            done.unwrap_or_else(|_| Err("OxiMux closed during the erase".into()))
+            let done = match reconnected {
+                Err(_) => return Err("OxiMux closed during the erase".into()),
+                Ok(Ok(Some(wiping))) => wiping.await.unwrap_or_else(|_| Err("the wiping boot did not finish".into())),
+                Ok(other) => other.map(drop),
+            };
+            if let Err(e) = &done {
+                let _ = this.update(cx, |hub, cx| hub.notice(&target, NoticeKind::Error, format!("The device was not erased: {e}"), cx));
+            }
+            done
         })
+    }
+
+    /// The wiping boot of `udid` ended: tell the erase waiting for it.
+    pub(super) fn wipe_done(&mut self, udid: &DeviceId, outcome: Result<(), String>) {
+        if let Some(waiter) = self.device_state.wipe_waiters.remove(udid) {
+            let _ = waiter.send(outcome);
+        }
     }
 
     /// Whether `udid` is being erased (a wake must not boot it meanwhile).

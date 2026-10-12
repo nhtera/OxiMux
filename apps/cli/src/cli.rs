@@ -920,8 +920,8 @@ pub enum SimCommand {
     /// Install a built .app (inside this worktree or Xcode's DerivedData) or,
     /// on Android, an .apk inside this worktree.
     Install { path: PathBuf },
-    /// Shut the simulator down. One the user booted is refused without
-    /// --force.
+    /// Shut the simulator down. A simulator the user booted is refused
+    /// without --force.
     Shutdown {
         #[arg(long)]
         force: bool,
@@ -944,7 +944,7 @@ pub enum SimCommand {
         mode: StatusBarArg,
     },
     /// Wipe the device to factory settings and boot it again (asked every
-    /// time). One the user booted is refused without --force.
+    /// time). A device the user booted is refused without --force.
     Erase {
         #[arg(long)]
         force: bool,

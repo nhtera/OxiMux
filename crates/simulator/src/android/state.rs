@@ -26,6 +26,10 @@ pub enum Step {
     /// every permission a service stands for, so a failure here is fine as
     /// long as one of the change's steps worked.
     Permission(Vec<String>),
+    /// A reset's second half (`clear-permission-flags`), run only after its
+    /// revoke worked, and then required: without it the app may never ask
+    /// again.
+    ClearFlags(Vec<String>),
 }
 
 const DEMO: &str = "com.android.systemui.demo";
@@ -79,7 +83,7 @@ pub fn steps(target: &Target, change: &StateChange) -> std::result::Result<Vec<S
                 // Reset: revoked, and as if never asked (that package only;
                 // `pm reset-permissions` would reset every app).
                 if *action == PrivacyAction::Reset {
-                    out.push(Step::Permission(owned(&["pm", "clear-permission-flags", app, perm, "user-set", "user-fixed"])));
+                    out.push(Step::ClearFlags(owned(&["pm", "clear-permission-flags", app, perm, "user-set", "user-fixed"])));
                 }
             }
             out
@@ -98,7 +102,10 @@ pub fn apply(adb: &Adb<'_>, serial: &str, target: &Target, change: &StateChange,
     let steps = steps(target, change).map_err(|r| match r {
         Reject::BadInput(why) | Reject::Unsupported(why) => SimError::Parse { what: "device state".into(), detail: why },
     })?;
-    let (mut applied, mut first_failure) = (false, None);
+    // A reset applied once one revoke + clear pair did; a grant or revoke,
+    // once one command did.
+    let resetting = steps.iter().any(|s| matches!(s, Step::ClearFlags(_)));
+    let (mut applied, mut revoked, mut first_failure) = (false, false, None);
     for step in &steps {
         match step {
             Step::Console(words) => {
@@ -115,11 +122,20 @@ pub fn apply(adb: &Adb<'_>, serial: &str, target: &Target, change: &StateChange,
             }
             Step::Shell(words) => drop(adb.shell(serial, &words.iter().map(String::as_str).collect::<Vec<_>>(), timeout)?),
             Step::Permission(words) => match adb.shell(serial, &words.iter().map(String::as_str).collect::<Vec<_>>(), timeout) {
-                Ok(_) => applied = true,
+                Ok(_) => {
+                    revoked = true;
+                    applied |= !resetting;
+                }
                 Err(e) => {
+                    revoked = false;
                     first_failure.get_or_insert(e);
                 }
             },
+            Step::ClearFlags(words) if revoked => {
+                adb.shell(serial, &words.iter().map(String::as_str).collect::<Vec<_>>(), timeout)?;
+                applied = true;
+            }
+            Step::ClearFlags(_) => {}
         }
     }
     match first_failure {
@@ -159,12 +175,29 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|s| match s {
-                Step::Permission(w) => w.join(" "),
+                Step::Permission(w) | Step::ClearFlags(w) => w.join(" "),
                 other => panic!("{other:?}"),
             })
             .collect();
         assert_eq!(all, ["pm revoke com.a.b android.permission.CAMERA", "pm clear-permission-flags com.a.b android.permission.CAMERA user-set user-fixed"]);
         assert!(!all.iter().any(|c| c.contains("reset-permissions")));
+    }
+
+    /// A reset holds only once a revoke AND its flag clear worked; a revoke
+    /// whose clear failed is a failure, not half a success.
+    #[test]
+    fn a_reset_needs_both_halves() {
+        let adb_path = Path::new("/sdk/adb");
+        let reset = StateChange::Privacy { action: PrivacyAction::Reset, service: Service::Camera, app: "com.a.b".into() };
+        let revoke = "/sdk/adb -s S shell pm revoke com.a.b android.permission.CAMERA";
+        let clear = "/sdk/adb -s S shell pm clear-permission-flags com.a.b android.permission.CAMERA user-set user-fixed";
+        let both = ScriptedRunner::default().expect(revoke, CmdOutput::ok("")).expect(clear, CmdOutput::ok(""));
+        apply(&Adb::new(&both, adb_path), "S", &PHONE(), &reset, Duration::from_secs(1)).unwrap();
+        let half = ScriptedRunner::default().expect(revoke, CmdOutput::ok("")).expect(clear, CmdOutput::failed(1, "device offline"));
+        assert!(apply(&Adb::new(&half, adb_path), "S", &PHONE(), &reset, Duration::from_secs(1)).is_err());
+        // Not declared: the clear is never tried, and nothing applied.
+        let none = ScriptedRunner::default().expect(revoke, CmdOutput::failed(255, "has not requested permission"));
+        assert!(apply(&Adb::new(&none, adb_path), "S", &PHONE(), &reset, Duration::from_secs(1)).is_err());
     }
 
     /// Nothing from a request reaches the device's `sh` unchecked.

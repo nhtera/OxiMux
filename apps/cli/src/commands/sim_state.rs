@@ -14,8 +14,9 @@ use crate::output::Failure;
 /// The most a push payload may be (Apple's limit for a notification).
 const MAX_PUSH: usize = 4096;
 /// Asked every time (≤ 90 s), then a recording finalized, shut down (≤ 60 s)
-/// and wiped (≤ 60 s).
-const ERASE: Duration = Duration::from_secs(240);
+/// and wiped: `simctl erase` (≤ 60 s), or an emulator's wiping boot
+/// (≤ 180 s).
+const ERASE: Duration = Duration::from_secs(360);
 
 /// The request for a device-state verb; `None` for any other.
 pub(super) fn request(command: &SimCommand, cwd: &Path) -> Option<Result<(SimCmdWire, Duration, String), Failure>> {
@@ -63,10 +64,15 @@ pub(super) fn request(command: &SimCommand, cwd: &Path) -> Option<Result<(SimCmd
 /// The JSON at `path`, checked here too: an object with an `aps` object, at
 /// most [`MAX_PUSH`] bytes.
 fn push_payload(path: &Path) -> Result<String, Failure> {
-    let text = std::fs::read_to_string(path).map_err(|e| usage(&format!("cannot read {}: {e}", path.display())))?;
-    if text.len() > MAX_PUSH {
-        return Err(usage(&format!("a push payload is at most {MAX_PUSH} bytes ({} is {})", path.display(), text.len())));
+    use std::io::Read as _;
+    let cannot = |e: std::io::Error| usage(&format!("cannot read {}: {e}", path.display()));
+    // One byte past the limit is enough to know it is too big.
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(MAX_PUSH as u64 + 1).read_to_end(&mut bytes)).map_err(cannot)?;
+    if bytes.len() > MAX_PUSH {
+        return Err(usage(&format!("a push payload is at most {MAX_PUSH} bytes ({} is larger)", path.display())));
     }
+    let text = String::from_utf8(bytes).map_err(|_| usage(&format!("{} is not UTF-8 text", path.display())))?;
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| usage(&format!("{} is not JSON: {e}", path.display())))?;
     if !value.get("aps").is_some_and(serde_json::Value::is_object) {
         return Err(usage("a push payload is a JSON object with an `aps` object in it"));

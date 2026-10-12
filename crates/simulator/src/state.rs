@@ -106,7 +106,13 @@ impl Service {
                 "android.permission.ACCESS_COARSE_LOCATION",
                 "android.permission.ACCESS_BACKGROUND_LOCATION",
             ],
-            Self::Photos | Self::MediaLibrary => &["android.permission.READ_MEDIA_IMAGES", "android.permission.READ_MEDIA_VIDEO"],
+            // Android 13+ splits media; before it (or for an app that still
+            // declares it) photo access is the storage permission.
+            Self::Photos | Self::MediaLibrary => &[
+                "android.permission.READ_MEDIA_IMAGES",
+                "android.permission.READ_MEDIA_VIDEO",
+                "android.permission.READ_EXTERNAL_STORAGE",
+            ],
             Self::Microphone => &["android.permission.RECORD_AUDIO"],
             Self::Motion => &["android.permission.ACTIVITY_RECOGNITION"],
             Self::Camera => &["android.permission.CAMERA"],

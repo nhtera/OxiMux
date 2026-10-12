@@ -183,7 +183,18 @@ impl SimulatorHub {
                     }
                 })
                 .await;
-            let _ = this.update(cx, |hub, cx| hub.finish_boot(udid, generation, result, cx));
+            let wiped = wipe.then(|| match &result {
+                BootResult::Booted => Ok(()),
+                BootResult::Cancelled => Err("the wiping boot was cancelled".to_owned()),
+                BootResult::Failed(e) => Err(e.clone()),
+                BootResult::AlreadyBooted => Err("the emulator was already running, so it was not wiped".to_owned()),
+            });
+            let _ = this.update(cx, |hub, cx| {
+                if let Some(wiped) = wiped {
+                    hub.wipe_done(&udid, wiped);
+                }
+                hub.finish_boot(udid, generation, result, cx);
+            });
         })
         .detach();
     }

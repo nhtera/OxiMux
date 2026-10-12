@@ -784,7 +784,7 @@ Install a built .app (inside this worktree or Xcode's DerivedData) or, on Androi
 
 #### `oximux sim shutdown`
 
-Shut the simulator down. One the user booted is refused without --force
+Shut the simulator down. A simulator the user booted is refused without --force
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -848,7 +848,7 @@ A clean status bar for screenshots, or the real one back
 
 #### `oximux sim erase`
 
-Wipe the device to factory settings and boot it again (asked every time). One the user booted is refused without --force
+Wipe the device to factory settings and boot it again (asked every time). A device the user booted is refused without --force
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |

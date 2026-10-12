@@ -23,9 +23,13 @@ use super::SimulatorPanel;
 pub(crate) enum DevicePrompt {
     /// The device it asks about: the panel's device may change meanwhile.
     Erase(DeviceId),
-    /// "lat, lon", and why the last try did not parse.
-    Location(Entity<InputState>, Option<String>),
+    /// The device it asks about, "lat, lon", and why the last try did not
+    /// parse.
+    Location(DeviceId, Entity<InputState>, Option<String>),
 }
+
+/// The typed location's field, before interface zoom.
+const LOCATION_INPUT_W: f32 = 180.;
 
 /// Places a screenshot or a location-based feature is often checked at.
 const PRESETS: [(&str, f64, f64); 4] = [
@@ -108,27 +112,24 @@ impl SimulatorPanel {
     }
 
     fn ask_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(udid) = self.device(cx) else { return };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("lat, lon (e.g. 10.77, 106.70)"));
         window.focus(&input.read(cx).focus_handle(cx), cx);
-        self.device_prompt = Some(DevicePrompt::Location(input, None));
+        self.device_prompt = Some(DevicePrompt::Location(udid, input, None));
         cx.notify();
     }
 
     fn answer_location(&mut self, set: bool, cx: &mut Context<Self>) {
-        let Some(DevicePrompt::Location(input, _)) = &self.device_prompt else { return };
-        if !set {
-            self.device_prompt = None;
-        } else {
-            let text = input.read(cx).value().to_string();
-            match parse_lat_lon(&text) {
+        let Some(DevicePrompt::Location(udid, input, _)) = self.device_prompt.take() else { return };
+        if set {
+            match parse_lat_lon(&input.read(cx).value()) {
+                // Only the device the question named.
                 Some((lat, lon)) => {
-                    self.device_prompt = None;
-                    self.apply_device_state(StateChange::Location { lat, lon }, cx);
+                    if self.device(cx).as_ref() == Some(&udid) {
+                        self.apply_device_state(StateChange::Location { lat, lon }, cx);
+                    }
                 }
-                None => {
-                    let input = input.clone();
-                    self.device_prompt = Some(DevicePrompt::Location(input, Some("latitude, longitude in degrees".into())));
-                }
+                None => self.device_prompt = Some(DevicePrompt::Location(udid, input, Some("latitude, longitude in degrees".into()))),
             }
         }
         cx.notify();
@@ -157,9 +158,9 @@ impl SimulatorPanel {
                     .child(Button::new("sim-erase-ok").danger().small().label("Erase").on_click(cx.listener(|this, _, _, cx| this.answer_erase(true, cx)))),
                 text("Every app and its data are deleted.".into(), theme.fg_muted),
             ),
-            DevicePrompt::Location(input, error) => (
+            DevicePrompt::Location(_, input, error) => (
                 self.pill()
-                    .child(div().w(px(180.)).child(Input::new(input).small()))
+                    .child(div().w(px(density.scale(LOCATION_INPUT_W))).child(Input::new(input).small()))
                     .child(Button::new("sim-location-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, _, cx| this.answer_location(false, cx))))
                     .child(Button::new("sim-location-set").primary().small().label("Set").on_click(cx.listener(|this, _, _, cx| this.answer_location(true, cx)))),
                 match error {
