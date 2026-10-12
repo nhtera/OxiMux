@@ -140,27 +140,32 @@ impl SimulatorPanel {
         cx.notify();
     }
 
-    /// The pill's question, while one is open.
+    /// The pill's question, while one is open. The pill holds only the
+    /// question and its buttons; what more there is to say goes on a line
+    /// under it, so the pill stays within a narrow panel.
     pub(super) fn render_device_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (theme, density, ty) = (self.theme, self.density, &self.typography);
         let text = |s: String, color| div().px(px(density.gap_inline)).text_size(px(ty.t_body_sm)).text_color(color).child(s);
-        Some(match self.device_prompt.as_ref()? {
-            DevicePrompt::Erase => self
-                .pill()
-                .child(text(format!("Erase {}? Every app and its data are deleted.", self.device_name(cx)), theme.fg_base))
-                .child(Button::new("sim-erase-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, _, cx| this.answer_erase(false, cx))))
-                .child(Button::new("sim-erase-ok").danger().small().label("Erase").on_click(cx.listener(|this, _, _, cx| this.answer_erase(true, cx))))
-                .into_any_element(),
-            DevicePrompt::Location(input, error) => {
-                let mut pill = self.pill().child(div().w(px(200.)).child(Input::new(input).small()));
-                if let Some(error) = error {
-                    pill = pill.child(text(error.clone(), theme.status_error));
-                }
-                pill.child(Button::new("sim-location-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, _, cx| this.answer_location(false, cx))))
-                    .child(Button::new("sim-location-set").primary().small().label("Set").on_click(cx.listener(|this, _, _, cx| this.answer_location(true, cx))))
-                    .into_any_element()
-            }
-        })
+        let (pill, note) = match self.device_prompt.as_ref()? {
+            DevicePrompt::Erase => (
+                self.pill()
+                    .child(text(format!("Erase {}?", self.device_name(cx)), theme.fg_base))
+                    .child(Button::new("sim-erase-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, _, cx| this.answer_erase(false, cx))))
+                    .child(Button::new("sim-erase-ok").danger().small().label("Erase").on_click(cx.listener(|this, _, _, cx| this.answer_erase(true, cx)))),
+                text("Every app and its data are deleted.".into(), theme.fg_muted),
+            ),
+            DevicePrompt::Location(input, error) => (
+                self.pill()
+                    .child(div().w(px(180.)).child(Input::new(input).small()))
+                    .child(Button::new("sim-location-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, _, cx| this.answer_location(false, cx))))
+                    .child(Button::new("sim-location-set").primary().small().label("Set").on_click(cx.listener(|this, _, _, cx| this.answer_location(true, cx)))),
+                match error {
+                    Some(error) => text(error.clone(), theme.status_error),
+                    None => text("latitude, longitude".into(), theme.fg_muted),
+                },
+            ),
+        };
+        Some(div().flex().flex_col().items_center().gap(px(density.gap_inline)).child(pill).child(note).into_any_element())
     }
 }
 
