@@ -170,8 +170,12 @@ pub fn on_quit(cx: &mut App) {
         // `quit` already released ownership of what the script shuts down.
         sim_state_keys::save_snapshot(&hub.repo, &hub.registry.snapshot());
         spawn_detached_shutdown(&owned);
+        // Demo mode off on what stays running (a phone, an emulator someone
+        // else started); an owned emulator is about to go anyway.
+        let demo: Vec<String> = hub.take_demo_serials().into_iter().filter(|s| !serials.contains(s)).collect();
         if let Some(sdk) = &hub.android_sdk {
             spawn_detached_emulator_shutdown(&sdk.adb(), &serials);
+            spawn_detached_demo_exit(&sdk.adb(), &demo);
         }
     });
 }
@@ -200,6 +204,29 @@ fn spawn_detached_emulator_shutdown(adb: &std::path::Path, serials: &[String]) {
             .spawn();
         if let Err(e) = spawned {
             tracing::warn!("could not schedule shutdown of owned emulators: {e}");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (adb, serials);
+}
+
+/// `adb -s S shell am broadcast … exit` per serial, each in its own process
+/// group so it outlives the app: the real status bar back on a device that
+/// keeps running.
+fn spawn_detached_demo_exit(adb: &std::path::Path, serials: &[String]) {
+    #[cfg(unix)]
+    for serial in serials {
+        use std::os::unix::process::CommandExt as _;
+        let spawned = std::process::Command::new(adb)
+            .args(["-s", serial.as_str(), "shell"])
+            .args(oximux_simulator::android::state::DEMO_EXIT)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn();
+        if let Err(e) = spawned {
+            tracing::warn!("could not turn demo mode off on {serial}: {e}");
         }
     }
     #[cfg(not(unix))]

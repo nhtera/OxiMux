@@ -619,6 +619,7 @@ impl SimulatorHub {
         // Switching device may have left the old one unattached.
         self.stop_unattached_recordings(cx);
         self.stop_unattached_controls(cx);
+        self.leave_unattached_demo_modes(cx);
         cx.emit(HubEvent::Changed(info.udid.clone()));
         Ok(info)
     }
@@ -663,16 +664,13 @@ impl SimulatorHub {
         let udid = self.registry.device_for(&key).cloned();
         self.forget_consent_requests(worktree, cx);
         self.forget_refs(&key);
-        // Before its session goes: the serial is only known while it streams.
-        if let Some(udid) = &udid {
-            self.leave_demo_mode(udid, cx);
-        }
         let effects = self.registry.detach(&key, Instant::now());
         self.run(effects, cx);
         // A recording belongs to the device: it ends with its last attachment.
         self.stop_unattached_recordings(cx);
-        // So does an iPhone's control (its runner).
+        // So does an iPhone's control (its runner), and Android's demo mode.
         self.stop_unattached_controls(cx);
+        self.leave_unattached_demo_modes(cx);
         if let Some(udid) = udid {
             cx.emit(HubEvent::Changed(udid));
         }
@@ -687,6 +685,12 @@ impl SimulatorHub {
 
     pub fn reconnect(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         let booted = self.watch.lock().unwrap().is_booted(udid).unwrap_or(true);
+        self.reconnect_as(udid, booted, cx);
+    }
+
+    /// [`Self::reconnect`] when whether `udid` is booted is known better than
+    /// the boot watcher's last poll (just after an erase shut it down).
+    pub(crate) fn reconnect_as(&mut self, udid: &DeviceId, booted: bool, cx: &mut Context<Self>) {
         let effects = self.registry.reconnect(udid, booted);
         self.run(effects, cx);
         cx.emit(HubEvent::Changed(udid.clone()));

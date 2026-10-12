@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -286,11 +286,15 @@ pub enum BootOutcome {
 /// down when it owns it); a thread reaps it when it exits. A boot we started
 /// that fails or times out is killed — a windowless emulator nobody owns
 /// would run on unseen. `wipe`: erase it as it boots (see
-/// [`avd::boot_args`]); an emulator already running is not wiped.
+/// [`avd::boot_args`]); an emulator already running cannot be, which is an
+/// error then, not a boot.
 pub fn boot_avd(runner: &dyn Runner, sdk: &Sdk, name: &str, wipe: bool, cancel: &AtomicBool) -> Result<BootOutcome> {
     let target = Target::Avd(name.to_owned());
     if let Some(serial) = serial_of(runner, sdk, &target, QUICK)? {
-        return wait_booted(runner, sdk, &target, Some(serial), cancel).map(BootOutcome::AlreadyBooted);
+        if wipe {
+            return Err(SimError::DeviceBusy(format!("{name} was started again before it could be wiped; it was not erased")));
+        }
+        return wait_booted(runner, sdk, &target, Some(serial), None, cancel).map(BootOutcome::AlreadyBooted);
     }
     let mut child = Command::new(sdk.emulator())
         .args(avd::boot_args(name, wipe))
@@ -298,7 +302,7 @@ pub fn boot_avd(runner: &dyn Runner, sdk: &Sdk, name: &str, wipe: bool, cancel: 
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    match wait_booted(runner, sdk, &target, None, cancel) {
+    match wait_booted(runner, sdk, &target, None, Some(&mut child), cancel) {
         Ok(serial) => {
             std::thread::Builder::new().name("oximux-emulator-reaper".into()).spawn(move || {
                 let _ = child.wait();
@@ -314,12 +318,29 @@ pub fn boot_avd(runner: &dyn Runner, sdk: &Sdk, name: &str, wipe: bool, cancel: 
     }
 }
 
-fn wait_booted(runner: &dyn Runner, sdk: &Sdk, target: &Target, mut serial: Option<String>, cancel: &AtomicBool) -> Result<String> {
+/// Until `target` reports booted. `child`: the emulator we started, whose
+/// exit (the AVD still held by another emulator, a bad config) ends the wait
+/// at once rather than at the timeout.
+fn wait_booted(
+    runner: &dyn Runner,
+    sdk: &Sdk,
+    target: &Target,
+    mut serial: Option<String>,
+    mut child: Option<&mut Child>,
+    cancel: &AtomicBool,
+) -> Result<String> {
     let deadline = Instant::now() + avd::BOOT_TIMEOUT;
     let adb = Adb::new(runner, &sdk.adb());
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(SimError::Cancelled);
+        }
+        if let Some(status) = child.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+            return Err(SimError::CommandFailed {
+                program: "emulator".into(),
+                code: status.code(),
+                stderr: "it exited while booting (is the AVD in use by another emulator?)".into(),
+            });
         }
         if serial.is_none() {
             serial = serial_of(runner, sdk, target, QUICK).ok().flatten();

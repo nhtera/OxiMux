@@ -13,6 +13,7 @@ use gpui_component::{
     Disableable as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
+use oximux_simulator::DeviceId;
 use oximux_simulator::caps::StateSet;
 use oximux_simulator::state::StateChange;
 
@@ -20,7 +21,8 @@ use super::SimulatorPanel;
 
 /// A question the pill asks instead of showing its buttons.
 pub(crate) enum DevicePrompt {
-    Erase,
+    /// The device it asks about: the panel's device may change meanwhile.
+    Erase(DeviceId),
     /// "lat, lon", and why the last try did not parse.
     Location(Entity<InputState>, Option<String>),
 }
@@ -89,7 +91,7 @@ impl SimulatorPanel {
                     let weak = weak.clone();
                     menu = menu.separator().item(PopupMenuItem::new("Erase…").on_click(move |_, _window, cx| {
                         let _ = weak.update(cx, |panel, cx| {
-                            panel.device_prompt = Some(DevicePrompt::Erase);
+                            panel.device_prompt = panel.device(cx).map(DevicePrompt::Erase);
                             cx.notify();
                         });
                     }));
@@ -133,8 +135,9 @@ impl SimulatorPanel {
     }
 
     fn answer_erase(&mut self, erase: bool, cx: &mut Context<Self>) {
-        self.device_prompt = None;
-        if erase && let (Some(hub), Some(udid)) = (self.hub.clone(), self.device(cx)) {
+        let Some(DevicePrompt::Erase(udid)) = self.device_prompt.take() else { return };
+        // Only the device the question named.
+        if erase && let Some(hub) = self.hub.clone() && self.device(cx).as_ref() == Some(&udid) {
             hub.update(cx, |hub, cx| hub.erase(&udid, cx).detach());
         }
         cx.notify();
@@ -147,7 +150,7 @@ impl SimulatorPanel {
         let (theme, density, ty) = (self.theme, self.density, &self.typography);
         let text = |s: String, color| div().px(px(density.gap_inline)).text_size(px(ty.t_body_sm)).text_color(color).child(s);
         let (pill, note) = match self.device_prompt.as_ref()? {
-            DevicePrompt::Erase => (
+            DevicePrompt::Erase(_) => (
                 self.pill()
                     .child(text(format!("Erase {}?", self.device_name(cx)), theme.fg_base))
                     .child(Button::new("sim-erase-cancel").ghost().small().label("Cancel").on_click(cx.listener(|this, _, _, cx| this.answer_erase(false, cx))))

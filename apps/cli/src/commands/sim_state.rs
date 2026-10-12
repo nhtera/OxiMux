@@ -6,24 +6,25 @@ use std::time::Duration;
 
 use oximux_remote_proto::simulator::{SimCmdWire, SimLocationWire, SimPrivacyActionWire, SimStateCmdWire};
 
-use super::sim::{APP, SLOW, usage};
+use super::sim::{APP, usage};
 use crate::cli::{AppearanceArg, LocationCommand, SimCommand, StatusBarArg};
 use crate::cli_sim_state::PrivacyActionArg;
 use crate::output::Failure;
 
 /// The most a push payload may be (Apple's limit for a notification).
 const MAX_PUSH: usize = 4096;
-/// Asked every time (≤ 90 s), then shut down, wiped and booting (≤ 90 s).
-const ERASE: Duration = Duration::from_secs(200);
+/// Asked every time (≤ 90 s), then a recording finalized, shut down (≤ 60 s)
+/// and wiped (≤ 60 s).
+const ERASE: Duration = Duration::from_secs(240);
 
 /// The request for a device-state verb; `None` for any other.
 pub(super) fn request(command: &SimCommand, cwd: &Path) -> Option<Result<(SimCmdWire, Duration, String), Failure>> {
     let state = |s, floor, said: String| Ok((SimCmdWire::DeviceState(s), floor, said));
     Some(match command {
         SimCommand::Location(LocationCommand::Set { lat, lon }) => {
-            state(SimStateCmdWire::Location(SimLocationWire::Set { lat: *lat, lon: *lon }), SLOW, format!("location set to {lat}, {lon}"))
+            state(SimStateCmdWire::Location(SimLocationWire::Set { lat: *lat, lon: *lon }), APP, format!("location set to {lat}, {lon}"))
         }
-        SimCommand::Location(LocationCommand::Clear) => state(SimStateCmdWire::Location(SimLocationWire::Clear), SLOW, "location cleared".into()),
+        SimCommand::Location(LocationCommand::Clear) => state(SimStateCmdWire::Location(SimLocationWire::Clear), APP, "location cleared".into()),
         SimCommand::Appearance { mode } => {
             let dark = *mode == AppearanceArg::Dark;
             // On a real phone the user is asked first.

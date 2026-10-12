@@ -546,12 +546,12 @@ fn downscale(png: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// `path` (relative paths are the worktree's) as an installable `.app`
-/// inside the worktree or Xcode's DerivedData.
 fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+/// `path` (relative paths are the worktree's) as an installable `.app`
+/// inside the worktree or Xcode's DerivedData.
 fn install_path(path: &str, worktree: &Path) -> Result<PathBuf, SimErrorWire> {
     let path = Path::new(path);
     let path = if path.is_absolute() { path.to_path_buf() } else { worktree.join(path) };

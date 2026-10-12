@@ -404,6 +404,10 @@ impl SimulatorHub {
         if self.agent.stopped.contains(udid) {
             return Wake::StoppedByUser;
         }
+        // Off on purpose, and booted again by the erase itself.
+        if self.erasing(udid) {
+            return Wake::Starting;
+        }
         match self.registry.phase(udid) {
             Phase::Live { .. } => Wake::Live,
             Phase::Booting { .. } | Phase::Starting { .. } => Wake::Starting,
