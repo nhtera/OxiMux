@@ -3,7 +3,7 @@
 //! CLI's alone; a recording is the host's (it sees every verb the agent
 //! sends), started, read and stopped through `SimCmdWire::Flow`.
 
-pub mod maestro;
+pub mod yaml_export;
 pub mod run;
 pub mod steps;
 
@@ -39,7 +39,11 @@ pub async fn flow(client: &Client, worktree: &Path, command: FlowCommand) -> Out
         format!("{} step{}", flow.count, plural(flow.count))
     };
     if let Some(path) = out {
-        write_private(&path, &flow.steps)?;
+        // The host has stopped: a failed write must not lose the steps.
+        write_private(&path, &flow.steps).map_err(|f| {
+            let steps = flow.steps.clone();
+            Failure { message: format!("{}; the steps follow, copy them:\n{}", f.message, steps.trim_end()), ..f }.with_data(json!({ "steps": steps }))
+        })?;
         human = format!("wrote {} step{} to {}", flow.count, plural(flow.count), path.display());
         value["path"] = json!(path);
     } else if let Some(saved) = &flow.saved {
@@ -60,9 +64,9 @@ pub fn export(file: &Path, out: Option<&Path>, app_id: Option<&str>) -> Outcome 
     for step in &all {
         let command = steps::command(&step.words)
             .map_err(|why| Failure::new("usage", exit::USAGE, format!("step {} (line {}): {why}: {}", step.n, step.line, step.text)))?;
-        inputs.push(maestro::Input { n: step.n, text: &step.text, cmd: steps::wire(command).ok() });
+        inputs.push(yaml_export::Input { n: step.n, text: &step.text, cmd: steps::wire(command).ok() });
     }
-    let exported = maestro::export(&header, &inputs, app_id).map_err(|why| Failure::new("export", exit::ERROR, why))?;
+    let exported = yaml_export::export(&header, &inputs, app_id).map_err(|why| Failure::new("export", exit::ERROR, why))?;
     for warning in &exported.warnings {
         eprintln!("warning: {warning}");
     }
@@ -72,8 +76,7 @@ pub fn export(file: &Path, out: Option<&Path>, app_id: Option<&str>) -> Outcome 
     let value = json!({ "yaml": exported.yaml, "warnings": exported.warnings });
     match out {
         Some(path) => {
-            std::fs::write(path, &exported.yaml)
-                .map_err(|e| Failure::new("write", exit::ERROR, format!("cannot write {}: {e}", path.display())))?;
+            write_private(path, &exported.yaml)?;
             Ok((value, format!("wrote {}", path.display())))
         }
         None => Ok((value, exported.yaml.trim_end().to_owned())),
@@ -91,13 +94,16 @@ fn flow_json(flow: &SimFlowWire) -> Value {
 }
 
 /// A flow file can hold what the user typed: the owner's alone.
-fn write_private(path: &Path, text: &str) -> Result<(), Failure> {
+pub(super) fn write_private(path: &Path, text: &str) -> Result<(), Failure> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let failed = |e: std::io::Error| Failure::new("write", exit::ERROR, format!("cannot write {}: {e}", path.display()));
     let mut file = options.open(path).map_err(failed)?;
+    // An existing file keeps its mode on open: made private here too.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600)).map_err(failed)?;
     std::io::Write::write_all(&mut file, text.as_bytes()).map_err(failed)
 }
 

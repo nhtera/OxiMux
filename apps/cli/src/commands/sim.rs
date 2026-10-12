@@ -145,6 +145,9 @@ pub(super) fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire
                 if exact.exact && label.is_none() && id.is_none() {
                     return Err(usage("--exact needs --label or --id"));
                 }
+                if label.is_none() && id.is_none() && exact.role.is_none() {
+                    return Err(usage("--nth needs --label, --id or --role"));
+                }
             }
             let named = |label: &Option<String>, id: &Option<String>, role: &Option<String>| match (label, id, role) {
                 (Some(l), _, _) => format!("tapped “{l}”"),

@@ -78,7 +78,12 @@ pub async fn run(client: &Client, worktree: &Path, args: RunArgs) -> Outcome {
 fn changes_state(command: &SimCommand) -> bool {
     matches!(
         command,
-        SimCommand::Privacy(_) | SimCommand::Install { .. } | SimCommand::Erase { .. } | SimCommand::Push(_) | SimCommand::Location(_)
+        SimCommand::Privacy(_)
+            | SimCommand::Install { .. }
+            | SimCommand::Erase { .. }
+            | SimCommand::Push(_)
+            | SimCommand::Location(_)
+            | SimCommand::Shutdown { .. }
     )
 }
 

@@ -226,6 +226,11 @@ impl SimulatorPanel {
                 }
             }
             HubEvent::DeviceBooted(udids) => cx.emit(PanelEvent::DeviceBooted(udids.clone())),
+            HubEvent::FlowNotice(path, kind, text) => {
+                if self.worktree.as_ref() == Some(path) {
+                    cx.emit(PanelEvent::Notice(*kind, text.clone()));
+                }
+            }
             HubEvent::Crash(udid, crash) => self.crashed(udid, crash, cx),
             // Frames repaint the screen view, not the whole panel.
             HubEvent::Frame(_) | HubEvent::Session(..) => {}

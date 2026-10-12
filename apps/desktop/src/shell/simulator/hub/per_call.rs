@@ -45,7 +45,8 @@ impl AskKind {
             Self::Erase => format!("erase {device}"),
             Self::Push { app } => format!("send a notification to {app} on {device}"),
             Self::PhysicalState { what } => format!("{what} on {device}"),
-            Self::FlowRun { lines } => format!("run {} step{} that change {device}", lines.len(), if lines.len() == 1 { "" } else { "s" }),
+            Self::FlowRun { lines } if lines.len() == 1 => format!("run 1 step that changes {device}"),
+            Self::FlowRun { lines } => format!("run {} steps that change {device}", lines.len()),
         }
     }
 
@@ -75,7 +76,9 @@ impl AskKind {
             Self::FlowRun { lines } => {
                 let mut body = "An agent in this worktree wants to run a flow with these steps, which change the device:".to_owned();
                 for line in lines.iter().take(FLOW_LINES_SHOWN) {
-                    body.push_str(&format!("\n• {}", crate::shell::simulator::agent_ops::clamp(line, 120)));
+                    // One line each, whatever a client sent.
+                    let line: String = line.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+                    body.push_str(&format!("\n• {}", crate::shell::simulator::agent_ops::clamp(&line, 120)));
                 }
                 if lines.len() > FLOW_LINES_SHOWN {
                     body.push_str(&format!("\n…and {} more", lines.len() - FLOW_LINES_SHOWN));
@@ -212,6 +215,7 @@ mod tests {
         let lines: Vec<String> = (0..10).map(|i| format!("privacy grant camera --app com.a{i}")).collect();
         let (title, body, (_, allow)) = AskKind::FlowRun { lines }.question("iPhone 17");
         assert_eq!((title.as_str(), allow), ("Run this flow on iPhone 17?", "Run"));
+        assert_eq!(AskKind::FlowRun { lines: vec!["erase".into()] }.what("iPhone 17"), "run 1 step that changes iPhone 17");
         assert!(body.contains("• privacy grant camera --app com.a0") && body.contains("…and 2 more"), "{body}");
     }
 }

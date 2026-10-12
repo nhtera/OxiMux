@@ -173,8 +173,9 @@ oximux sim run login.flow --settle  # settle after every action
   `location`) are shown to the user once, as a list, before step 1; if they
   say no, nothing runs (exit 5). `erase`, `push` and a real device's settings
   still ask when their turn comes.
-- `${NAME}` in a step is the environment variable `NAME` (a recorded password
-  is `type "${SECRET_1}"`): set it before the run.
+- `${SECRET_1}`, `${SECRET_2}`, … in a step are read from the environment
+  (a recorded password is `type "${SECRET_1}"`): set them before the run. No
+  other variable is read; `$${` writes a literal `${`.
 
 **Exact selectors.** `--label` also matches part of a label ("Settings" finds
 "Return to Settings"). `--exact` matches the label or id exactly; `--role R`

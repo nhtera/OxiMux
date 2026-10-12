@@ -95,8 +95,10 @@ pub fn command(words: &[String]) -> Result<SimCommand, String> {
     }
 }
 
-/// `words` with each `${NAME}` replaced by that environment variable: how a
-/// recorded secret (`type "${SECRET_1}"`) is supplied at replay.
+/// `words` with each `${SECRET_…}` replaced by that environment variable:
+/// how a recorded secret (`type "${SECRET_1}"`) is supplied at replay.
+/// Only `SECRET_` names are read — a flow file cannot reach any other
+/// variable (a token in an `open-url`) — and `$${` is a literal `${`.
 pub fn substitute(words: &[String]) -> Result<Vec<String>, String> {
     words.iter().map(|w| substitute_word(w, &|name| std::env::var(name).ok())).collect()
 }
@@ -104,21 +106,25 @@ pub fn substitute(words: &[String]) -> Result<Vec<String>, String> {
 fn substitute_word(word: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
     let mut out = String::with_capacity(word.len());
     let mut rest = word;
-    while let Some(at) = rest.find("${") {
+    while let Some(at) = rest.find('$') {
         out.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let Some(end) = after.find('}') else {
-            out.push_str(&rest[at..]);
-            return Ok(out);
-        };
-        let name = &after[..end];
-        let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit());
-        if named {
-            out.push_str(&var(name).ok_or_else(|| format!("set ${name} in the environment (the flow types it)"))?);
-        } else {
-            out.push_str(&rest[at..at + 3 + end]);
+        let after = &rest[at + 1..];
+        if let Some(tail) = after.strip_prefix("${") {
+            out.push_str("${");
+            rest = tail;
+            continue;
         }
-        rest = &after[end + 1..];
+        let name = after.strip_prefix('{').and_then(|a| a.find('}').map(|end| &a[..end]));
+        match name.filter(|n| n.len() > 7 && n.starts_with("SECRET_") && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+            Some(name) => {
+                out.push_str(&var(name).ok_or_else(|| format!("set ${name} in the environment (the flow types it)"))?);
+                rest = &after[name.len() + 2..];
+            }
+            None => {
+                out.push('$');
+                rest = after;
+            }
+        }
     }
     out.push_str(rest);
     Ok(out)
@@ -183,11 +189,13 @@ mod tests {
 
     #[test]
     fn a_secret_comes_from_the_environment() {
-        let var = |name: &str| (name == "SECRET_1").then(|| "hunter2".to_owned());
+        let var = |name: &str| matches!(name, "SECRET_1" | "HOME").then(|| "hunter2".to_owned());
         assert_eq!(substitute_word("${SECRET_1}", &var).unwrap(), "hunter2");
         assert_eq!(substitute_word("pre-${SECRET_1}-post", &var).unwrap(), "pre-hunter2-post");
         assert!(substitute_word("${SECRET_2}", &var).unwrap_err().contains("SECRET_2"));
         assert_eq!(substitute_word("cost ${1x} and ${", &var).unwrap(), "cost ${1x} and ${", "not a name: kept");
+        assert_eq!(substitute_word("https://x/?t=${HOME}", &var).unwrap(), "https://x/?t=${HOME}", "only SECRET_ names are read");
+        assert_eq!(substitute_word("$${SECRET_1} $5", &var).unwrap(), "${SECRET_1} $5", "a doubled $ is a literal one");
     }
 
     /// What the host writes, the CLI reads back to the same verb.

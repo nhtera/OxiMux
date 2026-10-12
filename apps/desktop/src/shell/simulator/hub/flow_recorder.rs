@@ -31,13 +31,18 @@ pub(crate) type RecKey = (WorktreeKey, DeviceId, RecSource);
 /// One piece of the user's input on the panel, as a recording takes it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PanelStep {
-    /// A tap at `at` (points), on the element `target` names exactly when
-    /// one was read in time (`secure`: a password field).
-    Tap { at: (f64, f64), target: Option<(SimSelectorWire, bool)> },
-    Swipe { from: (f64, f64), to: (f64, f64), duration_ms: u32 },
+    /// A tap at `at` (points, on a `screen` that size), on the element
+    /// `target` names exactly when one was read in time (`secure`: a
+    /// password field).
+    Tap { at: (f64, f64), screen: (f64, f64), target: Option<(SimSelectorWire, bool)> },
+    Swipe { from: (f64, f64), to: (f64, f64), screen: (f64, f64), duration_ms: u32 },
     /// Typed characters.
     Text(String),
     Backspace,
+    /// Return: ends the typing (focus may move to another field).
+    Return,
+    /// Input a flow cannot hold (an arrow key): said once in the warnings.
+    Skipped(String),
     Button(SimButtonWire),
     Rotate(SimOrientationWire),
 }
@@ -64,8 +69,10 @@ pub(crate) struct Recording {
     secrets: u32,
     /// Typing in progress (the last step is its line).
     typing: Option<Typing>,
-    /// The last tap landed on a password field.
-    secure_field: bool,
+    /// Whether the field typing goes into is a password field: `None` when
+    /// it is not known (a tap kept as a point, a Return), which records
+    /// typing as a secret too — a password is never written down by guess.
+    field: Option<bool>,
 }
 
 impl Recording {
@@ -104,8 +111,9 @@ impl Recording {
         let settled = |cmd| SimCmdWire::Settled { action: Box::new(cmd), timeout_ms: 0 };
         let point = |(x, y): (f64, f64)| SimPointWire { x, y };
         let cmd = match step {
-            PanelStep::Tap { at, target } => {
-                self.secure_field = target.as_ref().is_some_and(|(_, secure)| *secure);
+            PanelStep::Tap { at, screen, target } => {
+                self.fill_screen(Some(screen));
+                self.field = target.as_ref().map(|(_, secure)| *secure);
                 let aim = match target {
                     Some((sel, _)) => SimTargetWire::Exact(sel),
                     None => {
@@ -115,23 +123,91 @@ impl Recording {
                 };
                 settled(SimCmdWire::Tap(aim))
             }
-            PanelStep::Swipe { from, to, duration_ms } => settled(SimCmdWire::Swipe { from: point(from), to: point(to), duration_ms }),
-            PanelStep::Button(b) => settled(SimCmdWire::Button(b)),
+            PanelStep::Swipe { from, to, screen, duration_ms } => {
+                self.fill_screen(Some(screen));
+                self.field = None;
+                settled(SimCmdWire::Swipe { from: point(from), to: point(to), duration_ms })
+            }
+            PanelStep::Button(b) => {
+                self.field = None;
+                settled(SimCmdWire::Button(b))
+            }
             PanelStep::Rotate(o) => settled(SimCmdWire::Rotate(o)),
             PanelStep::Text(text) => return self.typed(Some(&text)),
             PanelStep::Backspace => return self.typed(None),
+            PanelStep::Return => {
+                if self.typing.is_some() {
+                    self.typed(Some("\n"));
+                } else {
+                    self.add(&settled(SimCmdWire::Type { text: "\n".into(), paste: false }));
+                }
+                self.typing = None;
+                self.field = None;
+                return;
+            }
+            PanelStep::Skipped(what) => return self.warn(format!("not recorded: {what}")),
         };
         self.add(&cmd);
+    }
+
+    /// An agent's verb that succeeded, its targets already named: typing goes
+    /// in as a placeholder unless the field it lands in is known not to be a
+    /// password field (`field`: what the verb's own target is, when it has
+    /// one — `Some(None)`: a target that could not be looked up).
+    pub(crate) fn agent(&mut self, cmd: SimCmdWire, field: Option<Option<bool>>) {
+        let cmd = match cmd {
+            SimCmdWire::AsCaller { cmd, .. } => *cmd,
+            other => other,
+        };
+        let (settle, inner) = match cmd {
+            SimCmdWire::Settled { action, timeout_ms } => (Some(timeout_ms), *action),
+            other => (None, other),
+        };
+        let inner = match inner {
+            SimCmdWire::Type { text, paste } => {
+                let text = self.guard_secret(text, self.field);
+                SimCmdWire::Type { text, paste }
+            }
+            SimCmdWire::TypeInto { target, text, paste } => {
+                let into = field.flatten();
+                let text = self.guard_secret(text, into);
+                self.field = into;
+                SimCmdWire::TypeInto { target, text, paste }
+            }
+            other => {
+                // Focus may have moved: only a tap says where to.
+                self.field = match &other {
+                    SimCmdWire::Tap(_) => field.flatten(),
+                    _ => None,
+                };
+                other
+            }
+        };
+        let cmd = match settle {
+            Some(timeout_ms) => SimCmdWire::Settled { action: Box::new(inner), timeout_ms },
+            None => inner,
+        };
+        self.add(&cmd);
+    }
+
+    /// `text` as a step may hold it: itself in a field known not to be a
+    /// password field, else the next placeholder.
+    fn guard_secret(&mut self, text: String, field: Option<bool>) -> String {
+        if field == Some(false) {
+            return text;
+        }
+        let name = self.next_secret();
+        self.warn(secret_warning(&name, field));
+        name
     }
 
     /// `text` typed (`None`: a backspace), into the field the last tap hit.
     fn typed(&mut self, text: Option<&str>) {
         if self.typing.is_none() {
-            let secret = self.secure_field;
-            if secret {
+            if self.field != Some(false) && text.is_some() {
                 let name = self.next_secret();
-                self.warn(format!("typing into a password field was recorded as {name}: set it in the environment to replay"));
-                let typing = Typing { text: name, secret };
+                self.warn(secret_warning(&name, self.field));
+                let typing = Typing { text: name, secret: true };
                 self.add(&SimCmdWire::Settled { action: Box::new(SimCmdWire::Type { text: typing.text.clone(), paste: false }), timeout_ms: 0 });
                 self.typing = Some(typing);
                 return;
@@ -176,6 +252,13 @@ impl Recording {
         }
     }
 
+    /// The screen's size, once known (a point step is scaled by it).
+    pub(crate) fn fill_screen(&mut self, screen: Option<(f64, f64)>) {
+        if self.screen.is_none() {
+            self.screen = screen;
+        }
+    }
+
     pub(crate) fn warn(&mut self, warning: String) {
         if !self.warnings.contains(&warning) {
             self.warnings.push(warning);
@@ -186,6 +269,15 @@ impl Recording {
     pub(crate) fn next_secret(&mut self) -> String {
         self.secrets += 1;
         format!("${{SECRET_{}}}", self.secrets)
+    }
+}
+
+fn secret_warning(name: &str, field: Option<bool>) -> String {
+    match field {
+        Some(true) => format!("typing into a password field was recorded as {name}: set it in the environment to replay"),
+        _ => format!(
+            "typing into a field that could not be read was recorded as {name} (it may be a password): set it to replay, or put the text back in the file if it is not secret"
+        ),
     }
 }
 
@@ -217,12 +309,11 @@ impl FlowRecorder {
         self.recordings.remove(key)
     }
 
-    /// Drop `worktree`'s recordings (it detached or changed device).
-    /// Returns whether any went.
-    pub(crate) fn forget_worktree(&mut self, worktree: &WorktreeKey) -> bool {
-        let before = self.recordings.len();
-        self.recordings.retain(|(w, _, _), _| w != worktree);
-        self.recordings.len() != before
+    /// End `worktree`'s recordings (it detached or changed device): they
+    /// are returned, for what is worth keeping.
+    pub(crate) fn forget_worktree(&mut self, worktree: &WorktreeKey) -> Vec<(RecKey, Recording)> {
+        let keys: Vec<RecKey> = self.recordings.keys().filter(|(w, _, _)| w == worktree).cloned().collect();
+        keys.into_iter().filter_map(|k| self.recordings.remove(&k).map(|r| (k, r))).collect()
     }
 }
 
@@ -235,10 +326,25 @@ impl SimulatorHub {
         &mut self.flows
     }
 
-    /// A worktree's recordings end when it detaches or changes device.
+    /// A worktree's recordings end when it detaches or changes device. The
+    /// user's own (the panel's) is saved, not lost, and they are told where;
+    /// an agent's goes (its `flow stop` would have said so).
     pub(super) fn forget_flows(&mut self, worktree: &WorktreeKey, cx: &mut gpui::Context<Self>) {
-        if self.flows.forget_worktree(worktree) {
-            cx.emit(super::HubEvent::Flow);
+        let ended = self.flows.forget_worktree(worktree);
+        if ended.is_empty() {
+            return;
+        }
+        cx.emit(super::HubEvent::Flow);
+        for ((_, _, source), recording) in ended {
+            if source != RecSource::Panel || recording.count() == 0 {
+                continue;
+            }
+            // A few hundred bytes: written here, so the notice can say where.
+            let notice = match save(worktree, &recording.text()) {
+                Ok(path) => (super::NoticeKind::Success, format!("The flow recording ended with the device; saved: {}", path.display())),
+                Err(why) => (super::NoticeKind::Error, format!("The flow recording ended with the device and could not be saved ({why})")),
+            };
+            cx.emit(super::HubEvent::FlowNotice(worktree.path().to_path_buf(), notice.0, notice.1));
         }
     }
 }
@@ -302,7 +408,7 @@ mod tests {
         let agent = flows.get(&key(RecSource::Agent)).unwrap();
         assert_eq!(agent.text(), "# oximux-flow v1\n# platform ios\n# screen 402x874\n# app com.a.b\nlaunch com.a.b --relaunch\ntap 1 2\n");
         assert_eq!(flows.get(&key(RecSource::Panel)).unwrap().count(), 0, "the panel's holds none of the agent's");
-        assert!(flows.forget_worktree(&key(RecSource::Agent).0));
+        assert_eq!(flows.forget_worktree(&key(RecSource::Agent).0).len(), 2);
         assert!(flows.get(&key(RecSource::Panel)).is_none());
     }
 
@@ -313,16 +419,17 @@ mod tests {
     #[test]
     fn panel_input_becomes_settled_steps_with_typing_kept_together() {
         let mut r = Recording { platform: "ios", ..Recording::default() };
-        r.panel(PanelStep::Tap { at: (100.0, 200.0), target: Some((exact("Email"), false)) });
+        let screen = (402.0, 874.0);
+        r.panel(PanelStep::Tap { at: (100.0, 200.0), screen, target: Some((exact("Email"), false)) });
         for c in ["a", "d", "x"] {
             r.panel(PanelStep::Text(c.into()));
         }
         r.panel(PanelStep::Backspace);
         r.panel(PanelStep::Text("a@b.c".into()));
-        r.panel(PanelStep::Tap { at: (100.0, 260.0), target: Some((exact("Password"), true)) });
+        r.panel(PanelStep::Tap { at: (100.0, 260.0), screen, target: Some((exact("Password"), true)) });
         r.panel(PanelStep::Text("hunter2".into()));
         r.panel(PanelStep::Text("!".into()));
-        r.panel(PanelStep::Tap { at: (201.0, 700.4), target: None });
+        r.panel(PanelStep::Tap { at: (201.0, 700.4), screen, target: None });
         r.panel(PanelStep::Button(SimButtonWire::Home));
         assert_eq!(
             r.steps,
@@ -336,12 +443,55 @@ mod tests {
             ]
         );
         assert!(!r.text().contains("hunter2"), "a secret is never kept");
+        assert!(r.text().contains("# screen 402x874\n"), "a point step's screen is in the header");
         assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+    }
+
+    /// A field that could not be read is taken for a password: nothing
+    /// typed is written down by guess — after a point tap, after Return.
+    #[test]
+    fn typing_into_an_unknown_field_is_kept_as_a_secret() {
+        let mut r = Recording::default();
+        let screen = (402.0, 874.0);
+        r.panel(PanelStep::Tap { at: (100.0, 200.0), screen, target: Some((exact("Email"), false)) });
+        r.panel(PanelStep::Text("ada@b.c".into()));
+        r.panel(PanelStep::Return);
+        r.panel(PanelStep::Text("hunter2".into()));
+        r.panel(PanelStep::Tap { at: (10.0, 10.0), screen, target: None });
+        r.panel(PanelStep::Text("also-secret".into()));
+        let text = r.text();
+        assert!(!text.contains("hunter2") && !text.contains("also-secret"), "{text}");
+        assert!(text.contains("type \"ada@b.c\\n\" --settle"), "{text}");
+        assert!(text.contains("${SECRET_1}") && text.contains("${SECRET_2}"), "{text}");
+    }
+
+    /// An agent's typing: its own text only where the field is known not to
+    /// be a password field.
+    #[test]
+    fn an_agents_typing_into_a_password_field_is_a_placeholder() {
+        let mut r = Recording::default();
+        let tap = |label: &str| SimCmdWire::Tap(SimTargetWire::Exact(exact(label)));
+        r.agent(tap("Email"), Some(Some(false)));
+        r.agent(SimCmdWire::Type { text: "ada@b.c".into(), paste: false }, None);
+        r.agent(tap("Password"), Some(Some(true)));
+        r.agent(SimCmdWire::Type { text: "hunter2".into(), paste: false }, None);
+        let into = SimCmdWire::TypeInto { target: SimTargetWire::Exact(exact("Code")), text: "123456".into(), paste: false };
+        r.agent(SimCmdWire::Settled { action: Box::new(into), timeout_ms: 0 }, Some(None));
+        r.agent(SimCmdWire::Button(SimButtonWire::Home), None);
+        r.agent(SimCmdWire::Type { text: "after-home".into(), paste: false }, None);
+        let text = r.text();
+        assert!(text.contains("type ada@b.c\n"), "{text}");
+        for secret in ["hunter2", "123456", "after-home"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(text.contains("tap --label Code --exact\ntype \"${SECRET_2}\" --settle"), "{text}");
     }
 
     #[test]
     fn backspacing_everything_typed_leaves_no_step() {
         let mut r = Recording::default();
+        r.panel(PanelStep::Tap { at: (1.0, 1.0), screen: (402.0, 874.0), target: Some((exact("Name"), false)) });
+        r.steps.clear();
         r.panel(PanelStep::Text("x".into()));
         r.panel(PanelStep::Backspace);
         assert!(r.steps.is_empty());

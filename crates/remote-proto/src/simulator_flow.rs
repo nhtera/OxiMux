@@ -333,6 +333,10 @@ fn target_words(line: Line, target: &SimTargetWire, point: bool) -> Result<Line,
             if sel.label.is_none() && sel.id.is_none() && sel.role.is_none() {
                 return Err("an exact selector names nothing".into());
             }
+            // The CLI takes one or the other.
+            if sel.label.is_some() && sel.id.is_some() {
+                return Err("an exact selector with both a label and an id".into());
+            }
             Ok(if sel.label.is_some() || sel.id.is_some() { line.flag("exact") } else { line })
         }
         SimTargetWire::Ref(r) => Err(format!("@e{r} is a ref to one screen; a step names the element itself")),

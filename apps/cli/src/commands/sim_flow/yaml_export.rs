@@ -1,7 +1,8 @@
-//! `sim flow export --maestro`: a flow file as Maestro YAML, a strict
-//! subset — every scalar double-quoted, labels and identifiers as escaped
-//! regular expressions (that is how the format matches text), points as
-//! percentages of the recorded screen.
+//! `sim flow export --maestro`: a flow file in that YAML test-flow format,
+//! a strict subset — every scalar double-quoted, labels and identifiers as
+//! escaped regular expressions (that is how the format matches text),
+//! points as whole percentages of the recorded screen (it takes no
+//! fractions).
 //!
 //! A step with no counterpart is never dropped silently: it stays in the
 //! YAML as `# unsupported: <step>` and is counted in the warnings.
@@ -55,7 +56,7 @@ pub fn export(header: &Header, steps: &[Input<'_>], app_id: Option<&str>) -> Res
         match result {
             Ok(()) => yaml.extend(out.into_iter().map(|l| l + "\n")),
             Err(Skip::Unsupported(why)) => {
-                yaml.push_str(&format!("# unsupported: {}\n", step.text));
+                yaml.push_str(&format!("# unsupported: {}\n", comment(step.text)));
                 warnings.push(format!("step {}: {why}: {}", step.n, step.text));
             }
             Err(Skip::Fatal(why)) => return Err(format!("step {}: {why}: {}", step.n, step.text)),
@@ -185,7 +186,7 @@ fn selector(target: &SimTargetWire, out: &mut Vec<String>, warnings: &mut Vec<St
 /// A point as `"x%,y%"` of the recorded screen.
 fn percent(p: SimPointWire, header: &Header) -> Result<String, Skip> {
     let (w, h) = header.screen.ok_or_else(|| Skip::Fatal("a point step needs `# screen WxH` in the file".into()))?;
-    Ok(format!("{:.1}%,{:.1}%", p.x / w * 100.0, p.y / h * 100.0))
+    Ok(format!("{:.0}%,{:.0}%", p.x / w * 100.0, p.y / h * 100.0))
 }
 
 /// `s` matched literally as a regular expression.
@@ -200,6 +201,13 @@ fn regex(s: &str) -> String {
     out
 }
 
+/// `s` safe in a `#` comment: anything YAML takes for a line break (a
+/// control character, U+0085, U+2028, U+2029) becomes a space, so nothing
+/// after it is read as YAML.
+fn comment(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || matches!(c, '\u{85}' | '\u{2028}' | '\u{2029}') { ' ' } else { c }).collect()
+}
+
 /// `s` as a double-quoted YAML scalar.
 fn q(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -211,7 +219,7 @@ fn q(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if c.is_control() || matches!(c, '\u{85}' | '\u{2028}' | '\u{2029}') => out.push_str(&format!("\\u{:04X}", c as u32)),
             c => out.push(c),
         }
     }
@@ -244,6 +252,8 @@ mod tests {
         assert_eq!(q(&regex("Price (USD)")), r#""Price \\(USD\\)""#);
         assert_eq!(q("say \"hi\"\n"), r#""say \"hi\"\n""#);
         assert_eq!(regex("a.b*"), r"a\.b\*");
+        assert_eq!(q("a\u{2028}b"), r#""a\u2028b""#, "a line separator stays inside the scalar");
+        assert_eq!(comment("tap\u{2028}- tapOn: x"), "tap - tapOn: x");
     }
 
     #[test]
@@ -260,6 +270,6 @@ mod tests {
         assert!(exported("tap 10 20\n", Some("com.a.b")).unwrap_err().contains("# screen"));
         assert!(exported("tap --label OK --exact\n", None).unwrap_err().contains("--app-id"));
         let out = exported("# screen 400x800\ntap 100 200\n", Some("x")).unwrap();
-        assert!(out.yaml.contains("point: \"25.0%,25.0%\""), "{}", out.yaml);
+        assert!(out.yaml.contains("point: \"25%,25%\""), "{}", out.yaml);
     }
 }

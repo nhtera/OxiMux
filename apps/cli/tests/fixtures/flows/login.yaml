@@ -17,8 +17,8 @@ appId: "com.example.app"
     text: "Price \\(USD\\)"
     index: 1
 - swipe:
-    start: "50.0%,80.1%"
-    end: "50.0%,22.9%"
+    start: "50%,80%"
+    end: "50%,23%"
     duration: 400
 - extendedWaitUntil:
     visible:
@@ -29,7 +29,7 @@ appId: "com.example.app"
 - assertNotVisible:
     id: "spinner"
 - tapOn:
-    point: "50.0%,50.0%"
+    point: "50%,50%"
 - pressKey: "Home"
 # unsupported: rotate landscape-left
 - setLocation:

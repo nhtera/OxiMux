@@ -74,7 +74,9 @@ impl SimulatorPanel {
     pub(super) fn record_panel(&mut self, step: PanelStep, cx: &mut Context<Self>) {
         let (Some(hub), Some(key)) = (self.hub.clone(), self.rec_key(cx)) else { return };
         hub.update(cx, |hub, cx| {
+            let screen = screen_points(hub, &key.1);
             if let Some(recording) = hub.flows_mut().get_mut(&key) {
+                recording.fill_screen(screen);
                 recording.panel(step);
                 cx.emit(HubEvent::Flow);
             }
@@ -103,7 +105,12 @@ impl SimulatorPanel {
             }
             _ => return,
         };
-        self.record_panel(step, cx);
+        // In line with the screen's taps and typing (a tap may still be
+        // reading its element).
+        match self.screen.clone() {
+            Some(screen) => screen.update(cx, |screen, cx| screen.record_step(step, cx)),
+            None => self.record_panel(step, cx),
+        }
     }
 
     /// The chip, while recording: a click stops it.

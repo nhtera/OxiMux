@@ -89,6 +89,11 @@ pub(super) struct Mapping {
 }
 
 impl Mapping {
+    /// The screen in points, as it is turned.
+    pub(super) fn points(self) -> (f64, f64) {
+        (self.points.w, self.points.h)
+    }
+
     pub(super) fn to_screen(self, r: Rect) -> Rect {
         agent::ax_rect_to_display(self.space, self.orientation, self.root, r, Size::new(1.0, 1.0))
     }
@@ -306,8 +311,14 @@ impl ScreenView {
     /// The exact selector of the element at `pt` (display-normalized) in the
     /// tree in hand — what a recording takes for a real iPhone's tap.
     pub(super) fn target_in_cached_tree(&self, pt: (f64, f64), cx: &Context<Self>) -> Option<(oximux_remote_proto::simulator::SimSelectorWire, bool)> {
-        let tree = self.usable_tree(cx)?;
+        // Only a current tree: an old one may be another screen's.
+        let tree = self.usable_tree(cx).filter(|_| self.tree_current(cx))?;
         super::recording::selector_at(&tree.nodes, pt, &|n| tree.map.to_screen(n.frame))
+    }
+
+    /// The screen in points, from the tree in hand.
+    pub(super) fn cached_points(&self, cx: &Context<Self>) -> Option<(f64, f64)> {
+        self.usable_tree(cx).map(|t| t.map.points())
     }
 
     /// Hit-test the tree in hand at the pointer.

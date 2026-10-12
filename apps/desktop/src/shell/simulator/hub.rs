@@ -79,6 +79,9 @@ pub enum HubEvent {
     Crash(DeviceId, oximux_simulator::diag::Crash),
     /// A flow recording started, grew or stopped: the REC chip re-reads.
     Flow,
+    /// Something to tell the user about a worktree's flow recording (it
+    /// ended with the device and was saved).
+    FlowNotice(PathBuf, NoticeKind, String),
 }
 
 pub struct SimulatorHub {
