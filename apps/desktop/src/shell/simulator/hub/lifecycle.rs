@@ -122,6 +122,7 @@ fn new_hub(
         device_state: Default::default(),
         crash_watch: Default::default(),
         recovery: Default::default(),
+        started_at: Default::default(),
     })
 }
 

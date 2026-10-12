@@ -153,6 +153,9 @@ pub struct SimulatorHub {
     crash_watch: crash_watch::CrashWatch,
     /// Blank screens climbing the recovery ladder (see `recovery`).
     recovery: HashMap<DeviceId, recovery::Recovery>,
+    /// When each device's stream was asked to start, until its first
+    /// picture: how long a start (an un-park) takes, logged at debug.
+    started_at: HashMap<DeviceId, Instant>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -781,6 +784,7 @@ impl SimulatorHub {
     }
 
     fn start_session(&mut self, udid: DeviceId, generation: Generation, cx: &mut Context<Self>) {
+        self.started_at.insert(udid.clone(), Instant::now());
         match udid.source() {
             Source::Adb => return self.start_android_session(udid, generation, cx),
             // Never the simulator helper: it would ask CoreSimulator for an
@@ -860,6 +864,16 @@ impl SimulatorHub {
         cx.emit(HubEvent::Changed(udid));
     }
 
+    /// The first picture since `udid`'s stream was asked to start: how long
+    /// that took (`RUST_LOG=oximux_app::shell::simulator=debug`).
+    fn note_first_picture(&mut self, udid: &DeviceId) {
+        if self.started_at.contains_key(udid) && self.session(udid).is_some_and(|s| s.frame_clock().seq > 0)
+            && let Some(at) = self.started_at.remove(udid)
+        {
+            tracing::debug!(%udid, elapsed_ms = at.elapsed().as_millis() as u64, "first picture after the stream started");
+        }
+    }
+
     /// Become the session's sole wake/event consumer and fan out. The wake
     /// closure owns only a channel (never the session), so it cannot keep
     /// the session alive; bursts of frames coalesce into one wake.
@@ -917,6 +931,7 @@ impl SimulatorHub {
                         }
                     }
                     if current {
+                        hub.note_first_picture(&udid);
                         cx.emit(HubEvent::Frame(udid.clone()));
                     }
                 });
