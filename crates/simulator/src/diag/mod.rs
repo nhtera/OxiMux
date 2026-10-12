@@ -11,6 +11,7 @@
 //! (`log show`'s predicate is built here, escaped; `adb logcat` quotes each
 //! word for the device's shell), never through a shell of ours.
 
+pub mod crash_buffer;
 pub mod crashes;
 pub mod logs;
 pub mod markers;

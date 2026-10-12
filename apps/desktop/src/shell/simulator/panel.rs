@@ -93,6 +93,8 @@ pub struct SimulatorPanel {
     pairing: Option<pair_card::PairCard>,
     /// The shown device's last crash, until dismissed or sent.
     crash: Option<(DeviceId, oximux_simulator::diag::Crash)>,
+    /// Every crash a row was raised for (a dismissed one stays gone).
+    crash_ids: std::collections::HashSet<String>,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,
@@ -151,6 +153,7 @@ impl SimulatorPanel {
             attach_error: None,
             pairing: None,
             crash: None,
+            crash_ids: Default::default(),
             theme,
             density,
             typography,

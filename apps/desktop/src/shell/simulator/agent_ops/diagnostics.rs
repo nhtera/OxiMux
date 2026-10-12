@@ -66,7 +66,9 @@ pub(super) async fn crashes(hub: &Entity<SimulatorHub>, udid: &DeviceId, wire: S
         }
         _ => {
             let sim = simctl_ready(hub, udid, cx).await?;
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| SimErrorWire::Unavailable("HOME is not set, so the crash reports cannot be found".into()))?;
             on_own_thread(move || crashes::sim_crashes(&SystemRunner, &home, &sim, since_secs, app.as_deref())).await?
         }
     };
@@ -93,23 +95,33 @@ fn failed(e: DiagError) -> SimErrorWire {
     }
 }
 
-/// A crash as the agent sees it: every word scrubbed.
+/// A crash as the agent sees it: every word scrubbed, and each part
+/// clamped so a reply stays small whatever an app logged.
 pub(crate) fn crash_wire(crash: Crash) -> SimCrashWire {
     SimCrashWire {
-        id: crash.id,
-        time: crash.time,
-        app: crash.app,
-        exception: scrub_text(&crash.exception),
-        reason: scrub_text(&crash.reason),
-        frames: crash.frames.iter().map(|f| scrub_text(f)).collect(),
+        id: clamp(&crash.id, 200),
+        time: clamp(&crash.time, 64),
+        app: clamp(&scrub_text(&crash.app), 256),
+        exception: clamp(&scrub_text(&crash.exception), 512),
+        reason: clamp(&scrub_text(&crash.reason), 2048),
+        frames: crash.frames.iter().map(|f| clamp(&scrub_text(f), 512)).collect(),
     }
 }
 
 fn list_wire(list: CrashList) -> SimCrashListWire {
     SimCrashListWire {
         crashes: list.crashes.into_iter().map(crash_wire).collect(),
-        warnings: list.warnings.iter().map(|w| scrub_text(w)).collect(),
+        warnings: list.warnings.iter().map(|w| clamp(&scrub_text(w), 1024)).collect(),
     }
+}
+
+/// At most `max` bytes of `s` (on a character boundary), `…` when cut.
+pub(crate) fn clamp(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let cut = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+    format!("{}…", &s[..cut])
 }
 
 #[cfg(test)]
@@ -138,9 +150,12 @@ mod tests {
             frames: vec!["com.a.b.Pay.go(Pay.kt:1)".into()],
             pid: Some(1),
         };
-        let wire = crash_wire(crash);
+        let wire = crash_wire(Crash { app: "com.a.b token=abc123secret".into(), ..crash.clone() });
         assert_eq!(wire.reason, "Checkout failed: token=[redacted]");
+        assert_eq!(wire.app, "com.a.b token=[redacted]", "the app's name is scrubbed too");
         assert_eq!(wire.frames, ["com.a.b.Pay.go(Pay.kt:1)"]);
+        let long = crash_wire(Crash { reason: "x".repeat(10_000), ..crash });
+        assert!(long.reason.len() <= 2048 + '…'.len_utf8());
     }
 
     #[test]

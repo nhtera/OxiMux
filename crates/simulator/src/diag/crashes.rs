@@ -2,8 +2,9 @@
 //! macOS's crash reporter, about 20 s after the app dies) and Android's crash
 //! buffer (`logcat -b crash`).
 //!
-//! [`ReportScan`] and [`BufferScan`] are the panel's watchers: their first
-//! look is a baseline, so a crash from before the panel opened never shows.
+//! [`ReportScan`] and [`super::crash_buffer::BufferScan`] are the panel's
+//! watchers: their first look is a baseline, so a crash from before the
+//! panel opened never shows. Android's half is in [`super::crash_buffer`].
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -11,10 +12,9 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use super::logs::{LOG_TIMEOUT, Level, device_now, predicate, sim_args, sim_executable};
+use super::logs::{LOG_TIMEOUT, Level, predicate, sim_args, sim_executable};
 use super::markers::{self, Kind};
 use super::{Crash, DiagResult, FRAMES};
-use crate::android::adb::Adb;
 use crate::runner::Runner;
 use crate::simctl::SimUdid;
 
@@ -48,6 +48,8 @@ pub struct Ips {
     /// The executable's path (a simulator app's runs inside its device).
     pub proc_path: String,
     pub bundle_id: Option<String>,
+    /// When the app died (the report is written later).
+    pub captured: Option<SystemTime>,
     pub crash: Crash,
 }
 
@@ -107,7 +109,37 @@ pub fn parse_ips(text: &str) -> Option<Ips> {
         frames,
         pid: body.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok()),
     };
-    Some(Ips { proc_path: str_of(&body, "procPath").unwrap_or_default(), bundle_id, crash })
+    let captured = str_of(&body, "captureTime").as_deref().and_then(capture_time);
+    Some(Ips { proc_path: str_of(&body, "procPath").unwrap_or_default(), bundle_id, captured, crash })
+}
+
+/// `2026-10-12 15:54:29.8027 +0700` as a time.
+pub fn capture_time(text: &str) -> Option<SystemTime> {
+    let mut words = text.split_whitespace();
+    let (date, clock, zone) = (words.next()?, words.next()?, words.next()?);
+    let mut ymd = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (ymd.next()??, ymd.next()??, ymd.next()??);
+    let mut hms = clock.split(':');
+    let (h, min) = (hms.next()?.parse::<i64>().ok()?, hms.next()?.parse::<i64>().ok()?);
+    let sec = hms.next()?.parse::<f64>().ok()?;
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let zone: i64 = zone.get(1..)?.parse().ok()?;
+    let offset = sign * ((zone / 100) * 3600 + (zone % 100) * 60);
+    // Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
+    // `days_from_civil`).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + h * 3600 + min * 60 - offset;
+    let at = Duration::from_secs_f64(secs as f64 + sec);
+    (secs >= 0).then(|| SystemTime::UNIX_EPOCH + at)
 }
 
 /// The `.ips` files in `dirs` changed at or after `since`, oldest first.
@@ -167,7 +199,8 @@ pub fn sim_crashes(runner: &dyn Runner, home: &Path, udid: &SimUdid, since_secs:
         }
         Err(e) => warnings.push(format!("(the log could not be read for warnings: {e})")),
     }
-    Ok(CrashList { crashes, warnings: newest(warnings) })
+    let (crashes, left_out) = keep_newest(crashes);
+    Ok(CrashList { crashes, warnings: newest(warnings, left_out) })
 }
 
 /// `log show` for every marker over the window.
@@ -233,6 +266,9 @@ fn unreported(crashes: &mut Vec<Crash>, line: &str) {
 #[derive(Debug, Default)]
 pub struct ReportScan {
     seen: Option<HashSet<PathBuf>>,
+    /// When the first look was: a report written after it for a crash
+    /// before it is not news.
+    since: Option<SystemTime>,
 }
 
 impl ReportScan {
@@ -243,8 +279,10 @@ impl ReportScan {
         let all = reports_since(&dirs, SystemTime::UNIX_EPOCH);
         let Some(seen) = &mut self.seen else {
             self.seen = Some(all.into_iter().collect());
+            self.since = Some(SystemTime::now());
             return Vec::new();
         };
+        let since = self.since.unwrap_or(SystemTime::UNIX_EPOCH);
         let mut crashes = Vec::new();
         for path in all {
             if seen.contains(&path) {
@@ -253,7 +291,7 @@ impl ReportScan {
             match read_ips(&path) {
                 Some(ips) => {
                     seen.insert(path);
-                    if ips.is_of(udid) {
+                    if ips.is_of(udid) && ips.captured.is_none_or(|at| at >= since) {
                         crashes.push(ips.crash);
                     }
                 }
@@ -271,186 +309,25 @@ fn age(path: &Path) -> Duration {
     std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok()).unwrap_or_default()
 }
 
-// ---- Android's crash buffer ----
+/// The most crashes a list carries (the newest): a reply stays well inside
+/// the transport's limit whatever the device logged.
+const MAX_CRASHES: usize = 20;
 
-/// One `logcat -v threadtime` line.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogLine<'a> {
-    /// `MM-DD hh:mm:ss.mmm`.
-    pub time: &'a str,
-    pub pid: u32,
-    pub level: char,
-    pub tag: &'a str,
-    pub msg: &'a str,
+/// The newest [`MAX_CRASHES`] of `crashes` (oldest first), and how many
+/// older ones were left out.
+pub(super) fn keep_newest(mut crashes: Vec<Crash>) -> (Vec<Crash>, usize) {
+    let skip = crashes.len().saturating_sub(MAX_CRASHES);
+    crashes.drain(..skip);
+    (crashes, skip)
 }
 
-/// `10-12 15:54:29.797  4321  4321 E AndroidRuntime: FATAL EXCEPTION: main`.
-pub fn parse_threadtime(line: &str) -> Option<LogLine<'_>> {
-    let time = line.get(..18)?;
-    let rest = line.get(18..)?.trim_start();
-    let (pid, rest) = rest.split_once(char::is_whitespace)?;
-    let (_tid, rest) = rest.trim_start().split_once(char::is_whitespace)?;
-    let rest = rest.trim_start();
-    let level = rest.chars().next()?;
-    let (tag, msg) = rest.get(1..)?.split_once(": ")?;
-    Some(LogLine { time, pid: pid.parse().ok()?, level, tag: tag.trim(), msg })
-}
-
-/// `pid 4321 (com.example.app)` at the end of a fatal signal line.
-fn signal_process(msg: &str) -> Option<(u32, String)> {
-    let at = msg.rfind("pid ")?;
-    let (pid, name) = msg[at + 4..].split_once(' ')?;
-    let name = name.trim().strip_prefix('(')?.strip_suffix(')')?;
-    Some((pid.parse().ok()?, name.to_owned()))
-}
-
-/// The crashes in a `logcat -b crash -v threadtime` dump: Java/Kotlin
-/// exceptions and native signals, oldest first.
-pub fn parse_crash_buffer(text: &str) -> Vec<Crash> {
-    let mut crashes: Vec<Crash> = Vec::new();
-    // The crash being read, and how its lines are read.
-    let mut open: Option<(usize, Reading)> = None;
-    for line in text.lines().filter_map(parse_threadtime) {
-        let msg = line.msg.trim_end();
-        // `FATAL EXCEPTION: main`, or `*** FATAL EXCEPTION IN SYSTEM PROCESS`.
-        if line.tag == "AndroidRuntime" && msg.contains("FATAL EXCEPTION") {
-            crashes.push(Crash { id: String::new(), time: line.time.into(), app: String::new(), exception: String::new(), reason: String::new(), frames: Vec::new(), pid: Some(line.pid) });
-            open = Some((crashes.len() - 1, Reading::Java));
-            continue;
-        }
-        if let Some(signal) = msg.split_once("Fatal signal ").map(|(_, s)| s) {
-            let (pid, app) = signal_process(msg).unzip();
-            let name = signal.split_once('(').and_then(|(_, s)| s.split_once(')')).map(|(s, _)| s.to_owned());
-            crashes.push(Crash {
-                id: String::new(),
-                time: line.time.into(),
-                app: app.unwrap_or_default(),
-                exception: name.unwrap_or_else(|| "signal".into()),
-                reason: format!("signal {}", signal.split(" in tid").next().unwrap_or(signal)),
-                frames: Vec::new(),
-                pid: pid.or(Some(line.pid)),
-            });
-            open = Some((crashes.len() - 1, Reading::Native));
-            continue;
-        }
-        let Some((at, reading)) = open else { continue };
-        let crash = &mut crashes[at];
-        let text = msg.trim();
-        if reading == Reading::Native {
-            // debuggerd names the process it dumps: another one's lines are
-            // not this crash's.
-            let dumped = text.strip_prefix("pid: ").and_then(|t| t.split(',').next()).and_then(|p| p.trim().parse::<u32>().ok());
-            if line.tag == "DEBUG" && dumped.is_some_and(|p| Some(p) != crash.pid) {
-                open = None;
-                continue;
-            }
-            // `#00 pc 000000000004e1a8  /apex/…/libc.so (abort+164)`.
-            if line.tag == "DEBUG" && text.starts_with('#') && text.contains(" pc ") && crash.frames.len() < FRAMES {
-                crash.frames.push(text.split_whitespace().skip(3).collect::<Vec<_>>().join(" "));
-            }
-            continue;
-        }
-        if line.tag != "AndroidRuntime" || Some(line.pid) != crash.pid {
-            open = None;
-            continue;
-        }
-        if reading == Reading::JavaCause {
-            continue;
-        }
-        if let Some(process) = text.strip_prefix("Process: ") {
-            crash.app = process.split(',').next().unwrap_or(process).trim().to_owned();
-        } else if let Some(frame) = text.strip_prefix("at ") {
-            if crash.frames.len() < FRAMES && !crash.exception.is_empty() {
-                crash.frames.push(frame.to_owned());
-            }
-        } else if crash.exception.is_empty() {
-            let (exception, reason) = text.split_once(": ").unwrap_or((text, ""));
-            crash.exception = exception.to_owned();
-            crash.reason = reason.to_owned();
-        } else if text.starts_with("Caused by: ") || text.starts_with("... ") {
-            // The first exception's own frames are enough.
-            open = Some((at, Reading::JavaCause));
-        }
-    }
-    // The process and the millisecond: never the frames, which a native
-    // crash's backtrace adds lines later (a read in between would give the
-    // same crash a second id).
-    for crash in &mut crashes {
-        crash.id = format!("{}@{}", crash.pid.unwrap_or(0), crash.time);
-    }
-    crashes
-}
-
-/// How a crash's following lines are read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reading {
-    /// A Java/Kotlin exception: its message, then its `at` frames.
-    Java,
-    /// Its causes, which add nothing to the summary.
-    JavaCause,
-    /// A native signal: frames from debuggerd's backtrace.
-    Native,
-}
-
-/// The apps the user installed on an Android device (`pm list packages -3`):
-/// a crash of anything else is the system's.
-pub fn user_apps(adb: &Adb, serial: &str) -> crate::Result<HashSet<String>> {
-    let out = adb.shell(serial, &["pm", "list", "packages", "-3"], Duration::from_secs(10))?;
-    Ok(out.lines().filter_map(|l| l.trim().strip_prefix("package:")).map(str::to_owned).collect())
-}
-
-/// `app`'s crash: its package, or one of its processes (`com.x:remote`).
-pub fn is_app(crash: &Crash, app: &str) -> bool {
-    crash.app == app || crash.app.strip_prefix(app).is_some_and(|rest| rest.starts_with(':'))
-}
-
-/// `logcat -d` of `buffers` from the device's `start` (epoch seconds).
-fn dump(adb: &Adb, serial: &str, buffers: &str, start: u64) -> crate::Result<String> {
-    adb.logcat(serial, &["-d", "-b", buffers, "-v", "threadtime", "-T", &format!("{start}.000")], LOG_TIMEOUT)
-}
-
-/// An Android device's crashes and warnings over the last `since_secs`.
-pub fn android_crashes(adb: &Adb, serial: &str, since_secs: u32, app: Option<&str>) -> DiagResult<CrashList> {
-    let start = device_now(adb, serial)?.saturating_sub(u64::from(since_secs));
-    let mut seen = HashSet::new();
-    let crashes = parse_crash_buffer(&dump(adb, serial, "crash", start)?)
-        .into_iter()
-        .filter(|c| app.is_none_or(|a| is_app(c, a)) && seen.insert(c.id.clone()))
-        .collect();
-    let warnings = dump(adb, serial, "main,system", start)?
-        .lines()
-        .filter(|l| markers::classify(l) == Some(Kind::Warning) && app.is_none_or(|a| l.contains(a)))
-        .map(str::to_owned)
-        .collect();
-    Ok(CrashList { crashes, warnings: newest(warnings) })
-}
-
-/// The panel's watch on an Android device's crash buffer: crashes not in
-/// the buffer at the first look.
-#[derive(Debug, Default)]
-pub struct BufferScan {
-    seen: Option<HashSet<String>>,
-}
-
-impl BufferScan {
-    /// New crashes since the last call; the first call only takes note.
-    pub fn poll(&mut self, adb: &Adb, serial: &str) -> crate::Result<Vec<Crash>> {
-        let text = adb.logcat(serial, &["-d", "-b", "crash", "-v", "threadtime", "-t", "500"], Duration::from_secs(10))?;
-        Ok(self.take(parse_crash_buffer(&text)))
-    }
-
-    fn take(&mut self, crashes: Vec<Crash>) -> Vec<Crash> {
-        let Some(seen) = &mut self.seen else {
-            self.seen = Some(crashes.into_iter().map(|c| c.id).collect());
-            return Vec::new();
-        };
-        crashes.into_iter().filter(|c| seen.insert(c.id.clone())).collect()
-    }
-}
-
-fn newest(mut lines: Vec<String>) -> Vec<String> {
+/// The newest warnings, then a note when crashes were left out.
+pub(super) fn newest(mut lines: Vec<String>, crashes_left_out: usize) -> Vec<String> {
     let skip = lines.len().saturating_sub(MAX_WARNINGS);
     lines.drain(..skip);
+    if crashes_left_out > 0 {
+        lines.push(format!("({crashes_left_out} older crashes left out: narrow --since or add --app)"));
+    }
     lines
 }
 

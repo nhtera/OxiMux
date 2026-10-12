@@ -1,4 +1,6 @@
 use super::*;
+use crate::android::adb::Adb;
+use crate::diag::crash_buffer::*;
 use crate::runner::{CmdOutput, ScriptedRunner};
 
 const SWIFT_TRAP: &str = include_str!("../../tests/fixtures/crash/swift_trap.ips");
@@ -74,14 +76,45 @@ fn the_report_watch_ignores_what_was_there_first() {
     assert!(scan.poll(home.path(), UDID).is_empty(), "the first look is a baseline");
     assert!(scan.poll(home.path(), UDID).is_empty());
     let dir = home.path().join("Library/Logs/DiagnosticReports");
+    // A report that lands now for a crash from before the first look.
+    std::fs::write(dir.join("Late.ips"), SWIFT_TRAP.replace("B8E1C770", "CCCCCCCC")).unwrap();
+    // Reports of crashes after it (the fixtures' times are in 2026).
+    let now = now_capture();
     std::fs::write(dir.join("Half.ips"), "{\"incident_id\":").unwrap();
-    std::fs::write(dir.join("Shop-1.ips"), UNCAUGHT).unwrap();
+    std::fs::write(dir.join("Shop-1.ips"), UNCAUGHT.replace("2026-10-12 16:00:50.1000 +0700", &now)).unwrap();
     let new = scan.poll(home.path(), UDID);
     assert_eq!(new.iter().map(|c| c.app.as_str()).collect::<Vec<_>>(), ["com.example.shop"]);
     assert!(scan.poll(home.path(), UDID).is_empty(), "each report once");
     // The half-written one completes: it shows then.
-    std::fs::write(dir.join("Half.ips"), SWIFT_TRAP.replace("B8E1C770", "BBBBBBBB")).unwrap();
+    std::fs::write(dir.join("Half.ips"), SWIFT_TRAP.replace("B8E1C770", "BBBBBBBB").replace("2026-10-12 15:54:29.8027 +0700", &now)).unwrap();
     assert_eq!(scan.poll(home.path(), UDID).len(), 1);
+}
+
+/// This moment as an `.ips` capture time, a second ahead (in UTC).
+fn now_capture() -> String {
+    let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64 + 1;
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil from days (Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.0000 +0000", rest / 3600, rest % 3600 / 60, rest % 60)
+}
+
+#[test]
+fn a_capture_time_reads_as_its_moment() {
+    let at = capture_time("2026-10-12 15:54:29.8027 +0700").unwrap();
+    let secs = at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64();
+    // 2026-10-12 08:54:29.8027 UTC.
+    assert!((secs - 1_791_795_269.802_7).abs() < 0.001, "{secs}");
+    assert_eq!(capture_time("2026-10-12 08:54:29 +0000"), Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_795_269)));
+    assert_eq!(capture_time("yesterday"), None);
 }
 
 #[test]
@@ -200,16 +233,71 @@ fn the_buffer_watch_ignores_what_was_there_first() {
 
 #[test]
 fn android_crashes_read_both_buffers_from_the_devices_clock() {
+    let anrs = "10-12 16:07:00.000  900  950 E ActivityManager: ANR in com.example.app (com.example.app/.Main)\n\
+                10-12 16:07:01.000  900  950 E ActivityManager: ANR in com.example.app.other (x)\n\
+                10-12 16:07:02.000  900  950 E ActivityManager: ANR in com.example.app:remote (y)\n";
     let runner = ScriptedRunner::default()
         .expect("adb -s S shell date +%s", CmdOutput::ok("1760000600\n"))
-        .expect("adb -s S logcat -d -b crash -v threadtime -T 1760000000.000", CmdOutput::ok(LOGCAT))
+        .expect("adb -s S logcat -d -v threadtime -T 1760000000.000 -b crash", CmdOutput::ok(LOGCAT))
+        .expect("adb -s S logcat -d -v threadtime -T 1760000000.000 -b system", CmdOutput::ok(anrs))
+        .expect("adb -s S shell pm list packages -U com.example.app", CmdOutput::ok("package:com.example.app uid:10123\n"))
         .expect(
-            "adb -s S logcat -d -b main,system -v threadtime -T 1760000000.000",
-            CmdOutput::ok("10-12 16:07:00.000  900  950 E ActivityManager: ANR in com.example.app (com.example.app/.Main)\n10-12 16:07:01.000  900  950 E ActivityManager: ANR in com.other\n"),
+            "adb -s S logcat -d -v threadtime -T 1760000000.000 -b main --uid=10123",
+            CmdOutput::ok("10-12 16:07:03.000 4321 4400 W ReactNativeJS: Possible Unhandled Promise Rejection (id: 0):\n"),
         );
     let adb = Adb::new(&runner, Path::new("adb"));
     let list = android_crashes(&adb, "S", 600, Some("com.example.app")).unwrap();
     assert_eq!(list.crashes.len(), 1);
     assert_eq!(list.crashes[0].app, "com.example.app");
-    assert_eq!(list.warnings.len(), 1, "{:?}", list.warnings);
+    // Its own ANR and its process's, never a look-alike package's; and what
+    // it wrote itself.
+    assert_eq!(list.warnings.len(), 3, "{:?}", list.warnings);
+    assert!(!list.warnings.iter().any(|w| w.contains("com.example.app.other")));
+    assert!(list.warnings[2].contains("Unhandled Promise Rejection"));
+}
+
+#[test]
+fn a_reply_keeps_the_newest_crashes_and_says_so() {
+    let crashes: Vec<Crash> = (0..25).map(|i| Crash { id: i.to_string(), ..parse_ips(SWIFT_TRAP).unwrap().crash }).collect();
+    let (kept, left_out) = keep_newest(crashes);
+    assert_eq!((kept.len(), left_out, kept[0].id.as_str()), (20, 5, "5"));
+    assert!(newest(vec![], left_out)[0].contains("5 older crashes left out"));
+}
+
+#[test]
+fn a_crash_named_late_is_announced_once_its_app_is_known() {
+    let head = "10-12 16:09:00.000  7000  7000 E AndroidRuntime: FATAL EXCEPTION: main\n";
+    let mut scan = BufferScan::default();
+    assert!(scan.take(vec![]).is_empty(), "baseline");
+    assert!(scan.take(parse_crash_buffer(head)).is_empty(), "no Process: line yet");
+    let named = format!("{head}10-12 16:09:00.000  7000  7000 E AndroidRuntime: Process: com.a.b, PID: 7000\n10-12 16:09:00.000  7000  7000 E AndroidRuntime: java.lang.Error: x\n");
+    assert_eq!(scan.take(parse_crash_buffer(&named)).len(), 1);
+    // A frame arriving later updates the announced crash.
+    let framed = format!("{named}10-12 16:09:00.000  7000  7000 E AndroidRuntime: \tat com.a.b.Main.go(Main.kt:1)\n");
+    let update = scan.take(parse_crash_buffer(&framed));
+    assert_eq!(update.len(), 1);
+    assert_eq!(update[0].frames.len(), 1);
+    assert!(scan.take(parse_crash_buffer(&framed)).is_empty());
+}
+
+#[test]
+fn a_baseline_crash_finishing_later_is_never_announced() {
+    let head = "10-12 16:09:00.000  7000  7000 E AndroidRuntime: FATAL EXCEPTION: main\n";
+    let mut scan = BufferScan::default();
+    assert!(scan.take(parse_crash_buffer(head)).is_empty(), "baseline");
+    let named = format!("{head}10-12 16:09:00.000  7000  7000 E AndroidRuntime: Process: com.a.b, PID: 7000\n10-12 16:09:00.000  7000  7000 E AndroidRuntime: \tat x.y(Z.kt:1)\n");
+    assert!(scan.take(parse_crash_buffer(&named)).is_empty());
+}
+
+#[test]
+fn two_java_crashes_interleaved_keep_their_own_lines() {
+    let text = "10-12 16:10:00.000  1000  1000 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                10-12 16:10:00.000  2000  2000 E AndroidRuntime: FATAL EXCEPTION: main\n\
+                10-12 16:10:00.001  1000  1000 E AndroidRuntime: Process: com.one, PID: 1000\n\
+                10-12 16:10:00.001  2000  2000 E AndroidRuntime: Process: com.two, PID: 2000\n\
+                10-12 16:10:00.002  1000  1000 E AndroidRuntime: java.lang.Error: one\n\
+                10-12 16:10:00.002  2000  2000 E AndroidRuntime: java.lang.Error: two\n\
+                10-12 16:10:00.003  1000  1000 E AndroidRuntime: \tat one.A(A.kt:1)\n";
+    let crashes = parse_crash_buffer(text);
+    assert_eq!(crashes.iter().map(|c| (c.app.as_str(), c.reason.as_str(), c.frames.len())).collect::<Vec<_>>(), [("com.one", "one", 1), ("com.two", "two", 0)]);
 }

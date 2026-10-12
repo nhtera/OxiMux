@@ -6,7 +6,7 @@
 /// live token; an app's log can print one too. Redacts (a) the value of
 /// every currently-set `*_API_KEY` / `*_TOKEN` / `*_SECRET` env var, (b)
 /// known secret-shaped tokens (`sk-ant-…`, `sk-…`, a JWT, an AWS access key,
-/// a `Bearer` credential) and (c) the value of a `token=`, `key=`, `code=`
+/// a `Bearer`/`Basic` credential) and (c) the value of a `token=`, `key=`, `code=`
 /// (and the like) parameter, or of such a field in JSON (`"access_token":
 /// "…"`) or a `token: …` line.
 pub fn scrub_text(text: &str) -> String {
@@ -26,7 +26,7 @@ pub fn scrub_text(text: &str) -> String {
     }
     redact_prefixed(&mut out, "sk-ant-");
     redact_sk_keys(&mut out);
-    redact_prefixed(&mut out, "Bearer ");
+    redact_auth_schemes(&mut out);
     redact_jwts(&mut out);
     redact_aws_keys(&mut out);
     redact_secret_params(&mut out);
@@ -88,18 +88,25 @@ fn redact_aws_keys(text: &mut String) {
 /// or one ending like them (`access_token`, `apiKey`, `client-secret`).
 fn names_a_secret(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    const EXACT: [&str; 9] = ["key", "token", "code", "secret", "password", "passwd", "auth", "sig", "signature"];
-    const ENDS: [&str; 7] = ["_key", "-key", "apikey", "token", "_secret", "-secret", "password"];
-    EXACT.contains(&name.as_str()) || ENDS.iter().any(|end| name.ends_with(end))
+    const EXACT: [&str; 6] = ["key", "code", "auth", "sig", "signature", "authorization"];
+    const ENDS: [&str; 3] = ["_key", "-key", "apikey"];
+    names_a_credential(&name) || EXACT.contains(&name.as_str()) || ENDS.iter().any(|end| name.ends_with(end))
 }
 
-/// A value worth hiding under a secret-like name: anything for a password
-/// or a secret; otherwise something long with a digit in it that is not an
-/// `UPPER_SNAKE` constant (`code=1`, `key=hasOnboarded` and
-/// `code=EXC_I386_INVOP` stay).
-fn looks_secret(name: &str, value: &str) -> bool {
+/// A name that says its value is a credential, whatever the value looks like
+/// (`access_token`, `client_secret`, `password`, `api_key`).
+fn names_a_credential(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    if name.ends_with("password") || name.ends_with("passwd") || name.ends_with("secret") {
+    const ENDS: [&str; 7] = ["token", "secret", "password", "passwd", "api_key", "api-key", "apikey"];
+    ENDS.iter().any(|end| name.ends_with(end))
+}
+
+/// A value worth hiding under a secret-like name: anything under a
+/// credential's name; under a looser one (`code`, `key`, `sig`), something
+/// long with a digit in it that is not an `UPPER_SNAKE` constant (`code=1`,
+/// `key=hasOnboarded` and `code=EXC_I386_INVOP` stay).
+fn looks_secret(name: &str, value: &str) -> bool {
+    if names_a_credential(name) {
         return !value.is_empty();
     }
     value.len() >= 8
@@ -147,6 +154,30 @@ fn redact_secret_params(text: &mut String) {
             from = at + REDACTED.len();
         } else {
             from = sep + 1;
+        }
+    }
+}
+
+/// The credential after an HTTP auth scheme, in any case: `Bearer <token>`,
+/// `basic <base64>` (the scheme stays, so the line still reads).
+fn redact_auth_schemes(text: &mut String) {
+    for scheme in ["bearer ", "basic "] {
+        let mut from = 0;
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(found) = lower[from..].find(scheme) else { break };
+            let pos = from + found;
+            let bytes = text.as_bytes();
+            let word_start = pos == 0 || !bytes[pos - 1].is_ascii_alphanumeric();
+            let at = pos + scheme.len();
+            let len = bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')).count();
+            // `basic usage` is prose: a credential is long, and base64 has a
+            // digit, a capital or padding somewhere.
+            let credential = len >= 8 && bytes[at..at + len].iter().any(|b| b.is_ascii_digit() || b.is_ascii_uppercase() || *b == b'=');
+            if word_start && credential && &text[at..at + len] != REDACTED {
+                text.replace_range(at..at + len, REDACTED);
+            }
+            from = at;
         }
     }
 }
@@ -211,7 +242,10 @@ mod tests {
         let clean = scrub_text(&format!("auth header {jwt} rejected"));
         assert_eq!(clean, "auth header [redacted] rejected");
         assert_eq!(scrub_text("key AKIAIOSFODNN7EXAMPLE, done"), "key [redacted], done");
-        assert_eq!(scrub_text("Authorization: Bearer abc.def.ghi"), "Authorization: [redacted]");
+        assert_eq!(scrub_text("Authorization: Bearer abc.def.ghi1"), "Authorization: Bearer [redacted]");
+        assert_eq!(scrub_text("authorization: bearer ya29.a0AfB_byC"), "authorization: bearer [redacted]");
+        assert_eq!(scrub_text("Authorization: Basic dXNlcjpwYXNzd29yZA=="), "Authorization: Basic [redacted]");
+        assert_eq!(scrub_text("the basic usage is shown below"), "the basic usage is shown below");
     }
 
     #[test]
@@ -231,6 +265,9 @@ mod tests {
             r#"<-- 200 {"access_token":"[redacted]","refresh_token": "[redacted]","expires_in":3599}"#
         );
         assert_eq!(scrub_text(r#"{"password":"x"}"#), r#"{"password":"[redacted]"}"#);
+        // A credential's name hides any value, whatever it looks like.
+        assert_eq!(scrub_text("access_token=abcdefghijklmnopqrstuvwxyz"), "access_token=[redacted]");
+        assert_eq!(scrub_text("refresh_token=ABCDEF12345"), "refresh_token=[redacted]");
         assert_eq!(scrub_text("auth token: 9f8e7d6c5b4a"), "auth token: [redacted]");
     }
 

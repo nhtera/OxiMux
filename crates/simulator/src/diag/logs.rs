@@ -151,12 +151,15 @@ pub fn sim_logs(runner: &dyn Runner, udid: &SimUdid, query: &LogQuery) -> DiagRe
     let predicate = predicate(process.as_deref(), query.level, query.grep.as_deref());
     let args = sim_args(udid, query.since_secs, query.level, predicate.as_deref());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = runner.run("xcrun", &args, None, LOG_TIMEOUT)?;
-    let out = simctl::require_success("log show", Some(udid.as_str()), out)?;
-    let text = out.stdout_str();
-    // `log show` opens with what it filtered on and a column header.
-    let lines = text.lines().filter(|l| !l.starts_with("Filtering the log data") && !l.starts_with("Timestamp "));
-    Ok(tail(lines, query.lines as usize))
+    let mut tail = Tail::new(query.lines as usize);
+    let out = runner.run_lines("xcrun", &args, LOG_TIMEOUT, &mut |line| {
+        // `log show` opens with what it filtered on and a column header.
+        if !line.starts_with("Filtering the log data") && !line.starts_with("Timestamp ") {
+            tail.push(line);
+        }
+    })?;
+    simctl::require_success("log show", Some(udid.as_str()), out)?;
+    Ok(tail.finish())
 }
 
 /// `logcat`'s priority filter.
@@ -182,7 +185,7 @@ pub fn logcat_args(start: u64, only: Option<Only>, level: Level) -> Vec<String> 
 }
 
 /// Android's first app uid: below it, uids are the system's, shared.
-const FIRST_APP_UID: u32 = 10_000;
+pub(super) const FIRST_APP_UID: u32 = 10_000;
 
 /// Whose lines `logcat` keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,12 +226,19 @@ pub fn app_pid(adb: &Adb, serial: &str, package: &str) -> Result<Option<u32>> {
 /// An Android device's log for `query`.
 pub fn android_logs(adb: &Adb, serial: &str, query: &LogQuery) -> DiagResult<LogLines> {
     let start = device_now(adb, serial)?.saturating_sub(u64::from(query.since_secs));
-    let read = |only| -> Result<String> {
+    let grep = query.grep.as_deref().map(str::to_lowercase);
+    let read = |only| -> Result<LogLines> {
         let args = logcat_args(start, only, query.level);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        adb.logcat(serial, &args, LOG_TIMEOUT)
+        let mut tail = Tail::new(query.lines as usize);
+        adb.logcat_lines(serial, &args, LOG_TIMEOUT, &mut |line| {
+            if !line.starts_with("--------- beginning of") && grep.as_deref().is_none_or(|g| line.to_lowercase().contains(g)) {
+                tail.push(line);
+            }
+        })?;
+        Ok(tail.finish())
     };
-    let text = match query.app.as_deref() {
+    Ok(match query.app.as_deref() {
         None => read(None)?,
         Some(app) => {
             if !is_package(app) {
@@ -252,34 +262,48 @@ pub fn android_logs(adb: &Adb, serial: &str, query: &LogQuery) -> DiagResult<Log
                 // Or an Android without `--uid`: the running process only.
                 None => match app_pid(adb, serial, app)? {
                     Some(pid) => read(Some(Only::Pid(pid)))?,
-                    None => String::new(),
+                    None => LogLines::default(),
                 },
             }
         }
-    };
-    let grep = query.grep.as_deref().map(str::to_lowercase);
-    let lines = text
-        .lines()
-        .filter(|l| !l.starts_with("--------- beginning of"))
-        .filter(|l| grep.as_deref().is_none_or(|g| l.to_lowercase().contains(g)));
-    Ok(tail(lines, query.lines as usize))
+    })
 }
 
-/// The last `max` lines, then the newest that fit in [`MAX_BYTES`].
-pub fn tail<'a>(lines: impl Iterator<Item = &'a str>, max: usize) -> LogLines {
-    let all: Vec<&str> = lines.collect();
-    let mut kept: Vec<String> = Vec::new();
-    let mut bytes = 0;
-    for line in all.iter().rev().take(max) {
-        bytes += line.len() + 1;
-        if bytes > MAX_BYTES {
-            break;
-        }
-        kept.push((*line).to_owned());
+/// The newest lines of a stream: at most `max` of them, within
+/// [`MAX_BYTES`]. Older ones are dropped as newer arrive, so a long output
+/// costs no more memory than what is kept.
+pub struct Tail {
+    max: usize,
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+    dropped: bool,
+}
+
+impl Tail {
+    pub fn new(max: usize) -> Self {
+        Self { max, lines: Default::default(), bytes: 0, dropped: false }
     }
-    let truncated = kept.len() < all.len();
-    kept.reverse();
-    LogLines { lines: kept, truncated }
+
+    pub fn push(&mut self, line: &str) {
+        self.lines.push_back(line.to_owned());
+        self.bytes += line.len() + 1;
+        while self.lines.len() > self.max || self.bytes > MAX_BYTES {
+            let Some(old) = self.lines.pop_front() else { break };
+            self.bytes -= old.len() + 1;
+            self.dropped = true;
+        }
+    }
+
+    pub fn finish(self) -> LogLines {
+        LogLines { lines: self.lines.into(), truncated: self.dropped }
+    }
+}
+
+/// [`Tail`] over lines already in hand.
+pub fn tail<'a>(lines: impl Iterator<Item = &'a str>, max: usize) -> LogLines {
+    let mut tail = Tail::new(max);
+    lines.for_each(|l| tail.push(l));
+    tail.finish()
 }
 
 /// `30s`, `5m`, `1h` (or bare seconds) as seconds.

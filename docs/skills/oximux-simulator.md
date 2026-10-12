@@ -247,7 +247,8 @@ oximux sim crashes --app com.example.app --since 1h
   short of a crash (an ANR, an unhandled promise rejection). A simulator's
   crash report is written a few seconds (up to ~20 s) after the app dies;
   until then `crashes` lists the crash without frames and says so — run it
-  again for them.
+  again for them. At most the newest 20 crashes come back (a note says how
+  many older ones were left out).
 - A real Android phone is read one app at a time: `--app` is required for
   both (exit 2 without it). A real iPhone has neither (exit 5).
 - Secret-looking values (API keys, tokens, `token=…`) are replaced with

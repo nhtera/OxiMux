@@ -22,7 +22,8 @@ use std::time::Duration;
 use gpui::{App, WeakEntity};
 use oximux_simulator::android::adb::Adb;
 use oximux_simulator::diag::Crash;
-use oximux_simulator::diag::crashes::{self, BufferScan, ReportScan};
+use oximux_simulator::diag::crash_buffer::{self, BufferScan};
+use oximux_simulator::diag::crashes::ReportScan;
 use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::{DeviceId, Source};
 
@@ -105,9 +106,9 @@ fn look(job: &Job, home: &std::path::Path) -> Vec<Crash> {
             }
             let mut apps = job.launched.clone();
             if !job.udid.is_physical() {
-                apps.extend(crashes::user_apps(&adb, serial).unwrap_or_default());
+                apps.extend(crash_buffer::user_apps(&adb, serial).unwrap_or_default());
             }
-            new.into_iter().filter(|c| apps.iter().any(|app| crashes::is_app(c, app))).collect()
+            new.into_iter().filter(|c| apps.iter().any(|app| crash_buffer::is_app(c, app))).collect()
         }
         (Scan::Android(_), None) => Vec::new(),
     }
@@ -127,8 +128,11 @@ pub(super) fn spawn_crash_watch(cx: &mut App, hub: WeakEntity<SimulatorHub>) {
                 .background_executor()
                 .spawn(async move { jobs.iter().flat_map(|job| look(job, &home).into_iter().map(|c| (job.udid.clone(), c))).collect::<Vec<_>>() })
                 .await;
-            let alive = hub.update(cx, |_, cx| {
-                for (udid, crash) in found {
+            let alive = hub.update(cx, |hub, cx| {
+                // Only a device still shown: it may have been hidden, or its
+                // stream ended, while it was looked at.
+                let shown = hub.registry.shown_live();
+                for (udid, crash) in found.into_iter().filter(|(udid, _)| shown.contains(udid)) {
                     cx.emit(HubEvent::Crash(udid, crash));
                 }
             });

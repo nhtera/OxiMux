@@ -11,17 +11,22 @@ use oximux_simulator::DeviceId;
 use oximux_simulator::diag::Crash;
 
 use super::SimulatorPanel;
+use crate::shell::simulator::agent_ops::clamp;
 use crate::shell::simulator::annotate::export;
 
 /// The most a summary takes in the agent's composer.
 const MAX_SUMMARY: usize = 4096;
 
 impl SimulatorPanel {
-    /// A crash on `udid`: the newest replaces any shown before. Scrubbed
-    /// once, here, for the row and whatever is sent.
+    /// A crash on `udid`: the newest replaces any shown before; the same
+    /// crash again (its frames arrived) updates its row, and never brings
+    /// back one dismissed or sent. Scrubbed once, here, for the row and
+    /// whatever is sent.
     pub(super) fn crashed(&mut self, udid: &DeviceId, crash: &Crash, cx: &mut Context<Self>) {
-        if self.device(cx).as_ref() == Some(udid) {
+        let showing = self.crash.as_ref().is_some_and(|(_, shown)| shown.id == crash.id);
+        if self.device(cx).as_ref() == Some(udid) && (showing || self.crash_ids.insert(crash.id.clone())) {
             let crash = Crash {
+                app: clamp(&scrub_text(&crash.app), 256),
                 exception: clamp(&scrub_text(&crash.exception), 300),
                 reason: clamp(&scrub_text(&crash.reason), 1500),
                 frames: crash.frames.iter().map(|f| clamp(&scrub_text(f), 200)).collect(),
@@ -76,15 +81,6 @@ impl SimulatorPanel {
         })
         .detach();
     }
-}
-
-/// At most `max` bytes of `s` (on a character boundary), `…` when cut.
-fn clamp(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_owned();
-    }
-    let cut = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-    format!("{}…", &s[..cut])
 }
 
 /// What the agent reads: the app, the exception, the reason and the frames

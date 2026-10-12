@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use oximux_remote_proto::simulator::SimErrorWire;
 use oximux_simulator::android::adb::Adb;
-use oximux_simulator::diag::crashes::{self, CrashList};
+use oximux_simulator::diag::crash_buffer;
+use oximux_simulator::diag::crashes::CrashList;
 use oximux_simulator::diag::logs::{self, LogLines, LogQuery};
 use oximux_simulator::diag::DiagResult;
 use oximux_simulator::runner::SystemRunner;
@@ -69,7 +70,7 @@ impl Device {
 
     /// The device's crashes (and warnings) over the last `since_secs`.
     pub(super) fn crashes(&self, since_secs: u32, app: Option<&str>) -> DiagResult<CrashList> {
-        crashes::android_crashes(&Adb::new(&SystemRunner, &self.adb), &self.serial, since_secs, app)
+        crash_buffer::android_crashes(&Adb::new(&SystemRunner, &self.adb), &self.serial, since_secs, app)
     }
 
     /// Install (or replace) the APK at `path`.
