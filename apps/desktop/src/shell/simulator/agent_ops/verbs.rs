@@ -31,7 +31,8 @@ use super::Target;
 use super::ax_lookup::{self, HELPER_TIMEOUT, Shown, off_screen, point_to_portrait, scale, screen};
 use super::guards::{Verb, check_bundle_id, check_text, is_input, is_web_url, unwrap};
 use super::settle::{self, Acted};
-use crate::shell::simulator::hub::{InstallAnswer, SimulatorHub, Wake, home_button, paste_now};
+use super::device_state::confirm;
+use crate::shell::simulator::hub::{AskKind, SimulatorHub, Wake, home_button, paste_now};
 
 /// How long a woken device may take to start streaming: a cold boot of a
 /// shut-down device measured 40-odd seconds on an M-series Mac.
@@ -378,7 +379,7 @@ pub(super) async fn execute(
             // question.
             let device = android_device(hub, udid, cx).await?;
             if udid.is_physical() {
-                confirm_install(hub, udid, name, &apk, target, cx).await?;
+                confirm(hub, udid, name, AskKind::Install { app: file_name(&apk) }, target, cx).await?;
             }
             on_own_thread(move || device.install(&apk)).await?.map(|()| SimReplyWire::Done)
         }
@@ -386,7 +387,7 @@ pub(super) async fn execute(
             let app = super::iphone::device_build(install_path(&path, &target.worktree)?)?;
             // Asked every time, once the phone is reachable (as on Android).
             let device = hub.read_with(cx, |hub, _| super::iphone::Device::reachable(hub, udid))?;
-            confirm_install(hub, udid, name, &app, target, cx).await?;
+            confirm(hub, udid, name, AskKind::Install { app: file_name(&app) }, target, cx).await?;
             let done = on_own_thread(move || device.install(&app)).await?.map(|()| SimReplyWire::Done);
             // The target picker lists the new app next time it opens.
             hub.update(cx, |hub, _| hub.forget_phone_apps(udid));
@@ -403,6 +404,7 @@ pub(super) async fn execute(
             .await?
             .map(|()| SimReplyWire::Done)
         }
+        SimCmdWire::DeviceState(change) => super::device_state::run(hub, udid, name, change, target, cx).await,
         SimCmdWire::Shutdown { force } => {
             let refused = hub
                 .update(cx, |hub, cx| {
@@ -493,38 +495,6 @@ fn simctl_udid(udid: &DeviceId) -> Result<SimUdid, SimErrorWire> {
     udid.sim_udid().ok_or_else(|| SimErrorWire::Unavailable(format!("{udid} is not a simulator")))
 }
 
-/// Ask the user, in the worktree's panel, before an agent installs `app` on
-/// a real device — every time, whatever was allowed before — and wait (up
-/// to `INSTALL_ASK_TTL`) for the answer.
-async fn confirm_install(
-    hub: &Entity<SimulatorHub>,
-    udid: &DeviceId,
-    name: &str,
-    app: &Path,
-    target: &Target,
-    cx: &mut AsyncApp,
-) -> Result<(), SimErrorWire> {
-    let app_name = app.file_name().map_or_else(|| app.display().to_string(), |n| n.to_string_lossy().into_owned());
-    let id = hub.update(cx, |hub, cx| hub.ask_install(udid, &target.worktree, name, &app_name, cx));
-    let (asked, what) = (target.clone(), format!("install {app_name} on {name}"));
-    super::with_root(cx, target, move |root, window, cx| {
-        let ids = (asked.project_id.clone(), asked.workspace_id.clone());
-        root.ask_simulator_consent(&asked.worktree, &asked.label, &what, ids, window, cx);
-    });
-    loop {
-        match hub.update(cx, |hub, _| hub.install_answer(id)) {
-            InstallAnswer::Allowed => return Ok(()),
-            InstallAnswer::Refused => return Err(SimErrorWire::Refused(format!("the user declined installing {app_name} on {name}"))),
-            InstallAnswer::Gone => {
-                return Err(SimErrorWire::Refused(format!(
-                    "the user did not confirm installing {app_name} on {name}; ask them, then retry"
-                )));
-            }
-            InstallAnswer::Pending => cx.background_executor().timer(Duration::from_millis(250)).await,
-        }
-    }
-}
-
 /// Drives a real iPhone whose control is on with whole gestures, in its
 /// queue's turn; `None` for any other device (it takes the touch stream).
 async fn on_iphone(session: &StreamSession, gestures: Vec<Gesture>) -> Option<Out> {
@@ -574,6 +544,10 @@ fn downscale(png: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     small.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// `path` (relative paths are the worktree's) as an installable `.app`

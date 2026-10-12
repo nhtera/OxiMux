@@ -98,7 +98,7 @@ impl SimulatorHub {
         self.devices.iter().find(|d| &d.udid == udid).map_or_else(|| "Simulator".into(), |d| d.name.clone())
     }
 
-    fn notice(&self, udid: &DeviceId, kind: NoticeKind, text: impl Into<String>, cx: &mut Context<Self>) {
+    pub(super) fn notice(&self, udid: &DeviceId, kind: NoticeKind, text: impl Into<String>, cx: &mut Context<Self>) {
         cx.emit(HubEvent::Notice(udid.clone(), kind, text.into()));
     }
 

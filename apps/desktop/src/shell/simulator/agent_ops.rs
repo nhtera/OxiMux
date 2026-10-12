@@ -35,6 +35,7 @@ use crate::workspace_root::WorkspaceRoot;
 mod android;
 mod ax_lookup;
 mod checks;
+mod device_state;
 mod guards;
 mod iphone;
 mod settle;

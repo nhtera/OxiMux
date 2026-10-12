@@ -7,6 +7,7 @@
 mod build_info;
 mod cli;
 mod cli_sim;
+mod cli_sim_state;
 mod client;
 mod client_identity;
 mod commands;
@@ -28,7 +29,7 @@ use cli::{
 use client::Client;
 use oximux_remote_proto::proto::{
     CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
-    SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
+    SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
 
@@ -281,6 +282,9 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         Command::Worktree {
             command: WorktreeCommand::Create { branch: Some(_), .. },
         } => Some((CREATE_WORKTREE_BASE_MIN_VERSION, "worktree create --branch")),
+        // v28: device state (`location`, `appearance`, `privacy`, `push`,
+        // `status-bar`, `erase`). Above the `Sim` arm.
+        Command::Sim { command, .. } if command.is_device_state() => Some((SIMULATOR_DEVICE_STATE_MIN_VERSION, "sim device state")),
         // v27: the verify loop — only a command that uses it (`--settle`,
         // `ax -i`, an @eN ref, `wait`, `assert`). Above the v26 arm, so
         // `button back --settle` asks for v27, and above the `Sim` arm.

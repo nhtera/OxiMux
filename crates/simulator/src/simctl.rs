@@ -243,7 +243,7 @@ fn stderr_of(out: &CmdOutput) -> String {
 /// `out.success()` or the appropriate [`SimError`], recognising `simctl`'s
 /// "Invalid device" phrasing as [`SimError::DeviceNotFound`] rather than a
 /// generic command failure.
-fn require_success(program: &str, udid: Option<&str>, out: CmdOutput) -> Result<CmdOutput> {
+pub(crate) fn require_success(program: &str, udid: Option<&str>, out: CmdOutput) -> Result<CmdOutput> {
     if out.success() {
         return Ok(out);
     }

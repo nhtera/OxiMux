@@ -149,12 +149,17 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// changed, stable `@eN` refs, and `wait`/`assert` in place of sleep-polling.
 /// A v26 host cannot decode them: see [`SIMULATOR_VERIFY_MIN_VERSION`].
 ///
+/// v28: appended **device state** (`SimCmdWire::DeviceState` and the
+/// `simulator_state` types): location, appearance, privacy, push, status bar
+/// and erase, plus the shape of network shaping (served later). A v27 host
+/// cannot decode them: see [`SIMULATOR_DEVICE_STATE_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -241,6 +246,11 @@ pub const SIMULATOR_ANDROID_BUTTONS_MIN_VERSION: u32 = 26;
 /// host. The host answers the v27 errors (`StaleRef`, `AssertFailed`,
 /// `TimedOut`) only to v27 verbs, so an older client never meets one.
 pub const SIMULATOR_VERIFY_MIN_VERSION: u32 = 27;
+
+/// The oldest host that serves the device-state verbs (`sim location`,
+/// `appearance`, `privacy`, `push`, `status-bar`, `erase`). Read by the
+/// **client** and gated on what the command asks for.
+pub const SIMULATOR_DEVICE_STATE_MIN_VERSION: u32 = 28;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the

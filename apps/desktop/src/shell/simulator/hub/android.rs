@@ -163,12 +163,13 @@ impl SimulatorHub {
             return;
         };
         let runner = self.runner.clone();
+        let wipe = self.take_wipe(&udid);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     match &target {
-                        Target::Avd(name) => match devices::boot_avd(runner.as_ref(), &sdk, name, &cancel) {
+                        Target::Avd(name) => match devices::boot_avd(runner.as_ref(), &sdk, name, wipe, &cancel) {
                             Ok(devices::BootOutcome::Booted(_)) => BootResult::Booted,
                             // Someone else started it meanwhile: not ours to shut down.
                             Ok(devices::BootOutcome::AlreadyBooted(_)) => BootResult::AlreadyBooted,
@@ -182,7 +183,18 @@ impl SimulatorHub {
                     }
                 })
                 .await;
-            let _ = this.update(cx, |hub, cx| hub.finish_boot(udid, generation, result, cx));
+            let wiped = wipe.then(|| match &result {
+                BootResult::Booted => Ok(()),
+                BootResult::Cancelled => Err("the wiping boot was cancelled".to_owned()),
+                BootResult::Failed(e) => Err(e.clone()),
+                BootResult::AlreadyBooted => Err("the emulator was already running, so it was not wiped".to_owned()),
+            });
+            let _ = this.update(cx, |hub, cx| {
+                if let Some(wiped) = wiped {
+                    hub.wipe_done(&udid, wiped);
+                }
+                hub.finish_boot(udid, generation, result, cx);
+            });
         })
         .detach();
     }

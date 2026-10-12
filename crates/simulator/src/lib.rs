@@ -49,6 +49,8 @@ pub mod registry;
 pub mod runner;
 pub mod session;
 pub mod simctl;
+pub mod simctl_state;
+pub mod state;
 pub mod stream;
 pub mod video;
 pub mod xcode_app;

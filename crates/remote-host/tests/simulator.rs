@@ -60,6 +60,20 @@ fn a_verify_loop_verb_reaches_the_simulator_as_sent() {
     assert_eq!(*spy.cmds.lock().unwrap(), [cmd]);
 }
 
+/// A device-state change (v28) is forwarded as sent, confined to the
+/// session's worktree like every other verb.
+#[test]
+fn a_device_state_change_reaches_the_simulator_as_sent() {
+    use oximux_remote_proto::simulator::{SimLocationWire, SimStateCmdWire};
+    let spy = Arc::new(Spy::default());
+    let cmd = SimCmdWire::DeviceState(SimStateCmdWire::Location(SimLocationWire::Set { lat: 10.77, lon: 106.7 }));
+    let req = Request::Simulator(SimRequestWire { worktree: Some("/work/other".into()), cmd: cmd.clone() });
+    let got = local(&host(Some(spy.clone())), LocalScope::Session("sess-1".into()), vec![req]);
+    assert_eq!(got, vec![Response::Simulator(Ok(SimReplyWire::Done))]);
+    assert_eq!(*spy.worktrees.lock().unwrap(), ["/work/mine"]);
+    assert_eq!(*spy.cmds.lock().unwrap(), [cmd]);
+}
+
 fn sim(worktree: Option<&str>) -> Request {
     Request::Simulator(SimRequestWire { worktree: worktree.map(Into::into), cmd: SimCmdWire::Screenshot { full: false } })
 }

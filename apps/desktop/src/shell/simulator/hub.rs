@@ -145,6 +145,8 @@ pub struct SimulatorHub {
     snapshots: snapshot::Coalescer<DeviceId, snapshot::Tree>,
     /// Agents' `@eN` refs, per worktree, device and caller.
     refs: oximux_simulator::ax_refs::RefStore,
+    /// Erases in progress and demo-mode status bars (see `device_state`).
+    device_state: device_state::Memo,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -152,16 +154,18 @@ impl EventEmitter<HubEvent> for SimulatorHub {}
 mod agent;
 mod android;
 mod capture;
+mod device_state;
 mod iphone;
 mod iphone_control;
 mod lifecycle;
+mod per_call;
 mod snapshot;
 mod wifi;
 
 pub use agent::Wake;
 pub use wifi::PairStage;
 pub(crate) use wifi::can_submit;
-pub(crate) use agent::InstallAnswer;
+pub(crate) use per_call::{AskKind, PerCallAnswer};
 pub(crate) use android::list_all;
 pub use capture::{HardwareButton, NoticeKind};
 pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};
@@ -615,6 +619,7 @@ impl SimulatorHub {
         // Switching device may have left the old one unattached.
         self.stop_unattached_recordings(cx);
         self.stop_unattached_controls(cx);
+        self.leave_unattached_demo_modes(cx);
         cx.emit(HubEvent::Changed(info.udid.clone()));
         Ok(info)
     }
@@ -663,8 +668,9 @@ impl SimulatorHub {
         self.run(effects, cx);
         // A recording belongs to the device: it ends with its last attachment.
         self.stop_unattached_recordings(cx);
-        // So does an iPhone's control (its runner).
+        // So does an iPhone's control (its runner), and Android's demo mode.
         self.stop_unattached_controls(cx);
+        self.leave_unattached_demo_modes(cx);
         if let Some(udid) = udid {
             cx.emit(HubEvent::Changed(udid));
         }
@@ -679,6 +685,12 @@ impl SimulatorHub {
 
     pub fn reconnect(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         let booted = self.watch.lock().unwrap().is_booted(udid).unwrap_or(true);
+        self.reconnect_as(udid, booted, cx);
+    }
+
+    /// [`Self::reconnect`] when whether `udid` is booted is known better than
+    /// the boot watcher's last poll (just after an erase shut it down).
+    pub(crate) fn reconnect_as(&mut self, udid: &DeviceId, booted: bool, cx: &mut Context<Self>) {
         let effects = self.registry.reconnect(udid, booted);
         self.run(effects, cx);
         cx.emit(HubEvent::Changed(udid.clone()));

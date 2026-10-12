@@ -16,15 +16,17 @@ use gpui_component::{
 use oximux_simulator::DeviceId;
 
 use super::SimulatorPanel;
+use crate::shell::simulator::hub::AskKind;
 
 impl SimulatorPanel {
     /// The question this worktree's agent is waiting on, in the flow above
-    /// the phone: may agents control the device, or — on a real device,
-    /// asked every time — may one install an app on it.
+    /// the phone: may agents control the device, or — asked every time — may
+    /// one install an app on a real device, erase it, send it a push, or
+    /// change a real device's settings.
     pub(super) fn render_consent_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (hub, worktree) = (self.hub.as_ref()?, self.worktree.as_ref()?);
-        if let Some((id, device, app)) = hub.read(cx).install_request(worktree) {
-            return Some(self.render_install(id, device, app, cx));
+        if let Some((id, device, kind)) = hub.read(cx).per_call_request(worktree) {
+            return Some(self.render_per_call(id, &device, &kind, cx));
         }
         let (udid, name) = hub.read(cx).consent_request(worktree)?;
         Some(self.render_consent(udid, name, cx))
@@ -38,7 +40,7 @@ impl SimulatorPanel {
         let worktree = self.worktree.as_ref()?;
         if !hub.read(cx).agent_active(&udid)
             || hub.read(cx).consent_request(worktree).is_some()
-            || hub.read(cx).install_request(worktree).is_some()
+            || hub.read(cx).per_call_request(worktree).is_some()
         {
             return None;
         }
@@ -77,23 +79,23 @@ impl SimulatorPanel {
         )
     }
 
-    /// An agent wants to install `app` on the real device `device`. Asked
-    /// every time: controlling a phone is not putting apps on it.
-    fn render_install(&self, id: u64, device: String, app: String, cx: &mut Context<Self>) -> AnyElement {
+    /// A question asked every time (see `hub::per_call`): controlling a
+    /// device is not putting apps on it, wiping it, or changing its settings.
+    fn render_per_call(&self, id: u64, device: &str, kind: &AskKind, cx: &mut Context<Self>) -> AnyElement {
+        let (title, body, (deny, allow)) = kind.question(device);
         self.render_question(
-            format!("Install {app} on {device}?"),
-            "An agent in this worktree wants to install this app on your real device. Allow it only if you expected this build."
-                .into(),
-            ("sim-install-deny", "Don't install"),
-            ("sim-install-allow", "Install"),
+            title,
+            body.into(),
+            ("sim-per-call-deny", deny),
+            ("sim-per-call-allow", allow),
             cx.listener(move |this, _, _window, cx| {
                 if let Some(hub) = this.hub.clone() {
-                    hub.update(cx, |hub, cx| hub.answer_install(id, false, cx));
+                    hub.update(cx, |hub, cx| hub.answer_per_call(id, false, cx));
                 }
             }),
             cx.listener(move |this, _, _window, cx| {
                 if let Some(hub) = this.hub.clone() {
-                    hub.update(cx, |hub, cx| hub.answer_install(id, true, cx));
+                    hub.update(cx, |hub, cx| hub.answer_per_call(id, true, cx));
                 }
             }),
         )

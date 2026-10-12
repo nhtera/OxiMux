@@ -784,7 +784,71 @@ Install a built .app (inside this worktree or Xcode's DerivedData) or, on Androi
 
 #### `oximux sim shutdown`
 
-Shut the simulator down. One the user booted is refused without --force
+Shut the simulator down. A simulator the user booted is refused without --force
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--force` | no |  |
+
+#### `oximux sim location`
+
+Set or clear where the device says it is
+
+_No arguments._
+
+##### `oximux sim location set`
+
+Pretend to be at LAT LON (degrees; south and west are negative)
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<LAT>` | yes |  |
+| `<LON>` | yes |  |
+
+##### `oximux sim location clear`
+
+Stop pretending (a simulator only; an emulator keeps its last place)
+
+_No arguments._
+
+#### `oximux sim appearance`
+
+Light or dark mode
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<MODE>` | yes |  |
+
+#### `oximux sim privacy`
+
+Grant, revoke or reset an app's permission (the app may restart)
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<ACTION>` | yes |  |
+| `<SERVICE>` | yes | calendar, contacts, location, location-always, photos, photos-add, media-library, microphone, motion, reminders, siri, camera, notifications (what each platform has differs) |
+| `--app` | yes | The app's bundle id (Android: package name). Required: nothing changes for every app at once |
+
+#### `oximux sim push`
+
+Deliver a push notification to an app (asked every time)
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--app` | yes | The app's bundle id |
+| `<FILE>` | yes | The notification's JSON: an object with `aps` (at most 4096 bytes) |
+
+#### `oximux sim status-bar`
+
+A clean status bar for screenshots, or the real one back
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<MODE>` | yes |  |
+
+#### `oximux sim erase`
+
+Wipe the device to factory settings and boot it again (asked every time). A device the user booted is refused without --force
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |

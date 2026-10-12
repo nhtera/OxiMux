@@ -147,7 +147,13 @@ impl SimCommand {
             | Self::Ax { .. }
             | Self::Install { .. }
             | Self::Shutdown { .. } => None,
+            Self::Location(_) | Self::Appearance { .. } | Self::Privacy(_) | Self::Push(_) | Self::StatusBar { .. } | Self::Erase { .. } => None,
         }
+    }
+
+    /// The v28 device-state verbs (`location`, `appearance`, …).
+    pub fn is_device_state(&self) -> bool {
+        matches!(self, Self::Location(_) | Self::Appearance { .. } | Self::Privacy(_) | Self::Push(_) | Self::StatusBar { .. } | Self::Erase { .. })
     }
 }
 
@@ -173,7 +179,13 @@ impl SimCommand {
             | Self::Install { .. }
             | Self::Shutdown { .. }
             | Self::Wait(_)
-            | Self::Assert(_) => None,
+            | Self::Assert(_)
+            | Self::Location(_)
+            | Self::Appearance { .. }
+            | Self::Privacy(_)
+            | Self::Push(_)
+            | Self::StatusBar { .. }
+            | Self::Erase { .. } => None,
         }
     }
 }

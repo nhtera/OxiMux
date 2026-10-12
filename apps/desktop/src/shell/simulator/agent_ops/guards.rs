@@ -67,7 +67,8 @@ pub(super) fn is_action(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::AxRefs { .. }
         | SimCmdWire::Wait { .. }
         | SimCmdWire::Assert { .. }
-        | SimCmdWire::AsCaller { .. } => false,
+        | SimCmdWire::AsCaller { .. }
+        | SimCmdWire::DeviceState(_) => false,
     }
 }
 
@@ -90,7 +91,8 @@ pub(super) fn is_input(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Shutdown { .. }
         | SimCmdWire::AxRefs { .. }
         | SimCmdWire::Wait { .. }
-        | SimCmdWire::Assert { .. } => false,
+        | SimCmdWire::Assert { .. }
+        | SimCmdWire::DeviceState(_) => false,
     }
 }
 
@@ -119,7 +121,8 @@ pub(super) fn needs_screen(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Launch { .. }
         | SimCmdWire::OpenUrl { .. }
         | SimCmdWire::Install { .. }
-        | SimCmdWire::Shutdown { .. } => false,
+        | SimCmdWire::Shutdown { .. }
+        | SimCmdWire::DeviceState(_) => false,
     }
 }
 
@@ -145,6 +148,9 @@ pub(super) fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static
         // The action's own needs, then the tree the settle reads.
         SimCmdWire::Settled { action, .. } => return refused_on(caps, action).or((!caps.ax).then_some(AX)),
         SimCmdWire::AsCaller { cmd, .. } => return refused_on(caps, cmd),
+        // Checked per change, on every class of device (an emulator takes
+        // no push), by `device_state`.
+        SimCmdWire::DeviceState(_) => return None,
         // The tap's needs, then typing's.
         SimCmdWire::TypeInto { target, .. } => return refused_on(caps, &SimCmdWire::Tap(target.clone())).or((!caps.keys).then_some("Typing")),
     };

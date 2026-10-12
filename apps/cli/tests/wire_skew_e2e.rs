@@ -642,3 +642,42 @@ fn a_new_client_is_told_an_old_host_has_no_verify_loop() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// v28: the device-state verbs against a released host that predates them —
+/// refused by the client gate, naming the version, never a decode error.
+#[test]
+fn a_new_client_is_told_an_old_host_has_no_device_state() {
+    let Some(old) = old_cli() else {
+        eprintln!("skipped: OXIMUX_SKEW_CLI is unset");
+        return;
+    };
+    let host_version = protocol_of(&old);
+    if host_version >= oximux_remote_proto::proto::SIMULATOR_DEVICE_STATE_MIN_VERSION {
+        eprintln!("skipped: the released peer already speaks v{host_version}");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let shim = tmp.path().join("bin");
+    common::install_claude_shim(&shim);
+    let (mut child, dir) = boot_released_serve(&old, &data, &shim, tmp.path());
+
+    for args in [
+        &["sim", "location", "set", "10.77", "106.7"][..],
+        &["sim", "appearance", "dark"],
+        &["sim", "privacy", "grant", "photos", "--app", "com.a.b"],
+        &["sim", "status-bar", "clean"],
+        &["sim", "erase"],
+    ] {
+        let out = common::bin().args(["--dir", &dir]).args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: a version gap is unreachable-class: {stderr}");
+        assert!(stderr.contains("protocol v28"), "{args:?}: the refusal names the version needed: {stderr}");
+        assert!(!stderr.contains("undecodable"), "{args:?}: never blame the frame: {stderr}");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+

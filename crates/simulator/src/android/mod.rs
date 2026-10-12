@@ -24,6 +24,7 @@ pub mod sdk;
 pub mod server_log;
 pub mod wifi;
 pub mod session;
+pub mod state;
 pub mod uiautomator;
 
 use crate::DeviceId;
