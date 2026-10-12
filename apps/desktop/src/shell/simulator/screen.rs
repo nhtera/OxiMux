@@ -40,7 +40,18 @@ use super::panel::settings;
 
 mod decode;
 mod input;
+mod inspector;
 mod keys;
+
+pub(crate) use inspector::Picked;
+
+/// What the screen tells the panel.
+pub(crate) enum ScreenEvent {
+    /// An ⌥-click picked an element (see `inspector`).
+    Picked(Picked),
+}
+
+impl gpui::EventEmitter<ScreenEvent> for ScreenView {}
 
 pub use keys::register_screen_key_bindings;
 
@@ -79,6 +90,8 @@ pub struct ScreenView {
     wheel: WheelDrag,
     wheel_state: input::WheelState,
     _wheel_idle: Option<Task<()>>,
+    /// ⌥ held over the screen: the element under the pointer.
+    inspector: inspector::Inspector,
     focus: FocusHandle,
     /// The "typing goes to the simulator" hint shows until then.
     hint_until: Option<Instant>,
@@ -156,6 +169,7 @@ impl ScreenView {
             wheel: WheelDrag::default(),
             wheel_state: input::WheelState::default(),
             _wheel_idle: None,
+            inspector: inspector::Inspector::default(),
             focus: cx.focus_handle(),
             hint_until: None,
             _hint: None,
@@ -181,6 +195,8 @@ impl ScreenView {
         let shown = binding.visible && !self.binding.visible;
         if device_changed {
             self.release_input(cx);
+            // Another device's elements are not this one's.
+            self.inspector = inspector::Inspector::default();
             if let Some(old) = self.image.take() {
                 cx.drop_image(old, Some(window));
             }
@@ -391,11 +407,19 @@ impl Render for ScreenView {
                         let _ = on_move.update(cx, |view, cx| view.drag_to(e.position, e.modifiers.alt, cx));
                     }
                 });
-                let on_up = weak;
+                let on_up = weak.clone();
                 window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture && e.button == MouseButton::Left {
                         let _ = on_up.update(cx, |view, cx| view.drag_end(e.position, cx));
                     }
+                });
+                // ⌥ pressed or released with the pointer still, while the
+                // screen has focus (gpui sends it only then); without focus a
+                // move, an ⌥-press or the release poll catches it.
+                let on_modifiers = weak;
+                window.on_modifiers_changed(move |e, window, cx| {
+                    let pos = window.mouse_position();
+                    let _ = on_modifiers.update(cx, |view, cx| view.inspect(pos, e.modifiers.alt, window, cx));
                 });
             },
         )
@@ -414,6 +438,11 @@ impl Render for ScreenView {
             .bg(gpui::black())
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(|view, e: &MouseMoveEvent, window, cx| {
+                if e.pressed_button.is_none() {
+                    view.inspect(e.position, e.modifiers.alt, window, cx);
+                }
+            }))
             .on_mouse_down_out(cx.listener(|view, _, window, cx| {
                 if view.focus.is_focused(window) {
                     window.blur(cx);
@@ -457,6 +486,9 @@ impl Render for ScreenView {
         }
         if show_fps {
             screen = screen.child(self.render_fps());
+        }
+        if let Some(overlay) = self.render_inspector() {
+            screen = screen.child(overlay);
         }
         screen
     }

@@ -207,6 +207,49 @@ pub fn center(node: &AxNode) -> (f64, f64) {
     node.frame.center()
 }
 
+/// The element under `pt` for the panel's inspector: the smallest on-screen
+/// node whose frame (in `rect_of`'s space) contains it, the deepest on a tie
+/// — so a button wins over the full-screen container around it.
+pub fn hit_test<'a>(nodes: &'a [AxNode], pt: (f64, f64), rect_of: &dyn Fn(&AxNode) -> Rect) -> Option<&'a AxNode> {
+    let mut best: Option<(f64, usize, &AxNode)> = None;
+    for flat in flatten(nodes, usize::MAX) {
+        if !is_on_screen(flat.node) {
+            continue;
+        }
+        let r = rect_of(flat.node);
+        let inside = r.w > 0.0 && r.h > 0.0 && (r.x..=r.x + r.w).contains(&pt.0) && (r.y..=r.y + r.h).contains(&pt.1);
+        let area = r.w * r.h;
+        if inside && best.is_none_or(|(a, d, _)| area < a || (area == a && flat.depth > d)) {
+            best = Some((area, flat.depth, flat.node));
+        }
+    }
+    best.map(|(_, _, node)| node)
+}
+
+/// How a command names an element.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Selector {
+    /// `--id`: its identifier, which no other element on screen has.
+    Id(String),
+    /// `--label`: its exact label, which no other element on screen has.
+    Label(String),
+}
+
+/// The selector that names `node` and nothing else on screen ([`find`]
+/// would land on it): its identifier, else its label; `None` when neither
+/// does (a point is then the only way to name it).
+pub fn unique_selector(nodes: &[AxNode], node: &AxNode) -> Option<Selector> {
+    let shown: Vec<&AxNode> = flatten(nodes, usize::MAX).into_iter().map(|f| f.node).filter(|n| is_on_screen(n)).collect();
+    let only = |same: &dyn Fn(&AxNode) -> bool| shown.iter().filter(|n| same(n)).count() == 1;
+    if let Some(id) = node.identifier.as_deref().filter(|id| !id.is_empty())
+        && only(&|n| n.identifier.as_deref() == Some(id))
+    {
+        return Some(Selector::Id(id.to_owned()));
+    }
+    let label = node.label.as_deref().filter(|l| !l.is_empty())?;
+    only(&|n| n.label.as_deref() == Some(label)).then(|| Selector::Label(label.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +349,52 @@ mod tests {
         );
         assert!(px > 0.85, "expected near the portrait buffer's right edge, got px={px}");
         assert!((py - 0.5).abs() < 0.1, "expected roughly mid-height, got py={py}");
+    }
+
+    fn node(role: &str, label: Option<&str>, id: Option<&str>, frame: (f64, f64, f64, f64), children: Vec<AxNode>) -> AxNode {
+        AxNode {
+            label: label.map(Into::into),
+            identifier: id.map(Into::into),
+            value: None,
+            role: role.into(),
+            role_description: String::new(),
+            enabled: true,
+            frame: Rect::new(frame.0, frame.1, frame.2, frame.3),
+            children,
+        }
+    }
+
+    fn screen_tree() -> Vec<AxNode> {
+        vec![node("Application", Some("App"), None, (0.0, 0.0, 400.0, 800.0), vec![
+            node("Other", None, None, (0.0, 500.0, 400.0, 300.0), vec![
+                node("Button", Some("Sign in"), Some("login_btn"), (120.0, 600.0, 162.0, 44.0), vec![]),
+                node("Button", Some("Help"), None, (10.0, 600.0, 60.0, 44.0), vec![]),
+            ]),
+            node("Button", Some("Help"), None, (330.0, 20.0, 60.0, 44.0), vec![]),
+            node("Icon", Some("Ghost"), None, (0.0, 0.0, 0.0, 0.0), vec![]),
+        ])]
+    }
+
+    #[test]
+    fn the_smallest_element_under_the_pointer_is_hit() {
+        let tree = screen_tree();
+        let same = |n: &AxNode| n.frame;
+        assert_eq!(hit_test(&tree, (200.0, 620.0), &same).and_then(|n| n.label.as_deref()), Some("Sign in"));
+        assert_eq!(hit_test(&tree, (200.0, 520.0), &same).map(|n| n.role.as_str()), Some("Other"), "the container, nothing smaller there");
+        assert_eq!(hit_test(&tree, (200.0, 100.0), &same).map(|n| n.role.as_str()), Some("Application"));
+        assert!(hit_test(&tree, (500.0, 100.0), &same).is_none(), "outside every element");
+        assert_ne!(hit_test(&tree, (0.0, 0.0), &same).and_then(|n| n.label.as_deref()), Some("Ghost"), "a zero-size node is never hit");
+        // In another space (here: halved), the same element.
+        let half = |n: &AxNode| Rect::new(n.frame.x / 2.0, n.frame.y / 2.0, n.frame.w / 2.0, n.frame.h / 2.0);
+        assert_eq!(hit_test(&tree, (100.0, 310.0), &half).and_then(|n| n.label.as_deref()), Some("Sign in"));
+    }
+
+    #[test]
+    fn a_selector_names_the_element_and_nothing_else() {
+        let tree = screen_tree();
+        let find_label = |l: &str| flatten(&tree, 100).into_iter().map(|f| f.node).find(|n| n.label.as_deref() == Some(l)).unwrap();
+        assert_eq!(unique_selector(&tree, find_label("Sign in")), Some(Selector::Id("login_btn".into())));
+        assert_eq!(unique_selector(&tree, find_label("App")), Some(Selector::Label("App".into())));
+        assert_eq!(unique_selector(&tree, find_label("Help")), None, "two Help buttons: only a point names one");
     }
 }

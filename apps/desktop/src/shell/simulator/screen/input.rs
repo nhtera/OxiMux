@@ -62,9 +62,16 @@ impl ScreenView {
         Some(Rect::new(f64::from(f32::from(bounds.origin.x)) + fit.x, f64::from(f32::from(bounds.origin.y)) + fit.y, fit.w, fit.h))
     }
 
+    /// The frame's painted rect inside the screen element (for overlays).
+    pub(super) fn frame_fit(&self) -> Option<Rect> {
+        let bounds = self.bounds.get()?;
+        let (w, h) = self.frame_size()?;
+        Some(geometry::letterbox(Size::new(f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height))), Size::new(w, h)))
+    }
+
     /// `pos` as a display-normalized point: `None` outside the frame unless
     /// `clamp`, which pins it to the nearest edge (a drag that left it).
-    fn display_point(&self, pos: Point<Pixels>, clamp: bool) -> Option<(f64, f64)> {
+    pub(super) fn display_point(&self, pos: Point<Pixels>, clamp: bool) -> Option<(f64, f64)> {
         let rect = self.frame_rect()?;
         let (x, y) = (f64::from(f32::from(pos.x)), f64::from(f32::from(pos.y)));
         if clamp {
@@ -101,6 +108,19 @@ impl ScreenView {
 
     pub(super) fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        // An ⌥-press on a device that can be inspected waits: a click picks
+        // the element (typing stays where it was), a drag of a few points
+        // becomes the pinch. It arms the inspector itself: ⌥ pressed with
+        // the pointer still reaches no listener without focus.
+        let inspectable = !self.focus.is_focused(window)
+            && self.display_point(event.position, false).is_some()
+            && self.binding.device.as_ref().is_some_and(|d| self.cannot_inspect(d, cx).is_none());
+        if event.modifiers.alt && inspectable {
+            self.release_input(cx);
+            self.inspect(event.position, true, window, cx);
+            self.inspector.press = Some(event.position);
+            return;
+        }
         self.capture_keyboard(window, cx);
         let Some(p) = self.display_point(event.position, false) else { return };
         let Some(pid) = self.session(cx).map(|s| s.pid()) else { return };
@@ -127,6 +147,17 @@ impl ScreenView {
 
     /// A window-level move while the left button is down.
     pub(super) fn drag_to(&mut self, pos: Point<Pixels>, _alt: bool, cx: &mut Context<Self>) {
+        if let Some(at) = self.inspector.press {
+            let moved = f32::from(pos.x - at.x).hypot(f32::from(pos.y - at.y));
+            if moved < super::inspector::CLICK_SLOP {
+                return;
+            }
+            // A drag after all: the pinch, from where the press went down.
+            self.inspector.press = None;
+            let (Some(p), Some(pid)) = (self.display_point(at, true), self.session(cx).map(|s| s.pid())) else { return };
+            self.send_touch(TouchPhase::Begin, p, 0, true, cx);
+            self.drag = Some(Drag { edge: 0, pinch: true, sent_at: Instant::now(), pid, last: p });
+        }
         let Some(drag) = self.live_drag(cx) else { return };
         if drag.sent_at.elapsed() < MOVE_INTERVAL {
             return;
@@ -142,6 +173,11 @@ impl ScreenView {
 
     /// A window-level left-button release: ends the touch wherever it is.
     pub(super) fn drag_end(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        // An ⌥-press that never moved: a pick.
+        if let Some(at) = self.inspector.press.take() {
+            self.pick_at(at, cx);
+            return;
+        }
         if self.live_drag(cx).is_none() {
             return;
         }
@@ -205,6 +241,7 @@ impl ScreenView {
     /// away from, the app lost focus, or the panel was hidden).
     pub(super) fn release_input(&mut self, cx: &mut Context<Self>) {
         self.finish_wheel(cx);
+        self.inspector.cancel_press();
         if self.live_drag(cx).is_some()
             && let Some(drag) = self.drag.take()
         {
