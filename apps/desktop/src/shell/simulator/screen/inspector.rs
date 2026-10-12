@@ -18,6 +18,7 @@ use oximux_simulator::geometry::{self, Rect, Size};
 use oximux_simulator::{DeviceId, Orientation};
 
 use super::ScreenView;
+use crate::shell::simulator::hub::ControlState;
 
 /// A tree this young is tested again rather than read again (a simulator
 /// reads in milliseconds; a phone's or an emulator's takes a second or two).
@@ -47,10 +48,18 @@ pub(crate) struct Picked {
 impl Picked {
     /// The `oximux sim tap` that reaches it.
     pub(crate) fn tap_command(&self) -> String {
+        // A value starting with `-` goes as `--label=…`, so it stays a
+        // value. One with a line break or a backtick would break the message
+        // it goes in: the point names it instead.
+        let plain = |s: &str| !s.chars().any(|c| c.is_control() || c == '`');
+        let flag = |name: &str, value: &str| {
+            let sep = if value.starts_with('-') { "=" } else { " " };
+            format!("oximux sim tap --{name}{sep}{}", shell_word(value))
+        };
         match &self.selector {
-            Some(Selector::Id(id)) => format!("oximux sim tap --id {}", shell_word(id)),
-            Some(Selector::Label(label)) => format!("oximux sim tap --label {}", shell_word(label)),
-            None => format!("oximux sim tap {:.0} {:.0}", self.points.x + self.points.w / 2.0, self.points.y + self.points.h / 2.0),
+            Some(Selector::Id(id)) if plain(id) => flag("id", id),
+            Some(Selector::Label(label)) if plain(label) => flag("label", label),
+            _ => format!("oximux sim tap {:.0} {:.0}", self.points.x + self.points.w / 2.0, self.points.y + self.points.h / 2.0),
         }
     }
 
@@ -112,11 +121,21 @@ pub(super) struct Inspector {
     pub(super) press: Option<Point<Pixels>>,
     /// Looks for ⌥'s release while armed.
     _release: Option<Task<()>>,
+    /// The last read started (device, when), failed or not: a failing read
+    /// (an Android dump mid-animation) is not retried on every move.
+    attempted: Option<(DeviceId, Instant)>,
+    /// The hover is from a tree kept while a real iPhone's runner was busy.
+    cached: bool,
+    /// An ⌥-click that landed before its tree: picked once the tree does.
+    pending_pick: Option<(f64, f64)>,
 }
 
 impl Inspector {
-    pub(super) fn armed(&self) -> bool {
-        self.armed
+    /// Drop a press in progress (the device is switched, the panel hidden,
+    /// the window left).
+    pub(super) fn cancel_press(&mut self) {
+        self.press = None;
+        self.pending_pick = None;
     }
 }
 
@@ -129,12 +148,20 @@ impl ScreenView {
             return;
         }
         let Some(device) = self.binding.device.clone() else { return };
+        // While typing goes to the device, ⌥ is a key for it, not the
+        // inspector.
+        if self.focus.is_focused(window) {
+            self.disarm(cx);
+            return;
+        }
         if !self.inspector.armed {
             self.inspector._release = Some(cx.spawn_in(window, async move |this, cx| {
                 loop {
                     cx.background_executor().timer(RELEASE_POLL).await;
                     let held = this.update_in(cx, |view, window, cx| {
-                        let held = window.modifiers().alt;
+                        // Released, or OxiMux left meanwhile (a release then
+                        // reaches nothing).
+                        let held = window.modifiers().alt && window.is_window_active();
                         if !held {
                             view.disarm(cx);
                         }
@@ -148,13 +175,27 @@ impl ScreenView {
         }
         self.inspector.armed = true;
         self.inspector.pointer = point;
-        if !self.hub.read(cx).caps(&device).ax {
-            self.inspector.unavailable = Some("No accessibility tree on this device".into());
+        if let Some(why) = self.cannot_inspect(&device, cx) {
+            self.inspector.unavailable = Some(why.into());
             self.inspector.hover = None;
             return cx.notify();
         }
         self.refresh_tree(&device, cx);
         self.retest(cx);
+    }
+
+    /// Whether `device` can be inspected now (`None`) or why not.
+    pub(super) fn cannot_inspect(&self, device: &DeviceId, cx: &Context<Self>) -> Option<&'static str> {
+        let hub = self.hub.read(cx);
+        if !hub.caps(device).ax {
+            return Some("No accessibility tree on this device");
+        }
+        // A real iPhone's tree comes from its control runner: only while it
+        // runs — an ⌥-hover never starts it.
+        if device.source() == oximux_simulator::Source::Devicectl && !matches!(hub.control_state(device), ControlState::On { .. }) {
+            return Some("Turn on the iPhone's control to inspect it");
+        }
+        None
     }
 
     /// ⌥ released (or the pointer left the screen): no outline.
@@ -173,13 +214,18 @@ impl ScreenView {
     fn refresh_tree(&mut self, device: &DeviceId, cx: &mut Context<Self>) {
         let Some(session) = self.session(cx) else { return };
         let fresh = if session.android().is_some() || session.ios_device().is_some() { FRESH_SLOW } else { FRESH };
-        let current = self.inspector.tree.as_ref().is_some_and(|t| {
-            &t.device == device && t.read_at.elapsed() < fresh && t.map.orientation == session.orientation()
-        });
-        if current || self.inspector.reading {
+        let usable = self.usable_tree(cx).is_some();
+        let current = usable && self.inspector.tree.as_ref().is_some_and(|t| t.read_at.elapsed() < fresh);
+        let tried = self.inspector.attempted.as_ref().is_some_and(|(d, at)| d == device && at.elapsed() < fresh);
+        // A real iPhone's runner does one job at a time: while it is busy
+        // (an agent's verb, a tap), the tree in hand is kept, marked cached.
+        let busy = matches!(self.hub.read(cx).control_state(device), ControlState::On { busy: true });
+        self.inspector.cached = busy && usable;
+        if current || tried || busy || self.inspector.reading {
             return;
         }
         self.inspector.reading = true;
+        self.inspector.attempted = Some((device.clone(), Instant::now()));
         let read = self.hub.update(cx, |hub, cx| hub.read_tree(device, &session, None, READ_TIMEOUT, cx));
         let (device, hub) = (device.clone(), self.hub.clone());
         cx.spawn(async move |this, cx| {
@@ -200,15 +246,29 @@ impl ScreenView {
                     },
                     Err(e) => view.inspector.unavailable = Some(format!("Could not read the screen's elements: {e}")),
                 }
+                // An ⌥-click that came before its tree.
+                if let Some(pt) = view.inspector.pending_pick.take()
+                    && let Some(picked) = view.usable_tree(cx).and_then(|t| picked_at(t, pt))
+                {
+                    cx.emit(super::ScreenEvent::Picked(picked));
+                }
                 view.retest(cx);
             });
         })
         .detach();
     }
 
+    /// The tree in hand, if it is the shown device's in its current
+    /// orientation (else its outlines would land on the wrong things).
+    fn usable_tree(&self, cx: &Context<Self>) -> Option<&Tree> {
+        let tree = self.inspector.tree.as_ref()?;
+        let orientation = self.session(cx)?.orientation();
+        (self.binding.device.as_ref() == Some(&tree.device) && tree.map.orientation == orientation).then_some(tree)
+    }
+
     /// Hit-test the tree in hand at the pointer.
     fn retest(&mut self, cx: &mut Context<Self>) {
-        let hover = match (&self.inspector.tree, self.inspector.pointer, self.inspector.armed) {
+        let hover = match (self.usable_tree(cx), self.inspector.pointer, self.inspector.armed) {
             (Some(tree), Some(pt), true) => picked_at(tree, pt),
             _ => None,
         };
@@ -219,10 +279,15 @@ impl ScreenView {
         }
     }
 
-    /// The element under `pos` now (an ⌥-click's pick).
-    pub(super) fn pick_at(&mut self, pos: Point<Pixels>) -> Option<Picked> {
-        let pt = self.display_point(pos, false)?;
-        picked_at(self.inspector.tree.as_ref()?, pt)
+    /// An ⌥-click at `pos` without moving: the element there, now or once
+    /// its tree lands.
+    pub(super) fn pick_at(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(pt) = self.display_point(pos, false) else { return };
+        match self.usable_tree(cx).and_then(|t| picked_at(t, pt)) {
+            Some(picked) => cx.emit(super::ScreenEvent::Picked(picked)),
+            None if self.inspector.reading => self.inspector.pending_pick = Some(pt),
+            None => {}
+        }
     }
 
     /// The outline and its chip, over the screen while ⌥ is held.
@@ -256,6 +321,9 @@ impl ScreenView {
         if let Some(Selector::Id(id)) = &hover.selector {
             label.push_str(&format!(" · {id}"));
         }
+        if self.inspector.cached {
+            label.push_str(" · cached");
+        }
         // Above the outline, or below it near the top.
         let above = r.y > 28.0;
         let outline = div()
@@ -267,7 +335,9 @@ impl ScreenView {
             .border_2()
             .border_color(theme.status_info)
             .rounded(px(2.));
-        let chip_top = if above { r.y - 24.0 } else { r.y + r.h + 4.0 };
+        // Kept on the screen: a tall element (a map, the app's root) would
+        // push it below the frame.
+        let chip_top = (if above { r.y - 24.0 } else { r.y + r.h + 4.0 }).clamp(fit.y + 2.0, (fit.y + fit.h - 24.0).max(fit.y + 2.0));
         let chip_row = div()
             .absolute()
             .left(px(fit.x as f32 + 4.0))
@@ -340,6 +410,8 @@ mod tests {
     fn a_pick_reads_as_a_command_that_reaches_it() {
         assert_eq!(picked(Some("Sign in"), Some(Selector::Id("login_btn".into()))).tap_command(), "oximux sim tap --id login_btn");
         assert_eq!(picked(Some("Sign in"), Some(Selector::Label("Sign in".into()))).tap_command(), "oximux sim tap --label 'Sign in'");
+        assert_eq!(picked(None, Some(Selector::Label("-5 items".into()))).tap_command(), "oximux sim tap --label='-5 items'");
+        assert_eq!(picked(None, Some(Selector::Label("a\nb".into()))).tap_command(), "oximux sim tap 201 622", "a line break: the point");
         assert_eq!(picked(None, None).tap_command(), "oximux sim tap 201 622", "the centre, in points");
         assert_eq!(shell_word("it's"), r"'it'\''s'");
         assert_eq!(picked(Some("Sign in"), None).title(), "Button “Sign in”");

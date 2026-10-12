@@ -195,6 +195,8 @@ impl ScreenView {
         let shown = binding.visible && !self.binding.visible;
         if device_changed {
             self.release_input(cx);
+            // Another device's elements are not this one's.
+            self.inspector = inspector::Inspector::default();
             if let Some(old) = self.image.take() {
                 cx.drop_image(old, Some(window));
             }
@@ -411,8 +413,9 @@ impl Render for ScreenView {
                         let _ = on_up.update(cx, |view, cx| view.drag_end(e.position, cx));
                     }
                 });
-                // ⌥ pressed or released with the pointer still: the inspector
-                // follows (a move carries the modifiers too).
+                // ⌥ pressed or released with the pointer still, while the
+                // screen has focus (gpui sends it only then); without focus a
+                // move, an ⌥-press or the release poll catches it.
                 let on_modifiers = weak;
                 window.on_modifiers_changed(move |e, window, cx| {
                     let pos = window.mouse_position();

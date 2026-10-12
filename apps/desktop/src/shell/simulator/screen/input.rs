@@ -108,11 +108,16 @@ impl ScreenView {
 
     pub(super) fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        // With the inspector up, an ⌥-press waits: a click picks the
-        // element (typing stays where it was), a drag of a few points
-        // becomes the pinch.
-        if event.modifiers.alt && self.inspector.armed() && self.display_point(event.position, false).is_some() {
+        // An ⌥-press on a device that can be inspected waits: a click picks
+        // the element (typing stays where it was), a drag of a few points
+        // becomes the pinch. It arms the inspector itself: ⌥ pressed with
+        // the pointer still reaches no listener without focus.
+        let inspectable = !self.focus.is_focused(window)
+            && self.display_point(event.position, false).is_some()
+            && self.binding.device.as_ref().is_some_and(|d| self.cannot_inspect(d, cx).is_none());
+        if event.modifiers.alt && inspectable {
             self.release_input(cx);
+            self.inspect(event.position, true, window, cx);
             self.inspector.press = Some(event.position);
             return;
         }
@@ -170,9 +175,7 @@ impl ScreenView {
     pub(super) fn drag_end(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         // An ⌥-press that never moved: a pick.
         if let Some(at) = self.inspector.press.take() {
-            if let Some(picked) = self.pick_at(at) {
-                cx.emit(super::ScreenEvent::Picked(picked));
-            }
+            self.pick_at(at, cx);
             return;
         }
         if self.live_drag(cx).is_none() {
@@ -238,6 +241,7 @@ impl ScreenView {
     /// away from, the app lost focus, or the panel was hidden).
     pub(super) fn release_input(&mut self, cx: &mut Context<Self>) {
         self.finish_wheel(cx);
+        self.inspector.cancel_press();
         if self.live_drag(cx).is_some()
             && let Some(drag) = self.drag.take()
         {
