@@ -73,7 +73,7 @@ impl SimulatorPanel {
         // The pairing card, while open, takes the banner's place.
         let banner = match self.render_pairing(window, cx) {
             Some(card) => Some(card),
-            None => self.render_consent_banner(cx).or_else(|| self.render_crash_row(cx)),
+            None => self.render_consent_banner(cx).or_else(|| self.render_recovery_row(cx)).or_else(|| self.render_crash_row(cx)),
         };
         let badge = self.render_agent_badge(cx);
         div()

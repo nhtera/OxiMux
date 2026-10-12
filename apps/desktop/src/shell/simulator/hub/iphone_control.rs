@@ -546,8 +546,7 @@ fn launch(
         HelperStatus::Found(path) => path,
         HelperStatus::Missing(why) => return Err(ControlError::LaunchFailed(why)),
     };
-    let found = runner.run("xcrun", &["--find", "xcodebuild"], None, Duration::from_secs(20)).map_err(|e| failed("Xcode", &e))?;
-    let xcodebuild = std::path::PathBuf::from(found.into_success("xcrun").map_err(|e| failed("Xcode", &e))?.stdout_str().trim());
+    let xcodebuild = oximux_simulator::runner::xcrun_find(runner, "xcodebuild", Duration::from_secs(20)).map_err(|e| failed("Xcode", &e))?;
     let version = runner
         .run(&xcodebuild.display().to_string(), &["-version"], None, Duration::from_secs(30))
         .map_err(|e| failed("Xcode", &e))?

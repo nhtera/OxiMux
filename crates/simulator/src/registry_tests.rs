@@ -182,9 +182,11 @@ fn only_a_shown_streaming_device_is_watched_for_crashes() {
     assert_eq!(reg.shown_live(), std::slice::from_ref(&u));
     reg.set_visible(&w, false, now);
     assert!(reg.shown_live().is_empty(), "hidden");
+    assert!(!reg.is_shown(&u));
     reg.set_visible(&w, true, now);
     reg.session_exited(&u, g, true, "gone".into());
     assert!(reg.shown_live().is_empty(), "restarting, not streaming");
+    assert!(reg.is_shown(&u), "still shown while it restarts");
 }
 
 #[test]

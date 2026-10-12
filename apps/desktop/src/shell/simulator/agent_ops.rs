@@ -79,6 +79,33 @@ pub(crate) struct Target {
 
 /// Carry out one `oximux sim` verb for the worktree containing `path`.
 pub async fn run(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
+    // A command's error can carry what a tool printed (stderr, a payload):
+    // scrubbed before it reaches the agent.
+    run_verb(path, cmd, cx).await.map_err(scrubbed)
+}
+
+/// `e` with secret-shaped values replaced in every word it carries.
+fn scrubbed(e: SimErrorWire) -> SimErrorWire {
+    use oximux_agent_core::scrub_text::scrub_text as s;
+    match e {
+        SimErrorWire::Unavailable(w) => SimErrorWire::Unavailable(s(&w)),
+        SimErrorWire::NotFound(w) => SimErrorWire::NotFound(s(&w)),
+        SimErrorWire::BadInput(w) => SimErrorWire::BadInput(s(&w)),
+        SimErrorWire::Failed(w) => SimErrorWire::Failed(s(&w)),
+        SimErrorWire::Refused(w) => SimErrorWire::Refused(s(&w)),
+        SimErrorWire::StaleRef(w) => SimErrorWire::StaleRef(s(&w)),
+        SimErrorWire::AssertFailed(w) => SimErrorWire::AssertFailed(s(&w)),
+        SimErrorWire::TimedOut(w) => SimErrorWire::TimedOut(s(&w)),
+        e @ (SimErrorWire::ConsentPending
+        | SimErrorWire::ConsentDenied { .. }
+        | SimErrorWire::AgentControlDisabled
+        | SimErrorWire::NoDevice
+        | SimErrorWire::NotStreaming
+        | SimErrorWire::PathOutsideWorktree) => e,
+    }
+}
+
+async fn run_verb(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
     let hub = cx
         .update(|cx| hub(cx))
         .ok_or_else(|| SimErrorWire::Unavailable("the Mobile Emulator panel needs an Apple silicon Mac".into()))?;
@@ -390,6 +417,13 @@ pub(crate) fn same_worktree(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_reaches_the_agent_scrubbed() {
+        let e = scrubbed(SimErrorWire::Failed("simctl push failed: Authorization: Bearer abcdefghijklmnop".into()));
+        assert_eq!(e, SimErrorWire::Failed("simctl push failed: Authorization: Bearer [redacted]".into()));
+        assert_eq!(scrubbed(SimErrorWire::NoDevice), SimErrorWire::NoDevice);
+    }
     use oximux_simulator::DeviceKind;
 
     fn info(udid: &str, name: &str, os: &str, state: DeviceState) -> DeviceInfo {

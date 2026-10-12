@@ -151,6 +151,11 @@ pub struct SimulatorHub {
     device_state: device_state::Memo,
     /// Shown devices watched for crashes (see `crash_watch`).
     crash_watch: crash_watch::CrashWatch,
+    /// Blank screens climbing the recovery ladder (see `recovery`).
+    recovery: HashMap<DeviceId, recovery::Recovery>,
+    /// When each device's stream was asked to start, until its first
+    /// picture: how long a start (an un-park) takes, logged at debug.
+    started_at: HashMap<DeviceId, Instant>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -164,6 +169,7 @@ mod iphone;
 mod iphone_control;
 mod lifecycle;
 mod per_call;
+mod recovery;
 mod snapshot;
 mod wifi;
 
@@ -175,6 +181,7 @@ pub(crate) use android::list_all;
 pub use capture::{HardwareButton, NoticeKind};
 pub use iphone::{CAMERA_DENIED, DEVICE_BUSY};
 pub use iphone_control::{ControlState, TargetApp, TeamChoice};
+pub use recovery::Step as RecoveryStep;
 pub(crate) use capture::{CaptureKind, capture_dir, capture_path, home_button, paste_now, stamp};
 
 pub use lifecycle::{install, on_quit};
@@ -777,6 +784,7 @@ impl SimulatorHub {
     }
 
     fn start_session(&mut self, udid: DeviceId, generation: Generation, cx: &mut Context<Self>) {
+        self.started_at.insert(udid.clone(), Instant::now());
         match udid.source() {
             Source::Adb => return self.start_android_session(udid, generation, cx),
             // Never the simulator helper: it would ask CoreSimulator for an
@@ -856,6 +864,16 @@ impl SimulatorHub {
         cx.emit(HubEvent::Changed(udid));
     }
 
+    /// The first picture since `udid`'s stream was asked to start: how long
+    /// that took (`RUST_LOG=oximux_app::shell::simulator=debug`).
+    fn note_first_picture(&mut self, udid: &DeviceId) {
+        if self.started_at.contains_key(udid) && self.session(udid).is_some_and(|s| s.frame_clock().seq > 0)
+            && let Some(at) = self.started_at.remove(udid)
+        {
+            tracing::debug!(%udid, elapsed_ms = at.elapsed().as_millis() as u64, "first picture after the stream started");
+        }
+    }
+
     /// Become the session's sole wake/event consumer and fan out. The wake
     /// closure owns only a channel (never the session), so it cannot keep
     /// the session alive; bursts of frames coalesce into one wake.
@@ -899,6 +917,7 @@ impl SimulatorHub {
                             // Visible, or the Encoding menu would say H.264
                             // over a JPEG stream with no hint why.
                             if let SessionEvent::EncodingFallback(why) = &event {
+                                hub.note_decoder_trouble(&udid, generation);
                                 let text = format!("{why}. Pick H.264 in the stream row to try again.");
                                 cx.emit(HubEvent::Notice(udid.clone(), NoticeKind::Error, text));
                             }
@@ -912,6 +931,7 @@ impl SimulatorHub {
                         }
                     }
                     if current {
+                        hub.note_first_picture(&udid);
                         cx.emit(HubEvent::Frame(udid.clone()));
                     }
                 });

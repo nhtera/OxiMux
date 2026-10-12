@@ -156,6 +156,14 @@ pub fn boot(runner: &dyn Runner, udid: &SimUdid, cmd_timeout: Duration, cancel: 
     }
 }
 
+/// `xcrun simctl bootstatus <udid>`: wait (up to `timeout`) until the
+/// device has finished booting. Never boots it.
+pub fn bootstatus(runner: &dyn Runner, udid: &SimUdid, timeout: Duration) -> Result<()> {
+    let udid = udid.as_str();
+    let out = run(runner, &["simctl", "bootstatus", udid], timeout)?;
+    require_success("simctl bootstatus", Some(udid), out).map(drop)
+}
+
 pub fn shutdown(runner: &dyn Runner, udid: &SimUdid, timeout: Duration) -> Result<()> {
     let udid = udid.as_str();
     let out = run(runner, &["simctl", "shutdown", udid], timeout)?;

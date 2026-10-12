@@ -45,6 +45,7 @@ mod crash_row;
 mod device_menu;
 mod pair_card;
 mod header;
+mod recovery_row;
 mod iphone_control;
 mod toolbar;
 mod send_to_agent;
@@ -96,6 +97,8 @@ pub struct SimulatorPanel {
     /// Every crash a row was raised for, by device (a dismissed one stays
     /// gone).
     crash_ids: std::collections::HashSet<(DeviceId, String)>,
+    /// Devices whose "still no picture" hint the user dismissed.
+    recovery_dismissed: std::collections::HashSet<DeviceId>,
     /// The screen as the crash row came up, by device and crash id (sent
     /// with it).
     crash_png: Option<(DeviceId, String, Vec<u8>)>,
@@ -159,6 +162,7 @@ impl SimulatorPanel {
             crash: None,
             crash_ids: Default::default(),
             crash_png: None,
+            recovery_dismissed: Default::default(),
             theme,
             density,
             typography,
