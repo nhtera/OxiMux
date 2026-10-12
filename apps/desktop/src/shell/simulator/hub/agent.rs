@@ -384,6 +384,11 @@ impl SimulatorHub {
         }
     }
 
+    /// The user shut `udid` down from the panel (and nothing lifted that).
+    pub fn is_stopped_by_user(&self, udid: &DeviceId) -> bool {
+        self.agent.stopped.contains(udid)
+    }
+
     /// The user reconnected or picked `udid`, an attach chose it, or the
     /// watcher saw it boot again: agents may wake it again. Never cleared by
     /// an agent's own wake — its verb may land before the shutdown does.

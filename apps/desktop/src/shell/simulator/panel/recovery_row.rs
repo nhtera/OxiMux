@@ -32,8 +32,9 @@ impl SimulatorPanel {
                         cx.notify();
                     }),
                     // The Device menu's own question: a plain confirmation.
+                    // The hint stays until the device shows a picture
+                    // again: a Cancel in the question brings nothing back.
                     cx.listener(move |this, _, _window, cx| {
-                        this.recovery_dismissed.insert(erase.clone());
                         this.device_prompt = Some(DevicePrompt::Erase(erase.clone()));
                         cx.notify();
                     }),

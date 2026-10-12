@@ -1,6 +1,7 @@
 //! A blank screen that recovers on its own: a simulator a panel shows (so
-//! streaming, not paused) that has sent no picture at all for
-//! [`NO_PICTURE`] climbs a short ladder, one step at a time:
+//! streaming, not paused) whose stream has sent no picture at all since it
+//! started — timed only while shown, [`NO_PICTURE`] of it — climbs a short
+//! ladder, one step at a time:
 //!
 //! 1. wait for its boot to finish (`simctl bootstatus`, ≤ 60 s), then
 //!    restart the stream — a helper started before the device finished
@@ -9,10 +10,16 @@
 //!    down and boot it again;
 //! 3. a hint in the panel: "Erase device…" — never done on its own.
 //!
-//! What never starts it: a hidden (paused) device — a paused helper captures
-//! nothing — time spent paused, a stream that already sent a picture, and a
-//! decoder in trouble (an H.264 fallback): those keep today's error path.
-//! [`Recovery`] is the pure decision; the hub runs what it asks for.
+//! Only a stream that never showed anything counts: a still screen sends no
+//! pictures (measured: none for 20 s and more on an idle home screen), so
+//! "no picture lately" would raise false alarms. What never starts it: a
+//! hidden (paused) device — a paused helper captures nothing — time spent
+//! paused, a stream that showed a picture, and a decoder in
+//! trouble (an H.264 fallback): those keep today's error path. A step that
+//! ends re-checks before it acts: the same stream, still shown, still blank,
+//! not being erased, not stopped by the user. A boot that does not finish in
+//! time ends at the hint (a reboot would only interrupt it). [`Recovery`] is
+//! the pure decision; the hub runs what it asks for.
 
 use std::time::{Duration, Instant};
 
@@ -67,14 +74,21 @@ pub struct Seen {
     pub owned: bool,
 }
 
+impl Seen {
+    /// The stream has shown a picture.
+    fn shown_a_picture(&self) -> bool {
+        self.seq > 0
+    }
+}
+
 /// One device's ladder.
 #[derive(Debug, Default)]
 pub struct Recovery {
     step: Step,
     /// The stream and pause epoch being timed, and since when.
     clock: Option<(u64, u64, Instant)>,
-    /// A step is running: wait for it to finish.
-    busy: bool,
+    /// The stream a running step was started for: wait for it to finish.
+    busy: Option<u64>,
     /// The one reboot this run is spent.
     rebooted: bool,
     /// The stream's decoder gave up (an H.264 fallback): not a blank screen.
@@ -86,6 +100,12 @@ impl Recovery {
         self.step
     }
 
+    /// The stream a running step was started for.
+    #[cfg(test)]
+    pub fn busy_for(&self) -> Option<u64> {
+        self.busy
+    }
+
     /// The stream `generation` fell back from H.264: its blank screen is the
     /// decoder's, and never reboots anything.
     pub fn decoder_trouble(&mut self, generation: u64) {
@@ -95,21 +115,39 @@ impl Recovery {
 
     /// The step asked for has finished: time the next stretch afresh.
     pub fn finished(&mut self) {
-        self.busy = false;
+        self.busy = None;
         self.clock = None;
+    }
+
+    /// The boot did not finish in time (a slow first boot, say): rebooting
+    /// it now would only interrupt it, so the ladder ends at the hint.
+    pub fn boot_wait_failed(&mut self) {
+        self.finished();
+        self.step = Step::Hint;
     }
 
     /// One look at the device; what to do now.
     pub fn observe(&mut self, now: Instant, seen: Seen) -> Action {
-        if seen.seq > 0 {
+        if seen.shown_a_picture() {
             // Pictures: whatever was wrong is not (or no longer).
-            self.step = Step::Watching;
+            if self.busy.is_none() {
+                self.step = Step::Watching;
+            }
             self.clock = None;
             return Action::None;
         }
+        if !seen.shown_live {
+            // Not shown (hidden, detached, stopped, failed): no clock, and
+            // no stale "waiting…" line; a running step finishes on its own.
+            self.clock = None;
+            if self.busy.is_none() && matches!(self.step, Step::WaitingForBoot | Step::Rebooting) {
+                self.step = Step::Watching;
+            }
+            return Action::None;
+        }
         let troubled = self.decoder_trouble == Some(seen.generation);
-        if !seen.shown_live || troubled || self.busy || self.step == Step::Hint {
-            if !self.busy {
+        if troubled || self.busy.is_some() || self.step == Step::Hint {
+            if self.busy.is_none() {
                 self.clock = None;
             }
             return Action::None;
@@ -135,7 +173,7 @@ impl Recovery {
             Step::WaitingForBoot | Step::Rebooting | Step::Hint => (Step::Hint, Action::None),
         };
         self.step = step;
-        self.busy = action != Action::None;
+        self.busy = (action != Action::None).then_some(seen.generation);
         action
     }
 }
@@ -151,14 +189,35 @@ impl SimulatorHub {
         self.recovery.entry(udid.clone()).or_default().decoder_trouble(generation);
     }
 
+    /// What the hub sees of `udid` now (`None`: no live stream).
+    fn seen(&self, udid: &DeviceId, shown: &[DeviceId]) -> Option<Seen> {
+        let (Phase::Live { generation }, Some(session)) = (self.registry.phase(udid), self.session(udid)) else { return None };
+        let clock = session.frame_clock();
+        Some(Seen { shown_live: shown.contains(udid), generation, seq: clock.seq, epoch: clock.epoch, owned: self.is_owned(udid) })
+    }
+
+    /// A step's ending may act on `udid` only if nothing changed meanwhile:
+    /// the same stream, still shown, still without a picture, not being
+    /// erased, not stopped by the user.
+    fn still_blank(&self, udid: &DeviceId, generation: u64) -> bool {
+        let shown = self.registry.shown_live();
+        let unchanged = self.seen(udid, &shown).is_some_and(|s| s.shown_live && s.generation == generation && !s.shown_a_picture());
+        unchanged && !self.erasing(udid) && !self.is_stopped_by_user(udid)
+    }
+
     /// Look at every shown simulator; start the steps the ladder asks for.
     fn look_for_blank_screens(&mut self, cx: &mut Context<Self>) {
+        // Never `xcrun` without a resolvable Xcode (the CLT dialog).
+        if !self.watch_gate().xcode_ok {
+            return;
+        }
         let now = Instant::now();
         let shown = self.registry.shown_live();
-        for udid in shown.iter().filter(|u| u.source() == Source::Simctl) {
-            let (Phase::Live { generation }, Some(session)) = (self.registry.phase(udid), self.session(udid)) else { continue };
-            let clock = session.frame_clock();
-            let seen = Seen { shown_live: true, generation, seq: clock.seq, epoch: clock.epoch, owned: self.is_owned(udid) };
+        let mut udids: Vec<DeviceId> = shown.iter().filter(|u| u.source() == Source::Simctl).cloned().collect();
+        udids.extend(self.recovery.keys().filter(|u| !shown.contains(u)).cloned());
+        for udid in udids {
+            let seen = self.seen(&udid, &shown).unwrap_or(Seen { shown_live: false, generation: 0, seq: 0, epoch: 0, owned: false });
+            tracing::trace!(%udid, shown = seen.shown_live, generation = seen.generation, epoch = seen.epoch, seq = seen.seq, "recovery look");
             let recovery = self.recovery.entry(udid.clone()).or_default();
             let before = recovery.step();
             let action = recovery.observe(now, seen);
@@ -167,54 +226,70 @@ impl SimulatorHub {
             }
             match action {
                 Action::None => {}
-                Action::WaitForBoot => self.wait_for_boot(udid, cx),
-                Action::Reboot => self.reboot_blank(udid, cx),
-            }
-        }
-        // A device no panel shows: its clock stops (the ladder's step and
-        // spent reboot stay).
-        for (udid, recovery) in &mut self.recovery {
-            if !shown.contains(udid) {
-                recovery.observe(now, Seen { shown_live: false, generation: 0, seq: 0, epoch: 0, owned: false });
+                Action::WaitForBoot => self.wait_for_boot(&udid, seen.generation, cx),
+                Action::Reboot => self.reboot_blank(&udid, seen.generation, cx),
             }
         }
     }
 
-    /// Step 1: wait for the boot, then a fresh stream.
-    fn wait_for_boot(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
-        let (Some(sim), runner) = (udid.sim_udid(), self.runner.clone()) else { return };
+    fn finish_step(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
+        if let Some(recovery) = self.recovery.get_mut(udid) {
+            recovery.finished();
+        }
+        cx.emit(HubEvent::Changed(udid.clone()));
+    }
+
+    /// Step 1: wait for the boot, then a fresh stream — unless something
+    /// changed meanwhile.
+    fn wait_for_boot(&mut self, udid: &DeviceId, generation: u64, cx: &mut Context<Self>) {
+        let (Some(sim), runner) = (udid.sim_udid(), self.runner.clone()) else { return self.finish_step(udid, cx) };
         tracing::info!(%udid, "no picture: waiting for the boot to finish, then restarting the stream");
         let udid = udid.clone();
         cx.spawn(async move |this, cx| {
             let booted = cx.background_executor().spawn(async move { simctl::bootstatus(runner.as_ref(), &sim, BOOT_WAIT) }).await;
-            if let Err(e) = booted {
-                tracing::info!(%udid, "bootstatus: {e}");
-            }
             let _ = this.update(cx, |hub, cx| {
-                hub.reconnect(&udid, cx);
-                if let Some(recovery) = hub.recovery.get_mut(&udid) {
-                    recovery.finished();
+                if let Err(e) = booted {
+                    tracing::info!(%udid, "bootstatus: {e}");
+                    if let Some(recovery) = hub.recovery.get_mut(&udid) {
+                        recovery.boot_wait_failed();
+                    }
+                    return cx.emit(HubEvent::Changed(udid.clone()));
                 }
+                if hub.still_blank(&udid, generation) {
+                    hub.reconnect(&udid, cx);
+                }
+                hub.finish_step(&udid, cx);
             });
         })
         .detach();
     }
 
-    /// Step 2: shut down and boot again (the registry boots a device it
-    /// owns when it reconnects as off).
-    fn reboot_blank(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
-        let (Some(sim), runner) = (udid.sim_udid(), self.runner.clone()) else { return };
+    /// Step 2: shut down (once, after a recording is finalized), wait until
+    /// the device is off, then boot it again — the registry boots a device
+    /// it owns when it reconnects as off. Not booted again if the user
+    /// stopped it, an erase began or nothing shows it any more.
+    fn reboot_blank(&mut self, udid: &DeviceId, generation: u64, cx: &mut Context<Self>) {
+        if !self.still_blank(udid, generation) {
+            return self.finish_step(udid, cx);
+        }
         tracing::info!(%udid, "still no picture: rebooting the simulator once");
         self.shutdown_after_recording(udid, cx);
         let udid = udid.clone();
         cx.spawn(async move |this, cx| {
-            // Already shutting down from above: an error here only says so.
-            let _ = cx.background_executor().spawn(async move { simctl::shutdown(runner.as_ref(), &sim, BOOT_WAIT) }).await;
-            let _ = this.update(cx, |hub, cx| {
-                hub.reconnect_as(&udid, false, cx);
-                if let Some(recovery) = hub.recovery.get_mut(&udid) {
-                    recovery.finished();
+            let deadline = Instant::now() + BOOT_WAIT;
+            loop {
+                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let Ok(off) = this.update(cx, |hub, _| hub.watch.lock().unwrap().is_booted(&udid) == Some(false)) else { return };
+                if off || Instant::now() >= deadline {
+                    break;
                 }
+            }
+            let _ = this.update(cx, |hub, cx| {
+                let wanted = hub.registry.attached_devices().contains(&udid);
+                if wanted && !hub.is_stopped_by_user(&udid) && !hub.erasing(&udid) {
+                    hub.reconnect_as(&udid, false, cx);
+                }
+                hub.finish_step(&udid, cx);
             });
         })
         .detach();
@@ -258,7 +333,7 @@ mod tests {
     fn a_shown_blank_owned_simulator_waits_then_reboots_once_then_hints() {
         let (mut r, t) = (Recovery::default(), Instant::now());
         assert_eq!(run(&mut r, t, 12, seen(0, 0, true)), [Action::WaitForBoot]);
-        assert_eq!(r.step(), Step::WaitingForBoot);
+        assert_eq!((r.step(), r.busy_for()), (Step::WaitingForBoot, Some(1)));
         // Nothing more while the step runs.
         assert!(run(&mut r, t + Duration::from_secs(14), 30, seen(0, 0, true)).is_empty());
         r.finished();
@@ -281,15 +356,40 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_or_a_pause_resets_the_clock() {
+    fn a_boot_that_does_not_finish_is_never_rebooted() {
+        let (mut r, t) = (Recovery::default(), Instant::now());
+        assert_eq!(run(&mut r, t, 12, seen(0, 0, true)), [Action::WaitForBoot]);
+        r.boot_wait_failed();
+        assert!(run(&mut r, t + Duration::from_secs(70), 30, seen(0, 0, true)).is_empty());
+        assert_eq!(r.step(), Step::Hint);
+    }
+
+    #[test]
+    fn a_pause_resets_the_clock_and_a_picture_ends_the_ladder() {
         let (mut r, t) = (Recovery::default(), Instant::now());
         // 8 s blank, then paused and resumed (a new epoch): 8 more is not 10.
         assert!(run(&mut r, t, 8, seen(0, 0, true)).is_empty());
         assert!(run(&mut r, t + Duration::from_secs(10), 8, seen(0, 1, true)).is_empty());
-        // A picture: back to watching, whatever the step was.
         assert_eq!(run(&mut r, t + Duration::from_secs(20), 12, seen(0, 1, true)), [Action::WaitForBoot]);
         r.finished();
         r.observe(t + Duration::from_secs(40), seen(1, 1, true));
+        assert_eq!(r.step(), Step::Watching);
+    }
+
+    #[test]
+    fn a_still_screen_is_never_taken_for_a_blank_one() {
+        // One picture, then none for minutes (an idle screen sends none).
+        let mut r = Recovery::default();
+        assert!(run(&mut r, Instant::now(), 300, seen(1, 0, true)).is_empty());
+        assert_eq!(r.step(), Step::Watching);
+    }
+
+    #[test]
+    fn a_step_line_clears_once_nothing_shows_the_device() {
+        let (mut r, t) = (Recovery::default(), Instant::now());
+        assert_eq!(run(&mut r, t, 12, seen(0, 0, true)), [Action::WaitForBoot]);
+        r.finished();
+        r.observe(t + Duration::from_secs(20), Seen { shown_live: false, ..seen(0, 0, true) });
         assert_eq!(r.step(), Step::Watching);
     }
 

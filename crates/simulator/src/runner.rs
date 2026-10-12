@@ -202,12 +202,16 @@ impl SystemRunner {
     }
 }
 
-/// `program` and its first two arguments, the rest counted: what an error
+/// `program` and its first two arguments (after adb's `-s <serial>`), the
+/// rest counted: what an error
 /// or a log line may say about a command. A later argument can be a payload,
 /// a path with a person's name in it, or a secret.
 pub fn redact_argv(program: &str, args: &[&str]) -> String {
-    let mut out = std::iter::once(program).chain(args.iter().take(2).copied()).collect::<Vec<_>>().join(" ");
-    match args.len().saturating_sub(2) {
+    // `adb -s <serial>` names the device, not the command: the two after it
+    // say what failed.
+    let keep = if args.first() == Some(&"-s") { 4 } else { 2 };
+    let mut out = std::iter::once(program).chain(args.iter().take(keep).copied()).collect::<Vec<_>>().join(" ");
+    match args.len().saturating_sub(keep) {
         0 => {}
         1 => out.push_str(" …(1 arg)"),
         rest => out.push_str(&format!(" …({rest} args)")),
@@ -326,7 +330,7 @@ mod tests {
     #[test]
     fn an_error_names_the_program_and_two_arguments_only() {
         assert_eq!(redact_argv("xcrun", &["simctl", "push", "U", "com.x", "-"]), "xcrun simctl push …(3 args)");
-        assert_eq!(redact_argv("adb", &["-s", "S", "shell"]), "adb -s S …(1 arg)");
+        assert_eq!(redact_argv("adb", &["-s", "S", "shell", "pm", "list", "packages"]), "adb -s S shell pm …(2 args)");
         assert_eq!(redact_argv("xcrun", &["--find", "simctl"]), "xcrun --find simctl");
         assert_eq!(redact_argv("sw_vers", &[]), "sw_vers");
     }
