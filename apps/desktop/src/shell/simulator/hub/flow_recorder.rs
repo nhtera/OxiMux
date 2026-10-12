@@ -303,12 +303,15 @@ fn secret_warning(name: &str, field: Option<bool>) -> String {
 pub(crate) struct FlowRecorder {
     recordings: HashMap<RecKey, Recording>,
     next: u64,
+    /// Stopped recordings being saved: none starts under the key meanwhile,
+    /// so a failed save can put its recording back.
+    saving: std::collections::HashSet<RecKey>,
 }
 
 impl FlowRecorder {
     /// Start recording under `key`; false when one already runs.
     pub(crate) fn start(&mut self, key: RecKey, platform: &'static str, screen: Option<(f64, f64)>) -> bool {
-        if self.recordings.contains_key(&key) {
+        if self.recordings.contains_key(&key) || self.saving.contains(&key) {
             return false;
         }
         self.next += 1;
@@ -316,10 +319,26 @@ impl FlowRecorder {
         true
     }
 
-    /// Put back a stopped recording whose save failed (unless another
-    /// started meanwhile).
-    pub(crate) fn restore(&mut self, key: RecKey, recording: Recording) {
-        self.recordings.entry(key).or_insert(recording);
+    /// Whether a stopped recording is being saved under `key`.
+    pub(crate) fn is_saving(&self, key: &RecKey) -> bool {
+        self.saving.contains(key)
+    }
+
+    /// Stop the recording under `key` to save it: until [`Self::saved`],
+    /// nothing starts under the key.
+    pub(crate) fn stop_to_save(&mut self, key: &RecKey) -> Option<Recording> {
+        let recording = self.recordings.remove(key)?;
+        self.saving.insert(key.clone());
+        Some(recording)
+    }
+
+    /// The save of a recording stopped by [`Self::stop_to_save`] ended; a
+    /// failed one (`Some`) puts it back.
+    pub(crate) fn saved(&mut self, key: RecKey, failed: Option<Recording>) {
+        self.saving.remove(&key);
+        if let Some(recording) = failed {
+            self.recordings.insert(key, recording);
+        }
     }
 
     pub(crate) fn get(&self, key: &RecKey) -> Option<&Recording> {
@@ -542,6 +561,18 @@ mod tests {
         assert!(r.steps.is_empty());
         r.panel(PanelStep::Backspace);
         assert!(r.steps.is_empty() && r.warnings.len() == 1);
+    }
+
+    #[test]
+    fn nothing_starts_while_a_stopped_recording_is_saved() {
+        let mut flows = FlowRecorder::default();
+        let k = key(RecSource::Agent);
+        flows.start(k.clone(), "ios", None);
+        flows.get_mut(&k).unwrap().push(vec!["tap 1 2".into()]);
+        let recording = flows.stop_to_save(&k).unwrap();
+        assert!(!flows.start(k.clone(), "ios", None), "not while saving");
+        flows.saved(k.clone(), Some(recording));
+        assert_eq!(flows.get(&k).map(|r| r.count()), Some(1), "a failed save keeps the steps");
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str,
                 let _ = super::ax_lookup::scale(hub, udid, &session, cx).await;
             }
             hub.update(cx, |hub, cx| {
+            if hub.flows().is_saving(&key) {
+                return Err(SimErrorWire::Refused("the last recording is still being saved; try again in a moment".into()));
+            }
             let screen = screen_points(hub, udid);
             if hub.flows_mut().start(key.clone(), platform(udid), screen) {
                 cx.emit(HubEvent::Flow);
@@ -35,18 +38,23 @@ pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str,
             // Stopped first, so what is saved is what is returned; a failed
             // save puts it back.
             let stopped = hub.update(cx, |hub, cx| {
-                let stopped = hub.flows_mut().stop(&key);
+                let flows = hub.flows_mut();
+                let stopped = if save { flows.stop_to_save(&key) } else { flows.stop(&key) };
                 cx.emit(HubEvent::Flow);
                 stopped
             });
             let recording = stopped.ok_or_else(|| SimErrorWire::Refused("nothing is recording; start with `oximux sim flow start`".into()))?;
             let saved = if save {
                 let (worktree, text) = (key.0.clone(), recording.text());
-                match cx.background_executor().spawn(async move { crate::shell::simulator::hub::save_flow(&worktree, &text) }).await {
-                    Ok(path) => Some(path.to_string_lossy().into_owned()),
+                let path = cx.background_executor().spawn(async move { crate::shell::simulator::hub::save_flow(&worktree, &text) }).await;
+                match path {
+                    Ok(path) => {
+                        hub.update(cx, |hub, _| hub.flows_mut().saved(key, None));
+                        Some(path.to_string_lossy().into_owned())
+                    }
                     Err(why) => {
                         hub.update(cx, |hub, cx| {
-                            hub.flows_mut().restore(key, recording);
+                            hub.flows_mut().saved(key, Some(recording));
                             cx.emit(HubEvent::Flow);
                         });
                         return Err(SimErrorWire::Failed(format!("{why}; still recording — retry, or `flow stop --out FILE`")));

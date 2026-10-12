@@ -35,11 +35,17 @@ pub async fn run(client: &Client, worktree: &Path, args: RunArgs) -> Outcome {
     let mut todo = Vec::new();
     for step in &all[args.from - 1..] {
         let bad = |why: String| Failure::new("usage", exit::USAGE, format!("step {} (line {}): {why}: {}", step.n, step.line, step.text));
-        // Parsed and checked as written (placeholders and all), then the
-        // secrets put in: a value never becomes a flag, and no error shows one.
-        steps::check(steps::command(&step.words).map_err(bad)?).map_err(bad)?;
-        let mut command = steps::command(&step.words).map_err(bad)?;
-        steps::substitute(&mut command).map_err(bad)?;
+        // Parsed as written (placeholders and all), then the secrets put in
+        // — a value never becomes a flag — then checked with them (a payload
+        // path from a secret must exist), an error naming none of them.
+        let filled = || -> Result<(SimCommand, Vec<String>), String> {
+            let mut command = steps::command(&step.words)?;
+            let secrets = steps::substitute(&mut command)?;
+            Ok((command, secrets))
+        };
+        let (checked, secrets) = filled().map_err(bad)?;
+        steps::check(checked).map_err(|why| bad(steps::redact(&why, &secrets)))?;
+        let (mut command, secrets) = filled().map_err(bad)?;
         if args.settle
             && let Some(settle) = command.settle_args_mut()
         {
@@ -51,9 +57,9 @@ pub async fn run(client: &Client, worktree: &Path, args: RunArgs) -> Outcome {
             client.require_version(needed, verb).map_err(|f| at(f, step, &args.file))?;
         }
         let Command::Sim { command, .. } = command else { unreachable!("built just above") };
-        todo.push((step, command));
+        todo.push((step, command, secrets));
     }
-    let changes: Vec<String> = todo.iter().filter(|(_, c)| changes_state(c)).map(|(s, _)| s.text.clone()).collect();
+    let changes: Vec<String> = todo.iter().filter(|(_, c, _)| changes_state(c)).map(|(s, _, _)| s.text.clone()).collect();
     if !changes.is_empty() {
         client.require_version(SIMULATOR_FLOW_MIN_VERSION, "sim run with steps that change device state")?;
         match call(client, worktree, SimCmdWire::Flow(SimFlowCmdWire::ApproveRun { lines: changes }), APPROVAL).await? {
@@ -62,14 +68,21 @@ pub async fn run(client: &Client, worktree: &Path, args: RunArgs) -> Outcome {
         }
     }
     let (mut ran, mut human) = (Vec::new(), Vec::new());
-    for (step, command) in todo {
+    for (step, command, secrets) in todo {
         // Boxed: `sim::run` is what dispatched here.
         match Box::pin(crate::commands::sim::run(client, Some(worktree.to_path_buf()), command)).await {
             Ok((value, said)) => {
+                // A report can repeat what was typed or tapped ("opened …").
+                let said = steps::redact(&said, &secrets);
+                let value = if secrets.is_empty() { value } else { serde_json::from_str(&steps::redact(&value.to_string(), &secrets)).unwrap_or(value) };
                 human.push(format!("{:>3}  {}\n     {}", step.n, step.text, said.replace('\n', "\n     ")));
                 ran.push(json!({ "step": step.n, "line": step.text, "result": value }));
             }
-            Err(failure) => return Err(at(failure, step, &args.file)),
+            // The host may echo what it was given (a label): no secret in it.
+            Err(failure) => {
+                let message = steps::redact(&failure.message, &secrets);
+                return Err(at(Failure { message, ..failure }, step, &args.file));
+            }
         }
     }
     let count = ran.len();

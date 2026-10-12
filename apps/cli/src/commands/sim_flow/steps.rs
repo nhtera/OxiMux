@@ -102,10 +102,22 @@ pub fn command(words: &[String]) -> Result<SimCommand, String> {
 /// only ever show the placeholder. Only `SECRET_` names are read — a flow
 /// file cannot reach any other variable (a token in an `open-url`) — and
 /// `$${` is a literal `${`.
-pub fn substitute(command: &mut SimCommand) -> Result<(), String> {
-    let var = |name: &str| std::env::var(name).ok();
+///
+/// Returns the values put in, so an error about the step can blank them.
+pub fn substitute(command: &mut SimCommand) -> Result<Vec<String>, String> {
+    let used = std::cell::RefCell::new(Vec::new());
+    let var = |name: &str| {
+        let value = std::env::var(name).ok();
+        used.borrow_mut().extend(value.clone());
+        value
+    };
     let sub = |s: &mut String| -> Result<(), String> {
         *s = substitute_word(s, &var)?;
+        Ok(())
+    };
+    let path = |p: &mut std::path::PathBuf| -> Result<(), String> {
+        let text = p.to_string_lossy().into_owned();
+        *p = substitute_word(&text, &var)?.into();
         Ok(())
     };
     let element = |e: &mut crate::cli_sim::ElementArgs| -> Result<(), String> {
@@ -121,9 +133,25 @@ pub fn substitute(command: &mut SimCommand) -> Result<(), String> {
         }
         SimCommand::OpenUrl { url, .. } => sub(url),
         SimCommand::Launch { bundle_id, .. } => sub(bundle_id),
-        // No other verb takes a secret: a placeholder there stays as written.
+        SimCommand::Install { path: p } => path(p),
+        SimCommand::Push(push) => {
+            sub(&mut push.app)?;
+            path(&mut push.file)
+        }
+        SimCommand::Privacy(privacy) => {
+            sub(&mut privacy.service)?;
+            sub(&mut privacy.app)
+        }
+        SimCommand::Attach { device, .. } => device.iter_mut().try_for_each(sub),
+        // The rest take numbers, names from a fixed list, or nothing.
         _ => Ok(()),
-    }
+    }?;
+    Ok(used.into_inner())
+}
+
+/// `message` with each of `secrets` blanked.
+pub fn redact(message: &str, secrets: &[String]) -> String {
+    secrets.iter().filter(|s| !s.is_empty()).fold(message.to_owned(), |m, s| m.replace(s.as_str(), "[redacted]"))
 }
 
 /// What the CLI checks of `command` before sending it (argument shapes
@@ -243,7 +271,8 @@ mod tests {
         // SAFETY: a variable only this test reads.
         unsafe { std::env::set_var("SECRET_STEPS_TEST", "--paste") };
         let mut cmd = command(&words("type \"${SECRET_STEPS_TEST}\"")).unwrap();
-        substitute(&mut cmd).unwrap();
+        assert_eq!(substitute(&mut cmd).unwrap(), ["--paste"]);
+        assert_eq!(redact("cannot read --paste/x", &["--paste".into()]), "cannot read [redacted]/x");
         match cmd {
             SimCommand::Type { text, paste, .. } => assert_eq!((text, paste), (vec!["--paste".to_owned()], false), "a value, not a flag"),
             other => panic!("{other:?}"),
