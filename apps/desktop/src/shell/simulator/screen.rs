@@ -56,6 +56,9 @@ pub(crate) enum ScreenEvent {
     Recorded(u64, crate::shell::simulator::hub::PanelStep),
     /// An unfocused grid tile was clicked: focus it (no touch was sent).
     Focus,
+    /// A chord pressed while a grid tile has the keyboard: for that tile's
+    /// device (see [`Binding::local_commands`]).
+    Command(super::panel::SimCommand),
 }
 
 impl gpui::EventEmitter<ScreenEvent> for ScreenView {}
@@ -83,11 +86,15 @@ pub(crate) struct Binding {
     pub inspect: bool,
     /// Paint at most [`REDUCED_FPS`] (an unfocused tile).
     pub throttle: bool,
+    /// The simulator chords (⌘⇧H, ⌘L, ⌘←/→, ⌘S, ⌘R) are emitted as
+    /// [`ScreenEvent::Command`] for this screen's device (a grid tile)
+    /// instead of reaching the root, which acts on the active worktree's.
+    pub local_commands: bool,
 }
 
 impl Binding {
     /// Off screen, nothing bound.
-    pub(crate) const NONE: Self = Self { device: None, visible: false, radius: 0.0, focused: true, inspect: true, throttle: false };
+    pub(crate) const NONE: Self = Self { device: None, visible: false, radius: 0.0, focused: true, inspect: true, throttle: false, local_commands: false };
 }
 
 pub struct ScreenView {
@@ -502,6 +509,9 @@ impl Render for ScreenView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_paste));
+        if self.binding.local_commands {
+            screen = keys::local_commands(screen, cx);
+        }
         #[cfg(target_os = "macos")]
         let picture = self.picture.as_ref().map(|p| p.buffer().clone());
         #[cfg(not(target_os = "macos"))]

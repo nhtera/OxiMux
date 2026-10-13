@@ -410,6 +410,8 @@ impl SimulatorPanel {
                 super::screen::ScreenEvent::Picked(picked) => panel.picked(picked.clone(), cx),
                 super::screen::ScreenEvent::Recorded(owner, step) => panel.record_owned(*owner, step.clone(), cx),
                 super::screen::ScreenEvent::Focus => panel.focus_tile(None, cx),
+                // The panel's own screen leaves its chords to the root.
+                super::screen::ScreenEvent::Command(_) => {}
             }));
             self.screen = Some(screen);
         }

@@ -197,7 +197,10 @@ impl SimulatorPanel {
             // looking at that device here.
             let worktree = self.tiles[i].worktree.clone();
             let content = match self.render_consent_for(&worktree, cx) {
-                Some(question) => div().flex().size_full().items_center().justify_center().p(px(gap)).child(question).into_any_element(),
+                Some(question) => {
+                    self.unbind_tile(i, window, cx);
+                    div().flex().size_full().items_center().justify_center().p(px(gap)).child(question).into_any_element()
+                }
                 None => self.tile_content(i, window, cx),
             };
             cells.push(self.render_tile(Some(self.tiles[i].viewer), content, cx));
@@ -280,6 +283,7 @@ impl SimulatorPanel {
             Phase::Idle => (Some("Not streaming.".to_owned()), Some(TileAction::Start)),
         };
         if let Some(line) = line {
+            self.unbind_tile(i, window, cx);
             return self.tile_stopped(&line, worktree, device, action, cx);
         }
         let (theme, typography) = (self.theme, self.typography.clone());
@@ -287,10 +291,10 @@ impl SimulatorPanel {
             Some(screen) => screen,
             None => {
                 let screen = cx.new(|cx| ScreenView::new(hub, theme, typography.clone(), window, cx));
-                let events = cx.subscribe(&screen, move |panel, _, event: &ScreenEvent, cx| {
-                    if matches!(event, ScreenEvent::Focus) {
-                        panel.focus_tile(Some(viewer), cx);
-                    }
+                let events = cx.subscribe(&screen, move |panel, _, event: &ScreenEvent, cx| match event {
+                    ScreenEvent::Focus => panel.focus_tile(Some(viewer), cx),
+                    ScreenEvent::Command(command) => panel.run_tile_command(viewer, *command, cx),
+                    ScreenEvent::Picked(_) | ScreenEvent::Recorded(..) => {}
                 });
                 self.tiles[i].screen = Some(screen.clone());
                 self.tiles[i]._events = Some(events);
@@ -306,12 +310,35 @@ impl SimulatorPanel {
             // A pick is sent to the active worktree's agent: only its device.
             inspect: false,
             throttle: !focused,
+            // Its chords are for its own device, not the active worktree's.
+            local_commands: true,
         };
         screen.update(cx, |screen, cx| {
             screen.bind(binding, theme, &typography, window, cx);
             screen.set_recording(None, cx);
         });
         screen.into_any_element()
+    }
+
+    /// Tile `i`'s screen gave way to a question or a line: unbind it, which
+    /// lifts a finger still down and stops it taking frames.
+    fn unbind_tile(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(screen) = self.tiles[i].screen.clone() {
+            let (theme, typography) = (self.theme, self.typography.clone());
+            screen.update(cx, |screen, cx| screen.bind(Binding::NONE, theme, &typography, window, cx));
+        }
+    }
+
+    /// A tile's header was clicked: focus it, typing included.
+    fn focus_tile_keyboard(&mut self, viewer: Option<ViewerId>, window: &mut Window, cx: &mut Context<Self>) {
+        let screen = match viewer {
+            None => self.screen.clone(),
+            Some(v) => self.tiles.iter().find(|t| t.viewer == v).and_then(|t| t.screen.clone()),
+        };
+        if let Some(screen) = screen {
+            screen.update(cx, |screen, cx| screen.take_keyboard(window, cx));
+        }
+        self.focus_tile(viewer, cx);
     }
 
     /// A tile that is not streaming: why, and how to start it.
@@ -381,6 +408,7 @@ impl SimulatorPanel {
         });
         let tip = if active { "An agent is using this device" } else { "Agents may control this device" };
         let header = div()
+            .on_mouse_down(MouseButton::Left, cx.listener(move |panel, _, window, cx| panel.focus_tile_keyboard(viewer, window, cx)))
             .flex()
             .flex_row()
             .items_center()

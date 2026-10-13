@@ -72,6 +72,7 @@ impl SimulatorPanel {
                     focused,
                     inspect: true,
                     throttle: !focused,
+                    local_commands: false,
                 };
                 match self.live_screen(binding, window, cx) {
                     Some(screen) => screen.into_any_element(),

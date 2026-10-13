@@ -7,17 +7,18 @@
 
 use std::path::PathBuf;
 
-use gpui::{Action, Context, Window};
+use gpui::{Action, App, Context, Entity, Window};
 
 use super::SimulatorPanel;
 use crate::actions::{
     SimActionButton, SimAnnotate, SimBack, SimDetach, SimHome, SimLock, SimOpenLogs, SimRecents, SimRotateCcw,
     SimRotateCw, SimScreenshot, SimShutdown, SimToggleKeyboard, SimToggleRecord, SimVolumeDown, SimVolumeUp,
 };
-use oximux_simulator::Source;
+use oximux_simulator::viewers::ViewerId;
+use oximux_simulator::{DeviceId, Source};
 use oximux_simulator::caps::{ButtonSet, DeviceCaps};
 
-use crate::shell::simulator::hub::{HardwareButton, is_udid};
+use crate::shell::simulator::hub::{HardwareButton, SimulatorHub, is_udid};
 use crate::shell::simulator::state::PanelState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,55 +128,40 @@ impl SimulatorPanel {
             return Outcome::NotStreaming;
         }
         let before = hub.read(cx).session(&udid).map(|s| s.orientation());
-        let sent = match command {
-            SimCommand::Home => hub.read(cx).home(&udid),
-            SimCommand::Lock => hub.read(cx).lock(&udid),
-            SimCommand::Back => hub.read(cx).back(&udid),
-            SimCommand::Recents => hub.read(cx).recents(&udid),
-            SimCommand::VolumeUp => hub.read(cx).press_hardware(&udid, HardwareButton::VolumeUp),
-            SimCommand::VolumeDown => hub.read(cx).press_hardware(&udid, HardwareButton::VolumeDown),
-            SimCommand::ActionButton => hub.read(cx).press_hardware(&udid, HardwareButton::Action),
-            SimCommand::RotateCw | SimCommand::RotateCcw => {
-                hub.update(cx, |hub, cx| hub.rotate(&udid, command == SimCommand::RotateCw, cx))
-            }
-            SimCommand::Screenshot => {
-                hub.update(cx, |hub, cx| hub.screenshot(&udid, cx));
-                true
-            }
-            SimCommand::ToggleRecord => {
-                hub.update(cx, |hub, cx| hub.toggle_recording(&udid, cx));
-                true
-            }
-            SimCommand::Annotate => {
-                self.start_annotating(window, cx);
-                true
-            }
-            SimCommand::ToggleKeyboard => {
-                if let Some(screen) = self.screen.clone() {
-                    screen.update(cx, |screen, cx| screen.toggle_capture(window, cx));
+        let sent = match device_command(&hub, &udid, command, cx) {
+            Some(sent) => sent,
+            None => match command {
+                SimCommand::Annotate => {
+                    self.start_annotating(window, cx);
+                    true
                 }
-                true
-            }
-            SimCommand::OpenLogs => {
-                let Some(cwd) = self.worktree.clone() else { return Outcome::NoDevice };
-                let title = format!("{} log", self.device_name(cx));
-                let script = match udid.source() {
-                    // The id lands in a shell command line: only a well-formed one.
-                    Source::Simctl if is_udid(udid.as_str()) => log_script(udid.as_str()),
-                    Source::Simctl | Source::Devicectl => return Outcome::NoDevice,
-                    Source::Adb => match hub.read(cx).logcat_script(&udid) {
-                        Some(script) => script,
-                        None => return Outcome::NotStreaming,
-                    },
-                };
-                return Outcome::OpenLogs { cwd, title, script };
-            }
-            SimCommand::Shutdown => {
-                self.confirm_shutdown = true;
-                cx.notify();
-                true
-            }
-            SimCommand::Detach => unreachable!("handled above"),
+                SimCommand::ToggleKeyboard => {
+                    if let Some(screen) = self.screen.clone() {
+                        screen.update(cx, |screen, cx| screen.toggle_capture(window, cx));
+                    }
+                    true
+                }
+                SimCommand::OpenLogs => {
+                    let Some(cwd) = self.worktree.clone() else { return Outcome::NoDevice };
+                    let title = format!("{} log", self.device_name(cx));
+                    let script = match udid.source() {
+                        // The id lands in a shell command line: only a well-formed one.
+                        Source::Simctl if is_udid(udid.as_str()) => log_script(udid.as_str()),
+                        Source::Simctl | Source::Devicectl => return Outcome::NoDevice,
+                        Source::Adb => match hub.read(cx).logcat_script(&udid) {
+                            Some(script) => script,
+                            None => return Outcome::NotStreaming,
+                        },
+                    };
+                    return Outcome::OpenLogs { cwd, title, script };
+                }
+                SimCommand::Shutdown => {
+                    self.confirm_shutdown = true;
+                    cx.notify();
+                    true
+                }
+                _ => unreachable!("device commands and Detach are handled above"),
+            },
         };
         if !sent {
             return Outcome::NotStreaming;
@@ -184,6 +170,19 @@ impl SimulatorPanel {
             self.record_command(command, before, cx);
         }
         Outcome::Done
+    }
+
+    /// A chord pressed while grid tile `viewer` has the keyboard: on that
+    /// tile's device (its screen takes the keyboard only while it streams).
+    /// Flow recording stays with the active worktree's device.
+    pub(super) fn run_tile_command(&mut self, viewer: ViewerId, command: SimCommand, cx: &mut Context<Self>) {
+        let Some(hub) = self.hub.clone() else { return };
+        let Some(udid) = self.tiles.iter().find(|t| t.viewer == viewer).and_then(|t| hub.read(cx).device_for(&t.worktree)) else {
+            return;
+        };
+        if command.allowed(&hub.read(cx).caps(&udid)) && device_command(&hub, &udid, command, cx) == Some(false) {
+            tracing::debug!(%udid, ?command, "simulator tile command not sent: no stream");
+        }
     }
 
     /// The confirmation's answer.
@@ -199,6 +198,33 @@ impl SimulatorPanel {
         }
         cx.notify();
     }
+}
+
+/// `command` on `udid`, when it is one that acts on the device alone:
+/// whether it was sent (`false`: no stream). `None` for the panel's own
+/// commands (annotate, the keyboard, logs, shut down, detach).
+fn device_command(hub: &Entity<SimulatorHub>, udid: &DeviceId, command: SimCommand, cx: &mut App) -> Option<bool> {
+    Some(match command {
+        SimCommand::Home => hub.read(cx).home(udid),
+        SimCommand::Lock => hub.read(cx).lock(udid),
+        SimCommand::Back => hub.read(cx).back(udid),
+        SimCommand::Recents => hub.read(cx).recents(udid),
+        SimCommand::VolumeUp => hub.read(cx).press_hardware(udid, HardwareButton::VolumeUp),
+        SimCommand::VolumeDown => hub.read(cx).press_hardware(udid, HardwareButton::VolumeDown),
+        SimCommand::ActionButton => hub.read(cx).press_hardware(udid, HardwareButton::Action),
+        SimCommand::RotateCw | SimCommand::RotateCcw => hub.update(cx, |hub, cx| hub.rotate(udid, command == SimCommand::RotateCw, cx)),
+        SimCommand::Screenshot => {
+            hub.update(cx, |hub, cx| hub.screenshot(udid, cx));
+            true
+        }
+        SimCommand::ToggleRecord => {
+            hub.update(cx, |hub, cx| hub.toggle_recording(udid, cx));
+            true
+        }
+        SimCommand::Annotate | SimCommand::ToggleKeyboard | SimCommand::OpenLogs | SimCommand::Shutdown | SimCommand::Detach => {
+            return None;
+        }
+    })
 }
 
 #[cfg(test)]

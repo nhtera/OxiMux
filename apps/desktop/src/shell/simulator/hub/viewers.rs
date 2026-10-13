@@ -32,6 +32,11 @@ use super::SimulatorHub;
 pub(crate) const REDUCED_FPS: f64 = 10.0;
 /// An unfocused tile's scale, as a fraction of the user's.
 const REDUCED_SCALE: f64 = 0.5;
+/// A failed profile change is sent once more after this long: the registry
+/// already counts it as applied, so nothing else would send it again.
+const PROFILE_RETRY: Duration = Duration::from_secs(1);
+/// How long one profile change may take.
+const PROFILE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One device's configure calls: taken in turn, newest wins.
 #[derive(Default)]
@@ -88,11 +93,19 @@ impl SimulatorHub {
             .unwrap_or_default();
         let (scale, fps) = self.stream_values(udid, &session, f64::from(stream.effective_scale()), f64::from(stream.fps));
         tracing::debug!(%udid, scale, fps, "simulator stream profile");
-        let target = udid.clone();
+        let (target, udid_for_retry) = (udid.clone(), udid.clone());
         // Quietly: the key frame (or JPEG size) it brings is not change on
-        // screen to an agent's settle.
-        self.in_turn(udid, cx, move || session.restream(scale, fps, Duration::from_secs(5)).map(drop), move |e| {
-            tracing::debug!(udid = %target, "simulator stream profile change failed: {e}");
+        // screen to an agent's settle. A newer change queued meanwhile still
+        // runs after the retry, so the newest one wins either way.
+        let call = move || {
+            session.restream(scale, fps, PROFILE_TIMEOUT).or_else(|e| {
+                tracing::debug!(udid = %udid_for_retry, "simulator stream profile change failed, retrying: {e}");
+                std::thread::sleep(PROFILE_RETRY);
+                session.restream(scale, fps, PROFILE_TIMEOUT)
+            })
+        };
+        self.in_turn(udid, cx, move || call().map(drop), move |e| {
+            tracing::warn!(udid = %target, "simulator stream profile change failed: {e}");
         });
     }
 
