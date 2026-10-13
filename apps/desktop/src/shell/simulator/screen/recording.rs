@@ -152,10 +152,21 @@ impl Recorder {
 
     /// A step known now, after any still being worked out.
     fn ready(&mut self, step: PanelStep, cx: &mut Context<ScreenView>) {
-        let Some(owner) = self.owner else { return };
+        if let Some(owner) = self.owner {
+            self.ready_for(owner, step, cx);
+        }
+    }
+
+    /// A step of recording `owner` known now, after any still being worked
+    /// out.
+    fn ready_for(&mut self, owner: u64, step: PanelStep, cx: &mut Context<ScreenView>) {
+        self.push_done(owner, step);
+        self.flush(cx);
+    }
+
+    fn push_done(&mut self, owner: u64, step: PanelStep) {
         self.next += 1;
         self.queue.push_back((self.next, owner, Slot::Done(Some(step))));
-        self.flush(cx);
     }
 
     /// Hand on the steps known, in order, each to the recording it went to
@@ -417,13 +428,12 @@ impl ScreenView {
         steps
     }
 
-    /// A step from outside the screen (a toolbar button), in line with the
-    /// screen's own.
-    pub(crate) fn record_step(&mut self, step: PanelStep, cx: &mut Context<Self>) {
-        if self.recorder.owner.is_some() {
-            self.rec_input();
-            self.recorder.ready(step, cx);
-        }
+    /// A step of recording `owner` from outside the screen (a toolbar
+    /// button), in line with the screen's own — named by the panel, so it
+    /// goes where it was meant even before the screen has heard of `owner`.
+    pub(crate) fn record_step(&mut self, owner: u64, step: PanelStep, cx: &mut Context<Self>) {
+        self.rec_input();
+        self.recorder.ready_for(owner, step, cx);
     }
 
     /// Text pasted into the device while recording.
@@ -516,7 +526,13 @@ mod tests {
             rec.queue.iter_mut().find(|(s, _, _)| *s == seq).unwrap().2 = Slot::Done(Some(PanelStep::Backspace));
         }
         assert!(!rec.waits(1) && rec.waits(2));
-        assert_eq!(rec.drain(1).len(), 2, "recording 1's own steps");
+        // A toolbar step names its recording: in line for it, whatever the
+        // screen has heard of.
+        rec.owner = None;
+        rec.push_done(1, PanelStep::Button(oximux_remote_proto::simulator::SimButtonWire::Home));
+        let mine = rec.drain(1);
+        assert_eq!(mine.len(), 3, "recording 1's own steps");
+        assert!(matches!(mine.last(), Some(PanelStep::Button(_))), "its toolbar step last");
         assert_eq!(rec.queue.iter().map(|(s, o, _)| (*s, *o)).collect::<Vec<_>>(), [(other, 2)], "recording 2's stay in line");
     }
 

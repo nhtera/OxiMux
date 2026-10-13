@@ -50,6 +50,11 @@ impl SimulatorPanel {
                 cx.emit(HubEvent::Flow);
             }
         });
+        // The screen takes input for it from now, not from its next render.
+        let owner = self.flow_id(cx);
+        if let Some(screen) = self.screen.clone() {
+            screen.update(cx, |screen, cx| screen.set_recording(owner, cx));
+        }
     }
 
     /// Stop: save it privately, copy the steps, and say where it went.
@@ -121,13 +126,6 @@ impl SimulatorPanel {
         }
     }
 
-    /// One piece of the user's input, while recording.
-    pub(super) fn record_panel(&mut self, step: PanelStep, cx: &mut Context<Self>) {
-        if let Some(key) = self.rec_key(cx) {
-            self.record_into(&key, step, cx);
-        }
-    }
-
     fn record_into(&mut self, key: &(WorktreeKey, DeviceId, RecSource), step: PanelStep, cx: &mut Context<Self>) {
         let Some(hub) = self.hub.clone() else { return };
         hub.update(cx, |hub, cx| {
@@ -163,10 +161,11 @@ impl SimulatorPanel {
             _ => return,
         };
         // In line with the screen's taps and typing (a tap may still be
-        // reading its element).
+        // reading its element), for the recording shown now.
+        let Some(owner) = self.flow_id(cx) else { return };
         match self.screen.clone() {
-            Some(screen) => screen.update(cx, |screen, cx| screen.record_step(step, cx)),
-            None => self.record_panel(step, cx),
+            Some(screen) => screen.update(cx, |screen, cx| screen.record_step(owner, step, cx)),
+            None => self.record_owned(owner, step, cx),
         }
     }
 
