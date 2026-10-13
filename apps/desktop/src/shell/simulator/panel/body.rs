@@ -47,7 +47,7 @@ impl SimulatorPanel {
         let screen: AnyElement = match state {
             PanelState::Checking => self.centered_line("Checking for Xcode and the simulator runtime…"),
             PanelState::Setup(availability) => self.render_setup(availability),
-            PanelState::Empty { .. } if grid => self.render_empty_tile(cx),
+            PanelState::Empty { error } if grid => self.render_empty_tile(error.as_deref(), cx),
             PanelState::Empty { error } => self.render_empty(error.as_deref(), cx),
             PanelState::Attaching => self.centered_line("Finding a simulator…"),
             PanelState::Booting => self.centered_line(&format!("Booting {}…", self.device_name(cx))),
@@ -202,7 +202,7 @@ impl SimulatorPanel {
     }
 
     /// The active worktree's tile in the grid, with nothing attached.
-    fn render_empty_tile(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_empty_tile(&self, error: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
         let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
         let devices = self.devices(cx);
         self.screen()
@@ -215,6 +215,8 @@ impl SimulatorPanel {
                 ty.t_body_md,
                 theme.fg_muted,
             ))
+            // Why the last attach failed, as the full panel says it.
+            .children(error.map(|error| self.text(error.to_owned(), ty.t_body_sm, theme.status_error)))
             .child(div().w_full().child(self.attach_split_button(devices, cx)))
             .into_any_element()
     }

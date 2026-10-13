@@ -274,6 +274,9 @@ impl SimulatorPanel {
         // old one, and the new active device takes the focus.
         let replaced = self.swap_into_tile(key.as_deref(), cx);
         let (old, was_shown) = (self.worktree.take(), self.shown);
+        // Another spelling of the same worktree (`/tmp` vs `/private/tmp`):
+        // the viewer just set is the one a release would drop.
+        let same = self.worktree_key == key && shown;
         self.worktree_key = key;
         self.worktree = worktree;
         self.shown = shown;
@@ -285,7 +288,7 @@ impl SimulatorPanel {
                 if let Some(new) = new.as_ref().filter(|_| shown) {
                     hub.set_viewer(new, own, viewer, cx);
                 }
-                if let Some(old) = old.as_ref().filter(|_| was_shown) {
+                if let Some(old) = old.as_ref().filter(|_| was_shown && !same) {
                     hub.release_viewer(old, own, cx);
                 }
                 if let Some((worktree, tile)) = replaced {
