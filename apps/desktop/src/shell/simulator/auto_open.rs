@@ -62,6 +62,8 @@ pub(crate) enum Trigger {
 pub(crate) struct AutoOpen {
     last_opened: HashMap<WorktreeKey, Instant>,
     closed: HashSet<WorktreeKey>,
+    /// The worktrees whose close was already explained in a toast this run.
+    told: HashSet<WorktreeKey>,
     /// The worktree the panel is showing, and the sidebar showing it (its
     /// entity id), while it shows.
     shown_for: Option<(WorktreeKey, u64)>,
@@ -90,7 +92,11 @@ impl AutoOpen {
     /// worktree it was showing — closing the sidebar, picking another tab — is
     /// the user closing it; showing it again (by hand, or by an attach) takes
     /// that back. A project switch swaps the sidebar, so it is never a close.
-    pub(crate) fn visibility_changed(&mut self, visible: bool, active: Option<&Path>, surface: u64) {
+    ///
+    /// Returns whether this hide just closed it and the user has not been told
+    /// yet this run how to bring it back on that worktree: the caller then
+    /// toasts it, once per worktree.
+    pub(crate) fn visibility_changed(&mut self, visible: bool, active: Option<&Path>, surface: u64) -> bool {
         let active = active.map(WorktreeKey::from_path);
         if visible {
             if let Some(key) = &active {
@@ -101,8 +107,10 @@ impl AutoOpen {
             && on == surface
             && active.as_ref() == Some(&shown)
         {
-            self.closed.insert(shown);
+            self.closed.insert(shown.clone());
+            return self.told.insert(shown);
         }
+        false
     }
 
     /// The active worktree changed while the panel shows (it now shows that
@@ -111,6 +119,21 @@ impl AutoOpen {
         if let Some((_, surface)) = self.shown_for.take() {
             self.shown_for = active.map(|path| (WorktreeKey::from_path(path), surface));
         }
+    }
+}
+
+/// The worktrees told, this run, how to turn the feature back on after it was
+/// switched off in Settings: the toast says so once per worktree.
+#[derive(Debug, Default)]
+pub(crate) struct OffTold(HashSet<WorktreeKey>);
+
+impl Global for OffTold {}
+
+impl OffTold {
+    /// Whether the user, switching the feature off while on `worktree` (none:
+    /// no worktree open), has yet to be told about it there. Records it.
+    pub(crate) fn first_for(&mut self, worktree: Option<&Path>) -> bool {
+        self.0.insert(worktree.map_or_else(|| WorktreeKey::from_path(Path::new("")), WorktreeKey::from_path))
     }
 }
 
@@ -251,7 +274,7 @@ mod tests {
         let w = Path::new(W);
         assert!(policy.should_open(w, Trigger::ToolCall, t));
         policy.visibility_changed(true, Some(w), SIDEBAR);
-        policy.visibility_changed(false, Some(w), SIDEBAR);
+        assert!(policy.visibility_changed(false, Some(w), SIDEBAR), "the close is told");
         let later = t + RATE_LIMIT * 10;
         for trigger in [Trigger::ToolCall, Trigger::DeviceBooted, Trigger::Verb] {
             assert!(!policy.should_open(w, trigger, later), "{trigger:?} must respect the close");
@@ -298,5 +321,33 @@ mod tests {
         policy.visibility_changed(false, Some(other), SIDEBAR);
         assert!(!policy.should_open(other, Trigger::Verb, t));
         assert!(policy.should_open(w, Trigger::Verb, t));
+    }
+
+    /// The user is told how to bring a closed panel back once per worktree
+    /// per run: never for a hide they did not make, never twice.
+    #[test]
+    fn a_close_is_told_once_per_worktree() {
+        let mut policy = AutoOpen::default();
+        let (w, other) = (Path::new(W), Path::new("/nonexistent/other"));
+        assert!(!policy.visibility_changed(true, Some(w), SIDEBAR), "showing is not a close");
+        assert!(!policy.visibility_changed(false, None, SIDEBAR), "turning the feature off is not a close");
+        policy.visibility_changed(true, Some(w), SIDEBAR);
+        assert!(policy.visibility_changed(false, Some(w), SIDEBAR));
+        policy.visibility_changed(true, Some(w), SIDEBAR);
+        assert!(!policy.visibility_changed(false, Some(w), SIDEBAR), "already told");
+        assert!(!policy.visibility_changed(false, Some(w), SIDEBAR), "a second hide without a show is no close");
+        policy.visibility_changed(true, Some(other), SIDEBAR);
+        assert!(policy.visibility_changed(false, Some(other), SIDEBAR), "another worktree is told its own");
+    }
+
+    #[test]
+    fn switching_it_off_is_told_once_per_worktree() {
+        let mut told = OffTold::default();
+        let (w, other) = (Path::new(W), Path::new("/nonexistent/other"));
+        assert!(told.first_for(Some(w)));
+        assert!(!told.first_for(Some(w)));
+        assert!(told.first_for(Some(other)));
+        assert!(told.first_for(None));
+        assert!(!told.first_for(None));
     }
 }

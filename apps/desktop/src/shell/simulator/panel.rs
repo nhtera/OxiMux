@@ -47,6 +47,7 @@ mod flow_rec;
 mod pair_card;
 mod header;
 mod inspector;
+mod onboarding;
 mod recovery_row;
 mod iphone_control;
 mod toolbar;

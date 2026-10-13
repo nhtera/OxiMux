@@ -77,7 +77,8 @@ impl SimulatorPanel {
                 .render_consent_banner(cx)
                 .or_else(|| self.render_recovery_row(cx))
                 .or_else(|| self.render_picked(cx))
-                .or_else(|| self.render_crash_row(cx)),
+                .or_else(|| self.render_crash_row(cx))
+                .or_else(|| matches!(state, PanelState::Streaming).then(|| self.render_intro(cx)).flatten()),
         };
         let badge = self.render_agent_badge(cx);
         div()
@@ -179,6 +180,8 @@ impl SimulatorPanel {
         }
         self.screen()
             .child(top)
+            .child(div().h(px(density.pad_panel * 2.0)))
+            .child(self.render_examples(cx))
             .child(div().flex_1())
             .when(ios, |screen| screen.child(self.text(TRADEMARK, ty.t_sub_label, theme.fg_subtle)))
             .child(div().h(px(density.pad_panel)))

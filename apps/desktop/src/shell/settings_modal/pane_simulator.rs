@@ -10,7 +10,7 @@
 //! revokes them, through the hub so the grant in memory goes too. Granting
 //! happens only in the panel's consent banner.
 
-use gpui::{Anchor, AnyElement, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Subscription, div, prelude::FluentBuilder, px};
+use gpui::{Anchor, AnyElement, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder, px};
 use gpui_component::button::Button;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::Sizable as _;
@@ -113,8 +113,44 @@ fn enable_entry(s: &SimulatorSettings, theme: Theme, cx: &mut Context<SettingsMo
     entry(
         "Enable Mobile Emulator",
         "Shows the Mobile Emulator tab in the right sidebar and lets agents attach to a device.",
-        toggle_switch("sim-enabled", s.enabled, theme, |_, _, cx| change(cx, |s| s.enabled = !s.enabled), cx),
+        toggle_switch(
+            "sim-enabled",
+            s.enabled,
+            theme,
+            |_, window, cx| {
+                let was_on = crate::shell::simulator::panel::settings(cx).enabled;
+                change(cx, |s| s.enabled = !s.enabled);
+                if was_on {
+                    tell_switched_off(window, cx);
+                }
+            },
+            cx,
+        ),
     )
+}
+
+/// Switched off: say how to turn it back on, once per worktree per run.
+fn tell_switched_off(window: &mut Window, cx: &mut Context<SettingsModal>) {
+    use crate::shell::chrome::toast::{ToastAction, ToastKind, toast_with_actions};
+    use crate::shell::simulator::auto_open::OffTold;
+    let handle = window.window_handle();
+    let root = crate::platform::window_registry::workspace_for_window(cx, handle.window_id());
+    let worktree = root.and_then(|root| root.read(cx).active_worktree.clone());
+    if !cx.default_global::<OffTold>().first_for(worktree.as_deref()) {
+        return;
+    }
+    let modal = cx.weak_entity();
+    let open = ToastAction::new("Open Settings", move |cx| {
+        let modal = modal.clone();
+        // Deferred: this runs inside the toast layer's update.
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = modal.update(cx, |modal, cx| modal.open_to_pane(super::SettingsPane::Simulator, window, cx));
+            });
+        });
+    });
+    let text = "Mobile Emulator hidden for this worktree. Turn it back on in Settings → Mobile Emulator.";
+    toast_with_actions(cx, ToastKind::Info, text, vec![open]);
 }
 
 fn default_device_entry(hub: Option<&Entity<SimulatorHub>>, current: Option<&str>, cx: &mut Context<SettingsModal>) -> SettingEntry {

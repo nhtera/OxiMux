@@ -166,6 +166,10 @@ pub struct SimulatorSettings {
     /// The Android SDK folder, when not found on its own (`ANDROID_HOME`,
     /// `ANDROID_SDK_ROOT`, `~/Library/Android/sdk`). Chosen in Settings.
     pub android_sdk: Option<String>,
+    /// The panel's intro callout was dismissed ("Got it"). Not security
+    /// state: a lost or hand-edited value only shows the callout again.
+    #[serde(default)]
+    pub intro_seen: bool,
 }
 
 impl Default for SimulatorSettings {
@@ -178,6 +182,7 @@ impl Default for SimulatorSettings {
             idle_shutdown_minutes: 10,
             stream: StreamSettings::default(),
             android_sdk: None,
+            intro_seen: false,
         }
     }
 }
@@ -369,6 +374,7 @@ mod tests {
                 show_fps: true,
             },
             android_sdk: Some("/opt/android-sdk".to_string()),
+            intro_seen: true,
         };
         let parsed = SimulatorSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
         assert_eq!(parsed, s);
@@ -385,6 +391,8 @@ mod tests {
         assert!(!s.agent_control);
         assert!(s.auto_open);
         assert_eq!(s.stream.fps, 30);
+        // A file from before the intro callout has not seen it.
+        assert!(!s.intro_seen);
         // A file from before the Encoding menu streams H.264.
         let s = SimulatorSettings::from_toml_str("[stream]\nfps = 60\n").expect("parses");
         assert_eq!((s.stream.fps, s.stream.encoding), (60, Encoding::H264));
