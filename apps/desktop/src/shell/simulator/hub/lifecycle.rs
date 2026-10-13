@@ -123,6 +123,8 @@ fn new_hub(
         crash_watch: Default::default(),
         recovery: Default::default(),
         flows: Default::default(),
+        next_viewer: 0,
+        turns: HashMap::new(),
         started_at: Default::default(),
     })
 }

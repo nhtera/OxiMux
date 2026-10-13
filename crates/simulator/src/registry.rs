@@ -15,15 +15,17 @@
 //! - **Stale completions lose.** Every boot and session start carries a
 //!   generation; a result for any other generation is discarded, and a late
 //!   session is stopped rather than installed.
-//! - **Visibility is refcounted per device**: the helper is paused only when
-//!   no attached worktree shows it, and a device hidden for [`PARK_AFTER`] is
-//!   **parked** — its helper stopped, its attachments kept — until a viewer
-//!   shows it again.
+//! - **Visibility is counted per device** ([`crate::viewers`]): each panel,
+//!   tile or remote view of a worktree's device is a viewer. The helper is
+//!   paused only when no viewer shows it, and a device hidden for
+//!   [`PARK_AFTER`] is **parked** — its helper stopped, its attachments kept
+//!   — until a viewer shows it again. Its stream quality is the best any
+//!   shown viewer asks for.
 //!
 //! The session type is generic (`S`) so tests use a plain token; the app uses
 //! `StreamSession`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::viewers::{StreamProfile, Viewer, ViewerId, arbitrate};
 use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState, Source};
 
 /// An owned device is shut down this long after its last detach, unless
@@ -105,6 +108,8 @@ pub enum Effect<S> {
     StopSession { udid: DeviceId, session: S },
     Pause(S),
     Resume(S),
+    /// Stream this session at `profile` (see [`crate::viewers`]).
+    SetProfile { udid: DeviceId, session: S, profile: StreamProfile },
     /// `simctl shutdown` a device we booted.
     ShutdownDevice { udid: DeviceId },
     /// Attachments or owned boots changed: persist [`Registry::snapshot`].
@@ -145,7 +150,10 @@ struct Device<S> {
     /// We booted it, so we shut it down (never a user-booted device).
     owned: bool,
     attached: BTreeSet<WorktreeKey>,
-    visible: BTreeSet<WorktreeKey>,
+    /// The viewers of its attached worktrees (a copy of the registry's).
+    viewers: BTreeMap<(WorktreeKey, ViewerId), Viewer>,
+    /// The profile its session streams at (a fresh session: the user's).
+    profile: StreamProfile,
     /// Last detach of an owned device, for the idle shutdown.
     idle_since: Option<Instant>,
     /// Automatic restarts since the session last went live.
@@ -168,7 +176,8 @@ impl<S> Device<S> {
             boot_cancel: None,
             owned: false,
             attached: BTreeSet::new(),
-            visible: BTreeSet::new(),
+            viewers: BTreeMap::new(),
+            profile: StreamProfile::Full,
             idle_since: None,
             restarts: 0,
             paused: false,
@@ -184,9 +193,9 @@ pub struct Registry<S> {
     attachments: HashMap<WorktreeKey, DeviceId>,
     devices: HashMap<DeviceId, Device<S>>,
     next_generation: Generation,
-    /// Worktrees whose panel is visible, attached or not: a panel shown
-    /// before its attach lands must not start its helper paused.
-    visible: BTreeSet<WorktreeKey>,
+    /// Every worktree's viewers, attached or not: a panel shown before its
+    /// attach lands must not start its helper paused.
+    viewers: BTreeMap<(WorktreeKey, ViewerId), Viewer>,
     /// How long an owned, unattached device idles before it is shut down;
     /// `None` keeps it running.
     idle_shutdown: Option<Duration>,
@@ -198,7 +207,7 @@ impl<S> Default for Registry<S> {
             attachments: HashMap::new(),
             devices: HashMap::new(),
             next_generation: 1,
-            visible: BTreeSet::new(),
+            viewers: BTreeMap::new(),
             idle_shutdown: Some(IDLE_SHUTDOWN),
         }
     }
@@ -288,18 +297,16 @@ impl<S: Clone> Registry<S> {
         }
         self.attachments.insert(worktree.clone(), udid.clone());
         let generation = self.bump();
-        let shown = self.visible.contains(&worktree);
+        let viewers: Vec<_> = self.viewers_of(&worktree).collect();
         let device = self.device_mut(&udid);
-        if shown {
-            device.visible.insert(worktree.clone());
-        }
+        device.viewers.extend(viewers);
         device.attached.insert(worktree);
         device.idle_since = None;
         match device.phase {
             // Already coming up or up: join it — and resume it if this
             // viewer is the first to show it (a paused device would park).
             Phase::Booting { .. } | Phase::Starting { .. } | Phase::Live { .. } => {
-                effects.extend(pause_if_hidden(device, Some(now)));
+                effects.extend(follow_viewers(&udid, device, Some(now)));
             }
             Phase::Idle | Phase::Parked | Phase::Disconnected { .. } | Phase::Failed { .. } => {
                 device.restarts = 0;
@@ -318,7 +325,7 @@ impl<S: Clone> Registry<S> {
         let mut effects = Vec::new();
         let device = self.device_mut(&udid);
         device.attached.remove(worktree);
-        let was_visible = device.visible.remove(worktree);
+        device.viewers.retain(|(w, _), _| w != worktree);
         if device.attached.is_empty() {
             if let Some(cancel) = device.boot_cancel.take() {
                 cancel.store(true, Ordering::SeqCst);
@@ -332,37 +339,69 @@ impl<S: Clone> Registry<S> {
             if device.owned {
                 device.idle_since = Some(now);
             }
-        } else if was_visible {
-            effects.extend(pause_if_hidden(device, Some(now)));
+        } else {
+            effects.extend(follow_viewers(&udid, device, Some(now)));
         }
         effects.push(Effect::Persist);
         effects
     }
 
-    /// The panel for `worktree` became visible or hidden. Showing a parked
-    /// device starts a fresh helper for it.
+    /// The panel for `worktree` became visible or hidden: one
+    /// [`ViewerId::Panel`] viewer, at the user's stream settings.
     pub fn set_visible(&mut self, worktree: &WorktreeKey, visible: bool, now: Instant) -> Vec<Effect<S>> {
-        if visible {
-            self.visible.insert(worktree.clone());
-        } else {
-            self.visible.remove(worktree);
-        }
+        let viewer = Viewer { shown: true, profile: StreamProfile::Full };
+        self.put_viewer(worktree, ViewerId::Panel(0), visible.then_some(viewer), now)
+    }
+
+    /// Add or update a viewer of `worktree`'s device (attached now or
+    /// later). A shown viewer of a parked device starts a fresh helper.
+    pub fn set_viewer(&mut self, worktree: &WorktreeKey, id: ViewerId, viewer: Viewer, now: Instant) -> Vec<Effect<S>> {
+        self.put_viewer(worktree, id, Some(viewer), now)
+    }
+
+    /// The viewer went away (its tile closed, its window too).
+    pub fn release_viewer(&mut self, worktree: &WorktreeKey, id: ViewerId, now: Instant) -> Vec<Effect<S>> {
+        self.put_viewer(worktree, id, None, now)
+    }
+
+    fn put_viewer(&mut self, worktree: &WorktreeKey, id: ViewerId, viewer: Option<Viewer>, now: Instant) -> Vec<Effect<S>> {
+        let key = (worktree.clone(), id);
+        match viewer {
+            Some(v) => self.viewers.insert(key.clone(), v),
+            None => self.viewers.remove(&key),
+        };
         let Some(udid) = self.attachments.get(worktree).cloned() else { return Vec::new() };
-        let unpark = visible && self.devices.get(&udid).is_some_and(|d| d.phase == Phase::Parked);
+        let shown = viewer.is_some_and(|v| v.shown);
+        let unpark = shown && self.devices.get(&udid).is_some_and(|d| d.phase == Phase::Parked);
         // Only a restart moves the generation (the watcher keys on it).
         let generation = if unpark { self.bump() } else { self.next_generation };
         let device = self.device_mut(&udid);
-        if visible {
-            device.visible.insert(worktree.clone());
-        } else {
-            device.visible.remove(worktree);
-        }
+        match viewer {
+            Some(v) => device.viewers.insert(key, v),
+            None => device.viewers.remove(&key),
+        };
         if unpark {
             device.restarts = 0;
             device.phase = Phase::Starting { generation };
             return vec![Effect::StartSession { udid, generation }];
         }
-        pause_if_hidden(device, Some(now)).into_iter().collect()
+        follow_viewers(&udid, device, Some(now))
+    }
+
+    /// The profile `udid`'s session streams at.
+    pub fn profile(&self, udid: &DeviceId) -> StreamProfile {
+        self.devices.get(udid).map_or(StreamProfile::Full, |d| d.profile)
+    }
+
+    /// Every attachment, by worktree.
+    pub fn attachments(&self) -> Vec<(WorktreeKey, DeviceId)> {
+        let mut out: Vec<_> = self.attachments.iter().map(|(w, d)| (w.clone(), d.clone())).collect();
+        out.sort();
+        out
+    }
+
+    fn viewers_of<'a>(&'a self, worktree: &'a WorktreeKey) -> impl Iterator<Item = ((WorktreeKey, ViewerId), Viewer)> + 'a {
+        self.viewers.iter().filter(move |((w, _), _)| w == worktree).map(|(k, v)| (k.clone(), *v))
     }
 
     /// An agent started or stopped driving `udid`. While it drives, the
@@ -372,7 +411,7 @@ impl<S: Clone> Registry<S> {
     pub fn set_agent_active(&mut self, udid: &DeviceId, active: bool, now: Instant) -> Vec<Effect<S>> {
         let Some(device) = self.devices.get_mut(udid) else { return Vec::new() };
         device.agent = active;
-        pause_if_hidden(device, Some(now)).into_iter().collect()
+        follow_viewers(udid, device, Some(now))
     }
 
     /// A [`Effect::Boot`] finished.
@@ -429,11 +468,13 @@ impl<S: Clone> Registry<S> {
                 device.session = Some(session);
                 device.phase = Phase::Live { generation };
                 device.paused = false;
+                // A fresh helper streams at the user's settings.
+                device.profile = StreamProfile::Full;
                 device
             }
         };
         // No clock here: a hidden start's parking clock starts at the next tick.
-        pause_if_hidden(device, None).into_iter().collect()
+        follow_viewers(udid, device, None)
     }
 
     /// The session for `generation` ended (helper exited). One automatic
@@ -514,7 +555,7 @@ impl<S: Clone> Registry<S> {
 
     /// A visible panel shows `udid`, streaming or not.
     pub fn is_shown(&self, udid: &DeviceId) -> bool {
-        self.devices.get(udid).is_some_and(|d| !d.visible.is_empty())
+        self.devices.get(udid).is_some_and(has_shown_viewer)
     }
 
     /// Every device a visible panel shows while it streams.
@@ -522,7 +563,7 @@ impl<S: Clone> Registry<S> {
         let mut out: Vec<_> = self
             .devices
             .iter()
-            .filter(|(_, d)| !d.visible.is_empty() && matches!(d.phase, Phase::Live { .. }))
+            .filter(|(_, d)| has_shown_viewer(d) && matches!(d.phase, Phase::Live { .. }))
             .map(|(u, _)| u.clone())
             .collect();
         out.sort();
@@ -695,11 +736,30 @@ fn not_connected(udid: &DeviceId) -> String {
     }
 }
 
-/// Pause when no attached worktree shows the device; resume when one does.
+/// Whether any viewer shows the device now.
+fn has_shown_viewer<S>(device: &Device<S>) -> bool {
+    device.viewers.values().any(|v| v.shown)
+}
+
+/// Bring the session in line with its viewers: paused or not, and the
+/// profile they ask for (an agent driving it asks for the user's settings).
+fn follow_viewers<S: Clone>(udid: &DeviceId, device: &mut Device<S>, now: Option<Instant>) -> Vec<Effect<S>> {
+    let mut effects: Vec<Effect<S>> = pause_if_hidden(device, now).into_iter().collect();
+    let wanted = if device.agent { Some(StreamProfile::Full) } else { arbitrate(device.viewers.values()) };
+    if let (Some(profile), Some(session)) = (wanted, device.session.clone())
+        && profile != device.profile
+    {
+        device.profile = profile;
+        effects.push(Effect::SetProfile { udid: udid.clone(), session, profile });
+    }
+    effects
+}
+
+/// Pause when no viewer shows the device; resume when one does.
 /// `now` starts the parking clock (`None`: the next tick starts it).
 fn pause_if_hidden<S: Clone>(device: &mut Device<S>, now: Option<Instant>) -> Option<Effect<S>> {
     let session = device.session.clone()?;
-    let hidden = device.visible.is_empty() && !device.agent;
+    let hidden = !has_shown_viewer(device) && !device.agent;
     if hidden == device.paused {
         return None;
     }

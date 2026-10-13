@@ -275,6 +275,18 @@ impl StreamSession {
         }
     }
 
+    /// Stream at `scale` and `fps` for a viewer's sake (see
+    /// `crate::viewers`), where the source can change live: a simulator's
+    /// helper. A real iPhone keeps its stream (its points per pixel and its
+    /// recordings come from it), and Android's is fixed when it starts.
+    /// Returns whether the source changed.
+    pub fn restream(&self, scale: f64, fps: f64, timeout: Duration) -> Result<bool> {
+        match self {
+            Self::Ios(s) => s.restream(scale, fps, timeout).map(|()| true),
+            Self::IosDevice(_) | Self::Android(_) => Ok(false),
+        }
+    }
+
     pub fn screenshot_png(&self, timeout: Duration) -> Result<Vec<u8>> {
         match self {
             Self::Ios(s) => s.screenshot_png(timeout),

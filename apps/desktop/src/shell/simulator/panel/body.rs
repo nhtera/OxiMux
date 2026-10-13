@@ -29,6 +29,7 @@ impl SimulatorPanel {
     pub(super) fn render_body(&mut self, state: &PanelState, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let density = self.density;
         let device = self.outline_device(cx);
+        let grid = self.has_grid();
         if !matches!(state, PanelState::Streaming) {
             // The stream went away under an annotation or a question.
             self.annotate = None;
@@ -39,13 +40,14 @@ impl SimulatorPanel {
             && let Some(screen) = self.screen.clone()
         {
             // Off screen: free the last frame and lift any finger.
-            let binding = Binding { device: None, visible: false, radius: 0.0 };
+            let binding = Binding::NONE;
             let (theme, typography) = (self.theme, self.typography.clone());
             screen.update(cx, |screen, cx| screen.bind(binding, theme, &typography, window, cx));
         }
         let screen: AnyElement = match state {
             PanelState::Checking => self.centered_line("Checking for Xcode and the simulator runtime…"),
             PanelState::Setup(availability) => self.render_setup(availability),
+            PanelState::Empty { .. } if grid => self.render_empty_tile(cx),
             PanelState::Empty { error } => self.render_empty(error.as_deref(), cx),
             PanelState::Attaching => self.centered_line("Finding a simulator…"),
             PanelState::Booting => self.centered_line(&format!("Booting {}…", self.device_name(cx))),
@@ -60,8 +62,17 @@ impl SimulatorPanel {
             // A sleeping phone streams nothing: say so, and let the user wake it.
             PanelState::Streaming if self.screen_off(cx) => self.render_screen_off(cx),
             PanelState::Streaming => {
-                let radius = self.area.get().and_then(|a| fit(a, &device)).map_or(0.0, |l| l.screen_radius);
-                let binding = Binding { device: self.device(cx), visible: self.visible && self.window_visible, radius };
+                let radius = if grid { 0.0 } else { self.area.get().and_then(|a| fit(a, &device)).map_or(0.0, |l| l.screen_radius) };
+                // In the grid, only the focused tile takes input.
+                let focused = self.focused.is_none();
+                let binding = Binding {
+                    device: self.device(cx),
+                    visible: self.visible && self.window_visible,
+                    radius,
+                    focused,
+                    inspect: true,
+                    throttle: !focused,
+                };
                 match self.live_screen(binding, window, cx) {
                     Some(screen) => screen.into_any_element(),
                     None => self.centered_line("Starting stream…"),
@@ -94,7 +105,7 @@ impl SimulatorPanel {
             .pt(px(density.pad_panel * 2.0))
             .pb(px(density.pad_panel))
             .children(banner)
-            .child(phone(self.theme, &device, &self.area, cx.weak_entity(), screen))
+            .child(if grid { self.render_grid(screen, window, cx) } else { phone(self.theme, &device, &self.area, cx.weak_entity(), screen) })
             .child(if self.annotate.is_some() { self.render_annotate_controls(cx) } else { self.render_toolbar(state, cx) })
             .children((matches!(state, PanelState::Streaming) && self.is_iphone(cx)).then(|| self.render_iphone_control(cx)))
             .children(badge)
@@ -130,7 +141,7 @@ impl SimulatorPanel {
         div().flex().flex_col().size_full().px(px(pad)).pt(px(pad * 2.0)).pb(px(pad))
     }
 
-    fn centered_line(&self, s: &str) -> AnyElement {
+    pub(super) fn centered_line(&self, s: &str) -> AnyElement {
         self.screen()
             .items_center()
             .justify_center()
@@ -186,6 +197,24 @@ impl SimulatorPanel {
             .when(ios, |screen| screen.child(self.text(TRADEMARK, ty.t_sub_label, theme.fg_subtle)))
             .child(div().h(px(density.pad_panel)))
             .child(self.attach_split_button(devices, cx))
+            .into_any_element()
+    }
+
+    /// The active worktree's tile in the grid, with nothing attached.
+    fn render_empty_tile(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
+        let devices = self.devices(cx);
+        self.screen()
+            .items_center()
+            .justify_center()
+            .gap(px(density.pad_panel))
+            .child(self.text(
+                // Attached before a restart, it starts on Attach.
+                if self.device(cx).is_some() { "Not streaming." } else { "No device on this worktree." },
+                ty.t_body_md,
+                theme.fg_muted,
+            ))
+            .child(div().w_full().child(self.attach_split_button(devices, cx)))
             .into_any_element()
     }
 

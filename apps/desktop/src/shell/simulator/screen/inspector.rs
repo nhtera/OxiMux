@@ -148,7 +148,7 @@ impl ScreenView {
     /// The pointer moved, or ⌥ changed, at `pos`.
     pub(super) fn inspect(&mut self, pos: Point<Pixels>, alt: bool, window: &mut Window, cx: &mut Context<Self>) {
         let point = self.display_point(pos, false);
-        if !alt || point.is_none() {
+        if !alt || point.is_none() || !self.binding.focused || !self.binding.inspect {
             self.disarm(cx);
             return;
         }
@@ -207,7 +207,7 @@ impl ScreenView {
     }
 
     /// ⌥ released (or the pointer left the screen): no outline.
-    fn disarm(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn disarm(&mut self, cx: &mut Context<Self>) {
         if self.inspector.armed {
             self.inspector.armed = false;
             self.inspector.hover = None;

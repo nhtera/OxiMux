@@ -163,6 +163,10 @@ pub struct SimulatorHub {
     started_at: HashMap<DeviceId, Instant>,
     /// Flow recordings, an agent's and the panel's (see `flow_recorder`).
     flows: flow_recorder::FlowRecorder,
+    /// The last viewer number handed out (see `viewers`).
+    next_viewer: u32,
+    /// Each device's configure calls, in turn (see `viewers`).
+    turns: HashMap<DeviceId, Arc<viewers::Turns>>,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -181,9 +185,11 @@ mod lifecycle;
 mod per_call;
 mod recovery;
 mod snapshot;
+mod viewers;
 mod wifi;
 
 pub use agent::Wake;
+pub(crate) use viewers::REDUCED_FPS;
 pub use wifi::PairStage;
 pub(crate) use wifi::can_submit;
 pub(crate) use per_call::{AskKind, PerCallAnswer};
@@ -330,16 +336,15 @@ impl SimulatorHub {
     }
 
     /// Apply stream settings to `udid`'s live session, in the background
-    /// (`configure` waits for the helper's reply).
-    pub fn configure_stream(&self, udid: &DeviceId, scale: f64, fps: f64, cx: &mut Context<Self>) {
+    /// (`configure` waits for the helper's reply). A device only unfocused
+    /// tiles show stays lowered.
+    pub fn configure_stream(&mut self, udid: &DeviceId, scale: f64, fps: f64, cx: &mut Context<Self>) {
         let Some(session) = self.session(udid) else { return };
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(e) = session.configure(Some(scale), Some(fps), None, Duration::from_secs(5)) {
-                    tracing::debug!("simulator stream configure failed: {e}");
-                }
-            })
-            .detach();
+        let (scale, fps) = self.stream_values(udid, &session, scale, fps);
+        // In turn with profile changes: the newest of them is what streams.
+        self.in_turn(udid, cx, move || session.configure(Some(scale), Some(fps), None, Duration::from_secs(5)), |e| {
+            tracing::debug!("simulator stream configure failed: {e}");
+        });
     }
 
     /// Switch `udid`'s live stream between JPEG and H.264 (iOS helpers that
@@ -700,13 +705,6 @@ impl SimulatorHub {
         }
     }
 
-    /// A worktree's panel was shown or hidden (pauses the helper when no
-    /// viewer of its device is visible).
-    pub fn set_visible(&mut self, worktree: &Path, visible: bool, cx: &mut Context<Self>) {
-        let effects = self.registry.set_visible(&WorktreeKey::from_path(worktree), visible, Instant::now());
-        self.run(effects, cx);
-    }
-
     pub fn reconnect(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         let booted = self.watch.lock().unwrap().is_booted(udid).unwrap_or(true);
         self.reconnect_as(udid, booted, cx);
@@ -735,6 +733,7 @@ impl SimulatorHub {
                 Effect::StopSession { session, .. } => session.shutdown(),
                 Effect::Pause(session) => drop(session.pause()),
                 Effect::Resume(session) => drop(session.resume()),
+                Effect::SetProfile { udid, session, .. } => self.apply_profile(&udid, session, cx),
                 // The registry never asks this of a real device; refused here
                 // too, whatever asked.
                 Effect::ShutdownDevice { udid } if udid.is_physical() => {

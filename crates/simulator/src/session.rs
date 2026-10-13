@@ -366,6 +366,14 @@ impl HelperSession {
         self.request(&Command::Configure { scale, fps, orientation, format: None }, timeout).map(drop)
     }
 
+    /// A new scale and rate for a viewer's sake (see `crate::viewers`): what
+    /// the change brings — a key frame, a JPEG of another size — never reads
+    /// as change on screen.
+    pub fn restream(&self, scale: f64, fps: f64, timeout: Duration) -> Result<()> {
+        self.inner.frames.rescaled(Instant::now());
+        self.configure(Some(scale), Some(fps), None, timeout)
+    }
+
     /// Switch the stream's encoding. A no-op on a helper without H.264 (it
     /// would reject the whole command).
     pub fn set_format(&self, format: StreamFormat, timeout: Duration) -> Result<()> {
