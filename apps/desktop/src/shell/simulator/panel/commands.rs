@@ -126,6 +126,7 @@ impl SimulatorPanel {
         if command.needs_stream() && !matches!(self.state(cx), PanelState::Streaming) {
             return Outcome::NotStreaming;
         }
+        let before = hub.read(cx).session(&udid).map(|s| s.orientation());
         let sent = match command {
             SimCommand::Home => hub.read(cx).home(&udid),
             SimCommand::Lock => hub.read(cx).lock(&udid),
@@ -176,7 +177,13 @@ impl SimulatorPanel {
             }
             SimCommand::Detach => unreachable!("handled above"),
         };
-        if sent { Outcome::Done } else { Outcome::NotStreaming }
+        if !sent {
+            return Outcome::NotStreaming;
+        }
+        if self.flow_steps(cx).is_some() {
+            self.record_command(command, before, cx);
+        }
+        Outcome::Done
     }
 
     /// The confirmation's answer.

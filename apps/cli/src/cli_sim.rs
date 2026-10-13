@@ -4,7 +4,7 @@
 use clap::{ArgGroup, Args};
 use oximux_remote_proto::simulator::{SimCheckWire, SimTargetWire};
 
-use crate::cli::SimCommand;
+use crate::cli::{ExactArgs, FlowCommand, SimCommand};
 
 /// `--settle` on an action.
 #[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
@@ -54,22 +54,27 @@ impl std::str::FromStr for TapArg {
 
 /// The element `wait` and `assert` name: a ref, a label or an identifier.
 #[derive(Args, Debug, Clone, PartialEq)]
-#[command(group(ArgGroup::new("element").required(true).args(["r", "label", "id"])))]
+#[command(group(ArgGroup::new("element").required(true).multiple(true).args(["r", "label", "id", "role"])))]
 pub struct ElementArgs {
     /// An `@eN` ref.
-    #[arg(value_name = "@eN")]
+    #[arg(value_name = "@eN", conflicts_with_all = ["label", "id", "role", "exact", "nth"])]
     pub r: Option<RefArg>,
     /// An accessibility label: exact match first, then a case-insensitive
-    /// substring.
-    #[arg(long, value_name = "TEXT")]
+    /// substring (only exact with --exact).
+    #[arg(long, value_name = "TEXT", conflicts_with = "id")]
     pub label: Option<String>,
     /// An accessibility identifier, exact.
     #[arg(long, value_name = "AXID")]
     pub id: Option<String>,
+    #[command(flatten)]
+    pub exact: ExactArgs,
 }
 
 impl ElementArgs {
     pub fn target(&self) -> SimTargetWire {
+        if let Some(exact) = self.exact.target(self.label.as_ref(), self.id.as_ref()) {
+            return exact;
+        }
         match (&self.r, &self.label, &self.id) {
             (Some(r), _, _) => SimTargetWire::Ref(r.0),
             (_, Some(label), _) => SimTargetWire::Label(label.clone()),
@@ -149,6 +154,23 @@ impl SimCommand {
             | Self::Shutdown { .. } => None,
             Self::Location(_) | Self::Appearance { .. } | Self::Privacy(_) | Self::Push(_) | Self::StatusBar { .. } | Self::Erase { .. } => None,
             Self::Logs(_) | Self::Crashes(_) => None,
+            // v30, and `run`'s steps are gated one by one.
+            Self::Run(_) | Self::Flow(_) => None,
+        }
+    }
+
+    /// The v30 feature this command uses (a recording's verbs, an exact
+    /// selector), named for the "host too old" refusal. `flow export` and
+    /// `run` themselves need none: export is local, and a run's steps are
+    /// gated one by one.
+    pub fn flow_feature(&self) -> Option<&'static str> {
+        match self {
+            Self::Flow(FlowCommand::Start | FlowCommand::Stop { .. } | FlowCommand::Status) => Some("sim flow"),
+            Self::Tap { exact, .. } if exact.used() => Some("sim … --exact/--role/--nth"),
+            Self::Wait(WaitArgs { element, .. }) | Self::Assert(AssertArgs { element, .. }) if element.exact.used() => {
+                Some("sim … --exact/--role/--nth")
+            }
+            _ => None,
         }
     }
 
@@ -193,7 +215,23 @@ impl SimCommand {
             | Self::StatusBar { .. }
             | Self::Erase { .. }
             | Self::Logs(_)
-            | Self::Crashes(_) => None,
+            | Self::Crashes(_)
+            | Self::Run(_)
+            | Self::Flow(_) => None,
+        }
+    }
+
+    /// [`Self::settle_args`], to change (`run --settle` turns it on).
+    pub fn settle_args_mut(&mut self) -> Option<&mut SettleArgs> {
+        match self {
+            Self::Tap { settle, .. }
+            | Self::Swipe { settle, .. }
+            | Self::Type { settle, .. }
+            | Self::Button { settle, .. }
+            | Self::Rotate { settle, .. }
+            | Self::Launch { settle, .. }
+            | Self::OpenUrl { settle, .. } => Some(settle),
+            _ => None,
         }
     }
 }

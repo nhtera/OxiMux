@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 pub use crate::cli_sim::{AssertArgs, SettleArgs, TapArg, WaitArgs};
 pub use crate::cli_sim_diag::{CrashesArgs, LogsArgs};
+pub use crate::cli_sim_flow::{ExactArgs, FlowCommand, RunArgs};
 pub use crate::cli_sim_state::{AppearanceArg, LocationCommand, PrivacyArgs, PushArgs, StatusBarArg};
 
 /// Exit codes, stated once. `2` is what clap itself exits with on a usage
@@ -858,6 +859,8 @@ pub enum SimCommand {
         #[arg(long, value_name = "AXID", conflicts_with_all = ["x", "y"])]
         id: Option<String>,
         #[command(flatten)]
+        exact: ExactArgs,
+        #[command(flatten)]
         settle: SettleArgs,
     },
     /// Swipe from (x1, y1) to (x2, y2), in points. Starting at the very
@@ -957,6 +960,14 @@ pub enum SimCommand {
     /// (default: the last 10m), and warnings short of a crash. A real Android
     /// phone needs --app.
     Crashes(CrashesArgs),
+    /// Run a file of steps in order, stopping at the first that fails (its
+    /// exit code is the run's). Steps that change device state ask the user
+    /// once, before step 1.
+    Run(RunArgs),
+    /// Record agent steps into a flow file that `sim run` replays, or export
+    /// one.
+    #[command(subcommand)]
+    Flow(FlowCommand),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

@@ -24,6 +24,12 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::simulator_diag::{SimCrashListWire, SimCrashWire, SimCrashesWire, SimLogLevelWire, SimLogsWire};
+pub use crate::simulator_flow::{FLOW_HEADER, SimFlowCmdWire, SimFlowWire, SimSelectorWire, render_step, words};
+/// The flow file's pieces (header, numbers, button names) for recorders
+/// and exporters.
+pub mod flow {
+    pub use crate::simulator_flow::{button, header, num};
+}
 pub use crate::simulator_state::{SimLocationWire, SimNetWire, SimPrivacyActionWire, SimStateCmdWire};
 pub use crate::simulator_verify::{
     SimCheckWire, SimDiffLineWire, SimDiffOpWire, SimRefNodeWire, SimSettleOutcomeWire, SimSettleWire,
@@ -109,6 +115,10 @@ pub enum SimCmdWire {
     Logs(SimLogsWire),
     /// The device's recent crashes, summarised: see [`SimCrashesWire`].
     Crashes(SimCrashesWire),
+    // v30: flows.
+    /// A recording of this worktree's agent verbs, or a run's approval: see
+    /// [`SimFlowCmdWire`].
+    Flow(SimFlowCmdWire),
 }
 
 impl SimCmdWire {
@@ -137,6 +147,9 @@ pub enum SimTargetWire {
     Id(String),
     /// v27: an `@eN` ref from `ax -i` or a settle diff, re-resolved when used.
     Ref(u32),
+    /// v30: an element named exactly (no substring fallback), by role and
+    /// position when its label is not unique.
+    Exact(SimSelectorWire),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +194,8 @@ pub enum SimReplyWire {
     /// Log lines, oldest first; `truncated` when older ones were left out.
     Logs { lines: Vec<String>, truncated: bool },
     Crashes(SimCrashListWire),
+    // v30: flows.
+    Flow(SimFlowWire),
 }
 
 /// One simulator device.

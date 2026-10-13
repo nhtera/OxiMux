@@ -42,13 +42,18 @@ mod decode;
 mod input;
 mod inspector;
 mod keys;
+mod recording;
 
 pub(crate) use inspector::Picked;
+pub(crate) use recording::STOP_WAIT;
 
 /// What the screen tells the panel.
 pub(crate) enum ScreenEvent {
     /// An ⌥-click picked an element (see `inspector`).
     Picked(Picked),
+    /// The user's input while the panel records a flow (see `recording`).
+    /// A step of the recording with this id.
+    Recorded(u64, crate::shell::simulator::hub::PanelStep),
 }
 
 impl gpui::EventEmitter<ScreenEvent> for ScreenView {}
@@ -92,6 +97,8 @@ pub struct ScreenView {
     _wheel_idle: Option<Task<()>>,
     /// ⌥ held over the screen: the element under the pointer.
     inspector: inspector::Inspector,
+    /// The user's input, while the panel records a flow.
+    recorder: recording::Recorder,
     focus: FocusHandle,
     /// The "typing goes to the simulator" hint shows until then.
     hint_until: Option<Instant>,
@@ -170,6 +177,7 @@ impl ScreenView {
             wheel_state: input::WheelState::default(),
             _wheel_idle: None,
             inspector: inspector::Inspector::default(),
+            recorder: recording::Recorder::default(),
             focus: cx.focus_handle(),
             hint_until: None,
             _hint: None,

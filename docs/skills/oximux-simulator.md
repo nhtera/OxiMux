@@ -147,6 +147,61 @@ checks once: exit 0, or 1 (`assert-failed`) with what it found. `--text`
 compares a field's value, else the element's label, exactly (surrounding
 spaces aside).
 
+## Several steps at once: `run`, flows, export
+
+A file of steps runs in order with one command, each exactly as if typed:
+
+```sh
+cat > login.flow <<'FLOW'
+# oximux-flow v1
+launch com.example.app --relaunch --settle
+tap --label "Sign in" --exact --settle
+type "ada@example.com"
+assert --label "Welcome" --exact
+FLOW
+oximux sim run login.flow           # stops at the first step that fails
+oximux sim run login.flow --from 3  # resume there (e.g. after exit 7)
+oximux sim run login.flow --settle  # settle after every action
+```
+
+- One step per line, without the leading oximux sim; `#` lines are comments; `-` as
+  the file reads the steps from stdin. Every line
+  is checked before step 1 runs, so a typo never leaves a half-driven app.
+- A failing step stops the run with that step's exit code and says
+  `step N failed: <line>`. `run`, `flow` and `wait-consent` cannot be steps.
+- Steps that change device state (`privacy`, `install`, `erase`, `push`,
+  `location`) are shown to the user once, as a list, before step 1; if they
+  say no, nothing runs (exit 5). `erase`, `push` and a real device's settings
+  still ask when their turn comes.
+- `${SECRET_1}`, `${SECRET_2}`, … in a step are read from the environment
+  (a recorded password is `type "${SECRET_1}"`): set them before the run. No
+  other variable is read; `$${` writes a literal `${`.
+
+**Exact selectors.** `--label` also matches part of a label ("Settings" finds
+"Return to Settings"). `--exact` matches the label or id exactly; `--role R`
+and `--nth N` (from 0, in `ax` order) pick among look-alikes:
+
+```sh
+oximux sim tap --label "Sign in" --exact
+oximux sim tap --label "Delete" --exact --nth 1
+oximux sim assert --role Image --nth 0
+```
+
+**Record your steps.** `oximux sim flow start` records the verbs you send on
+this worktree's device; `flow status` shows the steps so far; `flow stop`
+saves them in OxiMux's data and prints the path (`--out FILE` writes them
+where you say instead). Refs become exact selectors in the file, never
+`@eN`. The user can record their own taps and typing from the panel (Device
+menu › Record flow); you cannot start, read or stop that recording.
+
+**Export.** `oximux sim flow export login.flow --maestro --out flow.yaml`
+writes Maestro YAML (to stdout without `--out`; `--app-id ID` when the file
+has no `# app` line and no launch). Steps with no counterpart (rotation,
+installs, text checks) stay in the file as `# unsupported: <step>` and are
+counted on stderr; app data is never cleared. Point steps need the file's
+`# screen WxH` line (a recording writes it). Check the YAML with the user's
+own Maestro version.
+
 ## Coordinates are points
 
 `tap`, `swipe` and the `ax` frames all use **points**, from the top-left of the
@@ -316,9 +371,9 @@ oximux sim button volume-down
   select Xcode 26. The Mobile Emulator panel shows the exact command for an
   Xcode 26 it finds; the general form, with their own app path, quoted, is
   `sudo xcode-select -s '/Applications/Xcode.app/Contents/Developer'`.
-- `--settle`, `ax -i`, `wait`, `assert` and a tap by ref print what is on
-  screen, like `ax`: OxiMux hides their output from a phone mirroring your
-  chat.
+- `--settle`, `ax -i`, `wait`, `assert`, a tap by ref, `run` and `flow`
+  print what is on screen, like `ax`: OxiMux hides their output from a phone
+  mirroring your chat.
 - Screenshots and the AX tree go to your model provider. The user was told when
   they allowed it; do not sign in to real accounts on the simulator.
 - `oximux sim shutdown` refuses a device the user booted themselves. Do not add

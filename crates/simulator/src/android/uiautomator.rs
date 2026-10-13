@@ -55,6 +55,7 @@ fn node(n: roxmltree::Node<'_, '_>) -> AxNode {
         role: role.to_owned(),
         role_description: class.to_owned(),
         enabled: n.attribute("enabled") != Some("false"),
+        secure: n.attribute("password") == Some("true"),
         frame: n.attribute("bounds").and_then(parse_bounds).unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0)),
         children: n.children().filter(|c| c.has_tag_name("node")).map(node).collect(),
     }
@@ -140,5 +141,16 @@ mod tests {
         let tree = parse_dump(xml).unwrap();
         assert_eq!((tree[0].label.as_deref(), tree[0].value.as_deref()), (Some("Email"), Some("")));
         assert_eq!((tree[1].label.as_deref(), tree[1].value.as_deref()), (Some("Search"), Some("")));
+    }
+
+    /// A password field says so: what is typed into it is never recorded.
+    #[test]
+    fn a_password_field_is_secure() {
+        let xml = r#"<?xml version='1.0' ?><hierarchy rotation="0">
+<node class="android.widget.EditText" text="" content-desc="Password" password="true" clickable="true" bounds="[0,0][100,50]"/>
+<node class="android.widget.EditText" text="" content-desc="Email" password="false" clickable="true" bounds="[0,60][100,110]"/>
+</hierarchy>"#;
+        let tree = parse_dump(xml).unwrap();
+        assert!(tree[0].secure && !tree[1].secure);
     }
 }

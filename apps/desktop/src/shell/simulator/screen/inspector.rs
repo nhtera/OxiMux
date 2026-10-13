@@ -80,7 +80,7 @@ fn shell_word(s: &str) -> String {
 
 /// How the tree's frames map to the screen.
 #[derive(Clone, Copy, Debug)]
-struct Mapping {
+pub(super) struct Mapping {
     space: AxSpace,
     orientation: Orientation,
     root: Size,
@@ -89,7 +89,12 @@ struct Mapping {
 }
 
 impl Mapping {
-    fn to_screen(self, r: Rect) -> Rect {
+    /// The screen in points, as it is turned.
+    pub(super) fn points(self) -> (f64, f64) {
+        (self.points.w, self.points.h)
+    }
+
+    pub(super) fn to_screen(self, r: Rect) -> Rect {
         agent::ax_rect_to_display(self.space, self.orientation, self.root, r, Size::new(1.0, 1.0))
     }
 
@@ -303,6 +308,19 @@ impl ScreenView {
         (self.binding.device.as_ref() == Some(&tree.device) && tree.map.orientation == orientation).then_some(tree)
     }
 
+    /// The exact selector of the element at `pt` (display-normalized) in the
+    /// tree in hand — what a recording takes for a real iPhone's tap.
+    pub(super) fn target_in_cached_tree(&self, pt: (f64, f64), cx: &Context<Self>) -> Option<(oximux_remote_proto::simulator::SimSelectorWire, Option<bool>)> {
+        // Only a current tree: an old one may be another screen's.
+        let tree = self.usable_tree(cx).filter(|_| self.tree_current(cx))?;
+        super::recording::selector_at(&tree.nodes, pt, &|n| tree.map.to_screen(n.frame))
+    }
+
+    /// The screen in points, from the tree in hand.
+    pub(super) fn cached_points(&self, cx: &Context<Self>) -> Option<(f64, f64)> {
+        self.usable_tree(cx).map(|t| t.map.points())
+    }
+
     /// Hit-test the tree in hand at the pointer.
     fn retest(&mut self, cx: &mut Context<Self>) {
         let hover = match (self.usable_tree(cx), self.inspector.pointer, self.inspector.armed) {
@@ -412,7 +430,7 @@ fn picked_at(tree: &Tree, pt: (f64, f64)) -> Option<Picked> {
 
 /// How `nodes`' frames map onto `session`'s screen, turned `orientation`;
 /// `None` before its size or scale is known.
-fn mapping(
+pub(super) fn mapping(
     hub: &gpui::Entity<crate::shell::simulator::hub::SimulatorHub>,
     device: &DeviceId,
     session: &oximux_simulator::session::StreamSession,
@@ -446,6 +464,7 @@ mod tests {
                 role: "Button".into(),
                 role_description: String::new(),
                 enabled: true,
+                secure: false,
                 frame: Rect::new(0.0, 0.0, 1.0, 1.0),
                 children: vec![],
             },

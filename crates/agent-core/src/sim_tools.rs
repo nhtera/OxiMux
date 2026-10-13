@@ -27,8 +27,10 @@ use serde_json::Value;
 pub const CAPTURE_DIR: &str = "oximux-sim";
 
 /// The `oximux sim` verbs whose output is the screen's contents, or the
-/// device's log (which can carry anything an app printed).
-const CAPTURE_VERBS: [&str; 6] = ["screenshot", "ax", "wait", "assert", "logs", "crashes"];
+/// device's log (which can carry anything an app printed). A run prints its
+/// steps' output (settle diffs, asserts), a flow its recorded steps (labels
+/// read off the screen).
+const CAPTURE_VERBS: [&str; 8] = ["screenshot", "ax", "wait", "assert", "logs", "crashes", "run", "flow"];
 
 /// Flags that make any `oximux sim` verb print the screen's elements (a
 /// settle's diff, `ax -i`'s list), wherever they stand in the command.
@@ -133,6 +135,8 @@ mod tests {
             json!({"command": "oximux sim type @e2 hello"}),
             json!({"command": "oximux sim logs --app com.a.b --since 5m"}),
             json!({"command": ["oximux", "--json", "sim", "crashes"]}),
+            json!({"command": "oximux sim run login.flow --settle"}),
+            json!({"command": "oximux sim flow stop --out a.flow"}),
         ] {
             assert!(is_simulator_capture(&input), "{input}");
         }

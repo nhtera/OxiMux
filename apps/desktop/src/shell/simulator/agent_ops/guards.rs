@@ -70,7 +70,8 @@ pub(super) fn is_action(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::AsCaller { .. }
         | SimCmdWire::DeviceState(_)
         | SimCmdWire::Logs(_)
-        | SimCmdWire::Crashes(_) => false,
+        | SimCmdWire::Crashes(_)
+        | SimCmdWire::Flow(_) => false,
     }
 }
 
@@ -96,7 +97,8 @@ pub(super) fn is_input(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Assert { .. }
         | SimCmdWire::DeviceState(_)
         | SimCmdWire::Logs(_)
-        | SimCmdWire::Crashes(_) => false,
+        | SimCmdWire::Crashes(_)
+        | SimCmdWire::Flow(_) => false,
     }
 }
 
@@ -128,7 +130,8 @@ pub(super) fn needs_screen(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Shutdown { .. }
         | SimCmdWire::DeviceState(_)
         | SimCmdWire::Logs(_)
-        | SimCmdWire::Crashes(_) => false,
+        | SimCmdWire::Crashes(_)
+        | SimCmdWire::Flow(_) => false,
     }
 }
 
@@ -142,7 +145,7 @@ pub(super) fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static
         SimCmdWire::Screenshot { .. } => (caps.screenshot, "Screenshots"),
         SimCmdWire::Ax { .. } | SimCmdWire::AxRefs { .. } | SimCmdWire::Wait { .. } | SimCmdWire::Assert { .. } => (caps.ax, AX),
         // A ref is resolved in the tree before the touch.
-        SimCmdWire::Tap(SimTargetWire::Ref(_)) if caps.touch => (caps.ax, AX),
+        SimCmdWire::Tap(SimTargetWire::Ref(_) | SimTargetWire::Exact(_)) if caps.touch => (caps.ax, AX),
         SimCmdWire::Tap(_) | SimCmdWire::Swipe { .. } => (caps.touch, "Touch input"),
         SimCmdWire::Type { .. } => (caps.keys, "Typing"),
         SimCmdWire::Button(button) => (caps.buttons.contains(button_set(*button)), "That button"),
@@ -160,6 +163,9 @@ pub(super) fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static
         // Checked by `diagnostics`, with words of their own for a real
         // iPhone (and a phone's whole log).
         SimCmdWire::Logs(_) | SimCmdWire::Crashes(_) => return None,
+        // A recording is the app's own bookkeeping; a run's approval asks
+        // the user. Neither touches the device.
+        SimCmdWire::Flow(_) => return None,
         // The tap's needs, then typing's.
         SimCmdWire::TypeInto { target, .. } => return refused_on(caps, &SimCmdWire::Tap(target.clone())).or((!caps.keys).then_some("Typing")),
     };

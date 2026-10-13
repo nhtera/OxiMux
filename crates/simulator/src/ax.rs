@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::geometry::Rect;
+pub use crate::ax_exact::{Exact, exact_selector, field_kind, find_exact};
 use crate::{Result, SimError};
 
 /// One accessibility node. Field names follow this crate's convention
@@ -30,6 +31,8 @@ pub struct AxNode {
     pub role: String,
     pub role_description: String,
     pub enabled: bool,
+    /// A password field: what is typed into it is never recorded.
+    pub secure: bool,
     pub frame: Rect,
     pub children: Vec<AxNode>,
 }
@@ -74,6 +77,8 @@ fn value_to_string(v: Value) -> Option<String> {
 
 impl From<WireNode> for AxNode {
     fn from(w: WireNode) -> Self {
+        // `SecureTextField`, "secure text field".
+        let secure = w.ty == "SecureTextField" || w.role_description.to_lowercase().contains("secure");
         AxNode {
             label: w.ax_label,
             identifier: w.ax_unique_id,
@@ -81,6 +86,7 @@ impl From<WireNode> for AxNode {
             role: w.ty,
             role_description: w.role_description,
             enabled: w.enabled,
+            secure,
             frame: Rect::new(w.frame.x, w.frame.y, w.frame.width, w.frame.height),
             children: w.children.into_iter().map(Into::into).collect(),
         }
@@ -316,6 +322,14 @@ mod tests {
     }
 
     #[test]
+    fn a_secure_text_field_is_secure() {
+        let json = br#"[{"AXLabel":"Password","AXUniqueId":null,"AXValue":null,"type":"SecureTextField","role_description":"secure text field","enabled":true,"frame":{"x":0,"y":0,"width":10,"height":10},"children":[]},
+            {"AXLabel":"Email","AXUniqueId":null,"AXValue":null,"type":"TextField","role_description":"text field","enabled":true,"frame":{"x":0,"y":0,"width":10,"height":10},"children":[]}]"#;
+        let nodes = parse_describe(json).unwrap();
+        assert!(nodes[0].secure && !nodes[1].secure);
+    }
+
+    #[test]
     fn parses_frontmost() {
         let f = parse_frontmost(FRONTMOST_FIXTURE).unwrap();
         assert_eq!(f.bundle_id, "com.apple.mobilesafari");
@@ -359,6 +373,7 @@ mod tests {
             role: role.into(),
             role_description: String::new(),
             enabled: true,
+            secure: false,
             frame: Rect::new(frame.0, frame.1, frame.2, frame.3),
             children,
         }

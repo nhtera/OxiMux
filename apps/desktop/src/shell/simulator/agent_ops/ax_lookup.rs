@@ -122,15 +122,50 @@ pub(super) async fn element(
     hub: &Entity<SimulatorHub>,
     udid: &DeviceId,
     session: &StreamSession,
-    query: Query<'_>,
+    lookup: Lookup<'_>,
     what: &str,
     cx: &mut AsyncApp,
 ) -> Result<(AxNode, Arc<Vec<AxNode>>), SimErrorWire> {
     let nodes = read(hub, udid, session, cx).await?;
-    let node = ax::find(&nodes, query).cloned().ok_or_else(|| {
+    let node = lookup.find(&nodes).cloned().ok_or_else(|| {
         SimErrorWire::NotFound(format!("no on-screen element matches “{what}” (list them with `oximux sim ax`)"))
     })?;
     Ok((node, nodes))
+}
+
+/// How a verb names its element: `--label`/`--id` (a label falls back to
+/// a substring), or exactly (`--exact`, `--role`, `--nth`).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Lookup<'a> {
+    Query(Query<'a>),
+    Exact(&'a ax::Exact),
+}
+
+impl Lookup<'_> {
+    /// The element it names, preferring one on screen (see [`ax::find`]).
+    pub(super) fn find(self, nodes: &[AxNode]) -> Option<&AxNode> {
+        match self {
+            Self::Query(q) => ax::find(nodes, q),
+            Self::Exact(e) => ax::find_exact(nodes, e),
+        }
+    }
+
+}
+
+/// The wire's exact selector as the tree's.
+pub(super) fn exact_of(sel: &oximux_remote_proto::simulator::SimSelectorWire) -> ax::Exact {
+    ax::Exact { label: sel.label.clone(), id: sel.id.clone(), role: sel.role.clone(), nth: sel.nth as usize }
+}
+
+/// What an exact selector names, in words.
+pub(super) fn exact_name(sel: &oximux_remote_proto::simulator::SimSelectorWire) -> String {
+    let what = match (&sel.label, &sel.id, &sel.role) {
+        (Some(label), _, _) => label.clone(),
+        (_, Some(id), _) => format!("#{id}"),
+        (_, _, Some(role)) => format!("a {role}"),
+        _ => "nothing".into(),
+    };
+    if sel.nth > 0 { format!("{what} (match {})", sel.nth) } else { what }
 }
 
 /// The centre of `node` (from the read `nodes`) as a touch coordinate.

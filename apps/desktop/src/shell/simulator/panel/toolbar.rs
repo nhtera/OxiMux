@@ -118,6 +118,9 @@ impl SimulatorPanel {
             &ITEMS
         };
         let mut pill = self.pill();
+        if let Some(chip) = self.render_rec_chip(cx) {
+            pill = pill.child(chip).child(div().w(px(1.0)).h(px(density.h_row * 0.6)).bg(theme.border_inactive));
+        }
         for &item in items {
             let Some((id, icon, tip, command)) = item else {
                 pill = pill.child(div().w(px(1.0)).h(px(density.h_row * 0.6)).bg(theme.border_inactive));
@@ -148,7 +151,9 @@ impl SimulatorPanel {
         }
         let state = caps.as_ref().map_or(oximux_simulator::caps::StateSet::NONE, |caps| caps.state);
         let sim = device.as_ref().is_some_and(|d| d.source() == oximux_simulator::Source::Simctl);
-        if let Some(menu) = self.render_device_menu(state, sim, live, cx) {
+        // A flow records input: a device that takes touches.
+        let flow = caps.as_ref().is_some_and(|caps| caps.touch).then(|| self.flow_steps(cx).is_some());
+        if let Some(menu) = self.render_device_menu(state, sim, live, flow, cx) {
             pill = pill.child(div().w(px(1.0)).h(px(density.h_row * 0.6)).bg(theme.border_inactive)).child(menu);
         }
         pill.into_any_element()

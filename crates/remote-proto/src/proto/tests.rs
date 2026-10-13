@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 29,
-        "v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+        PROTOCOL_VERSION, 30,
+        "v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
          status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \

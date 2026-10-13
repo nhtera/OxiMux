@@ -126,7 +126,9 @@ impl SimCmdWire {
             | Self::Assert { .. }
             | Self::AsCaller { .. }
             | Self::TypeInto { .. } => true,
-            Self::Tap(target) => matches!(target, SimTargetWire::Ref(_)),
+            // v30 verbs: their client knows every v27 error.
+            Self::Flow(_) => true,
+            Self::Tap(target) => matches!(target, SimTargetWire::Ref(_) | SimTargetWire::Exact(_)),
             Self::Status
             | Self::Devices
             | Self::Attach { .. }

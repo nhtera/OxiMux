@@ -28,7 +28,7 @@ use oximux_simulator::simctl::SimUdid;
 use oximux_simulator::{Button, DeviceId, Orientation, Platform, Source, keyboard, simctl};
 
 use super::Target;
-use super::ax_lookup::{self, HELPER_TIMEOUT, Shown, off_screen, point_to_portrait, scale, screen};
+use super::ax_lookup::{self, HELPER_TIMEOUT, Lookup, Shown, off_screen, point_to_portrait, scale, screen};
 use super::guards::{Verb, check_bundle_id, check_text, is_input, is_web_url, unwrap};
 use super::settle::{self, Acted};
 use super::device_state::confirm;
@@ -143,14 +143,22 @@ async fn run_verb(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str, verb:
         None => None,
     };
     let refs: TableKey = (WorktreeKey::from_path(&target.worktree), udid.clone(), verb.caller);
-    if let Some(timeout_ms) = verb.settle {
-        return settle::settled(hub, udid, name, verb.inner, timeout_ms, &refs, target, cx).await;
+    // Planned before it runs (a ref is named from the read it came from),
+    // kept once it succeeded.
+    let planned = super::flow::plan(hub, &verb.inner, verb.settle, &refs, cx);
+    let reply = if let Some(timeout_ms) = verb.settle {
+        settle::settled(hub, udid, name, verb.inner, timeout_ms, &refs, target, cx).await?
+    } else {
+        // A ref's tap reports what it aimed at (and whether it had moved).
+        let by_ref = matches!(verb.inner, SimCmdWire::Tap(SimTargetWire::Ref(_)) | SimCmdWire::TypeInto { .. });
+        let (started, mut acted) = (Instant::now(), Acted::default());
+        let reply = execute(hub, udid, name, verb.inner, &refs, &mut acted, target, cx).await?;
+        if by_ref { SimReplyWire::Settled(acted.report(None, started)) } else { reply }
+    };
+    if let Some(planned) = planned {
+        super::flow::record(hub, &refs, planned, cx);
     }
-    // A ref's tap reports what it aimed at (and whether it had moved).
-    let by_ref = matches!(verb.inner, SimCmdWire::Tap(SimTargetWire::Ref(_)) | SimCmdWire::TypeInto { .. });
-    let (started, mut acted) = (Instant::now(), Acted::default());
-    let reply = execute(hub, udid, name, verb.inner, &refs, &mut acted, target, cx).await?;
-    Ok(if by_ref { SimReplyWire::Settled(acted.report(None, started)) } else { reply })
+    Ok(reply)
 }
 
 /// Carry out one verb, its envelopes already off and its guards passed.
@@ -172,6 +180,7 @@ pub(super) async fn execute(
         // Taken off by `unwrap` before anything runs.
         SimCmdWire::Settled { .. } | SimCmdWire::AsCaller { .. } => Err(SimErrorWire::BadInput("a wrapped verb inside a verb".into())),
         SimCmdWire::AxRefs { max } => settle::ax_refs(hub, udid, max, refs, cx).await,
+        SimCmdWire::Flow(flow) => super::flow::run(hub, udid, name, flow, target, cx).await,
         SimCmdWire::Wait { target: aim, gone, timeout_ms } => super::checks::wait(hub, udid, aim, gone, timeout_ms, refs, cx).await,
         SimCmdWire::Assert { target: aim, check } => super::checks::assert(hub, udid, aim, check, refs, cx).await,
         SimCmdWire::Screenshot { full } => screenshot(hub, udid, full, cx).await,
@@ -187,8 +196,12 @@ pub(super) async fn execute(
             let session = live_session(hub, udid, cx).await?;
             let at = match aim {
                 SimTargetWire::Point(p) => point_to_portrait(hub, udid, &session, (p.x, p.y), cx).await?,
-                SimTargetWire::Label(label) => settle::aim(hub, udid, &session, Query::Label(&label), &label, acted, cx).await?,
-                SimTargetWire::Id(id) => settle::aim(hub, udid, &session, Query::Id(&id), &id, acted, cx).await?,
+                SimTargetWire::Label(label) => settle::aim(hub, udid, &session, Lookup::Query(Query::Label(&label)), &label, acted, cx).await?,
+                SimTargetWire::Id(id) => settle::aim(hub, udid, &session, Lookup::Query(Query::Id(&id)), &id, acted, cx).await?,
+                SimTargetWire::Exact(sel) => {
+                    let (exact, what) = (ax_lookup::exact_of(&sel), ax_lookup::exact_name(&sel));
+                    settle::aim(hub, udid, &session, Lookup::Exact(&exact), &what, acted, cx).await?
+                }
                 SimTargetWire::Ref(r) => settle::aim_ref(hub, udid, &session, r, refs, acted, cx).await?,
             };
             if let Some(done) = on_iphone(&session, vec![Gesture::Tap { at, taps: 1 }]).await {

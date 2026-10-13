@@ -43,6 +43,7 @@ mod commands;
 mod consent;
 mod crash_row;
 mod device_menu;
+mod flow_rec;
 mod pair_card;
 mod header;
 mod inspector;
@@ -210,7 +211,9 @@ impl SimulatorPanel {
                     cx.notify();
                 }
             }
-            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged | HubEvent::Pairing => cx.notify(),
+            HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged | HubEvent::Pairing | HubEvent::Flow => {
+                cx.notify()
+            }
             HubEvent::AgentActivity(udid) => {
                 if self.device(cx).as_ref() == Some(udid) {
                     cx.notify();
@@ -223,6 +226,11 @@ impl SimulatorPanel {
                 }
             }
             HubEvent::DeviceBooted(udids) => cx.emit(PanelEvent::DeviceBooted(udids.clone())),
+            HubEvent::FlowNotice(path, kind, text) => {
+                if self.worktree.as_ref() == Some(path) {
+                    cx.emit(PanelEvent::Notice(*kind, text.clone()));
+                }
+            }
             HubEvent::Crash(udid, crash) => self.crashed(udid, crash, cx),
             // Frames repaint the screen view, not the whole panel.
             HubEvent::Frame(_) | HubEvent::Session(..) => {}
@@ -353,11 +361,16 @@ impl SimulatorPanel {
             let screen = cx.new(|cx| ScreenView::new(hub, theme, typography.clone(), window, cx));
             self._screen_events = Some(cx.subscribe(&screen, |panel, _, event: &super::screen::ScreenEvent, cx| match event {
                 super::screen::ScreenEvent::Picked(picked) => panel.picked(picked.clone(), cx),
+                super::screen::ScreenEvent::Recorded(owner, step) => panel.record_owned(*owner, step.clone(), cx),
             }));
             self.screen = Some(screen);
         }
         let screen = self.screen.clone()?;
-        screen.update(cx, |screen, cx| screen.bind(binding, theme, &typography, window, cx));
+        let recording = self.flow_id(cx);
+        screen.update(cx, |screen, cx| {
+            screen.bind(binding, theme, &typography, window, cx);
+            screen.set_recording(recording, cx);
+        });
         Some(screen)
     }
 

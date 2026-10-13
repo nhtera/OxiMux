@@ -85,7 +85,7 @@ impl SimulatorPanel {
         let (title, body, (deny, allow)) = kind.question(device);
         self.render_question(
             title,
-            body.into(),
+            body,
             ("sim-per-call-deny", deny),
             ("sim-per-call-allow", allow),
             cx.listener(move |this, _, _window, cx| {

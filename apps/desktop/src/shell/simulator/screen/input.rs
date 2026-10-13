@@ -127,6 +127,12 @@ impl ScreenView {
         self.release_input(cx);
         let pinch = event.modifiers.alt;
         let edge = if pinch { 0 } else { self.edge_at(p, cx) };
+        // A pinch is not a step a flow can hold.
+        if pinch {
+            self.rec_input();
+        } else {
+            self.rec_press(event.position, p, cx);
+        }
         self.send_touch(TouchPhase::Begin, p, edge, pinch, cx);
         self.drag = Some(Drag { edge, pinch, sent_at: Instant::now(), pid, last: p });
     }
@@ -154,6 +160,7 @@ impl ScreenView {
             }
             // A drag after all: the pinch, from where the press went down.
             self.inspector.press = None;
+            self.rec_input();
             let (Some(p), Some(pid)) = (self.display_point(at, true), self.session(cx).map(|s| s.pid())) else { return };
             self.send_touch(TouchPhase::Begin, p, 0, true, cx);
             self.drag = Some(Drag { edge: 0, pinch: true, sent_at: Instant::now(), pid, last: p });
@@ -184,10 +191,12 @@ impl ScreenView {
         let Some(drag) = self.drag.take() else { return };
         let p = self.display_point(pos, true).unwrap_or(drag.last);
         self.send_touch(TouchPhase::End, p, drag.edge, drag.pinch, cx);
+        self.rec_release(pos, cx);
     }
 
     pub(super) fn on_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        self.rec_input();
         let now = Instant::now();
         let fresh = self.wheel_state.last.is_none_or(|t| now.duration_since(t) > WHEEL_GAP);
         self.wheel_state.last = Some(now);
@@ -242,6 +251,7 @@ impl ScreenView {
     pub(super) fn release_input(&mut self, cx: &mut Context<Self>) {
         self.finish_wheel(cx);
         self.inspector.cancel_press();
+        self.recorder.cancel();
         if self.live_drag(cx).is_some()
             && let Some(drag) = self.drag.take()
         {

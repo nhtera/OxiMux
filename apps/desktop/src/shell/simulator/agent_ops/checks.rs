@@ -120,6 +120,10 @@ fn check_target(aim: &SimTargetWire) -> Result<(), SimErrorWire> {
     match aim {
         SimTargetWire::Point(_) => Err(SimErrorWire::BadInput("name an element (--label, --id or @eN), not a point".into())),
         SimTargetWire::Label(_) | SimTargetWire::Id(_) | SimTargetWire::Ref(_) => Ok(()),
+        SimTargetWire::Exact(sel) if sel.label.is_none() && sel.id.is_none() && sel.role.is_none() => {
+            Err(SimErrorWire::BadInput("an exact selector needs a label, an id or a role".into()))
+        }
+        SimTargetWire::Exact(_) => Ok(()),
     }
 }
 
@@ -129,6 +133,7 @@ fn target_name(aim: &SimTargetWire) -> String {
         SimTargetWire::Id(id) => format!("#{id}"),
         SimTargetWire::Ref(r) => format!("@e{r}"),
         SimTargetWire::Point(p) => format!("({}, {})", p.x, p.y),
+        SimTargetWire::Exact(sel) => format!("“{}”", super::ax_lookup::exact_name(sel)),
     }
 }
 
@@ -141,6 +146,7 @@ fn locate(hub: &Entity<SimulatorHub>, aim: &SimTargetWire, read: &Read, pt: f64,
         let found = match aim {
             SimTargetWire::Label(label) => ax::find_on_screen(&read.nodes, Query::Label(label)).cloned(),
             SimTargetWire::Id(id) => ax::find_on_screen(&read.nodes, Query::Id(id)).cloned(),
+            SimTargetWire::Exact(sel) => ax::find_exact(&read.nodes, &super::ax_lookup::exact_of(sel)).cloned(),
             SimTargetWire::Ref(r) => match table.resolve(*r, &read.nodes, pt) {
                 Ok(found) => Some(found.node.clone()),
                 Err(RefError::Gone) => None,
@@ -168,6 +174,7 @@ mod tests {
             role: role.into(),
             role_description: String::new(),
             enabled,
+            secure: false,
             frame: Rect::new(0.0, 0.0, 10.0, 10.0),
             children: Vec::new(),
         }

@@ -77,6 +77,11 @@ pub enum HubEvent {
     Pairing,
     /// An app on a device a panel shows crashed (see `crash_watch`).
     Crash(DeviceId, oximux_simulator::diag::Crash),
+    /// A flow recording started, grew or stopped: the REC chip re-reads.
+    Flow,
+    /// Something to tell the user about a worktree's flow recording (it
+    /// ended with the device and was saved).
+    FlowNotice(PathBuf, NoticeKind, String),
 }
 
 pub struct SimulatorHub {
@@ -156,6 +161,8 @@ pub struct SimulatorHub {
     /// When each device's stream was asked to start, until its first
     /// picture: how long a start (an un-park) takes, logged at debug.
     started_at: HashMap<DeviceId, Instant>,
+    /// Flow recordings, an agent's and the panel's (see `flow_recorder`).
+    flows: flow_recorder::FlowRecorder,
 }
 
 impl EventEmitter<HubEvent> for SimulatorHub {}
@@ -165,6 +172,9 @@ mod android;
 mod capture;
 mod crash_watch;
 mod device_state;
+mod flow_recorder;
+pub(crate) use flow_recorder::{PanelStep, RecSource, Recording, save as save_flow};
+pub(crate) use snapshot::{SharedRead, Tree};
 mod iphone;
 mod iphone_control;
 mod lifecycle;
@@ -625,6 +635,7 @@ impl SimulatorHub {
             // the refs that numbered its elements.
             self.forget_consent_requests(key.path(), cx);
             self.forget_refs(key);
+            self.forget_flows(key, cx);
         }
         let effects = self.registry.attach(key.clone(), info.udid.clone(), booted, Instant::now());
         self.run(effects, cx);
@@ -676,6 +687,7 @@ impl SimulatorHub {
         let udid = self.registry.device_for(&key).cloned();
         self.forget_consent_requests(worktree, cx);
         self.forget_refs(&key);
+        self.forget_flows(&key, cx);
         let effects = self.registry.detach(&key, Instant::now());
         self.run(effects, cx);
         // A recording belongs to the device: it ends with its last attachment.

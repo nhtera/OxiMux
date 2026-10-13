@@ -30,7 +30,12 @@ pub(crate) enum AskKind {
     Push { app: String },
     /// Change a real device's state, in words ("switch to dark mode").
     PhysicalState { what: String },
+    /// Run a file of steps, these of which change the device's state.
+    FlowRun { lines: Vec<String> },
 }
+
+/// How many of a run's steps the question lists.
+const FLOW_LINES_SHOWN: usize = 8;
 
 impl AskKind {
     /// What the agent wants, for the toast ("An agent in … wants to …").
@@ -40,12 +45,14 @@ impl AskKind {
             Self::Erase => format!("erase {device}"),
             Self::Push { app } => format!("send a notification to {app} on {device}"),
             Self::PhysicalState { what } => format!("{what} on {device}"),
+            Self::FlowRun { lines } if lines.len() == 1 => format!("run 1 step that changes {device}"),
+            Self::FlowRun { lines } => format!("run {} steps that change {device}", lines.len()),
         }
     }
 
     /// The banner: its title, why it is asked, and its two answers.
-    pub(crate) fn question(&self, device: &str) -> (String, &'static str, (&'static str, &'static str)) {
-        match self {
+    pub(crate) fn question(&self, device: &str) -> (String, String, (&'static str, &'static str)) {
+        let (title, body, answers) = match self {
             Self::Install { app } => (
                 format!("Install {app} on {device}?"),
                 "An agent in this worktree wants to install this app on your real device. Allow it only if you expected this build.",
@@ -66,7 +73,21 @@ impl AskKind {
                 "An agent in this worktree wants to change a setting on your real device. Asked every time.",
                 ("Don't allow", "Allow"),
             ),
-        }
+            Self::FlowRun { lines } => {
+                let mut body = "An agent in this worktree wants to run a flow with these steps, which change the device:".to_owned();
+                for line in lines.iter().take(FLOW_LINES_SHOWN) {
+                    // One line each, whatever a client sent.
+                    let line: String = line.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+                    body.push_str(&format!("\n• {}", crate::shell::simulator::agent_ops::clamp(&line, 120)));
+                }
+                if lines.len() > FLOW_LINES_SHOWN {
+                    body.push_str(&format!("\n…and {} more", lines.len() - FLOW_LINES_SHOWN));
+                }
+                body.push_str("\nErase and notifications still ask when their turn comes.");
+                return (format!("Run this flow on {device}?"), body, ("Don't run", "Run"));
+            }
+        };
+        (title, body.to_owned(), answers)
     }
 }
 
@@ -191,5 +212,10 @@ mod tests {
         let dark = AskKind::PhysicalState { what: "switch to dark mode".into() };
         assert_eq!(dark.question("Pixel 8").0, "Let an agent switch to dark mode on Pixel 8?");
         assert_eq!(AskKind::Install { app: "a.apk".into() }.question("Pixel 8").0, "Install a.apk on Pixel 8?");
+        let lines: Vec<String> = (0..10).map(|i| format!("privacy grant camera --app com.a{i}")).collect();
+        let (title, body, (_, allow)) = AskKind::FlowRun { lines }.question("iPhone 17");
+        assert_eq!((title.as_str(), allow), ("Run this flow on iPhone 17?", "Run"));
+        assert_eq!(AskKind::FlowRun { lines: vec!["erase".into()] }.what("iPhone 17"), "run 1 step that changes iPhone 17");
+        assert!(body.contains("• privacy grant camera --app com.a0") && body.contains("…and 2 more"), "{body}");
     }
 }

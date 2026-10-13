@@ -1,0 +1,21 @@
+# oximux-flow v1
+# platform ios
+# screen 402x874
+# app com.example.app
+launch com.example.app --relaunch --settle
+tap --label "Sign in" --exact --settle
+tap --id email_field --exact
+type "ada@example.com"
+tap --id password --exact
+type "${SECRET_1}"
+tap --label "Price (USD)" --exact --nth 1
+swipe 201 700 201 200 --duration 400
+wait --label Welcome --exact --timeout-ms 8000
+assert --label Welcome --exact
+assert --id spinner --exact --gone
+tap 201 437
+button home
+rotate landscape-left
+location set 37.3349 -122.009
+open-url "https://example.com/a?b=1"
+assert --label Total --exact --text "$5"

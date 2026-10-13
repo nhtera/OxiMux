@@ -680,6 +680,9 @@ Tap a point (x y, in points from the top-left), an @eN ref, or the element with 
 | `<Y>` | yes |  |
 | `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring |
 | `--id` | yes | An accessibility identifier, exact |
+| `--exact` | no | Match the label or identifier exactly (no substring fallback) |
+| `--role` | yes | Only elements of this role (`Button`, `TextField`, … as `ax` prints them); exact |
+| `--nth` | yes | The Nth such element on screen, from 0, in `ax` order |
 | `--settle` | no | Wait for the screen to go idle, then print what changed: `+` appeared, `-` went, with `@eN` refs to act on next |
 | `--settle-timeout` | yes | The longest to wait for it (default 5000 on a simulator, 6000 on Android or an iPhone, 8000 for launch and open-url; at most 60000) |
 
@@ -756,8 +759,11 @@ Wait for an element to appear (or, --gone, to go): exit 0 once it does, 4 when t
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<R>` | yes | An `@eN` ref |
-| `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring |
+| `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring (only exact with --exact) |
 | `--id` | yes | An accessibility identifier, exact |
+| `--exact` | no | Match the label or identifier exactly (no substring fallback) |
+| `--role` | yes | Only elements of this role (`Button`, `TextField`, … as `ax` prints them); exact |
+| `--nth` | yes | The Nth such element on screen, from 0, in `ax` order |
 | `--gone` | no | Wait for it to go away instead |
 | `--timeout-ms` | yes | Give up after this long (at most 60000) |
 
@@ -768,8 +774,11 @@ Check an element once: exit 0 if it holds, 1 (assert-failed) saying what was fou
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<R>` | yes | An `@eN` ref |
-| `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring |
+| `--label` | yes | An accessibility label: exact match first, then a case-insensitive substring (only exact with --exact) |
 | `--id` | yes | An accessibility identifier, exact |
+| `--exact` | no | Match the label or identifier exactly (no substring fallback) |
+| `--role` | yes | Only elements of this role (`Button`, `TextField`, … as `ax` prints them); exact |
+| `--nth` | yes | The Nth such element on screen, from 0, in `ax` order |
 | `--gone` | no | It is not on screen |
 | `--text` | yes | Its text (a field's value, else its label) is exactly this |
 | `--enabled` | no | It is on screen and enabled |
@@ -874,6 +883,53 @@ The device's recent crashes, each with its exception and top frames (default: th
 | --- | --- | --- |
 | `--since` | yes | How far back: 30s, 10m, 1h (at most 1h) |
 | `--app` | yes | One app's crashes (bundle id; Android: package name). Required on a real Android phone |
+
+#### `oximux sim run`
+
+Run a file of steps in order, stopping at the first that fails (its exit code is the run's). Steps that change device state ask the user once, before step 1
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<FILE>` | yes | The steps: one `oximux sim` command per line without the prefix (`tap --label "Sign in" --exact`), `#` comments. `-` reads stdin |
+| `--settle` | no | Settle after every action step |
+| `--from` | yes | Start at step N (from 1), e.g. to resume after exit 7 |
+
+#### `oximux sim flow`
+
+Record agent steps into a flow file that `sim run` replays, or export one
+
+_No arguments._
+
+##### `oximux sim flow start`
+
+Record this worktree's agent verbs on its device, from now
+
+_No arguments._
+
+##### `oximux sim flow stop`
+
+Stop recording: the steps are saved in OxiMux's data (private) and the path printed, or written to --out
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--out` | yes | Write the flow file here instead |
+
+##### `oximux sim flow status`
+
+Whether a recording runs, and its steps so far
+
+_No arguments._
+
+##### `oximux sim flow export`
+
+Turn a flow file into another tool's format
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<FILE>` | yes | The flow file (`-` reads stdin) |
+| `--maestro` | no | As Maestro YAML (the only format so far) |
+| `--out` | yes | Write it here instead of stdout |
+| `--app-id` | yes | The app the flow drives (default: the file's `# app`, else its first launch) |
 
 ### `oximux serve`
 
