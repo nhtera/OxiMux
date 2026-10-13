@@ -369,7 +369,7 @@ impl SimulatorPanel {
         let recording = self.flow_steps(cx).is_some();
         screen.update(cx, |screen, cx| {
             screen.bind(binding, theme, &typography, window, cx);
-            screen.set_recording(recording);
+            screen.set_recording(recording, cx);
         });
         Some(screen)
     }
