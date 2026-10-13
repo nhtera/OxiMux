@@ -244,6 +244,17 @@ impl SimulatorHub {
         &self.agent.granted
     }
 
+    /// Whether agents may run raw `simctl`/`adb` commands (`sim exec`):
+    /// Settings' switch, off unless the user turned it on.
+    pub fn exec_allowed(&self) -> bool {
+        sim_state_keys::exec_allowed(&self.repo)
+    }
+
+    pub fn set_exec_allowed(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        sim_state_keys::save_exec_allowed(&self.repo, allowed);
+        cx.emit(HubEvent::Consent);
+    }
+
     /// Settings withdrew an approval: in memory at once, and from the
     /// database (never revoke through the repository alone, or the grant in
     /// memory would outlive it until a restart).

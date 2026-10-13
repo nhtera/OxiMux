@@ -309,6 +309,38 @@ oximux sim crashes --app com.example.app --since 1h
 - Secret-looking values (API keys, tokens, `token=…`) are replaced with
   `[redacted]` before you see them.
 
+## Raw simctl and adb: `exec`
+
+For the rare command no verb above covers. **Off unless the user turned it on**
+(Settings → Mobile Emulator → "Allow agents to run raw simctl/adb commands");
+while it is off every call exits 5 (`refused`) without asking anyone. Prefer
+the dedicated verbs: they need no switch and ask less.
+
+```sh
+oximux sim exec -- ui appearance dark              # iOS: simctl ui <device> appearance dark
+oximux sim exec -- terminate com.example.app
+oximux sim exec -- shell pm clear com.example.app  # Android: adb -s <serial> shell …
+oximux sim exec -- install build/app-debug.apk
+```
+
+- Write the command after `--`, **without the device**: OxiMux adds the
+  attached one (`simctl <sub> <udid> …`, `adb -s <serial> …`).
+- The user is asked **every time**, shown the exact command, and the command
+  then runs outside your sandbox. Exit 5 if they say no.
+- iOS simulators run only `listapps`, `appinfo`, `terminate`, `openurl`, `ui`,
+  `status_bar`, `privacy`, `location`. A device id, `all`, `booted`, a host
+  path or a `file:` URL is refused (exit 2).
+- Android runs only `shell`, `install`, `uninstall`, `logcat`, `emu`, `push`,
+  `pull`. adb's global options (`-s -t -d -e -H -P -L`) and `connect`,
+  `disconnect`, `kill-server`, `reboot`, `root`, `remount` are refused
+  wherever they appear (so `logcat -d` is refused: use `oximux sim logs`).
+  `install` and `push` read, and `pull` writes, only inside the worktree;
+  `pull` needs the local path.
+- Not on a real iPhone (exit 5), and never inside `run`.
+- The output is cut to 64 KiB and the command stopped after 30 s (a followed
+  `logcat` returns what it printed by then). Secret-looking values are
+  `[redacted]`. A command that fails exits 1 with its output.
+
 ## Android
 
 The same verbs drive an Android emulator (an AVD) or a phone with USB
@@ -371,9 +403,9 @@ oximux sim button volume-down
   select Xcode 26. The Mobile Emulator panel shows the exact command for an
   Xcode 26 it finds; the general form, with their own app path, quoted, is
   `sudo xcode-select -s '/Applications/Xcode.app/Contents/Developer'`.
-- `--settle`, `ax -i`, `wait`, `assert`, a tap by ref, `run` and `flow`
-  print what is on screen, like `ax`: OxiMux hides their output from a phone
-  mirroring your chat.
+- `--settle`, `ax -i`, `wait`, `assert`, a tap by ref, `run`, `flow` and
+  `exec` print what is on screen or on the device, like `ax`: OxiMux hides
+  their output from a phone mirroring your chat.
 - Screenshots and the AX tree go to your model provider. The user was told when
   they allowed it; do not sign in to real accounts on the simulator.
 - `oximux sim shutdown` refuses a device the user booted themselves. Do not add

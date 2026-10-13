@@ -156,6 +156,7 @@ impl SimCommand {
             Self::Logs(_) | Self::Crashes(_) => None,
             // v30, and `run`'s steps are gated one by one.
             Self::Run(_) | Self::Flow(_) => None,
+            Self::Exec(_) => None,
         }
     }
 
@@ -172,6 +173,11 @@ impl SimCommand {
             }
             _ => None,
         }
+    }
+
+    /// `exec` (v31).
+    pub fn is_exec(&self) -> bool {
+        matches!(self, Self::Exec(_))
     }
 
     /// The v29 diagnostics verbs (`logs`, `crashes`).
@@ -217,7 +223,8 @@ impl SimCommand {
             | Self::Logs(_)
             | Self::Crashes(_)
             | Self::Run(_)
-            | Self::Flow(_) => None,
+            | Self::Flow(_)
+            | Self::Exec(_) => None,
         }
     }
 

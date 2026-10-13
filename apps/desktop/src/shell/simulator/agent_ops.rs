@@ -37,6 +37,7 @@ mod ax_lookup;
 mod checks;
 mod device_state;
 mod diagnostics;
+mod exec;
 mod flow;
 pub(crate) use flow::{platform as flow_platform, screen_points};
 pub(crate) use diagnostics::clamp;
@@ -129,6 +130,10 @@ async fn run_verb(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Si
             Ok(SimReplyWire::Done)
         }
         control => {
+            // Exec's own gates come first: off, or not allowed, asks nobody.
+            if let Some(exec) = exec_of(&control) {
+                exec::precheck(&hub, &target, exec, cx).await?;
+            }
             let (udid, name) = authorize(&hub, &target, cx)?;
             hub.update(cx, |hub, cx| hub.agent_verb_started(&udid, cx));
             let worktree = target.worktree.clone();
@@ -139,6 +144,16 @@ async fn run_verb(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Si
             hub.update(cx, |hub, cx| hub.agent_verb_finished(&udid, cx));
             out
         }
+    }
+}
+
+/// The exec `cmd` is or carries.
+fn exec_of(cmd: &SimCmdWire) -> Option<&oximux_remote_proto::simulator::SimExecWire> {
+    match cmd {
+        SimCmdWire::Exec(exec) => Some(exec),
+        SimCmdWire::AsCaller { cmd, .. } => exec_of(cmd),
+        SimCmdWire::Settled { action, .. } => exec_of(action),
+        _ => None,
     }
 }
 

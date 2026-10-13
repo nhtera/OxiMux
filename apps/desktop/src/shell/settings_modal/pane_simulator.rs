@@ -185,6 +185,7 @@ fn agent_entries(
                 cx,
             ),
         ),
+        exec_entry(theme, cx),
         commands::entry(theme, density, typography, cx),
         entry(
             "What agents can do",
@@ -200,6 +201,27 @@ fn agent_entries(
             ),
         ),
     ]
+}
+
+/// `oximux sim exec`'s switch: in the app's database (the hub's), not
+/// `simulator.toml`, which agents' own tools can write.
+fn exec_entry(theme: Theme, cx: &mut Context<SettingsModal>) -> SettingEntry {
+    let allowed = hub(cx).is_some_and(|hub| hub.read(cx).exec_allowed());
+    entry(
+        "Allow agents to run raw simctl/adb commands",
+        "`oximux sim exec`, asking you each time with the exact command. It runs outside the agent's sandbox.",
+        toggle_switch(
+            "sim-exec",
+            allowed,
+            theme,
+            move |_, _, cx| {
+                if let Some(hub) = hub(cx) {
+                    hub.update(cx, |hub, cx| hub.set_exec_allowed(!allowed, cx));
+                }
+            },
+            cx,
+        ),
+    )
 }
 
 fn stream_entries(

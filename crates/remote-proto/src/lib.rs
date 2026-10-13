@@ -29,6 +29,7 @@ pub mod pairing;
 pub mod proto;
 pub mod simulator;
 mod simulator_diag;
+mod simulator_exec;
 mod simulator_flow;
 mod simulator_state;
 mod simulator_verify;

@@ -202,6 +202,103 @@ impl SystemRunner {
     }
 }
 
+/// What [`run_bounded`] got from a command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bounded {
+    /// Exit code; `None` when it was killed (a signal, the cap, the deadline).
+    pub status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Its output reached the cap: the rest was not read, and it was stopped.
+    pub truncated: bool,
+    /// It was still running at the deadline, and was stopped.
+    pub timed_out: bool,
+}
+
+/// Run `program args…` (stdin closed), keeping at most `cap` bytes of its
+/// stdout and stderr together. It is stopped when that fills or at
+/// `timeout`, and what it wrote by then comes back: a command that never ends
+/// on its own (a log that follows) still answers.
+///
+/// On Unix it runs in a process group of its own, and stopping it stops the
+/// group: a child it started cannot keep the pipes (and this call) open. A
+/// child left behind by a command that exited is waited for only briefly.
+pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, cap: usize) -> Result<Bounded> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).no_window();
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn()?;
+    // Both streams draw on one budget; a reader that finds it spent stops.
+    let (left, full) = (Arc::new(AtomicUsize::new(cap)), Arc::new(AtomicBool::new(false)));
+    let capped = |pipe: Option<Box<dyn Read + Send>>| {
+        let (left, full, buf) = (left.clone(), full.clone(), Arc::new(Mutex::new(Vec::new())));
+        let kept = buf.clone();
+        let reader = std::thread::spawn(move || {
+            let Some(mut pipe) = pipe else { return };
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut chunk) {
+                if n == 0 {
+                    return;
+                }
+                let took = left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(l.saturating_sub(n))).unwrap_or(0).min(n);
+                kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(&chunk[..took]);
+                if took < n {
+                    full.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        (reader, buf)
+    };
+    let out = capped(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = capped(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = Instant::now() + timeout;
+    let (mut status, mut timed_out) = (None, false);
+    loop {
+        if let Some(done) = child.try_wait()? {
+            status = done.code();
+            break;
+        }
+        // Spent: it is writing more than anyone will read.
+        if full.load(Ordering::SeqCst) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop_group(&mut child, status.is_none());
+    // The pipes close once the group is gone; a descendant that left it
+    // could keep them open, so the readers get a moment, not forever.
+    let settle = Instant::now() + Duration::from_millis(500);
+    while !(out.0.is_finished() && err.0.is_finished()) && Instant::now() < settle {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let take = |buf: &Arc<Mutex<Vec<u8>>>| std::mem::take(&mut *buf.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    Ok(Bounded { status, stdout: take(&out.1), stderr: take(&err.1), truncated: full.load(Ordering::SeqCst), timed_out })
+}
+
+/// Stop what [`run_bounded`] started, while it still runs: its whole group
+/// on Unix. Never once it was reaped: its pid (the group's id) may then
+/// belong to someone else.
+fn stop_group(child: &mut std::process::Child, running: bool) {
+    if running {
+        #[cfg(unix)]
+        // SAFETY: `kill(2)` on the group this call created; its leader is
+        // not reaped yet, so the id is still this group's.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
 /// `program` and its first two arguments (after adb's `-s <serial>`), the
 /// rest counted: what an error
 /// or a log line may say about a command. A later argument can be a payload,
@@ -413,5 +510,24 @@ mod tests {
         assert_eq!(r.run("a", &["b"], None, Duration::ZERO).unwrap().stdout, b"x");
         assert!(r.run("a", &["b"], None, Duration::ZERO).is_err());
         assert_eq!(r.calls(), vec!["a b", "a b"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_bounded_run_keeps_at_most_the_cap_and_stops_at_the_deadline() {
+        let done = run_bounded("sh", &["-c", "echo out; echo err >&2; exit 3"], Duration::from_secs(10), 1024).unwrap();
+        assert_eq!((done.status, done.stdout.as_slice(), done.stderr.as_slice()), (Some(3), &b"out\n"[..], &b"err\n"[..]));
+        assert!(!done.truncated && !done.timed_out);
+        // Never ends on its own: cut at the cap, and stopped.
+        let flood = run_bounded("yes", &[], Duration::from_secs(10), 4096).unwrap();
+        assert!(flood.truncated && !flood.timed_out);
+        assert_eq!(flood.stdout.len() + flood.stderr.len(), 4096);
+        assert_eq!(flood.status, None);
+        // Quiet and endless: what it wrote, at the deadline.
+        let started = Instant::now();
+        let slow = run_bounded("sh", &["-c", "echo first; sleep 30"], Duration::from_millis(300), 1024).unwrap();
+        assert!(slow.timed_out && !slow.truncated);
+        assert_eq!(slow.stdout, b"first\n");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

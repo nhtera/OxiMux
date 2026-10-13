@@ -426,6 +426,7 @@ pub(super) async fn execute(
         SimCmdWire::DeviceState(change) => super::device_state::run(hub, udid, name, change, target, cx).await,
         SimCmdWire::Logs(query) => super::diagnostics::logs(hub, udid, query, cx).await,
         SimCmdWire::Crashes(query) => super::diagnostics::crashes(hub, udid, query, cx).await,
+        SimCmdWire::Exec(wire) => super::exec::run(hub, udid, name, wire, target, cx).await,
         SimCmdWire::Shutdown { force } => {
             let refused = hub
                 .update(cx, |hub, cx| {

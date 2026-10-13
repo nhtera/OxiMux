@@ -196,6 +196,7 @@ pub mod session_ctl;
 pub mod sessions;
 pub mod sim;
 pub mod sim_diag;
+pub mod sim_exec;
 pub mod sim_flow;
 pub mod sim_render;
 pub mod sim_state;

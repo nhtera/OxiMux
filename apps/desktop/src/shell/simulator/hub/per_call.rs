@@ -32,6 +32,8 @@ pub(crate) enum AskKind {
     PhysicalState { what: String },
     /// Run a file of steps, these of which change the device's state.
     FlowRun { lines: Vec<String> },
+    /// Run this raw `simctl`/`adb` command line (`sim exec`), shown whole.
+    Exec { command: String },
 }
 
 /// How many of a run's steps the question lists.
@@ -47,6 +49,7 @@ impl AskKind {
             Self::PhysicalState { what } => format!("{what} on {device}"),
             Self::FlowRun { lines } if lines.len() == 1 => format!("run 1 step that changes {device}"),
             Self::FlowRun { lines } => format!("run {} steps that change {device}", lines.len()),
+            Self::Exec { .. } => format!("run a raw command on {device}"),
         }
     }
 
@@ -85,6 +88,12 @@ impl AskKind {
                 }
                 body.push_str("\nErase and notifications still ask when their turn comes.");
                 return (format!("Run this flow on {device}?"), body, ("Don't run", "Run"));
+            }
+            Self::Exec { command } => {
+                let body = format!(
+                    "An agent in this worktree wants to run this command, outside its sandbox. Asked every time.\n{command}"
+                );
+                return (format!("Run a command on {device}?"), body, ("Don't run", "Run"));
             }
         };
         (title, body.to_owned(), answers)
@@ -217,5 +226,9 @@ mod tests {
         assert_eq!((title.as_str(), allow), ("Run this flow on iPhone 17?", "Run"));
         assert_eq!(AskKind::FlowRun { lines: vec!["erase".into()] }.what("iPhone 17"), "run 1 step that changes iPhone 17");
         assert!(body.contains("• privacy grant camera --app com.a0") && body.contains("…and 2 more"), "{body}");
+        let exec = AskKind::Exec { command: "xcrun simctl ui U appearance dark".into() };
+        let (title, body, (deny, allow)) = exec.question("iPhone 17");
+        assert_eq!((title.as_str(), deny, allow), ("Run a command on iPhone 17?", "Don't run", "Run"));
+        assert!(body.ends_with("\nxcrun simctl ui U appearance dark") && body.contains("outside its sandbox"), "{body}");
     }
 }

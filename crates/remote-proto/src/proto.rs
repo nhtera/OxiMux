@@ -164,12 +164,17 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// agent's verbs, approving a run's state changes once, and exact selectors.
 /// A v29 host cannot decode them: see [`SIMULATOR_FLOW_MIN_VERSION`].
 ///
+/// v31: appended **exec** (`SimCmdWire::Exec`, `SimReplyWire::ExecOutput` and
+/// the `simulator_exec` types): a raw `simctl`/`adb` command on the attached
+/// device, off unless the user turns it on, asked every time. A v30 host
+/// cannot decode it: see [`SIMULATOR_EXEC_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -270,6 +275,10 @@ pub const SIMULATOR_DIAG_MIN_VERSION: u32 = 29;
 /// approval, and exact selectors (`--exact`, `--role`, `--nth`). Read by the
 /// **client** and gated on what the command asks for.
 pub const SIMULATOR_FLOW_MIN_VERSION: u32 = 30;
+
+/// The oldest host that serves `sim exec`. Read by the **client** and gated
+/// on what the command asks for.
+pub const SIMULATOR_EXEC_MIN_VERSION: u32 = 31;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the

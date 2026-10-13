@@ -90,6 +90,7 @@ pub fn command(words: &[String]) -> Result<SimCommand, String> {
     match command {
         SimCommand::Run(_) => Err("a step cannot run another file".into()),
         SimCommand::Flow(_) => Err("a step cannot record or export flows".into()),
+        SimCommand::Exec(_) => Err("a step cannot run a raw exec command".into()),
         SimCommand::WaitConsent { .. } => Err("a step cannot wait for the user (exit 7 says to resume with --from)".into()),
         command => Ok(command),
     }
@@ -281,7 +282,7 @@ mod tests {
     fn a_step_is_parsed_as_the_cli_parses_it() {
         assert!(matches!(command(&words("tap 10 20")), Ok(SimCommand::Tap { .. })));
         assert!(command(&words("tap --bogus")).unwrap_err().contains("--bogus"), "clap's error, not an exit");
-        for refused in ["run x.flow", "flow start", "wait-consent", "--json tap 1 2", "tap 1 2 --worktree /w", "tap 1 2 --timeout 5"] {
+        for refused in ["run x.flow", "flow start", "wait-consent", "exec -- ui appearance dark", "--json tap 1 2", "tap 1 2 --worktree /w", "tap 1 2 --timeout 5"] {
             assert!(command(&words(refused)).is_err(), "{refused}");
         }
     }

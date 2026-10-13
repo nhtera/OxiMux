@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 pub use crate::cli_sim::{AssertArgs, SettleArgs, TapArg, WaitArgs};
 pub use crate::cli_sim_diag::{CrashesArgs, LogsArgs};
+pub use crate::cli_sim_exec::ExecArgs;
 pub use crate::cli_sim_flow::{ExactArgs, FlowCommand, RunArgs};
 pub use crate::cli_sim_state::{AppearanceArg, LocationCommand, PrivacyArgs, PushArgs, StatusBarArg};
 
@@ -968,6 +969,11 @@ pub enum SimCommand {
     /// one.
     #[command(subcommand)]
     Flow(FlowCommand),
+    /// Run a raw simctl (iOS simulator) or adb (Android) command on the
+    /// attached device: `oximux sim exec -- ui appearance dark`. Off unless
+    /// the user turns it on in Settings, asked every time, and limited to
+    /// commands that touch only that device.
+    Exec(ExecArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

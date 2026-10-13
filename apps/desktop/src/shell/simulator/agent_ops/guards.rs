@@ -71,7 +71,8 @@ pub(super) fn is_action(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::DeviceState(_)
         | SimCmdWire::Logs(_)
         | SimCmdWire::Crashes(_)
-        | SimCmdWire::Flow(_) => false,
+        | SimCmdWire::Flow(_)
+        | SimCmdWire::Exec(_) => false,
     }
 }
 
@@ -98,7 +99,8 @@ pub(super) fn is_input(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::DeviceState(_)
         | SimCmdWire::Logs(_)
         | SimCmdWire::Crashes(_)
-        | SimCmdWire::Flow(_) => false,
+        | SimCmdWire::Flow(_)
+        | SimCmdWire::Exec(_) => false,
     }
 }
 
@@ -131,7 +133,8 @@ pub(super) fn needs_screen(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::DeviceState(_)
         | SimCmdWire::Logs(_)
         | SimCmdWire::Crashes(_)
-        | SimCmdWire::Flow(_) => false,
+        | SimCmdWire::Flow(_)
+        | SimCmdWire::Exec(_) => false,
     }
 }
 
@@ -166,6 +169,8 @@ pub(super) fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static
         // A recording is the app's own bookkeeping; a run's approval asks
         // the user. Neither touches the device.
         SimCmdWire::Flow(_) => return None,
+        // simctl or adb, checked by `exec` (a real iPhone is refused there).
+        SimCmdWire::Exec(_) => return None,
         // The tap's needs, then typing's.
         SimCmdWire::TypeInto { target, .. } => return refused_on(caps, &SimCmdWire::Tap(target.clone())).or((!caps.keys).then_some("Typing")),
     };
