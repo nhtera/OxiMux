@@ -47,6 +47,8 @@ const ADB: [&str; 7] = ["shell", "install", "uninstall", "logcat", "emu", "push"
 /// only. Left out: `screenrecord` (writes host files), `avd` (the AVD's
 /// files and snapshots), `kill`.
 const EMU: [&str; 13] = ["geo", "sms", "gsm", "cdma", "power", "network", "sensor", "finger", "rotate", "event", "fold", "unfold", "ping"];
+/// `adb emu network` subcommands (not `capture`, which writes a host file).
+const NETWORK: [&str; 3] = ["speed", "delay", "status"];
 /// adb words that reach past the device, refused wherever they appear.
 const ADB_REFUSED: [&str; 6] = ["connect", "disconnect", "kill-server", "reboot", "root", "remount"];
 /// adb's global options (which device, which server), refused anywhere: the
@@ -110,6 +112,11 @@ pub(super) fn check(tool: Tool, argv: &[String], worktree: &Path) -> Result<Chec
     if argv.iter().any(|w| w == "--") {
         return bad("`--` is not allowed inside the command".into());
     }
+    // adb hands `emu`'s words to the console as one line: a line break would
+    // start another console command. No word needs one.
+    if argv.iter().any(|w| w.chars().any(char::is_control)) {
+        return bad("a control character (a line break, a tab) is not allowed in the command".into());
+    }
     let root = std::fs::canonicalize(worktree).map_err(|_| SimErrorWire::NoDevice)?;
     let plain = |argv: &[String]| Ok(Checked { argv: argv.to_vec(), root: root.clone(), reads: Vec::new(), writes: None });
     match tool {
@@ -142,6 +149,10 @@ pub(super) fn check(tool: Tool, argv: &[String], worktree: &Path) -> Result<Chec
             }
             if sub == "emu" && !argv.get(1).is_some_and(|c| EMU.contains(&c.as_str())) {
                 return bad(format!("`adb emu` runs only: {}", EMU.join(", ")));
+            }
+            // `network capture` writes a host file.
+            if sub == "emu" && argv[1] == "network" && !argv.get(2).is_some_and(|c| NETWORK.contains(&c.as_str())) {
+                return bad(format!("`adb emu network` runs only: {}", NETWORK.join(", ")));
             }
             if matches!(sub.as_str(), "install" | "push" | "pull") { adb_paths(sub, argv, root) } else { plain(argv) }
         }
@@ -277,16 +288,17 @@ pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str,
         return Err(SimErrorWire::Refused(OFF.into()));
     }
     let skip = prefix.len() - checked.argv.len();
-    let ran = on_own_thread(move || transfer(&program, prefix, skip, &checked)).await?;
+    let base = exec_files::private_base().map_err(|e| SimErrorWire::Failed(format!("no private folder for the transfer: {e}")))?;
+    let ran = on_own_thread(move || transfer(&program, prefix, skip, &checked, &base)).await?;
     Ok(SimReplyWire::ExecOutput(output(ran?)))
 }
 
 /// Run the approved command, adb's host files going through a private
-/// folder (see [`exec_files`]); `skip` words of `args` come before
-/// `checked.argv`.
-fn transfer(program: &str, mut args: Vec<String>, skip: usize, checked: &Checked) -> Result<(runner::Bounded, Option<u32>), SimErrorWire> {
+/// folder under `base` (see [`exec_files`]); `skip` words of `args` come
+/// before `checked.argv`.
+fn transfer(program: &str, mut args: Vec<String>, skip: usize, checked: &Checked, base: &Path) -> Result<(runner::Bounded, Option<u32>), SimErrorWire> {
     let failed = |e: std::io::Error| SimErrorWire::Failed(format!("no private folder for the transfer: {e}"));
-    let private = if checked.reads.is_empty() && checked.writes.is_none() { None } else { Some(tempfile::tempdir().map_err(failed)?) };
+    let private = if checked.reads.is_empty() && checked.writes.is_none() { None } else { Some(exec_files::private_dir(base).map_err(failed)?) };
     if let Some(dir) = &private {
         let inputs: Vec<PathBuf> = checked.reads.iter().map(|&i| PathBuf::from(&checked.argv[i])).collect();
         let staged = exec_files::stage_inputs(&checked.root, &inputs, dir.path())?;

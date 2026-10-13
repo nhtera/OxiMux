@@ -27,6 +27,32 @@ pub(super) fn in_git(path: &Path) -> bool {
     path.components().any(|c| matches!(c, Component::Normal(n) if is_git(n)))
 }
 
+/// Where transfers' private folders go: the app's data, not the temp folder,
+/// which agents' sandboxes usually may write (and so could swap a staged or
+/// pulled file mid-transfer).
+pub(super) fn private_base() -> io::Result<PathBuf> {
+    Ok(crate::app_paths::data_dir().ok_or_else(|| io::Error::other("no app data folder"))?.join("exec"))
+}
+
+/// A fresh folder under `base` (made owner-only) for one transfer.
+pub(super) fn private_dir(base: &Path) -> io::Result<tempfile::TempDir> {
+    fs::create_dir_all(base)?;
+    #[cfg(unix)]
+    fs::set_permissions(base, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    tempfile::Builder::new().prefix("t").tempdir_in(base)
+}
+
+/// One plain file with no other name: a hard link inside the worktree could
+/// name a file outside it.
+fn plain_file(file: &File) -> io::Result<()> {
+    let meta = file.metadata()?;
+    #[cfg(unix)]
+    let single = std::os::unix::fs::MetadataExt::nlink(&meta) == 1;
+    #[cfg(not(unix))]
+    let single = true;
+    if meta.is_file() && single { Ok(()) } else { Err(io::Error::other("not a plain file")) }
+}
+
 fn moved(path: &Path) -> SimErrorWire {
     SimErrorWire::Refused(format!("{} changed after it was approved; ask again", path.display()))
 }
@@ -38,8 +64,8 @@ pub(super) fn stage_inputs(root: &Path, inputs: &[PathBuf], into: &Path) -> Resu
     let mut staged = Vec::with_capacity(inputs.len());
     for (n, input) in inputs.iter().enumerate() {
         let mut file = open_inside(input, root, OpenOptions::new().read(true), false).map_err(|_| moved(input))?;
-        if !file.metadata().is_ok_and(|m| m.is_file()) {
-            return Err(SimErrorWire::BadInput(format!("{} is not a file", input.display())));
+        if plain_file(&file).is_err() {
+            return Err(SimErrorWire::BadInput(format!("{} is not a plain file", input.display())));
         }
         // A folder each, so two inputs of one name keep it (adb names the
         // device's copy after it).
@@ -88,7 +114,7 @@ fn place(root: &Path, src: &Path, dest: &Path, placed: &mut u32) -> Result<(), S
         }
     } else if kind.is_file() {
         let mut out = create_inside(dest, root).map_err(|_| refused())?;
-        let copied = File::open(src).and_then(|mut f| io::copy(&mut f, &mut out));
+        let copied = open_plain(src).and_then(|mut f| io::copy(&mut f, &mut out));
         copied.map_err(|e| SimErrorWire::Failed(format!("{} was not written: {e}", dest.display())))?;
         *placed += 1;
     }
@@ -132,10 +158,22 @@ fn create_inside(dest: &Path, root: &Path) -> io::Result<File> {
         Err(_) => {}
     }
     let file = open_inside(dest, root, OpenOptions::new().write(true), false)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other("not a file"));
-    }
+    plain_file(&file)?;
     file.set_len(0)?;
+    // What a pull writes is never executable, a new file or an old one.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+    Ok(file)
+}
+
+/// A file adb wrote into the private folder, read as a plain file only.
+fn open_plain(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    plain_file(&file)?;
     Ok(file)
 }
 
@@ -145,7 +183,9 @@ fn create_inside(dest: &Path, root: &Path) -> io::Result<File> {
 #[cfg(target_os = "macos")]
 fn open_inside(path: &Path, root: &Path, options: &mut OpenOptions, created: bool) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let file = options.custom_flags(libc::O_NOFOLLOW).open(path)?;
+    // Non-blocking: opening a named pipe would otherwise wait for a writer
+    // for good. A plain file (all that is used) reads and writes as usual.
+    let file = options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
     let real = real_path(&file)?;
     if real.starts_with(root) {
         return Ok(file);

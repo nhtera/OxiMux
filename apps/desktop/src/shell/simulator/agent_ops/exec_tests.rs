@@ -44,7 +44,7 @@ fn simctl_reaches_the_attached_device_only() {
 #[test]
 fn adb_refuses_its_global_options_and_device_wide_commands_anywhere() {
     let (_dir, w) = worktree();
-    for ok in ["shell input keyevent 3", "uninstall com.a.b", "logcat -b crash", "emu geo fix 106.7 10.7", "emu sms send 123 hi", "shell am start -a android.intent.action.VIEW"] {
+    for ok in ["shell input keyevent 3", "uninstall com.a.b", "logcat -b crash", "emu geo fix 106.7 10.7", "emu sms send 123 hi", "emu network speed full", "shell am start -a android.intent.action.VIEW"] {
         assert_eq!(check(Tool::Adb, &args(ok), &w).unwrap().argv, args(ok), "{ok}");
     }
     for global in ["-s", "-t", "-d", "-e", "-H", "-P", "-L"] {
@@ -54,7 +54,7 @@ fn adb_refuses_its_global_options_and_device_wide_commands_anywhere() {
     for glued in ["-sR58M123 shell", "shell -sR58", "-t2 shell", "-Hhost shell", "-P5037 shell", "-Ltcp:1 shell", "--one-device R58 shell"] {
         assert!(bad(Tool::Adb, glued, &w), "{glued}");
     }
-    for refused in ["shell -- ls", "push -- -x /sdcard/", "emu screenrecord start /tmp/x.webm", "emu avd snapshot save s", "emu kill", "emu", "connect 10.0.0.2", "disconnect", "kill-server", "reboot", "root", "remount", "shell reboot", "shell su root", "devices", "forward tcp:1 tcp:2", "sync", "tcpip 5555", "start-server", "install-multiple a.apk"] {
+    for refused in ["emu network capture start /tmp/x.pcap", "emu network", "shell -- ls", "push -- -x /sdcard/", "emu screenrecord start /tmp/x.webm", "emu avd snapshot save s", "emu kill", "emu", "connect 10.0.0.2", "disconnect", "kill-server", "reboot", "root", "remount", "shell reboot", "shell su root", "devices", "forward tcp:1 tcp:2", "sync", "tcpip 5555", "start-server", "install-multiple a.apk"] {
         assert!(bad(Tool::Adb, refused, &w), "{refused}");
     }
 }
@@ -160,14 +160,15 @@ fn a_transfer_goes_through_a_private_folder() {
     let prefix = |c: &Checked| [vec!["-s".to_owned(), "S".into()], c.argv.clone()].concat();
 
     let push = check(Tool::Adb, &args("push build/app.apk /sdcard/"), &w).unwrap();
-    let (done, placed) = transfer(adb, prefix(&push), 2, &push).unwrap();
+    let base = dir.path().join("private");
+    let (done, placed) = transfer(adb, prefix(&push), 2, &push, &base).unwrap();
     let said = String::from_utf8_lossy(&done.stdout).into_owned();
     assert!(said.starts_with("apk ") && !said.contains("/w/build/"), "a copy, not the worktree file: {said}");
     assert_eq!(placed, None);
 
     std::fs::create_dir(w.join("out")).unwrap();
     let pull = check(Tool::Adb, &args("pull /sdcard/x out"), &w).unwrap();
-    let (done, placed) = transfer(adb, prefix(&pull), 2, &pull).unwrap();
+    let (done, placed) = transfer(adb, prefix(&pull), 2, &pull, &base).unwrap();
     assert_eq!((done.status, placed), (Some(0), Some(1)));
     let file = w.join("out/x/f.txt");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
@@ -218,5 +219,56 @@ fn a_symlink_swapped_in_after_the_question_is_refused() {
 fn a_pull_says_how_many_files_it_placed() {
     let placed = output((runner::Bounded { status: Some(0), ..Default::default() }, Some(2)));
     assert_eq!(placed.stderr, "[oximux: 2 files placed in the worktree]");
+}
+
+/// adb joins `emu`'s words into one console line: a line break in one would
+/// start a console command the allowlist never saw.
+#[test]
+fn no_word_carries_a_control_character() {
+    let (_dir, w) = worktree();
+    for (tool, words) in [(Tool::Adb, vec!["emu", "ping", "\nkill"]), (Tool::Adb, vec!["shell", "ls\rreboot"]), (Tool::Simctl, vec!["ui", "appearance", "dark\t"])] {
+        let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        assert!(matches!(check(tool, &argv, &w), Err(SimErrorWire::BadInput(_))), "{words:?}");
+    }
+}
+
+/// A file with a second name (a hard link from outside) or a named pipe is
+/// not read or written, and a pipe never hangs the transfer.
+#[cfg(target_os = "macos")]
+#[test]
+fn only_plain_files_are_moved() {
+    let (dir, w) = worktree();
+    let root = std::fs::canonicalize(&w).unwrap();
+    let into = tempfile::tempdir().unwrap();
+    std::fs::hard_link(dir.path().join("secret.txt"), root.join("linked.txt")).unwrap();
+    assert!(exec_files::stage_inputs(&root, &[root.join("linked.txt")], into.path()).is_err(), "a hard link");
+    let fifo = root.join("pipe");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a NUL-terminated path in a folder this test owns.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert!(exec_files::stage_inputs(&root, std::slice::from_ref(&fifo), into.path()).is_err(), "a pipe, without hanging");
+    let pulled = tempfile::tempdir().unwrap();
+    std::fs::write(pulled.path().join("linked.txt"), b"new").unwrap();
+    assert!(exec_files::place_pulled(&root, pulled.path(), &root, 1).is_err(), "never written through a second name");
+    assert_eq!(std::fs::read(dir.path().join("secret.txt")).unwrap(), b"x");
+    std::fs::remove_file(pulled.path().join("linked.txt")).unwrap();
+    std::fs::write(pulled.path().join("pipe"), b"new").unwrap();
+    assert!(exec_files::place_pulled(&root, pulled.path(), &root, 1).is_err(), "nor into a pipe");
+}
+
+/// A file a pull overwrites loses its execute bit too.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_overwritten_file_is_never_executable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_dir, w) = worktree();
+    let root = std::fs::canonicalize(&w).unwrap();
+    std::fs::write(root.join("run.sh"), b"old").unwrap();
+    std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pulled = tempfile::tempdir().unwrap();
+    std::fs::write(pulled.path().join("run.sh"), b"new").unwrap();
+    assert_eq!(exec_files::place_pulled(&root, pulled.path(), &root, 1).unwrap(), 1);
+    assert_eq!(std::fs::read(root.join("run.sh")).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode() & 0o777, 0o644);
 }
 
