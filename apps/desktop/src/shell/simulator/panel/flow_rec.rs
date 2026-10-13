@@ -44,7 +44,23 @@ impl SimulatorPanel {
 
     /// Stop: save it privately, copy the steps, and say where it went.
     pub(super) fn stop_flow(&mut self, cx: &mut Context<Self>) {
-        let (Some(hub), Some(key)) = (self.hub.clone(), self.rec_key(cx)) else { return };
+        let Some(key) = self.rec_key(cx) else { return };
+        // A tap still reading its element is done within its read budget:
+        // waited out, not dropped (before the screen's size is known it has
+        // no point to fall back on).
+        let Some(wait) = self.screen.as_ref().and_then(|s| s.read(cx).recording_settles_in()) else {
+            return self.finish_stop(key, cx);
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| this.finish_stop(key, cx));
+        })
+        .detach();
+    }
+
+    fn finish_stop(&mut self, key: (WorktreeKey, DeviceId, RecSource), cx: &mut Context<Self>) {
+        // Switched away meanwhile: the switch saved it.
+        let Some(hub) = self.hub.clone().filter(|_| self.rec_key(cx).as_ref() == Some(&key)) else { return };
         // What the screen still holds in line (a tap reading its element,
         // typing behind it) goes in before the stop.
         let pending = self.screen.clone().map(|s| s.update(cx, |s, _| s.drain_recording())).unwrap_or_default();

@@ -91,6 +91,11 @@ impl Recorder {
         }
     }
 
+    /// Whether a tap is still reading its element.
+    fn reading(&self) -> bool {
+        self.queue.iter().any(|(_, slot)| matches!(slot, Slot::Waiting(_)))
+    }
+
     /// Everything still in line, in order, a tap still reading its element
     /// as its fallback: what a stop keeps.
     fn drain(&mut self) -> Vec<PanelStep> {
@@ -215,6 +220,12 @@ impl ScreenView {
         self.recorder.ready(step, cx);
     }
 
+    /// How long until every tap still reading its element has its step
+    /// (`None`: none is reading).
+    pub(crate) fn recording_settles_in(&self) -> Option<Duration> {
+        self.recorder.reading().then(|| READ_BUDGET + Duration::from_millis(100))
+    }
+
     /// Recording stops: the steps still in line, in order (a tap still
     /// reading its element as a point), handed over rather than dropped.
     pub(crate) fn drain_recording(&mut self) -> Vec<PanelStep> {
@@ -255,4 +266,20 @@ pub(super) fn selector_at(
     let in_password = ax::flatten(nodes, usize::MAX).iter().any(|f| f.node.secure && ax::is_on_screen(f.node) && inside(f.node));
     let kind = if in_password { Some(true) } else { ax::field_kind(node) };
     Some((SimSelectorWire { label: sel.label, id: sel.id, role: sel.role, nth }, kind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stop_waits_for_a_tap_that_has_no_point_to_keep() {
+        let mut rec = Recorder::default();
+        assert!(!rec.reading());
+        let seq = rec.wait_turn(None);
+        assert!(rec.reading(), "a tap with no fallback is still reading");
+        rec.queue.iter_mut().find(|(s, _)| *s == seq).unwrap().1 = Slot::Done(Some(PanelStep::Backspace));
+        assert!(!rec.reading());
+        assert_eq!(rec.drain().len(), 1);
+    }
 }

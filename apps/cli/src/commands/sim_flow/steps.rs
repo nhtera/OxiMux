@@ -105,9 +105,14 @@ pub fn command(words: &[String]) -> Result<SimCommand, String> {
 ///
 /// Returns the values put in, so an error about the step can blank them.
 pub fn substitute(command: &mut SimCommand) -> Result<Vec<String>, String> {
+    substitute_from(command, &|name| std::env::var(name).ok())
+}
+
+/// [`substitute`], each value looked up by `lookup`.
+fn substitute_from(command: &mut SimCommand, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<String>, String> {
     let used = std::cell::RefCell::new(Vec::new());
     let var = |name: &str| {
-        let value = std::env::var(name).ok();
+        let value = lookup(name);
         used.borrow_mut().extend(value.clone());
         value
     };
@@ -283,10 +288,9 @@ mod tests {
 
     #[test]
     fn a_secret_is_put_in_after_parsing_and_a_bad_step_is_caught_before_any_runs() {
-        // SAFETY: a variable only this test reads.
-        unsafe { std::env::set_var("SECRET_STEPS_TEST", "--paste") };
         let mut cmd = command(&words("type \"${SECRET_STEPS_TEST}\"")).unwrap();
-        assert_eq!(substitute(&mut cmd).unwrap(), ["--paste"]);
+        let lookup = |name: &str| (name == "SECRET_STEPS_TEST").then(|| "--paste".to_owned());
+        assert_eq!(substitute_from(&mut cmd, &lookup).unwrap(), ["--paste"]);
         assert_eq!(redact("cannot read --paste/x", &["--paste".into()]), "cannot read [redacted]/x");
         let tricky = "a \"b\"\nc\\".to_owned();
         let value = serde_json::json!({ "node": { "value": format!("x{tricky}y"), "list": [tricky.clone()] } });
