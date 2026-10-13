@@ -318,7 +318,10 @@ impl ScreenView {
                     }
                     _ => None,
                 };
-                let points = known.or_else(|| read.as_ref().map(|(_, map)| map.points())).or_else(|| view.cached_points(cx));
+                // The inspector's tree is the shown device's: of use only
+                // while that is still the device tapped.
+                let shown = view.binding.device.as_ref() == Some(&device);
+                let points = known.or_else(|| read.as_ref().map(|(_, map)| map.points())).or_else(|| view.cached_points(cx).filter(|_| shown));
                 let step = points.map(|screen @ (w, h)| {
                     let to_pt = |(x, y): (f64, f64)| (x * w, y * h);
                     match swipe {
@@ -330,7 +333,8 @@ impl ScreenView {
                                 // A real iPhone: the inspector's tree, when
                                 // it has one — never read again here, so it
                                 // vouches for no plain field.
-                                None => view.target_in_cached_tree(press.at, cx).map(|(sel, kind)| (sel, kind.filter(|secure| *secure))),
+                                None if shown => view.target_in_cached_tree(press.at, cx).map(|(sel, kind)| (sel, kind.filter(|secure| *secure))),
+                                None => None,
                             };
                             PanelStep::Tap { at: to_pt(press.at), screen, target }
                         }
@@ -352,9 +356,11 @@ impl ScreenView {
             let step = match (step, confirm) {
                 (Some(PanelStep::Tap { at, screen, target: Some((sel, _)) }), Some(after)) => {
                     let nodes = after.await.ok();
+                    // The tapped device's session, not the shown one's: the
+                    // panel may show another device by now.
                     let kind = this
-                        .update(cx, |view, cx| {
-                            let (nodes, session) = (nodes?, view.session(cx)?);
+                        .update(cx, |_, cx| {
+                            let (nodes, session) = (nodes?, session.clone()?);
                             let map = super::inspector::mapping(&hub, &device, &session, session.orientation(), &nodes, cx)?;
                             field_after(&nodes, &sel, press.at, &|n| map.to_screen(n.frame))
                         })
