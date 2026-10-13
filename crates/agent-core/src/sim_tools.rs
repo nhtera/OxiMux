@@ -30,7 +30,7 @@ pub const CAPTURE_DIR: &str = "oximux-sim";
 /// device's log (which can carry anything an app printed). A run prints its
 /// steps' output (settle diffs, asserts), a flow its recorded steps (labels
 /// read off the screen).
-const CAPTURE_VERBS: [&str; 8] = ["screenshot", "ax", "wait", "assert", "logs", "crashes", "run", "flow"];
+const CAPTURE_VERBS: [&str; 9] = ["screenshot", "ax", "wait", "assert", "logs", "crashes", "run", "flow", "exec"];
 
 /// Flags that make any `oximux sim` verb print the screen's elements (a
 /// settle's diff, `ax -i`'s list), wherever they stand in the command.

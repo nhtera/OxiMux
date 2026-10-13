@@ -288,6 +288,8 @@ fn lines(cmd: &SimCmdWire) -> Result<Vec<Line>, String> {
         | SimCmdWire::Logs(_)
         | SimCmdWire::Crashes(_)
         | SimCmdWire::Flow(_) => Vec::new(),
+        // A flow never runs one (`sim run` refuses it).
+        SimCmdWire::Exec(_) => return Err("a raw exec command is not a flow step".into()),
     })
 }
 

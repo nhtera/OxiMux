@@ -10,7 +10,7 @@
 //! revokes them, through the hub so the grant in memory goes too. Granting
 //! happens only in the panel's consent banner.
 
-use gpui::{Anchor, AnyElement, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Subscription, div, prelude::FluentBuilder, px};
+use gpui::{Anchor, AnyElement, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder, px};
 use gpui_component::button::Button;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::Sizable as _;
@@ -113,8 +113,44 @@ fn enable_entry(s: &SimulatorSettings, theme: Theme, cx: &mut Context<SettingsMo
     entry(
         "Enable Mobile Emulator",
         "Shows the Mobile Emulator tab in the right sidebar and lets agents attach to a device.",
-        toggle_switch("sim-enabled", s.enabled, theme, |_, _, cx| change(cx, |s| s.enabled = !s.enabled), cx),
+        toggle_switch(
+            "sim-enabled",
+            s.enabled,
+            theme,
+            |_, window, cx| {
+                let was_on = crate::shell::simulator::panel::settings(cx).enabled;
+                change(cx, |s| s.enabled = !s.enabled);
+                if was_on {
+                    tell_switched_off(window, cx);
+                }
+            },
+            cx,
+        ),
     )
+}
+
+/// Switched off: say how to turn it back on, once per worktree per run.
+fn tell_switched_off(window: &mut Window, cx: &mut Context<SettingsModal>) {
+    use crate::shell::chrome::toast::{ToastAction, ToastKind, toast_with_actions};
+    use crate::shell::simulator::auto_open::Told;
+    let handle = window.window_handle();
+    let root = crate::platform::window_registry::workspace_for_window(cx, handle.window_id());
+    let worktree = root.and_then(|root| root.read(cx).active_worktree.clone());
+    if !cx.default_global::<Told>().first_off(worktree.as_deref()) {
+        return;
+    }
+    let modal = cx.weak_entity();
+    let open = ToastAction::new("Open Settings", move |cx| {
+        let modal = modal.clone();
+        // Deferred: this runs inside the toast layer's update.
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = modal.update(cx, |modal, cx| modal.open_to_pane(super::SettingsPane::Simulator, window, cx));
+            });
+        });
+    });
+    let text = "Mobile Emulator turned off. Turn it back on in Settings → Mobile Emulator.";
+    toast_with_actions(cx, ToastKind::Info, text, vec![open]);
 }
 
 fn default_device_entry(hub: Option<&Entity<SimulatorHub>>, current: Option<&str>, cx: &mut Context<SettingsModal>) -> SettingEntry {
@@ -149,6 +185,7 @@ fn agent_entries(
                 cx,
             ),
         ),
+        exec_entry(theme, cx),
         commands::entry(theme, density, typography, cx),
         entry(
             "What agents can do",
@@ -164,6 +201,27 @@ fn agent_entries(
             ),
         ),
     ]
+}
+
+/// `oximux sim exec`'s switch: in the app's database (the hub's), not
+/// `simulator.toml`, which agents' own tools can write.
+fn exec_entry(theme: Theme, cx: &mut Context<SettingsModal>) -> SettingEntry {
+    let allowed = hub(cx).is_some_and(|hub| hub.read(cx).exec_allowed());
+    entry(
+        "Allow agents to run raw simctl/adb commands",
+        "`oximux sim exec`, asking you each time with the exact command. It runs outside the agent's sandbox.",
+        toggle_switch(
+            "sim-exec",
+            allowed,
+            theme,
+            move |_, _, cx| {
+                if let Some(hub) = hub(cx) {
+                    hub.update(cx, |hub, cx| hub.set_exec_allowed(!allowed, cx));
+                }
+            },
+            cx,
+        ),
+    )
 }
 
 fn stream_entries(

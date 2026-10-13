@@ -148,7 +148,9 @@ impl WorkspaceRoot {
         self.simulator.visible = visible;
         // Turned off in Settings is not the user closing it.
         let by_user = self.active_worktree.as_deref().filter(|_| super::panel::settings(cx).enabled);
-        self.simulator.auto_open.visibility_changed(visible, by_user, rs.entity_id().as_u64());
+        let closed = self.simulator.auto_open.visibility_changed(visible, by_user, rs.entity_id().as_u64());
+        let first = closed.is_some_and(|worktree| cx.default_global::<super::auto_open::Told>().first_close(worktree));
+        let tell = first.then(|| (self.toast_layer.clone(), cx.weak_entity()));
         let (window_w, window_h) = (f32::from(window.viewport_size().width), f32::from(window.viewport_size().height));
         let bump = visible && !self.simulator.bumped;
         let restore = !visible && self.simulator.maximized;
@@ -159,6 +161,17 @@ impl WorkspaceRoot {
             self.simulator.maximized = false;
         }
         cx.defer(move |cx| {
+            if let Some((layer, root)) = tell {
+                let reopen = ToastAction::new("Reopen", move |cx| {
+                    let root = root.clone();
+                    // Deferred: this runs inside the toast layer's update.
+                    cx.defer(move |cx| {
+                        let _ = root.update(cx, |root, cx| root.show_simulator_tab(cx));
+                    });
+                });
+                let text = "Mobile Emulator hidden for this worktree. Reopen it from the right sidebar, or run `oximux sim attach`.";
+                layer.update(cx, |layer, cx| layer.push_with_actions(ToastKind::Info, text, vec![reopen], cx));
+            }
             if bump || restore {
                 rs.update(cx, |sidebar, cx| {
                     if restore {

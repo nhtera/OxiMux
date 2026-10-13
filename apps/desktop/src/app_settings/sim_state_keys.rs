@@ -145,6 +145,22 @@ pub fn save_iphone_controlled(repo: &SettingsRepo, controlled: &HashSet<DeviceId
     }
 }
 
+/// `"1"` while agents may run raw `simctl`/`adb` commands (`oximux sim
+/// exec`). Off when absent or anything else. In the database, not
+/// `simulator.toml`: agents' own tools write that file, and this switch lets
+/// them act outside their sandbox.
+pub const KEY_EXEC_ALLOWED: &str = "sim_exec_allowed_v1";
+
+pub fn exec_allowed(repo: &SettingsRepo) -> bool {
+    matches!(repo.get(KEY_EXEC_ALLOWED), Ok(Some(v)) if v == "1")
+}
+
+pub fn save_exec_allowed(repo: &SettingsRepo, allowed: bool) {
+    if let Err(err) = repo.set(KEY_EXEC_ALLOWED, if allowed { "1" } else { "0" }) {
+        tracing::warn!(?err, "the exec switch was not saved");
+    }
+}
+
 pub fn feature_used(repo: &SettingsRepo) -> bool {
     matches!(repo.get(KEY_FEATURE_USED), Ok(Some(v)) if v == "1")
 }
@@ -234,5 +250,17 @@ mod tests {
         // Unreadable: none controlled (never a panic at startup).
         repo.set(KEY_IPHONE_CONTROLLED, "{not json").unwrap();
         assert!(load_iphone_controlled(&repo).is_empty());
+    }
+
+    #[test]
+    fn exec_is_off_unless_turned_on() {
+        let repo = SettingsRepo::new(open_memory().unwrap());
+        assert!(!exec_allowed(&repo), "absent: off");
+        save_exec_allowed(&repo, true);
+        assert!(exec_allowed(&repo));
+        save_exec_allowed(&repo, false);
+        assert!(!exec_allowed(&repo));
+        repo.set(KEY_EXEC_ALLOWED, "yes").unwrap();
+        assert!(!exec_allowed(&repo), "anything but 1: off");
     }
 }

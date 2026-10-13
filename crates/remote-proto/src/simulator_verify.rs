@@ -126,8 +126,8 @@ impl SimCmdWire {
             | Self::Assert { .. }
             | Self::AsCaller { .. }
             | Self::TypeInto { .. } => true,
-            // v30 verbs: their client knows every v27 error.
-            Self::Flow(_) => true,
+            // v30 and v31 verbs: their client knows every v27 error.
+            Self::Flow(_) | Self::Exec(_) => true,
             Self::Tap(target) => matches!(target, SimTargetWire::Ref(_) | SimTargetWire::Exact(_)),
             Self::Status
             | Self::Devices

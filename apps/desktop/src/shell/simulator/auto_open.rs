@@ -90,7 +90,10 @@ impl AutoOpen {
     /// worktree it was showing — closing the sidebar, picking another tab — is
     /// the user closing it; showing it again (by hand, or by an attach) takes
     /// that back. A project switch swaps the sidebar, so it is never a close.
-    pub(crate) fn visibility_changed(&mut self, visible: bool, active: Option<&Path>, surface: u64) {
+    ///
+    /// Returns the worktree this hide just closed it on, if it did (the caller
+    /// says how to bring it back, once per worktree: see [`Told`]).
+    pub(crate) fn visibility_changed(&mut self, visible: bool, active: Option<&Path>, surface: u64) -> Option<WorktreeKey> {
         let active = active.map(WorktreeKey::from_path);
         if visible {
             if let Some(key) = &active {
@@ -101,8 +104,10 @@ impl AutoOpen {
             && on == surface
             && active.as_ref() == Some(&shown)
         {
-            self.closed.insert(shown);
+            self.closed.insert(shown.clone());
+            return Some(shown);
         }
+        None
     }
 
     /// The active worktree changed while the panel shows (it now shows that
@@ -111,6 +116,31 @@ impl AutoOpen {
         if let Some((_, surface)) = self.shown_for.take() {
             self.shown_for = active.map(|path| (WorktreeKey::from_path(path), surface));
         }
+    }
+}
+
+/// What the user was told this run, app-wide (every window): how to bring
+/// back a panel they closed on a worktree, and how to turn the feature back
+/// on after switching it off there. Each once per worktree.
+#[derive(Debug, Default)]
+pub(crate) struct Told {
+    closed: HashSet<WorktreeKey>,
+    off: HashSet<WorktreeKey>,
+}
+
+impl Global for Told {}
+
+impl Told {
+    /// Whether closing the panel on `worktree` has yet to be explained.
+    /// Records it.
+    pub(crate) fn first_close(&mut self, worktree: WorktreeKey) -> bool {
+        self.closed.insert(worktree)
+    }
+
+    /// Whether switching the feature off while on `worktree` (none: no
+    /// worktree open) has yet to be explained there. Records it.
+    pub(crate) fn first_off(&mut self, worktree: Option<&Path>) -> bool {
+        self.off.insert(worktree.map_or_else(|| WorktreeKey::from_path(Path::new("")), WorktreeKey::from_path))
     }
 }
 
@@ -251,7 +281,7 @@ mod tests {
         let w = Path::new(W);
         assert!(policy.should_open(w, Trigger::ToolCall, t));
         policy.visibility_changed(true, Some(w), SIDEBAR);
-        policy.visibility_changed(false, Some(w), SIDEBAR);
+        assert!(policy.visibility_changed(false, Some(w), SIDEBAR).is_some(), "a close");
         let later = t + RATE_LIMIT * 10;
         for trigger in [Trigger::ToolCall, Trigger::DeviceBooted, Trigger::Verb] {
             assert!(!policy.should_open(w, trigger, later), "{trigger:?} must respect the close");
@@ -298,5 +328,33 @@ mod tests {
         policy.visibility_changed(false, Some(other), SIDEBAR);
         assert!(!policy.should_open(other, Trigger::Verb, t));
         assert!(policy.should_open(w, Trigger::Verb, t));
+    }
+
+    /// A close names its worktree; a hide the user did not make, or a
+    /// second hide without a show, is none.
+    #[test]
+    fn a_close_names_its_worktree() {
+        let mut policy = AutoOpen::default();
+        let w = Path::new(W);
+        assert_eq!(policy.visibility_changed(true, Some(w), SIDEBAR), None, "showing is not a close");
+        assert_eq!(policy.visibility_changed(false, None, SIDEBAR), None, "turning the feature off is not a close");
+        policy.visibility_changed(true, Some(w), SIDEBAR);
+        assert_eq!(policy.visibility_changed(false, Some(w), SIDEBAR), Some(WorktreeKey::from_path(w)));
+        assert_eq!(policy.visibility_changed(false, Some(w), SIDEBAR), None, "a second hide without a show");
+    }
+
+    /// Told once per worktree per run, in whichever window: a close and a
+    /// switch-off each.
+    #[test]
+    fn each_explanation_is_given_once_per_worktree() {
+        let mut told = Told::default();
+        let (w, other) = (Path::new(W), Path::new("/nonexistent/other"));
+        assert!(told.first_close(WorktreeKey::from_path(w)));
+        assert!(!told.first_close(WorktreeKey::from_path(w)));
+        assert!(told.first_close(WorktreeKey::from_path(other)));
+        assert!(told.first_off(Some(w)), "a switch-off is its own explanation");
+        assert!(!told.first_off(Some(w)));
+        assert!(told.first_off(None));
+        assert!(!told.first_off(None));
     }
 }

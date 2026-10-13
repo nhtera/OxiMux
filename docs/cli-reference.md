@@ -931,6 +931,14 @@ Turn a flow file into another tool's format
 | `--out` | yes | Write it here instead of stdout |
 | `--app-id` | yes | The app the flow drives (default: the file's `# app`, else its first launch) |
 
+#### `oximux sim exec`
+
+Run a raw simctl (iOS simulator) or adb (Android) command on the attached device: `oximux sim exec -- ui appearance dark`. Off unless the user turns it on in Settings, asked every time, and limited to commands that touch only that device
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<ARGV>` | yes | The command after `simctl` (iOS simulator) or `adb` (Android), after `--`, without the device: OxiMux adds the attached one |
+
 ### `oximux serve`
 
 Run this machine as a headless OxiMux host.

@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::simulator_exec::{SimExecOutputWire, SimExecWire};
 pub use crate::simulator_diag::{SimCrashListWire, SimCrashWire, SimCrashesWire, SimLogLevelWire, SimLogsWire};
 pub use crate::simulator_flow::{FLOW_HEADER, SimFlowCmdWire, SimFlowWire, SimSelectorWire, render_step, words};
 /// The flow file's pieces (header, numbers, button names) for recorders
@@ -119,6 +120,10 @@ pub enum SimCmdWire {
     /// A recording of this worktree's agent verbs, or a run's approval: see
     /// [`SimFlowCmdWire`].
     Flow(SimFlowCmdWire),
+    // v31: exec.
+    /// A raw `simctl`/`adb` command on the attached device, when the user
+    /// allowed exec and approves this one: see [`SimExecWire`].
+    Exec(SimExecWire),
 }
 
 impl SimCmdWire {
@@ -196,6 +201,8 @@ pub enum SimReplyWire {
     Crashes(SimCrashListWire),
     // v30: flows.
     Flow(SimFlowWire),
+    // v31: exec.
+    ExecOutput(SimExecOutputWire),
 }
 
 /// One simulator device.

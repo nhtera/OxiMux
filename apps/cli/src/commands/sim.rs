@@ -82,6 +82,7 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
         SimCommand::Run(args) => super::sim_flow::run::run(client, &worktree, args).await,
         SimCommand::Flow(command) => super::sim_flow::flow(client, &worktree, command).await,
         SimCommand::Crashes(args) => super::sim_diag::crashes(client, &worktree, args).await,
+        SimCommand::Exec(args) => super::sim_exec::exec(client, &worktree, args).await,
         SimCommand::Wait(args) => sim_verify::wait(client, &worktree, args).await,
         SimCommand::Assert(args) => sim_verify::assert(client, &worktree, args).await,
         SimCommand::Type { text, paste, settle } if text.len() > 1 => sim_verify::type_into(client, &worktree, text, paste, &settle).await,
@@ -232,7 +233,7 @@ pub(super) fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire
         | SimCommand::Push(_)
         | SimCommand::StatusBar { .. }
         | SimCommand::Erase { .. } => unreachable!("built by `sim_state::request` above"),
-        SimCommand::Logs(_) | SimCommand::Crashes(_) | SimCommand::Run(_) | SimCommand::Flow(_) => {
+        SimCommand::Logs(_) | SimCommand::Crashes(_) | SimCommand::Run(_) | SimCommand::Flow(_) | SimCommand::Exec(_) => {
             unreachable!("answered with a reply of their own")
         }
     })

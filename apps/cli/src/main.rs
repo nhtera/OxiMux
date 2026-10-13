@@ -8,6 +8,7 @@ mod build_info;
 mod cli;
 mod cli_sim;
 mod cli_sim_diag;
+mod cli_sim_exec;
 mod cli_sim_flow;
 mod cli_sim_state;
 mod client;
@@ -31,7 +32,7 @@ use cli::{
 use client::Client;
 use oximux_remote_proto::proto::{
     CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
-    SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_FLOW_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
+    SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_EXEC_MIN_VERSION, SIMULATOR_FLOW_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
 
@@ -284,6 +285,8 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         Command::Worktree {
             command: WorktreeCommand::Create { branch: Some(_), .. },
         } => Some((CREATE_WORKTREE_BASE_MIN_VERSION, "worktree create --branch")),
+        // v31: exec. Above every other `Sim` arm.
+        Command::Sim { command, .. } if command.is_exec() => Some((SIMULATOR_EXEC_MIN_VERSION, "sim exec")),
         // v30: flows (`flow start|stop|status`) and exact selectors. Above
         // every other `Sim` arm: `tap --exact --settle` needs v30, not v27.
         Command::Sim { command, .. } if command.flow_feature().is_some() => {

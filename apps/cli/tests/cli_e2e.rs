@@ -307,6 +307,16 @@ impl oximux_remote_host::SimulatorControl for StubSimulator {
                     saved: save.then(|| "/data/flows/flow-1.flow".into()),
                 })
             }
+            // The host's exec switch, stood in for by the first word.
+            SimCmdWire::Exec(SimExecWire { argv }) if argv[0] == "off" => {
+                return Err(SimErrorWire::Refused("exec is off; enable it in Settings → Mobile Emulator".into()));
+            }
+            SimCmdWire::Exec(SimExecWire { argv }) => SimReplyWire::ExecOutput(SimExecOutputWire {
+                status: Some(if argv[0] == "fail" { 2 } else { 0 }),
+                stdout: format!("ran {}\n", argv.join(" ")),
+                stderr: String::new(),
+                truncated: false,
+            }),
             _ => SimReplyWire::Done,
         })
     }
@@ -477,7 +487,7 @@ fn sim_verbs_against_a_live_host() {
     // Flows (v30). A run stops at the first step that fails, with that
     // step's exit code, and sends nothing after it.
     {
-        use oximux_remote_proto::simulator::{SimCmdWire, SimFlowCmdWire, SimSelectorWire, SimTargetWire};
+        use oximux_remote_proto::simulator::{SimCmdWire, SimExecWire, SimFlowCmdWire, SimSelectorWire, SimTargetWire};
         let flow = dir.path().join("login.flow");
         let steps = "# oximux-flow v1\ntap --label \"Sign in\" --exact\nassert --label \"Sign in\" --text \"Log in\"\ntap 1 2\n";
         std::fs::write(&flow, steps).unwrap();
@@ -526,6 +536,22 @@ fn sim_verbs_against_a_live_host() {
         assert_eq!(sim.cmds.lock().unwrap().last(), Some(&SimCmdWire::Flow(SimFlowCmdWire::Stop { save: false })));
         let out = sim_out(&["flow", "stop"]);
         assert!(String::from_utf8_lossy(&out.stdout).contains("saved 1 step to /data/flows/flow-1.flow"), "{}", String::from_utf8_lossy(&out.stdout));
+        // Exec (v31): every word after `--` goes as is, hyphens and all;
+        // the command's own failure is exit 1, with its output.
+        let out = sim_out(&["exec", "--", "ui", "appearance", "dark"]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran ui appearance dark");
+        let out = sim_out(&["exec", "--", "logcat", "-b", "crash"]);
+        assert_eq!(sim.cmds.lock().unwrap().last(), Some(&SimCmdWire::Exec(SimExecWire { argv: vec!["logcat".into(), "-b".into(), "crash".into()] })));
+        assert_eq!(out.status.code(), Some(0));
+        let out = sim_out(&["exec", "--", "fail"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("(the command exited 2)"), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = sim_out(&["exec", "--", "off"]);
+        assert_eq!(out.status.code(), Some(5), "refused, as every refused verb is");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("exec is off"), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = sim_out(&["exec"]);
+        assert_eq!(out.status.code(), Some(2), "a command is required");
         // Export needs no host at all.
         let out = bin(&dir.path().join("nobody")).args(["sim", "flow", "export", file.to_str().unwrap(), "--maestro", "--app-id", "com.a.b"]).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));

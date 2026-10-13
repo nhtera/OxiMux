@@ -31,6 +31,16 @@ impl Device {
         Ok(Self { adb, serial })
     }
 
+    /// The device's serial, as `adb -s` takes it.
+    pub(super) fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    /// The SDK's `adb`.
+    pub(super) fn adb(&self) -> &Path {
+        &self.adb
+    }
+
     fn shell(&self, args: &[&str], timeout: Duration) -> Result<String, String> {
         Adb::new(&SystemRunner, &self.adb).shell(&self.serial, args, timeout).map_err(|e| e.to_string())
     }
