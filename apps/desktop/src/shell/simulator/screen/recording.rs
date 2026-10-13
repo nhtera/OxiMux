@@ -14,7 +14,10 @@
 //!
 //! Motion alone cannot say a read is out of date: a simulator's stream
 //! sends refresh pictures for seconds after a change, and a key frame every
-//! few seconds on a still screen. It says when to read again.
+//! few seconds on a still screen. It says when to read again. So a read
+//! from before the tap never vouches for a plain field on its own: typing
+//! is kept as typed only when a read after the tap agrees (a password field
+//! may have taken the place — the screen moved, or the app loaded).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -22,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{Context, Pixels, Point};
 use oximux_remote_proto::simulator::SimSelectorWire;
+use oximux_simulator::DeviceId;
 use oximux_simulator::ax;
 use oximux_simulator::keyframe::FrameClock;
 
@@ -44,13 +48,16 @@ const STILL_CAP: Duration = Duration::from_millis(1500);
 const RETRY: Duration = Duration::from_secs(2);
 /// How often a recording looks whether the screen needs a read.
 const POLL: Duration = Duration::from_millis(150);
+/// The longest a Stop waits for taps still reading: a press read queued
+/// behind another, then a read after the tap.
+pub(crate) const STOP_WAIT: Duration = Duration::from_secs(16);
 
 /// The screen as last read while recording, and the user's last input.
 #[derive(Default)]
 struct Standing {
-    /// The latest finished read: when it began, in which run of pictures,
-    /// and what it read.
-    tree: Option<(Instant, u64, Arc<Vec<ax::AxNode>>)>,
+    /// The latest finished read: when it began, of which device in which
+    /// run of its pictures, and what it read.
+    tree: Option<(Instant, DeviceId, u64, Arc<Vec<ax::AxNode>>)>,
     /// A read under way: its id and start.
     reading: Option<(u64, Instant)>,
     failed_at: Option<Instant>,
@@ -58,24 +65,25 @@ struct Standing {
 }
 
 impl Standing {
-    /// The read to name a tap's element from: begun after the last input
-    /// had shown, in this run of pictures (a gap may be another screen).
-    fn usable(&self, epoch: u64) -> Option<&Arc<Vec<ax::AxNode>>> {
-        let (started, read_epoch, nodes) = self.tree.as_ref()?;
-        (*read_epoch == epoch && self.input_at.is_none_or(|input| *started >= input + AFTER_INPUT)).then_some(nodes)
+    /// The read to name a tap's element from: of `device`, begun after the
+    /// last input had shown, in this run of its pictures (a gap may be
+    /// another screen).
+    fn usable(&self, device: &DeviceId, epoch: u64) -> Option<&Arc<Vec<ax::AxNode>>> {
+        let (started, read_device, read_epoch, nodes) = self.tree.as_ref()?;
+        (read_device == device && *read_epoch == epoch && self.input_at.is_none_or(|input| *started >= input + AFTER_INPUT)).then_some(nodes)
     }
 
     /// Whether to read the screen now: once the last input has shown and
     /// the screen is still (or has moved too long to wait for), when there
     /// is no usable read or the screen moved since it began.
-    fn wants_read(&self, clock: &FrameClock, now: Instant) -> bool {
+    fn wants_read(&self, device: &DeviceId, clock: &FrameClock, now: Instant) -> bool {
         let ago = |t: Instant| now.saturating_duration_since(t);
         if self.reading.is_some() || self.failed_at.is_some_and(|t| ago(t) < RETRY) || self.input_at.is_some_and(|t| ago(t) < AFTER_INPUT) {
             return false;
         }
         let still = clock.last_motion_at.is_none_or(|motion| ago(motion) >= STILL);
-        match (self.usable(clock.epoch), &self.tree) {
-            (Some(_), Some((started, _, _))) => {
+        match (self.usable(device, clock.epoch), &self.tree) {
+            (Some(_), Some((started, _, _, _))) => {
                 let moved = clock.last_motion_at.is_some_and(|motion| motion > *started);
                 moved && (still || ago(*started) >= STILL_CAP)
             }
@@ -157,19 +165,9 @@ impl Recorder {
         }
     }
 
-    /// How long until every tap still reading has its step: within the
-    /// budget when it has a point to fall back on, else as long as the read
-    /// itself may take (the read is what says the screen's size).
-    fn settles_in(&self) -> Option<Duration> {
-        let waiting = |pointless: bool| self.queue.iter().any(|(_, slot)| matches!(slot, Slot::Waiting(f) if f.is_none() || !pointless));
-        let wait = if waiting(true) {
-            READ_TIMEOUT
-        } else if waiting(false) {
-            READ_BUDGET
-        } else {
-            return None;
-        };
-        Some(wait + Duration::from_millis(100))
+    /// Whether a tap is still working out its step.
+    fn waits(&self) -> bool {
+        self.queue.iter().any(|(_, slot)| matches!(slot, Slot::Waiting(_)))
     }
 
     /// Everything still in line, in order, a tap still reading its element
@@ -216,12 +214,13 @@ impl ScreenView {
         }
         let (Some(device), Some(session)) = (self.binding.device.clone(), self.session(cx)) else { return true };
         let (clock, now) = (session.frame_clock(), Instant::now());
-        if session.ios_device().is_some() || !self.recorder.standing.wants_read(&clock, now) {
+        if session.ios_device().is_some() || !self.recorder.standing.wants_read(&device, &clock, now) {
             return true;
         }
         let read = self.hub.update(cx, |hub, cx| hub.read_tree(&device, &session, Some(now), READ_TIMEOUT, cx));
         self.recorder.next += 1;
         let (id, epoch) = (self.recorder.next, clock.epoch);
+        let device = device.clone();
         self.recorder.standing.reading = Some((id, now));
         cx.spawn(async move |this, cx| {
             let nodes = read.await.ok();
@@ -230,7 +229,7 @@ impl ScreenView {
                 if standing.reading.is_some_and(|(r, _)| r == id) {
                     standing.reading = None;
                     match nodes {
-                        Some(nodes) => standing.tree = Some((now, epoch, nodes)),
+                        Some(nodes) => standing.tree = Some((now, device, epoch, nodes)),
                         None => standing.failed_at = Some(Instant::now()),
                     }
                 }
@@ -246,7 +245,10 @@ impl ScreenView {
             return;
         }
         let session = self.session(cx);
-        let standing = session.as_ref().and_then(|s| self.recorder.standing.usable(s.frame_clock().epoch).cloned());
+        let standing = match (&self.binding.device, &session) {
+            (Some(device), Some(s)) => self.recorder.standing.usable(device, s.frame_clock().epoch).cloned(),
+            _ => None,
+        };
         self.rec_input();
         let tree = match (self.binding.device.clone(), session) {
             _ if standing.is_some() => None,
@@ -287,6 +289,7 @@ impl ScreenView {
         let seq = self.recorder.wait_turn(fallback);
         let (left, read, standing) = (READ_BUDGET.saturating_sub(press.started.elapsed()), press.tree.clone(), press.standing.clone());
         let (hub, session) = (self.hub.clone(), self.session(cx));
+        let named_before = standing.is_some();
         cx.spawn(async move |this, cx| {
             // A swipe on a known screen needs nothing read. A read past the
             // budget still gives a screen not known yet its size, never the
@@ -303,8 +306,8 @@ impl ScreenView {
                 }
                 None => (None, false),
             };
-            let _ = this.update(cx, |view, cx| {
-                let read = match (tree, session) {
+            let Ok((step, confirm)) = this.update(cx, |view, cx| {
+                let read = match (tree, session.clone()) {
                     (Some(nodes), Some(session)) => {
                         super::inspector::mapping(&hub, &device, &session, session.orientation(), &nodes, cx).map(|map| (nodes, map))
                     }
@@ -319,15 +322,44 @@ impl ScreenView {
                             let target = match &read {
                                 _ if late => None,
                                 Some((nodes, map)) => selector_at(nodes, press.at, &|n| map.to_screen(n.frame)),
-                                // A real iPhone: the inspector's tree, when it has one.
-                                None => view.target_in_cached_tree(press.at, cx),
+                                // A real iPhone: the inspector's tree, when
+                                // it has one — never read again here, so it
+                                // vouches for no plain field.
+                                None => view.target_in_cached_tree(press.at, cx).map(|(sel, kind)| (sel, kind.filter(|secure| *secure))),
                             };
                             PanelStep::Tap { at: to_pt(press.at), screen, target }
                         }
                     }
                 });
-                view.recorder.resolve(seq, step, cx);
-            });
+                // A plain field named from a read before the tap: a read
+                // after it says whether typing there may be kept as typed.
+                let plain = matches!(&step, Some(PanelStep::Tap { target: Some((_, Some(false))), .. }));
+                let confirm = match &session {
+                    Some(session) if plain && named_before => {
+                        Some(hub.update(cx, |hub, cx| hub.read_tree(&device, session, Some(Instant::now()), READ_TIMEOUT, cx)))
+                    }
+                    _ => None,
+                };
+                (step, confirm)
+            }) else {
+                return;
+            };
+            let step = match (step, confirm) {
+                (Some(PanelStep::Tap { at, screen, target: Some((sel, _)) }), Some(after)) => {
+                    let nodes = after.await.ok();
+                    let kind = this
+                        .update(cx, |view, cx| {
+                            let (nodes, session) = (nodes?, view.session(cx)?);
+                            let map = super::inspector::mapping(&hub, &device, &session, session.orientation(), &nodes, cx)?;
+                            field_after(&nodes, &sel, press.at, &|n| map.to_screen(n.frame))
+                        })
+                        .ok()
+                        .flatten();
+                    Some(PanelStep::Tap { at, screen, target: Some((sel, kind)) })
+                }
+                (step, _) => step,
+            };
+            let _ = this.update(cx, |view, cx| view.recorder.resolve(seq, step, cx));
         })
         .detach();
     }
@@ -358,10 +390,9 @@ impl ScreenView {
         self.recorder.standing.input_at = Some(Instant::now());
     }
 
-    /// How long until every tap still reading its element has its step
-    /// (`None`: none is reading).
-    pub(crate) fn recording_settles_in(&self) -> Option<Duration> {
-        self.recorder.settles_in()
+    /// Whether a tap is still working out its step (a Stop waits for it).
+    pub(crate) fn recording_waits(&self) -> bool {
+        self.recorder.waits()
     }
 
     /// Recording stops: the steps still in line, in order (a tap still
@@ -408,6 +439,22 @@ pub(super) fn selector_at(
     Some((SimSelectorWire { label: sel.label, id: sel.id, role: sel.role, nth }, kind))
 }
 
+/// What typing goes into after a tap on the element `sel` named at `pt`,
+/// by a read made after the tap: a password field when one holds the point
+/// or `sel` now names one; a plain field only when `sel` still names a plain
+/// field; else not known (`None`).
+fn field_after(nodes: &[ax::AxNode], sel: &SimSelectorWire, pt: (f64, f64), rect_of: &dyn Fn(&ax::AxNode) -> oximux_simulator::geometry::Rect) -> Option<bool> {
+    let inside = |n: &ax::AxNode| {
+        let r = rect_of(n);
+        (r.x..=r.x + r.w).contains(&pt.0) && (r.y..=r.y + r.h).contains(&pt.1)
+    };
+    if ax::flatten(nodes, usize::MAX).iter().any(|f| f.node.secure && ax::is_on_screen(f.node) && inside(f.node)) {
+        return Some(true);
+    }
+    let exact = ax::Exact { label: sel.label.clone(), id: sel.id.clone(), role: sel.role.clone(), nth: sel.nth as usize };
+    ax::find_exact(nodes, &exact).and_then(ax::field_kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,37 +464,70 @@ mod tests {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let clock = |motion: Option<u64>, epoch| FrameClock { epoch, last_motion_at: motion.map(ms), ..FrameClock::default() };
+        let dev = |id: &str| DeviceId(id.into());
         let mut st = Standing { input_at: Some(t0), ..Standing::default() };
-        assert!(!st.wants_read(&clock(None, 1), ms(300)), "the input is still showing");
-        assert!(!st.wants_read(&clock(Some(500), 1), ms(700)), "the screen still moves");
-        assert!(st.wants_read(&clock(Some(500), 1), ms(800)));
-        assert!(st.wants_read(&clock(Some(1590), 1), ms(1600)), "moving too long to wait for");
-        st.tree = Some((ms(800), 1, Arc::new(Vec::new())));
-        assert!(st.usable(1).is_some());
-        assert!(st.usable(2).is_none(), "a gap in the pictures");
-        assert!(!st.wants_read(&clock(Some(700), 1), ms(1200)), "nothing moved since it began");
-        assert!(!st.wants_read(&clock(Some(1100), 1), ms(1200)), "a refresh picture: wait for stillness");
-        assert!(st.wants_read(&clock(Some(1100), 1), ms(1400)), "moved since, and still again");
-        assert!(st.usable(1).is_some(), "motion alone keeps it usable");
+        assert!(!st.wants_read(&dev("A"), &clock(None, 1), ms(300)), "the input is still showing");
+        assert!(!st.wants_read(&dev("A"), &clock(Some(500), 1), ms(700)), "the screen still moves");
+        assert!(st.wants_read(&dev("A"), &clock(Some(500), 1), ms(800)));
+        assert!(st.wants_read(&dev("A"), &clock(Some(1590), 1), ms(1600)), "moving too long to wait for");
+        st.tree = Some((ms(800), dev("A"), 1, Arc::new(Vec::new())));
+        assert!(st.usable(&dev("A"), 1).is_some());
+        assert!(st.usable(&dev("A"), 2).is_none(), "a gap in the pictures");
+        assert!(st.usable(&dev("B"), 1).is_none(), "another device's screen");
+        assert!(!st.wants_read(&dev("A"), &clock(Some(700), 1), ms(1200)), "nothing moved since it began");
+        assert!(!st.wants_read(&dev("A"), &clock(Some(1100), 1), ms(1200)), "a refresh picture: wait for stillness");
+        assert!(st.wants_read(&dev("A"), &clock(Some(1100), 1), ms(1400)), "moved since, and still again");
+        assert!(st.usable(&dev("A"), 1).is_some(), "motion alone keeps it usable");
         st.input_at = Some(ms(1500));
-        assert!(st.usable(1).is_none(), "an input since it began");
+        assert!(st.usable(&dev("A"), 1).is_none(), "an input since it began");
         st.reading = Some((7, ms(2200)));
-        assert!(!st.wants_read(&clock(None, 1), ms(2300)), "one read at a time");
+        assert!(!st.wants_read(&dev("A"), &clock(None, 1), ms(2300)), "one read at a time");
     }
 
     #[test]
-    fn a_stop_waits_for_a_tap_that_has_no_point_to_keep() {
+    fn a_stop_waits_for_every_tap_still_reading() {
         let mut rec = Recorder::default();
-        assert_eq!(rec.settles_in(), None);
+        assert!(!rec.waits());
         let point = PanelStep::Tap { at: (1.0, 2.0), screen: (402.0, 874.0), target: None };
         let first = rec.wait_turn(Some(point));
-        assert!(rec.settles_in().is_some_and(|d| d < READ_TIMEOUT), "a point to keep: the budget");
         let second = rec.wait_turn(None);
-        assert!(rec.settles_in().is_some_and(|d| d > READ_TIMEOUT), "no point: the whole read");
+        assert!(rec.waits());
         for seq in [first, second] {
             rec.queue.iter_mut().find(|(s, _)| *s == seq).unwrap().1 = Slot::Done(Some(PanelStep::Backspace));
         }
-        assert_eq!(rec.settles_in(), None);
+        assert!(!rec.waits());
         assert_eq!(rec.drain().len(), 2);
+    }
+
+    fn node(role: &str, label: &str, secure: bool, y: f64) -> ax::AxNode {
+        ax::AxNode {
+            label: Some(label.into()),
+            identifier: None,
+            value: None,
+            role: role.into(),
+            role_description: String::new(),
+            enabled: true,
+            secure,
+            frame: oximux_simulator::geometry::Rect::new(0.0, y, 400.0, 40.0),
+            children: vec![],
+        }
+    }
+
+    #[test]
+    fn a_plain_field_holds_only_when_the_read_after_the_tap_agrees() {
+        let screen = |kids: Vec<ax::AxNode>| {
+            let mut root = node("Application", "App", false, 0.0);
+            root.frame = oximux_simulator::geometry::Rect::new(0.0, 0.0, 400.0, 800.0);
+            root.children = kids;
+            vec![root]
+        };
+        let sel = SimSelectorWire { label: Some("Email".into()), id: None, role: None, nth: 0 };
+        let rect = |n: &ax::AxNode| n.frame;
+        let same = screen(vec![node("TextField", "Email", false, 100.0)]);
+        assert_eq!(field_after(&same, &sel, (10.0, 110.0), &rect), Some(false));
+        let swapped = screen(vec![node("TextField", "Email", false, 300.0), node("SecureTextField", "Password", true, 100.0)]);
+        assert_eq!(field_after(&swapped, &sel, (10.0, 110.0), &rect), Some(true), "a password field took the place");
+        let gone = screen(vec![node("Button", "Next", false, 100.0)]);
+        assert_eq!(field_after(&gone, &sel, (10.0, 110.0), &rect), None, "not known: a secret");
     }
 }

@@ -45,6 +45,7 @@ mod keys;
 mod recording;
 
 pub(crate) use inspector::Picked;
+pub(crate) use recording::STOP_WAIT;
 
 /// What the screen tells the panel.
 pub(crate) enum ScreenEvent {

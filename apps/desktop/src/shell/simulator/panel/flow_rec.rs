@@ -19,6 +19,7 @@ use super::commands::SimCommand;
 use super::{PanelEvent, SimulatorPanel};
 use crate::shell::simulator::agent_ops::{flow_platform, screen_points};
 use crate::shell::simulator::hub::{HubEvent, NoticeKind, PanelStep, RecSource, save_flow};
+use crate::shell::simulator::screen::STOP_WAIT;
 
 impl SimulatorPanel {
     fn rec_key(&self, cx: &gpui::App) -> Option<(WorktreeKey, DeviceId, RecSource)> {
@@ -48,14 +49,17 @@ impl SimulatorPanel {
         // The recording this Stop is for: a later one under the same key is
         // not (Stop, Start again, before the wait below is over).
         let Some(id) = hub.read(cx).flows().get(&key).map(|r| r.id()) else { return };
-        // A tap still reading its element is done within its read budget:
-        // waited out, not dropped (before the screen's size is known it has
-        // no point to fall back on).
-        let Some(wait) = self.screen.as_ref().and_then(|s| s.read(cx).recording_settles_in()) else {
+        // A tap still working out its step (reading its element, or a read
+        // after it on the field it named) is waited for, not dropped:
+        // without a known screen size it has no point to fall back on.
+        let Some(screen) = self.screen.clone().filter(|s| s.read(cx).recording_waits()) else {
             return self.finish_stop(key, id, cx);
         };
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(wait).await;
+            let started = std::time::Instant::now();
+            while started.elapsed() < STOP_WAIT && screen.read_with(cx, |s, _| s.recording_waits()) {
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+            }
             let _ = this.update(cx, |this, cx| this.finish_stop(key, id, cx));
         })
         .detach();
