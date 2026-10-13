@@ -345,6 +345,11 @@ impl FlowRecorder {
         self.recordings.get(key)
     }
 
+    /// The key recording `id` records under, while it records.
+    pub(crate) fn key_of(&self, id: u64) -> Option<RecKey> {
+        self.recordings.iter().find(|(_, r)| r.id == id).map(|(key, _)| key.clone())
+    }
+
     pub(crate) fn get_mut(&mut self, key: &RecKey) -> Option<&mut Recording> {
         self.recordings.get_mut(key)
     }

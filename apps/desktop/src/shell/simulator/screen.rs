@@ -52,7 +52,8 @@ pub(crate) enum ScreenEvent {
     /// An ⌥-click picked an element (see `inspector`).
     Picked(Picked),
     /// The user's input while the panel records a flow (see `recording`).
-    Recorded(crate::shell::simulator::hub::PanelStep),
+    /// A step of the recording with this id.
+    Recorded(u64, crate::shell::simulator::hub::PanelStep),
 }
 
 impl gpui::EventEmitter<ScreenEvent> for ScreenView {}

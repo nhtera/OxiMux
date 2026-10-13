@@ -28,8 +28,17 @@ impl SimulatorPanel {
 
     /// The steps recorded so far, while the panel records the shown device.
     pub(super) fn flow_steps(&self, cx: &gpui::App) -> Option<u32> {
+        self.flow_with(cx, |r| r.count())
+    }
+
+    /// The id of the recording the panel makes of the shown device.
+    pub(super) fn flow_id(&self, cx: &gpui::App) -> Option<u64> {
+        self.flow_with(cx, |r| r.id())
+    }
+
+    fn flow_with<T>(&self, cx: &gpui::App, f: impl Fn(&crate::shell::simulator::hub::Recording) -> T) -> Option<T> {
         let (hub, key) = (self.hub.as_ref()?, self.rec_key(cx)?);
-        hub.read(cx).flows().get(&key).map(|r| r.count())
+        hub.read(cx).flows().get(&key).map(f)
     }
 
     pub(super) fn start_flow(&mut self, cx: &mut Context<Self>) {
@@ -52,12 +61,12 @@ impl SimulatorPanel {
         // A tap still working out its step (reading its element, or a read
         // after it on the field it named) is waited for, not dropped:
         // without a known screen size it has no point to fall back on.
-        let Some(screen) = self.screen.clone().filter(|s| s.read(cx).recording_waits()) else {
+        let Some(screen) = self.screen.clone().filter(|s| s.read(cx).recording_waits(id)) else {
             return self.finish_stop(key, id, cx);
         };
         cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();
-            while started.elapsed() < STOP_WAIT && screen.read_with(cx, |s, _| s.recording_waits()) {
+            while started.elapsed() < STOP_WAIT && screen.read_with(cx, |s, _| s.recording_waits(id)) {
                 cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
             }
             let _ = this.update(cx, |this, cx| this.finish_stop(key, id, cx));
@@ -72,14 +81,11 @@ impl SimulatorPanel {
         if hub.read(cx).flows().get(&key).map(|r| r.id()) != Some(id) {
             return;
         }
-        // What the screen still holds in line (a tap reading its element,
-        // typing behind it) goes in before the stop — while the screen is
-        // still this recording's.
-        if self.rec_key(cx).as_ref() == Some(&key) {
-            let pending = self.screen.clone().map(|s| s.update(cx, |s, _| s.drain_recording())).unwrap_or_default();
-            for step in pending {
-                self.record_into(&key, step, cx);
-            }
+        // What the screen still holds in line for it (a tap reading its
+        // element, typing behind it) goes in before the stop.
+        let pending = self.screen.clone().map(|s| s.update(cx, |s, cx| s.drain_recording(id, cx))).unwrap_or_default();
+        for step in pending {
+            self.record_into(&key, step, cx);
         }
         let stopped = hub.update(cx, |hub, cx| {
             let stopped = hub.flows_mut().stop(&key);
@@ -104,6 +110,15 @@ impl SimulatorPanel {
             });
         })
         .detach();
+    }
+
+    /// A step of recording `id`, wherever the panel is now (nothing, once
+    /// it has stopped).
+    pub(super) fn record_owned(&mut self, id: u64, step: PanelStep, cx: &mut Context<Self>) {
+        let key = self.hub.as_ref().and_then(|hub| hub.read(cx).flows().key_of(id));
+        if let Some(key) = key {
+            self.record_into(&key, step, cx);
+        }
     }
 
     /// One piece of the user's input, while recording.

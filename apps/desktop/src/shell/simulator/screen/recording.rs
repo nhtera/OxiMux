@@ -106,11 +106,12 @@ struct Press {
 /// Recording state, for the life of the screen view.
 #[derive(Default)]
 pub(super) struct Recorder {
-    on: bool,
+    /// The recording this device's input goes to now (its id).
+    owner: Option<u64>,
     press: Option<Press>,
-    /// Steps in the order they happened; a tap still reading its element
-    /// holds back what came after it.
-    queue: VecDeque<(u64, Slot)>,
+    /// Steps in the order they happened, each with the recording it went
+    /// to; a tap still reading its element holds back what came after it.
+    queue: VecDeque<(u64, u64, Slot)>,
     next: u64,
     standing: Standing,
     /// Whether the screen is being watched for rest.
@@ -133,49 +134,52 @@ impl Recorder {
     }
 
     /// A place in line for a step still being worked out (`fallback`: what
-    /// to keep if recording stops first).
-    fn wait_turn(&mut self, fallback: Option<PanelStep>) -> u64 {
+    /// to keep if recording stops first); `None` when not recording.
+    fn wait_turn(&mut self, fallback: Option<PanelStep>) -> Option<u64> {
+        let owner = self.owner?;
         self.next += 1;
-        self.queue.push_back((self.next, Slot::Waiting(fallback)));
-        self.next
+        self.queue.push_back((self.next, owner, Slot::Waiting(fallback)));
+        Some(self.next)
     }
 
     /// The step for place `seq` (`None`: nothing to record after all).
     fn resolve(&mut self, seq: u64, step: Option<PanelStep>, cx: &mut Context<ScreenView>) {
-        if let Some(slot) = self.queue.iter_mut().find(|(s, _)| *s == seq) {
-            slot.1 = Slot::Done(step);
+        if let Some(slot) = self.queue.iter_mut().find(|(s, _, _)| *s == seq) {
+            slot.2 = Slot::Done(step);
         }
         self.flush(cx);
     }
 
     /// A step known now, after any still being worked out.
     fn ready(&mut self, step: PanelStep, cx: &mut Context<ScreenView>) {
+        let Some(owner) = self.owner else { return };
         self.next += 1;
-        self.queue.push_back((self.next, Slot::Done(Some(step))));
+        self.queue.push_back((self.next, owner, Slot::Done(Some(step))));
         self.flush(cx);
     }
 
+    /// Hand on the steps known, in order, each to the recording it went to
+    /// (the panel may show another one by now).
     fn flush(&mut self, cx: &mut Context<ScreenView>) {
-        while let Some((_, Slot::Done(_))) = self.queue.front() {
-            if let Some((_, Slot::Done(Some(step)))) = self.queue.pop_front()
-                && self.on
-            {
-                cx.emit(ScreenEvent::Recorded(step));
+        while let Some((_, _, Slot::Done(_))) = self.queue.front() {
+            if let Some((_, owner, Slot::Done(Some(step)))) = self.queue.pop_front() {
+                cx.emit(ScreenEvent::Recorded(owner, step));
             }
         }
     }
 
-    /// Whether a tap is still working out its step.
-    fn waits(&self) -> bool {
-        self.queue.iter().any(|(_, slot)| matches!(slot, Slot::Waiting(_)))
+    /// Whether a tap of recording `owner` is still working out its step.
+    fn waits(&self, owner: u64) -> bool {
+        self.queue.iter().any(|(_, o, slot)| *o == owner && matches!(slot, Slot::Waiting(_)))
     }
 
-    /// Everything still in line, in order, a tap still reading its element
-    /// as its fallback: what a stop keeps.
-    fn drain(&mut self) -> Vec<PanelStep> {
-        self.queue
-            .drain(..)
-            .filter_map(|(_, slot)| match slot {
+    /// Recording `owner`'s steps still in line, in order, a tap still
+    /// reading its element as its fallback: what its stop keeps.
+    fn drain(&mut self, owner: u64) -> Vec<PanelStep> {
+        let (mine, rest) = self.queue.drain(..).partition::<VecDeque<_>, _>(|(_, o, _)| *o == owner);
+        self.queue = rest;
+        mine.into_iter()
+            .filter_map(|(_, _, slot)| match slot {
                 Slot::Waiting(step) | Slot::Done(step) => step,
             })
             .collect()
@@ -183,14 +187,15 @@ impl Recorder {
 }
 
 impl ScreenView {
-    /// The panel started or stopped recording this device's input.
-    pub(crate) fn set_recording(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.recorder.on = on;
-        if !on {
+    /// The recording (by id) this device's input goes to now, if any. Steps
+    /// still in line keep going to the recording they were made for.
+    pub(crate) fn set_recording(&mut self, owner: Option<u64>, cx: &mut Context<Self>) {
+        if self.recorder.owner != owner {
             self.recorder.press = None;
-            self.recorder.queue.clear();
             self.recorder.standing = Standing::default();
-        } else if !self.recorder.watching {
+        }
+        self.recorder.owner = owner;
+        if owner.is_some() && !self.recorder.watching {
             self.recorder.watching = true;
             cx.spawn(async move |this, cx| {
                 loop {
@@ -208,7 +213,7 @@ impl ScreenView {
     /// one in hand (or reading) began after it last moved. `false` once
     /// recording has stopped.
     fn watch_screen(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.recorder.on {
+        if self.recorder.owner.is_none() {
             self.recorder.watching = false;
             return false;
         }
@@ -241,7 +246,7 @@ impl ScreenView {
 
     /// A finger went down at `at` (display-normalized).
     pub(super) fn rec_press(&mut self, pos: Point<Pixels>, at: (f64, f64), cx: &mut Context<Self>) {
-        if !self.recorder.on {
+        if self.recorder.owner.is_none() {
             return;
         }
         let session = self.session(cx);
@@ -286,7 +291,7 @@ impl ScreenView {
                 None => PanelStep::Tap { at: to_pt(press.at), screen, target: None },
             }
         });
-        let seq = self.recorder.wait_turn(fallback);
+        let Some(seq) = self.recorder.wait_turn(fallback) else { return };
         let (left, read, standing) = (READ_BUDGET.saturating_sub(press.started.elapsed()), press.tree.clone(), press.standing.clone());
         let (hub, session) = (self.hub.clone(), self.session(cx));
         let named_before = standing.is_some();
@@ -366,7 +371,7 @@ impl ScreenView {
 
     /// A key typed while recording: a character, or a backspace.
     pub(super) fn rec_key(&mut self, key: &str, key_char: Option<&str>, cx: &mut Context<Self>) {
-        if !self.recorder.on {
+        if self.recorder.owner.is_none() {
             return;
         }
         self.rec_input();
@@ -390,21 +395,26 @@ impl ScreenView {
         self.recorder.standing.input_at = Some(Instant::now());
     }
 
-    /// Whether a tap is still working out its step (a Stop waits for it).
-    pub(crate) fn recording_waits(&self) -> bool {
-        self.recorder.waits()
+    /// Whether a tap of recording `owner` is still working out its step (a
+    /// Stop waits for it).
+    pub(crate) fn recording_waits(&self, owner: u64) -> bool {
+        self.recorder.waits(owner)
     }
 
-    /// Recording stops: the steps still in line, in order (a tap still
-    /// reading its element as a point), handed over rather than dropped.
-    pub(crate) fn drain_recording(&mut self) -> Vec<PanelStep> {
-        self.recorder.drain()
+    /// Recording `owner` stops: its steps still in line, in order (a tap
+    /// still reading its element as a point), handed over rather than
+    /// dropped.
+    pub(crate) fn drain_recording(&mut self, owner: u64, cx: &mut Context<Self>) -> Vec<PanelStep> {
+        let steps = self.recorder.drain(owner);
+        // Another recording's steps may now lead the line.
+        self.recorder.flush(cx);
+        steps
     }
 
     /// A step from outside the screen (a toolbar button), in line with the
     /// screen's own.
     pub(crate) fn record_step(&mut self, step: PanelStep, cx: &mut Context<Self>) {
-        if self.recorder.on {
+        if self.recorder.owner.is_some() {
             self.rec_input();
             self.recorder.ready(step, cx);
         }
@@ -412,7 +422,7 @@ impl ScreenView {
 
     /// Text pasted into the device while recording.
     pub(super) fn rec_paste(&mut self, text: &str, cx: &mut Context<Self>) {
-        if self.recorder.on && !text.is_empty() {
+        if self.recorder.owner.is_some() && !text.is_empty() {
             self.rec_input();
             self.recorder.ready(PanelStep::Text(text.to_owned()), cx);
         }
@@ -485,18 +495,23 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_waits_for_every_tap_still_reading() {
+    fn a_stop_waits_for_its_own_taps_and_keeps_only_its_own_steps() {
         let mut rec = Recorder::default();
-        assert!(!rec.waits());
+        assert!(rec.wait_turn(None).is_none(), "not recording: no place in line");
+        rec.owner = Some(1);
         let point = PanelStep::Tap { at: (1.0, 2.0), screen: (402.0, 874.0), target: None };
-        let first = rec.wait_turn(Some(point));
-        let second = rec.wait_turn(None);
-        assert!(rec.waits());
+        let first = rec.wait_turn(Some(point)).unwrap();
+        let second = rec.wait_turn(None).unwrap();
+        // The panel moved on to recording 2 while recording 1's taps read.
+        rec.owner = Some(2);
+        let other = rec.wait_turn(None).unwrap();
+        assert!(rec.waits(1) && rec.waits(2));
         for seq in [first, second] {
-            rec.queue.iter_mut().find(|(s, _)| *s == seq).unwrap().1 = Slot::Done(Some(PanelStep::Backspace));
+            rec.queue.iter_mut().find(|(s, _, _)| *s == seq).unwrap().2 = Slot::Done(Some(PanelStep::Backspace));
         }
-        assert!(!rec.waits());
-        assert_eq!(rec.drain().len(), 2);
+        assert!(!rec.waits(1) && rec.waits(2));
+        assert_eq!(rec.drain(1).len(), 2, "recording 1's own steps");
+        assert_eq!(rec.queue.iter().map(|(s, o, _)| (*s, *o)).collect::<Vec<_>>(), [(other, 2)], "recording 2's stay in line");
     }
 
     fn node(role: &str, label: &str, secure: bool, y: f64) -> ax::AxNode {

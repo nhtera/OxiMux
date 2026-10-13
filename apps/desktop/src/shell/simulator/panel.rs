@@ -361,12 +361,12 @@ impl SimulatorPanel {
             let screen = cx.new(|cx| ScreenView::new(hub, theme, typography.clone(), window, cx));
             self._screen_events = Some(cx.subscribe(&screen, |panel, _, event: &super::screen::ScreenEvent, cx| match event {
                 super::screen::ScreenEvent::Picked(picked) => panel.picked(picked.clone(), cx),
-                super::screen::ScreenEvent::Recorded(step) => panel.record_panel(step.clone(), cx),
+                super::screen::ScreenEvent::Recorded(owner, step) => panel.record_owned(*owner, step.clone(), cx),
             }));
             self.screen = Some(screen);
         }
         let screen = self.screen.clone()?;
-        let recording = self.flow_steps(cx).is_some();
+        let recording = self.flow_id(cx);
         screen.update(cx, |screen, cx| {
             screen.bind(binding, theme, &typography, window, cx);
             screen.set_recording(recording, cx);

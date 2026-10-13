@@ -173,7 +173,7 @@ mod capture;
 mod crash_watch;
 mod device_state;
 mod flow_recorder;
-pub(crate) use flow_recorder::{PanelStep, RecSource, save as save_flow};
+pub(crate) use flow_recorder::{PanelStep, RecSource, Recording, save as save_flow};
 pub(crate) use snapshot::{SharedRead, Tree};
 mod iphone;
 mod iphone_control;
