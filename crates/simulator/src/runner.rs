@@ -220,9 +220,11 @@ pub struct Bounded {
 /// `timeout`, and what it wrote by then comes back: a command that never ends
 /// on its own (a log that follows) still answers.
 ///
-/// On Unix it runs in a process group of its own, and stopping it stops the
-/// group: a child it started cannot keep the pipes (and this call) open. A
-/// child left behind by a command that exited is waited for only briefly.
+/// On Unix it runs in a process group of its own. On macOS the whole group is
+/// stopped when the call ends, even after the command exited by itself (it
+/// is watched without being reaped, so the group's id stays its own): a
+/// child it left in the background cannot outlive the call. The readers stop
+/// with the call too, whoever still holds the pipes.
 pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, cap: usize) -> Result<Bounded> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -232,14 +234,17 @@ pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, cap: usize) 
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn()?;
     // Both streams draw on one budget; a reader that finds it spent stops.
-    let (left, full) = (Arc::new(AtomicUsize::new(cap)), Arc::new(AtomicBool::new(false)));
-    let capped = |pipe: Option<Box<dyn Read + Send>>| {
-        let (left, full, buf) = (left.clone(), full.clone(), Arc::new(Mutex::new(Vec::new())));
+    let (left, full, stop) = (Arc::new(AtomicUsize::new(cap)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let capped = |pipe: Option<Pipe>| {
+        let (left, full, stop, buf) = (left.clone(), full.clone(), stop.clone(), Arc::new(Mutex::new(Vec::new())));
         let kept = buf.clone();
         let reader = std::thread::spawn(move || {
             let Some(mut pipe) = pipe else { return };
             let mut chunk = [0u8; 8192];
             loop {
+                if !pipe.readable(&stop) {
+                    return;
+                }
                 let n = match pipe.read(&mut chunk) {
                     Ok(0) => return,
                     Ok(n) => n,
@@ -256,19 +261,17 @@ pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, cap: usize) 
         });
         (reader, buf)
     };
-    let out = capped(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let err = capped(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let out = capped(child.stdout.take().map(Pipe::new));
+    let err = capped(child.stderr.take().map(Pipe::new));
     let deadline = Instant::now() + timeout;
-    let (mut status, mut timed_out) = (None, false);
+    let mut timed_out = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(done)) => {
-                status = done.code();
-                break;
-            }
-            Ok(None) => {}
+        match exited(&mut child) {
+            Ok(true) => break,
+            Ok(false) => {}
             Err(e) => {
-                stop_group(&mut child, true);
+                stop_group(&mut child);
+                stop.store(true, Ordering::SeqCst);
                 return Err(e.into());
             }
         }
@@ -282,31 +285,97 @@ pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, cap: usize) 
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    stop_group(&mut child, status.is_none());
+    let status = stop_group(&mut child);
     // The pipes close once the group is gone; a descendant that left it
-    // could keep them open, so the readers get a moment, not forever.
+    // could keep them open, so the readers get a moment, then are stopped.
     let settle = Instant::now() + Duration::from_millis(500);
     while !(out.0.is_finished() && err.0.is_finished()) && Instant::now() < settle {
         std::thread::sleep(Duration::from_millis(10));
     }
+    stop.store(true, Ordering::SeqCst);
     let take = |buf: &Arc<Mutex<Vec<u8>>>| std::mem::take(&mut *buf.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     Ok(Bounded { status, stdout: take(&out.1), stderr: take(&err.1), truncated: full.load(Ordering::SeqCst), timed_out })
 }
 
-/// Stop what [`run_bounded`] started, while it still runs: its whole group
-/// on Unix. Never once it was reaped: its pid (the group's id) may then
-/// belong to someone else.
-fn stop_group(child: &mut std::process::Child, running: bool) {
-    if running {
+/// One of [`run_bounded`]'s output pipes.
+struct Pipe {
+    read: Box<dyn Read + Send>,
+    #[cfg(unix)]
+    fd: std::os::fd::RawFd,
+}
+
+impl Pipe {
+    #[cfg(unix)]
+    fn new<P: Read + Send + std::os::fd::AsRawFd + 'static>(pipe: P) -> Self {
+        Self { fd: pipe.as_raw_fd(), read: Box::new(pipe) }
+    }
+
+    #[cfg(not(unix))]
+    fn new<P: Read + Send + 'static>(pipe: P) -> Self {
+        Self { read: Box::new(pipe) }
+    }
+
+    /// Wait until there is something to read (or the pipe closed); `false`
+    /// once `stop` is set, so a reader never outlives its call (on Unix;
+    /// elsewhere the read itself waits).
+    fn readable(&self, stop: &std::sync::atomic::AtomicBool) -> bool {
+        #[cfg(not(unix))]
+        return !stop.load(std::sync::atomic::Ordering::SeqCst);
         #[cfg(unix)]
-        // SAFETY: `kill(2)` on the group this call created; its leader is
-        // not reaped yet, so the id is still this group's.
-        unsafe {
-            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        loop {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let mut poll = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one pollfd for a descriptor this pipe owns, open while
+            // it lives; a 50 ms wait.
+            if unsafe { libc::poll(&mut poll, 1, 50) } != 0 {
+                // Ready, closed, or an error the read reports.
+                return true;
+            }
         }
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read.read(buf)
+    }
+}
+
+/// Whether [`run_bounded`]'s command has ended. On macOS it stays unreaped
+/// (a zombie keeps its group's id), so its group can still be stopped.
+#[cfg(target_os = "macos")]
+fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: `waitid` fills a zeroed siginfo for one pid this call spawned;
+    // WNOWAIT leaves it to be reaped later.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    if unsafe { libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, flags) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.si_pid != 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    child.try_wait().map(|done| done.is_some())
+}
+
+/// Stop what [`run_bounded`] started and reap it: on macOS its whole group,
+/// its leader still unreaped (so the group's id is still its own), whether it
+/// ended or not; elsewhere the command itself. Its exit code, `None` when it
+/// was killed.
+fn stop_group(child: &mut std::process::Child) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    // SAFETY: `kill(2)` on the group this call created; its leader is not
+    // reaped yet, so the id is still this group's.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if child.try_wait().ok().flatten().is_none() {
         let _ = child.kill();
     }
-    let _ = child.wait();
+    child.wait().ok().and_then(|status| status.code())
 }
 
 /// `program` and its first two arguments (after adb's `-s <serial>`), the
@@ -540,4 +609,23 @@ mod tests {
         assert_eq!(slow.stdout, b"first\n");
         assert!(started.elapsed() < Duration::from_secs(10));
     }
+
+    /// A command that leaves a child in the background holding its pipes:
+    /// the call still returns at once, and the child does not outlive it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_background_child_does_not_outlive_the_call() {
+        let started = Instant::now();
+        let done = run_bounded("sh", &["-c", "sleep 30 & echo $!"], Duration::from_secs(10), 1024).unwrap();
+        assert_eq!(done.status, Some(0), "its own exit, not the kill");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let pid: libc::pid_t = String::from_utf8_lossy(&done.stdout).trim().parse().unwrap();
+        // SAFETY: signal 0 only asks whether the pid exists.
+        let gone = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            (unsafe { libc::kill(pid, 0) }) == -1
+        });
+        assert!(gone, "the background sleep was stopped");
+    }
 }
+

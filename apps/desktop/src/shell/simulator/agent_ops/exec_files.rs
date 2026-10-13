@@ -7,10 +7,13 @@
 //! input (`install`, `push`) is opened without following a final symlink, its
 //! real path checked inside the worktree, and copied into a private folder
 //! that adb reads instead. A `pull` writes into a private folder too, and its
-//! files are then placed in the worktree the same way: each opened without
-//! following a symlink and checked where it really landed, as a plain file
-//! (no execute bit), never under a `.git` folder.
+//! files are then placed in the worktree through folder handles: the target
+//! folder is opened and checked where it really is once, and everything goes
+//! in relative to that handle (never through a link), each file written
+//! under a scratch name and renamed over its own, as a plain file (no execute
+//! bit), never under a `.git` folder.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -63,7 +66,7 @@ fn moved(path: &Path) -> SimErrorWire {
 pub(super) fn stage_inputs(root: &Path, inputs: &[PathBuf], into: &Path) -> Result<Vec<PathBuf>, SimErrorWire> {
     let mut staged = Vec::with_capacity(inputs.len());
     for (n, input) in inputs.iter().enumerate() {
-        let mut file = open_inside(input, root, OpenOptions::new().read(true), false).map_err(|_| moved(input))?;
+        let mut file = open_inside(input, root).map_err(|_| moved(input))?;
         if plain_file(&file).is_err() {
             return Err(SimErrorWire::BadInput(format!("{} is not a plain file", input.display())));
         }
@@ -81,89 +84,63 @@ pub(super) fn stage_inputs(root: &Path, inputs: &[PathBuf], into: &Path) -> Resu
 
 /// Place what a pull wrote into `from` (a private folder) at `dest` in the
 /// worktree: into it when it is a folder already or there were several
-/// sources, else as it. Returns how many files were placed.
+/// sources (made when missing), else as it. Returns how many files were
+/// placed.
 pub(super) fn place_pulled(root: &Path, from: &Path, dest: &Path, sources: usize) -> Result<u32, SimErrorWire> {
     let failed = |e: io::Error| SimErrorWire::Failed(format!("the pulled files were not placed: {e}"));
+    let refused = || SimErrorWire::Refused(format!("{} is not a place exec writes to", dest.display()));
     let mut pulled: Vec<PathBuf> = fs::read_dir(from).map_err(failed)?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>().map_err(failed)?;
     pulled.sort();
     let into_dir = sources > 1 || fs::symlink_metadata(dest).is_ok_and(|m| m.is_dir());
+    let (parent, name) = (dest.parent().ok_or_else(refused)?, dest.file_name().ok_or_else(refused)?);
     let mut placed = 0;
-    for src in pulled {
-        let to = match src.file_name() {
-            Some(name) if into_dir => dest.join(name),
-            _ => dest.to_path_buf(),
+    if into_dir {
+        let dir = if fs::symlink_metadata(dest).is_ok_and(|m| m.is_dir()) {
+            at::checked_dir(dest, root).map_err(|_| refused())?
+        } else {
+            if is_git(name) {
+                return Err(refused());
+            }
+            let parent = at::checked_dir(parent, root).map_err(|_| refused())?;
+            at::make_dir(&parent, name).and_then(|()| at::open_dir(&parent, name)).map_err(|_| refused())?
         };
-        place(root, &src, &to, &mut placed)?;
+        for src in pulled {
+            let name = src.file_name().ok_or_else(refused)?.to_owned();
+            place(&src, &dir, &name, &mut placed)?;
+        }
+    } else {
+        let parent = at::checked_dir(parent, root).map_err(|_| refused())?;
+        for src in pulled {
+            place(&src, &parent, name, &mut placed)?;
+        }
     }
     Ok(placed)
 }
 
-fn place(root: &Path, src: &Path, dest: &Path, placed: &mut u32) -> Result<(), SimErrorWire> {
-    let refused = || SimErrorWire::Refused(format!("{} is not a place exec writes to", dest.display()));
-    if in_git(dest.strip_prefix(root).map_err(|_| refused())?) {
+/// Put `src` (from the private folder) in the folder `dir` as `name`.
+fn place(src: &Path, dir: &at::Dir, name: &OsStr, placed: &mut u32) -> Result<(), SimErrorWire> {
+    let refused = || SimErrorWire::Refused(format!("{} is not a place exec writes to", Path::new(name).display()));
+    if is_git(name) || name == ".." || name == "." {
         return Err(refused());
     }
-    let kind = fs::symlink_metadata(src).map_err(|e| SimErrorWire::Failed(format!("{}: {e}", src.display())))?;
+    let failed = |e: io::Error| SimErrorWire::Failed(format!("{} was not placed: {e}", Path::new(name).display()));
+    let kind = fs::symlink_metadata(src).map_err(failed)?;
     if kind.is_dir() {
-        make_dir_inside(dest, root).map_err(|_| refused())?;
-        let mut entries: Vec<PathBuf> = fs::read_dir(src).and_then(|d| d.map(|e| e.map(|e| e.path())).collect()).map_err(|e| SimErrorWire::Failed(e.to_string()))?;
+        // Never through a link: a folder of that name that is a link fails.
+        let sub = at::make_dir(dir, name).and_then(|()| at::open_dir(dir, name)).map_err(|_| refused())?;
+        let mut entries: Vec<PathBuf> = fs::read_dir(src).and_then(|d| d.map(|e| e.map(|e| e.path())).collect()).map_err(failed)?;
         entries.sort();
         for entry in entries {
-            let name = entry.file_name().ok_or_else(refused)?.to_owned();
-            place(root, &entry, &dest.join(name), placed)?;
+            let child = entry.file_name().ok_or_else(refused)?.to_owned();
+            place(&entry, &sub, &child, placed)?;
         }
     } else if kind.is_file() {
-        let mut out = create_inside(dest, root).map_err(|_| refused())?;
-        let copied = open_plain(src).and_then(|mut f| io::copy(&mut f, &mut out));
-        copied.map_err(|e| SimErrorWire::Failed(format!("{} was not written: {e}", dest.display())))?;
+        let mut from = open_plain(src).map_err(failed)?;
+        at::replace_file(dir, name, &mut from).map_err(failed)?;
         *placed += 1;
     }
     // Anything else a pull left (a link, a device node) is not placed.
     Ok(())
-}
-
-/// `dest` as a folder inside `root`: kept when it is one, else made. A
-/// folder this made outside (through a link swapped in meanwhile) is removed.
-fn make_dir_inside(dest: &Path, root: &Path) -> io::Result<()> {
-    let outside = || io::Error::other("outside the worktree");
-    let made = match fs::symlink_metadata(dest) {
-        Ok(meta) if meta.is_dir() => false,
-        Ok(_) => return Err(outside()),
-        Err(_) => {
-            fs::create_dir(dest)?;
-            true
-        }
-    };
-    let real = fs::canonicalize(dest)?;
-    if real.starts_with(root) {
-        return Ok(());
-    }
-    if made {
-        let _ = fs::remove_dir(&real);
-    }
-    Err(outside())
-}
-
-/// `dest` opened for writing, emptied, as a plain file inside `root`. A file
-/// this creates outside (through a link swapped in meanwhile) is removed,
-/// and an existing one outside is never opened for long, nor emptied.
-fn create_inside(dest: &Path, root: &Path) -> io::Result<File> {
-    let mut new = OpenOptions::new();
-    new.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut new, 0o644);
-    match open_inside(dest, root, &mut new, true) {
-        Ok(file) => return Ok(file),
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-        Err(_) => {}
-    }
-    let file = open_inside(dest, root, OpenOptions::new().write(true), false)?;
-    plain_file(&file)?;
-    file.set_len(0)?;
-    // What a pull writes is never executable, a new file or an old one.
-    #[cfg(unix)]
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
-    Ok(file)
 }
 
 /// A file adb wrote into the private folder, read as a plain file only.
@@ -177,44 +154,145 @@ fn open_plain(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// `path` opened with `options`, never through a final symlink, when the file
-/// it opened really lies inside `root`. `created`: the options create a new
-/// file, which is removed again when it landed elsewhere.
+/// `path` opened for reading, never through a final symlink (nor blocking on
+/// a named pipe), when the file it opened really lies inside `root` and
+/// outside its `.git` folder.
 #[cfg(target_os = "macos")]
-fn open_inside(path: &Path, root: &Path, options: &mut OpenOptions, created: bool) -> io::Result<File> {
+fn open_inside(path: &Path, root: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    // Non-blocking: opening a named pipe would otherwise wait for a writer
-    // for good. A plain file (all that is used) reads and writes as usual.
-    let file = options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
-    let real = real_path(&file)?;
-    if real.starts_with(root) {
-        return Ok(file);
-    }
-    drop(file);
-    if created {
-        let _ = fs::remove_file(&real);
-    }
-    Err(io::Error::other("outside the worktree"))
-}
-
-/// Where the file behind `file` really is, whatever path opened it.
-#[cfg(target_os = "macos")]
-fn real_path(file: &File) -> io::Result<PathBuf> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
-    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: `F_GETPATH` writes at most PATH_MAX bytes, NUL-terminated, into
-    // `buf`, which is that long; the descriptor is open for the call.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    at::check_inside(&at::real_path(&file)?, root)?;
+    Ok(file)
 }
 
 /// The Mobile Emulator runs on macOS only; nowhere else is a file checked
-/// where it really landed, so nothing is opened.
+/// where it really is, so nothing is opened.
 #[cfg(not(target_os = "macos"))]
-fn open_inside(_path: &Path, _root: &Path, _options: &mut OpenOptions, _created: bool) -> io::Result<File> {
+fn open_inside(_path: &Path, _root: &Path) -> io::Result<File> {
     Err(io::Error::other("exec moves files on macOS only"))
+}
+
+/// Folder handles and the `*at` calls made relative to them, so a link swapped
+/// into the worktree after a folder was checked changes nothing.
+#[cfg(target_os = "macos")]
+mod at {
+    use std::ffi::{CString, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::{Path, PathBuf};
+
+    /// An open folder.
+    pub(super) struct Dir(OwnedFd);
+
+    fn cname(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| io::Error::other("a name with a NUL"))
+    }
+
+    fn fd(ret: libc::c_int) -> io::Result<OwnedFd> {
+        // SAFETY: a descriptor the call just returned, owned by nothing else.
+        if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(ret) }) }
+    }
+
+    fn done(ret: libc::c_int) -> io::Result<()> {
+        if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    /// Where the file or folder behind `fd` really is, whatever path opened it.
+    pub(super) fn real_path(fd: &impl AsRawFd) -> io::Result<PathBuf> {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: `F_GETPATH` writes at most PATH_MAX bytes, NUL-terminated,
+        // into `buf`, which is that long; the descriptor is open for the call.
+        done(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) })?;
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(PathBuf::from(OsStr::from_bytes(&buf[..len])))
+    }
+
+    /// `real` lies inside `root`, outside its `.git` folder.
+    pub(super) fn check_inside(real: &Path, root: &Path) -> io::Result<()> {
+        match real.strip_prefix(root) {
+            Ok(within) if !super::in_git(within) => Ok(()),
+            _ => Err(io::Error::other("outside the worktree")),
+        }
+    }
+
+    /// The folder at `path`, opened, when it really lies inside `root`.
+    pub(super) fn checked_dir(path: &Path, root: &Path) -> io::Result<Dir> {
+        let c = cname(path.as_os_str())?;
+        // SAFETY: a NUL-terminated path; the result is checked.
+        let dir = Dir(fd(unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?);
+        check_inside(&real_path(&dir.0)?, root)?;
+        Ok(dir)
+    }
+
+    /// Make the folder `name` in `dir`; one already there is fine.
+    pub(super) fn make_dir(dir: &Dir, name: &OsStr) -> io::Result<()> {
+        let c = cname(name)?;
+        // SAFETY: a NUL-terminated name, relative to an open folder.
+        match done(unsafe { libc::mkdirat(dir.0.as_raw_fd(), c.as_ptr(), 0o755) }) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        }
+    }
+
+    /// The folder `name` in `dir`, never through a link.
+    pub(super) fn open_dir(dir: &Dir, name: &OsStr) -> io::Result<Dir> {
+        let c = cname(name)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: a NUL-terminated name, relative to an open folder.
+        Ok(Dir(fd(unsafe { libc::openat(dir.0.as_raw_fd(), c.as_ptr(), flags) })?))
+    }
+
+    /// Write `from` as `name` in `dir`: into a scratch file beside it, then
+    /// renamed over the name, so a failed copy leaves the old file whole and a
+    /// link or a second name is replaced, never written through.
+    pub(super) fn replace_file(dir: &Dir, name: &OsStr, from: &mut File) -> io::Result<()> {
+        let mut scratch = b".oximux-pull-".to_vec();
+        scratch.extend_from_slice(name.as_bytes());
+        let (scratch, target) = (cname(OsStr::from_bytes(&scratch))?, cname(name)?);
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: a NUL-terminated name, relative to an open folder.
+        let out = fd(unsafe { libc::openat(dir.0.as_raw_fd(), scratch.as_ptr(), flags, 0o644 as libc::c_uint) })?;
+        let mut out = File::from(out);
+        // SAFETY (both): NUL-terminated names, relative to an open folder.
+        let unlink = || unsafe { libc::unlinkat(dir.0.as_raw_fd(), scratch.as_ptr(), 0) };
+        let written = io::copy(from, &mut out).and_then(|_| out.sync_all());
+        let renamed = written.and_then(|()| done(unsafe { libc::renameat(dir.0.as_raw_fd(), scratch.as_ptr(), dir.0.as_raw_fd(), target.as_ptr()) }));
+        if renamed.is_err() {
+            unlink();
+        }
+        renamed
+    }
+}
+
+/// Elsewhere nothing is placed (see [`open_inside`]).
+#[cfg(not(target_os = "macos"))]
+mod at {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io;
+    use std::path::Path;
+
+    pub(super) struct Dir;
+
+    fn no() -> io::Error {
+        io::Error::other("exec moves files on macOS only")
+    }
+
+    pub(super) fn checked_dir(_path: &Path, _root: &Path) -> io::Result<Dir> {
+        Err(no())
+    }
+
+    pub(super) fn make_dir(_dir: &Dir, _name: &OsStr) -> io::Result<()> {
+        Err(no())
+    }
+
+    pub(super) fn open_dir(_dir: &Dir, _name: &OsStr) -> io::Result<Dir> {
+        Err(no())
+    }
+
+    pub(super) fn replace_file(_dir: &Dir, _name: &OsStr, _from: &mut File) -> io::Result<()> {
+        Err(no())
+    }
 }

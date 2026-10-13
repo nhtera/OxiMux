@@ -72,7 +72,7 @@ fn adb_host_paths_stay_inside_the_worktree() {
     let pull = check(Tool::Adb, &args("pull /sdcard/a /sdcard/b build"), &w).unwrap();
     assert_eq!((pull.reads, pull.writes), (vec![], Some((3, 2))), "two device paths, written at word 3");
     let pulled = check(Tool::Adb, &args("pull /sdcard/log.txt build/log.txt"), &w).unwrap().argv;
-    assert!(pulled[2].ends_with("build/log.txt") && Path::new(&pulled[2]).is_absolute(), "{pulled:?}");
+    assert!(Path::new(&pulled[2]).ends_with("build/log.txt") && Path::new(&pulled[2]).is_absolute(), "{pulled:?}");
     assert_eq!(pulled[1], "/sdcard/log.txt", "the device side is the device's");
     let into_root = check(Tool::Adb, &args("pull /sdcard/x build/.."), &w).unwrap().argv;
     assert_eq!(Path::new(&into_root[2]), std::fs::canonicalize(&w).unwrap(), "into the worktree's own folder");
@@ -205,8 +205,24 @@ fn a_symlink_swapped_in_after_the_question_is_refused() {
     std::fs::remove_file(root.join("x")).unwrap();
     std::fs::create_dir(root.join("x")).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("x/secret.txt")).unwrap();
-    assert!(exec_files::place_pulled(&root, pulled.path(), &root, 1).is_err());
+    assert_eq!(exec_files::place_pulled(&root, pulled.path(), &root, 1).unwrap(), 1, "the link is replaced");
     assert_eq!(std::fs::read(&outside).unwrap(), b"x", "never written through a link");
+    let placed = root.join("x/secret.txt");
+    assert!(std::fs::symlink_metadata(&placed).unwrap().is_file());
+    assert_eq!(std::fs::read(&placed).unwrap(), b"overwritten");
+    // The approved folder is now a link into git's folder.
+    let one = tempfile::tempdir().unwrap();
+    std::fs::write(one.path().join("config"), b"[core]").unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/config"), b"mine").unwrap();
+    std::os::unix::fs::symlink(root.join(".git"), root.join("conf")).unwrap();
+    assert!(exec_files::place_pulled(&root, one.path(), &root.join("conf/config"), 1).is_err());
+    assert!(exec_files::place_pulled(&root, one.path(), &root.join("conf"), 2).is_err(), "into it, as a folder");
+    assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), b"mine");
+    // As that name: the link itself is replaced.
+    assert_eq!(exec_files::place_pulled(&root, one.path(), &root.join("conf"), 1).unwrap(), 1);
+    assert!(std::fs::symlink_metadata(root.join("conf")).unwrap().is_file());
+    assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), b"mine");
     // A pulled tree with git's folder inside it is not placed.
     let git = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(git.path().join("repo/.Git")).unwrap();
@@ -249,11 +265,31 @@ fn only_plain_files_are_moved() {
     assert!(exec_files::stage_inputs(&root, std::slice::from_ref(&fifo), into.path()).is_err(), "a pipe, without hanging");
     let pulled = tempfile::tempdir().unwrap();
     std::fs::write(pulled.path().join("linked.txt"), b"new").unwrap();
-    assert!(exec_files::place_pulled(&root, pulled.path(), &root, 1).is_err(), "never written through a second name");
-    assert_eq!(std::fs::read(dir.path().join("secret.txt")).unwrap(), b"x");
+    assert_eq!(exec_files::place_pulled(&root, pulled.path(), &root, 1).unwrap(), 1, "the name is replaced");
+    assert_eq!(std::fs::read(dir.path().join("secret.txt")).unwrap(), b"x", "never written through a second name");
     std::fs::remove_file(pulled.path().join("linked.txt")).unwrap();
     std::fs::write(pulled.path().join("pipe"), b"new").unwrap();
-    assert!(exec_files::place_pulled(&root, pulled.path(), &root, 1).is_err(), "nor into a pipe");
+    assert_eq!(exec_files::place_pulled(&root, pulled.path(), &root, 1).unwrap(), 1, "nor into a pipe");
+    assert!(std::fs::symlink_metadata(root.join("pipe")).unwrap().is_file());
+}
+
+/// Several device paths into a folder that is not there yet: it is made.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pull_of_several_makes_its_folder() {
+    let (_dir, w) = worktree();
+    let root = std::fs::canonicalize(&w).unwrap();
+    let pulled = tempfile::tempdir().unwrap();
+    std::fs::write(pulled.path().join("a"), b"1").unwrap();
+    std::fs::write(pulled.path().join("b"), b"2").unwrap();
+    assert_eq!(exec_files::place_pulled(&root, pulled.path(), &root.join("new"), 2).unwrap(), 2);
+    assert_eq!(std::fs::read(root.join("new/b")).unwrap(), b"2");
+    // One device file to a name: placed as that name.
+    let one = tempfile::tempdir().unwrap();
+    std::fs::write(one.path().join("log.txt"), b"log").unwrap();
+    assert_eq!(exec_files::place_pulled(&root, one.path(), &root.join("build/renamed.txt"), 1).unwrap(), 1);
+    assert_eq!(std::fs::read(root.join("build/renamed.txt")).unwrap(), b"log");
+    assert!(!std::fs::read_dir(root.join("build")).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".oximux")), "no scratch left");
 }
 
 /// A file a pull overwrites loses its execute bit too.
