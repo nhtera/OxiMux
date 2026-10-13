@@ -331,11 +331,19 @@ oximux sim exec -- install build/app-debug.apk
   `status_bar`, `privacy`, `location`. A device id, `all`, `booted`, a host
   path or a `file:` URL is refused (exit 2).
 - Android runs only `shell`, `install`, `uninstall`, `logcat`, `emu`, `push`,
-  `pull`. adb's global options (`-s -t -d -e -H -P -L`) and `connect`,
-  `disconnect`, `kill-server`, `reboot`, `root`, `remount` are refused
-  wherever they appear (so `logcat -d` is refused: use `oximux sim logs`).
-  `install` and `push` read, and `pull` writes, only inside the worktree;
-  `pull` needs the local path.
+  `pull`, and `emu` only `geo`, `sms`, `gsm`, `cdma`, `power`, `network`,
+  `sensor`, `finger`, `rotate`, `event`, `fold`, `unfold`, `ping`. adb's global
+  options (`-s -t -d -e -H -P -L`), `--`, and `connect`, `disconnect`,
+  `kill-server`, `reboot`, `root`, `remount` are refused wherever they appear
+  (so `logcat -d` is refused: use `oximux sim logs`).
+- Host paths are relative to the **worktree root** (not your shell's folder)
+  and must stay inside it, outside `.git`. `install` and `push` take files
+  (not folders). `pull` needs the local path; its device paths may not contain
+  `.` or `..`. adb reads a private copy of what the user approved, and a pull
+  lands in a private folder first, then in the worktree as plain files (never
+  executable); a note says how many were placed.
+- On a real Android phone the question says so: the command can read and
+  change everything on it.
 - Not on a real iPhone (exit 5), and never inside `run`.
 - The output is cut to 64 KiB and the command stopped after 30 s (a followed
   `logcat` returns what it printed by then). Secret-looking values are

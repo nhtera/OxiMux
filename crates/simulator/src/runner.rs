@@ -239,10 +239,13 @@ pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, cap: usize) 
         let reader = std::thread::spawn(move || {
             let Some(mut pipe) = pipe else { return };
             let mut chunk = [0u8; 8192];
-            while let Ok(n) = pipe.read(&mut chunk) {
-                if n == 0 {
-                    return;
-                }
+            loop {
+                let n = match pipe.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                };
                 let took = left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(l.saturating_sub(n))).unwrap_or(0).min(n);
                 kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(&chunk[..took]);
                 if took < n {
@@ -258,9 +261,16 @@ pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, cap: usize) 
     let deadline = Instant::now() + timeout;
     let (mut status, mut timed_out) = (None, false);
     loop {
-        if let Some(done) = child.try_wait()? {
-            status = done.code();
-            break;
+        match child.try_wait() {
+            Ok(Some(done)) => {
+                status = done.code();
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                stop_group(&mut child, true);
+                return Err(e.into());
+            }
         }
         // Spent: it is writing more than anyone will read.
         if full.load(Ordering::SeqCst) {

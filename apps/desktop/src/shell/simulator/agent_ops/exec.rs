@@ -25,6 +25,7 @@ use oximux_simulator::{DeviceId, Source};
 
 use super::Target;
 use super::device_state::confirm;
+use super::exec_files;
 use super::verbs::{Out, android_device, on_own_thread, simctl_ready};
 use crate::shell::simulator::hub::{AskKind, SimulatorHub};
 
@@ -42,6 +43,10 @@ const SHOWN: usize = 2000;
 const SIMCTL: [&str; 8] = ["listapps", "appinfo", "terminate", "openurl", "ui", "status_bar", "privacy", "location"];
 /// `adb` commands an agent may run on the device.
 const ADB: [&str; 7] = ["shell", "install", "uninstall", "logcat", "emu", "push", "pull"];
+/// Emulator console commands (`adb emu …`) that act on the emulated device
+/// only. Left out: `screenrecord` (writes host files), `avd` (the AVD's
+/// files and snapshots), `kill`.
+const EMU: [&str; 13] = ["geo", "sms", "gsm", "cdma", "power", "network", "sensor", "finger", "rotate", "event", "fold", "unfold", "ping"];
 /// adb words that reach past the device, refused wherever they appear.
 const ADB_REFUSED: [&str; 6] = ["connect", "disconnect", "kill-server", "reboot", "root", "remount"];
 /// adb's global options (which device, which server), refused anywhere: the
@@ -79,14 +84,34 @@ pub(super) async fn precheck(hub: &Entity<SimulatorHub>, target: &Target, wire: 
     on_own_thread(move || check(tool, &argv, &worktree).map(drop)).await?
 }
 
-/// `argv` if `tool` may run it on the attached device, with every host path
-/// made absolute (it was checked inside `worktree`). `BadInput` names what
+/// What [`check`] allowed: the arguments, every host path made absolute and
+/// real (checked inside the worktree), and which of them adb reads or writes
+/// on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Checked {
+    pub argv: Vec<String>,
+    /// The worktree, real (symlinks resolved).
+    pub root: PathBuf,
+    /// Files adb reads (`install`, `push`), by position in `argv`.
+    pub reads: Vec<usize>,
+    /// Where a `pull` writes, by position, and how many device paths it pulls.
+    pub writes: Option<(usize, usize)>,
+}
+
+/// `argv` if `tool` may run it on the attached device. `BadInput` names what
 /// is not allowed.
-pub(super) fn check(tool: Tool, argv: &[String], worktree: &Path) -> Result<Vec<String>, SimErrorWire> {
+pub(super) fn check(tool: Tool, argv: &[String], worktree: &Path) -> Result<Checked, SimErrorWire> {
     let bad = |why: String| Err(SimErrorWire::BadInput(why));
     let Some(sub) = argv.first() else {
         return bad("name the command after `--`, e.g. `oximux sim exec -- ui appearance dark`".into());
     };
+    // Past `--` adb stops reading options: a word there would be a path this
+    // check took for one.
+    if argv.iter().any(|w| w == "--") {
+        return bad("`--` is not allowed inside the command".into());
+    }
+    let root = std::fs::canonicalize(worktree).map_err(|_| SimErrorWire::NoDevice)?;
+    let plain = |argv: &[String]| Ok(Checked { argv: argv.to_vec(), root: root.clone(), reads: Vec::new(), writes: None });
     match tool {
         Tool::Simctl => {
             if !SIMCTL.contains(&sub.as_str()) {
@@ -101,7 +126,7 @@ pub(super) fn check(tool: Tool, argv: &[String], worktree: &Path) -> Result<Vec<
                     return bad(format!("`{word}`: simctl exec takes no host files"));
                 }
             }
-            Ok(argv.to_vec())
+            plain(argv)
         }
         Tool::Adb => {
             for word in argv {
@@ -115,53 +140,70 @@ pub(super) fn check(tool: Tool, argv: &[String], worktree: &Path) -> Result<Vec<
             if !ADB.contains(&sub.as_str()) {
                 return bad(format!("`adb {sub}` is not allowed; exec runs only: {}", ADB.join(", ")));
             }
-            adb_paths(sub, argv, worktree)
+            if sub == "emu" && !argv.get(1).is_some_and(|c| EMU.contains(&c.as_str())) {
+                return bad(format!("`adb emu` runs only: {}", EMU.join(", ")));
+            }
+            if matches!(sub.as_str(), "install" | "push" | "pull") { adb_paths(sub, argv, root) } else { plain(argv) }
         }
     }
 }
 
-/// `argv` with the host side of `install`, `push` and `pull` checked and
-/// made absolute.
-fn adb_paths(sub: &str, argv: &[String], worktree: &Path) -> Result<Vec<String>, SimErrorWire> {
-    let mut out = argv.to_vec();
+/// `install`, `push` and `pull` with their host side checked and made real.
+fn adb_paths(sub: &str, argv: &[String], root: PathBuf) -> Result<Checked, SimErrorWire> {
+    let bad = |why: &str| Err(SimErrorWire::BadInput(why.into()));
+    let mut checked = Checked { argv: argv.to_vec(), root, reads: Vec::new(), writes: None };
     let operands: Vec<usize> = (1..argv.len()).filter(|&i| !argv[i].starts_with('-')).collect();
-    let host: Vec<(usize, bool)> = match sub {
-        "install" => operands.iter().map(|&i| (i, true)).collect(),
+    match sub {
+        "install" => checked.reads = operands,
         // `push LOCAL… REMOTE`.
-        "push" if operands.len() >= 2 => operands[..operands.len() - 1].iter().map(|&i| (i, true)).collect(),
-        "push" => return Err(SimErrorWire::BadInput("push takes a file in the worktree, then where it goes on the device".into())),
+        "push" if operands.len() >= 2 => checked.reads = operands[..operands.len() - 1].to_vec(),
+        "push" => return bad("push takes a file in the worktree, then where it goes on the device"),
         // `pull REMOTE… LOCAL`: the local side is required (else adb writes
         // where the app runs, outside any worktree).
-        "pull" if operands.len() >= 2 => vec![(operands[operands.len() - 1], false)],
-        "pull" => return Err(SimErrorWire::BadInput("pull takes the device's file, then where it goes in the worktree".into())),
-        _ => Vec::new(),
-    };
-    for (i, exists) in host {
-        out[i] = inside(&argv[i], worktree, exists)?.to_string_lossy().into_owned();
+        "pull" if operands.len() >= 2 => {
+            let (remotes, local) = (&operands[..operands.len() - 1], operands[operands.len() - 1]);
+            // adb names what it writes after the device path's last word: a
+            // `..` there would climb out of the folder it writes into.
+            if remotes.iter().any(|&i| argv[i].split('/').any(|w| w == "." || w == "..")) {
+                return bad("a device path to pull may not contain `.` or `..`");
+            }
+            checked.writes = Some((local, remotes.len()));
+        }
+        "pull" => return bad("pull takes the device's file, then where it goes in the worktree"),
+        _ => {}
     }
-    Ok(out)
+    for &i in &checked.reads {
+        checked.argv[i] = inside(&argv[i], &checked.root, true)?.to_string_lossy().into_owned();
+    }
+    if let Some((i, _)) = checked.writes {
+        checked.argv[i] = inside(&argv[i], &checked.root, false)?.to_string_lossy().into_owned();
+    }
+    Ok(checked)
 }
 
-/// `path` (relative to `worktree`) resolved, symlinks and all, when it is
-/// inside `worktree`. A path that need not exist yet (a pull's target) is
-/// checked by its folder.
-fn inside(path: &str, worktree: &Path, exists: bool) -> Result<PathBuf, SimErrorWire> {
-    let outside = || SimErrorWire::BadInput(format!("`{path}` is not inside this worktree"));
+/// `path` (relative to the worktree, `root`) resolved, symlinks and all, when
+/// it is inside it and not in its `.git` folder. A path that need not exist
+/// yet (a pull's target) is checked by its folder. One answer for "not
+/// there" and "not inside", so this says nothing about files elsewhere.
+fn inside(path: &str, root: &Path, exists: bool) -> Result<PathBuf, SimErrorWire> {
+    let refused = || SimErrorWire::BadInput(format!("`{path}` is not a file in this worktree"));
     if path.starts_with('~') {
-        return Err(outside());
+        return Err(refused());
     }
-    let root = std::fs::canonicalize(worktree).map_err(|_| outside())?;
-    let joined = worktree.join(path);
+    let joined = root.join(path);
     let real = match std::fs::canonicalize(&joined) {
         Ok(real) => real,
         Err(_) if !exists => {
-            let name = joined.file_name().filter(|n| *n != "..").ok_or_else(outside)?;
-            let parent = joined.parent().ok_or_else(outside)?;
-            std::fs::canonicalize(parent).map_err(|_| outside())?.join(name)
+            let name = joined.file_name().filter(|n| *n != "..").ok_or_else(refused)?;
+            let parent = joined.parent().ok_or_else(refused)?;
+            std::fs::canonicalize(parent).map_err(|_| refused())?.join(name)
         }
-        Err(_) => return Err(SimErrorWire::BadInput(format!("`{path}` was not found in this worktree"))),
+        Err(_) => return Err(refused()),
     };
-    if real.starts_with(&root) { Ok(real) } else { Err(outside()) }
+    match real.strip_prefix(root) {
+        Ok(within) if !exec_files::in_git(within) => Ok(real),
+        _ => Err(refused()),
+    }
 }
 
 /// An adb global option, alone or with its value attached (`-sSERIAL`).
@@ -200,45 +242,83 @@ fn shown(program: &str, args: &[String]) -> Result<String, SimErrorWire> {
 }
 
 /// Carry out an exec whose consent is settled: the device's id goes in,
-/// the user is asked with the exact command, then it runs, bounded.
+/// the user is asked with the exact command, then it runs, bounded. adb's
+/// host files are handled by [`exec_files`]: what the user approved is what
+/// adb reads, and where its pull lands.
 pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str, wire: SimExecWire, target: &Target, cx: &mut AsyncApp) -> Out {
+    let off = |hub: &Entity<SimulatorHub>, cx: &mut AsyncApp| !hub.read_with(cx, |hub, _| hub.exec_allowed());
     // Again here: the switch may have moved while consent was asked.
-    if !hub.read_with(cx, |hub, _| hub.exec_allowed()) {
+    if off(hub, cx) {
         return Err(SimErrorWire::Refused(OFF.into()));
     }
     let tool = Tool::of(udid)?;
     let worktree = target.worktree.clone();
-    let argv = on_own_thread(move || check(tool, &wire.argv, &worktree)).await??;
-    let (program, args, line) = match tool {
+    let checked = on_own_thread(move || check(tool, &wire.argv, &worktree)).await??;
+    let (program, prefix, line) = match tool {
         Tool::Simctl => {
             let sim = simctl_ready(hub, udid, cx).await?;
-            let mut args = vec!["simctl".to_owned(), argv[0].clone(), sim.as_str().to_owned()];
-            args.extend(argv[1..].iter().cloned());
+            let mut args = vec!["simctl".to_owned(), checked.argv[0].clone(), sim.as_str().to_owned()];
+            args.extend(checked.argv[1..].iter().cloned());
             let line = shown("xcrun", &args)?;
             ("xcrun".to_owned(), args, line)
         }
         Tool::Adb => {
             let device = android_device(hub, udid, cx).await?;
             let mut args = vec!["-s".to_owned(), device.serial().to_owned()];
-            args.extend(argv);
+            args.extend(checked.argv.iter().cloned());
             let line = shown("adb", &args)?;
             (device.adb().to_string_lossy().into_owned(), args, line)
         }
     };
-    confirm(hub, udid, name, AskKind::Exec { command: line }, target, cx).await?;
-    let ran = on_own_thread(move || {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        runner::run_bounded(&program, &refs, TIMEOUT, CAP).map_err(|e| (redact_argv(&program, &refs), e))
-    })
-    .await?;
-    let done = ran.map_err(|(what, e)| SimErrorWire::Failed(format!("{what} did not run: {e}")))?;
-    Ok(SimReplyWire::ExecOutput(output(done)))
+    let real_device = udid.is_physical();
+    confirm(hub, udid, name, AskKind::Exec { command: line, real_device }, target, cx).await?;
+    // And after the answer: turning it off while asked takes effect.
+    if off(hub, cx) {
+        return Err(SimErrorWire::Refused(OFF.into()));
+    }
+    let skip = prefix.len() - checked.argv.len();
+    let ran = on_own_thread(move || transfer(&program, prefix, skip, &checked)).await?;
+    Ok(SimReplyWire::ExecOutput(output(ran?)))
 }
 
-/// The reply: scrubbed, with a line saying why a stopped command stopped.
-fn output(done: runner::Bounded) -> SimExecOutputWire {
+/// Run the approved command, adb's host files going through a private
+/// folder (see [`exec_files`]); `skip` words of `args` come before
+/// `checked.argv`.
+fn transfer(program: &str, mut args: Vec<String>, skip: usize, checked: &Checked) -> Result<(runner::Bounded, Option<u32>), SimErrorWire> {
+    let failed = |e: std::io::Error| SimErrorWire::Failed(format!("no private folder for the transfer: {e}"));
+    let private = if checked.reads.is_empty() && checked.writes.is_none() { None } else { Some(tempfile::tempdir().map_err(failed)?) };
+    if let Some(dir) = &private {
+        let inputs: Vec<PathBuf> = checked.reads.iter().map(|&i| PathBuf::from(&checked.argv[i])).collect();
+        let staged = exec_files::stage_inputs(&checked.root, &inputs, dir.path())?;
+        for (&i, copy) in checked.reads.iter().zip(staged) {
+            args[skip + i] = copy.to_string_lossy().into_owned();
+        }
+        if let Some((i, _)) = checked.writes {
+            let pulled = dir.path().join("pulled");
+            std::fs::create_dir(&pulled).map_err(failed)?;
+            args[skip + i] = pulled.to_string_lossy().into_owned();
+        }
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let done = runner::run_bounded(program, &refs, TIMEOUT, CAP)
+        .map_err(|e| SimErrorWire::Failed(format!("{} did not run: {e}", redact_argv(program, &refs))))?;
+    let placed = match (checked.writes, &private) {
+        (Some((i, sources)), Some(dir)) if done.status == Some(0) => {
+            let dest = Path::new(&checked.argv[i]);
+            Some(exec_files::place_pulled(&checked.root, &dir.path().join("pulled"), dest, sources)?)
+        }
+        _ => None,
+    };
+    Ok((done, placed))
+}
+
+/// The reply: scrubbed, with a line saying why a stopped command stopped,
+/// or how many pulled files were placed.
+fn output((done, placed): (runner::Bounded, Option<u32>)) -> SimExecOutputWire {
     let mut stderr = String::from_utf8_lossy(&done.stderr).into_owned();
-    let note = if done.timed_out {
+    let note = if let Some(n) = placed {
+        Some(format!("[oximux: {n} file{} placed in the worktree]", if n == 1 { "" } else { "s" }))
+    } else if done.timed_out {
         Some(format!("[oximux: stopped after {} s]", TIMEOUT.as_secs()))
     } else if done.truncated {
         Some(format!("[oximux: output cut at {} KiB; the command was stopped]", CAP / 1024))

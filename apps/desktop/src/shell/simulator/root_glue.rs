@@ -149,7 +149,8 @@ impl WorkspaceRoot {
         // Turned off in Settings is not the user closing it.
         let by_user = self.active_worktree.as_deref().filter(|_| super::panel::settings(cx).enabled);
         let closed = self.simulator.auto_open.visibility_changed(visible, by_user, rs.entity_id().as_u64());
-        let tell = closed.then(|| (self.toast_layer.clone(), cx.weak_entity()));
+        let first = closed.is_some_and(|worktree| cx.default_global::<super::auto_open::Told>().first_close(worktree));
+        let tell = first.then(|| (self.toast_layer.clone(), cx.weak_entity()));
         let (window_w, window_h) = (f32::from(window.viewport_size().width), f32::from(window.viewport_size().height));
         let bump = visible && !self.simulator.bumped;
         let restore = !visible && self.simulator.maximized;

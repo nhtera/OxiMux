@@ -38,6 +38,7 @@ mod checks;
 mod device_state;
 mod diagnostics;
 mod exec;
+mod exec_files;
 mod flow;
 pub(crate) use flow::{platform as flow_platform, screen_points};
 pub(crate) use diagnostics::clamp;

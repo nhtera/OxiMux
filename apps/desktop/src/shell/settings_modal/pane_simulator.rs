@@ -132,11 +132,11 @@ fn enable_entry(s: &SimulatorSettings, theme: Theme, cx: &mut Context<SettingsMo
 /// Switched off: say how to turn it back on, once per worktree per run.
 fn tell_switched_off(window: &mut Window, cx: &mut Context<SettingsModal>) {
     use crate::shell::chrome::toast::{ToastAction, ToastKind, toast_with_actions};
-    use crate::shell::simulator::auto_open::OffTold;
+    use crate::shell::simulator::auto_open::Told;
     let handle = window.window_handle();
     let root = crate::platform::window_registry::workspace_for_window(cx, handle.window_id());
     let worktree = root.and_then(|root| root.read(cx).active_worktree.clone());
-    if !cx.default_global::<OffTold>().first_for(worktree.as_deref()) {
+    if !cx.default_global::<Told>().first_off(worktree.as_deref()) {
         return;
     }
     let modal = cx.weak_entity();
@@ -149,7 +149,7 @@ fn tell_switched_off(window: &mut Window, cx: &mut Context<SettingsModal>) {
             });
         });
     });
-    let text = "Mobile Emulator hidden for this worktree. Turn it back on in Settings → Mobile Emulator.";
+    let text = "Mobile Emulator turned off. Turn it back on in Settings → Mobile Emulator.";
     toast_with_actions(cx, ToastKind::Info, text, vec![open]);
 }
 

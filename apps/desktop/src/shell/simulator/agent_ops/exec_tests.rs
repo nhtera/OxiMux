@@ -22,7 +22,7 @@ fn worktree() -> (tempfile::TempDir, PathBuf) {
 fn simctl_runs_only_the_allowlist() {
     let (_dir, w) = worktree();
     for ok in ["ui appearance dark", "listapps", "appinfo com.a.b", "terminate com.a.b", "openurl https://example.com/x", "status_bar override --time 9:41", "privacy grant photos com.a.b", "location set 10.7,106.7"] {
-        assert_eq!(check(Tool::Simctl, &args(ok), &w).unwrap(), args(ok), "{ok}");
+        assert_eq!(check(Tool::Simctl, &args(ok), &w).unwrap().argv, args(ok), "{ok}");
     }
     for removed in ["spawn sh", "io screenshot x.png", "addmedia a.png", "push com.a.b p.json", "keychain add-root-cert c.pem", "get_app_container com.a.b", "delete", "erase", "create x y", "clone x", "shutdown", "boot", "getenv HOME", "install App.app"] {
         assert!(bad(Tool::Simctl, removed, &w), "{removed}");
@@ -44,8 +44,8 @@ fn simctl_reaches_the_attached_device_only() {
 #[test]
 fn adb_refuses_its_global_options_and_device_wide_commands_anywhere() {
     let (_dir, w) = worktree();
-    for ok in ["shell input keyevent 3", "uninstall com.a.b", "logcat -b crash", "emu geo fix 106.7 10.7", "shell am start -a android.intent.action.VIEW"] {
-        assert_eq!(check(Tool::Adb, &args(ok), &w).unwrap(), args(ok), "{ok}");
+    for ok in ["shell input keyevent 3", "uninstall com.a.b", "logcat -b crash", "emu geo fix 106.7 10.7", "emu sms send 123 hi", "shell am start -a android.intent.action.VIEW"] {
+        assert_eq!(check(Tool::Adb, &args(ok), &w).unwrap().argv, args(ok), "{ok}");
     }
     for global in ["-s", "-t", "-d", "-e", "-H", "-P", "-L"] {
         assert!(bad(Tool::Adb, &format!("{global} X shell ls"), &w), "{global} first");
@@ -54,7 +54,7 @@ fn adb_refuses_its_global_options_and_device_wide_commands_anywhere() {
     for glued in ["-sR58M123 shell", "shell -sR58", "-t2 shell", "-Hhost shell", "-P5037 shell", "-Ltcp:1 shell", "--one-device R58 shell"] {
         assert!(bad(Tool::Adb, glued, &w), "{glued}");
     }
-    for refused in ["connect 10.0.0.2", "disconnect", "kill-server", "reboot", "root", "remount", "shell reboot", "shell su root", "devices", "forward tcp:1 tcp:2", "sync", "tcpip 5555", "start-server", "install-multiple a.apk"] {
+    for refused in ["shell -- ls", "push -- -x /sdcard/", "emu screenrecord start /tmp/x.webm", "emu avd snapshot save s", "emu kill", "emu", "connect 10.0.0.2", "disconnect", "kill-server", "reboot", "root", "remount", "shell reboot", "shell su root", "devices", "forward tcp:1 tcp:2", "sync", "tcpip 5555", "start-server", "install-multiple a.apk"] {
         assert!(bad(Tool::Adb, refused, &w), "{refused}");
     }
 }
@@ -65,12 +65,16 @@ fn adb_host_paths_stay_inside_the_worktree() {
     let apk = std::fs::canonicalize(w.join("build/app.apk")).unwrap();
     let apk = apk.to_string_lossy().into_owned();
     // Relative to the worktree, made absolute.
-    assert_eq!(check(Tool::Adb, &args("install -r build/app.apk"), &w).unwrap(), vec!["install".to_owned(), "-r".into(), apk.clone()]);
-    assert_eq!(check(Tool::Adb, &args("push build/app.apk /sdcard/"), &w).unwrap()[1], apk);
-    let pulled = check(Tool::Adb, &args("pull /sdcard/log.txt build/log.txt"), &w).unwrap();
+    let install = check(Tool::Adb, &args("install -r build/app.apk"), &w).unwrap();
+    assert_eq!((install.argv, install.reads, install.writes), (vec!["install".to_owned(), "-r".into(), apk.clone()], vec![2], None));
+    let push = check(Tool::Adb, &args("push build/app.apk /sdcard/"), &w).unwrap();
+    assert_eq!((push.argv[1].as_str(), push.reads), (apk.as_str(), vec![1]));
+    let pull = check(Tool::Adb, &args("pull /sdcard/a /sdcard/b build"), &w).unwrap();
+    assert_eq!((pull.reads, pull.writes), (vec![], Some((3, 2))), "two device paths, written at word 3");
+    let pulled = check(Tool::Adb, &args("pull /sdcard/log.txt build/log.txt"), &w).unwrap().argv;
     assert!(pulled[2].ends_with("build/log.txt") && Path::new(&pulled[2]).is_absolute(), "{pulled:?}");
     assert_eq!(pulled[1], "/sdcard/log.txt", "the device side is the device's");
-    let into_root = check(Tool::Adb, &args("pull /sdcard/x build/.."), &w).unwrap();
+    let into_root = check(Tool::Adb, &args("pull /sdcard/x build/.."), &w).unwrap().argv;
     assert_eq!(Path::new(&into_root[2]), std::fs::canonicalize(&w).unwrap(), "into the worktree's own folder");
     // Out of it, by `..`, an absolute path, a home path, or a symlink.
     let secret = dir.path().join("secret.txt");
@@ -85,6 +89,13 @@ fn adb_host_paths_stay_inside_the_worktree() {
         "pull /sdcard/x /tmp/out.txt".to_owned(),
         "pull /sdcard/x build/../../out.txt".to_owned(),
         "install missing.apk".to_owned(),
+        // adb names what it writes after the device path's last word.
+        "pull /sdcard/x/y/.. build".to_owned(),
+        "pull /sdcard/./x build".to_owned(),
+        // Never git's folder, in any case: a hook or config there runs code.
+        "pull /sdcard/x .git/hooks/pre-commit".to_owned(),
+        "pull /sdcard/x .GIT/config".to_owned(),
+        "push .git/config /sdcard/".to_owned(),
     ] {
         assert!(bad(Tool::Adb, &escape, &w), "{escape}");
     }
@@ -112,12 +123,100 @@ fn the_question_shows_every_word_and_nothing_too_long() {
 
 #[test]
 fn a_stopped_command_says_why_and_its_output_is_scrubbed() {
-    let timed = output(runner::Bounded { status: None, stdout: b"partial".to_vec(), stderr: b"warn".to_vec(), truncated: false, timed_out: true });
+    let timed = output((runner::Bounded { status: None, stdout: b"partial".to_vec(), stderr: b"warn".to_vec(), truncated: false, timed_out: true }, None));
     assert_eq!((timed.status, timed.stdout.as_str()), (None, "partial"));
     assert_eq!(timed.stderr, "warn\n[oximux: stopped after 30 s]");
-    let cut = output(runner::Bounded { status: None, truncated: true, ..Default::default() });
+    let cut = output((runner::Bounded { status: None, truncated: true, ..Default::default() }, None));
     assert!(cut.truncated && cut.stderr.contains("cut at 64 KiB"));
     let key = "sk-ant-abc123XYZ";
-    let scrubbed = output(runner::Bounded { status: Some(0), stdout: format!("token {key}").into_bytes(), ..Default::default() });
+    let scrubbed = output((runner::Bounded { status: Some(0), stdout: format!("token {key}").into_bytes(), ..Default::default() }, None));
     assert!(!scrubbed.stdout.contains(key), "a secret-shaped value is scrubbed");
 }
+
+#[test]
+fn not_there_and_not_inside_read_the_same() {
+    let (dir, w) = worktree();
+    let say = |words: &str| match check(Tool::Adb, &args(words), &w) {
+        Err(SimErrorWire::BadInput(why)) => why.replace(words.split(' ').nth(1).unwrap(), "P"),
+        other => panic!("{other:?}"),
+    };
+    let outside = format!("install {}", dir.path().join("secret.txt").display());
+    assert_eq!(say(&outside), say("install /nonexistent/x.apk"), "nothing said about files elsewhere");
+}
+
+/// An approved transfer through a stand-in adb (a script): what it reads is
+/// a private copy of the approved file, and a pull lands in the worktree only.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_transfer_goes_through_a_private_folder() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (dir, w) = worktree();
+    let adb = dir.path().join("adb");
+    // `-s S push|pull …`: push prints the file adb was given; pull writes a
+    // folder with a file into the folder it was given.
+    std::fs::write(&adb, "#!/bin/sh\ncase $3 in push) cat \"$4\"; echo \" $4\";; pull) mkdir \"$5/x\" && printf hi > \"$5/x/f.txt\" && chmod 755 \"$5/x/f.txt\";; esac\n").unwrap();
+    std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let adb = adb.to_str().unwrap();
+    let prefix = |c: &Checked| [vec!["-s".to_owned(), "S".into()], c.argv.clone()].concat();
+
+    let push = check(Tool::Adb, &args("push build/app.apk /sdcard/"), &w).unwrap();
+    let (done, placed) = transfer(adb, prefix(&push), 2, &push).unwrap();
+    let said = String::from_utf8_lossy(&done.stdout).into_owned();
+    assert!(said.starts_with("apk ") && !said.contains("/w/build/"), "a copy, not the worktree file: {said}");
+    assert_eq!(placed, None);
+
+    std::fs::create_dir(w.join("out")).unwrap();
+    let pull = check(Tool::Adb, &args("pull /sdcard/x out"), &w).unwrap();
+    let (done, placed) = transfer(adb, prefix(&pull), 2, &pull).unwrap();
+    assert_eq!((done.status, placed), (Some(0), Some(1)));
+    let file = w.join("out/x/f.txt");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o644, "never executable");
+}
+
+/// The worktree changed between the question and the answer: a symlink now
+/// stands where the approved file or folder was. Nothing outside is read or
+/// written.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_symlink_swapped_in_after_the_question_is_refused() {
+    let (dir, w) = worktree();
+    let root = std::fs::canonicalize(&w).unwrap();
+    let outside = dir.path().join("secret.txt");
+    // Read: the approved file is now a link out.
+    let apk = root.join("build/app.apk");
+    let into = tempfile::tempdir().unwrap();
+    std::fs::remove_file(&apk).unwrap();
+    std::os::unix::fs::symlink(&outside, &apk).unwrap();
+    assert!(exec_files::stage_inputs(&root, std::slice::from_ref(&apk), into.path()).is_err(), "a final link");
+    std::fs::remove_file(&apk).unwrap();
+    std::fs::remove_dir(root.join("build")).unwrap();
+    std::os::unix::fs::symlink(dir.path(), root.join("build")).unwrap();
+    std::fs::write(dir.path().join("app.apk"), b"elsewhere").unwrap();
+    assert!(exec_files::stage_inputs(&root, &[apk], into.path()).is_err(), "a folder link");
+    // Write: the approved folder is now a link out, and so is a file.
+    let pulled = tempfile::tempdir().unwrap();
+    std::fs::create_dir(pulled.path().join("x")).unwrap();
+    std::fs::write(pulled.path().join("x/secret.txt"), b"overwritten").unwrap();
+    std::os::unix::fs::symlink(dir.path(), root.join("x")).unwrap();
+    assert!(exec_files::place_pulled(&root, pulled.path(), &root, 1).is_err());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"x", "the file outside is untouched");
+    std::fs::remove_file(root.join("x")).unwrap();
+    std::fs::create_dir(root.join("x")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("x/secret.txt")).unwrap();
+    assert!(exec_files::place_pulled(&root, pulled.path(), &root, 1).is_err());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"x", "never written through a link");
+    // A pulled tree with git's folder inside it is not placed.
+    let git = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(git.path().join("repo/.Git")).unwrap();
+    std::fs::write(git.path().join("repo/.Git/config"), b"[core]").unwrap();
+    assert!(exec_files::place_pulled(&root, git.path(), &root, 1).is_err());
+    assert!(!root.join("repo/.Git/config").exists());
+}
+
+#[test]
+fn a_pull_says_how_many_files_it_placed() {
+    let placed = output((runner::Bounded { status: Some(0), ..Default::default() }, Some(2)));
+    assert_eq!(placed.stderr, "[oximux: 2 files placed in the worktree]");
+}
+
