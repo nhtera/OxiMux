@@ -939,6 +939,59 @@ Run a raw simctl (iOS simulator) or adb (Android) command on the attached device
 | --- | --- | --- |
 | `<ARGV>` | yes | The command after `simctl` (iOS simulator) or `adb` (Android), after `--`, without the device: OxiMux adds the attached one |
 
+#### `oximux sim net`
+
+Shape an Android device's network: an emulator's speed, or offline and online (a real phone is asked every time). An iOS simulator shares the Mac's network and is never shaped
+
+_No arguments._
+
+##### `oximux sim net speed`
+
+An Android emulator's network speed: gsm, hscsd, gprs, edge, umts, hsdpa, lte, evdo, full, or kbit/s. The emulator shapes only mobile data, so a speed below full turns its Wi-Fi off (full turns it on)
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<SPEED>` | yes |  |
+
+##### `oximux sim net offline`
+
+Turn off the device's Wi-Fi and mobile data (Android). `net online` turns them back on
+
+_No arguments._
+
+##### `oximux sim net online`
+
+Turn the device's Wi-Fi and mobile data back on (Android)
+
+_No arguments._
+
+#### `oximux sim rn`
+
+Look into the React Native app on the device through Metro: its requests, or a CPU profile
+
+_No arguments._
+
+##### `oximux sim rn network`
+
+The React Native app's HTTP requests while it runs for a few seconds: method, status, time, size and URL (React Native 0.83 or later, in a debug build served by Metro on port 8081–8089)
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--seconds` | yes | How long to watch (1–60) |
+| `--grep` | yes | Only requests whose URL contains this |
+| `--bodies` | no | Also each request's headers and text bodies (at most 4 KiB each); secrets in them are redacted |
+| `--app` | yes | The app's bundle id or package, when several are connected to Metro |
+
+##### `oximux sim rn profile`
+
+Where the app's JavaScript spends its time: a CPU profile for a few seconds, its functions by self time
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--seconds` | yes | How long to profile (1–60) |
+| `--top` | yes | How many functions to list (1–100) |
+| `--app` | yes | The app's bundle id or package, when several are connected to Metro |
+
 ### `oximux serve`
 
 Run this machine as a headless OxiMux host.

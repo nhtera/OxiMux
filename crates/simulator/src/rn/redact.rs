@@ -16,9 +16,31 @@ pub fn header(name: &str, value: &str) -> String {
     if secret {
         return REDACTED.into();
     }
-    // `Location`, `Referer`, `Link`, …: a URL's query carries secrets too.
-    let value = if value.starts_with("http://") || value.starts_with("https://") { url(value) } else { value.to_owned() };
-    cut(&value, MAX_HEADER_VALUE)
+    // `Location`, `Referer`, `Link: <…>; rel=…`: a URL's query carries
+    // secrets too, whatever its scheme, relative or not.
+    cut(&urls_in(value), MAX_HEADER_VALUE)
+}
+
+/// `text` with every URL in it redacted ([`url`]): a word (between spaces,
+/// `<>`, quotes, `;` and `,`) with a scheme (`://`), or a `?` query.
+pub fn urls_in(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let is_url = word.contains("://") || (word.contains('?') && word.contains('='));
+        out.push_str(&if is_url { url(word) } else { std::mem::take(word) });
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | ';' | ',') {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 /// `url` with its userinfo and every query value redacted (keys kept).
@@ -88,8 +110,8 @@ fn redact_json(value: &mut serde_json::Value) {
                     redact_json(&mut inner);
                     *text = inner.to_string();
                 }
-            } else if (trimmed.starts_with("http://") || trimmed.starts_with("https://")) && !trimmed.contains(char::is_whitespace) {
-                *text = url(trimmed);
+            } else {
+                *text = urls_in(text);
             }
         }
         serde_json::Value::Object(map) => {
@@ -129,6 +151,13 @@ mod tests {
         }
         assert_eq!(header("Content-Type", "application/json"), "application/json");
         assert_eq!(header("Location", "https://app.example/cb?state=s1&email=a@b.co"), "https://app.example/cb?state=[redacted]&email=[redacted]");
+        assert_eq!(header("Location", "/reset?code=abcdef"), "/reset?code=[redacted]", "relative");
+        assert_eq!(
+            header("Link", r#"<https://a.test/reset?code=abcdef>; rel="next", <https://a.test/p?page=2>; rel="prev""#),
+            r#"<https://a.test/reset?code=[redacted]>; rel="next", <https://a.test/p?page=[redacted]>; rel="prev""#
+        );
+        assert_eq!(header("Location", "wss://a.test/live?token=T"), "wss://a.test/live?token=[redacted]");
+        assert_eq!(header("Accept", "text/html,*/*;q=0.8"), "text/html,*/*;q=0.8", "no URL, nothing changed");
         let long = header("Accept", &"x".repeat(500));
         assert!(long.len() <= MAX_HEADER_VALUE + '…'.len_utf8() && long.ends_with('…'));
     }
@@ -153,6 +182,8 @@ mod tests {
         let echo = body(r#"{"data":"{\"password\":\"P\",\"note\":\"hi\"}","url":"https://a.b/x?token=Q","args":{"user":"u"}}"#);
         assert!(!echo.contains("\\\"P\\\"") && !echo.contains("=Q"), "{echo}");
         assert!(echo.contains("hi") && echo.contains("token=[redacted]"), "{echo}");
+        let said = body(r#"{"next":"go to ws://a.test/s?ticket=K now","n":"plain"}"#);
+        assert!(said.contains("ticket=[redacted] now") && said.contains("plain"), "{said}");
         assert_eq!(body("plain text, not a form"), "plain text, not a form");
     }
 }

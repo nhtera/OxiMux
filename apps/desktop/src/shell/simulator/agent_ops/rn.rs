@@ -266,7 +266,7 @@ fn scrubbed(wire: SimRnWire) -> SimRnWire {
             ..n
         }),
         SimRnWire::Profile(p) => {
-            SimRnWire::Profile(SimRnProfileWire { functions: p.functions.into_iter().map(|f| SimRnFunctionWire { name: s(f.name), ..f }).collect(), ..p })
+            SimRnWire::Profile(SimRnProfileWire { functions: p.functions.into_iter().map(|f| SimRnFunctionWire { name: s(f.name), url: s(f.url), ..f }).collect(), ..p })
         }
     }
 }
