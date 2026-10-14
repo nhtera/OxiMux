@@ -47,7 +47,9 @@ impl StateSet {
     pub const PUSH: Self = Self(1 << 3);
     pub const STATUS_BAR: Self = Self(1 << 4);
     pub const ERASE: Self = Self(1 << 5);
-    pub const ALL: Self = Self(0b11_1111);
+    /// `sim net`: an emulator's speed, and offline/online (a phone: only those).
+    pub const NETWORK: Self = Self(1 << 6);
+    pub const ALL: Self = Self(0b111_1111);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -141,7 +143,8 @@ impl DeviceCaps {
     /// What `id` can do now; `runner`: a real iPhone's control runner is up.
     pub fn for_session(id: &DeviceId, runner: bool) -> Self {
         match id.source() {
-            Source::Simctl => Self::ALL,
+            // A simulator shares the Mac's network: never shaped.
+            Source::Simctl => Self { state: StateSet::ALL.without(StateSet::NETWORK), ..Self::ALL },
             // A phone is the user's own: OxiMux never rotates (it follows
             // the phone) or shuts it down.
             // Nor fakes its location (that needs an app) or erases it; FCM,
@@ -150,7 +153,7 @@ impl DeviceCaps {
                 buttons: ANDROID_BUTTONS,
                 rotate: false,
                 shutdown: false,
-                state: StateSet::APPEARANCE.union(StateSet::PRIVACY).union(StateSet::STATUS_BAR),
+                state: StateSet::APPEARANCE.union(StateSet::PRIVACY).union(StateSet::STATUS_BAR).union(StateSet::NETWORK),
                 ..Self::ALL
             },
             Source::Adb => Self { buttons: ANDROID_BUTTONS, state: StateSet::ALL.without(StateSet::PUSH), ..Self::ALL },
@@ -206,11 +209,12 @@ mod tests {
 
     #[test]
     fn device_state_by_class() {
-        assert_eq!(DeviceCaps::for_id(&id("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3")).state, StateSet::ALL);
+        let sim = DeviceCaps::for_id(&id("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3")).state;
+        assert_eq!(sim, StateSet::ALL.without(StateSet::NETWORK), "a simulator shares the Mac's network");
         let avd = DeviceCaps::for_id(&id("avd:Pixel")).state;
-        assert!(avd.contains(StateSet::LOCATION.union(StateSet::ERASE)) && !avd.contains(StateSet::PUSH));
+        assert!(avd.contains(StateSet::LOCATION.union(StateSet::ERASE).union(StateSet::NETWORK)) && !avd.contains(StateSet::PUSH));
         let phone = DeviceCaps::for_id(&id("adb:R58")).state;
-        assert!(phone.contains(StateSet::APPEARANCE.union(StateSet::PRIVACY).union(StateSet::STATUS_BAR)));
+        assert!(phone.contains(StateSet::APPEARANCE.union(StateSet::PRIVACY).union(StateSet::STATUS_BAR).union(StateSet::NETWORK)));
         assert!(!phone.contains(StateSet::LOCATION) && !phone.contains(StateSet::ERASE) && !phone.contains(StateSet::PUSH));
         assert_eq!(DeviceCaps::for_session(&id("iosdev:X"), true).state, StateSet::NONE, "an iPhone, even controlled");
     }

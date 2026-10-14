@@ -31,6 +31,7 @@ pub mod simulator;
 mod simulator_diag;
 mod simulator_exec;
 mod simulator_flow;
+mod simulator_rn;
 mod simulator_state;
 mod simulator_verify;
 #[cfg(any(test, feature = "testing"))]

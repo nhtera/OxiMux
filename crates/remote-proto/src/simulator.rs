@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::simulator_exec::{SimExecOutputWire, SimExecWire};
+pub use crate::simulator_rn::{SimRnCmdWire, SimRnFunctionWire, SimRnNetworkWire, SimRnProfileWire, SimRnRequestWire, SimRnWire};
 pub use crate::simulator_diag::{SimCrashListWire, SimCrashWire, SimCrashesWire, SimLogLevelWire, SimLogsWire};
 pub use crate::simulator_flow::{FLOW_HEADER, SimFlowCmdWire, SimFlowWire, SimSelectorWire, render_step, words};
 /// The flow file's pieces (header, numbers, button names) for recorders
@@ -124,6 +125,10 @@ pub enum SimCmdWire {
     /// A raw `simctl`/`adb` command on the attached device, when the user
     /// allowed exec and approves this one: see [`SimExecWire`].
     Exec(SimExecWire),
+    // v32: React Native.
+    /// A look into the React Native app on the attached device: see
+    /// [`SimRnCmdWire`].
+    Rn(SimRnCmdWire),
 }
 
 impl SimCmdWire {
@@ -203,6 +208,8 @@ pub enum SimReplyWire {
     Flow(SimFlowWire),
     // v31: exec.
     ExecOutput(SimExecOutputWire),
+    // v32: React Native.
+    Rn(SimRnWire),
 }
 
 /// One simulator device.

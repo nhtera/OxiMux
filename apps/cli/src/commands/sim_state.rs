@@ -1,13 +1,14 @@
-//! `oximux sim`'s device-state verbs (v28): the request each sends, the time
-//! the host may take, and what to say once done.
+//! `oximux sim`'s device-state verbs (v28; `net` served from v32): the
+//! request each sends, the time the host may take, and what to say once
+//! done.
 
 use std::path::Path;
 use std::time::Duration;
 
-use oximux_remote_proto::simulator::{SimCmdWire, SimLocationWire, SimPrivacyActionWire, SimStateCmdWire};
+use oximux_remote_proto::simulator::{SimCmdWire, SimLocationWire, SimNetWire, SimPrivacyActionWire, SimStateCmdWire};
 
 use super::sim::{APP, usage};
-use crate::cli::{AppearanceArg, LocationCommand, SimCommand, StatusBarArg};
+use crate::cli::{AppearanceArg, LocationCommand, NetCommand, SimCommand, StatusBarArg};
 use crate::cli_sim_state::PrivacyActionArg;
 use crate::output::Failure;
 
@@ -57,6 +58,26 @@ pub(super) fn request(command: &SimCommand, cwd: &Path) -> Option<Result<(SimCmd
             state(SimStateCmdWire::StatusBar { clean }, APP, if clean { "status bar cleaned (9:41)" } else { "status bar restored" }.into())
         }
         SimCommand::Erase { force } => state(SimStateCmdWire::Erase { force: *force }, ERASE, "erased; booting again".into()),
+        SimCommand::Net(NetCommand::Speed { speed }) => {
+            let said = if speed.trim().eq_ignore_ascii_case("full") {
+                "network speed set to full; Wi-Fi is on again".to_owned()
+            } else {
+                // The emulator shapes only mobile data.
+                format!("network speed set to {speed}; Wi-Fi is off so the app's traffic is shaped (undo: oximux sim net speed full)")
+            };
+            state(SimStateCmdWire::Net(SimNetWire::Speed(speed.clone())), APP, said)
+        }
+        // The way back, said every time.
+        SimCommand::Net(NetCommand::Offline) => {
+            state(SimStateCmdWire::Net(SimNetWire::Offline), APP, "offline: Wi-Fi and mobile data are off (undo: oximux sim net online)".into())
+        }
+        // On an emulator Wi-Fi is not shaped: a speed set earlier now
+        // applies only to mobile data.
+        SimCommand::Net(NetCommand::Online) => state(
+            SimStateCmdWire::Net(SimNetWire::Online),
+            APP,
+            "online: Wi-Fi and mobile data are on (an emulator's Wi-Fi is never slowed: `net speed` again to shape it)".into(),
+        ),
         _ => return None,
     })
 }

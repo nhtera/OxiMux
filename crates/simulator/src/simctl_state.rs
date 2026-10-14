@@ -66,6 +66,7 @@ pub fn argv(udid: &SimUdid, change: &StateChange) -> std::result::Result<Vec<Str
             words
         }
         StateChange::StatusBar { clean: false } => vec!["status_bar".into(), u.into(), "clear".into()],
+        StateChange::Net(_) => return Err(Reject::Unsupported(crate::state::IOS_NET_REFUSAL.into())),
     };
     Ok(std::iter::once("simctl".to_owned()).chain(words).collect())
 }

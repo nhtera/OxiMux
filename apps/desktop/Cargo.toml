@@ -85,6 +85,9 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+# `sim rn`: the React Native debugger session (see `agent_ops/rn_cdp.rs`).
+tokio-websockets = { workspace = true }
+http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
@@ -290,5 +293,7 @@ rqrr = "0.9"
 gpui = { workspace = true, features = ["test-support"] }
 gpui_macros = { workspace = true }
 tempfile = "3"
+# `agent_ops/rn_cdp.rs`'s tests stand up a debugger to talk to.
+tokio-websockets = { workspace = true, features = ["server"] }
 # The relay lifecycle's tests drive a real daemon booted in-process.
 oximux-relay = { workspace = true }

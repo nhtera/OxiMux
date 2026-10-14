@@ -149,7 +149,9 @@ fn redact_secret_params(text: &mut String) {
             None => bytes[at..].iter().take_while(|b| !value_end(b)).count(),
         };
         let (name, value) = (&text[start..name_end], &text[at..end]);
-        if start < name_end && names_a_secret(name) && value != REDACTED && looks_secret(name, value) {
+        // Already redacted (`[redacted]` itself ends a value at its `]`).
+        let done = text[at..].starts_with(REDACTED);
+        if start < name_end && names_a_secret(name) && !done && looks_secret(name, value) {
             text.replace_range(at..end, REDACTED);
             from = at + REDACTED.len();
         } else {
@@ -252,6 +254,8 @@ mod tests {
 
     #[test]
     fn a_secret_parameter_keeps_its_name_and_loses_its_value() {
+        // Already redacted (by the caller): left as it is.
+        assert_eq!(scrub_text("https://a.b/x?user=[redacted]&token=[redacted]"), "https://a.b/x?user=[redacted]&token=[redacted]");
         assert_eq!(
             scrub_text("GET https://api.example.com/cb?code=4/0AX8f2kQ&state=ok&access_token=ya29.a0AfB_byC HTTP/1.1"),
             "GET https://api.example.com/cb?code=[redacted]&state=ok&access_token=[redacted] HTTP/1.1"

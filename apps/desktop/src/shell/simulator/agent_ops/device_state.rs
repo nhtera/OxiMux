@@ -1,5 +1,5 @@
 //! The device-state verbs (`sim location`, `appearance`, `privacy`, `push`,
-//! `status-bar`, `erase`), once consent for the device is settled.
+//! `status-bar`, `erase`, `net`), once consent for the device is settled.
 //!
 //! Everything about a request is checked before the user is asked: the
 //! device class can do it (an emulator takes no push, a real iPhone none of
@@ -12,23 +12,27 @@
 use std::time::Duration;
 
 use gpui::{AsyncApp, Entity};
-use oximux_remote_proto::simulator::{SimErrorWire, SimLocationWire, SimPrivacyActionWire, SimReplyWire, SimStateCmdWire};
+use oximux_remote_proto::simulator::{SimErrorWire, SimLocationWire, SimNetWire, SimPrivacyActionWire, SimReplyWire, SimStateCmdWire};
 use oximux_simulator::caps::{self, StateSet};
-use oximux_simulator::state::{PrivacyAction, Reject, Service, StateChange};
-use oximux_simulator::{DeviceId, Source, android, simctl_state};
+use oximux_simulator::state::{IOS_NET_REFUSAL, NetChange, PrivacyAction, Reject, Service, StateChange};
+use oximux_simulator::{DeviceId, Platform, Source, android, simctl_state};
 
 use super::Target;
 use super::verbs::{Out, live_session};
 use crate::shell::simulator::hub::{AskKind, PerCallAnswer, SimulatorHub};
 
 pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str, cmd: SimStateCmdWire, target: &Target, cx: &mut AsyncApp) -> Out {
+    // Why, rather than "not available": the obvious fix would slow the Mac.
+    if matches!(cmd, SimStateCmdWire::Net(_)) && udid.platform() != Platform::Android {
+        let why = if udid.is_physical() { "a real iPhone's network is not shaped from here; throttle inside your app" } else { IOS_NET_REFUSAL };
+        return Err(SimErrorWire::Refused(why.into()));
+    }
     if let Some((need, what)) = needs(&cmd)
         && !hub.read_with(cx, |hub, _| hub.caps(udid)).state.contains(need)
     {
         return Err(SimErrorWire::Refused(caps::refuse(what, udid)));
     }
     match cmd {
-        SimStateCmdWire::Net(_) => Err(SimErrorWire::Refused("net: not available on this OxiMux yet".into())),
         SimStateCmdWire::Erase { force } => erase(hub, udid, name, force, target, cx).await,
         other => {
             let change = change_of(other)?;
@@ -40,7 +44,10 @@ pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str,
             };
             // Woken (it may be parked or shut down): an Android device's
             // serial is only known while it streams.
-            live_session(hub, udid, cx).await?;
+            let session = live_session(hub, udid, cx).await?;
+            if let Some(android) = session.android() {
+                android::net::check_transport(android.serial(), &change).map_err(rejected)?;
+            }
             if let Some(kind) = ask {
                 confirm(hub, udid, name, kind, target, cx).await?;
             }
@@ -59,8 +66,7 @@ fn needs(cmd: &SimStateCmdWire) -> Option<(StateSet, &'static str)> {
         SimStateCmdWire::Push { .. } => (StateSet::PUSH, "A push notification"),
         SimStateCmdWire::StatusBar { .. } => (StateSet::STATUS_BAR, "Overriding the status bar"),
         SimStateCmdWire::Erase { .. } => (StateSet::ERASE, "Erasing"),
-        // Refused as a whole until it is served.
-        SimStateCmdWire::Net(_) => return None,
+        SimStateCmdWire::Net(_) => (StateSet::NETWORK, "Shaping the network"),
     })
 }
 
@@ -81,7 +87,12 @@ fn change_of(cmd: SimStateCmdWire) -> Result<StateChange, SimErrorWire> {
         },
         SimStateCmdWire::Push { app, payload } => StateChange::Push { app, payload },
         SimStateCmdWire::StatusBar { clean } => StateChange::StatusBar { clean },
-        SimStateCmdWire::Erase { .. } | SimStateCmdWire::Net(_) => return Err(SimErrorWire::BadInput("not a state change".into())),
+        SimStateCmdWire::Net(net) => StateChange::Net(match net {
+            SimNetWire::Speed(speed) => NetChange::Speed(speed),
+            SimNetWire::Offline => NetChange::Offline,
+            SimNetWire::Online => NetChange::Online,
+        }),
+        SimStateCmdWire::Erase { .. } => return Err(SimErrorWire::BadInput("not a state change".into())),
     })
 }
 
@@ -117,6 +128,10 @@ fn describe(change: &StateChange) -> String {
         StateChange::Push { app, .. } => format!("send a notification to {app}"),
         StateChange::StatusBar { clean: true } => "show a clean status bar".into(),
         StateChange::StatusBar { clean: false } => "restore the status bar".into(),
+        StateChange::Net(NetChange::Speed(speed)) => format!("set its network speed to {speed}"),
+        // Both radios: on a phone that is the user's own mobile data too.
+        StateChange::Net(NetChange::Offline) => "turn off its Wi-Fi and mobile data".into(),
+        StateChange::Net(NetChange::Online) => "turn its Wi-Fi and mobile data back on".into(),
     }
 }
 
@@ -178,9 +193,20 @@ mod tests {
     }
 
     #[test]
+    fn a_network_change_is_checked_per_platform() {
+        let avd = DeviceId("avd:Medium_Phone".into());
+        let speed = |s: &str| change_of(SimStateCmdWire::Net(SimNetWire::Speed(s.into()))).unwrap();
+        assert!(check(&avd, &speed("edge")).is_ok());
+        assert!(matches!(check(&avd, &speed("12;x")), Err(SimErrorWire::BadInput(_))));
+        assert!(matches!(check(&DeviceId("adb:R58".into()), &speed("edge")), Err(SimErrorWire::Refused(_))), "emulator only");
+        let sim = DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into());
+        assert!(matches!(check(&sim, &StateChange::Net(NetChange::Offline)), Err(SimErrorWire::Refused(why)) if why.contains("Mac's network")));
+    }
+
+    #[test]
     fn each_change_names_its_capability() {
         assert_eq!(needs(&SimStateCmdWire::Erase { force: false }).map(|n| n.0), Some(StateSet::ERASE));
-        assert_eq!(needs(&SimStateCmdWire::Net(oximux_remote_proto::simulator::SimNetWire::Offline)), None);
+        assert_eq!(needs(&SimStateCmdWire::Net(SimNetWire::Offline)).map(|n| n.0), Some(StateSet::NETWORK));
         assert_eq!(describe(&StateChange::Appearance { dark: true }), "switch to dark mode");
         let grant = StateChange::Privacy { action: PrivacyAction::Grant, service: Service::Camera, app: "com.a.b".into() };
         assert_eq!(describe(&grant), "grant camera for com.a.b");

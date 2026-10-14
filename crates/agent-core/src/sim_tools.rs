@@ -29,8 +29,9 @@ pub const CAPTURE_DIR: &str = "oximux-sim";
 /// The `oximux sim` verbs whose output is the screen's contents, or the
 /// device's log (which can carry anything an app printed). A run prints its
 /// steps' output (settle diffs, asserts), a flow its recorded steps (labels
-/// read off the screen).
-const CAPTURE_VERBS: [&str; 9] = ["screenshot", "ax", "wait", "assert", "logs", "crashes", "run", "flow", "exec"];
+/// read off the screen); `rn` an app's traffic and code, `net` its device's
+/// network state.
+const CAPTURE_VERBS: [&str; 11] = ["screenshot", "ax", "wait", "assert", "logs", "crashes", "run", "flow", "exec", "rn", "net"];
 
 /// Flags that make any `oximux sim` verb print the screen's elements (a
 /// settle's diff, `ax -i`'s list), wherever they stand in the command.
@@ -137,6 +138,9 @@ mod tests {
             json!({"command": ["oximux", "--json", "sim", "crashes"]}),
             json!({"command": "oximux sim run login.flow --settle"}),
             json!({"command": "oximux sim flow stop --out a.flow"}),
+            json!({"command": "oximux sim rn network --seconds 10 --bodies"}),
+            json!({"command": ["oximux", "sim", "rn", "profile", "--top", "10"]}),
+            json!({"command": "oximux sim net offline"}),
         ] {
             assert!(is_simulator_capture(&input), "{input}");
         }

@@ -1,6 +1,6 @@
 //! Device state on Android, through `adb`: location (an emulator's console),
-//! appearance, privacy (per package, per permission), and a clean status bar
-//! (System UI's demo mode).
+//! appearance, privacy (per package, per permission), a clean status bar
+//! (System UI's demo mode) and the network ([`super::net`]).
 //!
 //! `adb shell` joins its words for the device's `sh`, so every word here is a
 //! constant, a permission from the table in [`crate::state`], or a package
@@ -93,13 +93,14 @@ pub fn steps(target: &Target, change: &StateChange) -> std::result::Result<Vec<S
         }
         StateChange::StatusBar { clean: true } => CLEAN_STATUS_BAR.iter().map(|w| Step::Shell(owned(w))).collect(),
         StateChange::StatusBar { clean: false } => vec![Step::Shell(owned(&DEMO_EXIT))],
+        StateChange::Net(net) => super::net::steps(target, net)?,
     })
 }
 
 /// Make `change` on the device at `serial` (`target` decides emulator or
 /// phone). A refused change runs nothing.
 pub fn apply(adb: &Adb<'_>, serial: &str, target: &Target, change: &StateChange, timeout: Duration) -> Result<()> {
-    let steps = steps(target, change).map_err(|r| match r {
+    let steps = super::net::check_transport(serial, change).and_then(|()| steps(target, change)).map_err(|r| match r {
         Reject::BadInput(why) | Reject::Unsupported(why) => SimError::Parse { what: "device state".into(), detail: why },
     })?;
     // A reset applied once one revoke + clear pair did; a grant or revoke,

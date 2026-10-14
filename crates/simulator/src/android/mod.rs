@@ -17,6 +17,7 @@ pub mod avd;
 pub mod devices;
 pub mod input;
 pub mod keycode;
+pub mod net;
 pub mod scrcpy_control;
 pub mod scrcpy_server;
 pub mod scrcpy_video;

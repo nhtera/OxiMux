@@ -11,6 +11,7 @@ pub use crate::cli_sim::{AssertArgs, SettleArgs, TapArg, WaitArgs};
 pub use crate::cli_sim_diag::{CrashesArgs, LogsArgs};
 pub use crate::cli_sim_exec::ExecArgs;
 pub use crate::cli_sim_flow::{ExactArgs, FlowCommand, RunArgs};
+pub use crate::cli_sim_rn::{NetCommand, RnCommand};
 pub use crate::cli_sim_state::{AppearanceArg, LocationCommand, PrivacyArgs, PushArgs, StatusBarArg};
 
 /// Exit codes, stated once. `2` is what clap itself exits with on a usage
@@ -974,6 +975,15 @@ pub enum SimCommand {
     /// the user turns it on in Settings, asked every time, and limited to
     /// commands that touch only that device.
     Exec(ExecArgs),
+    /// Shape an Android device's network: an emulator's speed, or offline
+    /// and online (a real phone is asked every time). An iOS simulator
+    /// shares the Mac's network and is never shaped.
+    #[command(subcommand)]
+    Net(NetCommand),
+    /// Look into the React Native app on the device through Metro: its
+    /// requests, or a CPU profile.
+    #[command(subcommand)]
+    Rn(RnCommand),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

@@ -169,12 +169,17 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// device, off unless the user turns it on, asked every time. A v30 host
 /// cannot decode it: see [`SIMULATOR_EXEC_MIN_VERSION`].
 ///
+/// v32: appended **React Native** (`SimCmdWire::Rn`, `SimReplyWire::Rn` and
+/// the `simulator_rn` types): an app's requests and a CPU profile through
+/// its Metro debugger. `sim net` (on the wire since v28) is served from v32
+/// too. A v31 host cannot decode it: see [`SIMULATOR_RN_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -279,6 +284,11 @@ pub const SIMULATOR_FLOW_MIN_VERSION: u32 = 30;
 /// The oldest host that serves `sim exec`. Read by the **client** and gated
 /// on what the command asks for.
 pub const SIMULATOR_EXEC_MIN_VERSION: u32 = 31;
+
+/// The oldest host that serves `sim rn` and `sim net` (a v28–v31 host
+/// refuses `net`, though it decodes it). Read by the **client** and gated on
+/// what the command asks for.
+pub const SIMULATOR_RN_MIN_VERSION: u32 = 32;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the

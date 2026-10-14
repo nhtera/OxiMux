@@ -17,6 +17,7 @@ use oximux_simulator::session::StreamSession;
 
 const APP_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
+const MODEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `adb` and the serial of a streaming Android session.
 pub(super) struct Device {
@@ -43,6 +44,12 @@ impl Device {
 
     fn shell(&self, args: &[&str], timeout: Duration) -> Result<String, String> {
         Adb::new(&SystemRunner, &self.adb).shell(&self.serial, args, timeout).map_err(|e| e.to_string())
+    }
+
+    /// The device's model (`ro.product.model`), as React Native names it.
+    pub(super) fn model(&self) -> Option<String> {
+        let model = self.shell(&["getprop", "ro.product.model"], MODEL_TIMEOUT).ok()?;
+        Some(model.trim().to_owned()).filter(|m| !m.is_empty())
     }
 
     /// Start `package`'s launcher activity (restarting it first when asked).

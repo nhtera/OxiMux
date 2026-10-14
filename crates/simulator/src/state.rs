@@ -1,5 +1,5 @@
 //! Device-state changes, as data: what `sim location`, `appearance`,
-//! `privacy`, `push` and `status-bar` ask of a device, checked before any
+//! `privacy`, `push`, `status-bar` and `net` ask of a device, checked before any
 //! command line is built. [`simctl_state`](crate::simctl_state) and
 //! [`android::state`](crate::android::state) turn a change into argv; erase is
 //! the hub's (it shuts the device down and boots it again).
@@ -19,7 +19,24 @@ pub enum StateChange {
     /// `payload`: a checked JSON object with `aps` (see [`check_push`]).
     Push { app: String, payload: String },
     StatusBar { clean: bool },
+    /// Network shaping (Android only: see [`crate::android::net`]).
+    Net(NetChange),
 }
+
+/// What `sim net` asks of a device's network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NetChange {
+    /// A preset the emulator console knows
+    /// ([`crate::android::net::SPEED_PRESETS`]) or kbit/s.
+    Speed(String),
+    Offline,
+    Online,
+}
+
+/// Why a simulator's network is never shaped: one wording for the CLI and
+/// the agent.
+pub const IOS_NET_REFUSAL: &str = "the iOS Simulator shares the Mac's network, so throttling it (Network Link Conditioner or pfctl) \
+slows every app on the Mac. Use an Android emulator, or throttle inside your app";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivacyAction {
