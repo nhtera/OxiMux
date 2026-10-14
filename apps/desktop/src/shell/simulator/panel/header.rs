@@ -42,6 +42,7 @@ impl SimulatorPanel {
                     .child(title),
             )
             .child(div().flex_1())
+            .children(self.render_add_tile(cx))
             .child(self.render_layout_button())
             .child(
                 Button::new("sim-close")

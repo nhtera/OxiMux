@@ -363,6 +363,11 @@ impl SimulatorHub {
         .detach();
     }
 
+    /// Whether agents may control `udid` (the user allowed it).
+    pub fn agents_allowed(&self, udid: &DeviceId) -> bool {
+        self.agent.consent.is_approved(udid)
+    }
+
     /// Whether the badge shows for `udid`.
     pub fn agent_active(&self, udid: &DeviceId) -> bool {
         self.agent.is_active(udid, Instant::now())

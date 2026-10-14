@@ -44,6 +44,7 @@ mod consent;
 mod crash_row;
 mod device_menu;
 mod flow_rec;
+mod grid;
 mod pair_card;
 mod header;
 mod inspector;
@@ -64,12 +65,17 @@ const HIDE_DEBOUNCE: Duration = Duration::from_millis(500);
 pub struct SimulatorPanel {
     hub: Option<Entity<SimulatorHub>>,
     worktree: Option<PathBuf>,
+    /// `worktree` as the hub names it (canonical: `/tmp` is `/private/tmp`).
+    worktree_key: Option<PathBuf>,
     /// Sidebar open on this tab (pushed by the root).
     visible: bool,
     /// The window is on screen (not minimized, covered or on another Space).
     window_visible: bool,
     /// What the hub was last told for `worktree`.
     shown: bool,
+    /// This window's own viewer of the active worktree's device (one per
+    /// window: two windows on one worktree are two viewers).
+    own: oximux_simulator::viewers::ViewerId,
     _hide: Option<Task<()>>,
     _window_visibility: Option<Subscription>,
     /// The live screen, made on first stream (it needs a window).
@@ -108,6 +114,12 @@ pub struct SimulatorPanel {
     /// The picked element's crop is being taken (Send waits for it).
     cropping: bool,
     _screen_events: Option<Subscription>,
+    /// Other worktrees' devices in the grid (see `grid`).
+    tiles: Vec<grid::Tile>,
+    /// The grid's focused tile (`None`: the active worktree's).
+    focused: Option<oximux_simulator::viewers::ViewerId>,
+    /// The grid's measured width (its column count follows it).
+    grid_width: Rc<Cell<Option<f32>>>,
     /// Devices whose "still no picture" hint the user dismissed.
     recovery_dismissed: std::collections::HashSet<DeviceId>,
     /// The screen as the crash row came up, by device and crash id (sent
@@ -146,13 +158,18 @@ impl SimulatorPanel {
             if let (Some(hub), Some(worktree)) = (panel.hub.clone(), panel.worktree.clone())
                 && panel.shown
             {
-                hub.update(cx, |hub, cx| hub.set_visible(&worktree, false, cx));
+                let own = panel.own;
+                hub.update(cx, |hub, cx| hub.release_viewer(&worktree, own, cx));
             }
+            panel.release_tiles(cx);
         })
         .detach();
+        let own = oximux_simulator::viewers::ViewerId::Panel(hub.as_ref().map_or(0, |h| h.update(cx, |hub, _| hub.next_viewer())));
         Self {
             hub,
+            own,
             worktree: None,
+            worktree_key: None,
             visible: false,
             window_visible: true,
             shown: false,
@@ -179,6 +196,9 @@ impl SimulatorPanel {
             pick_seq: 0,
             cropping: false,
             _screen_events: None,
+            tiles: Vec::new(),
+            focused: None,
+            grid_width: Rc::default(),
             theme,
             density,
             typography,
@@ -198,6 +218,8 @@ impl SimulatorPanel {
                     self.attaching = false;
                     self.attach_error = None;
                 }
+                // A tile whose worktree lost its device goes.
+                self.prune_tiles(cx);
                 cx.notify();
             }
             HubEvent::Notice(udid, kind, text) => {
@@ -206,20 +228,21 @@ impl SimulatorPanel {
                 }
             }
             HubEvent::AttachFailed(path, why) => {
-                if self.worktree.as_ref() == Some(path) {
+                // The hub names a worktree canonically (`/private/tmp/…`).
+                if self.worktree.as_ref() == Some(path) || self.worktree_key.as_ref() == Some(path) {
                     self.attaching = false;
                     self.attach_error = Some(why.clone());
                     cx.notify();
+                } else if self.tiles.iter().any(|t| &t.worktree == path) {
+                    // A tile's Start: no attach error row of its own.
+                    cx.emit(PanelEvent::Notice(NoticeKind::Error, why.clone()));
                 }
             }
             HubEvent::Availability | HubEvent::Devices | HubEvent::Consent | HubEvent::PhysicalChanged | HubEvent::Pairing | HubEvent::Flow => {
                 cx.notify()
             }
-            HubEvent::AgentActivity(udid) => {
-                if self.device(cx).as_ref() == Some(udid) {
-                    cx.notify();
-                }
-            }
+            // The badge, over the phone or in a tile's header.
+            HubEvent::AgentActivity(_) => cx.notify(),
             // The phone outline follows the stream's size and orientation.
             HubEvent::Session(udid, SessionEvent::Size { .. } | SessionEvent::Orientation(_)) => {
                 if self.device(cx).as_ref() == Some(udid) {
@@ -244,27 +267,45 @@ impl SimulatorPanel {
             return;
         }
         let shown = self.visible && self.window_visible;
+        let key = worktree.as_deref().map(|w| oximux_simulator::registry::WorktreeKey::from_path(w).path().to_path_buf());
+        // Every viewer is added before any is released: a device shown on
+        // both sides of the switch never pauses (a blip that would reset an
+        // agent's settle). A tile of the new worktree hands its slot to the
+        // old one, and the new active device takes the focus.
+        let replaced = self.swap_into_tile(key.as_deref(), cx);
+        let (old, was_shown) = (self.worktree.take(), self.shown);
+        // Another spelling of the same worktree (`/tmp` vs `/private/tmp`):
+        // the viewer just set is the one a release would drop.
+        let same = self.worktree_key == key && shown;
+        self.worktree_key = key;
+        self.worktree = worktree;
+        self.shown = shown;
+        self._hide = None;
         if let Some(hub) = self.hub.clone() {
-            // Show the new one first: two worktrees on one device then never
-            // see a pause-resume blip.
+            let (own, viewer) = (self.own, self.panel_viewer());
+            let new = self.worktree.clone();
             hub.update(cx, |hub, cx| {
-                if let Some(new) = worktree.as_ref().filter(|_| shown) {
-                    hub.set_visible(new, true, cx);
+                if let Some(new) = new.as_ref().filter(|_| shown) {
+                    hub.set_viewer(new, own, viewer, cx);
                 }
-                if let Some(old) = self.worktree.as_ref().filter(|_| self.shown) {
-                    hub.set_visible(old, false, cx);
+                if let Some(old) = old.as_ref().filter(|_| was_shown && !same) {
+                    hub.release_viewer(old, own, cx);
+                }
+                if let Some((worktree, tile)) = replaced {
+                    hub.release_viewer(&worktree, tile, cx);
                 }
             });
         }
-        self.shown = shown;
-        self._hide = None;
-        self.worktree = worktree;
+        // A hide still debouncing was cancelled: every tile follows `shown`.
+        self.sync_viewers(cx);
         // Both were about the old worktree's device.
         self.confirm_shutdown = false;
         self.device_prompt = None;
         self.annotate = None;
         self.attaching = false;
         self.attach_error = None;
+        // The new active worktree's tile, if it had one, is the active one now.
+        self.prune_tiles(cx);
         cx.notify();
     }
 
@@ -309,9 +350,12 @@ impl SimulatorPanel {
     /// [`HIDE_DEBOUNCE`] when it cannot.
     fn push_shown(&mut self, cx: &mut Context<Self>) {
         let shown = self.visible && self.window_visible;
-        if !shown && let Some(screen) = self.screen.clone() {
+        if !shown {
             // Decoding stops at once; only the helper's pause is debounced.
-            screen.update(cx, |screen, cx| screen.hide(cx));
+            if let Some(screen) = self.screen.clone() {
+                screen.update(cx, |screen, cx| screen.hide(cx));
+            }
+            self.hide_tiles(cx);
         }
         if shown {
             self._hide = None;
@@ -334,9 +378,14 @@ impl SimulatorPanel {
             return;
         }
         self.shown = shown;
-        if let (Some(hub), Some(worktree)) = (self.hub.clone(), self.worktree.clone()) {
-            hub.update(cx, |hub, cx| hub.set_visible(&worktree, shown, cx));
+        if let (Some(hub), Some(worktree)) = (self.hub.clone(), self.worktree.clone())
+            && !shown
+        {
+            let own = self.own;
+            hub.update(cx, |hub, cx| hub.release_viewer(&worktree, own, cx));
         }
+        // Shown: the panel's viewer; either way, every tile's.
+        self.sync_viewers(cx);
     }
 
     /// Follow the window's own visibility; registered on first render, the
@@ -363,6 +412,9 @@ impl SimulatorPanel {
             self._screen_events = Some(cx.subscribe(&screen, |panel, _, event: &super::screen::ScreenEvent, cx| match event {
                 super::screen::ScreenEvent::Picked(picked) => panel.picked(picked.clone(), cx),
                 super::screen::ScreenEvent::Recorded(owner, step) => panel.record_owned(*owner, step.clone(), cx),
+                super::screen::ScreenEvent::Focus => panel.focus_tile(None, cx),
+                // The panel's own screen leaves its chords to the root.
+                super::screen::ScreenEvent::Command(_) => {}
             }));
             self.screen = Some(screen);
         }
@@ -492,6 +544,9 @@ impl SimulatorPanel {
     /// The screen's corner radius for the device shown, in the current
     /// layout (0 before the first measurement).
     pub(super) fn screen_radius(&self, cx: &App) -> f32 {
+        if self.has_grid() {
+            return 0.0; // tiles have no bezel
+        }
         self.area.get().and_then(|a| bezel::fit(a, &self.outline_device(cx))).map_or(0.0, |l| l.screen_radius)
     }
 

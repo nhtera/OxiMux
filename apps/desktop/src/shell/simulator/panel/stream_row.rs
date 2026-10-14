@@ -126,8 +126,9 @@ impl SimulatorPanel {
         if settings(cx).stream.encoding != encoding {
             self.persist_stream(cx, |s| s.stream.encoding = encoding);
         }
-        if let (Some(hub), Some(udid)) = (self.hub.clone(), self.device(cx)) {
-            hub.update(cx, |hub, cx| hub.set_stream_format(&udid, encoding.format(), cx));
+        if let Some(hub) = self.hub.clone() {
+            let devices = self.shown_devices(cx);
+            hub.update(cx, |hub, cx| devices.iter().for_each(|udid| hub.set_stream_format(udid, encoding.format(), cx)));
         }
         cx.notify();
     }
@@ -137,8 +138,9 @@ impl SimulatorPanel {
     fn update_stream(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut SimulatorSettings)) {
         let next = self.persist_stream(cx, change);
         let (scale, fps) = (f64::from(next.stream.effective_scale()), f64::from(next.stream.fps));
-        if let (Some(hub), Some(udid)) = (self.hub.clone(), self.device(cx)) {
-            hub.update(cx, |hub, cx| hub.configure_stream(&udid, scale, fps, cx));
+        if let Some(hub) = self.hub.clone() {
+            let devices = self.shown_devices(cx);
+            hub.update(cx, |hub, cx| devices.iter().for_each(|udid| hub.configure_stream(udid, scale, fps, cx)));
         }
         cx.notify();
     }

@@ -35,7 +35,7 @@ use oximux_simulator::session::{FrameData, StreamSession};
 #[cfg(target_os = "macos")]
 use oximux_simulator::video::vt_decoder::Picture;
 
-use super::hub::{HubEvent, SimulatorHub};
+use super::hub::{HubEvent, REDUCED_FPS, SimulatorHub};
 use super::panel::settings;
 
 mod decode;
@@ -54,6 +54,11 @@ pub(crate) enum ScreenEvent {
     /// The user's input while the panel records a flow (see `recording`).
     /// A step of the recording with this id.
     Recorded(u64, crate::shell::simulator::hub::PanelStep),
+    /// An unfocused grid tile was clicked: focus it (no touch was sent).
+    Focus,
+    /// A chord pressed while a grid tile has the keyboard: for that tile's
+    /// device (see [`Binding::local_commands`]).
+    Command(super::panel::SimCommand),
 }
 
 impl gpui::EventEmitter<ScreenEvent> for ScreenView {}
@@ -74,6 +79,22 @@ pub(crate) struct Binding {
     pub visible: bool,
     /// Corner radius of the screen inside the bezel, for the capture ring.
     pub radius: f32,
+    /// Input reaches the device (an unfocused grid tile only takes the
+    /// click that focuses it).
+    pub focused: bool,
+    /// ⌥ inspects elements here.
+    pub inspect: bool,
+    /// Paint at most [`REDUCED_FPS`] (an unfocused tile).
+    pub throttle: bool,
+    /// The simulator chords (⌘⇧H, ⌘L, ⌘←/→, ⌘S, ⌘R) are emitted as
+    /// [`ScreenEvent::Command`] for this screen's device (a grid tile)
+    /// instead of reaching the root, which acts on the active worktree's.
+    pub local_commands: bool,
+}
+
+impl Binding {
+    /// Off screen, nothing bound.
+    pub(crate) const NONE: Self = Self { device: None, visible: false, radius: 0.0, focused: true, inspect: true, throttle: false, local_commands: false };
 }
 
 pub struct ScreenView {
@@ -113,6 +134,10 @@ pub struct ScreenView {
     typography: Typography,
     _hub_events: Subscription,
     _activation: Subscription,
+    /// When the last frame was taken, and the wait for the next one while
+    /// throttled.
+    last_pump: Option<Instant>,
+    _throttle: Option<Task<()>>,
 }
 
 /// Which frame a paint showed: an image, or an Android picture by sequence.
@@ -164,7 +189,7 @@ impl ScreenView {
         });
         Self {
             hub,
-            binding: Binding { device: None, visible: false, radius: 0.0 },
+            binding: Binding::NONE,
             image: None,
             #[cfg(target_os = "macos")]
             picture: None,
@@ -188,6 +213,8 @@ impl ScreenView {
             typography,
             _hub_events: subscription,
             _activation: activation,
+            last_pump: None,
+            _throttle: None,
         }
     }
 
@@ -201,6 +228,12 @@ impl ScreenView {
         }
         let device_changed = binding.device != self.binding.device;
         let shown = binding.visible && !self.binding.visible;
+        if !binding.focused && self.binding.focused {
+            self.release_input(cx);
+        }
+        if !binding.inspect || !binding.focused {
+            self.disarm(cx);
+        }
         if device_changed {
             self.release_input(cx);
             // Another device's elements are not this one's.
@@ -252,11 +285,27 @@ impl ScreenView {
             self.behind = true;
             return;
         }
+        // An unfocused tile paints at most REDUCED_FPS: the newest frame,
+        // once the gap has passed (a still screen sends no later one).
+        let gap = Duration::from_secs_f64(1.0 / REDUCED_FPS);
+        if let Some(wait) = self.last_pump.filter(|_| self.binding.throttle).and_then(|t| gap.checked_sub(t.elapsed())) {
+            if self._throttle.is_none() {
+                self._throttle = Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    let _ = this.update_in(cx, |view, window, cx| {
+                        view._throttle = None;
+                        view.pump(window, cx);
+                    });
+                }));
+            }
+            return;
+        }
         let Some(session) = self.session(cx) else { return };
         let pid = session.pid();
         let seen = self.taken.filter(|(p, _)| *p == pid).map_or(0, |(_, seq)| seq);
         let Some((seq, frame)) = session.latest_frame(seen) else { return };
         self.taken = Some((pid, seq));
+        self.last_pump = Some(Instant::now());
         let frame = match frame {
             FrameData::Jpeg(frame) => frame,
             #[cfg(target_os = "macos")]
@@ -460,6 +509,9 @@ impl Render for ScreenView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_paste));
+        if self.binding.local_commands {
+            screen = keys::local_commands(screen, cx);
+        }
         #[cfg(target_os = "macos")]
         let picture = self.picture.as_ref().map(|p| p.buffer().clone());
         #[cfg(not(target_os = "macos"))]

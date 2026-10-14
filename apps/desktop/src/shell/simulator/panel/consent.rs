@@ -4,8 +4,9 @@
 //!
 //! The question is built only from what the app resolved itself (the device's
 //! name from `simctl`), never from anything the agent sent. It shows only in
-//! the panel of the worktree whose agent asked; other windows and worktrees
-//! hear about it through a toast (see `root_glue`). The badge is advisory:
+//! the panel of the worktree whose agent asked, or in a grid tile showing
+//! that worktree's device (see `grid`); other windows and worktrees hear
+//! about it through a toast (see `root_glue`). The badge is advisory:
 //! the user's own input keeps working while an agent drives.
 
 use gpui::{AnyElement, Context, IntoElement, ParentElement as _, Styled as _, div, px};
@@ -24,7 +25,12 @@ impl SimulatorPanel {
     /// one install an app on a real device, erase it, send it a push, or
     /// change a real device's settings.
     pub(super) fn render_consent_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (hub, worktree) = (self.hub.as_ref()?, self.worktree.as_ref()?);
+        self.render_consent_for(self.worktree.as_ref()?, cx)
+    }
+
+    /// The question `worktree`'s agent is waiting on, if any.
+    pub(super) fn render_consent_for(&self, worktree: &std::path::Path, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let hub = self.hub.as_ref()?;
         if let Some((id, device, kind)) = hub.read(cx).per_call_request(worktree) {
             return Some(self.render_per_call(id, &device, &kind, cx));
         }

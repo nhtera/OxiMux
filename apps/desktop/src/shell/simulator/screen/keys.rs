@@ -10,11 +10,12 @@
 
 use std::time::{Duration, Instant};
 
-use gpui::{App, Context, KeyBinding, KeyDownEvent, NoAction, Window};
+use gpui::{App, Context, InteractiveElement, KeyBinding, KeyDownEvent, NoAction, Window};
 use oximux_simulator::keyboard::{self, KeyEvent};
 use oximux_simulator::protocol::{Command, KeyPhase};
 
-use super::{SIMULATOR_SCREEN_KEY_CONTEXT, ScreenView};
+use super::{SIMULATOR_SCREEN_KEY_CONTEXT, ScreenEvent, ScreenView};
+use crate::shell::simulator::panel::SimCommand;
 use crate::actions::{
     DismissOverlay, SimHome, SimLock, SimRotateCcw, SimRotateCw, SimScreenshot, SimToggleRecord,
 };
@@ -47,6 +48,21 @@ pub fn register_screen_key_bindings(cx: &mut App) {
         KeyBinding::new("cmd-s", SimScreenshot, ctx),
         KeyBinding::new("cmd-r", SimToggleRecord, ctx),
     ]);
+}
+
+/// A grid tile's chords: handled here, so they never reach the root (which
+/// acts on the active worktree's device), and emitted for the panel to run
+/// on this tile's device.
+pub(super) fn local_commands<E: InteractiveElement>(el: E, cx: &mut Context<ScreenView>) -> E {
+    fn on<A: gpui::Action, E: InteractiveElement>(el: E, command: SimCommand, cx: &mut Context<ScreenView>) -> E {
+        el.on_action(cx.listener(move |_, _: &A, _window, cx| cx.emit(ScreenEvent::Command(command))))
+    }
+    let el = on::<SimHome, _>(el, SimCommand::Home, cx);
+    let el = on::<SimLock, _>(el, SimCommand::Lock, cx);
+    let el = on::<SimRotateCw, _>(el, SimCommand::RotateCw, cx);
+    let el = on::<SimRotateCcw, _>(el, SimCommand::RotateCcw, cx);
+    let el = on::<SimScreenshot, _>(el, SimCommand::Screenshot, cx);
+    on::<SimToggleRecord, _>(el, SimCommand::ToggleRecord, cx)
 }
 
 /// GPUI's name for a non-printing key → `keyboard::named_key`'s name.
@@ -87,6 +103,14 @@ impl ScreenView {
             cx.background_executor().timer(HINT).await;
             let _ = this.update(cx, |_, cx| cx.notify());
         }));
+    }
+
+    /// Take the keyboard while a device streams here (a grid tile's header
+    /// was clicked).
+    pub(crate) fn take_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.binding.device.is_some() && self.binding.visible {
+            self.capture_keyboard(window, cx);
+        }
     }
 
     /// The keyboard toggle: take the keyboard, or give it back.

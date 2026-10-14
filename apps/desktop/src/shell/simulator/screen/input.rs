@@ -108,6 +108,12 @@ impl ScreenView {
 
     pub(super) fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        // An unfocused tile: the click only focuses it, typing included.
+        if !self.binding.focused {
+            self.capture_keyboard(window, cx);
+            cx.emit(super::ScreenEvent::Focus);
+            return;
+        }
         // An ⌥-press on a device that can be inspected waits: a click picks
         // the element (typing stays where it was), a drag of a few points
         // becomes the pinch. It arms the inspector itself: ⌥ pressed with
@@ -196,6 +202,9 @@ impl ScreenView {
 
     pub(super) fn on_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        if !self.binding.focused {
+            return;
+        }
         self.rec_input();
         let now = Instant::now();
         let fresh = self.wheel_state.last.is_none_or(|t| now.duration_since(t) > WHEEL_GAP);

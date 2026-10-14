@@ -34,6 +34,10 @@ pub const STATIC_BPPF: f64 = 0.005;
 /// A JPEG frame whose size differs from the last by more than this fraction
 /// is a change on screen (a static screen re-encodes to within a few bytes).
 pub const JPEG_DELTA: f64 = 0.02;
+/// After a rescale request, the first JPEG of another size this soon is
+/// the new size, not change on screen (pictures of the old size still in
+/// flight are judged as usual and do not use the excuse up).
+pub const REBASE_WINDOW: Duration = Duration::from_secs(1);
 /// The scrcpy server's encoder repeats the last picture after 100 ms without
 /// a new one, refining it: a delta this long after the previous one, the same
 /// size within [`REPEAT_SIZE`], is that repeat, whatever its bits per pixel
@@ -132,6 +136,9 @@ struct State {
     clock: FrameClock,
     keyframes: KeyframeLimiter,
     last_jpeg: Option<usize>,
+    /// The stream was asked for another size, until then: its first JPEG
+    /// of another size sets the new baseline instead of reading as change.
+    jpeg_rebase: Option<Instant>,
     /// The last delta: when, and its size.
     last_delta: Option<(Instant, usize)>,
 }
@@ -170,7 +177,12 @@ impl FrameSignal {
                 tracing::trace!(bytes, "jpeg frame");
                 let moved = state.last_jpeg.is_none_or(|last| (bytes as f64 - last as f64).abs() > last as f64 * JPEG_DELTA);
                 state.last_jpeg = Some(bytes);
-                moved
+                if state.jpeg_rebase.is_some_and(|until| now > until) {
+                    state.jpeg_rebase = None;
+                }
+                // The first change of size uses the excuse up.
+                let rebase = moved && state.jpeg_rebase.take().is_some();
+                moved && !rebase
             }
         };
         if motion {
@@ -207,6 +219,15 @@ impl FrameSignal {
     /// See [`KeyframeLimiter::forced`].
     pub fn forced_key(&self, now: Instant) {
         self.lock().keyframes.forced(now);
+    }
+
+    /// The stream is being asked for another size or rate (a viewer's
+    /// profile, not the screen): the key frame it brings is a requested
+    /// one, and the first JPEG of the new size is not change on screen.
+    pub fn rescaled(&self, now: Instant) {
+        let mut state = self.lock();
+        state.keyframes.forced(now);
+        state.jpeg_rebase = Some(now + REBASE_WINDOW);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -304,6 +325,44 @@ mod tests {
         assert_eq!(signal.clock().last_motion_at, Some(t0), "the first, then within 2%");
         signal.frame(t0 + 100 * MS, Ingress::Jpeg { bytes: 110_000 });
         assert_eq!(signal.clock().last_motion_at, Some(t0 + 100 * MS));
+    }
+
+    /// A viewer asked for another size: neither the key frame nor the
+    /// next JPEG's new size is change on screen; the one after is judged
+    /// against the new size.
+    #[test]
+    fn a_rescale_is_not_motion() {
+        let t0 = Instant::now();
+        let signal = FrameSignal::default();
+        signal.frame(t0, Ingress::Jpeg { bytes: 100_000 });
+        signal.rescaled(t0 + 10 * MS);
+        signal.frame(t0 + 50 * MS, Ingress::Jpeg { bytes: 30_000 });
+        signal.frame(t0 + 100 * MS, Ingress::Jpeg { bytes: 30_100 });
+        assert_eq!(signal.clock().last_motion_at, Some(t0), "the new size is the baseline");
+        signal.rescaled(t0 + 200 * MS);
+        signal.frame(t0 + 300 * MS, Ingress::Key { bytes: 40_000 });
+        assert_eq!(signal.clock().last_motion_at, Some(t0), "the key frame it brings");
+        signal.frame(t0 + 400 * MS, Ingress::Jpeg { bytes: 50_000 });
+        assert_eq!(signal.clock().last_motion_at, Some(t0), "the rescale's first JPEG");
+        signal.frame(t0 + 500 * MS, Ingress::Jpeg { bytes: 70_000 });
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 500 * MS), "only one JPEG is excused");
+    }
+
+    /// A picture of the old size still in flight when the rescale was asked
+    /// does not use the excuse up: the first of the new size has it.
+    #[test]
+    fn an_old_size_jpeg_in_flight_keeps_the_rescale_excuse() {
+        let t0 = Instant::now();
+        let signal = FrameSignal::default();
+        signal.frame(t0, Ingress::Jpeg { bytes: 100_000 });
+        signal.rescaled(t0 + 10 * MS);
+        signal.frame(t0 + 20 * MS, Ingress::Jpeg { bytes: 100_100 });
+        signal.frame(t0 + 60 * MS, Ingress::Jpeg { bytes: 30_000 });
+        assert_eq!(signal.clock().last_motion_at, Some(t0), "the new size is the baseline");
+        // The excuse lapses: a later change of size is change on screen.
+        signal.rescaled(t0 + 100 * MS);
+        signal.frame(t0 + 100 * MS + REBASE_WINDOW + MS, Ingress::Jpeg { bytes: 60_000 });
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 100 * MS + REBASE_WINDOW + MS));
     }
 
     #[test]

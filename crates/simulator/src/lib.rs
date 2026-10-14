@@ -55,6 +55,7 @@ pub mod simctl_state;
 pub mod state;
 pub mod stream;
 pub mod video;
+pub mod viewers;
 pub mod xcode_app;
 
 /// A device, by a stable id: an iOS simulator's UDID as `simctl` reports it,

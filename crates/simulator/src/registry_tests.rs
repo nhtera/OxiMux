@@ -20,6 +20,7 @@ fn kinds(effects: &[Effect<&'static str>]) -> Vec<String> {
             Effect::StopSession { udid, session } => format!("stop {udid} {session}"),
             Effect::Pause(s) => format!("pause {s}"),
             Effect::Resume(s) => format!("resume {s}"),
+            Effect::SetProfile { session, profile, .. } => format!("profile {session} {profile:?}"),
             Effect::ShutdownDevice { udid } => format!("shutdown {udid}"),
             Effect::Persist => "persist".into(),
         })
@@ -763,4 +764,131 @@ fn an_iphone_still_listed_after_a_drop_restarts_once() {
     let g = live(&mut reg, &wt("a"), &iphone, "s", now);
     assert_eq!(kinds(&reg.session_exited(&iphone, g, true, "capture failed".into())), ["stop iosdev:00008110-001A2C3E0A88401E s"]);
     assert!(matches!(reg.phase(&iphone), Phase::Disconnected { reason } if reason == "capture failed"));
+}
+
+fn tile(n: u32) -> ViewerId {
+    ViewerId::Tile(n)
+}
+
+fn shown(profile: StreamProfile) -> Viewer {
+    Viewer { shown: true, profile }
+}
+
+fn hidden(profile: StreamProfile) -> Viewer {
+    Viewer { shown: false, profile }
+}
+
+/// A tile in another window keeps a device streaming that no panel shows.
+#[test]
+fn a_shown_tile_keeps_its_device_unpaused() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    live(&mut reg, &w, &u, "s", now);
+    assert!(reg.set_viewer(&w, tile(1), shown(StreamProfile::Full), now).is_empty());
+    assert!(reg.set_visible(&w, false, now).is_empty(), "the tile still shows it");
+    assert!(reg.tick(now + PARK_AFTER * 3).is_empty(), "never parked while a tile shows it");
+    assert!(reg.is_shown(&u));
+    assert_eq!(kinds(&reg.release_viewer(&w, tile(1), now)), ["pause s"]);
+}
+
+/// Hiding the panel turns its tiles' viewers not-shown: every device
+/// pauses, parks one period later, and comes back when the panel shows.
+#[test]
+fn a_hidden_panel_with_three_tiles_parks_all_three() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let worktrees = [(wt("a"), dev("A"), "sa"), (wt("b"), dev("B"), "sb"), (wt("c"), dev("C"), "sc")];
+    for (i, (w, u, s)) in worktrees.iter().enumerate() {
+        live(&mut reg, w, u, s, now);
+        reg.set_visible(w, false, now);
+        reg.set_viewer(w, tile(i as u32), shown(StreamProfile::Full), now);
+    }
+    for (i, (w, _, s)) in worktrees.iter().enumerate() {
+        assert_eq!(kinds(&reg.set_viewer(w, tile(i as u32), hidden(StreamProfile::Full), now)), [format!("pause {s}")]);
+    }
+    assert!(reg.tick(now + PARK_AFTER - Duration::from_secs(1)).is_empty());
+    let mut stopped = kinds(&reg.tick(now + PARK_AFTER));
+    stopped.sort();
+    assert_eq!(stopped, ["stop A sa", "stop B sb", "stop C sc"]);
+    for (i, (w, u, _)) in worktrees.iter().enumerate() {
+        assert_eq!(reg.phase(u), Phase::Parked);
+        assert_eq!(kinds(&reg.set_viewer(w, tile(i as u32), shown(StreamProfile::Full), now)), [format!("start {u}")]);
+    }
+}
+
+/// A remote viewer counts like any other: nothing pauses or parks it.
+#[test]
+fn a_remote_viewer_prevents_pause_and_park() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    live(&mut reg, &w, &u, "s", now);
+    reg.set_viewer(&w, ViewerId::Remote(7), shown(StreamProfile::Full), now);
+    assert!(reg.set_visible(&w, false, now).is_empty());
+    assert!(reg.tick(now + PARK_AFTER * 2).is_empty());
+    assert_eq!(reg.phase(&u), Phase::Live { generation: reg.generation() - 1 });
+}
+
+/// The panel and a tile of one device share its one session.
+#[test]
+fn two_viewers_of_one_device_share_one_session() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (a, b, u) = (wt("a"), wt("b"), dev("U"));
+    live(&mut reg, &a, &u, "s", now);
+    reg.set_viewer(&a, tile(1), shown(StreamProfile::Full), now);
+    let fx = reg.attach(b.clone(), u.clone(), true, now);
+    assert_eq!(kinds(&fx), ["persist"], "joins the live session");
+    reg.set_viewer(&b, tile(2), shown(StreamProfile::Full), now);
+    assert_eq!(reg.session(&u), Some(&"s"));
+}
+
+/// A viewer set before its worktree attaches carries over to the device.
+#[test]
+fn a_tile_set_before_attach_carries_over() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    assert!(reg.set_viewer(&w, tile(1), shown(StreamProfile::Full), now).is_empty());
+    let g = start_gen(&reg.attach(w.clone(), u.clone(), true, now));
+    assert!(reg.session_started(&u, g, Ok("s")).is_empty(), "shown, so not paused");
+}
+
+/// Unfocused tiles alone lower the stream; any full viewer or an agent
+/// brings it back; a fresh session starts full and is lowered again.
+#[test]
+fn the_stream_profile_is_the_best_any_shown_viewer_asks_for() {
+    use StreamProfile::{Full, Reduced};
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    live(&mut reg, &w, &u, "s", now);
+    reg.set_viewer(&w, tile(1), shown(Reduced), now);
+    assert!(reg.set_visible(&w, false, now).iter().any(|e| matches!(e, Effect::SetProfile { profile: Reduced, .. })));
+    assert_eq!(reg.profile(&u), Reduced);
+    assert_eq!(kinds(&reg.set_viewer(&w, tile(2), shown(Full), now)), ["profile s Full"]);
+    assert_eq!(kinds(&reg.release_viewer(&w, tile(2), now)), ["profile s Reduced"]);
+    assert_eq!(kinds(&reg.set_agent_active(&u, true, now)), ["profile s Full"], "an agent gets the user's settings");
+    assert_eq!(kinds(&reg.set_agent_active(&u, false, now)), ["profile s Reduced"]);
+    // Hidden: paused, and the profile stays as it was.
+    assert_eq!(kinds(&reg.set_viewer(&w, tile(1), hidden(Reduced), now)), ["pause s"]);
+    assert_eq!(kinds(&reg.tick(now + PARK_AFTER)), ["stop U s"]);
+    let fx = reg.set_viewer(&w, tile(1), shown(Reduced), now);
+    let g = start_gen(&fx);
+    assert_eq!(kinds(&reg.session_started(&u, g, Ok("s2"))), ["profile s2 Reduced"], "a fresh helper starts full");
+}
+
+/// Detaching the worktree whose panel wanted full quality leaves the
+/// other worktree's unfocused tile in charge.
+#[test]
+fn detaching_a_full_viewer_lowers_a_shared_device() {
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (a, b, u) = (wt("a"), wt("b"), dev("U"));
+    live(&mut reg, &a, &u, "s", now);
+    reg.attach(b.clone(), u.clone(), true, now);
+    reg.set_viewer(&b, tile(1), shown(StreamProfile::Reduced), now);
+    assert_eq!(kinds(&reg.detach(&a, now)), ["profile s Reduced", "persist"]);
+    assert_eq!(reg.attachments(), [(b, u)]);
 }
