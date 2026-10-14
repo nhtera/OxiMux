@@ -272,9 +272,10 @@ oximux sim erase                            # wipe and boot again
 - `push` takes a JSON file: an object with `aps`, at most 4096 bytes.
 - `erase` deletes every app and its data. It is asked in the panel every
   time, as is `push`; a device the user booted is refused without `--force`.
-- What each device takes: a simulator, everything; an Android emulator,
-  everything but `push`; an Android phone, `appearance`, `privacy` and
-  `status-bar`, each asked in the panel every time; a real iPhone, none. A
+- What each device takes: a simulator, everything but `net`; an Android
+  emulator, everything but `push`; an Android phone, `appearance`, `privacy`,
+  `status-bar` and `net offline|online`, each asked in the panel every time;
+  a real iPhone, none. A
   gap exits 5 (`refused`) and says why; nothing is ever skipped silently.
 - An Android device's demo-mode status bar goes back to normal when the last
   worktree attached to it detaches, and when OxiMux quits.
