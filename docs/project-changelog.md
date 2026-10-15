@@ -11,7 +11,8 @@ see it. Each part needs a desktop at least as new as the wire version noted;
 an older desktop refuses the new verbs with a message saying so.
 
 - **Act, then see what changed** (wire v27, #56 `bcf72f78`, #57 `e00fff0c`).
-  `--settle` on any action waits for the screen to go idle and prints what
+  `--settle` on `tap`, `swipe`, `type`, `button`, `rotate`, `launch` and
+  `open-url` waits for the screen to go idle and prints what
   appeared and went, with `@eN` refs to act on next; `ax -i` lists the
   elements an agent can act on; `wait` and `assert` check for an element with
   exit codes instead of sleeps.
