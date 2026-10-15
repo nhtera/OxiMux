@@ -139,6 +139,24 @@ fn a_caller_that_leaves_drops_its_verb() {
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the verb was dropped with its caller");
 }
 
+/// A caller that sends another request and then leaves still takes its verb
+/// with it: a queued frame does not stop the connection being watched.
+#[test]
+fn a_caller_that_pipelines_then_leaves_drops_its_verb() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::new(AuthStore::new()))
+        .with_simulator(Arc::new(Hang(dropped.clone())));
+    let (server, client) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, LocalScope::Full);
+    let script = async move {
+        client.send(sim(Some("/work/repo")).to_bytes().unwrap()).await.unwrap();
+        client.send(sim(Some("/work/repo")).to_bytes().unwrap()).await.unwrap();
+        drop(client);
+    };
+    block_on(join(serve, script));
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the verb was dropped with its caller");
+}
+
 /// The first verb waits until released; the rest answer at once.
 struct Gate(Mutex<Option<futures::channel::oneshot::Receiver<()>>>);
 

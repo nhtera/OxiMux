@@ -50,14 +50,14 @@ use crate::auth::{AppPubkey, AuthStore, LocalScope, Peer};
 struct ConnState {
     authn: ConnAuthn,
     peer_version: u32,
-    /// A request frame read early (while a simulator verb raced the
-    /// connection for its caller leaving), served next.
-    held: Option<Vec<u8>>,
+    /// Request frames read early (while a simulator verb raced the
+    /// connection for its caller leaving), served next, in order.
+    held: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
-        Self { authn: ConnAuthn::Unauth, peer_version: ASSUMED_VERSION_WHEN_SILENT, held: None }
+        Self { authn: ConnAuthn::Unauth, peer_version: ASSUMED_VERSION_WHEN_SILENT, held: Default::default() }
     }
 }
 

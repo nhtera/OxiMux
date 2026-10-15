@@ -61,6 +61,9 @@ fn session_to_build(req: &Request) -> Option<&str> {
     }
 }
 
+/// The most request frames held while a simulator verb runs.
+const MAX_HELD: usize = 32;
+
 impl Dispatcher {
     /// Serve one connection until the peer closes or a send fails. A request
     /// yields exactly one response frame; a live subscription pushes many
@@ -109,7 +112,7 @@ impl Dispatcher {
         let mut live_leads = false;
 
         loop {
-            let picked = if let Some(frame) = state.held.take() {
+            let picked = if let Some(frame) = state.held.pop_front() {
                 Picked::Request(Some(frame))
             } else if streams.is_empty() {
                 // No live subscription: block purely on the next request — never
@@ -597,20 +600,24 @@ impl Dispatcher {
             let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let run = Box::pin(self.simulator(&peer, req));
-            return match select(run, Box::pin(transport.recv())).await {
-                Either::Left((response, _)) => self.send(transport, response).await,
-                // Held for the serve loop (never served by recursion: a
-                // client pipelining many would nest without limit).
-                Either::Right((Ok(Some(frame)), run)) => {
-                    state.held = Some(frame);
-                    self.send(transport, run.await).await
+            let mut run = Box::pin(self.simulator(&peer, req));
+            // Frames that arrive meanwhile are queued for the serve loop
+            // (never served by recursion), and the connection stays watched
+            // for its close; past `MAX_HELD` the verb is simply awaited.
+            while state.held.len() < MAX_HELD {
+                match select(run, Box::pin(transport.recv())).await {
+                    Either::Left((response, _)) => return self.send(transport, response).await,
+                    Either::Right((Ok(Some(frame)), pending)) => {
+                        state.held.push_back(frame);
+                        run = pending;
+                    }
+                    Either::Right((Ok(None) | Err(_), _)) => {
+                        tracing::debug!("the caller left: its simulator verb is dropped");
+                        return false;
+                    }
                 }
-                Either::Right((Ok(None) | Err(_), _)) => {
-                    tracing::debug!("the caller left: its simulator verb is dropped");
-                    false
-                }
-            };
+            }
+            return self.send(transport, run.await).await;
         }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it
         // `spawn_blocking`s the decode) and is awaited here rather than in the

@@ -50,7 +50,7 @@ impl SimulatorControl for Stub {
         };
         Ok(match cmd {
             // Only `…/app` is a worktree this host knows.
-            SimCmdWire::Status if !worktree.ends_with("/app") => return Err(SimErrorWire::NoDevice),
+            SimCmdWire::Status if !Path::new(worktree).ends_with("app") => return Err(SimErrorWire::NoDevice),
             SimCmdWire::Status => SimReplyWire::Status(SimStatusWire {
                 available: true,
                 reason: None,
@@ -255,6 +255,8 @@ fn an_mcp_server_refuses_an_unknown_worktree() {
 }
 
 /// Started in the home directory without `--worktree`: refused, with why.
+/// (Unix only: the home directory is `$HOME` there; Windows asks the shell.)
+#[cfg(unix)]
 #[test]
 fn an_mcp_server_never_starts_in_the_home_directory() {
     let home = tempfile::tempdir().unwrap();

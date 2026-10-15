@@ -164,12 +164,17 @@ pub(super) async fn confirm(
         let ids = (asked.project_id.clone(), asked.workspace_id.clone());
         root.ask_simulator_consent(&asked.worktree, (&asked.label, asked.principal), &toast, ids, window, cx);
     });
+    // Named as the banner named it.
+    let who = match target.principal {
+        oximux_remote_host::SimPrincipal::Agent => "an agent",
+        oximux_remote_host::SimPrincipal::Mcp => "this MCP client",
+    };
     loop {
         match hub.update(cx, |hub, _| hub.per_call_answer(id)) {
             PerCallAnswer::Allowed => return Ok(()),
-            PerCallAnswer::Refused => return Err(SimErrorWire::Refused(format!("the user declined to let an agent {what}"))),
+            PerCallAnswer::Refused => return Err(SimErrorWire::Refused(format!("the user declined to let {who} {what}"))),
             PerCallAnswer::Gone => {
-                return Err(SimErrorWire::Refused(format!("the user did not answer whether an agent may {what}; ask them, then retry")));
+                return Err(SimErrorWire::Refused(format!("the user did not answer whether {who} may {what}; ask them, then retry")));
             }
             PerCallAnswer::Pending => cx.background_executor().timer(Duration::from_millis(250)).await,
         }

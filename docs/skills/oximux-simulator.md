@@ -460,7 +460,10 @@ Add a stdio server to its config, naming your repository:
   agents' permission does not cover it, nor its theirs, and its permission
   ends when OxiMux quits.
 - Every call finishes within 25 s. A `wait` that would not fit is refused
-  (split it); a call that runs out is stopped on the device too.
+  (split it). When a call runs out, a look or a wait stops; an action that
+  changes the device (a tap, an install, a launch) may still finish, so
+  call `sim_observe` before retrying it. `sim_act` reports the steps that
+  ran before it stopped.
 - Without `--worktree` it starts only in a worktree OxiMux knows, never in
   `/` or your home directory. It needs the desktop app (the host with the
   simulator).

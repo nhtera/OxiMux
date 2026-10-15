@@ -68,7 +68,8 @@ fn chosen_worktree(flag: Option<PathBuf>, cwd: Option<PathBuf>, home: Option<Pat
     // Compared as the filesystem resolves them: a cwd reads back resolved
     // (`/private/var/…`) where `$HOME` may name a symlink.
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    if real(&cwd) == Path::new("/") || home.as_deref().is_some_and(|home| real(home) == real(&cwd)) {
+    // A root (`/`, `C:\`) has no parent.
+    if real(&cwd).parent().is_none() || home.as_deref().is_some_and(|home| real(home) == real(&cwd)) {
         return Err(format!(
             "started in {}, which is not a worktree; pass --worktree PATH (your repository) in the client's config",
             cwd.display()
@@ -96,11 +97,13 @@ mod tests {
 
     #[test]
     fn the_worktree_is_never_root_or_home() {
-        let home = Some(PathBuf::from("/Users/me"));
-        assert!(chosen_worktree(None, Some("/".into()), home.clone()).is_err());
-        assert!(chosen_worktree(None, Some("/Users/me".into()), home.clone()).is_err());
-        assert_eq!(chosen_worktree(None, Some("/Users/me/app".into()), home.clone()), Ok("/Users/me/app".into()));
-        assert_eq!(chosen_worktree(Some("app".into()), Some("/Users/me".into()), home.clone()), Ok("/Users/me/app".into()), "relative to where it starts");
-        assert_eq!(chosen_worktree(Some("/r".into()), Some("/".into()), home), Ok("/r".into()), "--worktree may be anywhere");
+        let me = std::env::temp_dir().join("oximux-mcp-home");
+        let root = me.ancestors().last().unwrap().to_path_buf();
+        let home = Some(me.clone());
+        assert!(chosen_worktree(None, Some(root.clone()), home.clone()).is_err());
+        assert!(chosen_worktree(None, Some(me.clone()), home.clone()).is_err());
+        assert_eq!(chosen_worktree(None, Some(me.join("app")), home.clone()), Ok(me.join("app")));
+        assert_eq!(chosen_worktree(Some("app".into()), Some(me.clone()), home.clone()), Ok(me.join("app")), "relative to where it starts");
+        assert_eq!(chosen_worktree(Some(me.join("r")), Some(root), home), Ok(me.join("r")), "--worktree may be anywhere");
     }
 }

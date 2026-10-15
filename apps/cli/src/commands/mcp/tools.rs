@@ -16,8 +16,10 @@ use clap::Parser;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
+use oximux_remote_proto::simulator::{SimPointWire, SimSelectorWire, SimTargetWire};
+
 use super::Ctx;
-use crate::cli::{Command, SimCommand};
+use crate::cli::{Command, SettleArgs, SimCommand};
 use crate::client::Client;
 use crate::output::Failure;
 
@@ -197,11 +199,25 @@ async fn act(client: &Client, ctx: &Ctx, args: &Value, deadline: Instant) -> Res
                 )));
             }
         }
-        for words in runs {
-            let verb = words[0].clone();
+        for run in runs {
+            let verb = match &run {
+                Run::Words(words) => words[0].clone(),
+                Run::TypeInto(..) => "type".to_owned(),
+            };
+            let ran = async {
+                match run {
+                    Run::Words(words) => sim(client, ctx, words).await,
+                    Run::TypeInto(target, text) => {
+                        let settle = SettleArgs { settle, settle_timeout: None };
+                        super::super::sim_verify::type_into_target(client, &ctx.worktree, target, text, false, &settle)
+                            .await
+                            .map_err(|f| failure_text(&f))
+                    }
+                }
+            };
             // Within what is left of the call: running out keeps the steps
             // already done in the answer, so none is repeated blindly.
-            let ran = tokio::time::timeout_at(deadline - WAIT_SLACK, sim(client, ctx, words)).await.map_err(|_| {
+            let ran = tokio::time::timeout_at(deadline - WAIT_SLACK, ran).await.map_err(|_| {
                 fail(&done, "it did not finish within this call's time; it may still complete on the device. Call sim_observe before going on".into())
             })?;
             let (_, text) = ran.map_err(|why| fail(&done, why))?;
@@ -211,9 +227,17 @@ async fn act(client: &Client, ctx: &Ctx, args: &Value, deadline: Instant) -> Res
     Ok(done.join("\n"))
 }
 
-/// The CLI words for one step (a `type` into a labelled element is a tap,
-/// then the typing).
-fn step_words(step: &Value, settle: bool) -> Result<Vec<Vec<String>>, String> {
+/// What one step runs: the CLI's words, or (typing into an element named by
+/// label, id or point) one tap-then-type request, which holds the device's
+/// input turn across both.
+#[derive(Debug, PartialEq)]
+enum Run {
+    Words(Vec<String>),
+    TypeInto(SimTargetWire, String),
+}
+
+/// What one step runs.
+fn step_words(step: &Value, settle: bool) -> Result<Vec<Run>, String> {
     let object = step.as_object().filter(|o| o.len() == 1).ok_or("a step is an object with exactly one key")?;
     let (verb, body) = object.iter().next().expect("one key");
     let settled = |mut w: Vec<String>| {
@@ -222,15 +246,16 @@ fn step_words(step: &Value, settle: bool) -> Result<Vec<Vec<String>>, String> {
         }
         w
     };
+    let words = |w: Vec<String>| vec![Run::Words(w)];
     Ok(match verb.as_str() {
-        "tap" => vec![settled([vec!["tap".into()], target_words(body, true)?].concat())],
+        "tap" => words(settled([vec!["tap".into()], target_words(body, true)?].concat())),
         "swipe" => {
             let p = |key: &str, axis: &str| body.pointer(&format!("/{key}/{axis}")).and_then(Value::as_f64).ok_or(format!("swipe needs {key}.{axis}"));
             let mut w = vec!["swipe".into(), num(p("from", "x")?), num(p("from", "y")?), num(p("to", "x")?), num(p("to", "y")?)];
             if let Some(ms) = body.get("duration_ms").and_then(Value::as_u64) {
                 w.extend(["--duration".into(), ms.to_string()]);
             }
-            vec![settled(w)]
+            words(settled(w))
         }
         "type" => {
             let text = body.get("text").and_then(Value::as_str).ok_or("type needs text")?.to_owned();
@@ -244,13 +269,13 @@ fn step_words(step: &Value, settle: bool) -> Result<Vec<Vec<String>>, String> {
                 w
             };
             match body.get("target") {
-                None => vec![typing(vec!["type".into()])],
-                Some(t) if t.get("ref").is_some() => vec![typing(vec!["type".into(), reference(&t["ref"])?])],
-                Some(t) => vec![[vec!["tap".into()], target_words(t, true)?].concat(), typing(vec!["type".into()])],
+                None => words(typing(vec!["type".into()])),
+                Some(t) if t.get("ref").is_some() => words(typing(vec!["type".into(), reference(&t["ref"])?])),
+                Some(t) => vec![Run::TypeInto(target_wire(t)?, text)],
             }
         }
-        "button" => vec![settled(vec!["button".into(), body.as_str().ok_or("button is a name")?.into()])],
-        "rotate" => vec![settled(vec!["rotate".into(), body.as_str().ok_or("rotate is an orientation")?.into()])],
+        "button" => words(settled(vec!["button".into(), body.as_str().ok_or("button is a name")?.into()])),
+        "rotate" => words(settled(vec!["rotate".into(), body.as_str().ok_or("rotate is an orientation")?.into()])),
         "wait" => {
             let mut w = [vec!["wait".into()], target_words(body.get("target").ok_or("wait needs a target")?, false)?].concat();
             if body.get("gone").and_then(Value::as_bool) == Some(true) {
@@ -259,7 +284,7 @@ fn step_words(step: &Value, settle: bool) -> Result<Vec<Vec<String>>, String> {
             if let Some(ms) = body.get("timeout_ms").and_then(Value::as_u64) {
                 w.extend(["--timeout-ms".into(), ms.to_string()]);
             }
-            vec![w]
+            words(w)
         }
         "assert" => {
             let mut w = [vec!["assert".into()], target_words(body.get("target").ok_or("assert needs a target")?, false)?].concat();
@@ -270,7 +295,7 @@ fn step_words(step: &Value, settle: bool) -> Result<Vec<Vec<String>>, String> {
                 Some(c) if c.get("text").and_then(Value::as_str).is_some() => w.push(format!("--text={}", c["text"].as_str().unwrap_or_default())),
                 Some(other) => return Err(format!("check is \"exists\", \"gone\", \"enabled\" or {{\"text\": …}}, not {other}")),
             }
-            vec![w]
+            words(w)
         }
         other => return Err(format!("no step `{other}` (tap, swipe, type, button, rotate, wait, assert)")),
     })
@@ -296,6 +321,26 @@ fn target_words(t: &Value, point_ok: bool) -> Result<Vec<String>, String> {
     match (t.get("x").and_then(Value::as_f64), t.get("y").and_then(Value::as_f64)) {
         (Some(x), Some(y)) if point_ok => Ok(vec![num(x), num(y)]),
         (Some(_), Some(_)) => Err("wait and assert name an element (ref, label or id), not a point".into()),
+        _ => Err("a target is one of: ref, label, id, or x and y".into()),
+    }
+}
+
+/// A label, id or point target as the wire names it (a ref goes as words).
+fn target_wire(t: &Value) -> Result<SimTargetWire, String> {
+    let text = |key: &str| t.get(key).and_then(Value::as_str).map(str::to_owned);
+    if let Some(label) = text("label") {
+        let exact = t.get("exact").and_then(Value::as_bool) == Some(true);
+        return Ok(if exact {
+            SimTargetWire::Exact(SimSelectorWire { label: Some(label), id: None, role: None, nth: 0 })
+        } else {
+            SimTargetWire::Label(label)
+        });
+    }
+    if let Some(id) = text("id") {
+        return Ok(SimTargetWire::Id(id));
+    }
+    match (t.get("x").and_then(Value::as_f64), t.get("y").and_then(Value::as_f64)) {
+        (Some(x), Some(y)) => Ok(SimTargetWire::Point(SimPointWire { x, y })),
         _ => Err("a target is one of: ref, label, id, or x and y".into()),
     }
 }
@@ -376,7 +421,14 @@ mod tests {
     use super::*;
 
     fn w(step: Value, settle: bool) -> Vec<String> {
-        step_words(&step, settle).unwrap().into_iter().map(|w| w.join(" ")).collect()
+        step_words(&step, settle)
+            .unwrap()
+            .into_iter()
+            .map(|run| match run {
+                Run::Words(w) => w.join(" "),
+                Run::TypeInto(target, text) => format!("type-into {target:?} {text}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -386,7 +438,8 @@ mod tests {
         assert_eq!(w(json!({ "tap": { "x": 120, "y": 44.5 } }), false), ["tap 120 44.5"]);
         assert_eq!(w(json!({ "type": { "text": "a@b.co", "target": { "ref": 2 } } }), true), ["type @e2 --settle a@b.co"]);
         assert_eq!(w(json!({ "type": { "text": "-1", "target": { "ref": 2 } } }), true), ["type @e2 --settle -- -1"]);
-        assert_eq!(w(json!({ "type": { "text": "-1", "target": { "label": "Qty" } } }), false), ["tap --label=Qty", "type -- -1"]);
+        assert_eq!(w(json!({ "type": { "text": "-1", "target": { "label": "Qty" } } }), false), ["type-into Label(\"Qty\") -1"], "one request, not a tap then a type");
+        assert_eq!(w(json!({ "type": { "text": "a", "target": { "x": 1, "y": 2 } } }), false), ["type-into Point(SimPointWire { x: 1.0, y: 2.0 }) a"]);
         assert_eq!(w(json!({ "swipe": { "from": { "x": 1, "y": 2 }, "to": { "x": 3, "y": 4 }, "duration_ms": 500 } }), false), ["swipe 1 2 3 4 --duration 500"]);
         assert_eq!(w(json!({ "wait": { "target": { "label": "Home" }, "gone": true, "timeout_ms": 3000 } }), true), ["wait --label=Home --gone --timeout-ms 3000"]);
         assert_eq!(w(json!({ "assert": { "target": { "id": "title" }, "check": { "text": "Hi" } } }), true), ["assert --id=title --text=Hi"]);
@@ -410,16 +463,19 @@ mod tests {
             json!({ "rotate": "landscape-left" }),
         ];
         for step in steps {
-            for words in step_words(&step, true).unwrap() {
+            for run in step_words(&step, true).unwrap() {
+                let Run::Words(words) = run else { continue };
                 assert!(Words::try_parse_from(&words).is_ok(), "{words:?}");
             }
         }
         let launch = app_words(&json!({ "action": "launch", "bundle_id": "com.a.b", "relaunch": true }), Path::new("/w")).unwrap();
         assert!(Words::try_parse_from(&launch).is_ok(), "{launch:?}");
-        assert_eq!(app_words(&json!({ "action": "install", "path": "build/A.app" }), Path::new("/w")).unwrap()[2], "/w/build/A.app");
+        let w = std::env::temp_dir();
+        assert_eq!(app_words(&json!({ "action": "install", "path": "build/A.app" }), &w).unwrap()[2], w.join("build/A.app").to_string_lossy());
         // A value that looks like a flag stays a value.
         for step in [json!({ "tap": { "label": "--help" } }), json!({ "assert": { "target": { "id": "-x" }, "check": { "text": "--worktree=/etc" } } })] {
-            for words in step_words(&step, true).unwrap() {
+            for run in step_words(&step, true).unwrap() {
+                let Run::Words(words) = run else { continue };
                 let parsed = Words::try_parse_from(&words).unwrap_or_else(|e| panic!("{words:?}: {e}"));
                 assert!(!matches!(parsed.command, SimCommand::Status), "{words:?}");
             }
