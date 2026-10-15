@@ -22,6 +22,7 @@ mod heartbeats;
 mod pairing_admin;
 mod schedules;
 mod serve;
+mod sim_view;
 mod simulator;
 mod state;
 mod stream;
@@ -53,11 +54,19 @@ struct ConnState {
     /// Request frames read early (while a simulator verb raced the
     /// connection for its caller leaving), served next, in order.
     held: std::collections::VecDeque<Vec<u8>>,
+    /// The devices this connection watches; dropped with the connection,
+    /// which stops their pumps.
+    views: sim_view::SimViews,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
-        Self { authn: ConnAuthn::Unauth, peer_version: ASSUMED_VERSION_WHEN_SILENT, held: Default::default() }
+        Self {
+            authn: ConnAuthn::Unauth,
+            peer_version: ASSUMED_VERSION_WHEN_SILENT,
+            held: Default::default(),
+            views: Default::default(),
+        }
     }
 }
 
@@ -169,6 +178,8 @@ pub struct Dispatcher {
     /// **authorized** caller `Unsupported` (a headless host has no simulator);
     /// anyone else still gets `Unauthorized` first.
     simulator: Option<Arc<dyn crate::simulator::SimulatorControl>>,
+    /// Numbers the phone's view subscriptions, unique for this host's run.
+    view_ids: std::sync::atomic::AtomicU64,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -194,6 +205,7 @@ impl Dispatcher {
             state_events: None,
             state_log: state::StateLog::default(),
             simulator: None,
+            view_ids: Default::default(),
             now_secs: system_now_secs,
         }
     }

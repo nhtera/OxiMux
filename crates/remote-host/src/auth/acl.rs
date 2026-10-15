@@ -382,6 +382,37 @@ impl AuthStore {
         matches!(peer.kind(), PeerKind::Local(_))
     }
 
+    /// May this caller **watch** a device on the desktop (never drive it)?
+    ///
+    /// Local callers: the same reach as
+    /// [`may_control_simulator`](Self::may_control_simulator), with a confined
+    /// caller pinned to its own worktree by the handler. A paired phone: not
+    /// revoked and at [`DeviceScope::Full`]. A device narrowed to one session
+    /// is refused, as for terminals: a device on screen belongs to no single
+    /// session, and its picture can show anything on the machine's screen.
+    /// The read-only tier may watch; watching acts on nothing.
+    ///
+    /// The first gate only: the desktop's "Let paired phones view" setting
+    /// and its per-device ask decide the rest.
+    pub fn may_view_simulator(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(_) => true,
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                matches!(
+                    st.devices.get(pubkey),
+                    Some(d) if !d.revoked && matches!(d.scope, DeviceScope::Full)
+                )
+            }
+        }
+    }
+
+    /// The name a paired device registered with (shown on the desktop when it
+    /// watches a device). `None` for a key never paired.
+    pub fn device_name(&self, pubkey: &AppPubkey) -> Option<String> {
+        self.inner.lock().unwrap().devices.get(pubkey).map(|d| d.name.clone())
+    }
+
     /// May this caller write the coordination blackboard? Same reach as
     /// [`may_read_state`](Self::may_read_state), minus the read-only tier: a
     /// device that may only watch must not be able to steer agents by editing

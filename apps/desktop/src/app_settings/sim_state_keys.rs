@@ -161,6 +161,22 @@ pub fn save_exec_allowed(repo: &SettingsRepo, allowed: bool) {
     }
 }
 
+/// `"1"` while paired phones may watch (never drive) a device. Off when
+/// absent or anything else. In the database for the same reason as
+/// [`KEY_EXEC_ALLOWED`]: a device's screen leaving the machine is not
+/// something an agent's tools may switch on.
+pub const KEY_PHONE_VIEW: &str = "sim_phone_view_v1";
+
+pub fn phone_view_allowed(repo: &SettingsRepo) -> bool {
+    matches!(repo.get(KEY_PHONE_VIEW), Ok(Some(v)) if v == "1")
+}
+
+pub fn save_phone_view_allowed(repo: &SettingsRepo, allowed: bool) {
+    if let Err(err) = repo.set(KEY_PHONE_VIEW, if allowed { "1" } else { "0" }) {
+        tracing::warn!(?err, "the phone viewing switch was not saved");
+    }
+}
+
 pub fn feature_used(repo: &SettingsRepo) -> bool {
     matches!(repo.get(KEY_FEATURE_USED), Ok(Some(v)) if v == "1")
 }
@@ -262,5 +278,17 @@ mod tests {
         assert!(!exec_allowed(&repo));
         repo.set(KEY_EXEC_ALLOWED, "yes").unwrap();
         assert!(!exec_allowed(&repo), "anything but 1: off");
+    }
+
+    #[test]
+    fn phone_viewing_is_off_unless_turned_on() {
+        let repo = SettingsRepo::new(open_memory().unwrap());
+        assert!(!phone_view_allowed(&repo), "absent: off");
+        save_phone_view_allowed(&repo, true);
+        assert!(phone_view_allowed(&repo));
+        save_phone_view_allowed(&repo, false);
+        assert!(!phone_view_allowed(&repo));
+        repo.set(KEY_PHONE_VIEW, "true").unwrap();
+        assert!(!phone_view_allowed(&repo), "anything but 1: off");
     }
 }

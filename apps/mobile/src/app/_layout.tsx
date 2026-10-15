@@ -59,6 +59,7 @@ export default function RootLayout() {
                     same). Detail routes below keep their back button and push slide. */}
                 <Stack.Screen name="sessions" options={{ title: 'Sessions', headerLeft: menuButton, animation: 'none' }} />
                 <Stack.Screen name="terminals" options={{ title: 'Terminals', headerLeft: menuButton, animation: 'none' }} />
+                <Stack.Screen name="simulator" options={{ title: 'Devices', headerLeft: menuButton, animation: 'none' }} />
                 <Stack.Screen name="settings" options={{ title: 'Settings', headerLeft: menuButton, animation: 'none' }} />
                 <Stack.Screen name="schedules" options={{ title: 'Schedules', headerLeft: menuButton, animation: 'none' }} />
                 {/* Titles come from the screens themselves: a session is named by the
@@ -67,6 +68,7 @@ export default function RootLayout() {
                 <Stack.Screen name="session/[id]" />
                 <Stack.Screen name="git/[id]" />
                 <Stack.Screen name="schedules/[id]" />
+                <Stack.Screen name="simulator/[device]" />
               </Stack>
             </AppDrawerProvider>
           </ThemeProvider>

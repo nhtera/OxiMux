@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use oximux_remote_proto::transport::{Transport, TransportError};
+use oximux_remote_proto::transport::{Transport, TransportError, UniRecv, UniSend};
 
 /// A hard cap on a single frame so a hostile or corrupt length prefix can't drive
 /// an unbounded allocation. Comfortably above any real RPC/event payload.
@@ -45,8 +45,9 @@ pub struct IrohTransport {
     send: Mutex<SendStream>,
     recv: Mutex<RecvHalf>,
     /// Held for the stream's lifetime — dropping the `Connection` resets the
-    /// streams, so keep it alive alongside them.
-    _conn: Connection,
+    /// streams, so keep it alive alongside them. Also what opens and accepts
+    /// the one-way streams a device's picture rides.
+    conn: Connection,
 }
 
 impl IrohTransport {
@@ -55,7 +56,7 @@ impl IrohTransport {
         Self {
             send: Mutex::new(send),
             recv: Mutex::new(RecvHalf { stream: recv, carry: Vec::new(), skip: 0 }),
-            _conn: conn,
+            conn,
         }
     }
 }
@@ -135,6 +136,47 @@ impl Transport for IrohTransport {
                 }
             }
         }
+    }
+
+    async fn open_uni(&self) -> Result<Box<dyn UniSend>, TransportError> {
+        let stream = self.conn.open_uni().await.map_err(|_| TransportError::Closed)?;
+        // Below the message stream: when the link is short, a terminal's
+        // keystrokes and an RPC's reply go before the next video bytes.
+        let _ = stream.set_priority(UNI_PRIORITY);
+        Ok(Box::new(IrohUniSend(stream)))
+    }
+
+    fn relayed(&self) -> Option<bool> {
+        let paths = self.conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected())?;
+        Some(selected.is_relay())
+    }
+
+    async fn accept_uni(&self) -> Result<Option<Box<dyn UniRecv>>, TransportError> {
+        // Any connection error means no stream will ever come: the end.
+        Ok(self.conn.accept_uni().await.ok().map(|s| Box::new(IrohUniRecv(s)) as Box<dyn UniRecv>))
+    }
+}
+
+/// The send priority of a one-way stream, below the message stream's
+/// default of 0.
+const UNI_PRIORITY: i32 = -1;
+
+struct IrohUniSend(SendStream);
+
+#[async_trait]
+impl UniSend for IrohUniSend {
+    async fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        self.0.write_all(bytes).await.map_err(write_err)
+    }
+}
+
+struct IrohUniRecv(RecvStream);
+
+#[async_trait]
+impl UniRecv for IrohUniRecv {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        self.0.read(buf).await.map_err(read_err)
     }
 }
 

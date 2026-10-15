@@ -49,11 +49,23 @@ pub(crate) fn spawn_maintainer(
     // driver bumps past it, which is how we recognize that we've been superseded.
     let my_epoch = Arc::new(AtomicU64::new(shared.epoch.load(Ordering::Acquire)));
 
+    // Whether the driver is Connected now. `Connected` reaches the app only
+    // once `activate` has published the session, not when the driver says so:
+    // the app answers it at once (it lists, it asks what the host supports),
+    // and before the publish every such call fails `NotConnected`. The lock
+    // also orders that late report against the driver's next transition, so
+    // a drop meanwhile is never followed by a stale `Connected`.
+    let connected = Arc::new(StdMutex::new(false));
+
     let on_state = {
         let shared = shared.clone();
         let first = first.clone();
         let my_epoch = my_epoch.clone();
+        let listener = listener.clone();
+        let connected = connected.clone();
         move |state: RsConnState| {
+            let mut now_connected = connected.lock().unwrap();
+            *now_connected = matches!(state, RsConnState::Connected);
             // Drop the live session whenever we're not Connected so an RPC during a
             // reconnect gap fails fast with `NotConnected` rather than stalling on a
             // dead pump (or racing the swap).
@@ -82,7 +94,9 @@ pub(crate) fn spawn_maintainer(
             {
                 let _ = tx.send(Err(MobileError::Transport(cause.clone())));
             }
-            listener.on_state(map_state(&state));
+            if !*now_connected {
+                listener.on_state(map_state(&state));
+            }
         }
     };
 
@@ -96,7 +110,13 @@ pub(crate) fn spawn_maintainer(
         // a superseding reconnect/disconnect can't be overwritten by a slow one.
         let epoch = shared.bump_epoch();
         my_epoch.store(epoch, Ordering::Release);
-        rt().spawn(activate(shared.clone(), session, first.clone(), epoch));
+        let (listener, connected) = (listener.clone(), connected.clone());
+        let ready = Box::new(move || {
+            if *connected.lock().unwrap() {
+                listener.on_state(ConnState::Connected);
+            }
+        });
+        rt().spawn(activate(shared.clone(), session, first.clone(), epoch, ready));
     };
 
     rt().spawn(maintain_connection(

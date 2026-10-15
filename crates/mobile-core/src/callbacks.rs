@@ -35,6 +35,20 @@ pub trait TerminalSink: Send + Sync {
     fn on_exit(&self, pty_id: String, code: Option<i32>);
 }
 
+/// Receives the frames of every device the phone watches.
+///
+/// One sink for every view, told apart by `token` (from
+/// `subscribe_sim_view`). A frame is passed on as it arrived — `kind` 0 is a
+/// decoder config (an avcC record), 1 a key frame, 2 a delta (AVCC samples)
+/// — for the app to decode; nothing is kept.
+#[uniffi::export(with_foreign)]
+pub trait SimViewSink: Send + Sync {
+    fn on_frame(&self, token: String, kind: u8, pts_us: u64, data: Vec<u8>);
+    /// The view ended: unsubscribed, the desktop stopped sharing, the
+    /// device stopped, or the connection dropped.
+    fn on_end(&self, token: String);
+}
+
 /// Receives the live session list for the whole client.
 ///
 /// The core pushes the *whole* per-device-filtered list on every change (a session

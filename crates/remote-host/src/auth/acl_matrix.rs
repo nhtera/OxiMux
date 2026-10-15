@@ -66,6 +66,8 @@ struct Row {
     // Local callers only, at either scope (the handler pins a confined one to
     // its own worktree).
     control_simulator: bool,
+    // Watching a device: local callers as above, plus a full-scope phone.
+    view_simulator: bool,
 }
 
 /// Ask every predicate about one caller.
@@ -94,6 +96,7 @@ fn observe(store: &AuthStore, peer: &Peer) -> Row {
         read_state: store.may_read_state(peer),
         write_state: store.may_write_state(peer),
         control_simulator: store.may_control_simulator(peer),
+        view_simulator: store.may_view_simulator(peer),
     }
 }
 
@@ -123,6 +126,7 @@ const NOTHING: Row = Row {
     read_state: false,
     write_state: false,
     control_simulator: false,
+    view_simulator: false,
 };
 
 /// A *valid* Ed25519 public key from a seed — `register` verifies the point is
@@ -193,6 +197,7 @@ fn a_local_operator_reaches_everything_including_pairing() {
             read_state: true,
             write_state: true,
             control_simulator: true,
+            view_simulator: true,
         },
         "the local operator is the host's own owner",
     );
@@ -234,6 +239,7 @@ fn a_session_confined_agent_reaches_only_its_own_session() {
             // handler pins a confined caller to its own session's worktree, so
             // it reaches the device its own work uses and nothing else.
             control_simulator: true,
+            view_simulator: true,
             ..NOTHING
         },
         "session confinement is the only boundary around an agent's own CLI",
@@ -246,7 +252,7 @@ fn a_session_confined_agent_reaches_only_its_own_session() {
 fn an_mcp_client_reaches_only_the_simulator() {
     let store = AuthStore::new();
     let peer = Peer::local(LocalScope::Mcp);
-    assert_eq!(observe(&store, &peer), Row { control_simulator: true, ..NOTHING }, "an outside client drives the device only");
+    assert_eq!(observe(&store, &peer), Row { control_simulator: true, view_simulator: true, ..NOTHING }, "an outside client reaches the device only");
     assert!(peer.is_mcp() && !peer.is_local_operator() && peer.own_session().is_none());
 }
 
@@ -302,8 +308,10 @@ fn a_full_remote_device_reaches_everything_except_pairing() {
             read_state: true,
             write_state: true,
             // A phone never drives the simulator: its screenshots would leave
-            // the machine.
+            // the machine. It may watch one, behind the desktop's own setting
+            // and ask.
             control_simulator: false,
+            view_simulator: true,
         },
         "a paired device may not enroll further devices",
     );
@@ -329,6 +337,8 @@ fn a_read_only_remote_device_watches_but_never_acts() {
             read_own_team_run: true,
             read_other_team_run: true,
             read_state: true,
+            // Watching a device acts on nothing.
+            view_simulator: true,
             ..NOTHING
         },
         "read-only is the tier that separates watching from driving",

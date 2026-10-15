@@ -296,6 +296,24 @@ impl SimulatorHub {
         cx.emit(HubEvent::Consent);
     }
 
+    /// Whether paired phones may watch a device: Settings' switch, off
+    /// unless the user turned it on.
+    pub fn phone_view_allowed(&self) -> bool {
+        sim_state_keys::phone_view_allowed(&self.repo)
+    }
+
+    /// Settings' switch: saved, and applied to live views at once (off ends
+    /// every one within a second).
+    pub fn set_phone_view_allowed(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        sim_state_keys::save_phone_view_allowed(&self.repo, allowed);
+        if !allowed {
+            crate::remote_control::sim_view::turned_off(cx);
+        }
+        crate::remote_control::sim_view::share(cx).set_on(allowed);
+        cx.emit(HubEvent::Consent);
+        cx.refresh_windows();
+    }
+
     /// Settings withdrew an approval: in memory at once, and from the
     /// database (never revoke through the repository alone, or the grant in
     /// memory would outlive it until a restart).

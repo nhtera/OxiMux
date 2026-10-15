@@ -99,6 +99,8 @@ struct Inner {
     child: Mutex<HelperChild>,
     ledger: Option<Arc<Ledger>>,
     kind: HelperKind,
+    /// The H.264 the helper sends, for a remote viewer.
+    tap: crate::encoded_tap::EncodedTap,
 }
 
 /// A running helper streaming one device. Cheap to clone; when the last
@@ -201,6 +203,15 @@ impl HelperSession {
             child: Mutex::new(child),
             ledger: opts.ledger.clone(),
             kind: opts.kind,
+            tap: Default::default(),
+        });
+        // A remote viewer asks for key frames through the tap, never through
+        // a session clone it would keep alive.
+        let weak = Arc::downgrade(&inner);
+        inner.tap.on_key_request(move || {
+            if let Some(inner) = weak.upgrade() {
+                video::request_key_frame(&inner);
+            }
         });
         let (video_tx, video_rx) = mpsc::sync_channel(video::QUEUE);
         let decoder = Arc::clone(&inner);
@@ -268,6 +279,12 @@ impl HelperSession {
         }
         let frame = self.inner.view.lock().unwrap().shown.clone()?;
         Some((seq, frame))
+    }
+
+    /// The H.264 the helper sends, for a remote viewer (nothing reaches it
+    /// while the helper streams JPEG).
+    pub fn tap(&self) -> &crate::encoded_tap::EncodedTap {
+        &self.inner.tap
     }
 
     /// When pictures last arrived, and last carried change (measured as they
@@ -507,6 +524,7 @@ fn dispatch_loop(
                         inner.frames.frame(now, Ingress::Delta { bytes, pixels });
                     }
                 }
+                tap_video(&inner.tap, &message);
                 // Never wait on the decoder: replies and events behind this
                 // picture must keep flowing. Decoded pictures wake the UI
                 // from the decoder's callback.
@@ -599,4 +617,18 @@ fn notify(inner: &Inner) {
 
 fn command_name(command: &Command) -> String {
     command.to_json(None).get("cmd").and_then(Value::as_str).unwrap_or("?").to_owned()
+}
+
+/// Hand one helper video message to the tap: every config (a late viewer
+/// starts from the last one), and pictures only while somebody watches.
+fn tap_video(tap: &crate::encoded_tap::EncodedTap, message: &protocol::Video) {
+    use crate::encoded_tap::{TapFrame, TapKind};
+    let kind = match message.tag {
+        protocol::VideoTag::Description => TapKind::Config,
+        protocol::VideoTag::Keyframe => TapKind::Key,
+        protocol::VideoTag::Delta => TapKind::Delta,
+    };
+    if kind == TapKind::Config || tap.wanted() {
+        tap.push(TapFrame { kind, pts_us: tap.pts_now(), data: Arc::from(message.data.as_slice()) });
+    }
 }

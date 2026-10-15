@@ -90,6 +90,8 @@ struct Inner {
     /// Input went through with no refusal from the server: the phone takes
     /// it, for this session's life (the setting needs a reconnect).
     input_proven: AtomicBool,
+    /// The H.264 the device sends, as AVCC, for a remote viewer.
+    tap: crate::encoded_tap::EncodedTap,
 }
 
 /// A streaming Android device. Cheap to clone; shut down when the last clone
@@ -159,6 +161,15 @@ impl AndroidSession {
             port,
             native,
             density,
+            tap: Default::default(),
+        });
+        // A remote viewer asks for key frames through the tap, never through
+        // a session clone it would keep alive.
+        let weak = Arc::downgrade(&inner);
+        inner.tap.on_key_request(move || {
+            if let Some(inner) = weak.upgrade() {
+                request_keyframe(&inner);
+            }
         });
         // The guard first: if the reader cannot start, dropping it stops all.
         let guard = Arc::new(Guard(Arc::clone(&inner)));
@@ -200,6 +211,11 @@ impl AndroidSession {
 
     pub fn take_events(&self) -> Option<mpsc::Receiver<SessionEvent>> {
         self.inner.events.lock().unwrap().take()
+    }
+
+    /// The H.264 the device sends (as AVCC), for a remote viewer.
+    pub fn tap(&self) -> &crate::encoded_tap::EncodedTap {
+        &self.inner.tap
     }
 
     /// When packets last arrived, and last carried change (measured as they
@@ -390,6 +406,36 @@ fn orientation_of(size: Option<(u32, u32)>, requested: Option<Orientation>) -> O
     }
 }
 
+/// Ask scrcpy for a key frame when the limiter allows (one forced key frame
+/// a second, whoever asks). scrcpy restarts its encoder for one, so the
+/// stream's next packets are a config and a key frame. A full control queue
+/// drops the ask: the next one wins.
+fn request_keyframe(inner: &Inner) {
+    let now = Instant::now();
+    if inner.frames.request_key(now) || inner.frames.poll_key(now) {
+        let control = inner.control.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(tx) = control.as_ref() {
+            let _ = tx.try_send(ControlMsg::ResetVideo.serialize());
+        }
+    }
+}
+
+/// Hand one packet to the tap, as WebCodecs takes it: a config as an avcC
+/// record (always: a late viewer starts from the last one), a picture as an
+/// AVCC sample (only while somebody watches).
+fn tap_packet(tap: &crate::encoded_tap::EncodedTap, packet: &super::scrcpy_video::MediaPacket) {
+    use crate::encoded_tap::{TapFrame, TapKind};
+    use crate::video::annexb;
+    if packet.config {
+        if let Some(record) = annexb::parameter_sets(&packet.data).as_ref().and_then(annexb::avcc_record) {
+            tap.push(TapFrame { kind: TapKind::Config, pts_us: 0, data: record.into() });
+        }
+    } else if tap.wanted() {
+        let kind = if packet.key_frame { TapKind::Key } else { TapKind::Delta };
+        tap.push(TapFrame { kind, pts_us: packet.pts, data: annexb::to_avcc(&packet.data).into() });
+    }
+}
+
 fn read_loop(inner: Arc<Inner>, mut video: TcpStream) {
     #[cfg(target_os = "macos")]
     let mut decoder: Option<Decoder> = None;
@@ -410,6 +456,9 @@ fn read_loop(inner: Arc<Inner>, mut video: TcpStream) {
             }
             Err(e) => break e.to_string(),
         };
+        if let VideoEvent::Media(packet) = &event {
+            tap_packet(&inner.tap, packet);
+        }
         if let VideoEvent::Media(packet) = &event
             && !packet.config
         {

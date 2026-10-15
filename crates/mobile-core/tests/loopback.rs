@@ -1193,3 +1193,142 @@ async fn a_phone_rewinds_a_session_and_its_transcript_truncates() {
     client.disconnect().await;
     let _ = server.await;
 }
+
+/// A desktop with one device whose frames the view test feeds, and a flag
+/// for the phone's viewer being released.
+struct ViewScreen {
+    frames: Mutex<Option<tokio::sync::mpsc::Receiver<oximux_remote_host::SimViewOut>>>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ViewSource {
+    frames: tokio::sync::mpsc::Receiver<oximux_remote_host::SimViewOut>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ViewSource {
+    fn drop(&mut self) {
+        self.released.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl oximux_remote_host::SimViewSource for ViewSource {
+    async fn next(&mut self) -> Option<oximux_remote_host::SimViewOut> {
+        self.frames.recv().await
+    }
+    fn allowed(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl oximux_remote_host::SimulatorControl for ViewScreen {
+    async fn run(
+        &self,
+        _: &str,
+        _: oximux_remote_host::SimPrincipal,
+        _: oximux_remote_proto::simulator::SimCmdWire,
+    ) -> Result<oximux_remote_proto::simulator::SimReplyWire, oximux_remote_proto::simulator::SimErrorWire> {
+        Ok(oximux_remote_proto::simulator::SimReplyWire::Done)
+    }
+    fn supports_view(&self) -> bool {
+        true
+    }
+    async fn view_subscribe(
+        &self,
+        _: &oximux_remote_host::SimViewer,
+        _: &str,
+    ) -> Result<oximux_remote_host::SimViewFeed, oximux_remote_proto::simulator::SimErrorWire> {
+        let frames = self.frames.lock().unwrap().take().ok_or(oximux_remote_proto::simulator::SimErrorWire::ConsentPending)?;
+        Ok(oximux_remote_host::SimViewFeed {
+            width: 590,
+            height: 1278,
+            bits_per_sec: 0,
+            source: Box::new(ViewSource { frames, released: self.released.clone() }),
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingViewSink {
+    frames: Mutex<Vec<(String, u8, Vec<u8>)>>,
+}
+
+impl oximux_mobile_core::SimViewSink for RecordingViewSink {
+    fn on_frame(&self, token: String, kind: u8, _pts_us: u64, data: Vec<u8>) {
+        self.frames.lock().unwrap().push((token, kind, data));
+    }
+    fn on_end(&self, _token: String) {}
+}
+
+/// The phone's whole view path across the FFI: subscribe, frames into the
+/// app's sink under the subscription's token, and — the regression this
+/// pins — dropping the client still closes the connection and releases the
+/// desktop's viewer, though a pump was waiting on the connection's streams.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watched_device_reaches_the_app_sink_and_dropping_the_client_lets_go() {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let screen = Arc::new(ViewScreen { frames: Mutex::new(Some(rx)), released: released.clone() });
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(Arc::new(SessionRegistry::new()), auth.clone()).with_simulator(screen));
+    let (client_t, server_t) = duplex_pair();
+    let server = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+    let ticket = PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let connector = Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) });
+    client
+        .connect_with(connector, ticket, "phone".into(), Arc::new(RecordingListener::default()))
+        .await
+        .expect("connect_with");
+    assert!(client.host_supports_sim_view(), "a current host serves views");
+    assert_eq!(client.connection_relayed(), None, "a loopback has no relay to speak of");
+
+    let sink = Arc::new(RecordingViewSink::default());
+    client.set_sim_view_sink(sink.clone());
+    let token = match client.subscribe_sim_view("E0E0".into()).await.expect("subscribe") {
+        oximux_mobile_core::SimSubscribeOutcome::Started { token, width, height } => {
+            assert_eq!((width, height), (590, 1278));
+            token
+        }
+        other => panic!("not started: {other:?}"),
+    };
+    let frame = |kind, payload: &[u8]| oximux_remote_host::SimViewOut { kind, pts_us: 0, payload: payload.into() };
+    tx.send(frame(oximux_remote_proto::simulator::SimViewKind::Config, &[1, 0x64, 0, 0x1f])).await.unwrap();
+    tx.send(frame(oximux_remote_proto::simulator::SimViewKind::Key, &[0, 0, 0, 1, 0x65])).await.unwrap();
+    for _ in 0..200 {
+        if sink.frames.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = sink.frames.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!((got[0].0.as_str(), got[0].1), (token.as_str(), 0), "the config first, under the token");
+    assert_eq!((got[1].1, got[1].2.as_slice()), (1, &[0, 0, 0, 1, 0x65][..]), "a key frame, as sent");
+
+    // Revoked on the desktop: the next subscribe is a refusal the app shows
+    // (and does not keep retrying), not an error.
+    for device in auth.devices() {
+        auth.revoke(&device.pubkey);
+    }
+    match client.subscribe_sim_view("E0E0".into()).await.expect("answered") {
+        oximux_mobile_core::SimSubscribeOutcome::Refused { message } => assert!(message.contains("no longer watch"), "{message}"),
+        other => panic!("a revoked phone was not refused: {other:?}"),
+    }
+
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(5), server).await.expect("the host's connection ends").unwrap();
+    for _ in 0..100 {
+        if released.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(released.load(std::sync::atomic::Ordering::SeqCst), "the desktop's viewer is released");
+}

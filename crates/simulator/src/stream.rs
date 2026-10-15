@@ -166,6 +166,16 @@ impl StreamSession {
         }
     }
 
+    /// The encoded picture, for a remote viewer (who asks for key frames
+    /// through it: [`crate::encoded_tap::TapReceiver::request_key`]).
+    pub fn tap(&self) -> &crate::encoded_tap::EncodedTap {
+        match self {
+            Self::Ios(s) => s.tap(),
+            Self::IosDevice(s) => s.video().tap(),
+            Self::Android(s) => s.tap(),
+        }
+    }
+
     /// When pictures last arrived, and last carried change on screen (see
     /// [`crate::keyframe`]): what an action's settle waits on.
     pub fn frame_clock(&self) -> crate::keyframe::FrameClock {

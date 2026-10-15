@@ -34,6 +34,7 @@ mod simulator_flow;
 mod simulator_rn;
 mod simulator_state;
 mod simulator_verify;
+mod simulator_view;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod transport;
@@ -46,4 +47,4 @@ pub use messages::{
 };
 pub use pairing::{PairingError, PairingTicket, registration_proof};
 pub use proto::{PROTOCOL_VERSION, Request, Response, RpcError, WireError};
-pub use transport::{Transport, TransportError};
+pub use transport::{Transport, TransportError, UniRecv, UniSend};

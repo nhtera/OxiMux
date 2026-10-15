@@ -179,12 +179,17 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// registers and keeps consent apart for. A v32 host has no MCP credential:
 /// see [`SIMULATOR_MCP_MIN_VERSION`].
 ///
+/// v34: **watching a device from the paired phone** ([`Request::SimViewables`],
+/// [`Request::SimSubscribe`], [`Request::SimUnsubscribe`] and their replies).
+/// The picture rides a one-way stream of its own, not this envelope. A v33
+/// host cannot decode them: see [`SIMULATOR_VIEW_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 33;
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -298,6 +303,10 @@ pub const SIMULATOR_RN_MIN_VERSION: u32 = 32;
 /// The oldest host that takes an outside MCP client (`oximux mcp`) as a
 /// principal of its own. Read by the **client**.
 pub const SIMULATOR_MCP_MIN_VERSION: u32 = 33;
+
+/// The oldest host the phone can watch a device on. Read by the **client**:
+/// the phone shows its Devices screen only to a host at or above it.
+pub const SIMULATOR_VIEW_MIN_VERSION: u32 = 34;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -918,6 +927,23 @@ pub enum Request {
     /// the reply reports as [`SimErrorWire::ConsentPending`] rather than
     /// blocking on it.
     Simulator(SimRequestWire),
+
+    // ---- v34: watching a device from the paired phone ----
+    /// The devices this caller may watch. A paired phone needs full scope
+    /// (not one narrowed to a session), and the desktop's "Let paired phones
+    /// view" setting on; with it off the reply is
+    /// [`SimErrorWire::Refused`] saying so.
+    SimViewables,
+    /// Start watching `device` (a [`SimViewableWire::device`]). The reply
+    /// carries the token of a one-way stream the host opens next; the
+    /// picture never rides this connection's message stream. The first ask
+    /// for a device in a desktop run waits on the user there:
+    /// [`SimErrorWire::ConsentPending`], retried by the phone.
+    ///
+    /// [`SimViewableWire::device`]: crate::simulator::SimViewableWire::device
+    SimSubscribe { device: String },
+    /// Stop watching. Idempotent; dropping the stream does the same.
+    SimUnsubscribe { token: crate::simulator::SimViewToken },
 }
 
 /// Host → client.
@@ -1147,6 +1173,12 @@ pub enum Response {
     // ---- v25: the iOS Simulator ----
     /// Reply to [`Request::Simulator`].
     Simulator(Result<SimReplyWire, SimErrorWire>),
+
+    // ---- v34: watching a device from the paired phone ----
+    /// Reply to [`Request::SimViewables`].
+    SimViewables(Result<Vec<crate::simulator::SimViewableWire>, SimErrorWire>),
+    /// Reply to [`Request::SimSubscribe`].
+    SimSubscribed(Result<crate::simulator::SimSubscribedWire, SimErrorWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

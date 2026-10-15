@@ -32,6 +32,6 @@ pub use demux::{DemuxPump, EventStream, SessionsStream, TerminalPush, TerminalSt
 pub use driver::{Bootstrap, Sleeper, maintain_connection};
 pub use error::SessionError;
 pub use reconnect::{ConnAction, ConnState, Reconnect};
-pub use session::RemoteSession;
+pub use session::{RemoteSession, SessionClosed, ViewStreams};
 pub use signer::ClientSigner;
 pub use subscription::{FoldOutcome, SessionSubscription};

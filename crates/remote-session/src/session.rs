@@ -10,6 +10,8 @@
 
 mod git;
 mod handshake;
+mod sim_view;
+pub use sim_view::{SessionClosed, ViewStreams};
 mod subscribe;
 mod terminals;
 
@@ -52,6 +54,16 @@ pub struct RemoteSession {
     /// The pushed session-list stream, taken once by the owner. Each item is a full
     /// per-device snapshot that replaces the client's session list wholesale.
     sessions: Mutex<Option<SessionsStream>>,
+    /// The connection itself, for the one-way streams the host opens (a
+    /// device's picture); every message rides the demux above.
+    transport: Arc<dyn Transport>,
+    /// The protocol version the host said it speaks in `Hello` (v1 for a host
+    /// too old to answer), so the app can offer only what the host serves.
+    host_version: std::sync::atomic::AtomicU32,
+    /// Taken once by [`Self::take_view_streams`]: resolves when this session
+    /// is dropped (its sender is `_views_open`).
+    views_closed: Mutex<Option<oneshot::Receiver<()>>>,
+    _views_open: oneshot::Sender<()>,
     /// Dropping this stops the pump — so the connection tears down when the
     /// session is dropped, no explicit close needed.
     _shutdown: oneshot::Sender<()>,
@@ -59,8 +71,13 @@ pub struct RemoteSession {
 
 impl RemoteSession {
     pub fn new(transport: Arc<dyn Transport>, signer: ClientSigner) -> Self {
-        let (handle, pump, events, terminals, sessions, shutdown) = demux(transport);
+        let (handle, pump, events, terminals, sessions, shutdown) = demux(transport.clone());
+        let (views_open, views_closed) = oneshot::channel();
         Self {
+            views_closed: Mutex::new(Some(views_closed)),
+            _views_open: views_open,
+            transport,
+            host_version: std::sync::atomic::AtomicU32::new(oximux_remote_proto::proto::ASSUMED_VERSION_WHEN_SILENT),
             demux: handle,
             signer,
             token: Mutex::new(None),

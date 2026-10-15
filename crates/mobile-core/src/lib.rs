@@ -18,16 +18,18 @@ mod client;
 mod ffi_types;
 mod runtime;
 mod sessions;
+mod sim_view;
 mod snapshot;
 mod subscription;
 mod terminals;
 
 uniffi::setup_scaffolding!();
 
-pub use callbacks::{ConnStateListener, TerminalSink, ThreadSink};
+pub use callbacks::{ConnStateListener, SimViewSink, TerminalSink, ThreadSink};
 pub use client::MobileClient;
 pub use ffi_types::{
     ChatImage, Choice, ConnState, MobileError, PermissionReply, ProjectSummary, SessionChoices,
     SessionSummary, TerminalInfo, TerminalScreen,
 };
+pub use sim_view::{SimSubscribeOutcome, SimViewList, SimViewable};
 pub use snapshot::ThreadSnapshot;

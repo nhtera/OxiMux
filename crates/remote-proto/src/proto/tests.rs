@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 33,
-        "v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+        PROTOCOL_VERSION, 34,
+        "v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
          status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
@@ -1022,3 +1022,39 @@ fn a_v10_decoder_cannot_read_a_cron_recurrence() {
     }
 }
 
+
+/// v34: the phone's view RPCs append after the simulator's (requests 70–72,
+/// replies 53–54) and survive the codec.
+#[test]
+fn sim_view_rpcs_append_and_round_trip() {
+    let token = [9u8; 16];
+    let reqs = [
+        (Request::SimViewables, 70),
+        (Request::SimSubscribe { device: "E0E0".into() }, 71),
+        (Request::SimUnsubscribe { token }, 72),
+    ];
+    for (req, ordinal) in reqs {
+        let bytes = req.to_bytes().expect("encode");
+        assert_eq!(bytes[0], ordinal, "{req:?}");
+        assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
+    }
+    let row = SimViewableWire {
+        device: "E0E0".into(),
+        name: "iPhone 17".into(),
+        worktree: "oximux · main".into(),
+        class: SimViewClassWire::AndroidPhone,
+        streaming: true,
+    };
+    let subscribed = SimSubscribedWire { token, width: 590, height: 1278 };
+    let resps = [
+        (Response::SimViewables(Ok(vec![row])), 53),
+        (Response::SimViewables(Err(SimErrorWire::Refused("off".into()))), 53),
+        (Response::SimSubscribed(Ok(subscribed)), 54),
+        (Response::SimSubscribed(Err(SimErrorWire::ConsentPending)), 54),
+    ];
+    for (resp, ordinal) in resps {
+        let bytes = resp.to_bytes().expect("encode");
+        assert_eq!(bytes[0], ordinal, "{resp:?}");
+        assert_eq!(Response::from_bytes(&bytes).expect("decode"), resp);
+    }
+}
