@@ -13,7 +13,7 @@ use futures::executor::block_on;
 use futures::future::join;
 use oximux_agents::session_registry::{SessionMeta, SessionRegistry};
 use oximux_agents::thread::StubConnection;
-use oximux_remote_host::{AuthStore, Dispatcher, LocalScope, PairingSlot, SimulatorControl, registration_proof};
+use oximux_remote_host::{AuthStore, Dispatcher, LocalScope, PairingSlot, SimPrincipal, SimulatorControl, registration_proof};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::messages::RegisterReq;
 use oximux_remote_proto::proto::{Request, Response, RpcError};
@@ -30,13 +30,15 @@ async fn call(client: &dyn Transport, req: Request) -> Response {
 #[derive(Default)]
 struct Spy {
     worktrees: Mutex<Vec<String>>,
+    principals: Mutex<Vec<SimPrincipal>>,
     cmds: Mutex<Vec<SimCmdWire>>,
 }
 
 #[async_trait::async_trait]
 impl SimulatorControl for Spy {
-    async fn run(&self, worktree: &str, cmd: SimCmdWire) -> Result<SimReplyWire, SimErrorWire> {
+    async fn run(&self, worktree: &str, principal: SimPrincipal, cmd: SimCmdWire) -> Result<SimReplyWire, SimErrorWire> {
         self.worktrees.lock().unwrap().push(worktree.to_string());
+        self.principals.lock().unwrap().push(principal);
         self.cmds.lock().unwrap().push(cmd);
         Ok(SimReplyWire::Done)
     }
@@ -86,6 +88,98 @@ fn a_log_read_reaches_the_simulator_as_sent() {
     assert_eq!(got, vec![Response::Simulator(Ok(SimReplyWire::Done))]);
     assert_eq!(*spy.worktrees.lock().unwrap(), ["/work/mine"]);
     assert_eq!(*spy.cmds.lock().unwrap(), [cmd]);
+}
+
+/// An outside MCP client is its own principal and names its worktree; an
+/// agent and the operator are agents.
+#[test]
+fn the_principal_follows_the_credential() {
+    let spy = Arc::new(Spy::default());
+    let got = local(&host(Some(spy.clone())), LocalScope::Mcp, vec![sim(Some("/work/repo"))]);
+    assert_eq!(got, vec![Response::Simulator(Ok(SimReplyWire::Done))]);
+    local(&host(Some(spy.clone())), LocalScope::Full, vec![sim(Some("/work/repo"))]);
+    local(&host(Some(spy.clone())), LocalScope::Session("sess-1".into()), vec![sim(None)]);
+    assert_eq!(*spy.principals.lock().unwrap(), [SimPrincipal::Mcp, SimPrincipal::Agent, SimPrincipal::Agent]);
+    assert_eq!(*spy.worktrees.lock().unwrap(), ["/work/repo", "/work/repo", "/work/mine"]);
+}
+
+/// A verb that never finishes, and says when it is dropped.
+struct Hang(Arc<std::sync::atomic::AtomicBool>);
+
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl SimulatorControl for Hang {
+    async fn run(&self, _: &str, _: SimPrincipal, _: SimCmdWire) -> Result<SimReplyWire, SimErrorWire> {
+        let _flag = DropFlag(self.0.clone());
+        futures::future::pending().await
+    }
+}
+
+/// A caller that goes away (a client timeout, a cancelled MCP call) takes its
+/// verb with it: nothing keeps acting on the device for nobody.
+#[test]
+fn a_caller_that_leaves_drops_its_verb() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::new(AuthStore::new()))
+        .with_simulator(Arc::new(Hang(dropped.clone())));
+    let (server, client) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, LocalScope::Mcp);
+    let script = async move {
+        client.send(sim(Some("/work/repo")).to_bytes().unwrap()).await.unwrap();
+        drop(client);
+    };
+    block_on(join(serve, script));
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the verb was dropped with its caller");
+}
+
+/// The first verb waits until released; the rest answer at once.
+struct Gate(Mutex<Option<futures::channel::oneshot::Receiver<()>>>);
+
+#[async_trait::async_trait]
+impl SimulatorControl for Gate {
+    async fn run(&self, _: &str, _: SimPrincipal, cmd: SimCmdWire) -> Result<SimReplyWire, SimErrorWire> {
+        let gate = self.0.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        Ok(match cmd {
+            SimCmdWire::Status => SimReplyWire::Done,
+            _ => SimReplyWire::Screenshot { png: vec![], width: 1, height: 1, scale: 1.0 },
+        })
+    }
+}
+
+/// A request sent while a verb runs (pipelined) is kept, and answered after
+/// it, in order — once each.
+#[test]
+fn a_pipelined_request_is_answered_after_the_verb_before_it() {
+    let (release, gate) = futures::channel::oneshot::channel();
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::new(AuthStore::new()))
+        .with_simulator(Arc::new(Gate(Mutex::new(Some(gate)))));
+    let (server, client) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, LocalScope::Full);
+    let script = async move {
+        client.send(sim(Some("/w")).to_bytes().unwrap()).await.unwrap();
+        let status = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: SimCmdWire::Status });
+        client.send(status.to_bytes().unwrap()).await.unwrap();
+        let _ = release.send(());
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(Response::from_bytes(&client.recv().await.unwrap().unwrap()).unwrap());
+        }
+        drop(client);
+        got
+    };
+    let got = block_on(join(serve, script)).1;
+    assert!(matches!(got[0], Response::Simulator(Ok(SimReplyWire::Screenshot { .. }))), "{got:?}");
+    assert_eq!(got[1], Response::Simulator(Ok(SimReplyWire::Done)));
 }
 
 fn sim(worktree: Option<&str>) -> Request {

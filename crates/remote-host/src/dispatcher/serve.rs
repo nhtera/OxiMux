@@ -109,7 +109,9 @@ impl Dispatcher {
         let mut live_leads = false;
 
         loop {
-            let picked = if streams.is_empty() {
+            let picked = if let Some(frame) = state.held.take() {
+                Picked::Request(Some(frame))
+            } else if streams.is_empty() {
                 // No live subscription: block purely on the next request — never
                 // busy-spin on an ended/empty merged stream.
                 Picked::Request(transport.recv().await.ok().flatten())
@@ -585,19 +587,38 @@ impl Dispatcher {
         // The simulator round-trips to the desktop's UI thread and waits on
         // the device (a screenshot, an install), so it is awaited here like
         // `CreateSession`. Its handler applies the simulator gate.
+        //
+        // Raced against the connection: a caller that goes away (a client
+        // timeout, an MCP tool call cancelled) drops the verb with it, rather
+        // than leaving it to act on the device with nobody listening. `recv`
+        // is cancel-safe, so a frame that arrives meanwhile (a pipelined
+        // request) is kept and served once this one is answered.
         if let Request::Simulator(req) = req {
             let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.simulator(&peer, req).await;
-            return self.send(transport, response).await;
+            let run = Box::pin(self.simulator(&peer, req));
+            return match select(run, Box::pin(transport.recv())).await {
+                Either::Left((response, _)) => self.send(transport, response).await,
+                // Held for the serve loop (never served by recursion: a
+                // client pipelining many would nest without limit).
+                Either::Right((Ok(Some(frame)), run)) => {
+                    state.held = Some(frame);
+                    self.send(transport, run.await).await
+                }
+                Either::Right((Ok(None) | Err(_), _)) => {
+                    tracing::debug!("the caller left: its simulator verb is dropped");
+                    false
+                }
+            };
         }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it
         // `spawn_blocking`s the decode) and is awaited here rather than in the
         // sync `dispatch`. Gated on the authenticated connection alone — it names
         // no session and mutates nothing.
         if let Request::TranscribeAudio { audio_base64, sample_rate } = req {
-            if authorized_peer(&state.authn, &self.auth).is_none() {
+            // Not an outside MCP client's: it drives the simulator, nothing else.
+            if authorized_peer(&state.authn, &self.auth).is_none_or(|peer| peer.is_mcp()) {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             }
             let response = self.transcribe_audio(&audio_base64, sample_rate).await;

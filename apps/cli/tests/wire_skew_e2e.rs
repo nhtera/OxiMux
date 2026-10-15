@@ -817,3 +817,52 @@ fn a_new_client_is_told_an_old_host_has_no_rn_or_net() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// v33: `oximux mcp` against a released host that predates MCP clients: the
+/// server starts (the client sees its tools), and each call says to update —
+/// never a handshake or decode error.
+#[test]
+fn an_mcp_client_is_told_an_old_host_takes_no_mcp() {
+    use std::io::{BufRead as _, Write as _};
+    let Some(old) = old_cli() else {
+        eprintln!("skipped: OXIMUX_SKEW_CLI is unset");
+        return;
+    };
+    let host_version = protocol_of(&old);
+    if host_version >= oximux_remote_proto::proto::SIMULATOR_MCP_MIN_VERSION {
+        eprintln!("skipped: the released peer already speaks v{host_version}");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let shim = tmp.path().join("bin");
+    common::install_claude_shim(&shim);
+    let (mut child, dir) = boot_released_serve(&old, &data, &shim, tmp.path());
+
+    let mut mcp = common::bin()
+        .args(["--dir", &dir, "mcp", "--worktree", tmp.path().to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = mcp.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(mcp.stdout.take().unwrap());
+    let mut ask = |message: serde_json::Value| -> serde_json::Value {
+        writeln!(stdin, "{message}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    ask(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }));
+    let status = ask(serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "sim_status", "arguments": {} } }));
+    let text = status["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
+    assert_eq!(status["result"]["isError"], true, "{status}");
+    assert!(text.contains("takes no MCP clients") && text.contains("update"), "the answer says what to do: {text}");
+    assert!(!text.contains("undecodable"), "never blame the frame: {text}");
+
+    let _ = mcp.kill();
+    let _ = mcp.wait();
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -174,12 +174,17 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// its Metro debugger. `sim net` (on the wire since v28) is served from v32
 /// too. A v31 host cannot decode it: see [`SIMULATOR_RN_MIN_VERSION`].
 ///
+/// v33: the **MCP principal**. No frame changed: the local hello gained a
+/// `Mcp` identity (an outside MCP client, `oximux mcp`), which a v33 desktop
+/// registers and keeps consent apart for. A v32 host has no MCP credential:
+/// see [`SIMULATOR_MCP_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -289,6 +294,10 @@ pub const SIMULATOR_EXEC_MIN_VERSION: u32 = 31;
 /// refuses `net`, though it decodes it). Read by the **client** and gated on
 /// what the command asks for.
 pub const SIMULATOR_RN_MIN_VERSION: u32 = 32;
+
+/// The oldest host that takes an outside MCP client (`oximux mcp`) as a
+/// principal of its own. Read by the **client**.
+pub const SIMULATOR_MCP_MIN_VERSION: u32 = 33;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the

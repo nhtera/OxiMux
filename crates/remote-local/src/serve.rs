@@ -211,6 +211,19 @@ impl LocalControlListener {
         }
     }
 
+    /// Mint the MCP client's credential, register it, and write it to the
+    /// runtime dir's MCP token file (owner-only, like the operator's). A
+    /// connection presenting it is the `Mcp` principal: a scope of its own,
+    /// with consent of its own. Not isolation — any process of this user can
+    /// read either file — but an outside client never rides an agent's
+    /// approval.
+    pub fn grant_mcp(&self, runtime_dir: &Path) -> Result<()> {
+        let secret = crate::generate_token();
+        secure::write_token_file(&crate::mcp_token_path(runtime_dir), &secret)?;
+        self.credentials.lock().unwrap().insert(LocalIdentity::Mcp, (secret, LocalClaim::Mcp));
+        Ok(())
+    }
+
     /// Drop a credential when its agent ends, so a leaked secret stops working
     /// with the process it was minted for. Keyed on the mint-time label, not
     /// the session id — the label is what the agent's environment carries.

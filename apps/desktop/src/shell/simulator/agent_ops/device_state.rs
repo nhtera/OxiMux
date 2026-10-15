@@ -158,11 +158,11 @@ pub(super) async fn confirm(
     cx: &mut AsyncApp,
 ) -> Result<(), SimErrorWire> {
     let what = kind.what(name);
-    let id = hub.update(cx, |hub, cx| hub.ask_per_call(udid, &target.worktree, name, kind, cx));
+    let id = hub.update(cx, |hub, cx| hub.ask_per_call(target.principal, udid, &target.worktree, name, kind, cx));
     let (asked, toast) = (target.clone(), what.clone());
     super::with_root(cx, target, move |root, window, cx| {
         let ids = (asked.project_id.clone(), asked.workspace_id.clone());
-        root.ask_simulator_consent(&asked.worktree, &asked.label, &toast, ids, window, cx);
+        root.ask_simulator_consent(&asked.worktree, (&asked.label, asked.principal), &toast, ids, window, cx);
     });
     loop {
         match hub.update(cx, |hub, _| hub.per_call_answer(id)) {

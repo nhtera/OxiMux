@@ -12,6 +12,7 @@ use oximux_remote_proto::simulator::{SimErrorWire, SimRequestWire};
 
 use super::Dispatcher;
 use crate::auth::Peer;
+use crate::simulator::SimPrincipal;
 
 impl Dispatcher {
     pub(super) async fn simulator(&self, peer: &Peer, req: SimRequestWire) -> Response {
@@ -38,6 +39,7 @@ impl Dispatcher {
                 }
             },
         };
-        Response::Simulator(simulator.run(&worktree, req.cmd).await)
+        let principal = if peer.is_mcp() { SimPrincipal::Mcp } else { SimPrincipal::Agent };
+        Response::Simulator(simulator.run(&worktree, principal, req.cmd).await)
     }
 }

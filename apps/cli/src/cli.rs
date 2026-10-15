@@ -372,6 +372,16 @@ pub enum Command {
         #[command(subcommand)]
         command: SimCommand,
     },
+    /// Serve the attached simulator to an outside MCP client over stdio
+    /// (`{"command": "oximux", "args": ["mcp", "--worktree", "/path/to/repo"]}`).
+    /// Six tools: status, observe, act, app, screenshot, wait-consent. The
+    /// client asks the user for its own permission, apart from agents'.
+    Mcp {
+        /// The worktree whose device to serve. Required unless the current
+        /// directory is a worktree OxiMux knows.
+        #[arg(long, value_name = "PATH")]
+        worktree: Option<PathBuf>,
+    },
     /// Run this machine as a headless OxiMux host.
     ///
     /// Boots the same session/terminal/storage stack the desktop app hosts —

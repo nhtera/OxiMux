@@ -187,6 +187,7 @@ pub mod git;
 pub mod heartbeat;
 pub mod hosts;
 pub mod model;
+pub mod mcp;
 pub mod pair;
 pub mod permit;
 pub mod run;

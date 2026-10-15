@@ -306,7 +306,7 @@ impl AuthStore {
     /// deleting its own wake-up is exactly what that caller is for.
     pub fn may_attempt_heartbeat_writes(&self, peer: &Peer) -> bool {
         match peer.kind() {
-            PeerKind::Local(_) => true,
+            PeerKind::Local(scope) => scope.is_agent_or_operator(),
             PeerKind::Remote(pubkey) => {
                 let st = self.inner.lock().unwrap();
                 matches!(st.devices.get(pubkey), Some(d) if !d.revoked && !d.read_only)
@@ -361,7 +361,7 @@ impl AuthStore {
     /// window into the host.
     pub fn may_read_state(&self, peer: &Peer) -> bool {
         match peer.kind() {
-            PeerKind::Local(_) => true,
+            PeerKind::Local(scope) => scope.is_agent_or_operator(),
             PeerKind::Remote(pubkey) => self.is_authorized(pubkey),
         }
     }
@@ -388,7 +388,7 @@ impl AuthStore {
     /// what they coordinate on.
     pub fn may_write_state(&self, peer: &Peer) -> bool {
         match peer.kind() {
-            PeerKind::Local(_) => true,
+            PeerKind::Local(scope) => scope.is_agent_or_operator(),
             PeerKind::Remote(pubkey) => {
                 let st = self.inner.lock().unwrap();
                 matches!(st.devices.get(pubkey), Some(d) if !d.revoked && !d.read_only)

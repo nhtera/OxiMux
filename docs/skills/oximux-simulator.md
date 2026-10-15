@@ -442,6 +442,29 @@ oximux sim button volume-down
 - `shutdown` stops an emulator OxiMux booted (with `--force`, one the user
   started). A phone is never shut down (exit 5).
 
+## Outside OxiMux: `oximux mcp`
+
+An agent app that is not OxiMux's own can drive the same device over MCP.
+Add a stdio server to its config, naming your repository:
+
+```json
+{ "mcpServers": { "oximux": { "command": "oximux", "args": ["mcp", "--worktree", "/path/to/repo"] } } }
+```
+
+- Six tools: `sim_status`, `sim_observe` (the `ax -i` list, optionally a
+  screenshot), `sim_act` (steps: tap, swipe, type, button, rotate, wait,
+  assert; each settles), `sim_app` (launch, install, open a URL),
+  `sim_screenshot`, `sim_wait_consent`. Each tool's text is the matching
+  CLI verb's. Nothing destructive (`erase`, `push`, `exec`) is exposed.
+- The client is asked for itself ("Let an outside MCP client control …"):
+  agents' permission does not cover it, nor its theirs, and its permission
+  ends when OxiMux quits.
+- Every call finishes within 25 s. A `wait` that would not fit is refused
+  (split it); a call that runs out is stopped on the device too.
+- Without `--worktree` it starts only in a worktree OxiMux knows, never in
+  `/` or your home directory. It needs the desktop app (the host with the
+  simulator).
+
 ## When something fails
 
 | exit | code | what to do |

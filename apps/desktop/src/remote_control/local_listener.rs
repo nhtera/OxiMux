@@ -66,6 +66,12 @@ pub fn start(
         let _guard = rt.enter();
         Arc::new(LocalControlListener::bind(&runtime_dir, &token)?)
     };
+    // The desktop is the host with the simulator: an outside MCP client
+    // (`oximux mcp`) gets a credential of its own. Without it, MCP is
+    // refused and nothing else changes.
+    if let Err(err) = listener.grant_mcp(&runtime_dir) {
+        tracing::warn!(%err, "could not write the MCP credential; `oximux mcp` will not connect");
+    }
     let accept_listener = listener.clone();
     let task = rt.spawn(async move {
         let listener = accept_listener;
@@ -99,6 +105,7 @@ pub fn start(
                             let scope = match claim {
                                 LocalClaim::Operator => LocalScope::Full,
                                 LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                                LocalClaim::Mcp => LocalScope::Mcp,
                             };
                             dispatcher.serve_local(transport.as_ref(), scope).await;
                         });

@@ -30,6 +30,9 @@ use super::AppPubkey;
 pub enum LocalScope {
     Full,
     Session(Arc<str>),
+    /// An outside MCP client (`oximux mcp`): the simulator, as a principal of
+    /// its own, and nothing else on the host.
+    Mcp,
 }
 
 impl LocalScope {
@@ -39,6 +42,7 @@ impl LocalScope {
         match self {
             LocalScope::Full => true,
             LocalScope::Session(id) => &**id == session_id,
+            LocalScope::Mcp => false,
         }
     }
 
@@ -48,6 +52,12 @@ impl LocalScope {
     /// serving a filtered view would silently widen the narrowing.
     pub(super) fn is_full(&self) -> bool {
         matches!(self, LocalScope::Full)
+    }
+
+    /// Host-wide surfaces every other local caller shares (the coordination
+    /// board, a heartbeat delete): never an outside MCP client's.
+    pub(super) fn is_agent_or_operator(&self) -> bool {
+        !matches!(self, LocalScope::Mcp)
     }
 }
 
@@ -136,7 +146,13 @@ impl Peer {
     pub(crate) fn own_session(&self) -> Option<&str> {
         match &self.0 {
             PeerKind::Local(LocalScope::Session(id)) => Some(id),
-            PeerKind::Local(LocalScope::Full) | PeerKind::Remote(_) => None,
+            PeerKind::Local(LocalScope::Full | LocalScope::Mcp) | PeerKind::Remote(_) => None,
         }
+    }
+
+    /// Whether this caller is an outside MCP client: the simulator keeps its
+    /// consent apart from agents'.
+    pub fn is_mcp(&self) -> bool {
+        matches!(&self.0, PeerKind::Local(LocalScope::Mcp))
     }
 }

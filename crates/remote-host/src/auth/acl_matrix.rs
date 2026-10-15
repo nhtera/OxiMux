@@ -240,6 +240,16 @@ fn a_session_confined_agent_reaches_only_its_own_session() {
     );
 }
 
+/// An outside MCP client (`oximux mcp`): the simulator, and nothing else — not
+/// a session, not the coordination board an agent shares, not a terminal.
+#[test]
+fn an_mcp_client_reaches_only_the_simulator() {
+    let store = AuthStore::new();
+    let peer = Peer::local(LocalScope::Mcp);
+    assert_eq!(observe(&store, &peer), Row { control_simulator: true, ..NOTHING }, "an outside client drives the device only");
+    assert!(peer.is_mcp() && !peer.is_local_operator() && peer.own_session().is_none());
+}
+
 /// Confinement is about the *named* session, not about the caller having been
 /// confined to something. A scope bound to one id refuses every other id, which
 /// is what stops an agent from walking into the session next door.

@@ -103,6 +103,16 @@ pub async fn dial(runtime_dir: &Path) -> Result<Arc<LocalSocketTransport>, DialE
     dial_as(runtime_dir, identity, &token).await
 }
 
+/// Dial as the MCP client (`oximux mcp`), with the runtime dir's MCP token.
+/// No such file: this host does not take MCP clients (an older OxiMux, or one
+/// without a simulator).
+pub async fn dial_mcp(runtime_dir: &Path) -> Result<Arc<LocalSocketTransport>, DialError> {
+    let token = read_token_file(&crate::mcp_token_path(runtime_dir)).map_err(|e| DialError::NoCredential(format!(
+        "this OxiMux does not take MCP clients ({e}): update OxiMux, and run it on the Mac with the simulator"
+    )))?;
+    dial_as(runtime_dir, LocalIdentity::Mcp, &token).await
+}
+
 /// Dial presenting an explicit identity/secret pair, rather than whichever
 /// credential the environment supplies.
 ///

@@ -106,6 +106,42 @@ pub(super) fn is_input(cmd: &SimCmdWire) -> bool {
     }
 }
 
+/// Whether a verb may be stopped halfway when its caller goes away: one that
+/// only reads or waits. Anything that touches the device (a gesture between
+/// its down and up, an erase, a state change, an install) runs to its end,
+/// or the device would be left half-done.
+pub(crate) fn may_abandon(cmd: &SimCmdWire) -> bool {
+    match cmd {
+        SimCmdWire::Status
+        | SimCmdWire::Devices
+        | SimCmdWire::Screenshot { .. }
+        | SimCmdWire::Ax { .. }
+        | SimCmdWire::AxRefs { .. }
+        | SimCmdWire::Wait { .. }
+        | SimCmdWire::Assert { .. }
+        | SimCmdWire::Logs(_)
+        | SimCmdWire::Crashes(_)
+        | SimCmdWire::Rn(_) => true,
+        SimCmdWire::AsCaller { cmd, .. } => may_abandon(cmd),
+        SimCmdWire::Attach { .. }
+        | SimCmdWire::Detach
+        | SimCmdWire::Tap(_)
+        | SimCmdWire::Swipe { .. }
+        | SimCmdWire::Type { .. }
+        | SimCmdWire::TypeInto { .. }
+        | SimCmdWire::Button(_)
+        | SimCmdWire::Rotate(_)
+        | SimCmdWire::Launch { .. }
+        | SimCmdWire::OpenUrl { .. }
+        | SimCmdWire::Install { .. }
+        | SimCmdWire::Shutdown { .. }
+        | SimCmdWire::Settled { .. }
+        | SimCmdWire::DeviceState(_)
+        | SimCmdWire::Flow(_)
+        | SimCmdWire::Exec(_) => false,
+    }
+}
+
 /// Verbs that read or drive the live screen (not the app verbs, which go
 /// through adb whether the screen is on or not). A settle reads the tree, so
 /// it needs the screen whatever it wraps.
@@ -241,6 +277,21 @@ mod tests {
 
     fn settled(cmd: SimCmdWire) -> SimCmdWire {
         SimCmdWire::Settled { action: Box::new(cmd), timeout_ms: 0 }
+    }
+
+    /// A caller that leaves stops only a look or a wait; a gesture, a state
+    /// change or an install runs to its end, envelope or not.
+    #[test]
+    fn only_reads_and_waits_are_abandoned() {
+        let wait = SimCmdWire::Wait { target: SimTargetWire::Label("Home".into()), gone: false, timeout_ms: 5000 };
+        assert!(may_abandon(&wait) && may_abandon(&SimCmdWire::Screenshot { full: false }));
+        assert!(may_abandon(&SimCmdWire::AsCaller { caller: 1, cmd: Box::new(SimCmdWire::AxRefs { max: 10 }) }));
+        let tap = SimCmdWire::Tap(SimTargetWire::Ref(3));
+        assert!(!may_abandon(&tap) && !may_abandon(&settled(tap)), "a finger is never left down");
+        let swipe = SimCmdWire::Swipe { from: oximux_remote_proto::simulator::SimPointWire { x: 1.0, y: 2.0 }, to: oximux_remote_proto::simulator::SimPointWire { x: 3.0, y: 4.0 }, duration_ms: 300 };
+        assert!(!may_abandon(&swipe));
+        let erase = SimCmdWire::DeviceState(oximux_remote_proto::simulator::SimStateCmdWire::Erase { force: false });
+        assert!(!may_abandon(&erase) && !may_abandon(&SimCmdWire::Install { path: "/w/A.app".into() }));
     }
 
     /// The verbs that inject input (and take the per-device input turn) —
