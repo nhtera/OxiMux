@@ -29,6 +29,9 @@ use serde::{Deserialize, Serialize};
 pub enum LocalClaim {
     Operator,
     Session(String),
+    /// An outside MCP client (`oximux mcp`): it drives the simulator as its
+    /// own principal, with consent of its own (appended; v33 hosts know it).
+    Mcp,
 }
 
 /// Which credential a caller is presenting. The label itself is **not** a
@@ -40,6 +43,10 @@ pub enum LocalIdentity {
     Operator,
     /// A per-session credential handed to one agent process at spawn.
     Session(String),
+    /// The MCP credential from the runtime dir's MCP token file, registered
+    /// only by a host with a simulator. An older host cannot decode this label
+    /// and drops the connection.
+    Mcp,
 }
 
 impl LocalIdentity {
@@ -52,6 +59,7 @@ impl LocalIdentity {
         match self {
             LocalIdentity::Operator => LocalClaim::Operator,
             LocalIdentity::Session(id) => LocalClaim::Session(id.clone()),
+            LocalIdentity::Mcp => LocalClaim::Mcp,
         }
     }
 }
@@ -228,7 +236,7 @@ mod tests {
     fn operator_only(identity: &LocalIdentity) -> Option<(String, LocalClaim)> {
         match identity {
             LocalIdentity::Operator => at_default_scope(LocalIdentity::Operator, TOKEN),
-            LocalIdentity::Session(_) => None,
+            LocalIdentity::Session(_) | LocalIdentity::Mcp => None,
         }
     }
 

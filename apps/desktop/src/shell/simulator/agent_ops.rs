@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{App, AsyncApp, Context, Entity, Window};
+use oximux_remote_host::SimPrincipal;
 use oximux_remote_proto::simulator::{
     SimCmdWire, SimConsentWire, SimDeviceWire, SimErrorWire, SimReplyWire, SimStatusWire,
 };
@@ -42,7 +43,7 @@ mod exec_files;
 mod flow;
 pub(crate) use flow::{platform as flow_platform, screen_points};
 pub(crate) use diagnostics::clamp;
-mod guards;
+pub(crate) mod guards;
 mod iphone;
 mod rn;
 mod rn_cdp;
@@ -81,13 +82,17 @@ pub(crate) struct Target {
     project_id: String,
     workspace_id: String,
     label: String,
+    /// Who asked (an agent, or an outside MCP client): consent and the
+    /// questions are its own.
+    pub principal: SimPrincipal,
 }
 
-/// Carry out one `oximux sim` verb for the worktree containing `path`.
-pub async fn run(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
+/// Carry out one `oximux sim` verb, for `principal`, for the worktree
+/// containing `path`.
+pub async fn run(path: String, principal: SimPrincipal, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
     // A command's error can carry what a tool printed (stderr, a payload):
     // scrubbed before it reaches the agent.
-    run_verb(path, cmd, cx).await.map_err(scrubbed)
+    run_verb(path, principal, cmd, cx).await.map_err(scrubbed)
 }
 
 /// `e` with secret-shaped values replaced in every word it carries.
@@ -111,7 +116,7 @@ fn scrubbed(e: SimErrorWire) -> SimErrorWire {
     }
 }
 
-async fn run_verb(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
+async fn run_verb(path: String, principal: SimPrincipal, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
     let hub = cx
         .update(|cx| hub(cx))
         .ok_or_else(|| SimErrorWire::Unavailable("the Mobile Emulator panel needs an Apple silicon Mac".into()))?;
@@ -120,7 +125,8 @@ async fn run_verb(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Si
     }
     let known = cx.update(known_worktrees);
     // Canonicalizing touches the filesystem: off the UI thread.
-    let target = cx.background_executor().spawn(async move { resolve(&path, known) }).await.ok_or(SimErrorWire::NoDevice)?;
+    let mut target = cx.background_executor().spawn(async move { resolve(&path, known) }).await.ok_or(SimErrorWire::NoDevice)?;
+    target.principal = principal;
     // An agent using the simulator counts as using the feature: the device
     // watcher may poll from now on.
     hub.update(cx, |hub, cx| hub.mark_used(cx));
@@ -139,13 +145,14 @@ async fn run_verb(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<Si
             }
             let (udid, name) = authorize(&hub, &target, cx)?;
             hub.update(cx, |hub, cx| hub.agent_verb_started(&udid, cx));
+            // Finished however the verb ends — dropped too, when its caller
+            // leaves — or the badge and the viewer it holds would stay.
+            let _finished = VerbFinished { hub: hub.downgrade(), udid: udid.clone(), cx: cx.clone() };
             let worktree = target.worktree.clone();
             with_root(cx, &target, move |root, _, cx| root.reveal_simulator_for(&worktree, Trigger::Verb, cx));
             // A v27 error never reaches a verb an older client could send.
             let asked = control.clone();
-            let out = verbs::run(&hub, &udid, &name, control, &target, cx).await.map_err(|e| e.for_verb(&asked));
-            hub.update(cx, |hub, cx| hub.agent_verb_finished(&udid, cx));
-            out
+            verbs::run(&hub, &udid, &name, control, &target, cx).await.map_err(|e| e.for_verb(&asked))
         }
     }
 }
@@ -220,6 +227,7 @@ fn resolve(path: &str, known: Vec<Known>) -> Option<Target> {
             project_id: k.project_id,
             workspace_id: k.workspace_id,
             label: k.label,
+            principal: SimPrincipal::Agent,
         })
 }
 
@@ -233,9 +241,31 @@ fn with_root(cx: &mut AsyncApp, target: &Target, f: impl FnOnce(&mut WorkspaceRo
     });
 }
 
-/// The kill switch, the attached device, then the user's consent for it.
-/// Returns the device and its name.
+/// Ends an agent verb's turn on the hub when it goes out of scope: at its
+/// end, or when the verb is dropped (its caller left).
+struct VerbFinished {
+    hub: gpui::WeakEntity<SimulatorHub>,
+    udid: DeviceId,
+    cx: AsyncApp,
+}
+
+impl Drop for VerbFinished {
+    fn drop(&mut self) {
+        let (hub, udid) = (self.hub.clone(), self.udid.clone());
+        // Queued, not run here: a drop may come mid-poll.
+        self.cx
+            .spawn(async move |cx: &mut AsyncApp| {
+                let _ = hub.update(cx, |hub, cx| hub.agent_verb_finished(&udid, cx));
+            })
+            .detach();
+    }
+}
+
+/// The kill switch, the attached device, then `principal`'s consent for it
+/// (an outside MCP client never rides an agent's, nor they its). Returns the
+/// device and its name.
 fn authorize(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> Result<(DeviceId, String), SimErrorWire> {
+    let principal = target.principal;
     let checked = cx
         .update(|cx| {
             if !super::panel::settings(cx).agent_control {
@@ -245,7 +275,7 @@ fn authorize(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> 
                 let udid = hub.device_for(&target.worktree).ok_or(SimErrorWire::NoDevice)?;
                 // Host-resolved, never caller text: it is shown to the user.
                 let name = device_name(hub, &udid);
-                let (verdict, raised) = hub.consent_check(&udid, &target.worktree, &name, cx);
+                let (verdict, raised) = hub.consent_check(principal, &udid, &target.worktree, &name, cx);
                 Ok((udid, name, verdict, raised))
             })
     })?;
@@ -255,7 +285,7 @@ fn authorize(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> 
         with_root(cx, target, move |root, window, cx| {
             root.ask_simulator_consent(
                 &target_for_root.worktree,
-                &target_for_root.label,
+                (&target_for_root.label, target_for_root.principal),
                 &what,
                 (target_for_root.project_id.clone(), target_for_root.workspace_id.clone()),
                 window,
@@ -275,6 +305,7 @@ fn device_name(hub: &SimulatorHub, udid: &DeviceId) -> String {
 }
 
 fn status(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
+    let principal = target.principal;
     cx.update(|cx| {
         let agent_control = super::panel::settings(cx).agent_control;
         hub.update(cx, |hub, _| {
@@ -300,7 +331,7 @@ fn status(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> Res
             let streaming = udid.as_ref().is_some_and(|u| matches!(hub.phase(u), oximux_simulator::registry::Phase::Live { .. }));
             let consent = match &udid {
                 None => SimConsentWire::NotAsked,
-                Some(udid) => match hub.consent_state(udid, &target.worktree) {
+                Some(udid) => match hub.consent_state(principal, udid, &target.worktree) {
                     State::NotAsked => SimConsentWire::NotAsked,
                     State::Pending => SimConsentWire::Pending,
                     State::Allowed => SimConsentWire::Allowed,

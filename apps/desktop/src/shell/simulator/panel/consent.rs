@@ -14,6 +14,7 @@ use gpui_component::{
     Sizable as _,
     button::{Button, ButtonVariants as _},
 };
+use oximux_remote_host::SimPrincipal;
 use oximux_simulator::DeviceId;
 
 use super::SimulatorPanel;
@@ -31,11 +32,11 @@ impl SimulatorPanel {
     /// The question `worktree`'s agent is waiting on, if any.
     pub(super) fn render_consent_for(&self, worktree: &std::path::Path, cx: &mut Context<Self>) -> Option<AnyElement> {
         let hub = self.hub.as_ref()?;
-        if let Some((id, device, kind)) = hub.read(cx).per_call_request(worktree) {
-            return Some(self.render_per_call(id, &device, &kind, cx));
+        if let Some((id, device, kind, principal)) = hub.read(cx).per_call_request(worktree) {
+            return Some(self.render_per_call(id, &device, &kind, principal, cx));
         }
-        let (udid, name) = hub.read(cx).consent_request(worktree)?;
-        Some(self.render_consent(udid, name, cx))
+        let (principal, udid, name) = hub.read(cx).consent_request(worktree)?;
+        Some(self.render_consent(principal, udid, name, cx))
     }
 
     /// The badge while an agent drives the device. Floats over the top of the
@@ -63,23 +64,35 @@ impl SimulatorPanel {
         )
     }
 
-    fn render_consent(&self, udid: DeviceId, name: String, cx: &mut Context<Self>) -> AnyElement {
-        let body = consent_body(&udid);
+    /// May agents (or, asked apart, an outside MCP client) control the
+    /// device? The answer goes to whoever asked.
+    fn render_consent(&self, principal: SimPrincipal, udid: DeviceId, name: String, cx: &mut Context<Self>) -> AnyElement {
+        let body = consent_body(principal, &udid);
+        let title = match principal {
+            SimPrincipal::Agent => format!("Let agents control {name}?"),
+            SimPrincipal::Mcp => format!("Let an outside MCP client control {name}?"),
+        };
         let (allow, deny) = (udid.clone(), udid);
         let allowed_name = name.clone();
         self.render_question(
-            format!("Let agents control {name}?"),
+            title,
             body,
             ("sim-consent-deny", "Don't allow"),
             ("sim-consent-allow", "Allow"),
             cx.listener(move |this, _, _window, cx| {
                 if let Some(hub) = this.hub.clone() {
-                    hub.update(cx, |hub, cx| hub.deny_agents(&deny, cx));
+                    hub.update(cx, |hub, cx| match principal {
+                        SimPrincipal::Agent => hub.deny_agents(&deny, cx),
+                        SimPrincipal::Mcp => hub.deny_mcp(&deny, cx),
+                    });
                 }
             }),
             cx.listener(move |this, _, _window, cx| {
                 if let Some(hub) = this.hub.clone() {
-                    hub.update(cx, |hub, cx| hub.allow_agents(&allow, allowed_name.clone(), cx));
+                    hub.update(cx, |hub, cx| match principal {
+                        SimPrincipal::Agent => hub.allow_agents(&allow, allowed_name.clone(), cx),
+                        SimPrincipal::Mcp => hub.allow_mcp(&allow, cx),
+                    });
                 }
             }),
         )
@@ -87,8 +100,8 @@ impl SimulatorPanel {
 
     /// A question asked every time (see `hub::per_call`): controlling a
     /// device is not putting apps on it, wiping it, or changing its settings.
-    fn render_per_call(&self, id: u64, device: &str, kind: &AskKind, cx: &mut Context<Self>) -> AnyElement {
-        let (title, body, (deny, allow)) = kind.question(device);
+    fn render_per_call(&self, id: u64, device: &str, kind: &AskKind, principal: SimPrincipal, cx: &mut Context<Self>) -> AnyElement {
+        let (title, body, (deny, allow)) = kind.question_from(device, principal);
         self.render_question(
             title,
             body,
@@ -172,7 +185,15 @@ impl SimulatorPanel {
 
 /// Why the consent question is asked. A real device's says so — screenshots
 /// may show the owner's own data — and that the answer lasts until quit.
-fn consent_body(udid: &DeviceId) -> String {
+fn consent_body(principal: SimPrincipal, udid: &DeviceId) -> String {
+    if principal == SimPrincipal::Mcp {
+        let device = if udid.is_physical() { "this real device" } else { "this simulator" };
+        return format!(
+            "An app outside OxiMux, connected with `oximux mcp`, wants to tap, type, and take screenshots of {device}. \
+             Agents' permission does not cover it. Screenshots go to wherever that app sends them. \
+             Access lasts until OxiMux quits."
+        );
+    }
     if udid.is_physical() {
         "An agent in this worktree wants to tap, type, and take screenshots of this real device. \
          Screenshots go to the agent's model provider and may show your personal data. \
@@ -191,9 +212,11 @@ mod tests {
 
     #[test]
     fn a_real_device_is_named_as_one_and_its_access_ends_at_quit() {
-        let real = consent_body(&DeviceId("adb:R58M123".into()));
+        let real = consent_body(SimPrincipal::Agent, &DeviceId("adb:R58M123".into()));
         assert!(real.contains("real device") && real.contains("until OxiMux quits"), "{real}");
-        let sim = consent_body(&DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into()));
+        let sim = consent_body(SimPrincipal::Agent, &DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into()));
         assert!(sim.contains("simulator") && !sim.contains("real device"));
+        let mcp = consent_body(SimPrincipal::Mcp, &DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into()));
+        assert!(mcp.contains("oximux mcp") && mcp.contains("does not cover") && mcp.contains("until OxiMux quits"), "{mcp}");
     }
 }

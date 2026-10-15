@@ -76,6 +76,8 @@ crossterm = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `oximux mcp` sends screenshots as base64 image content.
+base64 = { workspace = true }
 # `--output-schema`'s validator.
 jsonschema = { workspace = true }
 # Self-update. `minisign-verify` is the trust root: a zero-dependency verifier

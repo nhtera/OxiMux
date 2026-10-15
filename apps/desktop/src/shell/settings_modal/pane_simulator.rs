@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(left, ["avd:Pixel_Tablet"], "the row is gone from the database");
         hub.update(&mut vcx, |hub, _| {
             assert_eq!(hub.approvals().len(), 1);
-            assert_eq!(hub.consent_state(&u1, &worktree), State::NotAsked, "and from memory: it asks again");
+            assert_eq!(hub.consent_state(oximux_remote_host::SimPrincipal::Agent, &u1, &worktree), State::NotAsked, "and from memory: it asks again");
         });
         // Still paints with one left, then with none.
         hub.update(&mut vcx, |hub, cx| hub.revoke_all_agents(cx));

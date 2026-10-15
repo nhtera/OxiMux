@@ -146,12 +146,41 @@ impl Client {
     /// Dial the local socket, authenticate, and exchange versions. Every
     /// failure carries its exit class and a concrete next step.
     pub async fn connect(dir: Option<PathBuf>, timeout_secs: u64) -> Result<Self, Failure> {
+        Self::connect_as(dir, timeout_secs, false).await
+    }
+
+    /// [`Self::connect`] as an outside MCP client (`oximux mcp`), with the MCP
+    /// credential: the host keeps its consent apart from agents'.
+    pub async fn connect_mcp(dir: Option<PathBuf>, timeout_secs: u64) -> Result<Self, Failure> {
+        Self::connect_as(dir, timeout_secs, true).await
+    }
+
+    async fn connect_as(dir: Option<PathBuf>, timeout_secs: u64, mcp: bool) -> Result<Self, Failure> {
         let runtime_dir = runtime_dir(dir)?;
         let timeout = Duration::from_secs(timeout_secs.max(1));
-        let dialed = tokio::time::timeout(timeout, dial(&runtime_dir))
-            .await
-            .map_err(|_| timed_out("connecting to the host"))?;
+        let dialing = async {
+            if mcp { oximux_remote_local::dial_mcp(&runtime_dir).await } else { dial(&runtime_dir).await }
+        };
+        let dialed = tokio::time::timeout(timeout, dialing).await.map_err(|_| timed_out("connecting to the host"))?;
         let transport = dialed.map_err(|e| match e {
+            // No MCP credential: usually no OxiMux running here at all; else a
+            // host that takes no MCP clients (headless, or from before them).
+            DialError::NoCredential(_) if mcp && !oximux_remote_local::socket_path(&runtime_dir).exists() => {
+                Failure::new("unreachable", exit::UNREACHABLE, "OxiMux is not running on this Mac").with_steps([
+                    "open the OxiMux app, with local CLI access on (Settings → Remote)".into(),
+                ])
+            }
+            DialError::NoCredential(_) if mcp => Failure::new(
+                "incompatible",
+                exit::UNREACHABLE,
+                "the OxiMux running here takes no MCP clients (a headless `oximux serve` has no simulator)",
+            )
+            .with_steps(["open the OxiMux desktop app; update it if it is older than this CLI".into()]),
+            // A host that cannot decode the MCP label drops the handshake.
+            DialError::Handshake(_) if mcp => {
+                Failure::new("incompatible", exit::UNREACHABLE, "the OxiMux running here refused the MCP client (it is older than this CLI, or headless)")
+                    .with_steps(["update OxiMux and open the desktop app".into()])
+            }
             // An access failure, so exit 5 like every other refusal — the host
             // may be running perfectly well. Reporting it as `unreachable` sent
             // a retrying wrapper into a loop no retry could resolve.

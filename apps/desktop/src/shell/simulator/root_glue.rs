@@ -239,8 +239,9 @@ impl WorkspaceRoot {
 }
 
 impl WorkspaceRoot {
-    /// An agent in `worktree` asked to do `what` ("control iPhone 17", or
-    /// "install App.apk on Pixel 8" on a real device). Ask where that
+    /// An agent (or an outside MCP client, `who`) in `worktree` asked to do
+    /// `what` ("control iPhone 17", or "install App.apk on Pixel 8" on a real
+    /// device). Ask where that
     /// worktree is: the panel's banner when it is this window's active
     /// worktree and the panel shows (or auto-open may open it), else a toast
     /// whose Review shows it — switching there first when it is elsewhere.
@@ -248,7 +249,7 @@ impl WorkspaceRoot {
     pub(crate) fn ask_simulator_consent(
         &mut self,
         worktree: &Path,
-        label: &str,
+        (label, who): (&str, oximux_remote_host::SimPrincipal),
         what: &str,
         (project_id, workspace_id): (String, String),
         window: &mut Window,
@@ -280,7 +281,11 @@ impl WorkspaceRoot {
                 });
             });
         });
-        let text = format!("An agent in {label} wants to {what}.");
+        let who = match who {
+            oximux_remote_host::SimPrincipal::Agent => "An agent",
+            oximux_remote_host::SimPrincipal::Mcp => "An outside MCP client",
+        };
+        let text = format!("{who} in {label} wants to {what}.");
         self.toast_layer.update(cx, |layer, cx| layer.push_with_actions(ToastKind::Info, text, vec![review], cx));
     }
 

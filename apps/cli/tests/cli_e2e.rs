@@ -185,6 +185,7 @@ fn serve_dispatcher(rt: &tokio::runtime::Runtime, runtime_dir: &Path, dispatcher
                 let scope = match claim {
                     LocalClaim::Operator => LocalScope::Full,
                     LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                    LocalClaim::Mcp => LocalScope::Mcp,
                 };
                 dispatcher.serve_local(transport.as_ref(), scope).await;
             });
@@ -208,6 +209,7 @@ impl oximux_remote_host::SimulatorControl for StubSimulator {
     async fn run(
         &self,
         worktree: &str,
+        _principal: oximux_remote_host::SimPrincipal,
         cmd: oximux_remote_proto::simulator::SimCmdWire,
     ) -> Result<oximux_remote_proto::simulator::SimReplyWire, oximux_remote_proto::simulator::SimErrorWire> {
         use oximux_remote_proto::simulator::*;
@@ -988,6 +990,7 @@ fn serve_worktree_host(rt: &tokio::runtime::Runtime, runtime_dir: &Path, project
                 let scope = match claim {
                     LocalClaim::Operator => LocalScope::Full,
                     LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                    LocalClaim::Mcp => LocalScope::Mcp,
                 };
                 dispatcher.serve_local(transport.as_ref(), scope).await;
             });
@@ -1134,6 +1137,7 @@ fn serve_schedule_host(
                 let scope = match claim {
                     LocalClaim::Operator => LocalScope::Full,
                     LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                    LocalClaim::Mcp => LocalScope::Mcp,
                 };
                 dispatcher.serve_local(transport.as_ref(), scope).await;
             });

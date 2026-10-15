@@ -8286,6 +8286,7 @@ version = "0.1.41"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "clap_complete",

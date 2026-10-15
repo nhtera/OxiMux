@@ -992,6 +992,14 @@ Where the app's JavaScript spends its time: a CPU profile for a few seconds, its
 | `--top` | yes | How many functions to list (1–100) |
 | `--app` | yes | The app's bundle id or package, when several are connected to Metro |
 
+### `oximux mcp`
+
+Serve the attached simulator to an outside MCP client over stdio (`{"command": "oximux", "args": ["mcp", "--worktree", "/path/to/repo"]}`). Six tools: status, observe, act, app, screenshot, wait-consent. The client asks the user for its own permission, apart from agents'
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--worktree` | yes | The worktree whose device to serve. Required unless the current directory is a worktree OxiMux knows |
+
 ### `oximux serve`
 
 Run this machine as a headless OxiMux host.

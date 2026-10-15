@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gpui::Context;
+use oximux_remote_host::SimPrincipal;
 use oximux_simulator::{DeviceId, Source};
 use oximux_simulator::consent::{Consent, State, Verdict};
 use oximux_simulator::registry::{Phase, WorktreeKey};
@@ -29,6 +30,9 @@ pub(crate) const AGENT_BADGE: Duration = Duration::from_secs(2);
 /// Agent-control state the hub keeps.
 pub(crate) struct AgentState {
     consent: Consent,
+    /// An outside MCP client's consent (`oximux mcp`): its own, never an
+    /// agent's, and kept only until OxiMux quits.
+    mcp_consent: Consent,
     /// Where approvals persist. `None` in tests; grants then live in memory.
     approvals: Option<SimApprovalRepo>,
     /// The approvals with their names and dates, for Settings (kept here so
@@ -106,6 +110,7 @@ impl AgentState {
             .collect();
         Self {
             consent: Consent::new(granted.iter().map(|a| DeviceId(a.udid.clone()))),
+            mcp_consent: Consent::default(),
             approvals,
             granted,
             stopped: HashSet::new(),
@@ -169,34 +174,57 @@ pub enum Wake {
 }
 
 impl SimulatorHub {
-    /// A control verb wants `udid` for `worktree`: the verdict, and whether
-    /// the question should be shown now (new, or left open a while).
-    pub fn consent_check(&mut self, udid: &DeviceId, worktree: &Path, device_name: &str, cx: &mut Context<Self>) -> (Verdict, bool) {
-        let checked = self.agent.consent.check(udid, &WorktreeKey::from_path(worktree), device_name, Instant::now());
+    fn consent_of(&mut self, principal: SimPrincipal) -> &mut Consent {
+        match principal {
+            SimPrincipal::Agent => &mut self.agent.consent,
+            SimPrincipal::Mcp => &mut self.agent.mcp_consent,
+        }
+    }
+
+    /// A control verb from `principal` wants `udid` for `worktree`: the
+    /// verdict, and whether the question should be shown now (new, or left
+    /// open a while).
+    pub fn consent_check(
+        &mut self,
+        principal: SimPrincipal,
+        udid: &DeviceId,
+        worktree: &Path,
+        device_name: &str,
+        cx: &mut Context<Self>,
+    ) -> (Verdict, bool) {
+        let checked = self.consent_of(principal).check(udid, &WorktreeKey::from_path(worktree), device_name, Instant::now());
         if checked.1 {
             cx.emit(HubEvent::Consent);
         }
         checked
     }
 
-    /// Where `udid` stands for `worktree` (polling keeps its request alive).
-    pub fn consent_state(&mut self, udid: &DeviceId, worktree: &Path) -> State {
-        self.agent.consent.state(udid, &WorktreeKey::from_path(worktree), Instant::now())
+    /// Where `udid` stands for `principal` in `worktree` (polling keeps its
+    /// request alive).
+    pub fn consent_state(&mut self, principal: SimPrincipal, udid: &DeviceId, worktree: &Path) -> State {
+        self.consent_of(principal).state(udid, &WorktreeKey::from_path(worktree), Instant::now())
     }
 
-    /// The question `worktree`'s agent is waiting on about the device
-    /// attached there now, and that device's name.
-    pub fn consent_request(&self, worktree: &Path) -> Option<(DeviceId, String)> {
+    /// The question `worktree` is waiting on about the device attached there
+    /// now — an agent's first, then an outside MCP client's — and that
+    /// device's name.
+    pub fn consent_request(&self, worktree: &Path) -> Option<(SimPrincipal, DeviceId, String)> {
         let udid = self.device_for(worktree)?;
-        let request = self.agent.consent.pending_for(&WorktreeKey::from_path(worktree), &udid)?;
-        Some((request.udid.clone(), request.device_name.clone()))
+        let key = WorktreeKey::from_path(worktree);
+        [(SimPrincipal::Agent, &self.agent.consent), (SimPrincipal::Mcp, &self.agent.mcp_consent)]
+            .into_iter()
+            .find_map(|(principal, consent)| {
+                let request = consent.pending_for(&key, &udid)?;
+                Some((principal, request.udid.clone(), request.device_name.clone()))
+            })
     }
 
     /// `worktree` detached or changed device: drop its open questions.
     pub(super) fn forget_consent_requests(&mut self, worktree: &Path, cx: &mut Context<Self>) {
         let key = WorktreeKey::from_path(worktree);
         let asked = self.agent.per_call.forget_worktree(&key);
-        if self.agent.consent.forget_worktree(&key) || asked {
+        let mcp = self.agent.mcp_consent.forget_worktree(&key);
+        if self.agent.consent.forget_worktree(&key) || mcp || asked {
             cx.emit(HubEvent::Consent);
         }
     }
@@ -239,6 +267,19 @@ impl SimulatorHub {
         cx.emit(HubEvent::Consent);
     }
 
+    /// The user allowed an outside MCP client to control `udid`, until
+    /// OxiMux quits (never saved).
+    pub fn allow_mcp(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
+        self.agent.mcp_consent.allow(udid);
+        cx.emit(HubEvent::Consent);
+    }
+
+    /// The user refused the MCP client `udid` (for `consent::DENY_COOLDOWN`).
+    pub fn deny_mcp(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
+        self.agent.mcp_consent.deny(udid, Instant::now());
+        cx.emit(HubEvent::Consent);
+    }
+
     /// The approved devices, oldest first (the Settings list).
     pub fn approvals(&self) -> &[SimApproval] {
         &self.agent.granted
@@ -260,6 +301,7 @@ impl SimulatorHub {
     /// memory would outlive it until a restart).
     pub fn revoke_agents(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         self.agent.consent.revoke(udid);
+        self.agent.mcp_consent.revoke(udid);
         self.agent.granted.retain(|a| a.udid != udid.as_str());
         self.persist_approval(udid, None, cx);
         cx.emit(HubEvent::Consent);
@@ -319,7 +361,8 @@ impl SimulatorHub {
     /// CLI gave up) — from the tick.
     pub(super) fn expire_consent(&mut self, cx: &mut Context<Self>) {
         let asked = self.agent.per_call.expire();
-        if self.agent.consent.expire(Instant::now()) || asked {
+        let mcp = self.agent.mcp_consent.expire(Instant::now());
+        if self.agent.consent.expire(Instant::now()) || mcp || asked {
             cx.emit(HubEvent::Consent);
         }
     }
@@ -388,6 +431,9 @@ impl SimulatorHub {
         for udid in &all {
             self.revoke_agents(udid, cx);
         }
+        // An outside MCP client's grants (never listed: they end at quit).
+        self.agent.mcp_consent = Consent::default();
+        cx.emit(HubEvent::Consent);
     }
 
     /// The user shut `udid` down from the panel (the confirmed power button).
@@ -601,7 +647,7 @@ mod tests {
         hub.update(cx, |hub, cx| {
             hub.allow_agents(&phone, "Galaxy".into(), cx);
             hub.allow_agents(&sim, "iPhone".into(), cx);
-            assert_eq!(hub.consent_check(&phone, w, "Galaxy", cx).0, Verdict::Allowed, "allowed this run");
+            assert_eq!(hub.consent_check(SimPrincipal::Agent, &phone, w, "Galaxy", cx).0, Verdict::Allowed, "allowed this run");
         });
         cx.run_until_parked();
         let saved: Vec<String> = approvals.list().expect("list").into_iter().map(|a| a.udid).collect();
@@ -613,6 +659,29 @@ mod tests {
         assert_eq!(state.consent.check(&phone, &key, "Galaxy", Instant::now()).0, Verdict::Pending);
         assert_eq!(state.consent.check(&sim, &key, "iPhone", Instant::now()).0, Verdict::Allowed);
         assert!(state.granted.iter().all(|a| a.udid != "adb:R58M123"), "nor lists it in Settings");
+    }
+
+    /// An outside MCP client never rides agents' approval, nor they its; its
+    /// grant is never saved, and a revoke drops both.
+    #[gpui::test]
+    fn an_mcp_clients_consent_is_its_own(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let (settings, approvals) = (oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db));
+        let hub = cx.update(|cx| super::super::install_for_test(cx, settings.clone(), approvals.clone()));
+        let (sim, other, w) = (DeviceId("U-1".into()), DeviceId("U-2".into()), Path::new("/w"));
+        hub.update(cx, |hub, cx| {
+            hub.allow_agents(&sim, "iPhone".into(), cx);
+            assert_eq!(hub.consent_check(SimPrincipal::Agent, &sim, w, "iPhone", cx).0, Verdict::Allowed);
+            assert_eq!(hub.consent_check(SimPrincipal::Mcp, &sim, w, "iPhone", cx), (Verdict::Pending, true), "asked, as its own");
+            hub.allow_mcp(&other, cx);
+            assert_eq!(hub.consent_check(SimPrincipal::Mcp, &other, w, "iPad", cx).0, Verdict::Allowed);
+            assert_eq!(hub.consent_check(SimPrincipal::Agent, &other, w, "iPad", cx).0, Verdict::Pending, "agents are not covered");
+            hub.revoke_agents(&other, cx);
+            assert_eq!(hub.consent_state(SimPrincipal::Mcp, &other, w), State::NotAsked, "revoked: it asks again");
+        });
+        cx.run_until_parked();
+        let saved: Vec<String> = approvals.list().expect("list").into_iter().map(|a| a.udid).collect();
+        assert_eq!(saved, ["U-1"], "an MCP grant is never saved");
     }
 
     /// An agent never attaches someone's phone on its own (an old CLI may
@@ -647,23 +716,23 @@ mod tests {
         let (phone, w, other) = (DeviceId("adb:R58M123".into()), Path::new("/nonexistent/w"), Path::new("/nonexistent/o"));
         hub.update(cx, |hub, cx| {
             drop(hub.registry.attach(WorktreeKey::from_path(w), phone.clone(), true, Instant::now()));
-            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
+            let id = hub.ask_per_call(SimPrincipal::Agent, &phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
             assert_eq!(hub.per_call_answer(id), PerCallAnswer::Pending);
-            assert_eq!(hub.per_call_request(w), Some((id, "Galaxy".into(), AskKind::Install { app: "app-debug.apk".into() })));
+            assert_eq!(hub.per_call_request(w), Some((id, "Galaxy".into(), AskKind::Install { app: "app-debug.apk".into() }, SimPrincipal::Agent)));
             assert_eq!(hub.per_call_request(other), None, "never over another worktree's panel");
             hub.answer_per_call(id, true, cx);
             assert_eq!(hub.per_call_answer(id), PerCallAnswer::Allowed);
             assert_eq!(hub.per_call_answer(id), PerCallAnswer::Gone, "read once");
 
-            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
+            let id = hub.ask_per_call(SimPrincipal::Agent, &phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
             hub.answer_per_call(id, false, cx);
             assert_eq!(hub.per_call_answer(id), PerCallAnswer::Refused);
 
-            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
+            let id = hub.ask_per_call(SimPrincipal::Agent, &phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
             hub.agent.per_call.age_for_test(ASK_TTL);
             assert_eq!(hub.per_call_answer(id), PerCallAnswer::Gone, "expired: not allowed");
 
-            let id = hub.ask_per_call(&phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
+            let id = hub.ask_per_call(SimPrincipal::Agent, &phone, w, "Galaxy", AskKind::Install { app: "app-debug.apk".into() }, cx);
             hub.detach(w, cx);
             assert_eq!(hub.per_call_answer(id), PerCallAnswer::Gone, "the worktree moved on");
         });

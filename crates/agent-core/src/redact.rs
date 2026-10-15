@@ -71,7 +71,7 @@ impl ScreenshotFilter {
             ThreadEvent::ToolCallStarted { id, name, input } => {
                 if crate::screen_tools::is_computer_use_tool(name) {
                     remember(&mut self.screen_calls, id.clone());
-                } else if crate::sim_tools::is_simulator_capture(input) {
+                } else if crate::sim_tools::is_simulator_capture(input) || crate::sim_tools::is_simulator_mcp_tool(name) {
                     // The finalized input may arrive after an empty preview
                     // under the same id; either one decides.
                     remember(&mut self.sim_calls, id.clone());
@@ -188,8 +188,8 @@ fn scrub_entry(node: &mut Value, scrubbed: &mut usize) {
                 *scrubbed += 1;
                 return;
             }
-            let is_sim_capture = map.contains_key("name")
-                && map.get("input").is_some_and(crate::sim_tools::is_simulator_capture);
+            let is_sim_capture = map.get("name").and_then(Value::as_str).is_some_and(crate::sim_tools::is_simulator_mcp_tool)
+                || (map.contains_key("name") && map.get("input").is_some_and(crate::sim_tools::is_simulator_capture));
             if is_sim_capture {
                 let mut changed = false;
                 if let Some(Value::Array(images)) = map.get_mut("images")
@@ -482,6 +482,26 @@ mod tests {
         assert!(out.contains("tapped “Pay”"), "a tap's own result stays");
         // Scrubbing is idempotent: a second pass finds nothing left.
         assert_eq!(scrub_transcript(&out).1, 0);
+    }
+
+    /// An outside agent driving `oximux mcp`: the tool's name says it is a
+    /// capture, whatever its input (live and folded).
+    #[test]
+    fn an_mcp_simulator_capture_is_scrubbed_by_its_name() {
+        let mut filter = ScreenshotFilter::new();
+        filter.scrub(&mut ThreadEvent::ToolCallStarted { id: "o".into(), name: "mcp__oximux__sim_observe".into(), input: json!({}) });
+        filter.scrub(&mut ThreadEvent::ToolCallStarted { id: "s".into(), name: "mcp__oximux__sim_status".into(), input: json!({}) });
+        let mut tree = result("o", "Button “Pay $120 to Alex”");
+        assert!(filter.scrub(&mut tree));
+        assert!(!filter.scrub(&mut result("s", "device iPhone 17")), "status is not a capture");
+
+        let mut shot = ToolCall::new("x", "mcp__oximux__sim_screenshot", json!({}));
+        shot.images = vec![image()];
+        shot.result = Some("/tmp/oximux-sim/s.png".into());
+        let transcript = serde_json::to_string(&vec![ThreadEntry::ToolCall(shot)]).unwrap();
+        let (out, count) = scrub_transcript(&transcript);
+        assert_eq!(count, 1);
+        assert!(!out.contains("iVBORw0KGgo="), "the screenshot is gone: {out}");
     }
 
     #[test]

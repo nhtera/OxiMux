@@ -37,6 +37,20 @@ const CAPTURE_VERBS: [&str; 11] = ["screenshot", "ax", "wait", "assert", "logs",
 /// settle's diff, `ax -i`'s list), wherever they stand in the command.
 const CAPTURE_FLAGS: [&str; 3] = ["--settle", "-i", "--interactive"];
 
+/// The `oximux mcp` tools whose results are the screen's contents (the
+/// tree, a screenshot, settle diffs).
+const MCP_CAPTURE_TOOLS: [&str; 3] = ["sim_observe", "sim_screenshot", "sim_act"];
+
+/// Is `name` one of `oximux mcp`'s capturing tools, in any agent's naming
+/// (`mcp__oximux__sim_observe`, `oximux.sim_observe`, `oximux/sim_act`, or
+/// bare)? Matched on the tool, not the server's name, which the user picks.
+pub fn is_simulator_mcp_tool(name: &str) -> bool {
+    MCP_CAPTURE_TOOLS.iter().any(|tool| {
+        name == *tool
+            || name.strip_suffix(tool).is_some_and(|prefix| prefix.ends_with("__") || prefix.ends_with(['.', '/', ':']))
+    })
+}
+
 /// Does this tool input capture the simulator's screen?
 pub fn is_simulator_capture(input: &Value) -> bool {
     let mut strings = Vec::new();
@@ -143,6 +157,16 @@ mod tests {
             json!({"command": "oximux sim net offline"}),
         ] {
             assert!(is_simulator_capture(&input), "{input}");
+        }
+    }
+
+    #[test]
+    fn the_mcp_tools_are_recognised_in_every_naming() {
+        for name in ["mcp__oximux__sim_observe", "mcp__sim__sim_screenshot", "oximux.sim_act", "oximux/sim_observe", "oximux:sim_act", "sim_screenshot"] {
+            assert!(is_simulator_mcp_tool(name), "{name}");
+        }
+        for name in ["mcp__oximux__sim_status", "mcp__oximux__sim_wait_consent", "mcp__oximux__sim_app", "my_sim_observe", "sim_observer", "Bash"] {
+            assert!(!is_simulator_mcp_tool(name), "{name}");
         }
     }
 

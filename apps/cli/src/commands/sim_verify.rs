@@ -111,8 +111,14 @@ fn matched(reply: SimReplyWire, what: &str) -> Outcome {
 pub async fn type_into(client: &Client, worktree: &Path, words: Vec<String>, paste: bool, settle: &SettleArgs) -> Outcome {
     let [aim, text] = <[String; 2]>::try_from(words).map_err(|_| usage("`sim type` takes TEXT, or an @eN ref then TEXT"))?;
     let r = parse_ref(&aim).ok_or_else(|| usage("`sim type` takes TEXT, or an @eN ref then TEXT (see `oximux sim ax -i`)"))?;
-    let said = format!("typed {} characters into @e{r}", text.chars().count());
-    let (cmd, floor) = wrap(SimCmdWire::TypeInto { target: SimTargetWire::Ref(r), text, paste }, SLOW, settle);
+    type_into_target(client, worktree, SimTargetWire::Ref(r), text, paste, settle).await
+}
+
+/// Tap `target`, then type `text` into it: one request, so the host holds
+/// the device's input turn across both (nothing lands in between).
+pub async fn type_into_target(client: &Client, worktree: &Path, target: SimTargetWire, text: String, paste: bool, settle: &SettleArgs) -> Outcome {
+    let said = format!("typed {} characters into {}", text.chars().count(), name(&target));
+    let (cmd, floor) = wrap(SimCmdWire::TypeInto { target, text, paste }, SLOW, settle);
     acted(call(client, worktree, cmd, floor).await?, &said, false)
 }
 

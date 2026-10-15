@@ -47,7 +47,7 @@ mod secure;
 mod serve;
 mod transport;
 
-pub use dial::{DialError, credential, dial, dial_as};
+pub use dial::{DialError, credential, dial, dial_as, dial_mcp};
 pub use hello::{LocalClaim, LocalIdentity};
 pub use secure::{generate_token, read_token_file, write_token_file};
 pub use serve::{LocalControlListener, PendingConnection};
@@ -59,6 +59,10 @@ use std::path::{Path, PathBuf};
 /// the name so an old CLI dials nothing rather than a socket it misreads.
 pub const SOCKET_FILENAME: &str = "control-v1.sock";
 pub const TOKEN_FILENAME: &str = "control-v1.token";
+
+/// The MCP client's credential file beside it, written only by a host that
+/// serves the simulator (see [`LocalControlListener::grant_mcp`]).
+pub const MCP_TOKEN_FILENAME: &str = "control-v1.mcp.token";
 
 /// The role lock naming **which process may hold the control socket** for a
 /// data directory.
@@ -117,6 +121,11 @@ pub fn socket_path(runtime_dir: &Path) -> PathBuf {
 /// The bearer-token file beside it.
 pub fn token_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(TOKEN_FILENAME)
+}
+
+/// The MCP credential file beside it.
+pub fn mcp_token_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(MCP_TOKEN_FILENAME)
 }
 
 /// Whether this directory could hold a control socket at all.

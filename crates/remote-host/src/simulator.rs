@@ -16,9 +16,22 @@
 
 use oximux_remote_proto::simulator::{SimCmdWire, SimErrorWire, SimReplyWire};
 
+/// Who drives the device, as the caller's credential proved it: consent is
+/// kept per principal, so an outside MCP client never rides the approval
+/// given to agents (or the operator's CLI), nor they its.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SimPrincipal {
+    /// The operator's CLI or an agent's.
+    Agent,
+    /// An outside MCP client (`oximux mcp`).
+    Mcp,
+}
+
 #[async_trait::async_trait]
 pub trait SimulatorControl: Send + Sync {
-    /// Run `cmd` against the simulator attached to the worktree containing
-    /// `worktree` (a path; the implementation resolves it).
-    async fn run(&self, worktree: &str, cmd: SimCmdWire) -> Result<SimReplyWire, SimErrorWire>;
+    /// Run `cmd`, for `principal`, against the simulator attached to the
+    /// worktree containing `worktree` (a path; the implementation resolves
+    /// it). The future may be dropped (the caller went away): an
+    /// implementation stops the verb then.
+    async fn run(&self, worktree: &str, principal: SimPrincipal, cmd: SimCmdWire) -> Result<SimReplyWire, SimErrorWire>;
 }

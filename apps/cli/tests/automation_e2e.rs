@@ -121,6 +121,7 @@ fn boot(rt: &tokio::runtime::Runtime, runtime_dir: &Path, db_path: &Path) -> Hos
                 let scope = match claim {
                     LocalClaim::Operator => LocalScope::Full,
                     LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                    LocalClaim::Mcp => LocalScope::Mcp,
                 };
                 dispatcher.serve_local(transport.as_ref(), scope).await;
             });

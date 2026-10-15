@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::Context;
+use oximux_remote_host::SimPrincipal;
 use oximux_simulator::DeviceId;
 use oximux_simulator::registry::WorktreeKey;
 
@@ -51,6 +52,20 @@ impl AskKind {
             Self::FlowRun { lines } if lines.len() == 1 => format!("run 1 step that changes {device}"),
             Self::FlowRun { lines } => format!("run {} steps that change {device}", lines.len()),
             Self::Exec { .. } => format!("run a raw command on {device}"),
+        }
+    }
+
+    /// [`Self::question`], worded for whoever asked: an outside MCP client is
+    /// named as one, never as "an agent".
+    pub(crate) fn question_from(&self, device: &str, principal: SimPrincipal) -> (String, String, (&'static str, &'static str)) {
+        let (title, body, answers) = self.question(device);
+        match principal {
+            SimPrincipal::Agent => (title, body, answers),
+            SimPrincipal::Mcp => (
+                title.replace("Let an agent ", "Let an outside MCP client "),
+                body.replace("An agent in this worktree", "An outside MCP client (connected with `oximux mcp`)"),
+                answers,
+            ),
         }
     }
 
@@ -105,6 +120,8 @@ impl AskKind {
 /// An agent's question, waiting for the user's yes.
 struct Ask {
     id: u64,
+    /// Who asked: the banner names them.
+    principal: SimPrincipal,
     udid: DeviceId,
     worktree: WorktreeKey,
     device_name: String,
@@ -161,12 +178,21 @@ impl PerCall {
 impl SimulatorHub {
     /// Ask the user, in `worktree`'s panel, whether an agent may do `kind` to
     /// `udid`. Returns the question's number, for [`Self::per_call_answer`].
-    pub(crate) fn ask_per_call(&mut self, udid: &DeviceId, worktree: &Path, device_name: &str, kind: AskKind, cx: &mut Context<Self>) -> u64 {
+    pub(crate) fn ask_per_call(
+        &mut self,
+        principal: SimPrincipal,
+        udid: &DeviceId,
+        worktree: &Path,
+        device_name: &str,
+        kind: AskKind,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let per_call = &mut self.agent.per_call;
         per_call.next += 1;
         let id = per_call.next;
         per_call.asks.push(Ask {
             id,
+            principal,
             udid: udid.clone(),
             worktree: WorktreeKey::from_path(worktree),
             device_name: device_name.to_owned(),
@@ -195,10 +221,10 @@ impl SimulatorHub {
 
     /// The question `worktree`'s agent is waiting on about the device
     /// attached there now: its number, the device's name, and what it asks.
-    pub(crate) fn per_call_request(&self, worktree: &Path) -> Option<(u64, String, AskKind)> {
+    pub(crate) fn per_call_request(&self, worktree: &Path) -> Option<(u64, String, AskKind, SimPrincipal)> {
         let (udid, key) = (self.device_for(worktree)?, WorktreeKey::from_path(worktree));
         let ask = self.agent.per_call.asks.iter().find(|a| a.worktree == key && a.udid == udid && a.answer.is_none())?;
-        Some((ask.id, ask.device_name.clone(), ask.kind.clone()))
+        Some((ask.id, ask.device_name.clone(), ask.kind.clone(), ask.principal))
     }
 
     /// The banner's two answers.
@@ -235,5 +261,10 @@ mod tests {
         assert!(!body.contains("real phone"));
         let phone = AskKind::Exec { command: "adb -s R58 shell ls".into(), real_device: true };
         assert!(phone.question("Pixel 8").1.contains("This is a real phone"));
+        for kind in [AskKind::Install { app: "a.apk".into() }, AskKind::PhysicalState { what: "switch to dark mode".into() }, AskKind::Erase] {
+            let (title, body, _) = kind.question_from("Pixel 8", SimPrincipal::Mcp);
+            assert!(!title.contains("an agent") && !body.contains("An agent"), "{title} / {body}");
+            assert!(body.contains("outside MCP client"), "{body}");
+        }
     }
 }

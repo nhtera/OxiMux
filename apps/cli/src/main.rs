@@ -229,6 +229,9 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        // An MCP server on stdio: its own runtime, and stdout carries only
+        // JSON-RPC.
+        Command::Mcp { worktree } => commands::mcp::run(args.dir.clone(), worktree.clone()),
         // Host verbs: build the runtime, connect lazily, run the verb.
         _ => host_verb(args),
     };
@@ -688,7 +691,8 @@ fn host_verb(mut args: Cli) -> u8 {
                 | Command::Completions { .. }
                 | Command::Serve { .. }
                 | Command::Pair { .. }
-                | Command::Hosts { .. } => unreachable!("dispatched earlier"),
+                | Command::Hosts { .. }
+                | Command::Mcp { .. } => unreachable!("dispatched earlier"),
             }
         }
         .await;

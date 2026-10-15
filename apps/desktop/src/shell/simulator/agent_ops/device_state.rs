@@ -158,18 +158,23 @@ pub(super) async fn confirm(
     cx: &mut AsyncApp,
 ) -> Result<(), SimErrorWire> {
     let what = kind.what(name);
-    let id = hub.update(cx, |hub, cx| hub.ask_per_call(udid, &target.worktree, name, kind, cx));
+    let id = hub.update(cx, |hub, cx| hub.ask_per_call(target.principal, udid, &target.worktree, name, kind, cx));
     let (asked, toast) = (target.clone(), what.clone());
     super::with_root(cx, target, move |root, window, cx| {
         let ids = (asked.project_id.clone(), asked.workspace_id.clone());
-        root.ask_simulator_consent(&asked.worktree, &asked.label, &toast, ids, window, cx);
+        root.ask_simulator_consent(&asked.worktree, (&asked.label, asked.principal), &toast, ids, window, cx);
     });
+    // Named as the banner named it.
+    let who = match target.principal {
+        oximux_remote_host::SimPrincipal::Agent => "an agent",
+        oximux_remote_host::SimPrincipal::Mcp => "this MCP client",
+    };
     loop {
         match hub.update(cx, |hub, _| hub.per_call_answer(id)) {
             PerCallAnswer::Allowed => return Ok(()),
-            PerCallAnswer::Refused => return Err(SimErrorWire::Refused(format!("the user declined to let an agent {what}"))),
+            PerCallAnswer::Refused => return Err(SimErrorWire::Refused(format!("the user declined to let {who} {what}"))),
             PerCallAnswer::Gone => {
-                return Err(SimErrorWire::Refused(format!("the user did not answer whether an agent may {what}; ask them, then retry")));
+                return Err(SimErrorWire::Refused(format!("the user did not answer whether {who} may {what}; ask them, then retry")));
             }
             PerCallAnswer::Pending => cx.background_executor().timer(Duration::from_millis(250)).await,
         }

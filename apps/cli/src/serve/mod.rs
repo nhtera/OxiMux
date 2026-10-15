@@ -552,6 +552,7 @@ fn serve_local_connections(
                             let scope = match claim {
                                 LocalClaim::Operator => LocalScope::Full,
                                 LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                                LocalClaim::Mcp => LocalScope::Mcp,
                             };
                             dispatcher.serve_local(transport.as_ref(), scope).await;
                         });

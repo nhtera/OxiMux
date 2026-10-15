@@ -301,3 +301,23 @@ async fn a_silent_peer_does_not_block_the_accept_path() {
     };
     tokio::join!(server, clients);
 }
+
+/// The MCP credential earns the `Mcp` principal; a host that never granted it
+/// (an older OxiMux, a headless one) has no file to read, so the MCP client
+/// is refused before it dials.
+#[tokio::test]
+async fn the_mcp_credential_earns_the_mcp_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("runtime");
+    let listener = LocalControlListener::bind(&runtime_dir, &generate_token()).unwrap();
+    assert!(matches!(oximux_remote_local::dial_mcp(&runtime_dir).await, Err(oximux_remote_local::DialError::NoCredential(_))));
+
+    listener.grant_mcp(&runtime_dir).unwrap();
+    assert!(oximux_owner_only::is_restricted_to_owner(&oximux_remote_local::mcp_token_path(&runtime_dir)).unwrap());
+    let server = async {
+        let (_transport, claim) = listener.accept().await.unwrap();
+        assert_eq!(claim, LocalClaim::Mcp);
+    };
+    let client = async { oximux_remote_local::dial_mcp(&runtime_dir).await.unwrap() };
+    tokio::join!(server, client);
+}
