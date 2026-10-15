@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-10-15 — Mobile Emulator: verify loop, device state, flows, phone view, MCP (#56–#67)
+### 2026-10-16 — v0.1.42: Mobile Emulator: verify loop, device state, flows, phone view, MCP (#56–#69)
 
 Agents get a tighter loop on the attached device, and you get more ways to
 see it. Each part needs a desktop at least as new as the wire version noted;
@@ -49,8 +49,15 @@ an older desktop refuses the new verbs with a message saying so.
   device each run, shows "Viewed from …" in the status bar with Stop sharing,
   and ends the view within a second if you revoke the phone. Video uses a
   stream of its own, paced so terminals stay responsive on a slow link.
+  Needs the mobile app's next build.
+- **Fixes from the live verification run** (#69): the panel's × and
+  Fill/Split work while a device has the keyboard; a new tile no longer
+  stays black when its stream starts; `status-bar` and `appearance` reply
+  once the change is on screen, so a screenshot straight after shows it;
+  and `--settle` no longer times out on a screen with a blinking caret
+  (a five-step sign-in replay went from 26 s to 11 s).
 
-### 2026-10-11 — Terminal: command status marks show failures only
+### 2026-10-11 — v0.1.42: Terminal: command status marks show failures only
 
 - **A successful command no longer gets a green bar** beside its prompt. The
   bar read as a diff's "added line" marker on an ordinary `ls`. By default
