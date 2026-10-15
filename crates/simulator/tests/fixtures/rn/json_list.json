@@ -1,0 +1,39 @@
+[
+  {
+    "id": "cb709cfbf412476edc2e2b3c8957039b621f3f5b-1",
+    "title": "com.nhtera.rnprobe (iPhone 17)",
+    "description": "React Native Bridgeless [C++ connection]",
+    "appId": "com.nhtera.rnprobe",
+    "type": "node",
+    "devtoolsFrontendUrl": "/debugger-frontend/rn_fusebox.html?ws=%2Finspector%2Fdebug%3Fdevice%3Dcb709cfbf412476edc2e2b3c8957039b621f3f5b%26page%3D1&sources.hide_add_folder=true&unstable_enableNetworkPanel=true",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:8081/inspector/debug?device=cb709cfbf412476edc2e2b3c8957039b621f3f5b&page=1",
+    "deviceName": "iPhone 17",
+    "reactNative": {
+      "logicalDeviceId": "cb709cfbf412476edc2e2b3c8957039b621f3f5b",
+      "capabilities": { "nativePageReloads": true, "nativeSourceCodeFetching": false, "supportsMultipleDebuggers": true }
+    }
+  },
+  {
+    "id": "-1",
+    "title": "React Native Experimental (Improved Chrome Reloads)",
+    "description": "com.example.legacy",
+    "appId": "com.example.legacy",
+    "type": "node",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:8081/inspector/debug?device=0&page=-1",
+    "deviceName": "iPhone 17",
+    "vm": "don't use"
+  },
+  {
+    "id": "a51e0c1d-3",
+    "title": "com.example.other (sdk_gphone64_arm64)",
+    "description": "React Native Bridgeless [C++ connection]",
+    "appId": "com.example.other",
+    "type": "node",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:8082/inspector/debug?device=a51e0c1d&page=3",
+    "deviceName": "sdk_gphone64_arm64 - 16 - API 36",
+    "reactNative": {
+      "logicalDeviceId": "a51e0c1d",
+      "capabilities": { "nativePageReloads": true }
+    }
+  }
+]

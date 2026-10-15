@@ -48,6 +48,7 @@ pub mod keyframe;
 pub mod protocol;
 pub mod record;
 pub mod registry;
+pub mod rn;
 pub mod runner;
 pub mod session;
 pub mod simctl;

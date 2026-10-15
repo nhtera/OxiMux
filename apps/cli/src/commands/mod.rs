@@ -199,6 +199,7 @@ pub mod sim_diag;
 pub mod sim_exec;
 pub mod sim_flow;
 pub mod sim_render;
+pub mod sim_rn;
 pub mod sim_state;
 pub mod sim_verify;
 pub mod skills;

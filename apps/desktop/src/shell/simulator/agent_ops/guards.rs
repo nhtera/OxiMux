@@ -72,7 +72,8 @@ pub(super) fn is_action(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Logs(_)
         | SimCmdWire::Crashes(_)
         | SimCmdWire::Flow(_)
-        | SimCmdWire::Exec(_) => false,
+        | SimCmdWire::Exec(_)
+        | SimCmdWire::Rn(_) => false,
     }
 }
 
@@ -100,7 +101,8 @@ pub(super) fn is_input(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Logs(_)
         | SimCmdWire::Crashes(_)
         | SimCmdWire::Flow(_)
-        | SimCmdWire::Exec(_) => false,
+        | SimCmdWire::Exec(_)
+        | SimCmdWire::Rn(_) => false,
     }
 }
 
@@ -134,7 +136,8 @@ pub(super) fn needs_screen(cmd: &SimCmdWire) -> bool {
         | SimCmdWire::Logs(_)
         | SimCmdWire::Crashes(_)
         | SimCmdWire::Flow(_)
-        | SimCmdWire::Exec(_) => false,
+        | SimCmdWire::Exec(_)
+        | SimCmdWire::Rn(_) => false,
     }
 }
 
@@ -171,6 +174,9 @@ pub(super) fn refused_on(caps: &DeviceCaps, cmd: &SimCmdWire) -> Option<&'static
         SimCmdWire::Flow(_) => return None,
         // simctl or adb, checked by `exec` (a real iPhone is refused there).
         SimCmdWire::Exec(_) => return None,
+        // Metro's debugger, not the device: any class whose app reaches
+        // Metro and reports this device's name (`rn`'s own checks).
+        SimCmdWire::Rn(_) => return None,
         // The tap's needs, then typing's.
         SimCmdWire::TypeInto { target, .. } => return refused_on(caps, &SimCmdWire::Tap(target.clone())).or((!caps.keys).then_some("Typing")),
     };

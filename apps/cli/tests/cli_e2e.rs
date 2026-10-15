@@ -317,6 +317,32 @@ impl oximux_remote_host::SimulatorControl for StubSimulator {
                 stderr: String::new(),
                 truncated: false,
             }),
+            // A host's redacted look into the app.
+            SimCmdWire::Rn(SimRnCmdWire::Network { .. }) => SimReplyWire::Rn(SimRnWire::Network(SimRnNetworkWire {
+                app: "com.a.b".into(),
+                requests: vec![SimRnRequestWire {
+                    method: "POST".into(),
+                    url: "https://api.example.com/login?token=[redacted]".into(),
+                    status: Some(200),
+                    ms: Some(412),
+                    size: Some(586),
+                    mime: Some("application/json".into()),
+                    failed: None,
+                    request_headers: Vec::new(),
+                    response_headers: Vec::new(),
+                    request_body: None,
+                    response_body: None,
+                }],
+                truncated: false,
+                warnings: Vec::new(),
+            })),
+            SimCmdWire::Rn(SimRnCmdWire::Profile { .. }) => SimReplyWire::Rn(SimRnWire::Profile(SimRnProfileWire {
+                app: "com.a.b".into(),
+                duration_ms: 3000.0,
+                sampled_ms: 2990.0,
+                functions: vec![SimRnFunctionWire { name: "busyFibonacci".into(), url: "http://127.0.0.1:8081/index.bundle".into(), line: 9, self_ms: 1200.0 }],
+                warnings: Vec::new(),
+            })),
             _ => SimReplyWire::Done,
         })
     }
@@ -552,6 +578,27 @@ fn sim_verbs_against_a_live_host() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("exec is off"), "{}", String::from_utf8_lossy(&out.stderr));
         let out = sim_out(&["exec"]);
         assert_eq!(out.status.code(), Some(2), "a command is required");
+        // Net and rn (v32): the device-state wire, and a look into the app.
+        use oximux_remote_proto::simulator::{SimNetWire, SimRnCmdWire, SimStateCmdWire};
+        let out = sim_out(&["net", "offline"]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("undo: oximux sim net online"), "the way back is said");
+        assert_eq!(sim.cmds.lock().unwrap().last(), Some(&SimCmdWire::DeviceState(SimStateCmdWire::Net(SimNetWire::Offline))));
+        sim_out(&["net", "speed", "edge"]);
+        assert_eq!(sim.cmds.lock().unwrap().last(), Some(&SimCmdWire::DeviceState(SimStateCmdWire::Net(SimNetWire::Speed("edge".into())))));
+        let out = sim_out(&["rn", "network", "--seconds", "5", "--grep", "/login", "--bodies"]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.starts_with("POST   200") && stdout.contains("token=[redacted]") && stdout.contains("1 request from com.a.b in 5 s"), "{stdout}");
+        let asked = SimRnCmdWire::Network { seconds: 5, grep: Some("/login".into()), bodies: true, app: None };
+        assert_eq!(sim.cmds.lock().unwrap().last(), Some(&SimCmdWire::Rn(asked)));
+        let out = bin(&runtime_dir).args(["--json", "sim", "--worktree", wt, "rn", "profile", "--top", "5", "--app", "com.a.b"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(json_stdout(&out)["data"]["functions"][0]["name"], "busyFibonacci");
+        assert_eq!(sim.cmds.lock().unwrap().last(), Some(&SimCmdWire::Rn(SimRnCmdWire::Profile { seconds: 10, top: 5, app: Some("com.a.b".into()) })));
+        for bad in [&["rn", "network", "--seconds", "61"][..], &["rn", "profile", "--top", "0"], &["net", "slow"]] {
+            assert_eq!(sim_out(bad).status.code(), Some(2), "{bad:?}: a usage error, nothing sent");
+        }
         // Export needs no host at all.
         let out = bin(&dir.path().join("nobody")).args(["sim", "flow", "export", file.to_str().unwrap(), "--maestro", "--app-id", "com.a.b"]).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));

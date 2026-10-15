@@ -272,12 +272,70 @@ oximux sim erase                            # wipe and boot again
 - `push` takes a JSON file: an object with `aps`, at most 4096 bytes.
 - `erase` deletes every app and its data. It is asked in the panel every
   time, as is `push`; a device the user booted is refused without `--force`.
-- What each device takes: a simulator, everything; an Android emulator,
-  everything but `push`; an Android phone, `appearance`, `privacy` and
-  `status-bar`, each asked in the panel every time; a real iPhone, none. A
+- What each device takes: a simulator, everything but `net`; an Android
+  emulator, everything but `push`; an Android phone, `appearance`, `privacy`,
+  `status-bar` and `net offline|online`, each asked in the panel every time;
+  a real iPhone, none. A
   gap exits 5 (`refused`) and says why; nothing is ever skipped silently.
 - An Android device's demo-mode status bar goes back to normal when the last
   worktree attached to it detaches, and when OxiMux quits.
+
+## Network (Android)
+
+Slow the device down, or take it offline, to see how the app copes:
+
+```sh
+oximux sim net speed edge        # gsm, hscsd, gprs, edge, umts, hsdpa, lte, evdo, full, or kbit/s
+oximux sim net speed full        # back to normal
+oximux sim net offline           # Wi-Fi and mobile data off
+oximux sim net online            # both back on
+```
+
+- `speed` is an Android emulator's: the emulator shapes only its mobile
+  data, so a speed below `full` also turns its Wi-Fi off, and `full` turns
+  it back on.
+- `online` turns Wi-Fi back on, and an emulator never slows Wi-Fi: run
+  `net speed` again to shape it.
+- `offline` and `online` work on an emulator and a USB-connected phone. A
+  phone is asked in the panel every time (it is the user's own mobile data),
+  and a phone connected over Wi-Fi is never taken offline (adb would lose
+  it). Each `offline` prints its undo.
+- An iOS simulator shares the Mac's network: throttling it would slow every
+  app on the Mac, so `net` is refused there (exit 5). Throttle inside the
+  app instead.
+- An app reaches Metro over the network: while its device is offline,
+  `rn` cannot watch it (and the app reconnects a few seconds after `online`).
+
+## React Native: requests and CPU profile
+
+Look into a React Native app (0.83 or later, a debug build with Metro
+running on port 8081–8089) instead of adding logging:
+
+```sh
+oximux sim rn network                        # its requests for 10 s
+oximux sim rn network --seconds 20 --grep /api --bodies
+oximux sim rn profile --seconds 5 --top 10   # where its JavaScript spends time
+```
+
+- The app is the one running on the attached device (found by the device's
+  name, then checked to be running there); when several are connected, pick
+  one with `--app ID`. A real iPhone usually reports a generic name
+  ("iPhone"), so its app is not found: use a simulator.
+- `network` prints `METHOD STATUS TIME SIZE URL` per request (at most 200,
+  64 KiB); `--bodies` adds headers and text bodies (4 KiB each).
+  `Authorization`, cookies, token headers, every URL query value and known
+  secret JSON fields (`password`, `token`, `code`, …) come back as
+  `[redacted]`.
+- It sees requests made through React Native's own networking (`fetch` and
+  `XMLHttpRequest` in a plain React Native app). An Expo app's default
+  `fetch` (`expo/fetch`) reports elsewhere and does not show up here.
+- `profile` lists functions by self time; `(idle)` is time with no
+  JavaScript running. Lines are the bundle's (Metro serves one file), not
+  your source's.
+- Older React Native (before 0.83) has no network inspection: `network`
+  fails with what it found (exit 1). A Metro that allows one debugger at a
+  time disconnects an open React Native DevTools; the output warns when it
+  did.
 
 ## Logs and crashes
 
@@ -413,9 +471,9 @@ oximux sim button volume-down
   select Xcode 26. The Mobile Emulator panel shows the exact command for an
   Xcode 26 it finds; the general form, with their own app path, quoted, is
   `sudo xcode-select -s '/Applications/Xcode.app/Contents/Developer'`.
-- `--settle`, `ax -i`, `wait`, `assert`, a tap by ref, `run`, `flow` and
-  `exec` print what is on screen or on the device, like `ax`: OxiMux hides
-  their output from a phone mirroring your chat.
+- `--settle`, `ax -i`, `wait`, `assert`, a tap by ref, `run`, `flow`,
+  `exec`, `rn` and `net` print what is on screen or on the device, like
+  `ax`: OxiMux hides their output from a phone mirroring your chat.
 - Screenshots and the AX tree go to your model provider. The user was told when
   they allowed it; do not sign in to real accounts on the simulator.
 - `oximux sim shutdown` refuses a device the user booted themselves. Do not add

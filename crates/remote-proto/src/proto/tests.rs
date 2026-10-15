@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 31,
-        "v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+        PROTOCOL_VERSION, 32,
+        "v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
          status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
@@ -699,6 +699,46 @@ fn diagnostics_append_and_round_trip() {
         assert_eq!(Response::from_bytes(&bytes).expect("decode"), resp);
         // The reply's ordinal follows the envelope's and `Ok`'s.
         assert_eq!(bytes[2], ordinal, "{reply:?}");
+    }
+}
+
+/// v32 appends React Native after exec (verb 26, reply 13).
+#[test]
+fn react_native_appends_and_round_trips() {
+    let cmds = [
+        SimCmdWire::Rn(SimRnCmdWire::Network { seconds: 10, grep: Some("/api".into()), bodies: true, app: Some("a.b".into()) }),
+        SimCmdWire::Rn(SimRnCmdWire::Profile { seconds: 5, top: 20, app: None }),
+    ];
+    for cmd in cmds {
+        let req = Request::Simulator(SimRequestWire { worktree: Some("/w".into()), cmd: cmd.clone() });
+        let bytes = req.to_bytes().expect("encode");
+        assert_eq!(bytes[5], 26, "{cmd:?}");
+        assert_eq!(Request::from_bytes(&bytes).expect("decode"), req);
+        assert!(cmd.uses_verify() && cmd.is_control(), "a control verb from a client that knows every error");
+    }
+    let request = SimRnRequestWire {
+        method: "POST".into(),
+        url: "https://api.example.com/login?token=[redacted]".into(),
+        status: Some(200),
+        ms: Some(120),
+        size: Some(512),
+        mime: Some("application/json".into()),
+        failed: None,
+        request_headers: vec![("Authorization".into(), "[redacted]".into())],
+        response_headers: Vec::new(),
+        request_body: Some(r#"{"password":"[redacted]"}"#.into()),
+        response_body: None,
+    };
+    let function = SimRnFunctionWire { name: "render".into(), url: "http://localhost:8081/index.bundle".into(), line: 12, self_ms: 40.5 };
+    let replies = [
+        SimReplyWire::Rn(SimRnWire::Network(SimRnNetworkWire { app: "a.b".into(), requests: vec![request], truncated: false, warnings: Vec::new() })),
+        SimReplyWire::Rn(SimRnWire::Profile(SimRnProfileWire { app: "a.b".into(), duration_ms: 5000.0, sampled_ms: 4990.0, functions: vec![function], warnings: vec!["devtools".into()] })),
+    ];
+    for reply in replies {
+        let resp = Response::Simulator(Ok(reply.clone()));
+        let bytes = resp.to_bytes().expect("encode");
+        assert_eq!(bytes[2], 13, "{reply:?}");
+        assert_eq!(Response::from_bytes(&bytes).expect("decode"), resp);
     }
 }
 

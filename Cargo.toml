@@ -172,6 +172,12 @@ tokio = { version = "1", features = ["full"] }
 interprocess = { version = "2.4", features = ["tokio"] }
 futures = "0.3"
 anyhow = "1"
+# `sim rn`: a WebSocket client to a React Native app's debugger through
+# Metro (loopback only, no TLS). Already in the lock through iroh-relay; the
+# features match its client set, so no new crate is pulled in.
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "getrandom", "rand", "sha1_smol"] }
+# The header types `tokio-websockets` takes (already in the lock).
+http = "1"
 # Headless Mermaid (parse + layout + SVG), no browser/Node. Pinned exact: 0.x
 # with real API churn between minors, and 0.7+ raises MSRV past our 1.89.
 # `render` = SVG output; the `raster` feature stays off — gpui rasterizes SVG
