@@ -103,6 +103,16 @@ impl RootSimulator {
                 let _ = root.update(cx, |root, cx| match request {
                     RootRequest::Run(command) => root.run_simulator_command(command, window, cx),
                     RootRequest::SendToAgent(pick) => root.send_pick_to_active_chat(&pick, cx),
+                    RootRequest::CloseSidebar => {
+                        if let Some(rs) = root.right_sidebar.clone() {
+                            rs.update(cx, |s, cx| s.toggle(cx));
+                        }
+                        // The device view that had the keyboard is gone:
+                        // give it to the active pane, so the app's own keys
+                        // (reopening the sidebar among them) work at once.
+                        crate::shell::workspace_ops::refocus_active_pane(root, window, cx);
+                    }
+                    RootRequest::ToggleMaximized => root.toggle_simulator_maximized(window, cx),
                 });
             }));
         });

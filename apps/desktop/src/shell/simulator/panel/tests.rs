@@ -280,3 +280,37 @@ fn two_windows_on_one_worktree_are_two_viewers(cx: &mut TestAppContext) {
     two.update(vcx, |panel, cx| panel.set_shown(false, cx));
     assert!(!hub.read_with(vcx, |hub, _| hub.is_shown(&grid_udid(0))));
 }
+
+/// The header's × and Fill/Split reach the root through the sink, not as a
+/// dispatched action: a click that takes the keyboard back from the
+/// device's screen leaves nothing focused, and such an action reached no
+/// handler (the × did nothing while a tile had the keyboard).
+#[gpui::test]
+fn header_clicks_reach_the_root_through_the_sink(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (panel, vcx) = cx.add_window_view(|_window, cx| {
+        SimulatorPanel::new(Theme::default(), Density::default(), Typography::default(), cx)
+    });
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    panel.update(vcx, |panel, _| {
+        panel.set_command_sink(std::rc::Rc::new(move |request, _window, _cx| {
+            seen.borrow_mut().push(match request {
+                super::RootRequest::CloseSidebar => "close",
+                super::RootRequest::ToggleMaximized => "fill",
+                _ => "other",
+            });
+        }));
+    });
+    let close = panel.read_with(vcx, |panel, _| {
+        panel.root_request(|| super::RootRequest::CloseSidebar, crate::actions::ToggleRightSidebar)
+    });
+    let fill = panel.read_with(vcx, |panel, _| {
+        panel.root_request(|| super::RootRequest::ToggleMaximized, crate::actions::ToggleSimulatorMaximized)
+    });
+    vcx.update(|window, cx| {
+        close(&gpui::ClickEvent::default(), window, cx);
+        fill(&gpui::ClickEvent::default(), window, cx);
+    });
+    assert_eq!(*asked.borrow(), ["close", "fill"]);
+}

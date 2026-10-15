@@ -2,8 +2,11 @@
 //! device is attached — the device row (device menu, Detach) and the stream
 //! settings row.
 
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, Context, IntoElement, ParentElement as _, SharedString, Styled as _, WeakEntity, Window, div, px,
+    AnyElement, App, ClickEvent, Context, IntoElement, ParentElement as _, SharedString, Styled as _, WeakEntity,
+    Window, div, px,
 };
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::{
@@ -12,11 +15,27 @@ use gpui_component::{
 };
 use oximux_simulator::{DeviceId, DeviceInfo, DeviceState, Platform};
 
-use super::SimulatorPanel;
+use super::{RootRequest, SimulatorPanel};
 use crate::actions::{ToggleRightSidebar, ToggleSimulatorMaximized};
 use crate::shell::simulator::state::PanelState;
 
+/// A click handler that reaches the window root.
+type RootClick = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 impl SimulatorPanel {
+    /// A click that asks the root through the panel's sink: a click that
+    /// takes the keyboard back from the device's screen leaves nothing
+    /// focused, and an action dispatched then never reaches the root's
+    /// handlers. Without a sink (a panel no root has wired) the action is
+    /// dispatched as before.
+    pub(super) fn root_request<A: gpui::Action + Clone>(&self, request: fn() -> RootRequest, action: A) -> RootClick {
+        let sink = self.command_sink.clone();
+        Rc::new(move |_, window, cx| match &sink {
+            Some(sink) => sink(request(), window, cx),
+            None => window.dispatch_action(Box::new(action.clone()), cx),
+        })
+    }
+
     pub(super) fn render_header(&self, state: &PanelState, cx: &mut Context<Self>) -> AnyElement {
         let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
         // One name for iOS simulators and Android emulators and phones.
@@ -50,8 +69,9 @@ impl SimulatorPanel {
                     .xsmall()
                     .icon(Icon::default().path("icons/x.svg"))
                     .tooltip("Close sidebar")
-                    .on_click(|_, window: &mut Window, cx: &mut App| {
-                        window.dispatch_action(Box::new(ToggleRightSidebar), cx)
+                    .on_click({
+                        let close = self.root_request(|| RootRequest::CloseSidebar, ToggleRightSidebar);
+                        move |e, window, cx| close(e, window, cx)
                     }),
             );
 
@@ -72,20 +92,27 @@ impl SimulatorPanel {
     /// edge is not offered: the sidebar lives on the right.)
     fn render_layout_button(&self) -> AnyElement {
         let fill = self.is_maximized();
+        let toggle = self.root_request(|| RootRequest::ToggleMaximized, ToggleSimulatorMaximized);
         Button::new("sim-layout")
             .ghost()
             .xsmall()
             .icon(Icon::default().path(if fill { "icons/minimize-2.svg" } else { "icons/maximize-2.svg" }))
             .dropdown_menu(move |menu, _window, _cx| {
                 menu.label("Fill and arrange")
-                    .item(PopupMenuItem::new("Fill").checked(fill).on_click(move |_, window, cx| {
-                        if !fill {
-                            window.dispatch_action(Box::new(ToggleSimulatorMaximized), cx);
+                    .item(PopupMenuItem::new("Fill").checked(fill).on_click({
+                        let toggle = toggle.clone();
+                        move |e, window, cx| {
+                            if !fill {
+                                toggle(e, window, cx);
+                            }
                         }
                     }))
-                    .item(PopupMenuItem::new("Split").checked(!fill).on_click(move |_, window, cx| {
-                        if fill {
-                            window.dispatch_action(Box::new(ToggleSimulatorMaximized), cx);
+                    .item(PopupMenuItem::new("Split").checked(!fill).on_click({
+                        let toggle = toggle.clone();
+                        move |e, window, cx| {
+                            if fill {
+                                toggle(e, window, cx);
+                            }
                         }
                     }))
             })

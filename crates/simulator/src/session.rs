@@ -86,6 +86,9 @@ struct Inner {
     /// Bumped by every [`HelperSession::set_format`], so a JPEG fallback
     /// ends when the user asks for H.264 again.
     format_requests: AtomicU64,
+    /// The scale the stream was last asked for (at launch, then by each
+    /// configure that names one): what a nudge starts from and returns to.
+    stream_values: Mutex<f64>,
     /// Set when the decoder's queue was full and a picture was dropped: the
     /// decoder then waits for (and asks for) a key frame.
     video_dropped: std::sync::atomic::AtomicBool,
@@ -194,6 +197,7 @@ impl HelperSession {
             frame_seq: AtomicU64::new(0),
             frames: FrameSignal::default(),
             format_requests: AtomicU64::new(0),
+            stream_values: Mutex::new(opts.scale),
             video_dropped: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(Some(HashMap::new())),
@@ -328,23 +332,35 @@ impl HelperSession {
     /// Send `command` with an id and wait (≤ `timeout`) for its reply.
     /// Blocking: call from a background executor.
     pub fn request(&self, command: &Command, timeout: Duration) -> Result<Value> {
+        let queued = self.enqueue(command)?;
+        self.reply(command, queued, timeout)
+    }
+
+    /// Queue `command` with an id for [`Self::reply`].
+    fn enqueue(&self, command: &Command) -> Result<(u64, mpsc::Receiver<Reply>)> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(1);
         match self.inner.pending.lock().unwrap().as_mut() {
             Some(pending) => pending.insert(id, tx),
             None => return Err(SimError::HelperExited { code: self.exited().flatten() }),
         };
-        let forget = || {
-            if let Some(pending) = self.inner.pending.lock().unwrap().as_mut() {
-                pending.remove(&id);
-            }
-        };
         if let Err(e) = self.write(protocol::encode_command(command, Some(id)), false) {
-            forget();
+            self.forget(id);
             return Err(e);
         }
+        Ok((id, rx))
+    }
+
+    fn forget(&self, id: u64) {
+        if let Some(pending) = self.inner.pending.lock().unwrap().as_mut() {
+            pending.remove(&id);
+        }
+    }
+
+    /// Wait (≤ `timeout`) for a queued command's reply.
+    fn reply(&self, command: &Command, (id, rx): (u64, mpsc::Receiver<Reply>), timeout: Duration) -> Result<Value> {
         let reply = rx.recv_timeout(timeout);
-        forget();
+        self.forget(id);
         match reply {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(message)) => Err(SimError::HelperFailed(message)),
@@ -380,7 +396,18 @@ impl HelperSession {
         orientation: Option<Orientation>,
         timeout: Duration,
     ) -> Result<()> {
-        self.request(&Command::Configure { scale, fps, orientation, format: None }, timeout).map(drop)
+        let command = Command::Configure { scale, fps, orientation, format: None };
+        // The scale is recorded and its command queued under one lock, which
+        // the decoder's own scale commands also take: the helper's last
+        // scale is always the one recorded (see `video::restore_scale`).
+        let queued = {
+            let mut recorded = self.inner.stream_values.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(scale) = scale {
+                *recorded = scale;
+            }
+            self.enqueue(&command)?
+        };
+        self.reply(&command, queued, timeout).map(drop)
     }
 
     /// A new scale and rate for a viewer's sake (see `crate::viewers`): what

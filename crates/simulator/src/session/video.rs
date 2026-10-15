@@ -1,10 +1,11 @@
 //! The session's decoder thread: the helper's H.264 (`video` messages) into
 //! GPU pictures, on macOS.
 //!
-//! One VideoToolbox session per avcC record (the helper sends one before
-//! every key frame); pictures only from a key frame on; a key frame asked for
-//! whenever the stream is broken (a failed or dropped picture, no decoder
-//! yet); and, when decoding keeps failing, a fallback to JPEG that lasts
+//! One VideoToolbox session per avcC record (the helper usually sends one
+//! before each key frame, and a nudge of the scale makes it send one when a
+//! stream starts without); pictures only from a key frame on; a key frame
+//! asked for whenever the stream is broken (a failed or dropped picture, no
+//! decoder yet); and, when decoding keeps failing, a fallback to JPEG that lasts
 //! until the user picks H.264 again. The dispatcher feeds this thread through
 //! a bounded queue and never waits on it: a stalled decode drops pictures,
 //! it never holds up replies or grows memory.
@@ -17,6 +18,19 @@ use crate::protocol::{self, Command, StreamFormat, Video};
 
 /// Any `configure` makes the helper's next picture a key frame.
 const KEY_FRAME: Command = Command::Configure { scale: None, fps: None, orientation: None, format: None };
+
+/// How far the scale is nudged to make the helper send a missing avcC
+/// record (see [`VideoState::want_description`]).
+#[cfg(target_os = "macos")]
+const NUDGE: f64 = 0.98;
+
+/// How often to nudge again while no record has come.
+#[cfg(target_os = "macos")]
+const NUDGE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Nudges (each a different size) before the stream falls back to JPEG.
+#[cfg(target_os = "macos")]
+const MAX_NUDGES: u32 = 3;
 
 /// Pictures the dispatcher may queue ahead of the decoder.
 pub(super) const QUEUE: usize = 8;
@@ -58,6 +72,10 @@ struct VideoState {
     need_key: bool,
     #[cfg(target_os = "macos")]
     failures: u32,
+    /// A missing avcC record was asked for: when last, and how many times
+    /// since the decoder went.
+    #[cfg(target_os = "macos")]
+    nudged: Option<(std::time::Instant, u32)>,
     /// JPEG was asked for (at this many format requests): ignore H.264 until
     /// the user asks for it again.
     gave_up: Option<u64>,
@@ -101,6 +119,12 @@ impl VideoState {
                 match made {
                     Ok(decoder) => {
                         self.decoder = Some(decoder);
+                        if self.nudged.take().is_some() {
+                            // Back to the scale the viewers ask for now (a
+                            // restream may have come meanwhile): the record
+                            // that brings is the one decoded from then.
+                            restore_scale(inner);
+                        }
                         // A description always precedes a key frame.
                         self.need_key = true;
                         None
@@ -113,9 +137,15 @@ impl VideoState {
                     return None;
                 }
                 let Some(decoder) = &self.decoder else {
-                    // Joined mid-stream, or the decoder was dropped: the next
-                    // key frame brings a description, which rebuilds it.
+                    // Joined mid-stream, or the decoder was dropped: ask for
+                    // a key frame; one from a rebuilt encoder brings a
+                    // description, which rebuilds the decoder.
                     self.want_key(inner);
+                    if message.tag == VideoTag::Keyframe {
+                        // A key frame with no record before it: the helper
+                        // is not sending one.
+                        return self.want_description(inner);
+                    }
                     return None;
                 };
                 match decoder.decode_avcc(message.data) {
@@ -162,6 +192,36 @@ impl VideoState {
         }
     }
 
+    /// Make the helper send its avcC record: it sends one whenever it builds
+    /// an encoder, which a new size does and a key-frame request does not.
+    /// A fresh simulator's helper can start without one (its key frames came
+    /// alone, and the device stayed black until a tile's focus changed its
+    /// size). Nudged a little, and set back once the record has come.
+    /// Only for a simulator's helper: a real iPhone's capture keeps its
+    /// stream's size (its points per pixel and recordings come from it).
+    /// Each try is a different size (a helper already at the last one has
+    /// nothing to rebuild); after [`MAX_NUDGES`], JPEG.
+    #[cfg(target_os = "macos")]
+    fn want_description(&mut self, inner: &Inner) -> Option<String> {
+        if inner.kind != crate::helper::HelperKind::Simulator {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        let tries = match self.nudged {
+            Some((at, _)) if now.duration_since(at) < NUDGE_RETRY => return None,
+            // `give_up` takes the nudge, and sets the scale back with JPEG.
+            Some((_, tries)) if tries >= MAX_NUDGES => return self.give_up(inner, "the stream sends no H.264 description".into()),
+            Some((_, tries)) => tries + 1,
+            None => 1,
+        };
+        tracing::debug!(udid = %inner.udid, tries, "H.264 key frames with no description: nudging the scale for one");
+        self.nudged = Some((now, tries));
+        // Its key frame is no change on screen.
+        inner.frames.rescaled(now);
+        send_scale(inner, |scale| scale * NUDGE.powi(tries as i32), None);
+        None
+    }
+
     /// One bad picture: drop the decoder (a dead VideoToolbox session, e.g.
     /// after sleep, fails every picture) and wait for the next key frame and
     /// its description; too many in a row, and fall back to JPEG.
@@ -185,10 +245,35 @@ impl VideoState {
             self.decoder = None;
         }
         self.gave_up = Some(inner.format_requests.load(Ordering::Acquire));
-        let jpeg = Command::Configure { scale: None, fps: None, orientation: None, format: Some(StreamFormat::Jpeg) };
-        send_now(inner, &jpeg);
+        // A nudged stream goes back to its scale with the switch.
+        #[cfg(target_os = "macos")]
+        let nudged = self.nudged.take().is_some();
+        #[cfg(not(target_os = "macos"))]
+        let nudged = false;
+        if nudged {
+            send_scale(inner, |scale| scale, Some(StreamFormat::Jpeg));
+        } else {
+            send_now(inner, &Command::Configure { scale: None, fps: None, orientation: None, format: Some(StreamFormat::Jpeg) });
+        }
         Some(format!("H.264 stopped working ({why}); streaming JPEG"))
     }
+}
+
+/// Send a scale made from the one last asked for, under the lock
+/// `HelperSession::configure` records and queues its own under: a viewer's
+/// newer scale is never queued between the read and this command, so the
+/// helper's last scale is always the recorded one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn send_scale(inner: &Inner, scale: impl FnOnce(f64) -> f64, format: Option<StreamFormat>) {
+    let recorded = inner.stream_values.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    send_now(inner, &Command::Configure { scale: Some(scale(*recorded)), fps: None, orientation: None, format });
+}
+
+/// Back from a nudge to the scale asked for now.
+#[cfg(target_os = "macos")]
+fn restore_scale(inner: &Inner) {
+    inner.frames.rescaled(std::time::Instant::now());
+    send_scale(inner, |scale| scale, None);
 }
 
 /// Ask for a key frame through the limiter (one forced key frame a second,
@@ -234,6 +319,7 @@ mod tests {
             frame_seq: AtomicU64::new(0),
             frames: crate::keyframe::FrameSignal::default(),
             format_requests: AtomicU64::new(0),
+            stream_values: Mutex::new(0.5),
             video_dropped: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(Some(HashMap::new())),
@@ -273,6 +359,65 @@ mod tests {
 
     fn stop(inner: &Inner) {
         let _ = inner.child.lock().unwrap().kill();
+    }
+
+    /// A key frame with no avcC record before it (a fresh simulator's
+    /// helper can start that way): the scale is nudged so the helper builds
+    /// an encoder and sends one, then set back once it has come.
+    #[test]
+    fn a_missing_description_is_asked_for_and_the_scale_set_back() {
+        let (inner, rx) = inner();
+        let (record, key) = fixture();
+        let mut state = VideoState::default();
+        assert_eq!(state.handle(&inner, message(VideoTag::Keyframe, key.clone())), None);
+        let scales: Vec<f64> = sent(&rx).iter().filter_map(|c| c["scale"].as_f64()).collect();
+        assert_eq!(scales, [0.5 * NUDGE], "nudged once");
+        // A restream meanwhile: the scale goes back to the newer one.
+        *inner.stream_values.lock().unwrap() = 0.25;
+        // Another lone key frame within the retry period asks nothing more.
+        assert_eq!(state.handle(&inner, message(VideoTag::Keyframe, key.clone())), None);
+        assert!(sent(&rx).iter().all(|c| c["scale"].is_null()));
+        // The record comes: decoding starts, and the scale goes back.
+        assert_eq!(state.handle(&inner, message(VideoTag::Description, record)), None);
+        let scales: Vec<f64> = sent(&rx).iter().filter_map(|c| c["scale"].as_f64()).collect();
+        assert_eq!(scales, [0.25], "set back to what the viewers ask for now");
+        assert_eq!(state.handle(&inner, message(VideoTag::Keyframe, key)), None);
+        assert_eq!(inner.frame_seq.load(Ordering::Acquire), 1);
+        stop(&inner);
+    }
+
+    /// A helper that never sends a record: each nudge is another size, and
+    /// after the last the stream falls back to JPEG at its own scale. A real
+    /// iPhone's capture is never nudged.
+    #[test]
+    fn nudges_are_capped_then_jpeg_and_never_on_a_real_iphone() {
+        let (sim, rx) = inner();
+        let (_, key) = fixture();
+        let mut state = VideoState::default();
+        let mut scales = Vec::new();
+        let mut fell_back = None;
+        for _ in 0..=MAX_NUDGES {
+            // Each retry is due: pretend the last nudge was long ago.
+            if let Some((_, tries)) = state.nudged {
+                state.nudged = Some((std::time::Instant::now() - NUDGE_RETRY, tries));
+            }
+            fell_back = state.handle(&sim, message(VideoTag::Keyframe, key.clone())).or(fell_back);
+            scales.extend(sent(&rx).iter().filter_map(|c| c["scale"].as_f64().map(|s| (s, c["format"].as_str().map(str::to_owned)))));
+        }
+        let round = |v: f64| (v * 1e6).round() as i64;
+        let sizes: Vec<i64> = scales.iter().take(MAX_NUDGES as usize).map(|(s, _)| round(*s)).collect();
+        let want: Vec<i64> = (1..=3).map(|n| round(0.5 * NUDGE.powi(n))).collect();
+        assert_eq!(sizes, want, "a different size each time");
+        assert_eq!(scales.last(), Some(&(0.5, Some("jpeg".into()))), "JPEG, back at its own scale");
+        assert!(fell_back.is_some_and(|why| why.contains("no H.264 description")));
+        stop(&sim);
+
+        let (mut capture, rx) = inner();
+        Arc::get_mut(&mut capture).unwrap().kind = crate::helper::HelperKind::DeviceCapture;
+        let mut state = VideoState::default();
+        assert_eq!(state.handle(&capture, message(VideoTag::Keyframe, key)), None);
+        assert!(sent(&rx).iter().all(|c| c["scale"].is_null()), "a real iPhone keeps its size");
+        stop(&capture);
     }
 
     #[test]
