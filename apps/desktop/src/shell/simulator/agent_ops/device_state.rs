@@ -66,6 +66,10 @@ pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str,
 
 /// The longest a change the screen shows waits to be shown.
 const SHOWN_WAIT: Duration = Duration::from_millis(1500);
+/// Motion this recent when the change returns means the screen was busy.
+const BUSY_BEFORE: Duration = Duration::from_millis(300);
+/// What a busy screen waits for a change to show.
+const BUSY_REDRAW: Duration = Duration::from_millis(500);
 
 /// Wait (at most [`SHOWN_WAIT`]) until the screen has changed since
 /// `since`. The tools return before the device redraws, so a screenshot
@@ -73,6 +77,14 @@ const SHOWN_WAIT: Duration = Duration::from_millis(1500);
 /// comes once the change is on screen. Done either way: the change was made
 /// (one that changes nothing, `appearance dark` when dark, waits it out).
 async fn shown(session: &oximux_simulator::stream::StreamSession, since: Instant, cx: &mut AsyncApp) {
+    // A screen already moving (a spinner) moves on whatever happens: its
+    // motion would end the wait before the redraw. Then wait what a redraw
+    // was measured to take instead (a screenshot 0.5 s after `status-bar
+    // clean` always showed it).
+    if session.frame_clock().last_motion_at.is_some_and(|motion| since.saturating_duration_since(motion) < BUSY_BEFORE) {
+        cx.background_executor().timer(BUSY_REDRAW).await;
+        return;
+    }
     let deadline = since + SHOWN_WAIT;
     while Instant::now() < deadline {
         if session.frame_clock().last_motion_at.is_some_and(|motion| motion > since) {

@@ -216,10 +216,9 @@ impl VideoState {
         };
         tracing::debug!(udid = %inner.udid, tries, "H.264 key frames with no description: nudging the scale for one");
         self.nudged = Some((now, tries));
-        let scale = current_scale(inner) * NUDGE.powi(tries as i32);
         // Its key frame is no change on screen.
         inner.frames.rescaled(now);
-        send_now(inner, &Command::Configure { scale: Some(scale), fps: None, orientation: None, format: None });
+        send_scale(inner, |scale| scale * NUDGE.powi(tries as i32), None);
         None
     }
 
@@ -241,33 +240,40 @@ impl VideoState {
 
     fn give_up(&mut self, inner: &Inner, why: String) -> Option<String> {
         tracing::warn!(udid = %inner.udid, "falling back to JPEG: {why}");
-        // A nudged stream goes back to its scale with the switch.
-        #[cfg(target_os = "macos")]
-        let scale = self.nudged.take().map(|_| current_scale(inner));
-        #[cfg(not(target_os = "macos"))]
-        let scale = None;
         #[cfg(target_os = "macos")]
         {
             self.decoder = None;
         }
         self.gave_up = Some(inner.format_requests.load(Ordering::Acquire));
-        let jpeg = Command::Configure { scale, fps: None, orientation: None, format: Some(StreamFormat::Jpeg) };
-        send_now(inner, &jpeg);
+        // A nudged stream goes back to its scale with the switch.
+        #[cfg(target_os = "macos")]
+        let nudged = self.nudged.take().is_some();
+        #[cfg(not(target_os = "macos"))]
+        let nudged = false;
+        if nudged {
+            send_scale(inner, |scale| scale, Some(StreamFormat::Jpeg));
+        } else {
+            send_now(inner, &Command::Configure { scale: None, fps: None, orientation: None, format: Some(StreamFormat::Jpeg) });
+        }
         Some(format!("H.264 stopped working ({why}); streaming JPEG"))
     }
 }
 
-/// The scale the stream was last asked for (see `Inner::stream_values`).
-#[cfg(target_os = "macos")]
-fn current_scale(inner: &Inner) -> f64 {
-    *inner.stream_values.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Send a scale made from the one last asked for, under the lock
+/// `HelperSession::configure` records and queues its own under: a viewer's
+/// newer scale is never queued between the read and this command, so the
+/// helper's last scale is always the recorded one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn send_scale(inner: &Inner, scale: impl FnOnce(f64) -> f64, format: Option<StreamFormat>) {
+    let recorded = inner.stream_values.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    send_now(inner, &Command::Configure { scale: Some(scale(*recorded)), fps: None, orientation: None, format });
 }
 
 /// Back from a nudge to the scale asked for now.
 #[cfg(target_os = "macos")]
 fn restore_scale(inner: &Inner) {
     inner.frames.rescaled(std::time::Instant::now());
-    send_now(inner, &Command::Configure { scale: Some(current_scale(inner)), fps: None, orientation: None, format: None });
+    send_scale(inner, |scale| scale, None);
 }
 
 /// Ask for a key frame through the limiter (one forced key frame a second,
