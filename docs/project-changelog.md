@@ -4,6 +4,52 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-10-15 — Mobile Emulator: verify loop, device state, flows, phone view, MCP (#56–#67)
+
+Agents get a tighter loop on the attached device, and you get more ways to
+see it. Each part needs a desktop at least as new as the wire version noted;
+an older desktop refuses the new verbs with a message saying so.
+
+- **Act, then see what changed** (wire v27, #56 `bcf72f78`, #57 `e00fff0c`).
+  `--settle` on `tap`, `swipe`, `type`, `button`, `rotate`, `launch` and
+  `open-url` waits for the screen to go idle and prints what
+  appeared and went, with `@eN` refs to act on next; `ax -i` lists the
+  elements an agent can act on; `wait` and `assert` check for an element with
+  exit codes instead of sleeps.
+- **Device state** (v28, #58 `b10412ec`): `location`, `appearance`,
+  `privacy`, `push`, `status-bar`, `erase`, plus a Device menu in the panel.
+  Push and erase ask you every time; on a real Android phone every change
+  asks.
+- **Logs and crashes** (v29, #59 `9493f1dc`): bounded `logs` and `crashes`,
+  and a crash row in the panel that sends the report to the agent. What the
+  device printed is scrubbed before it reaches a mirrored chat.
+- **Recovery** (#60 `582cf906`): a simulator stuck on a blank screen restarts
+  its stream, then reboots once if OxiMux booted it, then suggests Erase.
+- **Element inspector** (#61 `359f8961`): hold ⌥ over the device to outline
+  elements; click one to send it to the agent or copy a selector.
+- **Batches and flows** (v30, #62 `d95e1676`): `run` a file of steps (one
+  approval), record a flow from the panel or by an agent, replay it, and
+  export it as Maestro YAML. A password typed while recording is saved as a
+  placeholder.
+- **Onboarding and `exec`** (v31, #63 `e6655117`): example prompts and a
+  one-time intro in the panel; `oximux sim exec` runs a raw `simctl`/`adb`
+  command, off unless you turn it on in Settings, and asked every time.
+- **Several devices at once** (#64 `9f584388`): up to four tiles in the
+  panel. A device nobody is looking at pauses, then parks.
+- **Network and React Native** (v32, #65 `5c3a87dc`): `net speed`,
+  `offline`, `online` on Android; `rn network` and `rn profile` read a
+  React Native app's requests and CPU profile through Metro (0.83 or later, with
+  secrets redacted).
+- **`oximux mcp`** (v33, #66 `1ad5aca7`): another agent app can drive the
+  same device over MCP, with six tools, nothing destructive, and its own
+  consent.
+- **Watch a device from your phone** (v34, #67 `97faba73`): with "Let paired
+  phones view the Mobile Emulator" on in Settings, the mobile app's Devices
+  screen shows a device live, view-only. The desktop asks once per phone and
+  device each run, shows "Viewed from …" in the status bar with Stop sharing,
+  and ends the view within a second if you revoke the phone. Video uses a
+  stream of its own, paced so terminals stay responsive on a slow link.
+
 ### 2026-10-11 — Terminal: command status marks show failures only
 
 - **A successful command no longer gets a green bar** beside its prompt. The

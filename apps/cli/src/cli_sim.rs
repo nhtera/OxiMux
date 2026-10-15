@@ -314,4 +314,30 @@ mod tests {
         let SimCommand::Assert(a) = sim(&["assert", "--label", "Next"]).unwrap() else { panic!() };
         assert_eq!(a.check(), SimCheckWire::Exists);
     }
+
+    /// Every `oximux sim` verb is classified for the chat scrub: its output
+    /// is the screen (mirrored chat hides it) or it is not. Walks the live
+    /// parser, so a new verb fails here until it is put in one list.
+    #[test]
+    fn every_sim_verb_is_classified_for_the_scrub() {
+        use clap::CommandFactory as _;
+        use oximux_agent_core::sim_tools::{CAPTURE_VERBS, NOT_CAPTURE_VERBS};
+        let root = Cli::command();
+        let sim = root.find_subcommand("sim").expect("`oximux sim`");
+        let verbs: Vec<&str> = sim.get_subcommands().map(|c| c.get_name()).collect();
+        assert!(verbs.len() > 20, "{verbs:?}");
+        for verb in &verbs {
+            let capture = CAPTURE_VERBS.contains(verb);
+            let not = NOT_CAPTURE_VERBS.contains(verb);
+            assert!(
+                capture != not,
+                "`oximux sim {verb}` must be in exactly one of sim_tools' CAPTURE_VERBS (its output is the screen \
+                 or the device's log) and NOT_CAPTURE_VERBS"
+            );
+        }
+        // And no list names a verb the CLI no longer has.
+        for verb in CAPTURE_VERBS.iter().chain(&NOT_CAPTURE_VERBS) {
+            assert!(verbs.contains(verb), "sim_tools lists `{verb}`, which `oximux sim` does not have");
+        }
+    }
 }
