@@ -31,7 +31,16 @@ pub const CAPTURE_DIR: &str = "oximux-sim";
 /// steps' output (settle diffs, asserts), a flow its recorded steps (labels
 /// read off the screen); `rn` an app's traffic and code, `net` its device's
 /// network state.
-const CAPTURE_VERBS: [&str; 11] = ["screenshot", "ax", "wait", "assert", "logs", "crashes", "run", "flow", "exec", "rn", "net"];
+pub const CAPTURE_VERBS: [&str; 11] = ["screenshot", "ax", "wait", "assert", "logs", "crashes", "run", "flow", "exec", "rn", "net"];
+
+/// Every other `oximux sim` verb: its own output is not the screen (an
+/// action prints what it did; with `--settle` or a ref it captures through
+/// [`CAPTURE_FLAGS`]). Listed, not implied, so a new verb has to be put in
+/// one list or the other: the CLI's tests fail on a verb in neither.
+pub const NOT_CAPTURE_VERBS: [&str; 20] = [
+    "status", "devices", "attach", "detach", "wait-consent", "tap", "swipe", "type", "button", "rotate", "launch",
+    "open-url", "install", "shutdown", "location", "appearance", "privacy", "push", "status-bar", "erase",
+];
 
 /// Flags that make any `oximux sim` verb print the screen's elements (a
 /// settle's diff, `ax -i`'s list), wherever they stand in the command.
@@ -128,6 +137,13 @@ fn next_word<'a>(words: &[&'a str], at: &mut usize) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_verb_is_both_capturing_and_not() {
+        for verb in CAPTURE_VERBS {
+            assert!(!NOT_CAPTURE_VERBS.contains(&verb), "`{verb}` is in both lists");
+        }
+    }
     use serde_json::json;
 
     #[test]

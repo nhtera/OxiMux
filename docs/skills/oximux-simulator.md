@@ -491,6 +491,13 @@ Add a stdio server to its config, naming your repository:
 
 - No volume buttons, no Touch ID / Face ID matching, no hardware keyboard
   shortcuts beyond typing text.
+- A real iPhone refuses what its tools cannot do (exit 5): device state,
+  logs and crashes, and `exec`. Use a simulator for those.
+- The user's paired phone can **watch** a device (Devices in the mobile
+  app), never control it. The desktop asks the user per phone and device,
+  shows "Viewed from …" in the status bar while it lasts, and it is off
+  unless they turned it on. It changes nothing for you: no verb starts or
+  stops it.
 - Verified with Xcode 26. Any other Xcode version (older or newer) is
   best-effort: it is not blocked, but the helper may fail on it. If the
   sim verbs keep failing with a helper error there, tell the user to

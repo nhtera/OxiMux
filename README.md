@@ -221,6 +221,9 @@ plans/            implementation plans + reports — gitignored
 - **Voice dictation** — offline speech-to-text (sherpa-onnx) into any text field.
 - **Remote control** — pair a phone to a desktop host over an iroh P2P link; the `apps/mobile` client mirrors chats, terminals, and the Git panel.
 - **Mobile Emulator (Beta)** — a live iOS simulator or Android emulator in the right sidebar, driven by hand or by agents through `oximux sim`, with per-device consent. Real devices work too: Android phones over USB or Wi-Fi (pair by code or QR), and USB iPhones, which you can view straight away and control once you turn it on. Control builds a small test runner signed with an Apple Development team you pick (Xcode 26, Developer Mode on the phone). An agent's access to a real device lasts until OxiMux quits.
+  - **For agents:** act and see what changed (`--settle`, `@eN` refs, `wait`, `assert`); device state (location, appearance, permissions, push, status bar, erase); logs and crash reports, with a crash row in the panel that sends the report to the agent; batches and recorded flows, with export to Maestro YAML; network shaping on Android; React Native requests and CPU profiles; a gated raw `simctl`/`adb` escape hatch (`exec`, off by default).
+  - **For you:** an ⌥-hover element inspector, up to four devices side by side, and a paired phone that can watch a device, view-only (off by default; asked per phone and device).
+  - **Outside OxiMux:** `oximux mcp` gives another agent app the same device over MCP, with its own consent.
 - **Ports** — a panel listing the local TCP ports the processes you spawned are listening on.
 - **Design system** — charcoal dark theme, cockpit density, typography scale (`oximux-settings`; see `docs/design-guidelines.md`).
 - **Updates** — signature-verified in-app auto-update for the bundle, and `oximux update` for the CLI pair.
