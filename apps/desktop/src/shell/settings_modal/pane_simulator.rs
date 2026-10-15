@@ -186,6 +186,7 @@ fn agent_entries(
             ),
         ),
         exec_entry(theme, cx),
+        phone_view_entry(theme, cx),
         commands::entry(theme, density, typography, cx),
         entry(
             "What agents can do",
@@ -217,6 +218,27 @@ fn exec_entry(theme: Theme, cx: &mut Context<SettingsModal>) -> SettingEntry {
             move |_, _, cx| {
                 if let Some(hub) = hub(cx) {
                     hub.update(cx, |hub, cx| hub.set_exec_allowed(!allowed, cx));
+                }
+            },
+            cx,
+        ),
+    )
+}
+
+/// Paired phones watching a device: in the app's database like `exec`'s
+/// switch, since it sends the device's screen off the machine.
+fn phone_view_entry(theme: Theme, cx: &mut Context<SettingsModal>) -> SettingEntry {
+    let allowed = hub(cx).is_some_and(|hub| hub.read(cx).phone_view_allowed());
+    entry(
+        "Let paired phones view the Mobile Emulator",
+        "A paired phone can watch a device, never control it. Each phone asks once per device until OxiMux quits.",
+        toggle_switch(
+            "sim-phone-view",
+            allowed,
+            theme,
+            move |_, _, cx| {
+                if let Some(hub) = hub(cx) {
+                    hub.update(cx, |hub, cx| hub.set_phone_view_allowed(!allowed, cx));
                 }
             },
             cx,

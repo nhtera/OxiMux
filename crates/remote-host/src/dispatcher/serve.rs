@@ -619,6 +619,19 @@ impl Dispatcher {
             }
             return self.send(transport, run.await).await;
         }
+        // The phone's view RPCs: listing and subscribing round-trip to the
+        // desktop's UI thread, and a subscription opens a stream of its own.
+        if matches!(req, Request::SimViewables | Request::SimSubscribe { .. } | Request::SimUnsubscribe { .. }) {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = match req {
+                Request::SimSubscribe { device } => self.sim_subscribe(&mut state.views, &peer, &device, transport).await,
+                Request::SimUnsubscribe { token } => self.sim_unsubscribe(&mut state.views, &peer, &token),
+                _ => self.sim_viewables(&peer).await,
+            };
+            return self.send(transport, response).await;
+        }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it
         // `spawn_blocking`s the decode) and is awaited here rather than in the
         // sync `dispatch`. Gated on the authenticated connection alone — it names

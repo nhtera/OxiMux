@@ -191,6 +191,16 @@ impl VideoState {
     }
 }
 
+/// Ask for a key frame through the limiter (one forced key frame a second,
+/// whoever asks): sent now when its turn has come, else held and sent by the
+/// decode loop once it does.
+pub(super) fn request_key_frame(inner: &Inner) {
+    let now = std::time::Instant::now();
+    if inner.frames.request_key(now) || inner.frames.poll_key(now) {
+        send_now(inner, &KEY_FRAME);
+    }
+}
+
 /// Queue `command` (no reply wanted) from a session thread.
 fn send_now(inner: &Inner, command: &Command) {
     if let Some(writer) = inner.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
@@ -233,6 +243,7 @@ mod tests {
             child: Mutex::new(crate::helper::HelperChild::Std(child)),
             ledger: None,
             kind: crate::helper::HelperKind::Simulator,
+            tap: Default::default(),
         };
         (Arc::new(inner), rx)
     }

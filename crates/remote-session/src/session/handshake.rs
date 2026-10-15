@@ -52,7 +52,14 @@ impl RemoteSession {
                 theirs: host_version,
             });
         }
+        self.host_version.store(host_version, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// The protocol version the host said it speaks (see [`Self::hello`]),
+    /// for gating what the app offers on what the host serves.
+    pub fn host_version(&self) -> u32 {
+        self.host_version.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// First-time pairing: prove possession of the QR's `handshake_secret` and, on

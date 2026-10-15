@@ -33,6 +33,10 @@ pub mod flow {
     pub use crate::simulator_flow::{button, header, num};
 }
 pub use crate::simulator_state::{SimLocationWire, SimNetWire, SimPrivacyActionWire, SimStateCmdWire};
+pub use crate::simulator_view::{
+    MAX_VIEW_PAYLOAD, SimSubscribedWire, SimViewClassWire, SimViewFrame, SimViewKind, SimViewToken, SimViewableWire,
+    VIEW_HEADER, ViewStreamError, encode_view_frame, read_view_frame, read_view_token,
+};
 pub use crate::simulator_verify::{
     SimCheckWire, SimDiffLineWire, SimDiffOpWire, SimRefNodeWire, SimSettleOutcomeWire, SimSettleWire,
 };

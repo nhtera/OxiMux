@@ -498,8 +498,12 @@ fn main() {
         // the UI thread, so a slow install never holds up another agent.
         if oximux_app::shell::simulator::hub(cx).is_some() {
             let (simulator, requests) = oximux_app::remote_control::sim_bridge::sim_bridge();
-            remote_control.set_simulator(std::sync::Arc::new(simulator));
+            // A paired phone may watch (never drive) a device, behind
+            // Settings' switch and a per-device ask.
+            let (views, view_requests) = oximux_app::remote_control::sim_view::view_bridge();
+            remote_control.set_simulator(std::sync::Arc::new(simulator.with_views(views)));
             oximux_app::remote_control::sim_bridge::serve_simulator(requests, cx);
+            oximux_app::remote_control::sim_view::serve_views(view_requests, cx);
         }
         // Schedules the phone can list and manage: the same store the desktop's
         // ticker fires and its Settings pane edits, so all three surfaces share one

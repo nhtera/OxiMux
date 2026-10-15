@@ -39,6 +39,7 @@ pub mod devicectl;
 pub mod diag;
 #[cfg(target_os = "macos")]
 pub mod disclaim;
+pub mod encoded_tap;
 pub mod geometry;
 pub mod gesture;
 pub mod helper;

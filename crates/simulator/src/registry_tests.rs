@@ -830,6 +830,21 @@ fn a_remote_viewer_prevents_pause_and_park() {
     assert_eq!(reg.phase(&u), Phase::Live { generation: reg.generation() - 1 });
 }
 
+/// A watching phone asks for the reduced profile: the desktop's panel, shown
+/// too, still wins; and a phone that leaves lets a hidden device pause.
+#[test]
+fn a_phone_watching_is_reduced_and_its_release_lets_the_device_pause() {
+    use StreamProfile::{Full, Reduced};
+    let now = Instant::now();
+    let mut reg = Reg::default();
+    let (w, u) = (wt("a"), dev("U"));
+    live(&mut reg, &w, &u, "s", now);
+    reg.set_viewer(&w, ViewerId::Remote(1), shown(Reduced), now);
+    assert_eq!(reg.profile(&u), Full, "the panel is still shown");
+    assert!(kinds(&reg.set_visible(&w, false, now)).contains(&"profile s Reduced".to_string()), "the phone alone lowers it");
+    assert_eq!(kinds(&reg.release_viewer(&w, ViewerId::Remote(1), now)), ["pause s"], "nobody shows it now");
+}
+
 /// The panel and a tile of one device share its one session.
 #[test]
 fn two_viewers_of_one_device_share_one_session() {

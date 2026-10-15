@@ -154,7 +154,8 @@ async fn backfill_gap(shared: &Arc<Shared>, session_id: &str, resume_from: u64) 
 /// Wire a freshly-(re)connected session into the shared state: restore any
 /// carried-over subscriptions, publish it as the live session, drain its event
 /// stream through the dispatcher, and signal the first-connection outcome to the
-/// waiting `connect_with`. Runs on the core runtime (spawned by the driver's
+/// waiting `connect_with`. `ready` runs once the session is published (the
+/// app hears `Connected` then). Runs on the core runtime (spawned by the driver's
 /// `on_connected`) so the driver keeps polling the pump that services the
 /// re-subscribe RPCs below.
 pub(crate) async fn activate(
@@ -162,6 +163,7 @@ pub(crate) async fn activate(
     session: Arc<RemoteSession>,
     first: FirstResult,
     epoch: u64,
+    ready: Box<dyn FnOnce() + Send>,
 ) {
     let events = session.take_events().expect("events taken once per session");
     // Taken here, beside the event stream, because both are per-session: a new
@@ -173,6 +175,8 @@ pub(crate) async fn activate(
     // rebuilds its subscriber set on accept, so this must be taken + re-subscribed
     // every activation, like the terminal stream above.
     let session_pushes = session.take_sessions().expect("sessions taken once per session");
+    // Per session too: each watched device's stream the host opens on it.
+    let view_streams = session.take_view_streams().expect("view streams taken once per session");
     resubscribe_all(&shared, &session).await;
     // Subscribe to the live session list on this connection; the RPC returns the
     // initial snapshot, delivered to the sink inside.
@@ -188,12 +192,16 @@ pub(crate) async fn activate(
         *live = Some(session);
     }
     rt().spawn(run_dispatcher(shared.clone(), events));
+    // The host opens a stream per watched device; a reconnect ends them all,
+    // and the app subscribes again (it hears `on_end`).
+    rt().spawn(crate::sim_view::run_view_pump(Arc::downgrade(&shared), view_streams));
     rt().spawn(crate::terminals::run_terminal_pump(shared.clone(), terminal_pushes));
     rt().spawn(crate::sessions::run_sessions_pump(shared.clone(), session_pushes));
     // After the session is published and the pump is running: the app answers this
     // by re-attaching, which needs a live session to issue the RPC against and a
     // running pump for the resulting frames to arrive through.
     crate::terminals::resync_attached(&shared);
+    ready();
     if let Some(tx) = first.lock().unwrap().take() {
         let _ = tx.send(Ok(()));
     }
@@ -314,6 +322,7 @@ mod tests {
             terminal_sink: StdMutex::new(None),
             attached: StdMutex::new(std::collections::HashSet::new()),
             sessions_sink: StdMutex::new(None),
+            sim_view_sink: StdMutex::new(None),
         })
     }
 
@@ -333,7 +342,7 @@ mod tests {
         let shared = shared_at_epoch(5); // current epoch = 5
         let first: FirstResult = Arc::new(StdMutex::new(Some(oneshot::channel().0)));
 
-        activate(shared.clone(), a_session(), first, 3).await; // stale epoch 3 != 5
+        activate(shared.clone(), a_session(), first, 3, Box::new(|| {})).await; // stale epoch 3 != 5
 
         assert!(shared.session.lock().unwrap().is_none(), "stale activate must not publish");
     }
@@ -345,7 +354,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let first: FirstResult = Arc::new(StdMutex::new(Some(tx)));
 
-        activate(shared.clone(), a_session(), first, 7).await; // epoch matches
+        activate(shared.clone(), a_session(), first, 7, Box::new(|| {})).await; // epoch matches
 
         assert!(shared.session.lock().unwrap().is_some(), "current activate publishes");
         assert!(matches!(rx.await, Ok(Ok(()))), "first-connection outcome signaled Ok");

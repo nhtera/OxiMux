@@ -1948,6 +1948,7 @@ impl Render for WorkspaceRoot {
                     oximux_agents::session_log::now_unix_ms(),
                     update_ready,
                     self.awake_status,
+                    crate::remote_control::sim_view::viewed_from(cx),
                     move |window, cx| {
                         if let Some(sc) = scm_for_click.clone() {
                             sc.update(cx, |panel, cx| {

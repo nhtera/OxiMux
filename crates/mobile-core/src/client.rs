@@ -59,6 +59,9 @@ pub(crate) struct Shared {
     /// [`terminal_sink`](Self::terminal_sink): the wire has a single session-list
     /// push stream, re-subscribed on every (re)connect.
     pub sessions_sink: StdMutex<Option<Arc<dyn crate::callbacks::SessionsSink>>>,
+    /// The app's sink for watched devices' frames. Connection-wide, like the
+    /// terminal sink; each view stream names its subscription.
+    pub sim_view_sink: StdMutex<Option<Arc<dyn crate::callbacks::SimViewSink>>>,
 }
 
 impl Shared {
@@ -115,6 +118,7 @@ impl MobileClient {
                 terminal_sink: StdMutex::new(None),
                 attached: StdMutex::new(HashSet::new()),
                 sessions_sink: StdMutex::new(None),
+                sim_view_sink: StdMutex::new(None),
             }),
             shutdown: StdMutex::new(None),
             host_endpoint: StdMutex::new(None),

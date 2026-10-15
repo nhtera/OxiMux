@@ -4,6 +4,7 @@ import {
   MessageSquare,
   Plus,
   Settings as SettingsIcon,
+  Smartphone,
   SquareTerminal,
   type LucideIcon,
 } from 'lucide-react-native';
@@ -48,6 +49,7 @@ export function CommandPalette({
   const theme = useTheme();
   const [query, setQuery] = useState('');
   const sessions = useClient((s) => s.sessions);
+  const views = useClient((s) => s.hostViews);
 
   const go = (run: () => void) => () => {
     onClose();
@@ -60,6 +62,7 @@ export function CommandPalette({
     const nav: Action[] = [
       { key: 'new', label: 'New session', icon: Plus, run: onNewSession },
       { key: 'terminals', label: 'Terminals', icon: SquareTerminal, run: () => router.push('/terminals') },
+      ...(views ? [{ key: 'devices', label: 'Devices', icon: Smartphone, run: () => router.push('/simulator') }] : []),
       { key: 'schedules', label: 'Schedules', icon: CalendarClock, run: () => router.push('/schedules') },
       { key: 'settings', label: 'Settings', icon: SettingsIcon, run: () => router.push('/settings') },
     ];
@@ -71,7 +74,7 @@ export function CommandPalette({
       run: () => router.push({ pathname: '/session/[id]', params: { id: s.sessionId } }),
     }));
     return [...nav, ...sessionActions];
-  }, [sessions, onNewSession]);
+  }, [sessions, onNewSession, views]);
 
   const q = query.trim().toLowerCase();
   const filtered = q

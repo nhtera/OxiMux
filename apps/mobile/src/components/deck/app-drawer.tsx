@@ -6,6 +6,7 @@ import {
   MessagesSquare,
   Plus,
   Settings,
+  Smartphone,
   SquareTerminal,
   type LucideIcon,
 } from 'lucide-react-native';
@@ -46,12 +47,23 @@ const EDGE_ZONE = 28;
 
 /** The four flat, always-relevant destinations. Detail routes are pushed on top
  *  of whichever of these is active and are not listed here. */
-const DESTINATIONS: { label: string; icon: LucideIcon; path: '/sessions' | '/terminals' | '/schedules' | '/settings' }[] = [
+type Destination = { label: string; icon: LucideIcon; path: '/sessions' | '/terminals' | '/simulator' | '/schedules' | '/settings' };
+
+const DESTINATIONS: Destination[] = [
   { label: 'Sessions', icon: MessagesSquare, path: '/sessions' },
   { label: 'Terminals', icon: SquareTerminal, path: '/terminals' },
   { label: 'Schedules', icon: CalendarClock, path: '/schedules' },
   { label: 'Settings', icon: Settings, path: '/settings' },
 ];
+
+/** Watching the desktop's devices: listed only for a host that serves it. */
+const DEVICES: Destination = { label: 'Devices', icon: Smartphone, path: '/simulator' };
+
+/** The destinations for the host connected now. */
+function useDestinations(): Destination[] {
+  const views = useClient((s) => s.hostViews);
+  return views ? [...DESTINATIONS.slice(0, 2), DEVICES, ...DESTINATIONS.slice(2)] : DESTINATIONS;
+}
 
 type DrawerApi = {
   open: () => void;
@@ -147,6 +159,7 @@ function DrawerPanel({
 }) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
+  const destinations = useDestinations();
   const sessions = useClient((s) => s.sessions);
   const pathname = usePathname();
 
@@ -182,7 +195,7 @@ function DrawerPanel({
         style={[styles.panel, { backgroundColor: theme.surface1, borderRightColor: theme.border, paddingTop: insets.top + Spacing.two }, panelStyle]}
       >
         <ScrollView contentContainerStyle={styles.inner} showsVerticalScrollIndicator={false}>
-          {DESTINATIONS.map((d) => {
+          {destinations.map((d) => {
             const active = pathname === d.path;
             return (
               <Pressable

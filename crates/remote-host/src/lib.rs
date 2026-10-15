@@ -37,7 +37,7 @@ pub use launcher::{LaunchError, SessionLauncher};
 pub use projects::ProjectProvider;
 pub use rewind::{RewindError, RewindService};
 pub use schedule_runner::{RunNowError, ScheduleRunner, TickerRunner, schedule_run_to_wire};
-pub use simulator::{SimPrincipal, SimulatorControl};
+pub use simulator::{SimPrincipal, SimViewFeed, SimViewOut, SimViewSource, SimViewer, SimulatorControl};
 pub use terminals::{AttachmentId, TerminalAttach, TerminalError, TerminalFrame, TerminalSource};
 pub use transcribe::{AudioTranscriber, TranscribeError};
 pub use worktrees::{WorktreeError, WorktreeService};

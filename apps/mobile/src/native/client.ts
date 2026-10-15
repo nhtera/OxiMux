@@ -39,6 +39,13 @@ type ClientState = {
   projects: ProjectSummary[];
   /** Non-null once a pairing has been attempted; the Rust core owns the connection. */
   client?: MobileClient;
+  /**
+   * The connected host can show its devices (Devices is offered). Kept here,
+   * read at each connection change, rather than asked of `client` during a
+   * render: the compiler memoizes a call on `client` alone, which would keep
+   * the answer from before the host's version was known.
+   */
+  hostViews: boolean;
 };
 
 /**
@@ -102,6 +109,13 @@ function deviceName(): string {
  * stored here rather than by the core, which has no getter for a seed it
  * generates — see `identity.ts`.
  */
+/** The store's view of a connection change. The core reports `Connected`
+ *  once the session is live, so the host's version is known by then. */
+function stateOf(client: MobileClient, state: ConnState) {
+  const next = phaseOf(state);
+  return { ...next, hostViews: next.phase === 'connected' && client.hostSupportsSimView() };
+}
+
 async function newClient(): Promise<MobileClient> {
   return new MobileClient(toArrayBuffer(await getOrCreateSeed()));
 }
@@ -120,6 +134,7 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
   phase: 'idle',
   sessions: [],
   projects: [],
+  hostViews: false,
 
   /**
    * Consume a scanned pairing ticket. The seed comes from the keystore so a
@@ -133,8 +148,8 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
     // snapshot and every subsequent change land in the store — the list is
     // push-driven, not polled (the Rust core re-subscribes on each reconnect).
     client.setSessionsSink({ onSessions: (sessions) => set({ sessions }) });
-    set({ client, phase: 'connecting', cause: undefined });
-    const onState = { onState: (state: ConnState) => set(phaseOf(state)) };
+    set({ client, phase: 'connecting', cause: undefined, hostViews: false });
+    const onState = { onState: (state: ConnState) => set(stateOf(client, state)) };
 
     try {
       await client.connect(ticketUrl, deviceName(), onState);
@@ -184,9 +199,9 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
       const client = await newClient();
       // See `pair`: the list is kept live by this push sink, not a poll.
       client.setSessionsSink({ onSessions: (sessions) => set({ sessions }) });
-      set({ client, phase: 'connecting', cause: undefined });
+      set({ client, phase: 'connecting', cause: undefined, hostViews: false });
       await client.reconnect(toArrayBuffer(endpointIdBytes(host)), {
-        onState: (state: ConnState) => set(phaseOf(state)),
+        onState: (state: ConnState) => set(stateOf(client, state)),
       });
       await get().refreshSessions();
       await get().refreshProjects();
@@ -233,7 +248,7 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
 
   async disconnect() {
     await get().client?.disconnect();
-    set({ phase: 'idle', sessions: [], projects: [], client: undefined, cause: undefined });
+    set({ phase: 'idle', sessions: [], projects: [], client: undefined, cause: undefined, hostViews: false });
   },
 
   /**

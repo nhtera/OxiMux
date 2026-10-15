@@ -9,9 +9,11 @@
 //! to stream — and serial draining would make every other agent's `status`
 //! wait behind it.
 
-use oximux_remote_host::{SimPrincipal, SimulatorControl};
-use oximux_remote_proto::simulator::{SimCmdWire, SimErrorWire, SimReplyWire};
+use oximux_remote_host::{SimPrincipal, SimViewFeed, SimViewer, SimulatorControl};
+use oximux_remote_proto::simulator::{SimCmdWire, SimErrorWire, SimReplyWire, SimViewableWire};
 use tokio::sync::{mpsc, oneshot};
+
+use super::sim_view::ViewRequest;
 
 /// One verb, plus where to send the answer.
 pub struct SimRequest {
@@ -29,13 +31,24 @@ const QUEUE: usize = 16;
 /// The dispatcher's end of the bridge.
 pub struct BridgeSimulator {
     tx: mpsc::Sender<SimRequest>,
+    /// A paired phone watching a device ([`super::sim_view`]), when the
+    /// desktop shows devices to phones at all.
+    views: Option<mpsc::Sender<ViewRequest>>,
+}
+
+impl BridgeSimulator {
+    /// Serve the phone's view RPCs through `views`.
+    pub fn with_views(mut self, views: mpsc::Sender<ViewRequest>) -> Self {
+        self.views = Some(views);
+        self
+    }
 }
 
 /// Build both ends. Dropping the receiver makes every later verb answer
 /// `Unavailable`, the right answer once the UI is gone.
 pub fn sim_bridge() -> (BridgeSimulator, mpsc::Receiver<SimRequest>) {
     let (tx, rx) = mpsc::channel(QUEUE);
-    (BridgeSimulator { tx }, rx)
+    (BridgeSimulator { tx, views: None }, rx)
 }
 
 fn busy() -> SimErrorWire {
@@ -49,6 +62,25 @@ impl SimulatorControl for BridgeSimulator {
         // `try_send`: a full queue or a dropped receiver fails now rather
         // than parking this RPC on the connection's request slot.
         self.tx.try_send(SimRequest { worktree: worktree.to_string(), principal, cmd, reply }).map_err(|_| busy())?;
+        answer.await.map_err(|_| busy())?
+    }
+
+    fn supports_view(&self) -> bool {
+        self.views.is_some()
+    }
+
+    async fn view_list(&self, viewer: &SimViewer) -> Result<Vec<SimViewableWire>, SimErrorWire> {
+        let views = self.views.as_ref().ok_or_else(busy)?;
+        let (reply, answer) = oneshot::channel();
+        views.try_send(ViewRequest::List { viewer: viewer.clone(), reply }).map_err(|_| busy())?;
+        answer.await.map_err(|_| busy())?
+    }
+
+    async fn view_subscribe(&self, viewer: &SimViewer, device: &str) -> Result<SimViewFeed, SimErrorWire> {
+        let views = self.views.as_ref().ok_or_else(busy)?;
+        let (reply, answer) = oneshot::channel();
+        let request = ViewRequest::Subscribe { viewer: viewer.clone(), device: device.to_string(), reply };
+        views.try_send(request).map_err(|_| busy())?;
         answer.await.map_err(|_| busy())?
     }
 }

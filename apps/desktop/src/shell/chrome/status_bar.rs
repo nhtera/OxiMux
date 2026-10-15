@@ -38,6 +38,9 @@ use crate::agent_awake::AwakeStatus;
 use crate::shell::source_control::primary_action::PrimaryAction;
 use crate::shell::usage_meter;
 
+/// The phone-viewing chip's icon.
+const PHONE_VIEW_ICON: &str = "icons/eye.svg";
+
 /// Which card a status-bar chip opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusPopoverKind {
@@ -161,6 +164,9 @@ pub fn view<F, G, H, P, T, A>(
     update_ready: Option<String>,
     // `None` where holds never reach the OS — the chip is then absent.
     awake: Option<AwakeStatus>,
+    // "Viewed from …" while a paired phone watches a device; a click stops
+    // sharing. Absent otherwise.
+    phone_view: Option<String>,
     on_primary_click: F,
     on_usage_click: G,
     on_update_click: H,
@@ -366,6 +372,35 @@ where
             .child(div().size(px(6.)).rounded_full().bg(dot_color))
     });
 
+    // Leads everything while it lasts: a device's screen leaving the
+    // machine is the one state here the user must never miss.
+    let phone_chip = phone_view.map(|label| {
+        let hover_bg = theme.hover_overlay;
+        div()
+            .id("status-bar-phone-view")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.))
+            .h(px(16.))
+            .px(px(6.))
+            .rounded(px(density.r_chip))
+            .bg(theme.status_warn.alpha(0.14))
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.status_warn)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .tooltip(|window, cx| {
+                gpui_component::tooltip::Tooltip::new("A paired phone is watching a device. Click to stop sharing.").build(window, cx)
+            })
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                crate::remote_control::sim_view::stop_sharing(cx);
+            })
+            .child(Icon::default().path(PHONE_VIEW_ICON).size(px(11.)).text_color(theme.status_warn))
+            .child(label)
+            .child(div().text_color(theme.fg_muted).child("· Stop"))
+    });
+
     div()
         .flex()
         .flex_row()
@@ -395,6 +430,14 @@ where
                 .justify_end()
                 .items_center()
                 .gap(px(2.))
+                .children(phone_chip.map(|chip| {
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .child(chip)
+                        .child(separator(theme, typography))
+                }))
                 .children(awake_chip.map(|chip| {
                     div()
                         .flex()

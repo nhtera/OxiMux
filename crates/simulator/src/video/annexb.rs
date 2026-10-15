@@ -83,6 +83,23 @@ fn first_set(data: &[u8], count: u8) -> Option<(Vec<u8>, &[u8])> {
     Some((first.filter(|s| !s.is_empty())?, at))
 }
 
+/// An avcC record (ISO/IEC 14496-15 §5.2.4.1) for `params`, with 4-byte NAL
+/// lengths: what a decoder outside this process (WebCodecs' `description`)
+/// is configured with. Profile, compatibility and level come from the SPS.
+pub fn avcc_record(params: &ParameterSets) -> Option<Vec<u8>> {
+    let (sps, pps) = (&params.sps, &params.pps);
+    if sps.len() < 4 || pps.is_empty() || sps.len() > usize::from(u16::MAX) || pps.len() > usize::from(u16::MAX) {
+        return None;
+    }
+    let mut out = vec![1, sps[1], sps[2], sps[3], 0xfc | 3, 0xe0 | 1];
+    out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.push(1);
+    out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    out.extend_from_slice(pps);
+    Some(out)
+}
+
 /// A picture as an AVCC sample. Parameter sets are left out: they belong in
 /// the format description, and repeating them in a sample confuses nothing
 /// but helps nothing either.
@@ -150,5 +167,14 @@ mod tests {
     #[test]
     fn a_picture_becomes_length_prefixed_without_parameter_sets() {
         assert_eq!(to_avcc(&stream()), [0, 0, 0, 4, 0x65, 0x88, 0x84, 0x00]);
+    }
+
+    #[test]
+    fn an_avcc_record_round_trips_its_parameter_sets() {
+        let params = ParameterSets { sps: vec![0x67, 0x64, 0x00, 0x1f, 0xac], pps: vec![0x68, 0xee, 0x3c] };
+        let record = avcc_record(&params).expect("a record");
+        assert_eq!(&record[..6], &[1, 0x64, 0x00, 0x1f, 0xff, 0xe1]);
+        assert_eq!(from_avcc_record(&record), Some(params));
+        assert_eq!(avcc_record(&ParameterSets { sps: vec![0x67], pps: vec![0x68] }), None, "an SPS too short to name a profile");
     }
 }

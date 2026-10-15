@@ -19,6 +19,7 @@ pub mod worktree_service;
 pub mod rewind_bridge;
 pub mod session_catalog;
 pub mod sim_bridge;
+pub mod sim_view;
 pub mod relay_terminals;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
