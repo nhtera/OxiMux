@@ -47,6 +47,23 @@ pub const REBASE_WINDOW: Duration = Duration::from_secs(1);
 pub const REPEAT_GAP: std::ops::RangeInclusive<Duration> = Duration::from_millis(90)..=Duration::from_millis(130);
 /// See [`REPEAT_GAP`].
 pub const REPEAT_SIZE: f64 = 0.01;
+/// A caret blinks: the same pictures every second. Measured on an iOS
+/// simulator with a text field focused: four deltas a cycle (462, 245, 475,
+/// 275 B at 0.01–0.02 bpp) and, at full size, a key frame nobody asked for
+/// twice a cycle (10 502 and 10 622 B), each the very same size one second
+/// later, for as long as the field has focus. A picture of the same kind and
+/// size (within [`REPEAT_SIZE`]) as one this long before is that blink, not
+/// change: without this, every settle on a screen with a focused field ran
+/// out (5 s per typed step). Only a stream that rests blinks (a gap of at
+/// least [`BLINK_MIN_GAP`] in the last period): a spinner also repeats about
+/// every second, but never pauses, and must stay motion.
+/// The first second of blinking still reads as motion, so a change that
+/// brings a caret is seen.
+pub const BLINK_PERIOD: std::ops::RangeInclusive<Duration> = Duration::from_millis(900)..=Duration::from_millis(1100);
+/// See [`BLINK_PERIOD`]: a caret's cycle has a pause of 300–560 ms with no
+/// picture (measured, both stream sizes); an animation, even a stepped
+/// spinner at 8 steps a second on a 10 fps stream, never pauses this long.
+pub const BLINK_MIN_GAP: Duration = Duration::from_millis(250);
 
 /// When pictures last arrived, and when one last carried change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -141,6 +158,36 @@ struct State {
     jpeg_rebase: Option<Instant>,
     /// The last delta: when, and its size.
     last_delta: Option<(Instant, usize)>,
+    /// The pictures of the last [`BLINK_PERIOD`]: when, their sizes, and
+    /// whether each was a key frame.
+    recent: std::collections::VecDeque<(Instant, usize, bool)>,
+}
+
+impl State {
+    /// Whether this picture repeats one of its kind from a
+    /// [`BLINK_PERIOD`] ago (and remember it for the next).
+    fn blink(&mut self, now: Instant, bytes: usize, key: bool) -> bool {
+        let horizon = *BLINK_PERIOD.end();
+        while self.recent.front().is_some_and(|&(at, _, _)| now.saturating_duration_since(at) > horizon) {
+            self.recent.pop_front();
+        }
+        // The longest stretch with no picture over the last period, up to now.
+        let mut gap = Duration::ZERO;
+        let mut last = now.checked_sub(horizon).unwrap_or(now);
+        for &(at, _, _) in self.recent.iter().chain(std::iter::once(&(now, 0, false))) {
+            gap = gap.max(at.saturating_duration_since(last));
+            last = at;
+        }
+        let rests = gap >= BLINK_MIN_GAP;
+        let blink = rests
+            && self.recent.iter().any(|&(at, size, was_key)| {
+                was_key == key
+                    && BLINK_PERIOD.contains(&now.saturating_duration_since(at))
+                    && (bytes as f64 - size as f64).abs() <= size as f64 * REPEAT_SIZE
+            });
+        self.recent.push_back((now, bytes, key));
+        blink
+    }
 }
 
 /// The frame clock and key-frame gate of one session, shared by its threads.
@@ -156,19 +203,21 @@ impl FrameSignal {
         let motion = match ingress {
             Ingress::Key { bytes } => {
                 let requested = state.keyframes.is_requested(now);
-                tracing::trace!(bytes, requested, "video key frame");
-                !requested
+                let blink = state.blink(now, bytes, true);
+                tracing::trace!(bytes, requested, blink, "video key frame");
+                !requested && !blink
             }
             Ingress::Delta { bytes, pixels } => {
                 let repeat = state.last_delta.is_some_and(|(at, size)| {
                     REPEAT_GAP.contains(&now.saturating_duration_since(at)) && (bytes as f64 - size as f64).abs() <= size as f64 * REPEAT_SIZE
                 });
                 state.last_delta = Some((now, bytes));
+                let blink = state.blink(now, bytes, false);
                 match pixels.filter(|&p| p > 0) {
                     Some(pixels) => {
                         let bppf = bytes as f64 * 8.0 / pixels as f64;
-                        tracing::trace!(bytes, pixels, bppf, repeat, "video delta");
-                        bppf > STATIC_BPPF && !repeat
+                        tracing::trace!(bytes, pixels, bppf, repeat, blink, "video delta");
+                        bppf > STATIC_BPPF && !repeat && !blink
                     }
                     None => true,
                 }
@@ -314,6 +363,55 @@ mod tests {
         assert_eq!(signal.clock().last_motion_at, Some(t0 + 500 * MS), "a blink: another size");
         signal.frame(t0 + 516 * MS, Ingress::Delta { bytes: 995, pixels: AVD });
         assert_eq!(signal.clock().last_motion_at, Some(t0 + 516 * MS), "the same size at the display's pace");
+    }
+
+    /// Measured on an iOS simulator with a text field focused: four deltas
+    /// a second, each repeated a second later at the same size. The first
+    /// cycle is motion; after it the screen is quiet; a real change still
+    /// moves.
+    #[test]
+    fn a_blinking_caret_is_quiet_after_its_first_second() {
+        let t0 = Instant::now();
+        let signal = FrameSignal::default();
+        const SIM: Option<u64> = Some(198_112);
+        let cycle = [(0, 462), (83, 245), (352, 475), (436, 275)];
+        for second in 0..3u32 {
+            for (ms, bytes) in cycle {
+                signal.frame(t0 + second * 1000 * MS + ms * MS, Ingress::Delta { bytes, pixels: SIM });
+            }
+        }
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 436 * MS), "only the first cycle moved");
+        signal.frame(t0 + 3200 * MS, Ingress::Delta { bytes: 3161, pixels: SIM });
+        assert_eq!(signal.clock().last_motion_at, Some(t0 + 3200 * MS), "typing still moves");
+        // At full size the blink brings key frames nobody asked for, twice
+        // a cycle: the first cycle moves, the rest are the blink.
+        let t1 = t0 + 5000 * MS;
+        for second in 0..3u32 {
+            signal.frame(t1 + second * 1000 * MS, Ingress::Key { bytes: 10_502 });
+            signal.frame(t1 + second * 1000 * MS + 500 * MS, Ingress::Key { bytes: 10_622 });
+        }
+        assert_eq!(signal.clock().last_motion_at, Some(t1 + 500 * MS), "only the first cycle's key frames moved");
+    }
+
+    /// A spinner repeats about every second too, but never pauses: it stays
+    /// motion, so a settle still reports a busy screen. At 10 fps with
+    /// jitter, at a slowed 8 fps, and stepping 8 times a second.
+    #[test]
+    fn a_spinner_stays_motion_however_it_is_paced() {
+        const SIM: Option<u64> = Some(198_112);
+        // (pictures, spacing in ms, jitter in ms, distinct sizes per second)
+        for (n, spacing, jitter, phases) in [(30u32, 100u32, 15u32, 10u32), (24, 125, 0, 8), (24, 125, 10, 8)] {
+            let t0 = Instant::now();
+            let signal = FrameSignal::default();
+            let mut last = t0;
+            for frame in 0..n {
+                let wobble = if frame % 2 == 0 { jitter } else { 0 };
+                last = t0 + (frame * spacing + wobble) * MS;
+                let bytes = 400 + (frame % phases) as usize * 37;
+                signal.frame(last, Ingress::Delta { bytes, pixels: SIM });
+            }
+            assert_eq!(signal.clock().last_motion_at, Some(last), "every picture moved ({spacing} ms, ±{jitter})");
+        }
     }
 
     #[test]

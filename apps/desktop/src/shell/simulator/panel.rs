@@ -516,6 +516,10 @@ pub(crate) enum RootRequest {
     Run(SimCommand),
     /// Stage an annotated screenshot in the active agent.
     SendToAgent(crate::actions::SendPickToActiveChat),
+    /// Close the right sidebar (the header's ×).
+    CloseSidebar,
+    /// Switch between Fill and Split.
+    ToggleMaximized,
 }
 
 /// Carries [`RootRequest`]s to the root. Never call it from inside an update

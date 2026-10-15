@@ -77,7 +77,9 @@ impl StreamFormat {
 /// What a [`Video`] message carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoTag {
-    /// The avcC record (SPS/PPS); the helper sends one before every key frame.
+    /// The avcC record (SPS/PPS). The helper usually sends one before each
+    /// key frame, but a fresh stream can start without one; it always sends
+    /// one when it builds an encoder (a change of size).
     Description,
     /// An IDR picture.
     Keyframe,

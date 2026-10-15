@@ -9,7 +9,7 @@
 //! change itself is the hub's (see `hub::device_state`), shared with the
 //! panel's Device menu.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{AsyncApp, Entity};
 use oximux_remote_proto::simulator::{SimErrorWire, SimLocationWire, SimNetWire, SimPrivacyActionWire, SimReplyWire, SimStateCmdWire};
@@ -51,9 +51,34 @@ pub(super) async fn run(hub: &Entity<SimulatorHub>, udid: &DeviceId, name: &str,
             if let Some(kind) = ask {
                 confirm(hub, udid, name, kind, target, cx).await?;
             }
+            let visible = matches!(change, StateChange::Appearance { .. } | StateChange::StatusBar { .. });
             let applied = hub.update(cx, |hub, cx| hub.apply_state(udid, change, cx));
-            applied.await.map(|()| SimReplyWire::Done).map_err(SimErrorWire::Failed)
+            applied.await.map_err(SimErrorWire::Failed)?;
+            if visible {
+                // From the tool's return, not its start: motion left over
+                // from before (a tap's animation) is not the change.
+                shown(&session, Instant::now(), cx).await;
+            }
+            Ok(SimReplyWire::Done)
         }
+    }
+}
+
+/// The longest a change the screen shows waits to be shown.
+const SHOWN_WAIT: Duration = Duration::from_millis(1500);
+
+/// Wait (at most [`SHOWN_WAIT`]) until the screen has changed since
+/// `since`. The tools return before the device redraws, so a screenshot
+/// taken right after `status-bar clean` showed the old bar; the reply now
+/// comes once the change is on screen. Done either way: the change was made
+/// (one that changes nothing, `appearance dark` when dark, waits it out).
+async fn shown(session: &oximux_simulator::stream::StreamSession, since: Instant, cx: &mut AsyncApp) {
+    let deadline = since + SHOWN_WAIT;
+    while Instant::now() < deadline {
+        if session.frame_clock().last_motion_at.is_some_and(|motion| motion > since) {
+            return;
+        }
+        cx.background_executor().timer(Duration::from_millis(50)).await;
     }
 }
 

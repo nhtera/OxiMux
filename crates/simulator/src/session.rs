@@ -86,6 +86,9 @@ struct Inner {
     /// Bumped by every [`HelperSession::set_format`], so a JPEG fallback
     /// ends when the user asks for H.264 again.
     format_requests: AtomicU64,
+    /// The scale the stream was last asked for (at launch, then by each
+    /// configure that names one): what a nudge starts from and returns to.
+    stream_values: Mutex<f64>,
     /// Set when the decoder's queue was full and a picture was dropped: the
     /// decoder then waits for (and asks for) a key frame.
     video_dropped: std::sync::atomic::AtomicBool,
@@ -194,6 +197,7 @@ impl HelperSession {
             frame_seq: AtomicU64::new(0),
             frames: FrameSignal::default(),
             format_requests: AtomicU64::new(0),
+            stream_values: Mutex::new(opts.scale),
             video_dropped: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(Some(HashMap::new())),
@@ -380,6 +384,9 @@ impl HelperSession {
         orientation: Option<Orientation>,
         timeout: Duration,
     ) -> Result<()> {
+        if let Some(scale) = scale {
+            *self.inner.stream_values.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = scale;
+        }
         self.request(&Command::Configure { scale, fps, orientation, format: None }, timeout).map(drop)
     }
 
