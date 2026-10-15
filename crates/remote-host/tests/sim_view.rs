@@ -43,6 +43,8 @@ struct Screen {
     /// a viewer.
     released: Arc<AtomicBool>,
     viewers: Mutex<Vec<SimViewer>>,
+    /// The feed's rate (0: unpaced).
+    bits_per_sec: std::sync::atomic::AtomicU64,
 }
 
 impl Screen {
@@ -53,6 +55,7 @@ impl Screen {
             sharing: Arc::new(AtomicBool::new(true)),
             released: Arc::new(AtomicBool::new(false)),
             viewers: Mutex::new(Vec::new()),
+            bits_per_sec: std::sync::atomic::AtomicU64::new(0),
         };
         (Arc::new(screen), tx)
     }
@@ -109,7 +112,8 @@ impl SimulatorControl for Screen {
         let frames = self.frames.lock().unwrap().take().ok_or(SimErrorWire::ConsentPending)?;
         Ok(SimViewFeed {
             width: 590,
-            height: 1278, bits_per_sec: 0,
+            height: 1278,
+            bits_per_sec: self.bits_per_sec.load(Ordering::SeqCst),
             source: Box::new(Source { frames, sharing: self.sharing.clone(), released: self.released.clone() }),
         })
     }
@@ -241,6 +245,29 @@ async fn stopping_sharing_on_the_desktop_ends_the_view() {
     screen.sharing.store(false, Ordering::SeqCst);
     let _ = feed.send(frame(SimViewKind::Delta, 2, &[8])).await;
     assert!(read_view_frame(stream.as_mut()).await.unwrap().is_none(), "nothing more is sent");
+    assert!(eventually(&screen.released, Duration::from_secs(2)).await);
+}
+
+/// **A large frame being paced out does not outlive the permission**: the
+/// rest of it is not sent once sharing stops, though it would take seconds.
+#[tokio::test]
+async fn stopping_sharing_cuts_a_frame_being_paced_out() {
+    let (screen, feed) = Screen::new();
+    // 80 kbit/s: a 60 kB key frame takes six seconds to go out.
+    screen.bits_per_sec.store(80_000, Ordering::SeqCst);
+    let (dispatcher, _auth) = host(&screen, None);
+    let (client, _serve) = paired(&dispatcher, None).await;
+    subscribe(&client).await;
+    let mut stream = client.accept_uni().await.unwrap().expect("a view stream");
+    read_view_token(stream.as_mut()).await.unwrap().expect("the token");
+    feed.send(frame(SimViewKind::Key, 1, &vec![7u8; 60_000])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let stopped = Instant::now();
+    screen.sharing.store(false, Ordering::SeqCst);
+    let read = tokio::time::timeout(Duration::from_secs(10), read_view_frame(stream.as_mut())).await.expect("the stream ends");
+    assert!(!matches!(read, Ok(Some(_))), "the frame was cut, not finished");
+    assert!(stopped.elapsed() < Duration::from_secs(2), "{:?}", stopped.elapsed());
     assert!(eventually(&screen.released, Duration::from_secs(2)).await);
 }
 

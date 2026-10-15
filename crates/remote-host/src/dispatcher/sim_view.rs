@@ -245,6 +245,11 @@ async fn pump(
         };
         for chunk in bytes.chunks(CHUNK) {
             tokio::time::sleep_until(pacer.book(chunk.len())).await;
+            // A large frame takes seconds to pace out: a revoke or Stop
+            // sharing meanwhile ends it at the next chunk, not after it.
+            if !still_allowed(&auth, &peer, source.as_ref()) {
+                return;
+            }
             if !write_while_allowed(stream.as_mut(), chunk, &auth, &peer, source.as_ref()).await {
                 return;
             }

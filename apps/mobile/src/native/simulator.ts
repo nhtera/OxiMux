@@ -223,6 +223,18 @@ export function useSimView(
       timer = setTimeout(() => void start(), ms);
     };
 
+    // To the page, or held until it is up. The config is kept either way:
+    // a page that reloads needs it again before any key frame decodes.
+    const deliver = (frame: ViewFrame) => {
+      const w = writer.current;
+      if (!w) {
+        buffer.current.push(frame);
+        return;
+      }
+      if (frame.k === FRAME_CONFIG) buffer.current.push(frame);
+      w(frame);
+    };
+
     client.setSimViewSink({
       onFrame: (t: string, kind: number, _pts: bigint, data: ArrayBuffer) => {
         if (!live) return;
@@ -232,9 +244,7 @@ export function useSimView(
           if (asking.current > 0) pending.push(t, { k: kind, b: toBase64(new Uint8Array(data)) });
           return;
         }
-        const frame = { k: kind, b: toBase64(new Uint8Array(data)) };
-        if (writer.current) writer.current(frame);
-        else buffer.current.push(frame);
+        deliver({ k: kind, b: toBase64(new Uint8Array(data)) });
       },
       onEnd: (t: string) => {
         if (!live) return;
@@ -267,8 +277,7 @@ export function useSimView(
         setPhase(next);
         setRelayed(client.connectionRelayed() ?? undefined);
         if (held) {
-          const w = writer.current;
-          if (w) for (const frame of held.buffer.drain()) w(frame);
+          if (writer.current) for (const frame of held.buffer.drain()) deliver(frame);
           else buffer.current = held.buffer;
           if (held.ended) ended();
         }

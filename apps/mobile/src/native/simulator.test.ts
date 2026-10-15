@@ -211,6 +211,28 @@ describe('useSimView', () => {
     expect(client.subscribeSimView).toHaveBeenCalledTimes(2);
   });
 
+  it('gives a page that reloads the config again, though frames went straight to the old one', async () => {
+    const client = fakeClient([started('t1')]);
+    const { result } = mount(client);
+    await waitFor(() => expect(result.current.phase.kind).toBe('live'));
+    const first: ViewFrame[] = [];
+    let unsubscribe = () => {};
+    act(() => {
+      unsubscribe = result.current.subscribe((x) => first.push(x));
+    });
+    act(() => client.frame('t1', FRAME_CONFIG));
+    act(() => client.frame('t1', FRAME_KEY));
+    act(() => client.frame('t1', FRAME_DELTA));
+    expect(first.map((x) => x.k)).toEqual([FRAME_CONFIG, FRAME_KEY, FRAME_DELTA]);
+    // The WebView reloads: its new page registers again.
+    unsubscribe();
+    const second: ViewFrame[] = [];
+    act(() => {
+      result.current.subscribe((x) => second.push(x));
+    });
+    expect(second.map((x) => x.k)).toEqual([FRAME_CONFIG]);
+  });
+
   it('never subscribes while inactive', async () => {
     const client = fakeClient([started('t1')]);
     const { result } = mount(client, false);

@@ -121,14 +121,21 @@ async fn read_view(shared: Weak<Shared>, mut stream: Box<dyn UniRecv>, closed: S
             Either::Right(_) => Ok(None),
         };
         // Read per frame, like the terminal sink: the app may register it
-        // after frames started.
+        // after frames started, so a frame with no sink yet is skipped, not
+        // the end of the view.
         let Some(shared) = shared.upgrade() else { return };
-        let Some(sink) = shared.sim_view_sink.lock().unwrap().clone() else { return };
+        let sink = shared.sim_view_sink.lock().unwrap().clone();
         drop(shared);
         match frame {
-            Ok(Some(frame)) => sink.on_frame(token.clone(), frame.kind as u8, frame.pts_us, frame.payload),
+            Ok(Some(frame)) => {
+                if let Some(sink) = sink {
+                    sink.on_frame(token.clone(), frame.kind as u8, frame.pts_us, frame.payload);
+                }
+            }
             Ok(None) | Err(_) => {
-                sink.on_end(token);
+                if let Some(sink) = sink {
+                    sink.on_end(token);
+                }
                 return;
             }
         }
