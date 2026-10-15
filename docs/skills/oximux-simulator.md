@@ -247,6 +247,10 @@ oximux sim open-url "myapp://settings"
 
 `home` is the swipe-up gesture on Face ID devices and the button on the rest.
 `open-url` takes `http(s)` and app schemes, never `file:`.
+On a simulator, `lock` turns the display off and only another `lock` turns it
+back on: until then `home` and swipes still reach the (unseen) apps, but
+screenshots and the panel show the dimmed frame from before. Press `lock`
+again, then swipe up from the bottom edge to unlock.
 
 ## Device state: location, appearance, privacy, push, status bar, erase
 
