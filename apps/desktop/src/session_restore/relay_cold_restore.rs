@@ -182,7 +182,9 @@ pub fn read_cold_restore(
     // Tail first (bounds the parse work), aligned to a line boundary
     // when the cap actually cut, then strip alternate-screen content
     // (the part that scrambles on replay).
-    let scrollback = std::fs::read(dir.join("scrollback.bin")).unwrap_or_default();
+    let scrollback = oximux_relay_proto::checkpoint_codec::decode(
+        &std::fs::read(dir.join("scrollback.bin")).unwrap_or_default(),
+    );
     // A session that was itself restored starts with the clear this function
     // put in front of its history (the daemon seeds the prefill into the
     // ring). Replayed mid-stream it would wipe the older history above it, so
@@ -501,6 +503,20 @@ mod tests {
         // A control byte in the label can never break the line.
         let hint = resume_hint("Co\ndex");
         assert!(String::from_utf8_lossy(&hint).contains("previous Codex session"));
+    }
+
+    #[test]
+    fn a_compressed_checkpoint_restores_like_a_raw_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("checkpoints");
+        let dir = base.join("pty-gz");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
+        let stored = oximux_relay_proto::checkpoint_codec::encode(b"compressed history\r\n");
+        assert_ne!(stored, b"compressed history\r\n");
+        std::fs::write(dir.join("scrollback.bin"), stored).unwrap();
+        let restore = read_cold_restore(&base, "pty-gz", RestoreMarker::Restored).expect("restorable");
+        assert!(String::from_utf8_lossy(&restore.bytes).contains("compressed history"));
     }
 
     #[test]

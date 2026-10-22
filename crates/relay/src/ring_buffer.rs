@@ -1,9 +1,16 @@
 // Fixed-capacity byte ring buffer for per-PTY scrollback replay. When
 // the buffer fills, the oldest bytes are silently overwritten — the
 // daemon never blocks the PTY reader on slow consumers.
+//
+// The storage grows with the output, up to the capacity: an idle shell holds
+// a prompt's worth, not a megabyte (measured: 200 idle PTYs held ~1 MiB of
+// resident memory each with the ring allocated up front).
 
 pub struct RingBuffer {
+    // Grows to `cap`, then stays; until then it holds exactly the bytes
+    // written, oldest first, and `head == len`.
     buf: Vec<u8>,
+    cap: usize,
     // Position to write the next byte. Always in `[0, capacity)`.
     head: usize,
     // Total bytes currently stored; `min(written, capacity)`.
@@ -14,14 +21,15 @@ impl RingBuffer {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "RingBuffer capacity must be > 0");
         Self {
-            buf: vec![0; capacity],
+            buf: Vec::new(),
+            cap: capacity,
             head: 0,
             len: 0,
         }
     }
 
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.cap
     }
 
     pub fn len(&self) -> usize {
@@ -33,14 +41,27 @@ impl RingBuffer {
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
-        let cap = self.buf.len();
+        let cap = self.cap;
         // Inputs larger than capacity overwrite themselves; only the
         // last `cap` bytes matter.
-        let bytes = if bytes.len() > cap {
+        let mut bytes = if bytes.len() > cap {
             &bytes[bytes.len() - cap..]
         } else {
             bytes
         };
+        // Still growing: append (doubling the storage, capped at `cap`), and
+        // wrap only what does not fit.
+        if self.buf.len() < cap {
+            let take = bytes.len().min(cap - self.buf.len());
+            if self.buf.capacity() < self.buf.len() + take {
+                let want = (self.buf.capacity() * 2).max(self.buf.len() + take).max(4096).min(cap);
+                self.buf.reserve_exact(want - self.buf.len());
+            }
+            self.buf.extend_from_slice(&bytes[..take]);
+            self.len = self.buf.len();
+            self.head = self.buf.len() % cap;
+            bytes = &bytes[take..];
+        }
         let n = bytes.len();
         if n == 0 {
             return;
@@ -63,7 +84,7 @@ impl RingBuffer {
         if self.len == 0 {
             return Vec::new();
         }
-        let cap = self.buf.len();
+        let cap = self.cap;
         let start = (self.head + cap - self.len) % cap;
         let mut out = Vec::with_capacity(self.len);
         if start + self.len <= cap {
@@ -134,6 +155,31 @@ mod tests {
                 naive.drain(..drop);
             }
             assert_eq!(rb.snapshot(), naive, "mismatch after push of {n} bytes");
+        }
+    }
+
+    #[test]
+    fn storage_grows_with_output_and_capacity_is_unchanged() {
+        let mut rb = RingBuffer::new(1 << 20);
+        assert_eq!(rb.capacity(), 1 << 20);
+        rb.push(b"$ ");
+        assert!(rb.buf.capacity() <= 4096, "an idle prompt holds {} bytes", rb.buf.capacity());
+        assert_eq!(rb.snapshot(), b"$ ");
+        assert_eq!(rb.capacity(), 1 << 20);
+    }
+
+    #[test]
+    fn growth_then_wrap_matches_naive_tail_at_every_step() {
+        let cap = 10_000;
+        let mut rb = RingBuffer::new(cap);
+        let mut naive: Vec<u8> = Vec::new();
+        for i in 0..400u32 {
+            let chunk: Vec<u8> = (0..(i * 37 % 300)).map(|j| (i + j) as u8).collect();
+            rb.push(&chunk);
+            naive.extend_from_slice(&chunk);
+            let tail = &naive[naive.len().saturating_sub(cap)..];
+            assert_eq!(rb.snapshot(), tail, "after push {i}");
+            assert!(rb.buf.len() <= cap && rb.buf.capacity() <= cap);
         }
     }
 }

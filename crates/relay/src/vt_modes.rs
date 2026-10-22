@@ -174,10 +174,25 @@ impl ModeTracker {
         Self { offset, ..Self::default() }
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+    pub fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            // Plain text between escapes is most of any stream and changes
+            // nothing: skip to the next ESC in one scan.
+            if self.scan == Scan::Ground {
+                match bytes.iter().position(|&b| b == 0x1b) {
+                    Some(i) => {
+                        self.offset += i as u64;
+                        bytes = &bytes[i..];
+                    }
+                    None => {
+                        self.offset += bytes.len() as u64;
+                        return;
+                    }
+                }
+            }
             self.offset += 1;
-            self.step(b);
+            self.step(bytes[0]);
+            bytes = &bytes[1..];
         }
     }
 

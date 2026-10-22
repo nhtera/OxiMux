@@ -41,6 +41,7 @@ members = [
     "crates/proc-tree",
     "crates/worktree-ops",
     "crates/agent-hooks",
+    "tools/bench-term",
     "xtask",
 ]
 

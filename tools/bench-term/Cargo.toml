@@ -1,0 +1,27 @@
+[package]
+name = "bench-term"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+
+# Memory / CPU / throughput harness for the terminal stack (relay daemon and
+# the client-side terminal model). A standalone tool, not part of xtask (which
+# keeps a minimal-dependency policy and is built by every lint job). Run it by
+# hand: `cargo run -p bench-term -- --help`.
+
+[[bin]]
+name = "bench-term"
+path = "src/main.rs"
+
+[dependencies]
+oximux-pty = { workspace = true }
+oximux-relay-client = { workspace = true }
+oximux-relay-proto = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

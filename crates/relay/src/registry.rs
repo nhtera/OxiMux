@@ -737,8 +737,8 @@ impl PtyRegistry {
         // — no PTYs, or none with new output — and indistinguishable from a
         // broken flush unless the pass says which it was.
         let (mut written, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-        for kv in self.entries.iter() {
-            let e = kv.value();
+        let entries: Vec<Arc<Entry>> = self.entries.iter().map(|kv| Arc::clone(kv.value())).collect(); // no shard guard while writing
+        for e in &entries {
             // An ended session's checkpoint is its reader's to keep or remove;
             // writing one here would resurrect a directory it just deleted.
             if e.child_exited.load(Ordering::Acquire) {
@@ -753,17 +753,17 @@ impl PtyRegistry {
             let bytes = e.ring.lock().expect("ring poisoned").raw();
             let cols = *e.cols.lock().expect("cols poisoned");
             let rows = *e.rows.lock().expect("rows poisoned");
-            // Live cwd straight from the kernel (one proc_pidinfo per
-            // ACTIVE pty per tick) — shells don't reliably announce cwd
-            // changes in-band, and the cold-restore consumer wants the
-            // directory the user was actually in when the daemon died.
+            // Live cwd from the kernel: shells don't reliably announce it, and a
+            // cold restore wants where the user really was.
             let live_cwd = e.pid.and_then(oximux_proc_cwd::cwd_of_pid);
             match store.write_scrollback(&e.pty_id, &bytes, cols, rows, live_cwd.as_deref()) {
-                // Store the pre-snapshot counter: output that landed
-                // mid-write is picked up by the next pass.
+                // Pre-snapshot counter: output landing mid-write goes next pass.
                 Ok(()) => {
                     e.checkpointed_bytes_out.store(seen, Ordering::Relaxed);
                     written += 1;
+                    if e.child_exited.load(Ordering::Acquire) && !self.restarting.load(Ordering::SeqCst) { // ended mid-write
+                        let _ = store.remove(&e.pty_id);
+                    }
                 }
                 Err(err) => {
                     failed += 1;

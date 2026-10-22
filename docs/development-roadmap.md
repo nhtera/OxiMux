@@ -68,6 +68,12 @@ commit SHAs). This file tracks *status and what is next*, not history.
 - Clean-VM installs (Linux, Windows); `install-cli.ps1` has run only under CI parse-check.
 - Agent Chat remote-seam extraction (owed refactor).
 
+**Terminal scale (measured, recorded — not scheduled)**
+- Threads: 4 per PTY in the relay daemon, 816 at 200 PTYs (`tools/bench-term`). A shared
+  readiness loop for quiet PTYs would cut it; worth it if agent fleets reach hundreds.
+- Terminal model: 16 MiB per pane at 5000 rows × 120 cols — under the 20 MiB bar for a
+  lighter core.
+
 **Product**
 - Editor phase 05 step 6+ — paused; revisit only with a concrete need.
 - v1.0 tag: decide what beyond the v0.1.x train it means (dogfood gate below).

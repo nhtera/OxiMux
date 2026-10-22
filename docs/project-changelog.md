@@ -57,6 +57,19 @@ installed.
 - An older daemon kept after an update (because it has sessions) still works
   as before; these improvements apply once it is replaced.
 
+**Lighter on idle terminals**
+
+- **Idle terminals cost almost nothing.** The terminal daemon no longer wakes
+  up 50 times a second per terminal, and a terminal's history buffer grows
+  with its output instead of reserving a megabyte up front: in a development
+  build, 200 idle shells went from ~210 MiB and ~8% CPU to ~25 MiB and under
+  1%.
+- **Crash checkpoints are 6–28× smaller** (compressed). Checkpoints written
+  by this version cannot be restored by an older one after a downgrade — a
+  restored pane would show garbage instead of its history.
+- New developer tool: `cargo run -p bench-term` measures the daemon and the
+  terminal model.
+
 **Readable program colors on the light theme**
 
 - **Minimum text contrast.** On the Paper theme, text colors a program chose

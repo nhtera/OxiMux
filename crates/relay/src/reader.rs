@@ -119,8 +119,15 @@ impl ReplaySnapshot {
 /// would never report `Exit` — the original bug, reintroduced.
 const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
 
-/// Wake-up granularity for the drain loop while no output is arriving.
-const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// What the read and reap threads tell [`reader_loop`].
+enum PtyMsg {
+    /// Output, in order.
+    Chunk(Vec<u8>),
+    /// The pty closed (or the read failed): no more output.
+    Eof,
+    /// The child was reaped, with its exit code when it had one.
+    Exited(Option<i32>),
+}
 
 // The reader task owns the PTY's full I/O state (reader, child handle, ring,
 // subscribers, exit flags); threading it as discrete args keeps the spawn site
@@ -143,34 +150,40 @@ pub(crate) fn reader_loop(
     // thread of its own rather than inline, so the loop below can end the session
     // on whichever comes first: EOF, or the child being reaped plus a short
     // drain. Waiting for EOF alone is what does not port — see `POST_EXIT_DRAIN`.
-    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<Option<i32>>(1);
+    //
+    // Both report into ONE channel, so the loop sleeps until there is something
+    // to do: an idle shell costs no wakeups at all (it used to poll every
+    // 20 ms, 50 wakeups a second per PTY). Only the post-exit
+    // drain waits on a deadline.
+    let (msg_tx, msg_rx) = std::sync::mpsc::sync_channel::<PtyMsg>(8);
+    let reaper_tx = msg_tx.clone();
     std::thread::spawn(move || {
         let code = child.wait().ok().map(|s| s.exit_code() as i32);
-        let _ = exit_tx.send(code);
+        let _ = reaper_tx.send(PtyMsg::Exited(code));
     });
 
-    // Dropping `bytes_tx` is how the reader reports EOF, keeping the unix path's
+    // `Eof` is how the reader reports the pty closing, keeping the unix path's
     // "pty closed, session over" behaviour exactly as it was.
-    let (bytes_tx, bytes_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
     let pty_id_for_reader = pty_id.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; READ_CHUNK_BYTES];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => return,
+                Ok(0) => break,
                 Ok(n) => {
                     // Blocking send: these bytes are the scrollback, so applying
                     // backpressure to the pty is right and dropping them is not.
-                    if bytes_tx.send(buf[..n].to_vec()).is_err() {
+                    if msg_tx.send(PtyMsg::Chunk(buf[..n].to_vec())).is_err() {
                         return;
                     }
                 }
                 Err(e) => {
                     tracing::debug!(?e, pty_id = pty_id_for_reader, "reader EOF/err");
-                    return;
+                    break;
                 }
             }
         }
+        let _ = msg_tx.send(PtyMsg::Eof);
     });
 
     // Live output only: replayed history never reaches here, so it is never answered.
@@ -201,39 +214,48 @@ pub(crate) fn reader_loop(
     // would claim a session that had already ended on its own.
     let mut ended_by_restart: Option<bool> = None;
     loop {
-        match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
-            Ok(chunk) => publish(&chunk),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        let msg = match drain_deadline {
+            // Live: sleep until the reader or the reaper has news.
+            None => msg_rx.recv().ok(),
+            // Reaped: take what output is still in flight, up to the deadline.
+            Some(deadline) => msg_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok(),
+        };
+        match msg {
+            Some(PtyMsg::Chunk(chunk)) => publish(&chunk),
+            // Both ends gone, the deadline passed, or the pty closed: done.
+            None | Some(PtyMsg::Eof) => {
                 ended_by_restart.get_or_insert_with(|| restarting.load(Ordering::SeqCst));
                 break;
             }
-        }
-        if reaped.is_none()
-            && let Ok(code) = exit_rx.try_recv()
-        {
-            ended_by_restart.get_or_insert_with(|| restarting.load(Ordering::SeqCst));
-            reaped = Some(code);
-            drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
-        }
-        if let Some(deadline) = drain_deadline
-            && Instant::now() >= deadline
-        {
-            break;
+            Some(PtyMsg::Exited(code)) => {
+                ended_by_restart.get_or_insert_with(|| restarting.load(Ordering::SeqCst));
+                reaped = Some(code);
+                drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
+            }
         }
     }
 
     // Output the reader already handed over belongs in the ring ahead of `Exit`.
-    while let Ok(chunk) = bytes_rx.try_recv() {
-        publish(&chunk);
+    while let Ok(msg) = msg_rx.try_recv() {
+        match msg {
+            PtyMsg::Chunk(chunk) => publish(&chunk),
+            PtyMsg::Exited(code) if reaped.is_none() => reaped = Some(code),
+            _ => {}
+        }
     }
 
-    // On the EOF route the reaper has not been consulted yet, and its status is
-    // worth blocking for: EOF means the pty is gone, so `wait` is about to
-    // return. On the reaped route the code is already in hand.
+    // On the EOF route the reaper has not reported yet, and its status is worth
+    // blocking for: EOF means the pty is gone, so `wait` is about to return. On
+    // the reaped route the code is already in hand.
     let code = match reaped {
         Some(code) => code,
-        None => exit_rx.recv().unwrap_or(None),
+        None => loop {
+            match msg_rx.recv() {
+                Ok(PtyMsg::Exited(code)) => break code,
+                Ok(_) => continue,
+                Err(_) => break None,
+            }
+        },
     };
     // Stash the status BEFORE flipping `child_exited`, so any reader that
     // observes the flag (here or in `attach`) also sees the final code.
