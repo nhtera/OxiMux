@@ -14,6 +14,7 @@ pub mod commit_message_heuristic;
 pub mod coord;
 pub mod osc_sideband;
 pub mod poll_helpers;
+pub mod program_status;
 pub mod registry;
 pub mod retry;
 pub mod runtime;

@@ -141,9 +141,18 @@ impl TerminalView {
                     } else {
                         Some((*state, *value))
                     };
-                    if matches!(*state, 2 | 4) && !self.focused {
+                    // An agent reporting its own status says when it needs the
+                    // user; its progress errors are not a second alarm.
+                    if matches!(*state, 2 | 4)
+                        && !self.focused
+                        && !self.agent_scan.program_status_in_force()
+                    {
                         got_bell = true;
                     }
+                }
+                // OSC 7501: the program's own status, parsed by the backend.
+                TerminalEvent::ProgramStatus { root, .. } => {
+                    self.agent_scan.feed_program_status(root.clone());
                 }
                 _ => {}
             }
@@ -362,6 +371,7 @@ impl TerminalView {
         scan.poll(std::time::Instant::now(), || self.os_pid());
         let changed = scan.current() != before;
         self.proc_scan = scan;
+        self.agent_scan.set_agent_present(self.proc_scan.current().is_some());
         if changed {
             tracing::debug!(
                 agent = ?self.proc_scan.current(),

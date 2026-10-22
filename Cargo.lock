@@ -8516,6 +8516,7 @@ version = "0.1.42"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "base64",
  "nix",
  "oximux-core",
  "oximux-shell-env",

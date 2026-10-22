@@ -9,6 +9,8 @@ pub mod codec;
 // inherited Mach bootstrap port going dead, which has no Windows equivalent.
 #[cfg(unix)]
 pub mod host_lookup;
+mod program_status_query;
+mod pty_writer;
 pub mod registry;
 pub mod ring_buffer;
 // The pipe's access control. Windows-only because it is the platform that

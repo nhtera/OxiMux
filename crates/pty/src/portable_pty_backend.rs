@@ -35,13 +35,13 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 use crate::close_grace::{JoinHandleWatcher, close_with_grace, term_step};
-use crate::events::TerminalEvent;
+use crate::events::{TerminalEvent, is_status_event, push_bounded_status};
+use crate::program_status::{PROGRAM_STATUS_REPLY, ReplyTicket};
 use crate::polarity::{COLOR_FG_BG, background_polarity};
 use crate::snapshot::{Cell, TerminalSnapshot};
 use crate::state::TerminalState;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const STATUS_EVENT_CAPACITY: usize = 256;
 const READ_BUFFER_BYTES: usize = 4096;
 const SCROLLBACK_ROWS: usize = 5_000;
 
@@ -86,12 +86,20 @@ const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
 /// arriving. Also the granularity of [`POST_EXIT_DRAIN`].
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// The PTY's input side, shared by `write` and the program-status reply.
+type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+/// The latest `ProgramStatus` per session, waiting for the renderer.
+type StatusSlots = Arc<Mutex<HashMap<TerminalSessionId, TerminalEvent>>>;
+
 struct Session {
     /// PTY-bound handles. `None` for sessions in the dormant state
     /// (F3.4: restored sub-panes that hold a prefilled grid but haven't
     /// spawned a shell child yet). `promote_to_live` fills them in.
     master: Option<Box<dyn MasterPty + Send>>,
-    writer: Option<Box<dyn Write + Send>>,
+    /// Shared with the watcher, which answers program-status queries through
+    /// it. `None` while dormant and once closed.
+    writer: SharedWriter,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     state: Arc<Mutex<TerminalState>>,
     watcher: Option<JoinHandle<()>>,
@@ -127,6 +135,10 @@ pub struct PortablePtyBackend {
     event_tx: SyncSender<TerminalEvent>,
     event_rx: Receiver<TerminalEvent>,
     status_events: Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
+    /// The latest program status per session, for the renderer. Kept out of the
+    /// event channel, which drops on full: a status change is the one event a
+    /// hidden pane cannot afford to lose, and only the latest one matters.
+    latest_program_status: StatusSlots,
 }
 
 impl PortablePtyBackend {
@@ -138,6 +150,7 @@ impl PortablePtyBackend {
             event_tx,
             event_rx,
             status_events: Arc::new(Mutex::new(HashMap::new())),
+            latest_program_status: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -201,7 +214,8 @@ impl TerminalBackend for PortablePtyBackend {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
+        let writer: SharedWriter =
+            Arc::new(Mutex::new(Some(pair.master.take_writer().context("take writer")?)));
 
         let id = self.mint_id();
         if cfg.capture_status_events {
@@ -217,12 +231,17 @@ impl TerminalBackend for PortablePtyBackend {
         if !prefill.is_empty() {
             fresh.prefill(prefill);
         }
+        // This backend owns the PTY, so it is the one that answers its
+        // program-status queries — whether or not a view is mounted.
+        fresh.set_answers_program_status(true);
         let state = Arc::new(Mutex::new(fresh));
         let cwd_hint: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let tx = self.event_tx.clone();
         let watcher_state = Arc::clone(&state);
         let watcher_cwd = Arc::clone(&cwd_hint);
         let status_events = Arc::clone(&self.status_events);
+        let status_slots = Arc::clone(&self.latest_program_status);
+        let watcher_writer = Arc::clone(&writer);
         let watcher = std::thread::spawn(move || {
             watch_session(
                 id,
@@ -232,6 +251,8 @@ impl TerminalBackend for PortablePtyBackend {
                 watcher_state,
                 watcher_cwd,
                 status_events,
+                watcher_writer,
+                status_slots,
             )
         });
 
@@ -239,7 +260,7 @@ impl TerminalBackend for PortablePtyBackend {
             id,
             Session {
                 master: Some(pair.master),
-                writer: Some(writer),
+                writer,
                 killer: Some(killer),
                 state,
                 watcher: Some(watcher),
@@ -264,7 +285,7 @@ impl TerminalBackend for PortablePtyBackend {
             id,
             Session {
                 master: None,
-                writer: None,
+                writer: Arc::new(Mutex::new(None)),
                 killer: None,
                 state,
                 watcher: None,
@@ -296,6 +317,8 @@ impl TerminalBackend for PortablePtyBackend {
         let rows = cfg.rows;
         if let Ok(mut state) = session.state.lock() {
             state.resize(cols, rows);
+            // Live from here on, and this backend owns the PTY's replies.
+            state.set_answers_program_status(true);
         }
         session.cols = cols;
         session.rows = rows;
@@ -339,7 +362,7 @@ impl TerminalBackend for PortablePtyBackend {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
+        *lock_writer(&session.writer) = Some(pair.master.take_writer().context("take writer")?);
         let tx = self.event_tx.clone();
         if cfg.capture_status_events {
             self.status_events
@@ -351,6 +374,8 @@ impl TerminalBackend for PortablePtyBackend {
         let watcher_state = Arc::clone(&session.state);
         let watcher_cwd = Arc::clone(&session.cwd_hint);
         let status_events = Arc::clone(&self.status_events);
+        let status_slots = Arc::clone(&self.latest_program_status);
+        let watcher_writer = Arc::clone(&session.writer);
         let watcher = std::thread::spawn(move || {
             watch_session(
                 id,
@@ -360,11 +385,12 @@ impl TerminalBackend for PortablePtyBackend {
                 watcher_state,
                 watcher_cwd,
                 status_events,
+                watcher_writer,
+                status_slots,
             )
         });
 
         session.master = Some(pair.master);
-        session.writer = Some(writer);
         session.killer = Some(killer);
         session.watcher = Some(watcher);
         session.pid = pid;
@@ -376,8 +402,8 @@ impl TerminalBackend for PortablePtyBackend {
             .sessions
             .get_mut(&id)
             .with_context(|| format!("unknown session {id:?}"))?;
-        let writer = session
-            .writer
+        let mut guard = lock_writer(&session.writer);
+        let writer = guard
             .as_mut()
             .with_context(|| format!("session {id:?} is dormant; promote_to_live first"))?;
         writer.write_all(bytes).context("pty write")?;
@@ -569,6 +595,14 @@ impl TerminalBackend for PortablePtyBackend {
         while let Ok(event) = self.event_rx.try_recv() {
             out.push(event);
         }
+        // After the batch it arrived with or behind: the latest status wins.
+        out.extend(
+            self.latest_program_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain()
+                .map(|(_, event)| event),
+        );
         out
     }
 
@@ -601,6 +635,10 @@ impl TerminalBackend for PortablePtyBackend {
     }
 
     fn close(&mut self, id: TerminalSessionId) -> Result<()> {
+        self.latest_program_status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
         let Some(mut session) = self.sessions.remove(&id) else {
             return Ok(());
         };
@@ -612,7 +650,14 @@ impl TerminalBackend for PortablePtyBackend {
         }
         // Drop writer immediately so write() callers get EBADF rather than
         // racing with the pending kill.
-        drop(session.writer.take());
+        // `try_lock`: a reply thread blocked on a full input buffer holds it,
+        // and waiting here would stall the kill that unblocks it. Its handle
+        // drops the writer once it finishes.
+        match session.writer.try_lock() {
+            Ok(mut w) => drop(w.take()),
+            Err(std::sync::TryLockError::Poisoned(p)) => drop(p.into_inner().take()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
         // Build the SIGTERM step. On Unix, target the whole process group
         // (negative pid) so children spawned by the agent CLI also receive
         // the signal. The negative-pid contract works because portable-pty
@@ -657,6 +702,9 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(())
     }
 }
+// Every handle the watcher drives is distinct (reader, child, renderer channel,
+// grid, cwd cache, status queues, writer); bundling them would only hide them.
+#[allow(clippy::too_many_arguments)]
 fn watch_session(
     id: TerminalSessionId,
     mut reader: Box<dyn Read + Send>,
@@ -665,6 +713,8 @@ fn watch_session(
     state: Arc<Mutex<TerminalState>>,
     cwd_hint: Arc<Mutex<Option<PathBuf>>>,
     status_events: Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
+    writer: SharedWriter,
+    status_slots: StatusSlots,
 ) {
     // Reap the child independently of the reader. The reader's renderer
     // notifications are nonblocking, so an absent renderer cannot stop the PTY
@@ -722,7 +772,7 @@ fn watch_session(
         match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
             Ok(chunk) => {
                 let chunk = c0.apply(&chunk);
-                if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events) {
+                if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events, &writer, &status_slots) {
                     return;
                 }
             }
@@ -750,7 +800,7 @@ fn watch_session(
     // publishing. Bounded by the channel, so this cannot spin.
     while let Ok(chunk) = bytes_rx.try_recv() {
         let chunk = c0.apply(&chunk);
-        if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events) {
+        if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events, &writer, &status_slots) {
             return;
         }
     }
@@ -773,6 +823,7 @@ fn watch_session(
 ///
 /// Returns `false` when the renderer is gone, which is the caller's signal to
 /// abandon the session without publishing `Exit`.
+#[allow(clippy::too_many_arguments)]
 fn forward_chunk(
     id: TerminalSessionId,
     chunk: &[u8],
@@ -780,14 +831,19 @@ fn forward_chunk(
     state: &Arc<Mutex<TerminalState>>,
     cwd_hint: &Arc<Mutex<Option<PathBuf>>>,
     status_events: &Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
+    writer: &SharedWriter,
+    status_slots: &StatusSlots,
 ) -> bool {
     // Drive the grid + collect derived events (bell, cwd, command marks,
     // progress, title, clipboard, device replies) in one locked pass. The OSC
     // scanner now lives in `TerminalState`.
-    let derived = match state.lock() {
-        Ok(mut s) => s.advance_collecting(id, chunk),
-        Err(_) => Vec::new(),
+    let (derived, reply) = match state.lock() {
+        Ok(mut s) => (s.advance_collecting(id, chunk), s.take_program_status_reply()),
+        Err(_) => (Vec::new(), None),
     };
+    if let Some(ticket) = reply {
+        write_program_status_reply(writer, ticket);
+    }
     // Forward derived events BEFORE the Output chunk so attention (bell) lands
     // ahead of the bytes that raised it. OSC 7 cwd is absorbed locally into the
     // cheap cwd cache rather than the event stream — `cwd_hint()` is the lookup
@@ -799,7 +855,17 @@ fn forward_chunk(
                     *slot = Some(path);
                 }
             }
+            status @ TerminalEvent::ProgramStatus { .. } => {
+                push_status_event(status_events, id, &status);
+                status_slots
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(id, status);
+            }
             other => {
+                if is_status_event(&other) {
+                    push_status_event(status_events, id, &other);
+                }
                 if !try_send_renderer_event(tx, other) {
                     return false;
                 }
@@ -832,15 +898,31 @@ fn push_status_event(
     let Some(queue) = queues.get_mut(&id) else {
         return;
     };
-    if queue.len() >= STATUS_EVENT_CAPACITY {
-        if let Some(index) = queue
-            .iter()
-            .position(|queued| matches!(queued, TerminalEvent::Output { .. }))
-        {
-            queue.remove(index);
-        } else if matches!(event, TerminalEvent::Output { .. }) {
-            return;
-        }
+    push_bounded_status(queue, event.clone());
+}
+
+fn lock_writer(writer: &SharedWriter) -> std::sync::MutexGuard<'_, Option<Box<dyn Write + Send>>> {
+    writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Answer a program-status query on a thread of its own. The watcher must not
+/// block on the PTY's input: a program that has stopped reading would fill it,
+/// and a watcher stuck writing stops draining the output that program is
+/// blocked on. Replies are rare (one per program start, gated and capped by
+/// the state), so a short-lived thread beats a resident one.
+fn write_program_status_reply(writer: &SharedWriter, ticket: Arc<ReplyTicket>) {
+    let writer = Arc::clone(writer);
+    let for_thread = Arc::clone(&ticket);
+    let spawned = std::thread::Builder::new()
+        .name("pty-status-reply".into())
+        .spawn(move || {
+            if let Some(w) = lock_writer(&writer).as_mut() {
+                let _ = w.write_all(PROGRAM_STATUS_REPLY).and_then(|()| w.flush());
+            }
+            for_thread.mark_written(Instant::now());
+        });
+    // Not sent; settle the ticket so the gate lets the next query try again.
+    if spawned.is_err() {
+        ticket.mark_written(Instant::now());
     }
-    queue.push_back(event.clone());
 }

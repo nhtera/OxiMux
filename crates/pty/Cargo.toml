@@ -13,6 +13,8 @@ oximux-shell-env = { workspace = true }
 anyhow = { workspace = true }
 portable-pty = { workspace = true }
 alacritty_terminal = { workspace = true }
+# OSC 7501 program-status `msg`/`title` are base64 UTF-8.
+base64 = { workspace = true }
 # tokio/tracing land when the UI consumer needs async fan-out or structured logs.
 
 [target.'cfg(unix)'.dependencies]

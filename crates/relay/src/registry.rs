@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use crate::checkpoint::CheckpointStore;
+use crate::program_status_query::ProgramStatusQueryDetector;
+use crate::pty_writer::PtyWriter;
 use crate::ring_buffer::RingBuffer;
 
 // Bounded per-subscriber channel. The session writer task drains it;
@@ -114,7 +116,8 @@ struct Entry {
     // reader has its own cloned fd. `Arc` so the resend-confirm task can
     // share the handle without holding the registry entry.
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    // Input goes through the writer thread so the reader never blocks on it.
+    writer: PtyWriter,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     ring: Arc<Mutex<RingBuffer>>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
@@ -283,7 +286,7 @@ impl PtyRegistry {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
+        let writer = PtyWriter::spawn(&pty_id, pair.master.take_writer().context("take writer")?)?;
 
         let seeded_history = !args.prefill.is_empty();
         let mut seeded = RingBuffer::new(REPLAY_BUFFER_BYTES);
@@ -307,6 +310,7 @@ impl PtyRegistry {
         let bytes_out_for_reader = Arc::clone(&bytes_out);
         let checkpoints_for_reader = self.checkpoints.clone();
         let restarting_for_reader = Arc::clone(&self.restarting);
+        let writer_for_reader = writer.clone();
         std::thread::Builder::new()
             .name(format!("relay-pty-{pty_id}"))
             .spawn(move || {
@@ -321,6 +325,7 @@ impl PtyRegistry {
                     bytes_out_for_reader,
                     checkpoints_for_reader,
                     restarting_for_reader,
+                    writer_for_reader,
                 )
             })
             .context("spawn reader thread")?;
@@ -347,7 +352,7 @@ impl PtyRegistry {
             attachments: Mutex::new(HashMap::new()),
             resize_seq: AtomicU64::new(0),
             master: Arc::new(Mutex::new(pair.master)),
-            writer: Mutex::new(writer),
+            writer,
             killer: Mutex::new(killer),
             ring,
             subscribers,
@@ -467,9 +472,7 @@ impl PtyRegistry {
             .entries
             .get(pty_id)
             .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
-        let mut w = entry.writer.lock().expect("writer poisoned");
-        w.write_all(bytes).context("pty write")?;
-        w.flush().context("pty flush")?;
+        entry.writer.write(bytes)?;
         entry
             .bytes_in
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -1041,6 +1044,7 @@ fn reader_loop(
     bytes_out: Arc<AtomicU64>,
     checkpoints: Option<Arc<CheckpointStore>>,
     restarting: Arc<AtomicBool>,
+    writer: PtyWriter,
 ) {
     // Reap on a thread of its own rather than after the read loop, and read on a
     // thread of its own rather than inline, so the loop below can end the session
@@ -1076,7 +1080,10 @@ fn reader_loop(
         }
     });
 
-    let publish = |bytes: &[u8]| {
+    // Live output only: replayed history never reaches here, so it is never answered.
+    let mut queries = ProgramStatusQueryDetector::new();
+    let mut publish = |bytes: &[u8]| {
+        queries.feed(bytes, Instant::now(), |ticket| writer.try_reply(ticket));
         bytes_out.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         // Lock-order discipline: ring before subscribers, same
         // order `attach` uses, to keep snapshot+push atomic.

@@ -1504,8 +1504,8 @@ fn boot_relay_supervisor(
             .join()
             .expect("relay handshake thread panicked")
     });
-    let (client, stale_version) = match connect_result {
-        Ok(boot) => (boot.client, boot.stale_version),
+    let (client, stale_version, version_unknown) = match connect_result {
+        Ok(boot) => (boot.client, boot.stale_version, boot.version_unknown),
         Err(SupervisorError::VersionMismatch) => {
             tracing::warn!("relay version mismatch; falling back to in-process PTYs");
             #[cfg(target_os = "macos")]
@@ -1530,7 +1530,12 @@ fn boot_relay_supervisor(
             &client_arc,
         )),
     ));
-    let backend = RelayBackend::new(std::sync::Arc::clone(&client_arc), relay_rt.handle().clone());
+    // A daemon that predates program-status replies (kept after an update, or
+    // of unknown version) leaves them to the client.
+    let client_replies = version_unknown
+        || stale_version.as_deref().is_some_and(|v| !oximux_relay_client::daemon_answers_program_status(v));
+    let backend = RelayBackend::new(std::sync::Arc::clone(&client_arc), relay_rt.handle().clone())
+        .with_program_status_replies(client_replies);
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
     install_shared_backend(shared);

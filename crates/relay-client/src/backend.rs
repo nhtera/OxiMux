@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
+use oximux_pty::program_status::PROGRAM_STATUS_REPLY;
 use oximux_pty::{
     Cell, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId, TerminalSnapshot,
-    TerminalState, apply_color_fg_bg, background_polarity,
+    TerminalState, apply_color_fg_bg, background_polarity, is_status_event, push_bounded_status,
 };
 use oximux_relay_proto::{Notification, Request, Response};
 use tokio::runtime::Handle;
@@ -19,7 +20,6 @@ use crate::client::RelayClient;
 // preserved when an app switches between in-process and relay
 // backends mid-session (e.g., relay went down + supervisor restarted).
 const SCROLLBACK_ROWS: usize = 5000;
-const STATUS_EVENT_CAPACITY: usize = 256;
 
 /// Debug-only output-arrival probe, paired with the app-side input/echo trace.
 /// Off unless `OXIMUX_INPUT_TRACE` is set; appends to the same log file so the
@@ -108,6 +108,11 @@ pub struct RelayBackend {
     /// still answers for it — recovery finds the lost session's checkpoint by
     /// it, even for a view that mounts the session only after the swap.
     inherited_external_ids: Mutex<HashMap<TerminalSessionId, String>>,
+    /// Whether this client answers the OSC 7501 feature queries of the PTYs it
+    /// shows. A current daemon answers its own; this is for one left over from
+    /// an older version (kept after an update because it has sessions), which
+    /// predates that and would otherwise leave every program unanswered.
+    answers_program_status: bool,
 }
 
 impl RelayBackend {
@@ -126,7 +131,15 @@ impl RelayBackend {
             inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
             status_inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
             inherited_external_ids: Mutex::new(HashMap::new()),
+            answers_program_status: false,
         }
+    }
+
+    /// Answer program-status queries client-side — only for a daemon that does
+    /// not answer them itself (see [`daemon_answers_program_status`]).
+    pub fn with_program_status_replies(mut self, answers: bool) -> Self {
+        self.answers_program_status = answers;
+        self
     }
 
     /// Daemon-replacement seeding: take over the dead predecessor backend's
@@ -236,15 +249,20 @@ impl RelayBackend {
         // the daemon's full retained output and the receiver grid has to be
         // sized to fit it, regardless of what the user picked for fresh spawns.
         let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, SCROLLBACK_ROWS)));
+        let id = self.mint_id();
         {
             let mut s = lock_recover(&state, "terminal state");
-            s.advance(&replay);
-            // Replay is historical: drop title/clipboard/bell/color events it
-            // fired so they don't leak into the first live frame.
-            s.clear_collected();
+            s.set_answers_program_status(self.answers_program_status);
+            // Replay is historical: it drops the title/clipboard/bell/color
+            // events it fired so they don't leak into the first live frame, but
+            // keeps the program's last reported status, which consumers start
+            // from.
+            s.replay(&replay);
+            if let Some(ev) = s.program_status_event(id) {
+                push_event(&self.event_queues, id, ev);
+            }
         }
 
-        let id = self.mint_id();
         let generation = Arc::new(AtomicU64::new(1));
         let (sub_id, notif_rx) = self.client.subscribe_pty(relay_pty_id);
         // Address this subscription. Without it the pane also receives the
@@ -301,7 +319,7 @@ impl RelayBackend {
                     if generation.load(Ordering::Acquire) != my_generation {
                         return;
                     }
-                    resync_after_gap(&client, &relay_pty_id, &state).await;
+                    resync_after_gap(&client, &relay_pty_id, &state, &queues, id).await;
                     if let Some(waker) = lock_recover(&wakers, "output wakers").get(&id) {
                         waker();
                     }
@@ -309,6 +327,16 @@ impl RelayBackend {
                 }
                 let flow =
                     apply_relay_notification(&state, &queues, id, &generation, my_generation, n);
+                // Only set on a state that answers queries itself (an older
+                // daemon): the reply goes out the same way keystrokes do.
+                let reply = lock_recover(&state, "terminal state").take_program_status_reply();
+                if let Some(ticket) = reply {
+                    let _ = client.try_send_oneway(Request::Write {
+                        pty_id: relay_pty_id.clone(),
+                        bytes: PROGRAM_STATUS_REPLY.to_vec(),
+                    });
+                    ticket.mark_written(std::time::Instant::now());
+                }
                 // Event-driven drain: nudge the UI the instant output is queued
                 // so it renders on arrival instead of waiting for the next
                 // (macOS-throttled) poll tick. Fired for every notification —
@@ -321,6 +349,29 @@ impl RelayBackend {
                 }
             }
         })
+    }
+}
+
+/// The first release whose daemon answers OSC 7501 program-status queries.
+pub const PROGRAM_STATUS_REPLIES_SINCE: (u64, u64, u64) = (0, 1, 43);
+
+/// Whether a daemon of `version` answers its PTYs' program-status queries, so
+/// the client must not. A daemon kept after an update is merely *another*
+/// version — possibly a newer one, which does answer — so the decision is the
+/// version, not the mismatch. An unreadable version is taken as old: a second
+/// reply is harmless to the program, none at all loses its status.
+pub fn daemon_answers_program_status(version: &str) -> bool {
+    let mut parts = version
+        .split(['-', '+'])
+        .next()
+        .unwrap_or_default()
+        .split('.')
+        .map(str::parse::<u64>);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) => {
+            (major, minor, patch) >= PROGRAM_STATUS_REPLIES_SINCE
+        }
+        _ => false,
     }
 }
 
@@ -341,6 +392,8 @@ async fn resync_after_gap(
     client: &RelayClient,
     relay_pty_id: &str,
     state: &Arc<Mutex<TerminalState>>,
+    queues: &SessionEventQueues,
+    id: TerminalSessionId,
 ) {
     let resp = client
         .request(Request::Replay {
@@ -359,12 +412,20 @@ async fn resync_after_gap(
         }
     };
     let mut s = lock_recover(state, "terminal state");
-    *s = TerminalState::new(cols, rows, SCROLLBACK_ROWS);
-    s.advance(&replay);
+    let before = s.program_status_root();
+    let mut fresh = TerminalState::new(cols, rows, SCROLLBACK_ROWS);
+    // Who answers, and a handshake whose query the ring may have dropped.
+    fresh.inherit_program_status(&s);
+    *s = fresh;
     // Replay is historical: drop the title/clipboard/bell/colour events it
     // fired so a resync does not re-ring the bell for output the user already
-    // saw before the gap.
-    s.clear_collected();
+    // saw before the gap. Program-status records are kept, and a status change
+    // that fell inside the gap is announced now — nothing else would.
+    s.replay(&replay);
+    if let Some(ev) = s.program_status_change_since(id, before.as_ref()) {
+        drop(s);
+        push_event(queues, id, ev);
+    }
 }
 
 /// Apply one relay notification to the local terminal state + event
@@ -548,6 +609,7 @@ impl TerminalBackend for RelayBackend {
         if !prefill.is_empty() {
             fresh.prefill(prefill);
         }
+        fresh.set_answers_program_status(self.answers_program_status);
         let state = Arc::new(Mutex::new(fresh));
         let id = self.mint_id();
         if cfg.capture_status_events {
@@ -996,12 +1058,7 @@ fn register_status_queue(queues: &mut EventQueues, id: TerminalSessionId) {
         .get(&id)
         .into_iter()
         .flat_map(|queue| queue.iter())
-        .filter(|event| {
-            matches!(
-                event,
-                TerminalEvent::Output { .. } | TerminalEvent::Exit { .. }
-            )
-        })
+        .filter(|event| is_status_event(event))
         .cloned()
         .collect::<Vec<_>>();
     let mut status = VecDeque::new();
@@ -1013,10 +1070,8 @@ fn register_status_queue(queues: &mut EventQueues, id: TerminalSessionId) {
 
 fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {
     let mut queues = lock_recover(queues, "event queues");
-    if matches!(
-        event,
-        TerminalEvent::Output { .. } | TerminalEvent::Exit { .. }
-    ) && let Some(status) = queues.status.get_mut(&id)
+    if is_status_event(&event)
+        && let Some(status) = queues.status.get_mut(&id)
     {
         push_bounded_status(status, event.clone());
     }
@@ -1031,20 +1086,6 @@ fn push_status_event_only(
     if let Some(status) = lock_recover(queues, "event queues").status.get_mut(&id) {
         push_bounded_status(status, event);
     }
-}
-
-fn push_bounded_status(queue: &mut VecDeque<TerminalEvent>, event: TerminalEvent) {
-    if queue.len() >= STATUS_EVENT_CAPACITY {
-        if let Some(index) = queue
-            .iter()
-            .position(|queued| matches!(queued, TerminalEvent::Output { .. }))
-        {
-            queue.remove(index);
-        } else if matches!(event, TerminalEvent::Output { .. }) {
-            return;
-        }
-    }
-    queue.push_back(event);
 }
 
 /// Lock a mutex, recovering from poison instead of propagating the
@@ -1084,6 +1125,18 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oximux_pty::STATUS_EVENT_CAPACITY;
+
+    #[test]
+    fn only_a_daemon_older_than_the_feature_leaves_replies_to_the_client() {
+        assert!(!daemon_answers_program_status("0.1.42"));
+        assert!(daemon_answers_program_status("0.1.43"));
+        assert!(daemon_answers_program_status("0.1.44"));
+        assert!(daemon_answers_program_status("0.2.0"));
+        assert!(daemon_answers_program_status("0.1.43-beta.1"));
+        assert!(!daemon_answers_program_status("garbage"));
+        assert!(!daemon_answers_program_status(""));
+    }
 
     // A panic while some thread held a backend lock must not take every
     // later backend call down with it: lock_recover hands back the

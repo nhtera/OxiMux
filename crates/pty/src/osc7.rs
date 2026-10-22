@@ -1,6 +1,7 @@
 //! Out-of-band scanner — runs alongside alacritty's parser to pick up the
 //! sequences alacritty does NOT surface as events: OSC 7 (cwd), OSC 133/633
-//! (shell-integration command marks), OSC 9;4 (progress), and the two that
+//! (shell-integration command marks), OSC 9;4 (progress), OSC 7501 (program
+//! status, see `program_status`), and the two that
 //! destroy the scrollback — `CSI 3J` (erase saved lines) and `ESC c` (RIS).
 //!
 //! Those last two are not OSCs, and they earn their place here because they
@@ -39,6 +40,7 @@
 use std::path::PathBuf;
 
 use crate::events::CommandMarkKind;
+use crate::program_status::{ProgramReport, is_query, parse_report};
 
 /// Hard cap on a single OSC payload buffer. RFC has no real limit but
 /// 4 KiB is several orders of magnitude over any realistic OSC 7 path.
@@ -71,6 +73,14 @@ pub enum OscHit {
     /// so each mark rides up with its own content and keeps pointing at it;
     /// the commands stay one scroll away, badges and all.
     HistoryWiped,
+    /// `ESC c` (RIS) on its own: a full reset, which also wipes program
+    /// status. Raised right after the [`OscHit::HistoryWiped`] the same bytes
+    /// produce; `CSI 3J` raises only that one.
+    Ris,
+    /// OSC 7501 feature query (`ESC ] 7501 ; ? ST`).
+    ProgramStatusQuery,
+    /// OSC 7501 report, parsed. Malformed reports never get this far.
+    ProgramStatus(ProgramReport),
 }
 
 const ESC: u8 = 0x1b;
@@ -163,6 +173,7 @@ impl OscScanner {
                 // RIS. Two bytes, no parameters, no ambiguity.
                 b'c' => {
                     on_hit(OscHit::HistoryWiped);
+                    on_hit(OscHit::Ris);
                     OscState::Normal
                 }
                 ESC => OscState::AfterEsc, // back-to-back ESCs — stay armed
@@ -249,6 +260,14 @@ impl OscScanner {
             b"9" => {
                 if let Some(hit) = parse_progress(rest) {
                     on_hit(hit);
+                }
+            }
+            // OSC 7501 program status: a feature query or a report.
+            b"7501" => {
+                if is_query(rest) {
+                    on_hit(OscHit::ProgramStatusQuery);
+                } else if let Some(report) = parse_report(rest) {
+                    on_hit(OscHit::ProgramStatus(report));
                 }
             }
             _ => {}
@@ -722,4 +741,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ris_is_told_apart_from_an_erase_of_saved_lines() {
+        assert!(collect_hits(b"\x1bc").contains(&OscHit::Ris));
+        assert!(!collect_hits(b"\x1b[3J\x1b[H\x1b[2J").contains(&OscHit::Ris));
+    }
+
+    #[test]
+    fn program_status_query_and_report_decode_with_either_terminator() {
+        for st in [&b"\x07"[..], b"\x1b\\"] {
+            let mut bytes = b"\x1b]7501;?".to_vec();
+            bytes.extend_from_slice(st);
+            bytes.extend_from_slice(b"\x1b]7501;state=working:app=x");
+            bytes.extend_from_slice(st);
+            let hits = collect_hits(&bytes);
+            assert_eq!(hits.first(), Some(&OscHit::ProgramStatusQuery), "{hits:?}");
+            assert!(
+                matches!(hits.get(1), Some(OscHit::ProgramStatus(ProgramReport::Set { .. }))),
+                "{hits:?}"
+            );
+        }
+        // A malformed report is not a hit at all.
+        assert!(collect_hits(b"\x1b]7501;state=sleeping\x07").is_empty());
+    }
+
+    #[test]
+    fn a_program_status_sequence_split_at_every_byte_decodes_once() {
+        let whole = b"\x1b]7501;?\x07\x1b]7501;state=done:msg=aGk=\x1b\\";
+        for split in 0..=whole.len() {
+            let mut scanner = OscScanner::new();
+            let mut hits = Vec::new();
+            scanner.feed(&whole[..split], |h| hits.push(h));
+            scanner.feed(&whole[split..], |h| hits.push(h));
+            assert_eq!(hits.len(), 2, "split at {split}: {hits:?}");
+            assert_eq!(hits[0], OscHit::ProgramStatusQuery);
+        }
+    }
 }

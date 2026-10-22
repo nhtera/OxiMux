@@ -48,6 +48,10 @@ pub struct BootDaemon {
     pub client: RelayClient,
     /// Set when the daemon is from another app version and was kept.
     pub stale_version: Option<String>,
+    /// The daemon's version could not be read, so whether it has this app's
+    /// features is unknown. Callers that would rather answer twice than not at
+    /// all (the program-status reply) treat it like a stale one.
+    pub version_unknown: bool,
 }
 
 impl RelaySupervisor {
@@ -64,15 +68,21 @@ impl RelaySupervisor {
     ) -> Result<BootDaemon, SupervisorError> {
         let record = self.read_pid_record();
         let daemon_version = match assess(record.as_ref(), app_version) {
-            Staleness::Fresh => return Ok(BootDaemon { client, stale_version: None }),
+            Staleness::Fresh => {
+                return Ok(BootDaemon { client, stale_version: None, version_unknown: false });
+            }
             Staleness::Unknown => {
                 tracing::info!("relay pid record unreadable; not checking the daemon's version");
-                return Ok(BootDaemon { client, stale_version: None });
+                return Ok(BootDaemon { client, stale_version: None, version_unknown: true });
             }
             Staleness::Stale { daemon_version } => daemon_version,
         };
         let kept = |client: RelayClient| -> Result<BootDaemon, SupervisorError> {
-            Ok(BootDaemon { client, stale_version: Some(daemon_version.clone()) })
+            Ok(BootDaemon {
+                client,
+                stale_version: Some(daemon_version.clone()),
+                version_unknown: false,
+            })
         };
         if serve_attached() {
             tracing::info!(%daemon_version, app_version, "stale relay daemon kept: oximux serve uses it");
@@ -121,7 +131,8 @@ impl RelaySupervisor {
             }
             Staleness::Fresh | Staleness::Unknown => None,
         };
-        Ok(BootDaemon { client, stale_version })
+        // Whatever replaced it was started by this app, so Unknown here is ours.
+        Ok(BootDaemon { client, stale_version, version_unknown: false })
     }
 }
 

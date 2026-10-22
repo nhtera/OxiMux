@@ -17,13 +17,17 @@ pub mod grid_serializer;
 pub mod osc7;
 pub mod polarity;
 pub mod portable_pty_backend;
+pub mod program_status;
 pub mod snapshot;
 pub mod state;
 
 pub use backend::{
     InputMode, MouseMode, OutputWaker, SpawnConfig, TerminalBackend, TerminalSessionId,
 };
-pub use events::{CommandMarkKind, TerminalEvent};
+pub use events::{
+    CommandMarkKind, STATUS_EVENT_CAPACITY, TerminalEvent, is_status_event, push_bounded_status,
+};
+pub use program_status::{ProgramRecord, ProgramState};
 pub use grid_serializer::{
     CAPTURE_HEADER_LEN, CAPTURE_HEADER_MAGIC, SerializeOptions, build_capture_header,
     parse_capture_header, serialize_term, serialize_term_capped, serialize_term_capped_with_dims,

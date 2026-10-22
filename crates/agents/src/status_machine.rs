@@ -11,6 +11,9 @@
 //!   (the user is being asked something; slow user is not idle agent).
 //! - terminal states (`Done` / `Failed`) never transition out.
 //!
+//! Sources rank `ProgramStatus > Sideband > Regex` (see [`StatusSource`]): once a
+//! higher source has spoken, a lower one no longer moves the status.
+//!
 //! Pure logic — no I/O, no tokio, no PTY. `feed()` takes the wall-clock
 //! instant from the caller so tests can drive synthetic time.
 
@@ -38,6 +41,18 @@ pub struct StatusTransition {
     pub to: AgentStatus,
 }
 
+/// Where the status comes from, lowest rank first. A source never transitions
+/// the status while a higher one is in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StatusSource {
+    /// The adapter's regex table and the output/silence heuristics.
+    Regex,
+    /// OSC 9999 sideband events (the agent hooks).
+    Sideband,
+    /// OSC 7501 program status, armed (see [`StatusMachine::feed_program_status`]).
+    ProgramStatus,
+}
+
 /// Per-session status machine. Cheap to construct (just an `Arc` clone of
 /// the adapter's pattern slice + a 1 KiB ring); one per live session.
 pub struct StatusMachine {
@@ -46,16 +61,26 @@ pub struct StatusMachine {
     current: AgentStatus,
     last_output_at: Option<Instant>,
     sideband_running: bool,
-    /// Set the first time a sideband (hook) event arrives. From then on the
-    /// hooks are the authority for `Running`/`Idle`: raw output no longer flips
-    /// a finished agent back to `Running`, and the silence-decay is disabled —
-    /// only an explicit sideband or exit changes the live/idle state. This is
-    /// the reference cockpit's model (state changes on hook events, not on the
-    /// presence/absence of output), and it removes the "Running flash" an agent
-    /// would otherwise show when it prints a final summary AFTER its `Stop`
-    /// hook reported idle. The regex table still runs, so the immediate
+    /// The highest source in force.
+    ///
+    /// `Sideband` is set the first time a sideband (hook) event arrives. From
+    /// then on the hooks are the authority for `Running`/`Idle`: raw output no
+    /// longer flips a finished agent back to `Running`, and the silence-decay is
+    /// disabled — only an explicit sideband or exit changes the live/idle state.
+    /// This is the reference cockpit's model (state changes on hook events, not
+    /// on the presence/absence of output), and it removes the "Running flash"
+    /// an agent would otherwise show when it prints a final summary AFTER its
+    /// `Stop` hook reported idle. The regex table still runs, so the immediate
     /// `NeedsApproval`/`WaitingForInput` body-prompt backstop is preserved.
-    hook_driven: bool,
+    ///
+    /// `ProgramStatus` silences both lower sources outright: the program says
+    /// what it is doing, including when it is blocked on the user, so neither
+    /// a backstop nor a heuristic has anything to add — and a regex match on
+    /// screen text is exactly what a forged prompt would exploit.
+    source: StatusSource,
+    /// A sideband event was ever seen, so releasing program status falls back
+    /// to `Sideband` rather than `Regex`.
+    sideband_seen: bool,
 }
 
 impl StatusMachine {
@@ -67,8 +92,14 @@ impl StatusMachine {
             current: AgentStatus::Idle,
             last_output_at: None,
             sideband_running: false,
-            hook_driven: false,
+            source: StatusSource::Regex,
+            sideband_seen: false,
         }
+    }
+
+    /// The highest source currently in force.
+    pub fn source(&self) -> StatusSource {
+        self.source
     }
 
     /// Current status (last successful transition's target, or `Idle`).
@@ -80,7 +111,7 @@ impl StatusMachine {
     /// changed, else `None`. `now` is the caller's clock — typically
     /// `Instant::now()`, but tests pass synthetic instants.
     pub fn feed(&mut self, bytes: &[u8], now: Instant) -> Option<StatusTransition> {
-        if bytes.is_empty() || self.current.is_terminal() {
+        if bytes.is_empty() || self.current.is_terminal() || self.source == StatusSource::ProgramStatus {
             return None;
         }
         self.push_to_ring(bytes);
@@ -110,7 +141,7 @@ impl StatusMachine {
         //    revive it to `Running` and trigger a decay flash. The next real
         //    turn re-enters `Running` through its `UserPromptSubmit`/`PreToolUse`
         //    sideband, not through output.
-        if !self.hook_driven && !matches!(self.current, AgentStatus::Running) {
+        if self.source == StatusSource::Regex && !matches!(self.current, AgentStatus::Running) {
             self.sideband_running = false;
             return self.transition_to(AgentStatus::Running);
         }
@@ -131,7 +162,7 @@ impl StatusMachine {
         }
         // Hooks own the live/idle state once seen — never decay a hook-reported
         // Running on output silence; only a `Stop` sideband or exit ends it.
-        if self.sideband_running || self.hook_driven {
+        if self.sideband_running || self.source > StatusSource::Regex {
             return None;
         }
         let last = self.last_output_at?;
@@ -198,7 +229,12 @@ impl StatusMachine {
         // A hook has spoken: from here the sideband (not raw output) owns the
         // live/idle state. Marked even if the session is already terminal so the
         // invariant is recorded for any future logic.
-        self.hook_driven = true;
+        self.sideband_seen = true;
+        if self.source == StatusSource::ProgramStatus {
+            // Outranked: the caller still publishes the event's detail.
+            return None;
+        }
+        self.source = StatusSource::Sideband;
         if self.current.is_terminal() {
             return None;
         }
@@ -207,6 +243,38 @@ impl StatusMachine {
             self.last_output_at = None;
         }
         self.transition_to(derived)
+    }
+
+    /// Apply the program's root status (OSC 7501). `None` means nobody is
+    /// reporting any more: the rank is released and the lower sources resume,
+    /// from the status the program last left.
+    ///
+    /// A report takes over only when trusted: `trusted` is the caller's call —
+    /// the report followed a feature query in this stream, or the caller knows
+    /// the process is an agent. Otherwise it changes nothing, so a file that
+    /// merely contains report bytes cannot set an agent's status.
+    pub fn feed_program_status(
+        &mut self,
+        root: Option<&oximux_pty::ProgramRecord>,
+        trusted: bool,
+    ) -> Option<StatusTransition> {
+        if self.current.is_terminal() {
+            return None;
+        }
+        let Some(record) = root else {
+            if self.source == StatusSource::ProgramStatus {
+                self.source = if self.sideband_seen { StatusSource::Sideband } else { StatusSource::Regex };
+            }
+            return None;
+        };
+        if self.source < StatusSource::ProgramStatus && !trusted {
+            return None;
+        }
+        self.source = StatusSource::ProgramStatus;
+        self.sideband_running = false;
+        self.last_output_at = None;
+        let (status, _) = crate::program_status::map_program_status(record);
+        self.transition_to(status)
     }
 
     fn push_to_ring(&mut self, bytes: &[u8]) {
@@ -561,5 +629,68 @@ mod tests {
 
         assert!(sm.tick(start + IDLE_AFTER * 2).is_none());
         assert_eq!(sm.current(), &AgentStatus::Running);
+    }
+
+    fn report(p: &str) -> oximux_pty::ProgramRecord {
+        match oximux_pty::program_status::parse_report(p.as_bytes()) {
+            Some(oximux_pty::program_status::ProgramReport::Set { record, .. }) => record,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn armed_program_status_outranks_regex_sideband_and_decay() {
+        use oximux_core::AgentSidebandState;
+        let pats = patterns(&[(r"Do you want to proceed", AgentStatus::NeedsApproval("x".into()))]);
+        let mut sm = StatusMachine::new(pats);
+        let start = t0();
+        sm.feed_program_status(Some(&report("state=working")), true);
+        assert_eq!(sm.current(), &AgentStatus::Running);
+        assert_eq!(sm.source(), StatusSource::ProgramStatus);
+        assert!(sm.feed(b"Do you want to proceed? (y/n)", start).is_none());
+        assert!(sm.feed_sideband(AgentSidebandState::Idle, None).is_none());
+        assert!(sm.tick(start + IDLE_AFTER * 2).is_none());
+        assert_eq!(sm.current(), &AgentStatus::Running);
+    }
+
+    #[test]
+    fn an_untrusted_report_changes_nothing() {
+        let mut sm = StatusMachine::new(patterns(&[]));
+        assert!(sm.feed_program_status(Some(&report("state=blocked:kind=permission")), false).is_none());
+        assert_eq!(sm.current(), &AgentStatus::Idle);
+        assert_eq!(sm.source(), StatusSource::Regex);
+        // Once armed, later reports need no new handshake.
+        sm.feed_program_status(Some(&report("state=working")), true);
+        let t = sm.feed_program_status(Some(&report("state=blocked:kind=question")), false).unwrap();
+        assert_eq!(t.to, AgentStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn release_hands_back_to_the_lower_source() {
+        use oximux_core::AgentSidebandState;
+        let mut sm = StatusMachine::new(patterns(&[]));
+        sm.feed_program_status(Some(&report("state=working")), true);
+        sm.feed_program_status(None, false);
+        assert_eq!(sm.source(), StatusSource::Regex);
+        assert!(sm.tick(t0()).is_none(), "no decay clock is running");
+        // With hooks seen before, release falls back to them.
+        sm.feed_sideband(AgentSidebandState::Working, None);
+        sm.feed_program_status(Some(&report("state=idle")), true);
+        sm.feed_program_status(None, false);
+        assert_eq!(sm.source(), StatusSource::Sideband);
+        assert!(sm.feed_sideband(AgentSidebandState::Working, None).is_some());
+    }
+
+    #[test]
+    fn a_finished_turn_is_idle_not_terminal() {
+        let mut sm = StatusMachine::new(patterns(&[]));
+        sm.feed_program_status(Some(&report("state=working")), true);
+        sm.feed_program_status(Some(&report("state=done")), true);
+        assert_eq!(sm.current(), &AgentStatus::Idle);
+        let t = sm.feed_program_status(Some(&report("state=working")), true).unwrap();
+        assert_eq!(t.to, AgentStatus::Running);
+        // Process exit still ends it for good.
+        sm.note_exit(Some(0));
+        assert!(sm.feed_program_status(Some(&report("state=working")), true).is_none());
     }
 }

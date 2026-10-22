@@ -4,6 +4,27 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased — Agent status without hooks (OSC 7501 program status)
+
+Agents that report their own status now get it shown exactly, with no hooks
+installed.
+
+- **OxiMux answers the program-status query.** A program that supports the
+  open OSC 7501 protocol asks its terminal once, then reports idle, working,
+  done, or waiting on you (with the reason). OxiMux answers it once per PTY,
+  attached or not, and the report sets the agent's status ahead of hooks and
+  screen matching. Claude Code ≥ 2.1.295 reports this way today.
+- **Survives a reopen.** Re-attaching to a running agent restores its last
+  reported status from the daemon's buffer.
+- **Safe by default.** Report bytes printed by something else (a `cat` in a
+  plain shell) never create an agent row. Status text is sanitized before
+  display. A program that floods queries or echoes the reply cannot stall or
+  loop a pane: replies are debounced and capped, and the daemon now writes to
+  each PTY from a dedicated thread.
+- An older daemon kept after an update (because it has sessions) does not
+  know the protocol; the app answers in its place until that daemon is
+  replaced.
+
 ### 2026-10-16 — v0.1.42: Mobile Emulator: verify loop, device state, flows, phone view, MCP (#56–#69)
 
 Agents get a tighter loop on the attached device, and you get more ways to
