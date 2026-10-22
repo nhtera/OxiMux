@@ -782,17 +782,19 @@ impl PaneGroup {
         pane_visible: bool,
         cx: &gpui::App,
     ) {
-        self.notify_terminal(session, crate::notifier::NotificationKind::Bell, String::new(), pane_visible, cx);
+        self.notify_terminal(session, crate::notifier::NotificationKind::Bell, String::new(), false, pane_visible, cx);
     }
 
     /// One path for every terminal-sourced banner (bell, OSC 9/777,
     /// `oximux notify`). The title is fixed to the tab's own label, and the
-    /// terminal source collapses bursts under its own key, apart from agents.
+    /// terminal source collapses bursts under its own key, apart from agents
+    /// (`explicit`: the user's `oximux notify`, which has a key of its own).
     pub fn notify_terminal(
         &self,
         session: TerminalSessionId,
         kind: crate::notifier::NotificationKind,
         body: String,
+        explicit: bool,
         pane_visible: bool,
         cx: &gpui::App,
     ) {
@@ -811,7 +813,7 @@ impl PaneGroup {
             // slot; the `bell:` identifier namespace keeps it from ever
             // being read as an agent tab id, and routes a click to the pane.
             tab_id: TabId(session.0),
-            workspace_key: crate::notifier::terminal_burst_key(&self.cwd.to_string_lossy()),
+            workspace_key: crate::notifier::terminal_burst_key(&self.cwd.to_string_lossy(), explicit),
             label: label.to_string(),
             body,
             window_active: self.window_active.load(Ordering::Relaxed),

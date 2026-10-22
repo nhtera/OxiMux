@@ -46,7 +46,7 @@ impl TerminalView {
         let mut clipboard_text: Option<String> = None;
         let mut pty_replies: Vec<Vec<u8>> = Vec::new();
         // Only the last notification of a batch can show anyway (debounce).
-        let mut notification: Option<(Option<String>, String)> = None;
+        let mut notification: Option<(Option<String>, String, bool)> = None;
         for ev in &events {
             match ev {
                 TerminalEvent::Output { bytes, .. } => {
@@ -161,7 +161,7 @@ impl TerminalView {
                     if !self.focused {
                         got_bell = true;
                     }
-                    notification = Some((title.clone(), body.clone()));
+                    notification = Some((title.clone(), body.clone(), *explicit));
                 }
                 // OSC 7501: the program's own status, parsed by the backend.
                 TerminalEvent::ProgramStatus { root, .. } => {
@@ -191,8 +191,8 @@ impl TerminalView {
         if bell_rang && settings.bell == BellStyle::Notify {
             self.maybe_notify_bell(cx);
         }
-        if let Some((title, body)) = notification {
-            self.maybe_notify_terminal(title, body, cx);
+        if let Some((title, body, explicit)) = notification {
+            self.maybe_notify_terminal(title, body, explicit, cx);
         }
         let session_id = self.session_id;
         if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {

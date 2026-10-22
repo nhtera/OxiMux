@@ -377,9 +377,11 @@ pub fn terminal_notification_body(title: Option<&str>, body: &str) -> Option<Str
 
 /// Burst-collapse key for a terminal-sourced banner. Its own namespace, so a
 /// program printing notifications in a loop collapses only its own banners
-/// and can never use up the slot an agent's approval banner needs.
-pub fn terminal_burst_key(workspace: &str) -> String {
-    format!("term:{workspace}")
+/// and can never use up the slot an agent's approval banner needs. The user's
+/// own `oximux notify` (`explicit`) gets a slot of its own too, so a bell or a
+/// program's OSC 9 just before it cannot swallow it.
+pub fn terminal_burst_key(workspace: &str, explicit: bool) -> String {
+    if explicit { format!("term-explicit:{workspace}") } else { format!("term:{workspace}") }
 }
 
 /// `SettingsRepo` keys for the notification prefs (flat KV, `"true"`/`"false"`).
@@ -522,12 +524,14 @@ mod tests {
     fn a_terminal_burst_never_uses_up_an_agents_slot() {
         let mut gate = BurstGate::new();
         let now = Instant::now();
-        let key = terminal_burst_key("/wt");
+        let key = terminal_burst_key("/wt", false);
         assert!(gate.should_fire(&key, now));
         // A program looping notifications in the same worktree…
         assert!(!gate.should_fire(&key, now + Duration::from_millis(10)));
-        // …leaves the agent's own burst slot for that worktree untouched.
+        // …leaves the agent's own burst slot for that worktree untouched,
         assert!(gate.should_fire("/wt", now + Duration::from_millis(20)));
+        // and the user's own `oximux notify` too.
+        assert!(gate.should_fire(&terminal_burst_key("/wt", true), now + Duration::from_millis(30)));
     }
 
     fn na(reason: &str) -> AgentStatus {

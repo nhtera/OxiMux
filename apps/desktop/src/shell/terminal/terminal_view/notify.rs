@@ -26,7 +26,13 @@ impl TerminalView {
 
     /// Hand a notification to the pane group's one terminal-banner path. The
     /// text is sanitized there; this end only rate-limits the pane.
-    pub(super) fn maybe_notify_terminal(&mut self, title: Option<String>, body: String, cx: &mut Context<Self>) {
+    pub(super) fn maybe_notify_terminal(
+        &mut self,
+        title: Option<String>,
+        body: String,
+        explicit: bool,
+        cx: &mut Context<Self>,
+    ) {
         let now = std::time::Instant::now();
         if self
             .last_notify_banner
@@ -49,6 +55,7 @@ impl TerminalView {
                         session,
                         crate::notifier::NotificationKind::TerminalNotify,
                         body,
+                        explicit,
                         pane_visible,
                         cx,
                     );
