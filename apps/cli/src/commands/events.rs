@@ -105,8 +105,8 @@ fn emit(kind: Kind, s: &SessionSummary, json_mode: bool) -> bool {
             "{}  {:<7}  {}  {}{flag}",
             now.format("%H:%M:%S"),
             kind.as_str(),
-            s.session_id,
-            s.title
+            crate::output::printable(&s.session_id),
+            crate::output::printable(&s.title)
         )
     };
     written.and_then(|()| out.flush()).is_ok()
@@ -164,12 +164,14 @@ impl Stream {
     /// session gone (it cannot come back, so waiting on would never end).
     fn apply(&mut self, rows: Vec<SessionSummary>, now: Instant) -> Step {
         let ids: BTreeSet<String> = rows.iter().map(|s| s.session_id.clone()).collect();
+        let titles: BTreeMap<&str, &str> =
+            rows.iter().map(|s| (s.session_id.as_str(), s.title.as_str())).collect();
         let added: Vec<String> = ids.difference(&self.all).cloned().collect();
         if let Some(id) = self.only.clone()
             && is_placeholder(&id)
-            && self.current.contains_key(&id)
             && !ids.contains(&id)
-            && let Some(next) = self.successor(&ids, &added, now)
+            && let Some(was) = self.current.get(&id)
+            && let Some(next) = self.successor(&was.title, &titles, &added, now)
         {
             self.only = Some(next);
         }
@@ -204,14 +206,24 @@ impl Stream {
     }
 
     /// The one session that appeared with the watched one's disappearance —
-    /// in this list, or one just before it — if there is exactly one.
-    fn successor(&self, ids: &BTreeSet<String>, added: &[String], now: Instant) -> Option<String> {
+    /// in this list, or one just before it — under the same title, if there
+    /// is exactly one. A re-keyed draft keeps its title; an unrelated chat
+    /// opened in the same moment does not share it (and if it does, two
+    /// candidates are no answer).
+    fn successor(
+        &self,
+        title: &str,
+        titles: &BTreeMap<&str, &str>,
+        added: &[String],
+        now: Instant,
+    ) -> Option<String> {
         let mut candidates: BTreeSet<&String> = added.iter().collect();
         if let Some((at, earlier)) = &self.last_added
             && now.duration_since(*at) <= REKEY_WINDOW
         {
-            candidates.extend(earlier.iter().filter(|id| ids.contains(*id)));
+            candidates.extend(earlier.iter());
         }
+        candidates.retain(|id| titles.get(id.as_str()) == Some(&title));
         match candidates.into_iter().collect::<Vec<_>>().as_slice() {
             [one] => Some((*one).clone()),
             _ => None,
@@ -374,6 +386,21 @@ mod tests {
         let mut s = stream(Some("agent-3"), vec![row("agent-3", "d", false)], t0);
         let two = vec![row("x-uuid", "d", false), row("y-uuid", "d", false)];
         assert!(matches!(s.apply(two, t0), Step::Done(Err(_))));
+    }
+
+    #[test]
+    fn a_new_chat_under_another_title_is_not_the_draft() {
+        let t0 = Instant::now();
+        let mut s = stream(Some("agent-4"), vec![row("agent-4", "fix the parser", false)], t0);
+        let other = vec![row("77aa-uuid", "unrelated", true)];
+        assert!(matches!(s.apply(other, t0), Step::Done(Err(_))));
+    }
+
+    #[test]
+    fn host_text_cannot_drive_the_callers_terminal() {
+        let shown = crate::output::printable("ok\u{1b}]0;pwned\u{7}\u{9b}2J");
+        assert_eq!(shown, "ok\u{FFFD}]0;pwned\u{FFFD}\u{FFFD}2J");
+        assert_eq!(crate::output::printable("plain title é"), "plain title é");
     }
 
     #[test]

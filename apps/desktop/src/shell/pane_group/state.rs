@@ -791,22 +791,6 @@ impl PaneGroup {
         })
     }
 
-    /// Dispatch a terminal-bell banner for `session` through the
-    /// notification pipeline. Called by the ringing `TerminalView` (which
-    /// owns the per-pane debounce); this end contributes the request
-    /// context the view can't see: the tab label, the workspace key for
-    /// burst collapse, and the live window-active flag. The dispatcher
-    /// applies the master/source gates, visible-pane suppression, and the
-    /// focus gate.
-    pub fn notify_terminal_bell(
-        &self,
-        session: TerminalSessionId,
-        pane_visible: bool,
-        cx: &gpui::App,
-    ) {
-        self.notify_terminal(session, crate::notifier::NotificationKind::Bell, String::new(), false, pane_visible, cx);
-    }
-
     /// One path for every terminal-sourced banner (bell, OSC 9/777,
     /// `oximux notify`). The title is fixed to the tab's own label, and the
     /// terminal source collapses bursts under its own key, apart from agents

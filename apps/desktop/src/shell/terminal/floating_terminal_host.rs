@@ -182,6 +182,19 @@ impl WorkspaceRoot {
                 FloatingTerminalEvent::RenameRequested { idx } => {
                     this.open_floating_rename_dialog(*idx, window, cx);
                 }
+                FloatingTerminalEvent::Banner { session, label, cwd, kind, body, explicit, pane_visible } => {
+                    this.notifier.notify(crate::notifier::NotificationRequest {
+                        source: crate::notifier::NotificationSource::TerminalBell,
+                        kind: *kind,
+                        tab_id: crate::notifier::TabId(session.0),
+                        workspace_key: crate::notifier::terminal_burst_key(cwd, *explicit),
+                        label: label.clone(),
+                        body: body.clone(),
+                        window_active: window.is_window_active(),
+                        pane_visible: *pane_visible,
+                        coalesce_until_focus: false,
+                    });
+                }
             },
         ));
         self.floating_terminal = Some(entity);

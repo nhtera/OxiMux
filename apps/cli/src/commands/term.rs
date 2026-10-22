@@ -68,7 +68,7 @@ pub async fn ls(client: &Client) -> Result<(Value, String), Failure> {
         "no terminals".to_string()
     } else {
         rows.iter()
-            .map(|t| format!("{}  {}x{}  {}", t.pty_id, t.cols, t.rows, t.cwd))
+            .map(|t| format!("{}  {}x{}  {}", t.pty_id, t.cols, t.rows, crate::output::printable(&t.cwd)))
             .collect::<Vec<_>>()
             .join("\n")
     };

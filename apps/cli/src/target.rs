@@ -186,7 +186,7 @@ fn ambiguous(kind: Kind, arg: &str, hits: &[Candidate]) -> Failure {
     // The candidates go to stderr in both modes, so a script that captures
     // stdout still leaves a person something to read.
     for hit in hits {
-        eprintln!("  {}  {}", hit.id, hit.label);
+        eprintln!("  {}  {}", crate::output::printable(&hit.id), crate::output::printable(&hit.label));
     }
     Failure::new(
         "target-ambiguous",

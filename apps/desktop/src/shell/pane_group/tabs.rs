@@ -1260,7 +1260,7 @@ impl PaneGroup {
 
     /// Dispatch a chat-attention banner (turn finished / errored / needs
     /// approval / question / auth) for the chat tab backing `view`, through the
-    /// shared notification pipeline. Mirrors `notify_terminal_bell`: the view
+    /// shared notification pipeline. Mirrors `notify_terminal`: the view
     /// classified the edge; this end contributes the context the view can't see —
     /// the tab label, the workspace burst key, whether the tab is the visible one,
     /// and the live window-active flag. The notifier applies the master/source

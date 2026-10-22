@@ -515,6 +515,11 @@ pub enum TerminalViewEvent {
     Recovered { session_id: TerminalSessionId },
 }
 
+/// A bell or notification banner, for an owner that is not a pane group (a
+/// floating terminal) — see `notify.rs`.
+pub struct TerminalBanner { pub kind: crate::notifier::NotificationKind, pub body: String, pub explicit: bool, pub pane_visible: bool }
+impl EventEmitter<TerminalBanner> for TerminalView {}
+
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
 
 pub struct TerminalView {
@@ -668,7 +673,7 @@ pub struct TerminalView {
     last_bell_banner: Option<std::time::Instant>,
     /// When this pane last raised a terminal-notification banner (OSC 9/777,
     /// `oximux notify`); see `notify.rs`.
-    last_notify_banner: Option<std::time::Instant>,
+    last_notify_banner: [Option<std::time::Instant>; 2],
     /// When the read-only toast was last shown here (`read_only.rs`).
     read_only_notice_at: Option<std::time::Instant>,
     /// Async path-existence answers for detected `path:line` links, keyed by

@@ -93,6 +93,7 @@ impl Render for TerminalView {
         let command_badges = self.visible_command_badges(s.exit_badges);
         let hovered_badge = self.label_badge(&command_badges, window);
         let paint_params = PaintParams {
+            radius_xs: self.density.r_xs,
             snapshot: self.snapshot.clone(),
             theme,
             typography: self.typography.clone(),

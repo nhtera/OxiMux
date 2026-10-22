@@ -139,6 +139,8 @@ pub struct PaintParams {
     /// strength, so only the find box's caret reads as "type here".
     pub cursor_focused: bool,
     pub pad: f32,
+    /// The density's smallest corner radius (the link-target chip).
+    pub radius_xs: f32,
     /// `(row, col_start, col_end)` of the link the pointer is hovering with
     /// Cmd held — underlined so the user sees it's clickable. `None` = none.
     pub hovered_link: Option<(usize, usize, usize)>,

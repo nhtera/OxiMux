@@ -161,7 +161,11 @@ impl TerminalView {
                     if !self.focused {
                         got_bell = true;
                     }
-                    notification = Some((title.clone(), body.clone(), *explicit));
+                    // The user's own request is never displaced by a program's
+                    // later in the same batch.
+                    if notification.as_ref().is_none_or(|n| *explicit || !n.2) {
+                        notification = Some((title.clone(), body.clone(), *explicit));
+                    }
                 }
                 // OSC 7501: the program's own status, parsed by the backend.
                 TerminalEvent::ProgramStatus { root, .. } => {
@@ -285,19 +289,7 @@ impl TerminalView {
             return;
         }
         self.last_bell_banner = Some(now);
-        let session = self.session_id;
-        let pane_visible = self.is_visible();
-        if let Some(opener) = self.opener.clone() {
-            // Deferred, never inline: this runs from `tick`, inside this very
-            // view's entity update. The group's tab walk reads every terminal
-            // view — this one included — and reading a checked-out entity is a
-            // double-lease abort. `defer` lets the current borrow release first.
-            cx.defer(move |cx| {
-                let _ = opener.update(cx, |pg, cx| {
-                    pg.notify_terminal_bell(session, pane_visible, cx);
-                });
-            });
-        }
+        self.route_banner(crate::notifier::NotificationKind::Bell, String::new(), false, cx);
     }
 
     /// Fold a shell-integration command mark into the gutter-badge list. A

@@ -402,10 +402,15 @@ impl PtyRegistry {
             }
         }
         drop(ring);
-        let replay = replay.build().bytes;
+        let replay = replay.build();
+        // As on attach: an alternate-screen frame the ring no longer holds is
+        // the program's to redraw, and a quiet one would otherwise stay blank.
+        if replay.alt_screen {
+            crate::repaint_nudge::nudge(&entry.master, entry.pid, &entry.last_nudge);
+        }
         let cols = *entry.cols.lock().expect("cols poisoned");
         let rows = *entry.rows.lock().expect("rows poisoned");
-        Ok((replay, cols, rows))
+        Ok((replay.bytes, cols, rows))
     }
 
     /// Attach a subscriber and return `(replay, cols, rows, attachment_id)`

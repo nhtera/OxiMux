@@ -90,7 +90,7 @@ pub fn paint_link_label(
     };
     window.paint_quad(
         fill(chip, p.theme.bg_overlay)
-            .corner_radii(px(3.0))
+            .corner_radii(px(p.radius_xs))
             .border_widths(px(1.0))
             .border_color(if label.warn { p.theme.status_error } else { p.theme.border_inactive }),
     );
