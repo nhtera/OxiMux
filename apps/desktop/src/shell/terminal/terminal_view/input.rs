@@ -383,7 +383,7 @@ impl TerminalView {
             .find(|l| l.row == row && col >= l.col_start && col <= l.col_end)
         {
             return Some(LinkMatch {
-                target: LinkTarget::Url(span.uri.clone()),
+                target: crate::shell::terminal_links::osc8_link_target(&span.uri),
                 col_start: span.col_start,
                 col_end: span.col_end,
             });
@@ -404,6 +404,8 @@ impl TerminalView {
         let hit = self.link_at(row, col)?;
         Some(match hit.target {
             LinkTarget::Url(u) => u,
+            // Nothing the context menu could open.
+            LinkTarget::Blocked { .. } => return None,
             LinkTarget::Path { path, line, col } => {
                 let mut s = path.to_string_lossy().into_owned();
                 if let Some(l) = line {
@@ -499,7 +501,7 @@ impl TerminalView {
     pub(super) fn underlinable_hover(&mut self, cx: &mut Context<Self>) -> Option<(usize, usize, usize)> {
         let span = self.hovered_link?;
         match self.link_at(span.0, span.1)?.target {
-            LinkTarget::Url(_) => Some(span),
+            LinkTarget::Url(_) | LinkTarget::Blocked { .. } => Some(span),
             LinkTarget::Path { path, .. } => self.path_link_ready(&path, cx).then_some(span),
         }
     }
@@ -508,9 +510,20 @@ impl TerminalView {
     /// host pane group's editor (at the parsed line/col).
     fn open_link(&mut self, target: LinkTarget, window: &mut Window, cx: &mut Context<Self>) {
         match target {
-            LinkTarget::Url(url) => {
-                cx.open_url(&url);
+            // A `file:` URL never reaches the system handler, which would run it.
+            LinkTarget::Url(url) if crate::shell::terminal_links::is_file_url(&url) => {
+                let target = match crate::shell::terminal_links::file_url_path(&url) {
+                    Some(path) => LinkTarget::Path { path, line: None, col: None },
+                    None => LinkTarget::Blocked { uri: url, scheme: "file".into() },
+                };
+                self.open_link(target, window, cx);
             }
+            LinkTarget::Url(url) => cx.open_url(&url),
+            LinkTarget::Blocked { scheme, .. } => crate::shell::toast::toast(
+                cx,
+                crate::shell::toast::ToastKind::Warning,
+                format!("Blocked link (scheme {scheme})"),
+            ),
             LinkTarget::Path { path, line, col } => {
                 let resolved = self.resolve_path(&path);
                 if let Some(opener) = self.opener.clone() {
@@ -585,6 +598,7 @@ impl TerminalView {
             self.hovered_link = next;
             cx.notify();
         }
+        self.refresh_link_label(ev.position, window, cx);
         let mode = cx.try_global::<TerminalSettings>().map_or_else(ExitBadges::default, |s| s.exit_badges);
         let badge = self.badge_under(ev.position, mode, window);
         self.set_hovered_badge(badge, cx);
@@ -1333,6 +1347,7 @@ impl TerminalView {
         self.selection = None;
         self.hovered_link = None;
         self.hovered_badge = None;
+        self.link_label = None;
         self.scroll_px = 0.0;
         // The wipe reset the grid's history to zero; the gutter badges are
         // anchored to absolute history lines, so they no longer point at the

@@ -115,6 +115,8 @@ pub struct PaintParams {
     /// The badge under the pointer, if any: its exit code is labelled beside
     /// the gutter so the mark explains itself.
     pub hovered_badge: Option<CommandBadge>,
+    /// The OSC 8 hyperlink under the pointer, labelled with its real target.
+    pub link_label: Option<crate::shell::link_hover::LinkLabel>,
     /// Live alpha multipliers (dim / unfocused / unfocused-cursor) from
     /// `TerminalSettings`.
     pub alphas: Alphas,
@@ -488,6 +490,9 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
     if let Some(badge) = p.hovered_badge {
         let row_y = origin.y + line_h * badge.row as f32;
         paint_exit_label(badge, point(bounds.origin.x + px(6.0), row_y), line_h, p, window, cx);
+    }
+    if let Some(label) = &p.link_label {
+        crate::shell::link_hover::paint_link_label(label, origin, cell_w, line_h, p, window, cx);
     }
 }
 

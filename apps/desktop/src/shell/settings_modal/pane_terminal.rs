@@ -257,6 +257,17 @@ fn settings_entries(
         cx,
     );
 
+    let osc_notify = toggle_switch(
+        "term-osc-notify",
+        t.osc_notifications,
+        theme,
+        |this, _w, cx| {
+            this.terminal.osc_notifications = !this.terminal.osc_notifications;
+            this.persist_terminal(cx);
+        },
+        cx,
+    );
+
     let option_meta = toggle_switch(
         "term-optmeta",
         t.option_as_meta,
@@ -339,6 +350,12 @@ fn settings_entries(
             "Clipboard write (OSC 52)",
             "Let programs set the system clipboard via OSC 52.",
             osc52,
+        ),
+        entry(
+            "Program notifications (OSC 9 / 777)",
+            "Show a desktop notification when a program asks for one. Off by default, since any program \
+             can print the request. `oximux notify` always works.",
+            osc_notify,
         ),
         entry(
             "Option as Meta",

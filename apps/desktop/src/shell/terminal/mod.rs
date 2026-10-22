@@ -20,6 +20,7 @@ pub mod floating_terminal;
 pub mod floating_terminal_host;
 pub mod floating_terminal_persistence;
 pub mod key_input;
+pub mod link_hover;
 pub mod mouse_report;
 pub mod terminal_canvas;
 pub mod terminal_links;

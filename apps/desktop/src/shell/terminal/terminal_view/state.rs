@@ -45,6 +45,8 @@ impl TerminalView {
         let mut latest_title: Option<String> = None;
         let mut clipboard_text: Option<String> = None;
         let mut pty_replies: Vec<Vec<u8>> = Vec::new();
+        // Only the last notification of a batch can show anyway (debounce).
+        let mut notification: Option<(Option<String>, String)> = None;
         for ev in &events {
             match ev {
                 TerminalEvent::Output { bytes, .. } => {
@@ -150,6 +152,17 @@ impl TerminalView {
                         got_bell = true;
                     }
                 }
+                // OSC 9 / 777 or `oximux notify`: pane attention like a bell,
+                // plus a banner (see `notify.rs`).
+                TerminalEvent::Notify { title, body, explicit, .. }
+                    if Self::accepts_notification(*explicit, &settings)
+                        && (*explicit || !self.agent_reports_itself()) =>
+                {
+                    if !self.focused {
+                        got_bell = true;
+                    }
+                    notification = Some((title.clone(), body.clone()));
+                }
                 // OSC 7501: the program's own status, parsed by the backend.
                 TerminalEvent::ProgramStatus { root, .. } => {
                     self.agent_scan.feed_program_status(root.clone());
@@ -177,6 +190,9 @@ impl TerminalView {
         // silenced by the dispatcher's visible-pane rule.
         if bell_rang && settings.bell == BellStyle::Notify {
             self.maybe_notify_bell(cx);
+        }
+        if let Some((title, body)) = notification {
+            self.maybe_notify_terminal(title, body, cx);
         }
         let session_id = self.session_id;
         if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {

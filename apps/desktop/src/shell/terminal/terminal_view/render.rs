@@ -105,6 +105,7 @@ impl Render for TerminalView {
             selection: self.selection,
             command_badges,
             hovered_badge,
+            link_label: self.link_label.clone().filter(|_| self.pointer_in_view),
             alphas,
         };
 
@@ -350,6 +351,7 @@ impl Render for TerminalView {
                 this.pointer_in_view = *hovered;
                 if !*hovered {
                     this.set_hovered_badge(None, cx);
+                    this.set_link_label(None, cx);
                 }
             }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {

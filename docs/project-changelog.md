@@ -25,6 +25,25 @@ installed.
   know the protocol; the app answers in its place until that daemon is
   replaced.
 
+**Terminal notifications and safer links**
+
+- **Program notifications (opt-in).** Settings → Terminal → *Program
+  notifications* shows a desktop banner when a program prints `OSC 9;<text>`
+  or `OSC 777;notify;<title>;<body>`. Off by default, since any program can.
+  The banner title is always "Terminal — <tab>"; a program's own title is
+  quoted in the body, and text is sanitized and length-capped. OSC 9;4
+  progress is unchanged.
+- **`oximux notify` shows its title and body** in the banner (it used to ring
+  the bell only), through the same path.
+- **Terminal banners no longer crowd out agent banners.** Bells and terminal
+  notifications collapse bursts under their own key, so a script printing
+  notifications in a loop cannot suppress an agent's approval banner.
+- **Hyperlinks (OSC 8) only open what is safe.** Cmd-click hands only
+  `http`, `https` and `mailto` to the system; `file://` opens in OxiMux's
+  editor and is never executed; any other scheme is blocked with a toast.
+  Hovering a hyperlink shows its real target, flagged ⚠ when the visible text
+  names a different host.
+
 ### 2026-10-16 — v0.1.42: Mobile Emulator: verify loop, device state, flows, phone view, MCP (#56–#69)
 
 Agents get a tighter loop on the attached device, and you get more ways to

@@ -782,6 +782,20 @@ impl PaneGroup {
         pane_visible: bool,
         cx: &gpui::App,
     ) {
+        self.notify_terminal(session, crate::notifier::NotificationKind::Bell, String::new(), pane_visible, cx);
+    }
+
+    /// One path for every terminal-sourced banner (bell, OSC 9/777,
+    /// `oximux notify`). The title is fixed to the tab's own label, and the
+    /// terminal source collapses bursts under its own key, apart from agents.
+    pub fn notify_terminal(
+        &self,
+        session: TerminalSessionId,
+        kind: crate::notifier::NotificationKind,
+        body: String,
+        pane_visible: bool,
+        cx: &gpui::App,
+    ) {
         let Some(idx) = self.tab_index_for_terminal_session(session, cx) else {
             return;
         };
@@ -792,14 +806,14 @@ impl PaneGroup {
             .unwrap_or_else(|| tab.label.clone());
         self.notifier.notify(crate::notifier::NotificationRequest {
             source: crate::notifier::NotificationSource::TerminalBell,
-            kind: crate::notifier::NotificationKind::Bell,
-            // Bell banners carry the raw terminal session id in the tab_id
+            kind,
+            // Terminal banners carry the raw terminal session id in the tab_id
             // slot; the `bell:` identifier namespace keeps it from ever
-            // being read as an agent tab id.
+            // being read as an agent tab id, and routes a click to the pane.
             tab_id: TabId(session.0),
-            workspace_key: self.cwd.to_string_lossy().into_owned(),
+            workspace_key: crate::notifier::terminal_burst_key(&self.cwd.to_string_lossy()),
             label: label.to_string(),
-            body: String::new(),
+            body,
             window_active: self.window_active.load(Ordering::Relaxed),
             pane_visible,
             // A bell is a one-shot event, not a sticky state — no until-focus coalescing.

@@ -216,7 +216,7 @@ fn toast_for_kind(
         NotificationKind::NeedsApproval | NotificationKind::WaitingForInput => None,
         // Bell never reaches this mapper (it's not an agent lifecycle
         // edge); listed for exhaustiveness.
-        NotificationKind::Bell => None,
+        NotificationKind::Bell | NotificationKind::TerminalNotify => None,
     }
 }
 

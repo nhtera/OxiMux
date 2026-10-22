@@ -357,6 +357,12 @@ impl TerminalState {
                     hit @ (OscHit::Ris | OscHit::ProgramStatusQuery | OscHit::ProgramStatus(_)) => {
                         self.push_program_status(id, hit, now, &mut out)
                     }
+                    OscHit::Notify { title, body } => out.push(TerminalEvent::Notify {
+                        id,
+                        title,
+                        body,
+                        explicit: false,
+                    }),
                 }
             }
         }

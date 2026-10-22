@@ -504,11 +504,12 @@ fn apply_relay_notification(
             push_event(queues, id, TerminalEvent::Exit { id, code });
             ControlFlow::Break(())
         }
-        // Explicit `oximux notify` → raise the same pane attention as a
-        // bell. (title/body are carried on the wire for a future OS-banner
-        // surface; not consumed here yet.)
-        Notification::Attention { .. } => {
-            push_event(queues, id, TerminalEvent::Bell { id });
+        // Explicit `oximux notify`: the same terminal-notification path as a
+        // program's OSC 9 / 777, marked explicit (the user asked for it, so no
+        // opt-in applies). An empty title means none was given.
+        Notification::Attention { title, body, .. } => {
+            let title = (!title.is_empty()).then_some(title);
+            push_event(queues, id, TerminalEvent::Notify { id, title, body, explicit: true });
             ControlFlow::Continue(())
         }
         // The daemon discarded output for this subscriber because our queue was
@@ -1337,7 +1338,7 @@ mod tests {
     // An explicit `oximux notify` Attention notification raises the same
     // pane attention as a bell and keeps the pump running.
     #[test]
-    fn attention_notification_emits_bell_and_continues() {
+    fn attention_notification_emits_an_explicit_notify_and_continues() {
         let id = TerminalSessionId(9);
         let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
         let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
@@ -1360,8 +1361,12 @@ mod tests {
         let q = guard.renderer.get(&id).expect("events queued");
         assert_eq!(q.len(), 1);
         assert!(
-            matches!(q[0], TerminalEvent::Bell { .. }),
-            "Attention → Bell"
+            matches!(
+                &q[0],
+                TerminalEvent::Notify { title: Some(t), body, explicit: true, .. }
+                    if t == "Claude" && body == "needs you"
+            ),
+            "Attention → explicit Notify carrying its title and body"
         );
     }
 

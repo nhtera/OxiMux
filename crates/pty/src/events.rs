@@ -125,6 +125,15 @@ pub enum TerminalEvent {
         root: Option<ProgramRecord>,
         handshake: bool,
     },
+    /// A request to show a desktop notification. `explicit` is the user's own
+    /// `oximux notify`; otherwise a program printed `OSC 9` / `OSC 777`, which
+    /// is opt-in. Text is raw: whoever displays it sanitizes it.
+    Notify {
+        id: TerminalSessionId,
+        title: Option<String>,
+        body: String,
+        explicit: bool,
+    },
 }
 
 impl TerminalEvent {
@@ -145,7 +154,8 @@ impl TerminalEvent {
             | TerminalEvent::Progress { id, .. }
             | TerminalEvent::Clipboard { id, .. }
             | TerminalEvent::PtyReply { id, .. }
-            | TerminalEvent::ProgramStatus { id, .. } => *id,
+            | TerminalEvent::ProgramStatus { id, .. }
+            | TerminalEvent::Notify { id, .. } => *id,
         }
     }
 }

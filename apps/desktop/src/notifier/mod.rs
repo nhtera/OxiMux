@@ -164,6 +164,10 @@ pub enum NotificationKind {
     /// when the bell setting is `Notify`, so it has no per-kind toggle of
     /// its own — the source gate + that setting are the opt-ins.
     Bell,
+    /// A notification a terminal asked for: a program's OSC 9 / 777 (opt-in,
+    /// `terminal.osc_notifications`) or the user's `oximux notify`. No per-kind
+    /// toggle, like `Bell`.
+    TerminalNotify,
 }
 
 impl NotificationKind {
@@ -187,6 +191,9 @@ impl NotificationKind {
             Self::Done => format!("Agent finished — {agent_label}"),
             Self::Failed => format!("Agent failed — {agent_label}"),
             Self::Bell => format!("Terminal bell — {agent_label}"),
+            // Fixed: a program may not choose the banner title, or it could
+            // pose as an agent or the system. Its own title goes in the body.
+            Self::TerminalNotify => format!("Terminal — {agent_label}"),
         }
     }
 }
@@ -322,7 +329,7 @@ impl AgentNotifySettings {
             NotificationKind::Failed => &self.failed,
             // Bell carries no per-kind toggle: the per-pane `Notify` bell
             // setting and the source gate above are the opt-ins.
-            NotificationKind::Bell => return true,
+            NotificationKind::Bell | NotificationKind::TerminalNotify => return true,
         };
         flag.load(Ordering::Relaxed)
     }
@@ -336,6 +343,43 @@ impl Default for AgentNotifySettings {
     fn default() -> Self {
         Self::defaults()
     }
+}
+
+/// Longest program-supplied title / body shown in a terminal notification.
+pub const TERMINAL_TITLE_MAX_CHARS: usize = 128;
+pub const TERMINAL_BODY_MAX_CHARS: usize = 512;
+
+/// The banner body for a terminal notification: the program's own title (if
+/// any) quoted on the first line, then its text. Both are sanitized — control,
+/// bidi and invisible characters stripped — and capped, since they are
+/// whatever a program printed. `None` when nothing is left to show.
+pub fn terminal_notification_body(title: Option<&str>, body: &str) -> Option<String> {
+    let clean = |s: &str, max: usize| {
+        let s = oximux_pty::program_status::sanitize_display_text(s);
+        let s = s.trim();
+        if s.chars().count() > max {
+            let mut cut: String = s.chars().take(max - 1).collect();
+            cut.push('…');
+            cut
+        } else {
+            s.to_string()
+        }
+    };
+    let title = title.map(|t| clean(t, TERMINAL_TITLE_MAX_CHARS)).unwrap_or_default();
+    let body = clean(body, TERMINAL_BODY_MAX_CHARS);
+    match (title.is_empty(), body.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(body),
+        (false, true) => Some(format!("“{title}”")),
+        (false, false) => Some(format!("“{title}”\n{body}")),
+    }
+}
+
+/// Burst-collapse key for a terminal-sourced banner. Its own namespace, so a
+/// program printing notifications in a loop collapses only its own banners
+/// and can never use up the slot an agent's approval banner needs.
+pub fn terminal_burst_key(workspace: &str) -> String {
+    format!("term:{workspace}")
 }
 
 /// `SettingsRepo` keys for the notification prefs (flat KV, `"true"`/`"false"`).
@@ -448,6 +492,43 @@ impl Default for SuppressMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_notification_keeps_a_fixed_title_and_quotes_the_programs() {
+        assert_eq!(NotificationKind::TerminalNotify.title("build"), "Terminal — build");
+        assert_eq!(
+            terminal_notification_body(Some("Agent needs approval"), "click me").as_deref(),
+            Some("“Agent needs approval”\nclick me")
+        );
+        assert_eq!(terminal_notification_body(None, "done").as_deref(), Some("done"));
+        assert_eq!(terminal_notification_body(Some("T"), "").as_deref(), Some("“T”"));
+    }
+
+    #[test]
+    fn terminal_notification_text_is_sanitized_capped_and_may_vanish() {
+        assert_eq!(
+            terminal_notification_body(None, "ok\u{1b}[31m\u{202E}gnp\u{200B}\n").as_deref(),
+            Some("ok[31mgnp")
+        );
+        assert_eq!(terminal_notification_body(Some("\u{200B}"), " \u{7} "), None);
+        let long = terminal_notification_body(None, &"x".repeat(2000)).unwrap();
+        assert_eq!(long.chars().count(), TERMINAL_BODY_MAX_CHARS);
+        assert!(long.ends_with('…'));
+        let title = terminal_notification_body(Some(&"t".repeat(500)), "b").unwrap();
+        assert_eq!(title.lines().next().unwrap().chars().count(), TERMINAL_TITLE_MAX_CHARS + 2);
+    }
+
+    #[test]
+    fn a_terminal_burst_never_uses_up_an_agents_slot() {
+        let mut gate = BurstGate::new();
+        let now = Instant::now();
+        let key = terminal_burst_key("/wt");
+        assert!(gate.should_fire(&key, now));
+        // A program looping notifications in the same worktree…
+        assert!(!gate.should_fire(&key, now + Duration::from_millis(10)));
+        // …leaves the agent's own burst slot for that worktree untouched.
+        assert!(gate.should_fire("/wt", now + Duration::from_millis(20)));
+    }
 
     fn na(reason: &str) -> AgentStatus {
         AgentStatus::NeedsApproval(reason.into())

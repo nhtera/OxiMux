@@ -117,6 +117,10 @@ pub struct TerminalSettings {
     pub windows_powershell: WindowsPowerShell,
     /// How a bell is surfaced.
     pub bell: BellStyle,
+    /// Show a desktop notification when a program asks for one with OSC 9 or
+    /// OSC 777. Off by default: any program can print those bytes. The banner
+    /// title is always OxiMux's own; `oximux notify` is not gated by this.
+    pub osc_notifications: bool,
     /// Per-terminal shell history. Sourced at spawn: applies to new terminals.
     pub per_terminal_history: PerTerminalHistory,
     /// Which finished commands get a left-margin status mark.
@@ -146,6 +150,7 @@ impl Default for TerminalSettings {
             windows_shell: WindowsShell::default(),
             windows_powershell: WindowsPowerShell::default(),
             bell: BellStyle::Visual,
+            osc_notifications: false,
             per_terminal_history: PerTerminalHistory::Auto,
             exit_badges: ExitBadges::Failures,
         }

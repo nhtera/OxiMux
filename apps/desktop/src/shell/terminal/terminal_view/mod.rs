@@ -654,6 +654,9 @@ pub struct TerminalView {
     /// The command-status mark whose gutter the pointer is in, labelled with
     /// its exit code. Set on mouse-move, dropped when the pointer leaves.
     hovered_badge: Option<CommandBadge>,
+    /// The OSC 8 hyperlink under the pointer, labelled with its real target
+    /// (see `link_label.rs`). Tracked on mouse-move so a change repaints.
+    link_label: Option<crate::shell::link_hover::LinkLabel>,
     /// The pointer is over this pane: gates the exit-code label, re-hit-tested each render.
     pointer_in_view: bool,
     /// Last bell-banner dispatch instant, rate-limiting BEL storms (a
@@ -662,6 +665,9 @@ pub struct TerminalView {
     /// collapses further, but that one is shared across panes -- this
     /// keeps a single pane from monopolizing it.
     last_bell_banner: Option<std::time::Instant>,
+    /// When this pane last raised a terminal-notification banner (OSC 9/777,
+    /// `oximux notify`); see `notify.rs`.
+    last_notify_banner: Option<std::time::Instant>,
     /// Async path-existence answers for detected `path:line` links, keyed by
     /// resolved absolute path. Hover/paint/click consult it without touching
     /// the filesystem; misses spawn a background stat (see
@@ -775,6 +781,8 @@ mod restore_notice;
 mod state;
 mod daemon_recovery;
 mod command_badge_hover;
+mod link_label;
+mod notify;
 #[cfg(test)]
 mod daemon_loss_tests;
 #[cfg(test)]

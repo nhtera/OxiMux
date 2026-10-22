@@ -13,7 +13,7 @@ commit SHAs). This file tracks *status and what is next*, not history.
 | Phase | Capability | Status |
 |---|---|---|
 | 00 | Foundation: workspace, GPUI shell, CI guards | shipped; CI guards grew file-size lint, docs gate, cargo-tree gate, bundle-version gate |
-| 01 | Terminal cockpit: multi-pane PTY, tabs, search, render perf | shipped (multiplexer + emulator-richness plans complete 2026-05-29/30; IME, OSC 7/8/52/133/633/7501, CJK, box-drawing) |
+| 01 | Terminal cockpit: multi-pane PTY, tabs, search, render perf | shipped (multiplexer + emulator-richness plans complete 2026-05-29/30; IME, OSC 7/8/9/52/133/633/777/7501, CJK, box-drawing) |
 | 02 | Git core: status, diff, stage, commit, stash, worktree UI | shipped; later: commit graph, virtualized DiffView, pull/push/sync primary button (v0.1.6) |
 | 03 | CLI agent integration | superseded — the adapter/StatusMachine design was replaced by the **Agent Chat cockpit** (stream-json decoder, ACP, OSC-9999 status sideband, hooks); see workstreams below |
 | 04 | Workspace persistence: SQLite + session restore | shipped (sessions, tabs, windows, agent chats, titles all restore; storage migrations through V024+) |

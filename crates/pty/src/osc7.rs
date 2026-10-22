@@ -81,6 +81,10 @@ pub enum OscHit {
     ProgramStatusQuery,
     /// OSC 7501 report, parsed. Malformed reports never get this far.
     ProgramStatus(ProgramReport),
+    /// A desktop-notification request: `OSC 9 ; <text>` (body only) or
+    /// `OSC 777 ; notify ; <title> ; <body>`. Raw text — every display surface
+    /// sanitizes it, since it is whatever the program printed.
+    Notify { title: Option<String>, body: String },
 }
 
 const ESC: u8 = 0x1b;
@@ -255,11 +259,30 @@ impl OscScanner {
                     on_hit(hit);
                 }
             }
-            // OSC 9 is overloaded; only `9;4;state;value` (progress) is ours.
-            // OSC 9;<text> desktop notifications are left to a future surface.
+            // OSC 9 is overloaded: `9;4;state;value` is progress, any other
+            // `9;<digits>[;…]` is some terminal's subcommand (cwd, …) and is
+            // ignored, and anything else is notification text.
             b"9" => {
                 if let Some(hit) = parse_progress(rest) {
                     on_hit(hit);
+                } else if !is_numbered_subcommand(rest) && !rest.is_empty() {
+                    on_hit(OscHit::Notify {
+                        title: None,
+                        body: String::from_utf8_lossy(rest).into_owned(),
+                    });
+                }
+            }
+            // OSC 777 carries several subcommands; only `notify;<title>;<body>`.
+            b"777" => {
+                if let Some(rest) = rest.strip_prefix(b"notify;") {
+                    let (title, body) = match rest.iter().position(|&b| b == b';') {
+                        Some(i) => (&rest[..i], &rest[i + 1..]),
+                        None => (rest, &b""[..]),
+                    };
+                    on_hit(OscHit::Notify {
+                        title: Some(String::from_utf8_lossy(title).into_owned()),
+                        body: String::from_utf8_lossy(body).into_owned(),
+                    });
                 }
             }
             // OSC 7501 program status: a feature query or a report.
@@ -297,6 +320,12 @@ fn parse_command_mark(rest: &[u8]) -> Option<OscHit> {
         None
     };
     Some(OscHit::CommandMark { kind, exit })
+}
+
+/// `<digits>` alone or followed by `;` — an OSC 9 subcommand, not text.
+fn is_numbered_subcommand(rest: &[u8]) -> bool {
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0 && rest.get(digits).is_none_or(|&b| b == b';')
 }
 
 /// Parse the payload AFTER the `9;` prefix. Only `4;state;value` (progress)
@@ -592,9 +621,11 @@ mod tests {
     }
 
     #[test]
-    fn osc9_non_progress_is_ignored() {
-        // OSC 9;<text> desktop notification — not progress, no hit.
-        assert!(collect_hits(b"\x1b]9;build done\x07").is_empty());
+    fn osc9_non_progress_is_not_progress() {
+        // OSC 9;<text> is a desktop notification, never a progress hit.
+        let hits = collect_hits(b"\x1b]9;build done\x07");
+        assert!(!hits.iter().any(|h| matches!(h, OscHit::Progress { .. })));
+        assert!(matches!(hits.as_slice(), [OscHit::Notify { .. }]));
     }
 
     #[test]
@@ -739,6 +770,55 @@ mod tests {
             matches!(hits.last(), Some(OscHit::CommandMark { .. })),
             "the prompt mark after the erases must survive; got {hits:?}"
         );
+    }
+
+    fn notifies(bytes: &[u8]) -> Vec<(Option<String>, String)> {
+        collect_hits(bytes)
+            .into_iter()
+            .filter_map(|h| match h {
+                OscHit::Notify { title, body } => Some((title, body)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn osc9_text_is_a_notification_but_its_subcommands_are_not() {
+        assert_eq!(notifies(b"\x1b]9;build done\x07"), vec![(None, "build done".into())]);
+        assert_eq!(notifies(b"\x1b]9;12 tests passed\x07"), vec![(None, "12 tests passed".into())]);
+        assert!(notifies(b"\x1b]9;9;/tmp\x07").is_empty(), "9;9 is a cwd report");
+        assert!(notifies(b"\x1b]9;1\x07").is_empty());
+        assert!(notifies(b"\x1b]9;\x07").is_empty());
+        // Progress is unchanged and never doubles as a notification.
+        let hits = collect_hits(b"\x1b]9;4;1;50\x07");
+        assert_eq!(hits, vec![OscHit::Progress { state: 1, value: 50 }]);
+    }
+
+    #[test]
+    fn osc777_notify_carries_title_and_body_and_other_subcommands_are_ignored() {
+        assert_eq!(
+            notifies(b"\x1b]777;notify;CI;green; really\x1b\\"),
+            vec![(Some("CI".into()), "green; really".into())]
+        );
+        assert_eq!(notifies(b"\x1b]777;notify;Only title\x07"), vec![(Some("Only title".into()), String::new())]);
+        assert!(notifies(b"\x1b]777;preexec\x07").is_empty());
+    }
+
+    #[test]
+    fn a_notification_split_at_every_byte_decodes_once() {
+        let whole = b"\x1b]777;notify;T;B\x07";
+        for split in 0..=whole.len() {
+            let mut scanner = OscScanner::new();
+            let mut hits = Vec::new();
+            scanner.feed(&whole[..split], |h| hits.push(h));
+            scanner.feed(&whole[split..], |h| hits.push(h));
+            assert_eq!(hits.len(), 1, "split at {split}");
+        }
+        // Past the payload cap the sequence is dropped, not truncated.
+        let mut huge = b"\x1b]9;".to_vec();
+        huge.extend(std::iter::repeat_n(b'x', 5000));
+        huge.push(0x07);
+        assert!(notifies(&huge).is_empty());
     }
 
     #[test]
