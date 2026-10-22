@@ -4,22 +4,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
-use oximux_pty::program_status::PROGRAM_STATUS_REPLY;
 use oximux_pty::{
     Cell, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId, TerminalSnapshot,
     TerminalState, apply_color_fg_bg, background_polarity, is_status_event, push_bounded_status,
 };
 use oximux_relay_proto::{Notification, Request, Response};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 
+use crate::attach::AttachCtx;
 use crate::client::RelayClient;
 
 // Match the in-process backend's scrollback so visual continuity is
 // preserved when an app switches between in-process and relay
 // backends mid-session (e.g., relay went down + supervisor restarted).
-const SCROLLBACK_ROWS: usize = 5000;
+pub(crate) const SCROLLBACK_ROWS: usize = 5000;
 
 /// Debug-only output-arrival probe, paired with the app-side input/echo trace.
 /// Off unless `OXIMUX_INPUT_TRACE` is set; appends to the same log file so the
@@ -52,51 +51,54 @@ fn arrival_trace(bytes: usize) {
 // emptied the queue, leaving the actually-active pane with nothing to
 // render.
 #[derive(Default)]
-struct EventQueues {
+pub(crate) struct EventQueues {
     renderer: HashMap<TerminalSessionId, VecDeque<TerminalEvent>>,
     status: HashMap<TerminalSessionId, VecDeque<TerminalEvent>>,
 }
 
-type SessionEventQueues = Arc<Mutex<EventQueues>>;
+pub(crate) type SessionEventQueues = Arc<Mutex<EventQueues>>;
 
-struct Session {
-    relay_pty_id: String,
+/// Per-session drain signals, shared with each pump.
+pub(crate) type OutputWakers = Arc<Mutex<HashMap<TerminalSessionId, oximux_pty::OutputWaker>>>;
+
+pub(crate) struct Session {
+    pub(crate) relay_pty_id: String,
     // Daemon-minted handle for THIS attachment. Sent back on every
     // `Resize`/`Detach` so the daemon updates the right attachment's
     // requested size in its "smallest screen wins" `min` computation.
-    attachment_id: u64,
+    pub(crate) attachment_id: u64,
     // This session's handle in the client's per-PTY subscriber fan-out.
     // Unique per attachment so teardown removes only OUR output stream and
     // never a sibling session that shares the same daemon PTY.
-    sub_id: u64,
-    state: Arc<Mutex<TerminalState>>,
-    cols: u16,
-    rows: u16,
+    pub(crate) sub_id: u64,
+    pub(crate) state: Arc<Mutex<TerminalState>>,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
     // Reconnect guard: a monotonic attach-generation. The pump captures
     // the value at spawn time and stops touching `state`/emitting events once
     // it no longer matches — so a superseded pump (a future reconnect /
     // multi-window re-attach, or this session's own teardown) can't
     // double-drive the shared `TerminalState`. Bumped in `close` so the
     // pump stops draining into an orphaned state during teardown.
-    generation: Arc<AtomicU64>,
-    _pump: JoinHandle<()>,
+    pub(crate) generation: Arc<AtomicU64>,
+    pub(crate) _pump: JoinHandle<()>,
 }
 
 /// Session ids for every `RelayBackend` in the process. One counter, not one
 /// per backend: a replaced backend's views stay mounted holding their ids —
 /// possibly for good, if bringing them back fails — so a successor starting
 /// its own count could mint one of them again and cross-wire two panes.
-static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct RelayBackend {
     client: Arc<RelayClient>,
     handle: Handle,
-    sessions: Mutex<HashMap<TerminalSessionId, Session>>,
+    sessions: Arc<Mutex<HashMap<TerminalSessionId, Session>>>,
     event_queues: SessionEventQueues,
     /// Per-session event-driven drain signals. The pump invokes the matching
     /// waker right after enqueuing output so the UI drains on arrival instead
     /// of polling a (throttled) timer. Shared with each pump task by Arc clone.
-    output_wakers: Arc<Mutex<HashMap<TerminalSessionId, oximux_pty::OutputWaker>>>,
+    output_wakers: OutputWakers,
     /// Session ids inherited from a predecessor backend that died with the
     /// old daemon (a crash or a restart). Each yields exactly one `DaemonLost`
     /// from `drain_events_for` (renderer) and from `drain_status_events_for`
@@ -125,7 +127,7 @@ impl RelayBackend {
         Self {
             client,
             handle,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             event_queues: Arc::new(Mutex::new(EventQueues::default())),
             output_wakers: Arc::new(Mutex::new(HashMap::new())),
             inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
@@ -216,139 +218,22 @@ impl RelayBackend {
 
     // Attach implementation. Public so callers holding a concrete
     // `RelayBackend` can skip the trait-method indirection; the trait
-    // method forwards to this. Replays the daemon's buffered bytes
-    // into the local TerminalState BEFORE the pump starts so the
-    // first frame the renderer sees is the full prior screen.
+    // method forwards to this. See `AttachCtx::attach`.
     pub fn attach_relay_pty(&self, relay_pty_id: &str) -> Result<TerminalSessionId> {
-        let resp = self.request(Request::Attach {
-            pty_id: relay_pty_id.to_owned(),
-        })?;
-        let (replay, cols, rows, attachment_id) = match resp {
-            Response::AttachOk {
-                replay,
-                cols,
-                rows,
-                attachment_id,
-            } => (replay, cols, rows, attachment_id),
-            Response::Err { code, message } => bail!("attach: {code:?} — {message}"),
-            other => bail!("unexpected attach response: {other:?}"),
-        };
-        // Build the local emulator at the daemon PTY's CURRENT dims, NOT a
-        // hardcoded default. The replay bytes were produced by a process
-        // drawing into a grid of this exact size — absolute-position CSI
-        // sequences only land correctly when the receiving grid matches.
-        // Replaying into the wrong size (then reflowing on the first
-        // pane-driven resize) is what scrambled restored full-screen TUIs.
-        // When the pane later resizes, `TerminalBackend::resize` resizes
-        // the REAL daemon PTY, the live process repaints via SIGWINCH, and
-        // those bytes arrive on the live stream — no static reflow.
-        let cols = cols.max(1);
-        let rows = rows.max(1);
-        // NOTE: attach uses the const scrollback (not the user's
-        // `scrollback_lines` setting) by design — the replay buffer must hold
-        // the daemon's full retained output and the receiver grid has to be
-        // sized to fit it, regardless of what the user picked for fresh spawns.
-        let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, SCROLLBACK_ROWS)));
-        let id = self.mint_id();
-        {
-            let mut s = lock_recover(&state, "terminal state");
-            s.set_answers_program_status(self.answers_program_status);
-            // Replay is historical: it drops the title/clipboard/bell/color
-            // events it fired so they don't leak into the first live frame, but
-            // keeps the program's last reported status, which consumers start
-            // from.
-            s.replay(&replay);
-            if let Some(ev) = s.program_status_event(id) {
-                push_event(&self.event_queues, id, ev);
-            }
-        }
-
-        let generation = Arc::new(AtomicU64::new(1));
-        let (sub_id, notif_rx) = self.client.subscribe_pty(relay_pty_id);
-        // Address this subscription. Without it the pane also receives the
-        // copies the daemon fans to every OTHER attachment on the same PTY — a
-        // paired phone watching this terminal is enough to make the pane render
-        // every byte twice.
-        self.client.bind_attachment(relay_pty_id, sub_id, attachment_id);
-        let pump = self.spawn_pump(
-            id,
-            relay_pty_id.to_owned(),
-            Arc::clone(&state),
-            Arc::clone(&generation),
-            1,
-            notif_rx,
-        );
-        lock_recover(&self.sessions, "sessions").insert(
-            id,
-            Session {
-                relay_pty_id: relay_pty_id.to_owned(),
-                attachment_id,
-                sub_id,
-                state,
-                cols,
-                rows,
-                generation,
-                _pump: pump,
-            },
-        );
-        Ok(id)
+        self.attach_ctx().attach(relay_pty_id)
     }
 
-    fn spawn_pump(
-        &self,
-        id: TerminalSessionId,
-        relay_pty_id: String,
-        state: Arc<Mutex<TerminalState>>,
-        generation: Arc<AtomicU64>,
-        my_generation: u64,
-        mut notif_rx: UnboundedReceiver<Notification>,
-    ) -> JoinHandle<()> {
-        let queues = Arc::clone(&self.event_queues);
-        let wakers = Arc::clone(&self.output_wakers);
-        let client = Arc::clone(&self.client);
-        self.handle.spawn(async move {
-            while let Some(n) = notif_rx.recv().await {
-                // A gap is handled here rather than in `apply_relay_notification`
-                // because recovery needs an await on the daemon, and that
-                // function is deliberately synchronous so the generation guard
-                // stays unit-testable without a runtime.
-                if matches!(n, Notification::Gapped { .. }) {
-                    // Same guard the apply path opens with: a superseded pump
-                    // must not touch the shared state, and a resync writes the
-                    // whole grid.
-                    if generation.load(Ordering::Acquire) != my_generation {
-                        return;
-                    }
-                    resync_after_gap(&client, &relay_pty_id, &state, &queues, id).await;
-                    if let Some(waker) = lock_recover(&wakers, "output wakers").get(&id) {
-                        waker();
-                    }
-                    continue;
-                }
-                let flow =
-                    apply_relay_notification(&state, &queues, id, &generation, my_generation, n);
-                // Only set on a state that answers queries itself (an older
-                // daemon): the reply goes out the same way keystrokes do.
-                let reply = lock_recover(&state, "terminal state").take_program_status_reply();
-                if let Some(ticket) = reply {
-                    let _ = client.try_send_oneway(Request::Write {
-                        pty_id: relay_pty_id.clone(),
-                        bytes: PROGRAM_STATUS_REPLY.to_vec(),
-                    });
-                    ticket.mark_written(std::time::Instant::now());
-                }
-                // Event-driven drain: nudge the UI the instant output is queued
-                // so it renders on arrival instead of waiting for the next
-                // (macOS-throttled) poll tick. Fired for every notification —
-                // an empty drain is cheap; a missed wake is felt lag.
-                if let Some(waker) = lock_recover(&wakers, "output wakers").get(&id) {
-                    waker();
-                }
-                if flow.is_break() {
-                    return;
-                }
-            }
-        })
+    /// Everything an attach or a pump needs, cloned out of the backend so the
+    /// work can run without the caller holding it (see `begin_attach_existing`).
+    pub(crate) fn attach_ctx(&self) -> AttachCtx {
+        AttachCtx {
+            client: Arc::clone(&self.client),
+            handle: self.handle.clone(),
+            sessions: Arc::clone(&self.sessions),
+            queues: Arc::clone(&self.event_queues),
+            wakers: Arc::clone(&self.output_wakers),
+            answers_program_status: self.answers_program_status,
+        }
     }
 }
 
@@ -375,66 +260,13 @@ pub fn daemon_answers_program_status(version: &str) -> bool {
     }
 }
 
-/// Rebuild the local grid from the daemon's replay ring after a dropped frame.
-///
-/// Uses `Replay` rather than a second `Attach`: this session already holds an
-/// attachment, and attaching again would add a stale entry to the daemon's
-/// smallest-screen-wins size calculation — so recovering from a dropped frame
-/// would resize the live process.
-///
-/// The state is replaced wholesale rather than patched. There is no way to know
-/// which bytes were missed, so the grid is rebuilt at the daemon's current dims
-/// exactly as `attach` builds it; anything less would leave the hole in place.
-/// A failure here is logged and left alone: a stale grid is worse than a correct
-/// one but far better than tearing down a live session over one dropped frame,
-/// and the next gap retries.
-async fn resync_after_gap(
-    client: &RelayClient,
-    relay_pty_id: &str,
-    state: &Arc<Mutex<TerminalState>>,
-    queues: &SessionEventQueues,
-    id: TerminalSessionId,
-) {
-    let resp = client
-        .request(Request::Replay {
-            pty_id: relay_pty_id.to_owned(),
-        })
-        .await;
-    let (replay, cols, rows) = match resp {
-        Ok(Response::ReplayOk { replay, cols, rows }) => (replay, cols.max(1), rows.max(1)),
-        Ok(other) => {
-            tracing::warn!(?relay_pty_id, ?other, "gap resync: unexpected response");
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(?relay_pty_id, ?err, "gap resync: request failed");
-            return;
-        }
-    };
-    let mut s = lock_recover(state, "terminal state");
-    let before = s.program_status_root();
-    let mut fresh = TerminalState::new(cols, rows, SCROLLBACK_ROWS);
-    // Who answers, and a handshake whose query the ring may have dropped.
-    fresh.inherit_program_status(&s);
-    *s = fresh;
-    // Replay is historical: drop the title/clipboard/bell/colour events it
-    // fired so a resync does not re-ring the bell for output the user already
-    // saw before the gap. Program-status records are kept, and a status change
-    // that fell inside the gap is announced now — nothing else would.
-    s.replay(&replay);
-    if let Some(ev) = s.program_status_change_since(id, before.as_ref()) {
-        drop(s);
-        push_event(queues, id, ev);
-    }
-}
-
 /// Apply one relay notification to the local terminal state + event
 /// queue, honoring the reconnect generation guard. Returns
 /// `ControlFlow::Break` when the pump must stop — either the session was
 /// superseded (`generation` moved past `my_generation`) or the PTY
 /// exited. Extracted from the pump loop so the guard is unit-testable
 /// without standing up a tokio task.
-fn apply_relay_notification(
+pub(crate) fn apply_relay_notification(
     state: &Arc<Mutex<TerminalState>>,
     queues: &SessionEventQueues,
     id: TerminalSessionId,
@@ -540,6 +372,12 @@ impl TerminalBackend for RelayBackend {
         self.attach_relay_pty(external_id)
     }
 
+    fn begin_attach_existing(&mut self, external_id: &str) -> Option<oximux_pty::AttachJob> {
+        let ctx = self.attach_ctx();
+        let external_id = external_id.to_owned();
+        Some(Box::new(move || ctx.attach(&external_id)))
+    }
+
     fn set_output_waker(&mut self, id: TerminalSessionId, waker: oximux_pty::OutputWaker) {
         lock_recover(&self.output_wakers, "output wakers").insert(id, waker);
     }
@@ -620,12 +458,13 @@ impl TerminalBackend for RelayBackend {
                 .or_default();
         }
         let generation = Arc::new(AtomicU64::new(1));
-        let pump = self.spawn_pump(
+        let pump = self.attach_ctx().spawn_pump(
             id,
             relay_pty_id.to_owned(),
             Arc::clone(&state),
             Arc::clone(&generation),
             1,
+            attachment_id,
             notif_rx,
         );
         lock_recover(&self.sessions, "sessions").insert(
@@ -1069,7 +908,7 @@ fn register_status_queue(queues: &mut EventQueues, id: TerminalSessionId) {
     queues.status.insert(id, status);
 }
 
-fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {
+pub(crate) fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {
     let mut queues = lock_recover(queues, "event queues");
     if is_status_event(&event)
         && let Some(status) = queues.status.get_mut(&id)
@@ -1096,7 +935,7 @@ fn push_status_event_only(
 /// session with a synthetic exit), so recovery can never hand out state
 /// a caller can't safely drop — whereas propagating would cascade one
 /// bad session into whole-backend death.
-fn lock_recover<'a, T: ?Sized>(
+pub(crate) fn lock_recover<'a, T: ?Sized>(
     m: &'a Mutex<T>,
     what: &'static str,
 ) -> std::sync::MutexGuard<'a, T> {

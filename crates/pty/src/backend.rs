@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use crate::events::TerminalEvent;
 use crate::snapshot::{Cell, TerminalSnapshot};
 
+/// A deferred attach (see [`TerminalBackend::begin_attach_existing`]).
+pub type AttachJob = Box<dyn FnOnce() -> Result<TerminalSessionId> + Send>;
+
 /// Opaque handle to one running PTY session. Backends mint these monotonically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TerminalSessionId(pub u64);
@@ -157,6 +160,15 @@ pub trait TerminalBackend: Send + 'static {
         Err(anyhow::anyhow!(
             "this backend does not support attach_existing"
         ))
+    }
+
+    /// [`attach_existing`](Self::attach_existing) as work to run later, so a
+    /// caller sharing this backend behind a lock can release it first: the
+    /// round-trip and the replay parse must not hold up every other pane. The
+    /// job registers the session with this backend when it finishes. `None`
+    /// when the backend has no such split; call `attach_existing` instead.
+    fn begin_attach_existing(&mut self, _external_id: &str) -> Option<AttachJob> {
+        None
     }
 
     /// Local-side identifier this backend would use to persist the

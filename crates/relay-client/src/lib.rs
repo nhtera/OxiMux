@@ -8,6 +8,7 @@
 //   `TerminalState` per session for snapshot/search/serialize calls
 //   that should stay local (no socket round trip).
 
+mod attach;
 pub mod backend;
 pub mod client;
 mod codec;

@@ -259,6 +259,18 @@ impl TerminalView {
         true
     }
 
+    /// The session this pending view was waiting for will not come (its PTY
+    /// is gone): show it as exited instead of a blank pane that drops keys.
+    pub fn abandon_pending_attach(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_attach {
+            return;
+        }
+        self.pending_attach = false;
+        self.pending_relay_hint = None;
+        self.exited = Some(-1);
+        cx.notify();
+    }
+
     /// Replace the LIVE session behind this view with another one. The one
     /// caller is the cockpit resume fallback: a restored agent tab whose CLI
     /// rejected the persisted conversation id gets a fresh CLI in the same

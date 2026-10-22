@@ -44,6 +44,19 @@ installed.
   Hovering a hyperlink shows its real target, flagged ⚠ when the visible text
   names a different host.
 
+**Reopening shows what was really on screen**
+
+- **Full-screen programs survive a reopen.** A TUI (an editor, `htop`, an
+  agent) keeps its alternate screen, scroll region, and mouse, paste and key
+  modes when you reopen OxiMux or a second window attaches — even after more
+  output than the replay buffer holds — and is asked to repaint.
+- **No garbled first line, no doubled output.** A reopened terminal's history
+  starts on a clean line, and output arriving during the reattach is neither
+  lost nor shown twice; recovering from a dropped frame no longer repeats it.
+- **Tearing off a pane no longer freezes the window** while it reattaches.
+- An older daemon kept after an update (because it has sessions) still works
+  as before; these improvements apply once it is replaced.
+
 **Readable program colors on the light theme**
 
 - **Minimum text contrast.** On the Paper theme, text colors a program chose

@@ -821,3 +821,73 @@ fn program_status_a_client_answering_for_an_older_daemon_sends_its_reply() {
     assert_eq!(text.matches(PROGRAM_STATUS_REPLY_HEX).count(), 2, "{text:?}");
     let _ = backend.close(id);
 }
+
+// --- Reattach fidelity (unix: POSIX shell scripts) ---
+
+#[cfg(unix)]
+fn screen_text(backend: &RelayBackend, id: TerminalSessionId) -> (Vec<String>, (usize, usize)) {
+    let snap = backend.snapshot(id).expect("snapshot");
+    let rows = snap
+        .cells
+        .iter()
+        .map(|row| row.iter().map(|c| if c.ch == '\0' { ' ' } else { c.ch }).collect::<String>().trim_end().to_owned())
+        .collect();
+    (rows, (snap.cursor.0 as usize, snap.cursor.1 as usize))
+}
+
+/// A second client attaching after more than a ring's worth of output sees
+/// the same screen and cursor as the client that watched it all live.
+#[cfg(unix)]
+#[test]
+fn a_reattach_after_a_wrapped_ring_shows_the_same_screen_and_cursor() {
+    let mut fx = boot_fixture();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "i=0; while [ $i -lt 40000 ]; do echo \"line $i with some padding text here\"; i=$((i+1)); done; \
+             printf '\\033[2J\\033[Htop row\\033[12;7Hmiddle\\033[20;3HREADY'; sleep 30"
+                .into(),
+        ],
+        cwd: test_cwd(),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    let id = fx.backend.spawn(cfg).expect("spawn");
+    let events = drain_until(&mut fx.backend, Duration::from_secs(30), |e| {
+        matches!(e, TerminalEvent::Output { bytes, .. } if String::from_utf8_lossy(bytes).contains("READY"))
+    });
+    assert!(!events.is_empty(), "no output");
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = fx.backend.drain_events();
+    let live = screen_text(&fx.backend, id);
+
+    let pty = fx.backend.external_id_of(id).expect("relay id");
+    let mut second =
+        RelayBackend::new(Arc::clone(fx.backend.client()), fx._runtime.handle().clone());
+    let attached = second.attach_existing(&pty).expect("attach");
+    let replayed = screen_text(&second, attached);
+    assert_eq!(replayed.0, live.0, "screen differs");
+    assert_eq!(replayed.1, live.1, "cursor differs");
+    assert!(live.0.iter().any(|r| r.contains("middle")));
+    let _ = second.detach(attached);
+    let _ = fx.backend.close(id);
+}
+
+/// The off-lock attach job registers its session with the backend it came
+/// from.
+#[cfg(unix)]
+#[test]
+fn a_deferred_attach_job_registers_its_session() {
+    let mut fx = boot_fixture();
+    let id = fx.backend.spawn(program_status_script("state=idle")).expect("spawn");
+    let pty = fx.backend.external_id_of(id).expect("relay id");
+    let mut second =
+        RelayBackend::new(Arc::clone(fx.backend.client()), fx._runtime.handle().clone());
+    let job = second.begin_attach_existing(&pty).expect("relay backends split the attach");
+    let attached = job().expect("attach");
+    assert_eq!(second.external_id_of(attached).as_deref(), Some(pty.as_str()));
+    let _ = second.detach(attached);
+    let _ = fx.backend.close(id);
+}

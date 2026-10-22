@@ -22,7 +22,7 @@ pub mod snapshot;
 pub mod state;
 
 pub use backend::{
-    InputMode, MouseMode, OutputWaker, SpawnConfig, TerminalBackend, TerminalSessionId,
+    AttachJob, InputMode, MouseMode, OutputWaker, SpawnConfig, TerminalBackend, TerminalSessionId,
 };
 pub use events::{
     CommandMarkKind, STATUS_EVENT_CAPACITY, TerminalEvent, is_status_event, push_bounded_status,

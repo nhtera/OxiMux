@@ -236,16 +236,17 @@ pub fn relay_state_snapshot() -> RelayStateSnapshot {
 /// (caller falls back to spawn + visual prefill).
 pub fn attach_pty_existing(external_id: &str) -> Option<(SharedBackend, TerminalSessionId)> {
     let shared = SHARED_BACKEND.get()?;
-    // Attach is a synchronous daemon round-trip on the calling thread
-    // (background executor from the restore reconcile; main thread from
-    // tear-off). Hold off App Nap for its duration.
+    // A synchronous daemon round-trip on a background executor; hold off App
+    // Nap for it. The shared backend is held only to take the job, so every
+    // other pane keeps drawing and typing while it runs.
     let _nap = crate::app_nap::prevent("relay attach");
-    let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    match guard.attach_existing(external_id) {
-        Ok(session_id) => {
-            drop(guard);
-            Some((Arc::clone(shared), session_id))
-        }
+    let lock = || shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let job = lock().begin_attach_existing(external_id);
+    // A daemon respawn may have swapped the backend while the job ran, and the
+    // session went to the one it replaced: report failure, not a dead pane.
+    let landed = |id: TerminalSessionId| lock().external_id_of(id).is_some().then_some(id).ok_or_else(|| anyhow::anyhow!("backend replaced during attach"));
+    match job.map_or_else(|| lock().attach_existing(external_id), |job| job().and_then(landed)) {
+        Ok(session_id) => Some((Arc::clone(shared), session_id)),
         Err(err) => {
             tracing::debug!(?err, external_id, "attach_existing failed");
             None
