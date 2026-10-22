@@ -83,6 +83,7 @@ impl Render for TerminalView {
             dim: s.dim_alpha,
             unfocused: s.unfocused_alpha,
             unfocused_cursor: s.unfocused_cursor_alpha,
+            min_contrast: s.effective_minimum_contrast(theme.is_light()),
         };
 
         // Build owned paint params (`FnOnce + 'static` requires no

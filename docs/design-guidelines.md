@@ -147,6 +147,17 @@ at the far end of the lightness range from its ground, the alpha overlays are th
 polarity, the ladder runs the right way, and every inherited accent actually darkened.
 A palette pasted in from the wrong polarity fails the suite rather than shipping.
 
+**Program colors get a contrast floor.** The 16 named terminal colors have a hand-picked
+Paper set (at the 3:1 default only bright yellow moves, barely), but programs also choose
+256-color and truecolor text designed for dark terminals. `terminal.minimum_contrast` (Settings → Terminal → *Minimum text contrast*)
+darkens or lightens such text until it reaches the ratio against its cell, changing only
+OKLab lightness so the hue survives — a red error stays red. Default: 3:1 on Paper, off on
+Charcoal. Applied to the cell's final colors after an inverse swap and before the dim /
+unfocused fades; never to hidden text, cells on the theme's own default colors, the
+cursor block, runs made only of block elements or private-use glyphs (half-block images,
+swatches, powerline seams), search highlights or the selection.
+The math lives in `shell/color_contrast.rs`, shared with the diff view's token floor.
+
 ## Density
 
 Tight is the default. The cockpit fits more on screen than the conventional desktop

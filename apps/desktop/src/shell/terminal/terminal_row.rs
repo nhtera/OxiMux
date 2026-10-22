@@ -189,7 +189,13 @@ const UNFOCUSED_CURSOR_ALPHA: f32 = 0.3;
 fn effective_colors(run: &Run, pane_focused: bool, theme: &Theme) -> (gpui::Hsla, gpui::Hsla) {
     let fg = resolve(run.fg, ColorRole::Fg, theme);
     let bg = resolve(run.bg, ColorRole::Bg, theme);
-    let (mut fg, mut bg) = if run.inverse { (bg, fg) } else { (fg, bg) };
+    let (fg, mut bg) = if run.inverse { (bg, fg) } else { (fg, bg) };
+    // The same correction the canvas applies, at the theme's default ratio:
+    // this element-based row builder has no settings of its own and is not the
+    // live paint path (the canvas is), so a user's own ratio does not reach it.
+    let skip = crate::shell::terminal_canvas::keeps_its_color(&run.text, run.fg, run.bg, false, run.is_cursor);
+    let min = oximux_settings::TerminalSettings::default().effective_minimum_contrast(theme.is_light());
+    let mut fg = crate::shell::terminal_canvas::corrected_fg(fg, bg, skip, min);
     if run.dim {
         fg.a *= DIM_FG_ALPHA;
     }

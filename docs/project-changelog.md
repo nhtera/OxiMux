@@ -44,6 +44,14 @@ installed.
   Hovering a hyperlink shows its real target, flagged ⚠ when the visible text
   names a different host.
 
+**Readable program colors on the light theme**
+
+- **Minimum text contrast.** On the Paper theme, text colors a program chose
+  for dark terminals (256-color and truecolor) are darkened until they read at
+  3:1 against their background, keeping their hue. Settings → Terminal →
+  *Minimum text contrast* picks the theme default, off, 3:1, 4.5:1 or 7:1. The
+  dark theme is unchanged by default.
+
 ### 2026-10-16 — v0.1.42: Mobile Emulator: verify loop, device state, flows, phone view, MCP (#56–#69)
 
 Agents get a tighter loop on the attached device, and you get more ways to

@@ -10,6 +10,7 @@ pub mod agents_dashboard;
 pub mod automations_view;
 pub mod browser_view;
 pub mod chrome;
+pub mod color_contrast;
 pub mod command_palette;
 pub mod commit_dialog;
 pub mod compose_bar;

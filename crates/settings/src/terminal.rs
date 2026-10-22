@@ -121,6 +121,11 @@ pub struct TerminalSettings {
     /// OSC 777. Off by default: any program can print those bytes. The banner
     /// title is always OxiMux's own; `oximux notify` is not gated by this.
     pub osc_notifications: bool,
+    /// Minimum contrast ratio (1–21) a program-chosen text color keeps against
+    /// its cell background; darker or lighter as needed, hue kept. `None`
+    /// follows the theme: 3.0 on the light theme, where colors picked for dark
+    /// terminals wash out, and off (1.0) on the dark one.
+    pub minimum_contrast: Option<f32>,
     /// Per-terminal shell history. Sourced at spawn: applies to new terminals.
     pub per_terminal_history: PerTerminalHistory,
     /// Which finished commands get a left-margin status mark.
@@ -151,6 +156,7 @@ impl Default for TerminalSettings {
             windows_powershell: WindowsPowerShell::default(),
             bell: BellStyle::Visual,
             osc_notifications: false,
+            minimum_contrast: None,
             per_terminal_history: PerTerminalHistory::Auto,
             exit_badges: ExitBadges::Failures,
         }
@@ -163,6 +169,16 @@ impl Global for TerminalSettings {}
 impl TerminalSettings {
     /// File name within the app data dir.
     pub const FILE_NAME: &'static str = "terminal.toml";
+
+    /// The minimum-contrast ratio in force for a light or dark theme: the
+    /// user's own value, else the theme default. Always within 1.0–21.0.
+    pub fn effective_minimum_contrast(&self, light_theme: bool) -> f32 {
+        let default = if light_theme { 3.0 } else { 1.0 };
+        self.minimum_contrast
+            .filter(|v| v.is_finite())
+            .unwrap_or(default)
+            .clamp(1.0, 21.0)
+    }
 
     /// Parse a TOML document into settings; missing keys fall back to default.
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
@@ -198,6 +214,21 @@ impl TerminalSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimum_contrast_follows_the_theme_unless_set() {
+        let mut s = TerminalSettings::default();
+        assert_eq!(s.effective_minimum_contrast(true), 3.0);
+        assert_eq!(s.effective_minimum_contrast(false), 1.0);
+        s.minimum_contrast = Some(4.5);
+        assert_eq!(s.effective_minimum_contrast(false), 4.5);
+        s.minimum_contrast = Some(99.0);
+        assert_eq!(s.effective_minimum_contrast(true), 21.0);
+        s.minimum_contrast = Some(f32::NAN);
+        assert_eq!(s.effective_minimum_contrast(true), 3.0);
+        let parsed = TerminalSettings::from_toml_str("minimum_contrast = 7.0").unwrap();
+        assert_eq!(parsed.minimum_contrast, Some(7.0));
+    }
 
     #[test]
     fn default_round_trips_through_toml() {

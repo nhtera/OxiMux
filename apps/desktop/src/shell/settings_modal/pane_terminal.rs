@@ -142,6 +142,29 @@ fn settings_entries(
         cx,
     );
 
+    // Minimum text contrast: the theme's default, off, or a fixed ratio.
+    let contrast_choice = |v: Option<f32>| {
+        move |this: &mut SettingsModal, _w: &mut gpui::Window, cx: &mut gpui::Context<SettingsModal>| {
+            this.terminal.minimum_contrast = v;
+            this.persist_terminal(cx);
+        }
+    };
+    let contrast_is = |v: Option<f32>| t.minimum_contrast == v;
+    let min_contrast = segmented(
+        "term-min-contrast",
+        vec![
+            Segment::new("Theme default", contrast_is(None), contrast_choice(None)),
+            Segment::new("Off", contrast_is(Some(1.0)), contrast_choice(Some(1.0))),
+            Segment::new("3:1", contrast_is(Some(3.0)), contrast_choice(Some(3.0))),
+            Segment::new("4.5:1", contrast_is(Some(4.5)), contrast_choice(Some(4.5))),
+            Segment::new("7:1", contrast_is(Some(7.0)), contrast_choice(Some(7.0))),
+        ],
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
     // Windows-only: which shell family new panes run, and which PowerShell
     // binary the PowerShell family resolves to. Built unconditionally (the
     // enums are cross-platform) but only surfaced as rows on Windows below.
@@ -323,6 +346,12 @@ fn settings_entries(
             scroll_mult,
         ),
         entry("Bell", "Visual flash on the terminal bell, or off.", bell),
+        entry(
+            "Minimum text contrast",
+            "Darken or lighten program-chosen text colors that are hard to read on their background, keeping \
+             their hue. Theme default is 3:1 on the light theme and off on the dark one.",
+            min_contrast,
+        ),
         entry(
             "Command status marks",
             "Mark finished commands in the left margin. Failures marks only commands that exited with an error; \
