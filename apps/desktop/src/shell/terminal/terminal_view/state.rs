@@ -481,6 +481,10 @@ impl TerminalView {
         let Some(bytes) = self.queued_first_output_input.take() else {
             return;
         };
+        // A pre-typed resume command is input too: a read-only pane gets none.
+        if self.is_read_only() {
+            return;
+        }
         self.queued_input_last_output = None;
         let session_id = self.session_id;
         if let Err(err) = self.with_backend(|be| be.write(session_id, &bytes)) {

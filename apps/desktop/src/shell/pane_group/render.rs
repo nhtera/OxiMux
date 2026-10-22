@@ -320,7 +320,7 @@ pub fn build_tab_strip_for(
             let ambient = detect_tab_agent(t, cx);
             PaneGroupTabHeader {
                 tab_idx: idx,
-                label: t.custom_title.clone().unwrap_or_else(|| {
+                label: with_lock_badge(&t.content, cx, t.custom_title.clone().unwrap_or_else(|| {
                     // Browser tabs show the live page title (falling back to the
                     // URL host) read from the BrowserView, so the chip tracks
                     // navigation. A user-set custom title still wins above.
@@ -337,7 +337,7 @@ pub fn build_tab_strip_for(
                             .or_else(|| terminal_osc2_title(t, cx))
                             .unwrap_or_else(|| t.label.clone())
                     }
-                }),
+                })),
                 kind_marker: ambient
                     .as_ref()
                     .map(|a| PaneTabKindMarker::Agent(a.adapter_id))
@@ -576,6 +576,14 @@ fn attention_for(content: &crate::shell::pane_content::PaneContent, cx: &App) ->
             .iter_all_views()
             .any(|(_, _, v)| v.read(cx).attention()),
         _ => false,
+    }
+}
+
+/// `label` with a lock in front when the tab's visible terminal is read-only.
+fn with_lock_badge(content: &crate::shell::pane_content::PaneContent, cx: &App, label: SharedString) -> SharedString {
+    match content.terminal_active_view() {
+        Some(v) if v.read(cx).is_read_only() => format!("🔒 {label}").into(),
+        _ => label,
     }
 }
 

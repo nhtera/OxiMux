@@ -289,12 +289,9 @@ fn migrate_zsh_overlay(dir: &Path, zsh_home: &Path) {
     }
 }
 
-/// Escape a value for a PowerShell single-quoted literal: nothing interpolates
-/// inside one, so only the quote itself needs doubling. The app data dir is
-/// unlikely to contain one, but a path is user data and gets treated as such.
-fn ps_single_quote(s: &str) -> String {
-    s.replace('\'', "''")
-}
+// The app data dir is unlikely to contain a quote, but a path is user data and
+// gets treated as such.
+use crate::shell::terminal::shell_quote::ps_single_quote;
 
 /// Create parent dirs and write `content`, skipping the write when the file is
 /// already byte-identical (the common steady state — avoids needless churn the

@@ -348,6 +348,9 @@ pub struct WorkspaceRoot {
     /// Same focus-restore guard for the command palette and project picker
     /// (both grab focus on open).
     pub(crate) _palette_sub: Option<Subscription>,
+    /// The terminal the palette was opened over: Insert Path types into it, and
+    /// focus goes back to it when the palette closes (`terminal_actions`).
+    pub(crate) palette_terminal: Option<WeakEntity<crate::shell::terminal_view::TerminalView>>,
     pub(crate) _search_palette_sub: Option<Subscription>,
     pub(crate) _session_history_sub: Option<Subscription>,
     pub(crate) _project_picker_sub: Option<Subscription>,
@@ -1115,9 +1118,7 @@ impl WorkspaceRoot {
         let palette_sub = cx.subscribe_in(
             &palette,
             window,
-            |root, _palette, _ev: &PaletteEvent, window, cx| {
-                root.focus_handle.focus(window, cx);
-            },
+            |root, _palette, ev: &PaletteEvent, window, cx| root.on_palette_event(ev, window, cx),
         );
         let search_palette_sub = cx.subscribe_in(
             &search_palette,
@@ -1514,6 +1515,7 @@ impl WorkspaceRoot {
             _awake_settings_observer: awake_settings_observer,
             _onboarding_sub: Some(onboarding_sub),
             _palette_sub: Some(palette_sub),
+            palette_terminal: None,
             _search_palette_sub: Some(search_palette_sub),
             _session_history_sub: Some(session_history_sub),
             _project_picker_sub: Some(project_picker_sub),
@@ -1832,3 +1834,4 @@ mod ops;
 mod render;
 mod search_palette;
 mod stash_dialogs;
+mod terminal_actions;

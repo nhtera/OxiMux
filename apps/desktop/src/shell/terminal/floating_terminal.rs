@@ -340,6 +340,11 @@ impl FloatingTerminal {
         self.tabs.iter().map(|t| &t.view)
     }
 
+    /// The terminal on screen in the floating window.
+    pub fn active_view(&self) -> Option<&Entity<TerminalView>> {
+        self.tabs.get(self.active).map(|t| &t.view)
+    }
+
     /// Number of open tabs (root-side guards + tests).
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
@@ -425,6 +430,7 @@ impl FloatingTerminal {
                     external_id: t.external_id.clone(),
                     surface_id: t.surface_id.clone(),
                     tab_id: t.tab_id.clone(),
+                    read_only: crate::shell::terminal::terminal_locks::is_locked(&t.tab_id),
                 })
                 .collect(),
         }

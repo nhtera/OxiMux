@@ -79,6 +79,10 @@ impl WorkspaceRoot {
         );
         let mut specs = Vec::new();
         for tab in &blob.tabs {
+            // Locked again before the view mounts, so no input reaches it.
+            if tab.read_only {
+                crate::shell::terminal::terminal_locks::set(&tab.tab_id, tab.external_id.as_deref(), true);
+            }
             let ids = SurfaceIds::restored(tab.cwd.clone(), tab.surface_id.clone(), tab.tab_id.clone());
             let reattached = tab.external_id.as_deref().and_then(|ext| {
                 (session_ok && snap.live_external_ids.contains(ext))

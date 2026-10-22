@@ -34,9 +34,13 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::mount_inner(
+        let view = Self::mount_inner(
             backend, session_id, ids, theme, density, typography, true, window, cx,
-        )
+        );
+        // A locked terminal mounted straight onto its PTY (tear-off, a
+        // floating restore) keeps that PTY locked for remote input.
+        view.bind_lock_to_session();
+        view
     }
 
     /// Like [`mount`](Self::mount) but does NOT grab focus on construction.
@@ -54,9 +58,11 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::mount_inner(
+        let view = Self::mount_inner(
             backend, session_id, ids, theme, density, typography, false, window, cx,
-        )
+        );
+        view.bind_lock_to_session();
+        view
     }
 
     /// The spawn is done outside `cx.new` because the entity builder closure
@@ -172,6 +178,7 @@ impl TerminalView {
             pointer_in_view: false,
             last_bell_banner: None,
             last_notify_banner: None,
+            read_only_notice_at: None,
             link_exists: ExistenceCache::new(),
             link_stat_inflight: 0,
             command_marks: Vec::new(),
@@ -340,6 +347,9 @@ impl TerminalView {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .external_id_of(session_id);
+        // A locked terminal's new PTY is locked for remote input too — bound
+        // only now that its id is known.
+        self.bind_lock_to_session();
         // A restored pane can be focused while still a placeholder (no pid,
         // no relay id); point its history note at the shell it now has.
         crate::shell::terminal::shell_history::refresh_focus(&self.ids.tab_id, self.history_focus_note());
@@ -462,6 +472,7 @@ impl TerminalView {
             pointer_in_view: false,
             last_bell_banner: None,
             last_notify_banner: None,
+            read_only_notice_at: None,
             link_exists: ExistenceCache::new(),
             link_stat_inflight: 0,
             command_marks: Vec::new(),

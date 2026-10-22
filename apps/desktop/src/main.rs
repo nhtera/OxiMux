@@ -93,6 +93,12 @@ fn main() {
         );
     }
 
+    // Read-only terminals locked in an earlier run stay locked to remote input
+    // from the first request, not from when their project is next opened.
+    if let Some(dir) = oximux_app::app_paths::data_dir() {
+        oximux_app::shell::terminal::terminal_locks::persist_to(dir.join("locked-terminals"));
+    }
+
     // Before `gpui_platform::application()`, which is where GPUI reads it, and
     // before anything spawns — it writes the environment. Without this the
     // browser pane loads its page and renders nothing: GPUI's composited window
@@ -467,8 +473,12 @@ fn main() {
         }
         // Serve terminals when the relay came up. Absent (in-process PTY
         // fallback), every terminal RPC keeps answering `Unauthorized`.
+        // Behind the read-only lock: a locked terminal takes no remote input.
         if let Some(terminals) = oximux_app::remote_control::relay_terminals::installed() {
-            remote_control.set_terminals(terminals);
+            remote_control.set_terminals(std::sync::Arc::new(oximux_app::remote_control::locked_terminals::LockedTerminals::new(
+                terminals,
+                oximux_app::shell::terminal::terminal_locks::shared_locked_ptys(),
+            )));
         }
         // The inbound half: a phone asking for a new session hands the request
         // to this loop, which opens the tab on the UI thread and answers with

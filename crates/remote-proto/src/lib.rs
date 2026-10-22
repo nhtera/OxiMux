@@ -47,4 +47,10 @@ pub use messages::{
 };
 pub use pairing::{PairingError, PairingTicket, registration_proof};
 pub use proto::{PROTOCOL_VERSION, Request, Response, RpcError, WireError};
+
+/// The `RpcError::BadRequest` message a host answers terminal input with when
+/// the user locked that terminal read-only. A message rather than a variant so
+/// a peer from before the lock still decodes it; clients that know it (the
+/// `oximux` CLI's exit code) match on it.
+pub const READ_ONLY_TERMINAL: &str = "terminal is read-only";
 pub use transport::{Transport, TransportError, UniRecv, UniSend};

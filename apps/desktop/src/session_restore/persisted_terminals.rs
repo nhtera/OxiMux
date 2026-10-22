@@ -216,6 +216,10 @@ pub struct PersistedSubPane {
     /// Active tab index within `tabs`. `0` for single-tab leaves.
     #[serde(default)]
     pub active_tab: usize,
+    /// The leaf's active terminal is read-only (mirrors its `tabs` entry, for
+    /// a single-tab leaf that has none). `false` for older blobs.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// One terminal tab inside a persisted leaf. Carries the per-tab cwd +
@@ -229,6 +233,9 @@ pub struct PersistedLeafTab {
     pub surface_id: String,
     #[serde(default)]
     pub tab_id: String,
+    /// The terminal is read-only (see `terminal_locks`). `false` for older blobs.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Tab kind tag persisted alongside `PersistedTab`. The agent variant
@@ -987,14 +994,17 @@ mod tests {
                     cwd: Some("/tmp/a".into()),
                     surface_id: "surf-a".into(),
                     tab_id: "tab-a".into(),
+                    read_only: false,
                 },
                 PersistedLeafTab {
                     cwd: Some("/tmp/b".into()),
                     surface_id: "surf-b".into(),
                     tab_id: "tab-b".into(),
+                    read_only: true,
                 },
             ],
             active_tab: 1,
+            read_only: true,
         };
         let back: PersistedSubPane =
             serde_json::from_str(&serde_json::to_string(&sp).unwrap()).unwrap();
@@ -1002,6 +1012,10 @@ mod tests {
         assert_eq!(back.active_tab, 1);
         assert_eq!(back.tabs[0].tab_id, "tab-a");
         assert_eq!(back.tabs[1].surface_id, "surf-b");
+        assert!(back.tabs[1].read_only && !back.tabs[0].read_only && back.read_only);
+        // An older blob without the field reads as unlocked.
+        let legacy: PersistedLeafTab = serde_json::from_str(r#"{"cwd":null,"surface_id":"s","tab_id":"t"}"#).unwrap();
+        assert!(!legacy.read_only);
         // Top-level fields mirror the active tab for legacy readers.
         assert_eq!(back.tab_id, "tab-b");
     }

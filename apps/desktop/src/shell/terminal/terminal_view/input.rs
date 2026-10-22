@@ -350,7 +350,8 @@ impl TerminalView {
         if self.selecting.is_some() && matches!(action, MouseAction::Drag | MouseAction::Release) {
             return false;
         }
-        if modifiers.shift {
+        // Shift selects locally; so does every click on a read-only pane.
+        if modifiers.shift || self.is_read_only() {
             return false;
         }
         let id = self.session_id;
@@ -626,6 +627,9 @@ impl TerminalView {
         let up = lines > 0;
         let count = lines.unsigned_abs() as usize;
 
+        // A read-only pane scrolls its own history instead of sending wheel
+        // reports or arrow keys to the program.
+        let mode = if self.is_read_only() { oximux_pty::MouseMode::default() } else { mode };
         if mode.any_reporting() {
             let cell = self.cell_at(ev.position, window);
             let mods = mod_bits(ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
@@ -988,7 +992,7 @@ impl TerminalView {
         // has nowhere meaningful to go. Drop it quietly (the window is
         // typically a few ms after first paint) instead of spamming
         // "pty write failed" per keystroke against the placeholder grid.
-        if self.pending_attach {
+        if self.pending_attach || self.input_blocked_by_lock(cx) {
             return;
         }
         // F3.4: paste / cmd-shortcut paths bypass the focus-in respawn
@@ -1156,6 +1160,13 @@ impl TerminalView {
         let Some(text) = item.text() else {
             return;
         };
+        self.send_as_paste(&text, force_plain, cx);
+    }
+
+    /// Send `text` the way a paste goes: ESC stripped, and wrapped for a
+    /// program that asked for bracketed paste. Shared by the clipboard and by
+    /// insert-path.
+    pub(super) fn send_as_paste(&mut self, text: &str, force_plain: bool, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;
         }

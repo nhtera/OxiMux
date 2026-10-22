@@ -489,7 +489,7 @@ impl WorkspaceRoot {
     /// receive dictated text: a terminal's active sub-pane, or a code editor's
     /// input. `None` for diff / browser / tasks / chat (chat dictates through the
     /// composer's own handler, never here).
-    fn focused_dictation_sink(
+    pub(super) fn focused_dictation_sink(
         &self,
         cx: &gpui::App,
     ) -> Option<crate::shell::agent_chat::HudSink> {
@@ -1891,6 +1891,9 @@ impl WorkspaceRoot {
             self.push_toast(ToastKind::Info, "Open an agent chat or agent terminal to send this to.", cx);
             return;
         };
+        if self.refuse_locked_agent(session_id, cx) {
+            return;
+        }
         let runtime = self.cli_runtime.clone();
         let text = action.markdown.clone();
         // Same reactor requirement as the `SendTextToActiveAgent`

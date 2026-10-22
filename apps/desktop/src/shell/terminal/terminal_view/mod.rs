@@ -669,6 +669,8 @@ pub struct TerminalView {
     /// When this pane last raised a terminal-notification banner (OSC 9/777,
     /// `oximux notify`); see `notify.rs`.
     last_notify_banner: Option<std::time::Instant>,
+    /// When the read-only toast was last shown here (`read_only.rs`).
+    read_only_notice_at: Option<std::time::Instant>,
     /// Async path-existence answers for detected `path:line` links, keyed by
     /// resolved absolute path. Hover/paint/click consult it without touching
     /// the filesystem; misses spawn a background stat (see
@@ -782,8 +784,10 @@ mod restore_notice;
 mod state;
 mod daemon_recovery;
 mod command_badge_hover;
+mod insert_path;
 mod link_label;
 mod notify;
+mod read_only;
 #[cfg(test)]
 mod daemon_loss_tests;
 #[cfg(test)]

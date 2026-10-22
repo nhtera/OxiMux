@@ -57,6 +57,20 @@ installed.
 - An older daemon kept after an update (because it has sessions) still works
   as before; these improvements apply once it is replaced.
 
+**Insert a path, lock a terminal**
+
+- **Insert Path** (⌥⌘P, or the command palette): pick a file or folder under
+  the terminal's directory and it is typed at the cursor, relative where it
+  can be and quoted only when the shell needs it — never with a trailing
+  newline, and a file name holding a control character is never offered.
+- **Read-only terminals**: *Make Read-Only* in a terminal's right-click menu
+  (or *Toggle Read-Only Terminal* in the palette) stops every input path —
+  keys, paste, dictation, mouse reports, and a paired phone or `oximux term
+  send` through this desktop — while scrolling, selecting and copying keep
+  working. The tab and pane show a lock, and the lock survives a restart
+  (an agent's terminal comes back unlocked). Not covered: a headless `oximux serve`, or a process writing to the
+  terminal daemon's socket directly.
+
 **Lighter on idle terminals**
 
 - **Idle terminals cost almost nothing.** The terminal daemon no longer wakes

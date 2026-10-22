@@ -167,3 +167,35 @@ async fn an_already_exited_pane_is_not_marked_lost(cx: &mut TestAppContext) {
         assert_eq!(v.exited, Some(1), "its own exit code survives");
     });
 }
+
+/// A locked terminal restored onto a daemon PTY locks that PTY for remote
+/// input as soon as the view adopts it — the id is unknown until then.
+#[gpui::test]
+async fn adopting_a_session_locks_its_pty_when_the_terminal_is_locked(cx: &mut TestAppContext) {
+    use crate::shell::terminal::terminal_locks::{self as locks, pty_is_locked, shared_locked_ptys};
+    let (placeholder, placeholder_id) = spawn_local_pty_dormant(80, 24).expect("dormant spawn");
+    let window = cx.add_window(|win, cx| {
+        TerminalView::mount_pending(
+            placeholder,
+            placeholder_id,
+            SurfaceIds::restored("/proj", "surface-lock".into(), "tab-lock-adopt".into()),
+            None,
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            win,
+            cx,
+        )
+    });
+    locks::set("tab-lock-adopt", None, true);
+    assert!(!pty_is_locked(&shared_locked_ptys(), "pty-gone"));
+    let live: SharedBackend = Arc::new(std::sync::Mutex::new(Box::new(LostBackend {
+        lost: Arc::new(AtomicBool::new(false)),
+        reported: false,
+    })));
+    window
+        .update(cx, |v, _w, cx| assert!(v.adopt_live_session(live, TerminalSessionId(1), cx)))
+        .unwrap();
+    assert!(pty_is_locked(&shared_locked_ptys(), "pty-gone"), "the adopted PTY is locked");
+    locks::set("tab-lock-adopt", Some("pty-gone"), false);
+}

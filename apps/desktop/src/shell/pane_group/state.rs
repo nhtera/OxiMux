@@ -420,6 +420,28 @@ impl PaneGroup {
         })
     }
 
+    /// Whether the terminal running agent `session_id` is read-only. Checks the
+    /// agent's own PTY view (`term`), not whichever split is focused: a side
+    /// shell added with Cmd+D must neither unlock nor lock the agent. With no
+    /// `term` (the runtime no longer knows it), any locked view in its tab
+    /// refuses.
+    pub fn agent_session_read_only(
+        &self,
+        session_id: AgentSessionId,
+        term: Option<TerminalSessionId>,
+        cx: &gpui::App,
+    ) -> bool {
+        self.tabs.iter().any(|t| {
+            let is_agent = matches!(&t.kind, PaneGroupTabKind::Agent { session_id: sid, .. } if *sid == session_id);
+            let PaneContent::Terminal(tree) = &t.content else { return false };
+            is_agent
+                && tree.iter_all_views().any(|(_, _, v)| {
+                    let v = v.read(cx);
+                    term.is_none_or(|id| v.session_id() == id) && v.is_read_only()
+                })
+        })
+    }
+
     /// First agent session id found anywhere in this group's tab list,
     /// regardless of active state. Fallback target when no active agent
     /// tab is available (e.g. terminal in active tab, agent in a

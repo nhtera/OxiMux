@@ -508,7 +508,7 @@ impl Render for TerminalView {
                 this.on_key_down(event, window, cx);
             }))
             .child(grid_canvas);
-        if let Some(badge) = dormant_badge {
+        if let Some(badge) = dormant_badge.or_else(|| self.read_only_pill()) {
             root = root.child(badge);
         }
         // A pane whose PTY child has exited gets a centered "process exited"

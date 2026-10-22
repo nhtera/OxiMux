@@ -138,6 +138,7 @@ fn header_row(
     let mode_label = match mode {
         PaletteMode::QuickOpen => "Files",
         PaletteMode::Commands => "Commands",
+        PaletteMode::InsertPath => "Insert path",
     };
 
     div()
@@ -206,8 +207,8 @@ fn result_list(input: &ModalRenderInput<'_>) -> gpui::AnyElement {
                 ));
             }
         }
-        // QuickOpen renders plain string rows from `file_rows` via `file_row`.
-        PaletteMode::QuickOpen => {
+        // QuickOpen and InsertPath render plain string rows from `file_rows`.
+        PaletteMode::QuickOpen | PaletteMode::InsertPath => {
             // `row_count == 0` ⇒ the single row is a non-actionable hint.
             let actionable = input.row_count > 0;
             for (i, path) in input.file_rows.iter().enumerate() {

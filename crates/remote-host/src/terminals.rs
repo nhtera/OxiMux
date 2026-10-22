@@ -68,6 +68,9 @@ pub enum TerminalError {
     NotFound,
     #[error("the terminal host is unavailable")]
     Unavailable,
+    /// The user locked this terminal against input on the host.
+    #[error("the terminal is read-only")]
+    ReadOnly,
 }
 
 /// The desktop's terminals, as much of them as the remote protocol exposes.

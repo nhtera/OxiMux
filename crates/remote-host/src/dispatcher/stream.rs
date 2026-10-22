@@ -573,6 +573,11 @@ impl Dispatcher {
             Err(crate::terminals::TerminalError::NotFound) => {
                 Response::Error(RpcError::UnknownSession)
             }
+            // A dedicated message on an existing variant, so phones that
+            // predate the lock still decode the answer.
+            Err(crate::terminals::TerminalError::ReadOnly) => {
+                Response::Error(RpcError::BadRequest(oximux_remote_proto::READ_ONLY_TERMINAL.into()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "terminal input failed");
                 Response::Error(RpcError::Internal("terminals unavailable".into()))
