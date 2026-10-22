@@ -64,7 +64,7 @@ stopped waiting.
 | 5 | not allowed — retrying will not help |
 | 6 | `serve` only: another host holds the data directory — do not restart |
 | 7 | waiting on the user (`sim` consent) — wait, then retry |
-| 8 | no such session/terminal id, or an ambiguous prefix — nothing was sent |
+| 8 | a short id or prefix matched nothing, or several — nothing was sent (a full UUID the host does not know is 1) |
 | 130 | stopped with Ctrl+C |
 
 Branch on the number. `--json` prints `{"ok":true,"data":…}` or
