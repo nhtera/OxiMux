@@ -136,8 +136,7 @@ pub async fn resolve_in_place(client: &Client, command: &mut Command) -> Result<
         // An agent-scoped caller lists only its own session, so "not found"
         // may really be "not yours": the host says which, with its own hint.
         Pick::NotFound
-            if kind == Kind::Session
-                && std::env::var_os(oximux_remote_local::SESSION_ENV_VAR).is_some() =>
+            if kind == Kind::Session && crate::commands::events::agent_scoped() =>
         {
             Ok(())
         }

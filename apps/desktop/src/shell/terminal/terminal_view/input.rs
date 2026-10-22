@@ -578,7 +578,8 @@ impl TerminalView {
         // target (or scroll another link under the pointer), and a label still
         // naming the old one would hide the very mismatch it exists to show.
         if let Some(label) = &self.link_label {
-            self.link_label = crate::shell::link_hover::osc8_label(&self.snapshot, label.row, label.col);
+            let (row, col) = label.pointer;
+            self.link_label = crate::shell::link_hover::osc8_label(&self.snapshot, row, col);
         }
     }
 

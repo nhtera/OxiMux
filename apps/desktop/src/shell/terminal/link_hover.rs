@@ -20,6 +20,8 @@ const MAX_LABEL_CHARS: usize = 120;
 pub struct LinkLabel {
     pub row: usize,
     pub col: usize,
+    /// The cell the pointer was on: a redraw relabels from here.
+    pub pointer: (usize, usize),
     pub text: String,
     /// The visible text names a different destination than the target.
     pub warn: bool,
@@ -53,7 +55,7 @@ pub fn osc8_label(snapshot: &TerminalSnapshot, row: usize, col: usize) -> Option
         Osc8Action::Blocked(_) => " — blocked",
     };
     let text = format!("{}{target}{verdict}", if warn { "⚠ " } else { "" });
-    Some(LinkLabel { row, col: span.col_start, text, warn })
+    Some(LinkLabel { row, col: span.col_start, pointer: (row, col), text, warn })
 }
 
 /// Paint the label as a chip on the row below the link, or above it when the
@@ -129,10 +131,13 @@ mod tests {
 
     #[test]
     fn a_redraw_under_a_resting_pointer_relabels_from_the_labels_own_cell() {
-        // What `revalidate_hover` recomputes: same text, new target, same cell.
+        // What `revalidate_hover` recomputes: same text, new target, the cell
+        // the pointer is on (not the link's start).
         let before = osc8_label(&snapshot_with("https://docs.rs/x", "https://docs.rs/x"), 0, 4).unwrap();
         assert!(!before.warn);
-        let after = osc8_label(&snapshot_with("https://docs.rs/x", "https://evil.example/"), before.row, before.col).unwrap();
+        assert_eq!(before.pointer, (0, 4));
+        let (row, col) = before.pointer;
+        let after = osc8_label(&snapshot_with("https://docs.rs/x", "https://evil.example/"), row, col).unwrap();
         assert!(after.warn && after.text.starts_with("⚠ https://evil.example/"));
     }
 

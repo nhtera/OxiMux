@@ -18,13 +18,23 @@ pub fn has_control(s: &str) -> bool {
     s.chars().any(char::is_control)
 }
 
-/// Quote `path` for a POSIX shell (sh, bash, zsh, fish read single quotes the
-/// same way for this). Unquoted when every character is plain; otherwise
-/// wrapped in single quotes with each `'` written as `'\''`. A leading `-`
-/// (an option) or `~` (another user's home, `~foo`) gets `./`; only a `~/`
-/// the caller wrote for the home directory itself stays outside the quotes so
-/// the shell still expands it.
+/// Quote `path` for a POSIX shell (sh, bash, zsh). Unquoted when every
+/// character is plain; otherwise wrapped in single quotes with each `'`
+/// written as `'\''`. A leading `-` (an option) or `~` (another user's home,
+/// `~foo`) gets `./`; only a `~/` the caller wrote for the home directory
+/// itself stays outside the quotes so the shell still expands it.
 pub fn posix_quote(path: &str) -> String {
+    single_quoted(path, |s| s.replace('\'', r"'\''"))
+}
+
+/// Quote `path` for fish: as [`posix_quote`], except that inside fish's single
+/// quotes a backslash escapes `'` and itself — so both are escaped, or a name
+/// like `x\';calc;#` would close the quote early and run `calc`.
+pub fn fish_quote(path: &str) -> String {
+    single_quoted(path, |s| s.replace('\\', r"\\").replace('\'', r"\'"))
+}
+
+fn single_quoted(path: &str, escape: impl Fn(&str) -> String) -> String {
     let path = if path.starts_with('-') || (path.starts_with('~') && !path.starts_with("~/")) {
         format!("./{path}")
     } else {
@@ -38,25 +48,29 @@ pub fn posix_quote(path: &str) -> String {
         Some(rest) => ("~/", rest),
         None => ("", path.as_str()),
     };
-    format!("{home}'{}'", rest.replace('\'', r"'\''"))
+    format!("{home}'{}'", escape(rest))
 }
 
 /// How the shell in a pane reads a typed word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellDialect {
-    /// sh, bash (Git Bash too), zsh, fish.
+    /// sh, bash (Git Bash too), zsh.
     Posix,
+    Fish,
     PowerShell,
     /// `cmd.exe`.
     Cmd,
 }
 
 impl ShellDialect {
-    /// The dialect of the shell `program` (a path or a bare name).
+    /// The dialect of the shell `program` (a path, a bare name, or a login
+    /// shell's `-zsh`).
     pub fn of_program(program: &str) -> Self {
         let name = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
-        match name.strip_suffix(".exe").unwrap_or(&name) {
+        let name = name.trim_start_matches('-');
+        match name.strip_suffix(".exe").unwrap_or(name) {
             "cmd" => Self::Cmd,
+            "fish" => Self::Fish,
             "powershell" | "pwsh" => Self::PowerShell,
             _ => Self::Posix,
         }
@@ -71,6 +85,7 @@ pub fn quote_for(path: &str, dialect: ShellDialect) -> Option<String> {
     }
     match dialect {
         ShellDialect::Posix => Some(posix_quote(path)),
+        ShellDialect::Fish => Some(fish_quote(path)),
         ShellDialect::PowerShell => Some(powershell_quote(path)),
         ShellDialect::Cmd => cmd_quote(path),
     }
@@ -192,6 +207,16 @@ mod tests {
     }
 
     #[test]
+    fn fish_escapes_backslashes_and_quotes_inside_single_quotes() {
+        // `x\';calc;#` must stay one word: no way out of the quotes.
+        assert_eq!(fish_quote(r"x\';calc;#"), r"'x\\\';calc;#'");
+        assert_eq!(fish_quote(r"my dir\"), r"'my dir\\'");
+        assert_eq!(fish_quote("it's"), r"'it\'s'");
+        assert_eq!(fish_quote("~/my docs"), "~/'my docs'");
+        assert_eq!(fish_quote("plain/path.md"), "plain/path.md");
+    }
+
+    #[test]
     fn cmd_quoting_and_refusals() {
         assert_eq!(cmd_quote(r"C:\Users\me\x.txt").as_deref(), Some(r"C:\Users\me\x.txt"));
         assert_eq!(cmd_quote("a&calc").as_deref(), Some("\"a&calc\""));
@@ -211,6 +236,9 @@ mod tests {
         assert_eq!(ShellDialect::of_program("powershell.exe"), ShellDialect::PowerShell);
         assert_eq!(ShellDialect::of_program(r"C:\Program Files\Git\bin\bash.exe"), ShellDialect::Posix);
         assert_eq!(ShellDialect::of_program("/bin/zsh"), ShellDialect::Posix);
+        assert_eq!(ShellDialect::of_program("-zsh"), ShellDialect::Posix);
+        assert_eq!(ShellDialect::of_program("/opt/homebrew/bin/fish"), ShellDialect::Fish);
+        assert_eq!(ShellDialect::of_program("-fish"), ShellDialect::Fish);
         assert_eq!(quote_for("a\x03b", ShellDialect::Posix), None);
         assert_eq!(quote_for("it's", ShellDialect::Posix).as_deref(), Some(r"'it'\''s'"));
     }

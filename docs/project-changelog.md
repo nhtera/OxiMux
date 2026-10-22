@@ -62,8 +62,8 @@ installed.
 - **Insert Path** (⌥⌘P, or the command palette): pick a file or folder under
   the terminal's directory and it is typed at the cursor, relative where it
   can be and quoted only when the shell needs it, the way that shell reads
-  it (POSIX shells, PowerShell, or `cmd`, which refuses a path it cannot
-  quote) — never with a trailing newline, and a file name holding a control
+  it (POSIX shells, fish, PowerShell, or `cmd`, which refuses a path it
+  cannot quote; read from the pane's own shell process) — never with a trailing newline, and a file name holding a control
   character is never offered.
 - **Read-only terminals**: *Make Read-Only* in a terminal's right-click menu
   (or *Toggle Read-Only Terminal* in the palette) stops every input path —

@@ -13,13 +13,27 @@ impl TerminalView {
     /// `false` (nothing typed) for a path that cannot be typed safely there: a
     /// control byte (it would act, not appear), or what `cmd` cannot quote.
     pub fn insert_path(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
-        let shown = path_for_insertion(path, self.live_cwd().as_deref(), dirs::home_dir().as_deref());
-        let dialect = ShellDialect::of_program(&super::spawn_settings::spawn_shell_program());
+        let dialect = self.shell_dialect();
+        // `cmd` has no `~`: a home-relative path would name nothing there.
+        let home = (dialect != ShellDialect::Cmd).then(dirs::home_dir).flatten();
+        let shown = path_for_insertion(path, self.live_cwd().as_deref(), home.as_deref());
         let Some(quoted) = quote_for(&shown, dialect) else {
             return false;
         };
         self.send_as_paste(&quoted, false, cx);
         true
+    }
+
+    /// How this pane's shell reads a typed word — from its own process, since
+    /// the shell setting may have changed since it spawned; the setting only
+    /// when the process cannot be read.
+    fn shell_dialect(&self) -> ShellDialect {
+        let own = self.os_pid().and_then(|pid| {
+            oximux_proc_tree::argv_of_pid(pid)
+                .and_then(|argv| argv.into_iter().next())
+                .or_else(|| oximux_proc_tree::process(pid).map(|p| p.name))
+        });
+        ShellDialect::of_program(&own.unwrap_or_else(super::spawn_settings::spawn_shell_program))
     }
 
     /// The shell's directory now: its OSC 7 report, else the OS's answer for

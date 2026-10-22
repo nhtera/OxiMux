@@ -18,6 +18,9 @@ use super::*;
 struct LostBackend {
     lost: Arc<AtomicBool>,
     reported: bool,
+    /// The daemon PTY id it reports. Unique per test that reads the process-
+    /// wide lock set, which parallel tests would otherwise share.
+    pty: &'static str,
 }
 
 impl TerminalBackend for LostBackend {
@@ -25,7 +28,7 @@ impl TerminalBackend for LostBackend {
         anyhow::bail!("not used")
     }
     fn external_id_of(&self, _id: TerminalSessionId) -> Option<String> {
-        Some("pty-gone".into())
+        Some(self.pty.into())
     }
     fn write(&mut self, _id: TerminalSessionId, _bytes: &[u8]) -> anyhow::Result<()> {
         Ok(())
@@ -57,6 +60,7 @@ async fn a_session_lost_with_its_daemon_is_marked_and_never_clean_exits(cx: &mut
     let backend: SharedBackend = Arc::new(std::sync::Mutex::new(Box::new(LostBackend {
         lost: Arc::clone(&lost),
         reported: false,
+        pty: "pty-gone",
     })));
     let window = cx.add_window(|win, cx| {
         TerminalView::mount_background(
@@ -109,6 +113,7 @@ async fn without_a_relay_a_lost_shell_stays_lost(cx: &mut TestAppContext) {
     let backend: SharedBackend = Arc::new(std::sync::Mutex::new(Box::new(LostBackend {
         lost,
         reported: false,
+        pty: "pty-gone",
     })));
     let window = cx.add_window(|win, cx| {
         TerminalView::mount_background(
@@ -143,6 +148,7 @@ async fn an_already_exited_pane_is_not_marked_lost(cx: &mut TestAppContext) {
     let backend: SharedBackend = Arc::new(std::sync::Mutex::new(Box::new(LostBackend {
         lost: Arc::clone(&lost),
         reported: false,
+        pty: "pty-gone",
     })));
     let window = cx.add_window(|win, cx| {
         TerminalView::mount_background(
@@ -188,14 +194,15 @@ async fn adopting_a_session_locks_its_pty_when_the_terminal_is_locked(cx: &mut T
         )
     });
     locks::set("tab-lock-adopt", None, true);
-    assert!(!pty_is_locked(&shared_locked_ptys(), "pty-gone"));
+    assert!(!pty_is_locked(&shared_locked_ptys(), "pty-lock-adopt"));
     let live: SharedBackend = Arc::new(std::sync::Mutex::new(Box::new(LostBackend {
         lost: Arc::new(AtomicBool::new(false)),
         reported: false,
+        pty: "pty-lock-adopt",
     })));
     window
         .update(cx, |v, _w, cx| assert!(v.adopt_live_session(live, TerminalSessionId(1), cx)))
         .unwrap();
-    assert!(pty_is_locked(&shared_locked_ptys(), "pty-gone"), "the adopted PTY is locked");
-    locks::set("tab-lock-adopt", Some("pty-gone"), false);
+    assert!(pty_is_locked(&shared_locked_ptys(), "pty-lock-adopt"), "the adopted PTY is locked");
+    locks::set("tab-lock-adopt", Some("pty-lock-adopt"), false);
 }

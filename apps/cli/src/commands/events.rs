@@ -118,6 +118,18 @@ enum Step {
     Done(Result<(Value, String), Failure>),
 }
 
+/// A draft chat's placeholder id (`agent-3`) — the only kind that is ever
+/// re-keyed. A real id that disappears has ended, whatever appears with it.
+fn is_placeholder(id: &str) -> bool {
+    id.strip_prefix("agent-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether this process holds an agent-scoped credential — the same reading
+/// the connection itself makes (an empty value is the operator).
+pub(crate) fn agent_scoped() -> bool {
+    std::env::var(oximux_remote_local::SESSION_ENV_VAR).is_ok_and(|v| !v.trim().is_empty())
+}
+
 /// How long after a session appears it can still be the new id of a watched
 /// one that disappears.
 const REKEY_WINDOW: Duration = Duration::from_secs(5);
@@ -154,6 +166,7 @@ impl Stream {
         let ids: BTreeSet<String> = rows.iter().map(|s| s.session_id.clone()).collect();
         let added: Vec<String> = ids.difference(&self.all).cloned().collect();
         if let Some(id) = self.only.clone()
+            && is_placeholder(&id)
             && self.current.contains_key(&id)
             && !ids.contains(&id)
             && let Some(next) = self.successor(&ids, &added, now)
@@ -258,8 +271,7 @@ pub async fn run(
     if let Some(id) = &stream.only
         && !stream.current.contains_key(id)
     {
-        let scoped = std::env::var_os(oximux_remote_local::SESSION_ENV_VAR).is_some();
-        return Err(rpc_failure(if scoped {
+        return Err(rpc_failure(if agent_scoped() {
             oximux_remote_proto::proto::RpcError::Unauthorized
         } else {
             oximux_remote_proto::proto::RpcError::UnknownSession
@@ -362,6 +374,19 @@ mod tests {
         let mut s = stream(Some("agent-3"), vec![row("agent-3", "d", false)], t0);
         let two = vec![row("x-uuid", "d", false), row("y-uuid", "d", false)];
         assert!(matches!(s.apply(two, t0), Step::Done(Err(_))));
+    }
+
+    #[test]
+    fn a_real_id_that_disappears_has_ended_whatever_appears_with_it() {
+        let t0 = Instant::now();
+        let a = "1f3a9c00-1234-4abc-9def-0123456789ab";
+        let mut s = stream(Some(a), vec![row(a, "task", false)], t0);
+        let replaced = vec![row("77aa0000-1234-4abc-9def-0123456789ab", "next", true)];
+        let Step::Done(Err(failure)) = s.apply(replaced, t0) else {
+            panic!("a closed session is not followed onto a new one");
+        };
+        assert_eq!(failure.code, "session-gone");
+        assert!(is_placeholder("agent-12") && !is_placeholder("agent-") && !is_placeholder("agent-x1"));
     }
 
     #[test]
