@@ -78,7 +78,7 @@ impl WorkspaceRoot {
         }
         let Some(root) = view
             .read(cx)
-            .cwd_hint()
+            .live_cwd()
             .or_else(|| self.active_project_panes().map(|p| p.read(cx).cwd().clone()))
         else {
             return;
