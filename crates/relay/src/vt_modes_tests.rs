@@ -182,3 +182,24 @@ fn the_postamble_turns_off_what_the_body_left_on() {
     let post = String::from_utf8(postamble(&body, &live)).unwrap();
     assert!(post.contains("\x1b[?1049l") && post.contains("\x1b[?2004l"), "{post:?}");
 }
+
+#[test]
+fn the_sequence_in_flight_is_located_by_its_esc() {
+    let mut t = ModeTracker::new();
+    t.feed(b"abc");
+    assert_eq!(t.seq_start(), None);
+    t.feed(b"\x1b[3");
+    assert_eq!(t.seq_start(), Some(3));
+    t.feed(b"1mxy");
+    assert_eq!(t.seq_start(), None, "finished");
+    // An OSC's start stays put across an ESC inside the string...
+    t.feed(b"\x1b]0;title");
+    assert_eq!(t.seq_start(), Some(10));
+    t.feed(b"\x1b");
+    assert_eq!(t.seq_start(), Some(10));
+    t.feed(b"\\");
+    assert_eq!(t.seq_start(), None);
+    // ...and a new ESC inside a CSI starts a new sequence.
+    t.feed(b"\x1b[1\x1b[");
+    assert_eq!(t.seq_start(), Some(t.offset() - 2));
+}

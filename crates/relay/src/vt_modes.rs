@@ -146,6 +146,10 @@ pub struct ModeTracker {
     alt_entry_end: Option<u64>,
     /// Stream offset of the next byte fed.
     offset: u64,
+    /// Stream offset of the ESC that began the sequence still in flight, or
+    /// `None` between sequences. The stream can end mid-sequence (output is
+    /// read in arbitrary chunks); a replay keeps such a tail last.
+    seq_start: Option<u64>,
 }
 
 impl ModeTracker {
@@ -167,6 +171,11 @@ impl ModeTracker {
     /// start offset given to [`starting_at`](Self::starting_at)).
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Where the escape sequence the stream currently ends inside began.
+    pub fn seq_start(&self) -> Option<u64> {
+        self.seq_start
     }
 
     /// A tracker whose first byte sits at stream offset `offset`.
@@ -197,6 +206,19 @@ impl ModeTracker {
     }
 
     fn step(&mut self, b: u8) {
+        let before = self.scan;
+        self.advance(b);
+        match self.scan {
+            Scan::Ground => self.seq_start = None,
+            // A fresh ESC starts a sequence; one inside a string only ends it.
+            Scan::Esc if b == 0x1b && before != Scan::Str => {
+                self.seq_start = Some(self.offset.saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+
+    fn advance(&mut self, b: u8) {
         const ESC: u8 = 0x1b;
         self.scan = match (self.scan, b) {
             // CAN / SUB abort any sequence.
@@ -258,7 +280,7 @@ impl ModeTracker {
             // its own — as the client's parser has it.
             (Scan::StrEsc, _) => {
                 self.scan = Scan::Esc;
-                return self.step(b);
+                return self.advance(b);
             }
         };
     }

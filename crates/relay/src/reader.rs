@@ -70,6 +70,7 @@ impl ReplayLog {
             offset: self.modes.offset(),
             live: self.modes.modes().clone(),
             alt_entry_end: self.modes.alt_entry_end(),
+            seq_start: self.modes.seq_start(),
         }
     }
 }
@@ -81,6 +82,7 @@ pub(crate) struct ReplaySnapshot {
     offset: u64,
     live: crate::vt_modes::Modes,
     alt_entry_end: Option<u64>,
+    seq_start: Option<u64>,
 }
 
 impl ReplaySnapshot {
@@ -90,10 +92,23 @@ impl ReplaySnapshot {
         let body_start = if wrapped { align_start(&self.snap) } else { 0 };
         let body_start_offset = self.offset - (len - body_start) as u64;
         let evicted = self.alt_entry_end.is_some_and(|end| end <= body_start_offset);
+        // The ring may end inside an escape sequence the live stream will
+        // finish. That partial sequence goes last — after the postamble, which
+        // would otherwise land inside it (an ESC aborts a CSI and ends an OSC
+        // early, so the live remainder would print as text). Kept even when
+        // the body is dropped, for the same reason.
+        let first_offset = self.offset - len as u64;
+        let tail = match self.seq_start {
+            Some(start) if start >= first_offset && (start - first_offset) as usize >= body_start => {
+                self.snap.split_off((start - first_offset) as usize)
+            }
+            _ => Vec::new(),
+        };
         let mut bytes = if evicted { Vec::new() } else { self.snap.split_off(body_start) };
         let mut body_modes = ModeTracker::new();
         body_modes.feed(&bytes);
         bytes.extend_from_slice(&postamble(body_modes.modes(), &self.live));
+        bytes.extend_from_slice(&tail);
         Replay { bytes, alt_screen: self.live.alt_screen.is_some() }
     }
 }
@@ -337,3 +352,45 @@ fn pty_id_of(notif: &Notification) -> &str {
     }
 }
 
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    /// A log that has wrapped well past `early`, then took `tail`.
+    fn wrapped(early: &[u8], tail: &[u8]) -> ReplayLog {
+        let mut log = ReplayLog::new(64, b"");
+        log.push(early);
+        log.push(&[b'x'; 200]);
+        log.push(tail);
+        log
+    }
+
+    #[test]
+    fn a_ring_cut_inside_a_csi_keeps_the_postamble_out_of_it() {
+        // The scroll region was set long ago (evicted), and the ring now ends
+        // halfway through `ESC [ 3 1 m`.
+        let replay = wrapped(b"\x1b[5;20r", b"\nline\n\x1b[3").snapshot().build().bytes;
+        assert_eq!(replay, b"line\n\x1b7\x1b[5;20r\x1b8\x1b[3", "{:?}", String::from_utf8_lossy(&replay));
+    }
+
+    #[test]
+    fn a_ring_cut_inside_an_osc_keeps_it_whole_and_last() {
+        let replay = wrapped(b"\x1b[?1h", b"\nok\n\x1b]8;;https://exa").snapshot().build().bytes;
+        assert_eq!(replay, b"ok\n\x1b[?1h\x1b]8;;https://exa", "{:?}", String::from_utf8_lossy(&replay));
+    }
+
+    #[test]
+    fn an_evicted_alt_screen_still_ends_with_the_partial_sequence() {
+        // In the alternate screen, its entry long gone: no body, but the
+        // sequence the live stream is finishing must still come last.
+        let replay = wrapped(b"\x1b[?1049h", b"\n\x1b[2").snapshot().build().bytes;
+        assert_eq!(replay, b"\x1b[?1049h\x1b[2", "{:?}", String::from_utf8_lossy(&replay));
+    }
+
+    #[test]
+    fn a_ring_between_sequences_is_unchanged() {
+        let replay = wrapped(b"\x1b[5;20r", b"\nline\n\x1b[31mred").snapshot().build().bytes;
+        assert_eq!(replay, b"line\n\x1b[31mred\x1b7\x1b[5;20r\x1b8");
+    }
+}
