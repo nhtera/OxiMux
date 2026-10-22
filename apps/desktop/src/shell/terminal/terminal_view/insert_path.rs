@@ -4,19 +4,20 @@
 use std::path::Path;
 
 use super::*;
-use crate::shell::terminal::shell_quote::{has_control, posix_quote, powershell_quote};
+use crate::shell::terminal::shell_quote::{ShellDialect, quote_for};
 
 impl TerminalView {
     /// Type `path` at the cursor: relative to the terminal's directory when it
     /// is inside it, else under `~/` or absolute; quoted only as needed; no
-    /// trailing space or newline. `false` (nothing typed) for a path holding a
-    /// control byte — a name like that would act, not appear.
+    /// trailing space or newline, quoted the way the pane's shell reads it.
+    /// `false` (nothing typed) for a path that cannot be typed safely there: a
+    /// control byte (it would act, not appear), or what `cmd` cannot quote.
     pub fn insert_path(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
         let shown = path_for_insertion(path, self.live_cwd().as_deref(), dirs::home_dir().as_deref());
-        if has_control(&shown) {
+        let dialect = ShellDialect::of_program(&super::spawn_settings::spawn_shell_program());
+        let Some(quoted) = quote_for(&shown, dialect) else {
             return false;
-        }
-        let quoted = if cfg!(windows) { powershell_quote(&shown) } else { posix_quote(&shown) };
+        };
         self.send_as_paste(&quoted, false, cx);
         true
     }

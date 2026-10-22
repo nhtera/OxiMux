@@ -9,9 +9,15 @@
 //! v1 reports lifecycle and the permission flag only — the summary carries no
 //! turn status, so `--until idle` and friends wait on a status frame the host
 //! does not send yet. `oximux wait` covers one session in the meantime.
+//!
+//! `--session` follows a draft chat onto the agent's own id: the desktop lists
+//! a chat that has never run under a placeholder (`agent-3`) and, on its first
+//! turn, registers the agent's id and then drops the placeholder. One session
+//! appearing as the watched one disappears is that move, not an ending.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
+use std::time::{Duration, Instant};
 
 use oximux_remote_proto::messages::SessionSummary;
 use oximux_remote_proto::proto::{Request, Response};
@@ -112,39 +118,91 @@ enum Step {
     Done(Result<(Value, String), Failure>),
 }
 
-/// Diff `rows` against `current`, print the changes, and say whether the
-/// stream is over: `--until` met, stdout closed, or the one watched session
-/// gone (it cannot come back, so waiting on would never end).
-fn apply(
-    current: &mut Watched,
-    rows: Vec<SessionSummary>,
-    only: Option<&str>,
+/// How long after a session appears it can still be the new id of a watched
+/// one that disappears.
+const REKEY_WINDOW: Duration = Duration::from_secs(5);
+
+/// The stream's state from one list to the next.
+struct Stream {
+    current: Watched,
+    /// `--session`; moves with a re-keyed draft (see the module docs).
+    only: Option<String>,
     until: Option<EventsUntil>,
     json_mode: bool,
-) -> Step {
-    let next = watched(rows, only);
-    for (kind, s) in diff(current, &next) {
-        if !emit(kind, &s, json_mode) {
-            // Whoever read the stream has stopped (`events | head -1`). No
-            // result line either: it would only hit the same closed pipe.
-            std::process::exit(exit::OK.into());
-        }
-        if kind == Kind::Removed && only.is_some() {
-            let id = s.session_id.clone();
-            return Step::Done(Err(Failure::new(
-                "session-gone",
-                exit::ERROR,
-                format!("session {id} ended"),
-            )
-            .with_data(json!({ "session": id }))));
+    /// Every id in the last list, watched or not.
+    all: BTreeSet<String>,
+    /// The ids that last appeared, and when.
+    last_added: Option<(Instant, Vec<String>)>,
+}
+
+impl Stream {
+    fn new(only: Option<&str>, until: Option<EventsUntil>, json_mode: bool) -> Self {
+        Self {
+            current: Watched::new(),
+            only: only.map(str::to_owned),
+            until,
+            json_mode,
+            all: BTreeSet::new(),
+            last_added: None,
         }
     }
-    *current = next;
-    // Checked against the state already in force too: waiting for a state
-    // the session is in now returns at once, as `oximux wait` does.
-    match met(until, current) {
-        Some(session) => Step::Done(Ok(reached(session))),
-        None => Step::Continue,
+
+    /// Diff `rows` against the last list, print the changes, and say whether
+    /// the stream is over: `--until` met, stdout closed, or the one watched
+    /// session gone (it cannot come back, so waiting on would never end).
+    fn apply(&mut self, rows: Vec<SessionSummary>, now: Instant) -> Step {
+        let ids: BTreeSet<String> = rows.iter().map(|s| s.session_id.clone()).collect();
+        let added: Vec<String> = ids.difference(&self.all).cloned().collect();
+        if let Some(id) = self.only.clone()
+            && self.current.contains_key(&id)
+            && !ids.contains(&id)
+            && let Some(next) = self.successor(&ids, &added, now)
+        {
+            self.only = Some(next);
+        }
+        let next = watched(rows, self.only.as_deref());
+        for (kind, s) in diff(&self.current, &next) {
+            if !emit(kind, &s, self.json_mode) {
+                // Whoever read the stream has stopped (`events | head -1`). No
+                // result line either: it would only hit the same closed pipe.
+                std::process::exit(exit::OK.into());
+            }
+            if kind == Kind::Removed && self.only.as_deref() == Some(s.session_id.as_str()) {
+                let id = s.session_id.clone();
+                return Step::Done(Err(Failure::new(
+                    "session-gone",
+                    exit::ERROR,
+                    format!("session {id} ended"),
+                )
+                .with_data(json!({ "session": id }))));
+            }
+        }
+        self.current = next;
+        self.all = ids;
+        if !added.is_empty() {
+            self.last_added = Some((now, added));
+        }
+        // Checked against the state already in force too: waiting for a state
+        // the session is in now returns at once, as `oximux wait` does.
+        match met(self.until, &self.current) {
+            Some(session) => Step::Done(Ok(reached(session))),
+            None => Step::Continue,
+        }
+    }
+
+    /// The one session that appeared with the watched one's disappearance —
+    /// in this list, or one just before it — if there is exactly one.
+    fn successor(&self, ids: &BTreeSet<String>, added: &[String], now: Instant) -> Option<String> {
+        let mut candidates: BTreeSet<&String> = added.iter().collect();
+        if let Some((at, earlier)) = &self.last_added
+            && now.duration_since(*at) <= REKEY_WINDOW
+        {
+            candidates.extend(earlier.iter().filter(|id| ids.contains(*id)));
+        }
+        match candidates.into_iter().collect::<Vec<_>>().as_slice() {
+            [one] => Some((*one).clone()),
+            _ => None,
+        }
     }
 }
 
@@ -188,11 +246,24 @@ pub async fn run(
 
     // The sessions already open come first, as `added`, so a consumer starts
     // from the same picture as `oximux ls` without a second call.
-    let mut current = Watched::new();
+    let mut stream = Stream::new(only, until, json_mode);
     for rows in std::iter::once(initial).chain(early) {
-        if let Step::Done(outcome) = apply(&mut current, rows, only, until, json_mode) {
+        if let Step::Done(outcome) = stream.apply(rows, Instant::now()) {
             return outcome;
         }
+    }
+    // A session that is not there to begin with is never coming: say so now
+    // rather than wait forever. A caller scoped to one session hears "not
+    // yours", with the host's own hint.
+    if let Some(id) = &stream.only
+        && !stream.current.contains_key(id)
+    {
+        let scoped = std::env::var_os(oximux_remote_local::SESSION_ENV_VAR).is_some();
+        return Err(rpc_failure(if scoped {
+            oximux_remote_proto::proto::RpcError::Unauthorized
+        } else {
+            oximux_remote_proto::proto::RpcError::UnknownSession
+        }));
     }
 
     // One Ctrl+C listener for the whole stream, so a press between two frames
@@ -212,7 +283,7 @@ pub async fn run(
             }
             continue;
         };
-        if let Step::Done(outcome) = apply(&mut current, rows, only, until, json_mode) {
+        if let Step::Done(outcome) = stream.apply(rows, Instant::now()) {
             return outcome;
         }
     }
@@ -254,17 +325,43 @@ mod tests {
         assert!(diff(&before, &watched(vec![moved], None)).is_empty());
     }
 
+    fn stream(only: Option<&str>, rows: Vec<SessionSummary>, at: Instant) -> Stream {
+        let mut stream = Stream::new(only, None, true);
+        assert!(matches!(stream.apply(rows, at), Step::Continue));
+        stream
+    }
+
     #[test]
     fn the_watched_session_ending_ends_the_stream() {
-        let mut current = watched(vec![row("b", "two", false)], Some("b"));
-        let Step::Done(Err(failure)) = apply(&mut current, vec![row("a", "one", false)], Some("b"), None, true)
-        else {
+        let t0 = Instant::now();
+        let mut s = stream(Some("b"), vec![row("a", "one", false), row("b", "two", false)], t0);
+        let Step::Done(Err(failure)) = s.apply(vec![row("a", "one", false)], t0 + REKEY_WINDOW * 2) else {
             panic!("a watched session that is gone cannot be waited on");
         };
         assert_eq!((failure.code, failure.exit), ("session-gone", exit::ERROR));
         // Watching everything, one session ending is just a line.
-        let mut all = watched(vec![row("b", "two", false)], None);
-        assert!(matches!(apply(&mut all, vec![], None, None, true), Step::Continue));
+        let mut all = stream(None, vec![row("b", "two", false)], t0);
+        assert!(matches!(all.apply(vec![], t0), Step::Continue));
+    }
+
+    #[test]
+    fn a_draft_moving_to_the_agents_id_is_followed() {
+        let t0 = Instant::now();
+        // In one list: the placeholder goes, the agent's id arrives.
+        let mut s = stream(Some("agent-1"), vec![row("agent-1", "draft", false)], t0);
+        assert!(matches!(s.apply(vec![row("1f3a-uuid", "draft", false)], t0), Step::Continue));
+        assert_eq!(s.only.as_deref(), Some("1f3a-uuid"));
+        // Across two lists: registered first, the placeholder dropped next.
+        let mut s = stream(Some("agent-2"), vec![row("agent-2", "draft", false)], t0);
+        let both = vec![row("agent-2", "draft", false), row("77aa-uuid", "draft", false)];
+        assert!(matches!(s.apply(both, t0), Step::Continue));
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(matches!(s.apply(vec![row("77aa-uuid", "draft", true)], t1), Step::Continue));
+        assert_eq!(s.only.as_deref(), Some("77aa-uuid"));
+        // Two sessions appearing at once: no way to tell, so it ended.
+        let mut s = stream(Some("agent-3"), vec![row("agent-3", "d", false)], t0);
+        let two = vec![row("x-uuid", "d", false), row("y-uuid", "d", false)];
+        assert!(matches!(s.apply(two, t0), Step::Done(Err(_))));
     }
 
     #[test]

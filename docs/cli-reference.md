@@ -18,7 +18,7 @@ differs from what is committed.
 | 5 | `access_denied` | The caller is not allowed to do this. Retrying will not help. |
 | 6 | `data_dir_held` | `serve` only: another host already holds the data directory. Do not restart on it. |
 | 7 | `pending_user` | Waiting on a person (a `sim` verb before the user allowed agents on the device). Wait, then retry. |
-| 8 | `target_not_found` | No session or terminal has that id, or the prefix matches more than one (the candidates go to stderr). Nothing was sent. |
+| 8 | `target_not_found` | A short id or prefix matched no session or terminal, or matched several (the candidates go to stderr). Nothing was sent. A full UUID the host does not know exits 1. |
 | 130 | `interrupted` | Stopped with Ctrl+C (a streaming verb such as `events`). |
 
 ## Conventions

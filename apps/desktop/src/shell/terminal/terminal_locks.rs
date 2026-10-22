@@ -102,14 +102,18 @@ pub fn set(tab_id: &str, pty_id: Option<&str>, locked: bool) {
     }
 }
 
-/// A locked terminal now runs on `pty_id` (a restore re-attached it, or a
-/// respawn replaced it): lock that PTY for remote input too.
+/// The terminal `tab_id` now runs on `pty_id` (a restore re-attached it, or a
+/// respawn replaced it): remote input to that PTY follows the tab's lock. An
+/// unlocked tab also clears a lock the PTY carried from before — the saved
+/// list outlives a tab that came back with a fresh id (an agent tab), or one
+/// unlocked before its PTY was known, and must not keep refusing remote input
+/// to a terminal the window shows as unlocked.
 pub fn bind_pty(tab_id: &str, pty_id: &str) {
-    if is_locked(tab_id) {
-        let mut ptys = locks().ptys.write().unwrap_or_else(|p| p.into_inner());
-        if ptys.insert(pty_id.to_owned()) {
-            save(&ptys);
-        }
+    let locked = is_locked(tab_id);
+    let mut ptys = locks().ptys.write().unwrap_or_else(|p| p.into_inner());
+    let changed = if locked { ptys.insert(pty_id.to_owned()) } else { ptys.remove(pty_id) };
+    if changed {
+        save(&ptys);
     }
 }
 
@@ -132,9 +136,13 @@ mod tests {
         // Restored onto a new PTY: that one is locked too.
         bind_pty("locks-test-tab", "locks-test-pty-b");
         assert!(pty_is_locked(&ptys, "locks-test-pty-b"));
-        // An unlocked tab binds nothing.
+        // An unlocked tab binds nothing, and clears a lock its PTY carried
+        // from an earlier run (the saved list) that this tab no longer has.
         bind_pty("locks-test-other", "locks-test-pty-c");
         assert!(!pty_is_locked(&ptys, "locks-test-pty-c"));
+        ptys.write().unwrap().insert("locks-test-pty-stale".into());
+        bind_pty("locks-test-other", "locks-test-pty-stale");
+        assert!(!pty_is_locked(&ptys, "locks-test-pty-stale"));
         set("locks-test-tab", Some("locks-test-pty-b"), false);
         assert!(!is_locked("locks-test-tab"));
         assert!(!pty_is_locked(&ptys, "locks-test-pty-b"));

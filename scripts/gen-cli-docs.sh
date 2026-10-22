@@ -104,7 +104,7 @@ printf '%s' "$DUMP" | jq -r '
   + "| " + (.exit_codes.access_denied | tostring) + " | `access_denied` | The caller is not allowed to do this. Retrying will not help. |\n"
   + "| " + (.exit_codes.data_dir_held | tostring) + " | `data_dir_held` | `serve` only: another host already holds the data directory. Do not restart on it. |\n"
   + "| " + (.exit_codes.pending_user | tostring) + " | `pending_user` | Waiting on a person (a `sim` verb before the user allowed agents on the device). Wait, then retry. |\n"
-  + "| " + (.exit_codes.target_not_found | tostring) + " | `target_not_found` | No session or terminal has that id, or the prefix matches more than one (the candidates go to stderr). Nothing was sent. |\n"
+  + "| " + (.exit_codes.target_not_found | tostring) + " | `target_not_found` | A short id or prefix matched no session or terminal, or matched several (the candidates go to stderr). Nothing was sent. A full UUID the host does not know exits 1. |\n"
   + "| " + (.exit_codes.interrupted | tostring) + " | `interrupted` | Stopped with Ctrl+C (a streaming verb such as `events`). |\n"
   + "\n"
   + "## Conventions\n"

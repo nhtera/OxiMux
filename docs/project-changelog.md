@@ -61,8 +61,10 @@ installed.
 
 - **Insert Path** (⌥⌘P, or the command palette): pick a file or folder under
   the terminal's directory and it is typed at the cursor, relative where it
-  can be and quoted only when the shell needs it — never with a trailing
-  newline, and a file name holding a control character is never offered.
+  can be and quoted only when the shell needs it, the way that shell reads
+  it (POSIX shells, PowerShell, or `cmd`, which refuses a path it cannot
+  quote) — never with a trailing newline, and a file name holding a control
+  character is never offered.
 - **Read-only terminals**: *Make Read-Only* in a terminal's right-click menu
   (or *Toggle Read-Only Terminal* in the palette) stops every input path —
   keys, paste, dictation, mouse reports, and a paired phone or `oximux term
@@ -81,7 +83,8 @@ installed.
 - **`oximux events [--session S] [--until awaiting-permission]`** streams one
   line per session added, removed or changed (NDJSON with `--json`). Ctrl+C
   exits 130; `--until` exits 0 once a session waits for a decision; with
-  `--session`, the stream ends (exit 1) when that session does. Turn status
+  `--session`, an unknown id exits 1 at once, the stream ends (exit 1) when
+  that session does, and a draft chat is followed onto the agent's own id. Turn status
   (`--until idle` across sessions) is not in this version.
 - **Short ids.** Every session or terminal UUID takes a unique prefix of 4+
   characters; other ids (`agent-3`) must be given in full. **Behavior

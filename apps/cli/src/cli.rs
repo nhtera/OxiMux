@@ -31,8 +31,9 @@ pub mod exit {
     /// `serve` only: another host already holds the data directory. A
     /// supervisor must not restart on it (the incumbent is healthy).
     pub const HELD: u8 = crate::serve::EXIT_HELD_BY_ANOTHER_HOST;
-    /// A session or terminal id matched nothing, or a prefix matched several.
-    /// Decided before anything was sent to the host.
+    /// A short id or prefix matched no session or terminal, or matched
+    /// several. Decided before anything was sent; a full UUID the host does
+    /// not know is the host's answer (1) instead.
     pub const TARGET: u8 = 8;
     /// Stopped with Ctrl+C (128 + SIGINT, the shell convention).
     pub const INTERRUPTED: u8 = 130;
@@ -47,7 +48,7 @@ pub mod exit {
 ///
 /// Exit codes: 0 ok · 1 error · 2 usage · 3 host unreachable · 4 timed out ·
 /// 5 access denied · 6 data dir held (`serve`) · 7 waiting for the user
-/// (`sim` consent) · 8 no such target, or an ambiguous id prefix ·
+/// (`sim` consent) · 8 a short id or prefix matched nothing, or several ·
 /// 130 interrupted (Ctrl+C).
 #[derive(Parser, Debug)]
 #[command(name = "oximux", version, about, verbatim_doc_comment)]
@@ -283,8 +284,11 @@ pub enum Command {
     /// Ctrl+C (exit 130), or until `--until` is met (exit 0).
     ///
     /// With --json each line is one NDJSON object:
-    ///   {"ts","kind":"added|removed|changed","session","title","awaiting_permission"}
+    ///   {"ts","kind":"added|removed|changed","session","title","model","awaiting_permission"}
     /// The sessions already open are reported first, as `added`.
+    /// With --session, an id that is not listed exits at once (1); the
+    /// stream ends (1) when that session does, and follows a draft chat
+    /// onto the agent's own id after its first turn.
     #[command(verbatim_doc_comment)]
     Events {
         /// Only this session (its id, or a unique prefix of it).

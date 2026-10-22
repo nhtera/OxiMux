@@ -111,10 +111,14 @@ impl WorkspaceRoot {
                     crate::shell::toast::toast(
                         cx,
                         crate::shell::toast::ToastKind::Warning,
-                        "That path holds a control character and cannot be typed safely.",
+                        "That path cannot be typed safely in this shell.",
                     );
                 }
             }
+            // A close that lands after the palette was opened again (⌥⌘P over
+            // an open palette closes it, then reopens) is stale: the new
+            // picker owns the target and the focus.
+            PaletteEvent::Closed if self.palette.read(cx).is_open() => {}
             PaletteEvent::Closed => match self.palette_terminal.take().and_then(|v| v.upgrade()) {
                 Some(view) => {
                     let handle = gpui::Focusable::focus_handle(view.read(cx), cx);
