@@ -71,6 +71,27 @@ installed.
   (an agent's terminal comes back unlocked). Not covered: a headless `oximux serve`, or a process writing to the
   terminal daemon's socket directly.
 
+**CLI: type into terminals, stream session changes, short ids**
+
+- **`oximux term send <pty> [TEXT] [--keys …] [--stdin] [--enter]`** types
+  into a terminal without attaching. Named keys (`up`, `esc`, `f5`,
+  `ctrl-c`, `alt-b`, …); `--app-cursor` for full-screen programs. A terminal
+  locked read-only on the desktop exits 5. `term attach` on a locked terminal
+  keeps showing it and says it is watch-only.
+- **`oximux events [--session S] [--until awaiting-permission]`** streams one
+  line per session added, removed or changed (NDJSON with `--json`). Ctrl+C
+  exits 130; `--until` exits 0 once a session waits for a decision; with
+  `--session`, the stream ends (exit 1) when that session does. Turn status
+  (`--until idle` across sessions) is not in this version.
+- **Short ids.** Every session or terminal UUID takes a unique prefix of 4+
+  characters; other ids (`agent-3`) must be given in full. **Behavior
+  change:** an id that is not a full UUID and matches nothing, or a prefix
+  matching several, now exits **8** instead of 1, with the candidates on
+  stderr. A full UUID unknown to the host still exits 1, and an agent-scoped
+  caller still gets the host's answer (exit 5 for another session).
+- The published exit table now lists 6 (`serve`: data directory held), 8 and
+  130.
+
 **Lighter on idle terminals**
 
 - **Idle terminals cost almost nothing.** The terminal daemon no longer wakes

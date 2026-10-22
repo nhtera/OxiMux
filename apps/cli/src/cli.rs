@@ -28,6 +28,14 @@ pub mod exit {
     /// (7, not 6: `serve` already exits 6 when another host holds the data
     /// directory.)
     pub const PENDING: u8 = 7;
+    /// `serve` only: another host already holds the data directory. A
+    /// supervisor must not restart on it (the incumbent is healthy).
+    pub const HELD: u8 = crate::serve::EXIT_HELD_BY_ANOTHER_HOST;
+    /// A session or terminal id matched nothing, or a prefix matched several.
+    /// Decided before anything was sent to the host.
+    pub const TARGET: u8 = 8;
+    /// Stopped with Ctrl+C (128 + SIGINT, the shell convention).
+    pub const INTERRUPTED: u8 = 130;
 }
 
 /// Drive a running OxiMux host from the command line.
@@ -38,7 +46,9 @@ pub mod exit {
 /// it, not when the agent finishes — watch the session for completion.
 ///
 /// Exit codes: 0 ok · 1 error · 2 usage · 3 host unreachable · 4 timed out ·
-/// 5 access denied · 7 waiting for the user (`sim` consent).
+/// 5 access denied · 6 data dir held (`serve`) · 7 waiting for the user
+/// (`sim` consent) · 8 no such target, or an ambiguous id prefix ·
+/// 130 interrupted (Ctrl+C).
 #[derive(Parser, Debug)]
 #[command(name = "oximux", version, about, verbatim_doc_comment)]
 pub struct Cli {
@@ -156,7 +166,7 @@ pub enum Command {
     /// `— resynced —` marker is printed rather than losing events silently.
     #[command(verbatim_doc_comment)]
     Attach {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// Replay retained events after this sequence number first
         /// (default: attach at the live edge).
@@ -176,7 +186,7 @@ pub enum Command {
     /// a turn parked on a permission request ends only when something decides.
     #[command(verbatim_doc_comment)]
     Send {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The prompt to send, or `-` to read it from stdin.
         prompt: String,
@@ -214,7 +224,7 @@ pub enum Command {
     /// `--stalled-after` to bound PROGRESS as well, and the two are told apart.
     #[command(verbatim_doc_comment)]
     Wait {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The state to wait for.
         #[arg(long, value_enum)]
@@ -226,19 +236,19 @@ pub enum Command {
     },
     /// Fetch a session's full transcript (paged under the hood).
     Transcript {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
     },
     /// Interrupt a session's in-flight turn. The session stays open.
     Stop {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
     },
     /// Redirect a mid-turn agent with additional guidance. Needs a backend with a
     /// mid-turn message queue; claude and codex have none and refuse it, so on those
     /// use `stop` and then `send`
     Steer {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The guidance to inject.
         text: String,
@@ -267,6 +277,22 @@ pub enum Command {
     Term {
         #[command(subcommand)]
         command: TermCommand,
+    },
+    /// Stream session changes as they happen: one line per session added,
+    /// removed, or changed (title, model, waiting for permission). Runs until
+    /// Ctrl+C (exit 130), or until `--until` is met (exit 0).
+    ///
+    /// With --json each line is one NDJSON object:
+    ///   {"ts","kind":"added|removed|changed","session","title","awaiting_permission"}
+    /// The sessions already open are reported first, as `added`.
+    #[command(verbatim_doc_comment)]
+    Events {
+        /// Only this session (its id, or a unique prefix of it).
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Exit 0 as soon as a watched session reaches this state.
+        #[arg(long, value_enum, value_name = "STATE")]
+        until: Option<EventsUntil>,
     },
     /// Install, remove, and inspect the status hooks that let agent CLIs
     /// report what they are doing.
@@ -501,7 +527,7 @@ pub enum WaitUntil {
 pub enum PermitCommand {
     /// List a session's pending permission requests and questions.
     Ls {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
     },
     /// Approve a pending permission request.
@@ -512,7 +538,7 @@ pub enum PermitCommand {
     /// narrow an over-broad command rather than denying and re-prompting.
     #[command(verbatim_doc_comment)]
     Allow {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The request id (from `permit ls`; default: the latest pending).
         request: Option<String>,
@@ -531,7 +557,7 @@ pub enum PermitCommand {
     },
     /// Deny a pending permission request.
     Deny {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The request id (from `permit ls`; default: the latest pending).
         request: Option<String>,
@@ -546,7 +572,7 @@ pub enum PermitCommand {
     /// option number, or free text.
     #[command(verbatim_doc_comment)]
     Answer {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The request id (from `permit ls`; default: the latest pending).
         request: Option<String>,
@@ -560,13 +586,13 @@ pub enum PermitCommand {
 pub enum ModelCommand {
     /// List the models (and modes) the session's backend offers.
     Ls {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
     },
     /// Switch the session's model. May be refused by backends that fix the
     /// model at spawn when no desktop view can respawn the child.
     Set {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The model id (from `model ls`).
         model: String,
@@ -577,7 +603,7 @@ pub enum ModelCommand {
 pub enum ModeCommand {
     /// Switch the session's permission mode (ids from `model ls`).
     Set {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The mode id (from `model ls`).
         mode: String,
@@ -588,12 +614,12 @@ pub enum ModeCommand {
 pub enum GitCommand {
     /// Working-tree status of the session's repository.
     Status {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
     },
     /// Diff one path (as listed by `git status`).
     Diff {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// Repository-relative path, as `git status` listed it.
         path: String,
@@ -606,7 +632,7 @@ pub enum GitCommand {
     },
     /// Stage paths into the index.
     Stage {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// Repository-relative paths, as `git status` listed them.
         #[arg(required = true)]
@@ -614,7 +640,7 @@ pub enum GitCommand {
     },
     /// Remove paths from the index, leaving the worktree untouched.
     Unstage {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// Repository-relative paths, as `git status` listed them.
         #[arg(required = true)]
@@ -622,7 +648,7 @@ pub enum GitCommand {
     },
     /// Commit what is already staged.
     Commit {
-        /// The session id (see `oximux ls`).
+        /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
         /// The commit message.
         #[arg(short, long)]
@@ -638,9 +664,44 @@ pub enum TermCommand {
     /// Ctrl+] detaches; the terminal keeps running.
     #[command(verbatim_doc_comment)]
     Attach {
-        /// The terminal id (see `term ls`).
+        /// The terminal id, or a unique prefix of it (see `term ls`).
         pty: String,
     },
+    /// Type into a terminal without attaching: text first, then `--keys`,
+    /// then Enter if `--enter`. Nothing is added — no newline unless asked.
+    ///
+    /// Arrow, Home and End keys are sent in normal cursor mode; pass
+    /// `--app-cursor` for a full-screen program that switched to application
+    /// cursor mode (most editors and pagers do).
+    #[command(verbatim_doc_comment)]
+    Send {
+        /// The terminal id, or a unique prefix of it (see `term ls`).
+        pty: String,
+        /// Text to type, exactly as given.
+        text: Option<String>,
+        /// Named keys to press after the text, in order. Repeatable, or
+        /// comma-separated: `--keys up,up,enter`. Names: enter, tab, esc,
+        /// backspace, space, up, down, left, right, home, end, pgup, pgdn,
+        /// insert, delete, f1-f12, ctrl-<a-z>, alt-<char> (any but a comma).
+        #[arg(long, value_name = "KEY", value_delimiter = ',')]
+        keys: Vec<String>,
+        /// Read the text to type from stdin instead of the argument.
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
+        /// Press Enter after everything else.
+        #[arg(long)]
+        enter: bool,
+        /// Send cursor keys in application mode (`ESC O A` rather than `ESC [ A`).
+        #[arg(long)]
+        app_cursor: bool,
+    },
+}
+
+/// When `oximux events` stops on its own.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventsUntil {
+    /// A watched session is waiting for a permission decision or an answer.
+    AwaitingPermission,
 }
 
 #[derive(Subcommand, Debug)]

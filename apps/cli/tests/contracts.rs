@@ -67,17 +67,31 @@ fn the_exit_codes_are_the_numbers_scripts_branch_on() {
     assert_eq!(codes["host_unreachable"], 3);
     assert_eq!(codes["timeout"], 4);
     assert_eq!(codes["access_denied"], 5);
-    // Not 6: `serve` already exits 6 when another host holds the data dir.
+    // `serve` only: another host holds the data dir. Why `pending_user` is 7.
+    assert_eq!(codes["data_dir_held"], 6);
     assert_eq!(codes["pending_user"], 7);
+    assert_eq!(codes["target_not_found"], 8);
+    assert_eq!(codes["interrupted"], 130);
 
-    // And the dump names exactly these seven — one nobody documented, or a
+    // And the dump names exactly these ten — one nobody documented, or a
     // renamed key, both break a caller reading the map by name.
     let named: Vec<&str> = codes.as_object().expect("a map").keys().map(String::as_str).collect();
     let mut sorted = named.clone();
     sorted.sort_unstable();
     assert_eq!(
         sorted,
-        ["access_denied", "error", "host_unreachable", "ok", "pending_user", "timeout", "usage"],
+        [
+            "access_denied",
+            "data_dir_held",
+            "error",
+            "host_unreachable",
+            "interrupted",
+            "ok",
+            "pending_user",
+            "target_not_found",
+            "timeout",
+            "usage",
+        ],
         "the exit-code vocabulary changed: {named:?}",
     );
 }
@@ -202,6 +216,7 @@ fn the_documented_verbs_still_exist() {
     let promised = [
         "agent-context",
         "attach",
+        "events",
         "git",
         "heartbeat",
         "hosts",

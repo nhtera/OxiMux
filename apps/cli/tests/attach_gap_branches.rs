@@ -17,7 +17,7 @@ use std::process::Command;
 
 use oximux_agent_core::thread::ThreadEvent;
 use oximux_remote_local::{LocalControlListener, generate_token};
-use oximux_remote_proto::messages::{HelloAckWire, SessionStatusWire, TranscriptPageWire};
+use oximux_remote_proto::messages::{HelloAckWire, SessionStatusWire, SessionSummary, TranscriptPageWire};
 use oximux_remote_proto::proto::{MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, Request, Response};
 use oximux_remote_proto::{HostEvent, Transport};
 
@@ -49,8 +49,9 @@ async fn recv(t: &dyn Transport) -> Option<Request> {
     Some(Request::from_bytes(&f).expect("decodable request"))
 }
 
-/// Answer the `Hello`/`Subscribe {after_seq: 0}` opening every attach makes,
-/// replying with a contiguous seqs 1–3 backlog.
+/// Answer the `Hello`/`ListSessions`/`Subscribe {after_seq: 0}` opening every
+/// attach makes, replying with a contiguous seqs 1–3 backlog. `ListSessions`
+/// is the CLI resolving `gap` (not a full id) to the session it names.
 async fn serve_opening(t: &dyn Transport) {
     match recv(t).await {
         Some(Request::Hello(_)) => {
@@ -64,6 +65,19 @@ async fn serve_opening(t: &dyn Transport) {
             .await;
         }
         other => panic!("expected Hello, got {other:?}"),
+    }
+    match recv(t).await {
+        Some(Request::ListSessions) => {
+            let row = SessionSummary {
+                session_id: "gap".into(),
+                title: "gap".into(),
+                model: None,
+                last_seq: 3,
+                awaiting_permission: false,
+            };
+            send(t, Response::Sessions(vec![row])).await;
+        }
+        other => panic!("expected ListSessions, got {other:?}"),
     }
     match recv(t).await {
         Some(Request::Subscribe { session_id, after_seq }) => {
