@@ -45,6 +45,12 @@ const SIDEBAND_MARKER: &[u8] = b"\x1b]9999";
 /// reference app's stale-after window.
 const SIDEBAND_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// How long a program-status report may come before the process scan names an
+/// agent and still count as that agent's. An agent reports right after it
+/// starts, a scan or two before it is seen; anything older was printed by
+/// something else.
+const PRE_AGENT_GRACE: Duration = Duration::from_secs(5);
+
 /// A fresh hook-derived reading for one terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AmbientSideband {
@@ -64,8 +70,11 @@ pub struct AmbientAgentScan {
     last_seen: Option<Instant>,
     /// The program's own latest root status (OSC 7501).
     /// Kept even while untrusted, so it takes effect the moment the process
-    /// scan names the agent — the first report often beats that scan.
+    /// scan names the agent — the first report often beats that scan. Only
+    /// briefly, though: see [`PRE_AGENT_GRACE`].
     program: Option<ProgramRecord>,
+    /// When `program` arrived.
+    program_at: Option<Instant>,
     /// The process tree shows an agent here; see the module docs.
     agent_present: bool,
 }
@@ -85,6 +94,7 @@ impl AmbientAgentScan {
             cached_prompt: None,
             last_seen: None,
             program: None,
+            program_at: None,
             agent_present: false,
         }
     }
@@ -153,12 +163,24 @@ impl AmbientAgentScan {
 
     /// The program's root status changed (`None`: nobody is reporting). The
     /// handshake bit is not needed here: trust comes from the process scan.
-    pub fn feed_program_status(&mut self, root: Option<ProgramRecord>) {
+    pub fn feed_program_status(&mut self, root: Option<ProgramRecord>, now: Instant) {
+        self.program_at = root.is_some().then_some(now);
         self.program = root;
     }
 
     /// Whether the process tree currently shows an agent in this terminal.
-    pub fn set_agent_present(&mut self, present: bool) {
+    /// When one appears, a report that came well before it is dropped: it was
+    /// printed by something else (a `cat` of a captured log, then the agent),
+    /// and would otherwise speak for the new agent until that agent reports —
+    /// which one that never speaks this protocol never does.
+    pub fn set_agent_present(&mut self, present: bool, now: Instant) {
+        if present
+            && !self.agent_present
+            && self.program_at.is_some_and(|at| now.saturating_duration_since(at) > PRE_AGENT_GRACE)
+        {
+            self.program = None;
+            self.program_at = None;
+        }
         self.agent_present = present;
     }
 
@@ -367,7 +389,7 @@ mod tests {
     fn program_status_in_a_plain_shell_never_registers_an_agent() {
         let mut scan = AmbientAgentScan::new();
         let now = Instant::now();
-        scan.feed_program_status(program("state=blocked:kind=permission"));
+        scan.feed_program_status(program("state=blocked:kind=permission"), now);
         assert!(scan.current(now).is_none());
         assert!(!scan.program_status_in_force());
     }
@@ -377,8 +399,8 @@ mod tests {
         let mut scan = AmbientAgentScan::new();
         let now = Instant::now();
         // The report lands first; the process scan catches up a poll later.
-        scan.feed_program_status(program("state=working"));
-        scan.set_agent_present(true);
+        scan.feed_program_status(program("state=working"), now);
+        scan.set_agent_present(true, now + Duration::from_secs(1));
         assert_eq!(scan.current(now).unwrap().status, AgentStatus::Running);
         // It outranks a hook's status, while the hook's prompt still titles it.
         scan.feed(&osc(r#"{"v":1,"state":"idle","prompt":"fix the parser"}"#), now);
@@ -386,7 +408,18 @@ mod tests {
         assert_eq!(cur.status, AgentStatus::Running);
         assert_eq!(cur.detail.prompt.as_deref(), Some("fix the parser"));
         // Released: the hook reading is back.
-        scan.feed_program_status(None);
+        scan.feed_program_status(None, now);
         assert_eq!(scan.current(now).unwrap().status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn a_report_printed_long_before_the_agent_started_does_not_speak_for_it() {
+        let mut scan = AmbientAgentScan::new();
+        let t0 = Instant::now();
+        // `cat captured.log` prints a report; minutes later an agent starts.
+        scan.feed_program_status(program("state=blocked:kind=permission"), t0);
+        scan.set_agent_present(true, t0 + PRE_AGENT_GRACE + Duration::from_secs(60));
+        assert!(!scan.program_status_in_force());
+        assert!(scan.current(t0).is_none(), "this agent has reported nothing yet");
     }
 }

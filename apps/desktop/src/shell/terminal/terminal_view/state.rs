@@ -165,7 +165,7 @@ impl TerminalView {
                 }
                 // OSC 7501: the program's own status, parsed by the backend.
                 TerminalEvent::ProgramStatus { root, .. } => {
-                    self.agent_scan.feed_program_status(root.clone());
+                    self.agent_scan.feed_program_status(root.clone(), std::time::Instant::now());
                 }
                 _ => {}
             }
@@ -387,7 +387,7 @@ impl TerminalView {
         scan.poll(std::time::Instant::now(), || self.os_pid());
         let changed = scan.current() != before;
         self.proc_scan = scan;
-        self.agent_scan.set_agent_present(self.proc_scan.current().is_some());
+        self.agent_scan.set_agent_present(self.proc_scan.current().is_some(), std::time::Instant::now());
         if changed {
             tracing::debug!(
                 agent = ?self.proc_scan.current(),

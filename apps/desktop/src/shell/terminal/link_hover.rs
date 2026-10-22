@@ -128,6 +128,15 @@ mod tests {
     }
 
     #[test]
+    fn a_redraw_under_a_resting_pointer_relabels_from_the_labels_own_cell() {
+        // What `revalidate_hover` recomputes: same text, new target, same cell.
+        let before = osc8_label(&snapshot_with("https://docs.rs/x", "https://docs.rs/x"), 0, 4).unwrap();
+        assert!(!before.warn);
+        let after = osc8_label(&snapshot_with("https://docs.rs/x", "https://evil.example/"), before.row, before.col).unwrap();
+        assert!(after.warn && after.text.starts_with("⚠ https://evil.example/"));
+    }
+
+    #[test]
     fn the_label_is_cut_to_the_room_right_of_the_link() {
         let mut snap = snapshot_with("x", &format!("https://e.com/{}", "a".repeat(200)));
         snap.cols = 40;

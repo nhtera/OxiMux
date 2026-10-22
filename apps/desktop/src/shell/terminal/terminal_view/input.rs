@@ -574,6 +574,12 @@ impl TerminalView {
                 .link_at(row, c0)
                 .map(|hit| (row, hit.col_start, hit.col_end));
         }
+        // The label too: a program can redraw the same text over a different
+        // target (or scroll another link under the pointer), and a label still
+        // naming the old one would hide the very mismatch it exists to show.
+        if let Some(label) = &self.link_label {
+            self.link_label = crate::shell::link_hover::osc8_label(&self.snapshot, label.row, label.col);
+        }
     }
 
     /// Update the Cmd-hover link underline. Called on mouse-move; clears the
