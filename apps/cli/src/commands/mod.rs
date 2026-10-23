@@ -191,6 +191,7 @@ pub mod hosts;
 pub mod model;
 pub mod mcp;
 pub mod notify;
+pub mod open;
 pub mod pair;
 pub mod permit;
 pub mod run;

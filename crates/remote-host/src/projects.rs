@@ -23,4 +23,36 @@ pub trait ProjectProvider: Send + Sync {
     /// host path a client hands back to
     /// [`Request::CreateSession`](oximux_remote_proto::proto::Request::CreateSession).
     async fn projects(&self) -> Vec<ProjectSummaryWire>;
+
+    /// Open `path` (absolute; validated by the implementation, which owns the
+    /// filesystem question) as a project in the desktop, and bring it forward.
+    ///
+    /// The default is [`OpenProjectError::Unsupported`]: a host with no
+    /// windows — headless `oximux serve` — has nothing to open it in.
+    async fn open(&self, _path: &str) -> Result<OpenedProject, OpenProjectError> {
+        Err(OpenProjectError::Unsupported)
+    }
+}
+
+/// What [`ProjectProvider::open`] opened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenedProject {
+    pub project: ProjectSummaryWire,
+    /// The linked worktree selected in it, when the folder was one the host
+    /// lists.
+    pub worktree: Option<String>,
+}
+
+/// Why a folder could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenProjectError {
+    /// This host has no windows to open a project in.
+    Unsupported,
+    /// The path does not name an existing directory.
+    NotADirectory,
+    /// The desktop could not do it right now (no window to open it in, or its
+    /// UI did not answer).
+    Unavailable,
+    /// Registering the project failed.
+    Failed(String),
 }

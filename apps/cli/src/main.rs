@@ -94,6 +94,20 @@ fn tighten_destructive_suggestions(mut err: clap::Error) -> clap::Error {
     err
 }
 
+/// Every name clap answers to at the top level — commands, their aliases, and
+/// `help` — so a folder sharing one is never mistaken for it.
+fn command_names() -> Vec<String> {
+    use clap::CommandFactory as _;
+    let cli = Cli::command();
+    let mut names: Vec<String> = cli
+        .get_subcommands()
+        .flat_map(|command| std::iter::once(command.get_name()).chain(command.get_all_aliases()))
+        .map(str::to_string)
+        .collect();
+    names.push("help".into());
+    names
+}
+
 fn main() -> std::process::ExitCode {
     // Before clap, and before anything else: the verb an installed agent hook
     // runs. Its flags come from a file OxiMux wrote and may include one this
@@ -109,8 +123,12 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(commands::notify::run());
     }
 
+    // `oximux <folder>` is `oximux open <folder>`, like `code .`: decided on
+    // the raw arguments, before clap would call the folder an unknown command.
+    let argv = commands::open::with_bare_path_as_open(std::env::args_os().collect(), &command_names(), std::path::Path::is_dir);
+
     // Usage errors exit 2 here, printing clap's own message — before any I/O.
-    let args = match Cli::try_parse() {
+    let args = match Cli::try_parse_from(argv) {
         Ok(args) => args,
         // `exit()` keeps clap's own behavior: usage errors print to stderr and
         // exit 2, while `--help`/`--version` print to stdout and exit 0.
@@ -456,6 +474,10 @@ fn host_verb(mut args: Cli) -> u8 {
                 Command::Ls { all_hosts: true, strict } => {
                     return commands::hosts::fleet_ls(strict, timeout, dir).await;
                 }
+                // May start the app first, so it connects for itself.
+                Command::Open { path } => {
+                    return commands::open::run(&path, timeout, client::HostSelection { flag: host, dir }).await;
+                }
                 // A file to a file: no host involved.
                 Command::Sim { command: cli::SimCommand::Flow(cli::FlowCommand::Export { file, out, app_id, .. }), .. } => {
                     return commands::sim_flow::export(&file, out.as_deref(), app_id.as_deref());
@@ -723,7 +745,8 @@ fn host_verb(mut args: Cli) -> u8 {
                 | Command::Serve { .. }
                 | Command::Pair { .. }
                 | Command::Hosts { .. }
-                | Command::Mcp { .. } => unreachable!("dispatched earlier"),
+                | Command::Mcp { .. }
+                | Command::Open { .. } => unreachable!("dispatched earlier"),
             }
         }
         .await;

@@ -465,20 +465,29 @@ impl WorkspaceRoot {
                     tracing::debug!("dropped-folder registration superseded by a later drop");
                     return;
                 }
-                let path_str = path.to_string_lossy().to_string();
-                let name = crate::shell::add_project_dialog::name_from_path(&path);
-                match this.app_state.project_repo.insert_or_touch(&name, &path_str, &default_branch) {
-                    Ok(project) => {
-                        this.refresh_recent_projects();
-                        this.set_active_project(project, window, cx);
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, path = %path_str, "dropped-folder registration failed");
-                    }
+                if let Err(err) = this.register_and_activate(&path, &default_branch, window, cx) {
+                    tracing::warn!(?err, path = %path.display(), "dropped-folder registration failed");
                 }
             });
         })
         .detach();
+    }
+
+    /// Register `path` as a project — `insert_or_touch`, so a known root is
+    /// re-activated rather than duplicated — and make it the active one.
+    pub(super) fn register_and_activate(
+        &mut self,
+        path: &std::path::Path,
+        default_branch: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Project, oximux_storage::StorageError> {
+        let path_str = path.to_string_lossy().to_string();
+        let name = crate::shell::add_project_dialog::name_from_path(path);
+        let project = self.app_state.project_repo.insert_or_touch(&name, &path_str, default_branch)?;
+        self.refresh_recent_projects();
+        self.set_active_project(project.clone(), window, cx);
+        Ok(project)
     }
 
     /// Push hidden-state to every project's terminals except `active_id`, so a

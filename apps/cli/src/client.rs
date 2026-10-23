@@ -87,11 +87,24 @@ pub fn unexpected_reply(what: &str, got: &Response) -> Failure {
 }
 
 /// How a verb was told which host to reach.
+#[derive(Clone)]
 pub struct HostSelection {
     /// The `--host` flag, if given.
     pub flag: Option<String>,
     /// The runtime dir override, for the local path only.
     pub dir: Option<PathBuf>,
+}
+
+impl HostSelection {
+    /// Whether this resolves to this machine's own socket — no `--host`, no
+    /// `OXIMUX_HOST`, no recorded default — by the same order
+    /// [`Client::resolve_and_connect`] follows.
+    pub fn is_local(&self) -> Result<bool, Failure> {
+        let env = std::env::var(HOST_ENV_VAR).ok();
+        let config = crate::hosts_store::config_dir()?;
+        let hosts = HostsFile::load(&config)?;
+        Ok(hosts.resolve(self.flag.as_deref(), env.as_deref())?.is_none())
+    }
 }
 
 impl Client {

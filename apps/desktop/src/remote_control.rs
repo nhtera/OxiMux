@@ -13,6 +13,7 @@
 //! [`AgentChatView`]: crate::shell::agent_chat
 
 pub mod launch_bridge;
+pub mod open_bridge;
 pub mod local_listener;
 pub mod project_provider;
 pub mod worktree_service;

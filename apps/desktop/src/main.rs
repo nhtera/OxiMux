@@ -582,8 +582,13 @@ fn main() {
         // Projects the phone can start a session in without typing a path: the same
         // recent-projects store the desktop sidebar lists, read directly (no UI hop)
         // since it is durable data, not live view state.
+        // `oximux open` / `oximux .` rides the same provider: the folder hops to
+        // this loop, which opens it in the frontmost window and brings it forward.
+        let (opener, opens) = oximux_app::remote_control::open_bridge::open_bridge();
+        oximux_app::remote_control::open_bridge::serve_opens(opens, cx);
         remote_control.set_project_provider(std::sync::Arc::new(
-            oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo()),
+            oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo())
+                .with_opener(opener),
         ));
         // Worktrees the CLI can create, list, and remove: the same repos and
         // host-derived path scheme the desktop's New-Worktree flow uses, so a

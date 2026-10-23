@@ -384,6 +384,14 @@ Say what is happening in a worktree — a one-line comment, a work phase, or bot
 | `--comment` | yes | The status line — what is happening here right now. `""` clears it |
 | `--phase` | yes | The work phase: todo, in-progress, in-review, or done. `""` clears it. An unrecognised value is refused |
 
+### `oximux open`
+
+Open a folder as a project in the OxiMux app, like `code .`.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<PATH>` | yes | The folder to open |
+
 ### `oximux projects`
 
 Project verbs

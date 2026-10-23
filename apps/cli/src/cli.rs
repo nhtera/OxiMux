@@ -314,6 +314,22 @@ pub enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    /// Open a folder as a project in the OxiMux app, like `code .`.
+    ///
+    /// The folder's git work tree opens (a linked worktree opens its main
+    /// repository with that worktree selected); a plain folder opens as itself.
+    /// A project OxiMux already knows is selected again, not added twice. The
+    /// app comes forward, and is started first when it is not running.
+    ///
+    /// `oximux <folder>` is the same: a first argument that is `.`, `..`, or
+    /// starts with `/`, `./`, `../` or `~` — or names an existing folder that is
+    /// not one of these commands — opens it. A folder named like a command
+    /// (`term`) needs `./term`.
+    #[command(verbatim_doc_comment)]
+    Open {
+        /// The folder to open.
+        path: PathBuf,
+    },
     /// Project verbs.
     Projects {
         #[command(subcommand)]

@@ -184,12 +184,16 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// The picture rides a one-way stream of its own, not this envelope. A v33
 /// host cannot decode them: see [`SIMULATOR_VIEW_MIN_VERSION`].
 ///
+/// v35: **opening a folder in the desktop** ([`Request::OpenProject`] and its
+/// [`Response::ProjectOpened`] reply) — `oximux .`. A v34 host cannot decode
+/// it: see [`OPEN_PROJECT_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -307,6 +311,10 @@ pub const SIMULATOR_MCP_MIN_VERSION: u32 = 33;
 /// The oldest host the phone can watch a device on. Read by the **client**:
 /// the phone shows its Devices screen only to a host at or above it.
 pub const SIMULATOR_VIEW_MIN_VERSION: u32 = 34;
+
+/// The oldest host that opens a folder as a project (`oximux open`, `oximux .`).
+/// Read by the **client**.
+pub const OPEN_PROJECT_MIN_VERSION: u32 = 35;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -944,6 +952,17 @@ pub enum Request {
     SimSubscribe { device: String },
     /// Stop watching. Idempotent; dropping the stream does the same.
     SimUnsubscribe { token: crate::simulator::SimViewToken },
+
+    // ---- v35: opening a folder in the desktop ----
+    /// Open `path` — absolute, an existing directory — as a project in the
+    /// desktop and bring its window forward: the folder's git work tree, or for
+    /// a linked worktree its main repository with that worktree selected; a
+    /// plain folder as itself. Registered the way a folder dropped on the left
+    /// rail is, so a known project is re-selected rather than duplicated.
+    /// Local operator only (a paired device or a confined agent is refused
+    /// with [`RpcError::Unauthorized`]); a host with no windows — headless
+    /// `oximux serve` — answers [`RpcError::Unsupported`].
+    OpenProject { path: String },
 }
 
 /// Host → client.
@@ -1179,6 +1198,12 @@ pub enum Response {
     SimViewables(Result<Vec<crate::simulator::SimViewableWire>, SimErrorWire>),
     /// Reply to [`Request::SimSubscribe`].
     SimSubscribed(Result<crate::simulator::SimSubscribedWire, SimErrorWire>),
+
+    // ---- v35: opening a folder in the desktop ----
+    /// Reply to [`Request::OpenProject`]: the project now active, and the
+    /// linked worktree selected in it when the folder was one the desktop
+    /// lists (`None` otherwise, including a worktree it has no row for).
+    ProjectOpened { project: ProjectSummaryWire, worktree: Option<String> },
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.
