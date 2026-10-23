@@ -18,9 +18,11 @@ together (`--dir <DIR>` overrides the destination; PowerShell:
 `scripts/install-cli.ps1`). macOS/Linuxbrew alternatively:
 `brew install nhtera/tap/oximux`.
 
-On a machine with the desktop app this is not needed: the app ships the CLI
-and puts it first on `PATH` in its own terminals. A separately installed copy
-there may be a different version from the app's. On Windows the installer
+On a machine with the desktop app, the terminals the app opens need none of
+this: it ships the CLI and puts it first on their `PATH`. A service such as
+`oximux serve`, or a terminal the app did not open, still needs an installed
+copy (or the bundled one's full path) — and a separately installed copy may be a
+different version from the app's. On Windows the installer
 refuses the app's own install folder (`%LOCALAPPDATA%\Programs\OxiMux`, which is
 this installer's default too — Windows paths ignore case). For a separate copy
 pass `-Dir <folder>`, or set `$env:OXIMUX_INSTALL_DIR` when piping the script

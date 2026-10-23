@@ -94,12 +94,14 @@ can't drift from what the binary actually accepts.
 
 **With the desktop app, there is nothing to install.** The app ships the CLI,
 and every new shell OxiMux opens has it first on `PATH` as `oximux` (and at
-`$OXIMUX_CLI`), always the same version as the app. `oximux .` opens the
+`$OXIMUX_CLI`), always the same version as the app — even ahead of a copy your
+own startup files put first, while shell integration is on (the default). `oximux .` opens the
 folder you are in as a project.
 
-Agents the app starts do not get it on their `PATH`: the desktop does not yet
-give each agent a credential of its own, so through the CLI an agent would act
-with your full access. An agent you start yourself in an OxiMux shell inherits
+Agents the app starts do not get the bundled copy on their `PATH`: the desktop
+does not yet give each agent a credential of its own, so through the CLI an
+agent would act with your full access. (A separately installed `oximux` already
+on your `PATH` stays reachable to them.) An agent you start yourself in an OxiMux shell inherits
 that shell's `PATH` — and that access.
 
 For a server, a machine without the app, or terminals outside OxiMux:

@@ -18,10 +18,12 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
   folder in a git repository opens the repository, and one in a linked worktree
   opens its main repository, with the worktree selected when OxiMux lists it.
   The app comes forward, and is started first when it is not running.
-- **Agents don't get it on their `PATH`.** Agents OxiMux starts would act
-  with your full access through it, so it stays off their `PATH` until each
-  agent gets a credential of its own. An agent you start yourself in an OxiMux
-  shell inherits that shell's `PATH`, and that access.
+- **Agents don't get the bundled copy on their `PATH`.** Agents OxiMux starts
+  would act with your full access through it, so it stays off their `PATH`
+  until each agent gets a credential of its own. A separately installed
+  `oximux` already on your `PATH` stays reachable to them, as before. An agent
+  you start yourself in an OxiMux shell inherits that shell's `PATH`, bundled
+  copy included, and that access.
 - **Hook fixes.** The separate CLI's `agent-status` hook dialed the wrong
   socket and silently reported nothing; it now reaches the terminal. The CLI
   also answers `oximux notify`, and both hooks ignore extra arguments an agent

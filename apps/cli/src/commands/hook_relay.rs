@@ -44,6 +44,16 @@ pub(crate) async fn deliver(socket: &Path, token: &str, request: Request) -> Res
     .unwrap_or_else(|_| Err("the relay did not answer in time".to_owned()))
 }
 
+/// Where to look for the relay: the data root of the one that spawned this
+/// pane, which it advertises as `OXIMUX_SOCKET_PATH` (a host serving another
+/// `--data-dir` included), else this machine's default data root.
+pub(crate) fn runtime_dir() -> Option<PathBuf> {
+    std::env::var_os("OXIMUX_SOCKET_PATH")
+        .map(PathBuf::from)
+        .and_then(|socket| socket.parent().map(Path::to_path_buf))
+        .or_else(oximux_remote_local::default_runtime_dir)
+}
+
 /// A current-thread runtime for one exchange, or `None` if one cannot be built.
 pub(crate) fn runtime() -> Option<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().ok()

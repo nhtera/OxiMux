@@ -84,12 +84,19 @@ pub fn resolve(path: &str, known_roots: &[String]) -> Result<(PathBuf, Option<Pa
             .map(|(_, spelled)| PathBuf::from(spelled.as_str()))
     };
     let (root, worktree) = project_of(&folder);
-    // A linked worktree belongs to its main repository, whose directory does
-    // not hold it, so only a plain folder or a primary work tree is matched by
-    // containment; the worktree's project is matched by its root alone.
-    if worktree.is_none()
-        && let Some(known) = deepest_holding(&folder)
-    {
+    // A known project holding the folder wins — except, inside a linked
+    // worktree, one above the worktree itself (a parent folder registered as a
+    // project): that worktree belongs to its main repository, which does not
+    // hold it on disk. A project registered at or inside the worktree is still
+    // re-selected.
+    let held = deepest_holding(&folder).filter(|known| match &worktree {
+        None => true,
+        Some(top) => {
+            let top = top.canonicalize().unwrap_or_else(|_| top.clone());
+            Path::new(known).canonicalize().is_ok_and(|resolved| resolved.starts_with(&top))
+        }
+    });
+    if let Some(known) = held {
         return Ok((known, None));
     }
     let root = root.canonicalize().unwrap_or(root);
@@ -211,7 +218,16 @@ mod tests {
 
         let (root, worktree) = project_of(&linked.join("src"));
         assert_eq!(root.canonicalize().unwrap(), main.canonicalize().unwrap());
-        assert_eq!(worktree, Some(linked));
+        assert_eq!(worktree, Some(linked.clone()));
+
+        // A parent folder registered as a project does not capture it…
+        let parent = vec![dir.path().to_string_lossy().into_owned()];
+        let (root, worktree) = resolve(&linked.join("src").to_string_lossy(), &parent).unwrap();
+        assert_eq!(root.canonicalize().unwrap(), main.canonicalize().unwrap());
+        assert!(worktree.is_some());
+        // …but the worktree registered as its own project is re-selected.
+        let itself = vec![linked.to_string_lossy().into_owned()];
+        assert_eq!(resolve(&linked.join("src").to_string_lossy(), &itself).unwrap(), (linked, None));
     }
 
     #[test]

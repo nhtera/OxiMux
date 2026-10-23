@@ -74,7 +74,8 @@ pub struct Cli {
     /// Seconds to wait for a host reply before giving up (exit 4). For `wait`,
     /// this is the overall bound on the wait itself. It does NOT bound an
     /// agent's turn: `run`/`send` stream until the turn ends, and `attach`
-    /// until Ctrl+C. Bound a turn with `run`/`send --turn-timeout`.
+    /// until Ctrl+C. Bound a turn with `run`/`send --turn-timeout`. `open`
+    /// waits at least 30 s for its reply, which can follow starting the app.
     #[arg(long, global = true, default_value_t = 10, value_name = "SECS")]
     pub timeout: u64,
 

@@ -21,11 +21,19 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The same last-one-wins token a dropped folder takes: two opens (or an
+        // open and a drop) in quick succession must end on the later one, not
+        // on whichever default-branch read finished last.
+        self.drop_epoch = self.drop_epoch.wrapping_add(1);
+        let epoch = self.drop_epoch;
         cx.spawn_in(window, async move |this, cx| {
             // Off the foreground, as the drop path does: it runs git.
             let default_branch =
                 crate::shell::workspace::project_picker::detect_default_branch(&root).await;
             let opened = this.update_in(cx, |this, window, cx| {
+                if this.drop_epoch != epoch {
+                    return Err("superseded by a later open".to_string());
+                }
                 let project = this
                     .register_and_activate(&root, &default_branch, window, cx)
                     .map_err(|err| format!("could not register {}: {err}", root.display()))?;
@@ -46,7 +54,12 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        let rows = self.app_state.workspace_repo.list_for_project(&project.id).ok()?;
+        let rows = self
+            .app_state
+            .workspace_repo
+            .list_for_project(&project.id)
+            .inspect_err(|err| tracing::warn!(?err, "open: could not list the project's worktrees"))
+            .ok()?;
         let same = |row: &str| std::path::Path::new(row).canonicalize().ok().as_deref() == Some(path);
         let row = rows.into_iter().find(|row| row.archived_at.is_none() && same(&row.worktree_path))?;
         let selected = row.worktree_path.clone();

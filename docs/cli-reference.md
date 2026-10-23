@@ -36,7 +36,7 @@ These apply to every command.
 | `--json` | no | Emit machine-readable JSON on stdout (one convention, every verb). Streaming verbs (run/send/attach/wait) emit NDJSON event lines, then a final result object |
 | `--dir` | yes | The host's runtime directory (where its control socket lives). Defaults to this machine's OxiMux data directory. Local hosts only |
 | `--host` | yes | Talk to a paired remote host instead of this machine (see `oximux hosts ls`). Also read from $OXIMUX_HOST; a recorded default applies when neither is set. With no hosts paired, everything talks to this machine — no configuration needed |
-| `--timeout` | yes | Seconds to wait for a host reply before giving up (exit 4). For `wait`, this is the overall bound on the wait itself. It does NOT bound an agent's turn: `run`/`send` stream until the turn ends, and `attach` until Ctrl+C. Bound a turn with `run`/`send --turn-timeout` |
+| `--timeout` | yes | Seconds to wait for a host reply before giving up (exit 4). For `wait`, this is the overall bound on the wait itself. It does NOT bound an agent's turn: `run`/`send` stream until the turn ends, and `attach` until Ctrl+C. Bound a turn with `run`/`send --turn-timeout`. `open` waits at least 30 s for its reply, which can follow starting the app |
 
 ## Commands
 

@@ -135,9 +135,18 @@ pub(super) fn shell_spawn_config(cwd: PathBuf, env: Vec<(String, String)>, cols:
     // The command line tool this app ships, first on the shell's PATH. Here
     // and nowhere else: agents the app spawns carry no per-session credential
     // yet, so they do not get it (see the module).
+    // Built on the PATH the shell would otherwise get — a shell-settings or
+    // caller `PATH` already in the env, else the app's own — since this entry
+    // is applied last and replaces it.
+    let effective_path = merged_env
+        .iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"));
     merged_env.extend(crate::platform::bundled_cli::shell_env(
         crate::platform::bundled_cli::bin_dir(),
-        std::env::var_os("PATH"),
+        effective_path,
     ));
     SpawnConfig {
         cwd,

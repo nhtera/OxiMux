@@ -122,22 +122,14 @@ pub fn swap_all(replacements: &[Replacement]) -> Result<Vec<PathBuf>, SwapError>
             if let Some(parent) = replacement.installed.parent()
                 && let Err(err) = fs::create_dir_all(parent)
             {
-                undo_moves(&moved_aside);
-                return Err(SwapError::RolledBack {
-                    path: replacement.installed.clone(),
-                    detail: err.to_string(),
-                });
+                return Err(pass_one_failed(&moved_aside, &replacement.installed, err));
             }
             moved_aside.push((replacement.installed.clone(), None));
             continue;
         }
         let backup = backup_path(&replacement.installed);
         if let Err(err) = fs::rename(&replacement.installed, &backup) {
-            undo_moves(&moved_aside);
-            return Err(SwapError::RolledBack {
-                path: replacement.installed.clone(),
-                detail: err.to_string(),
-            });
+            return Err(pass_one_failed(&moved_aside, &replacement.installed, err));
         }
         moved_aside.push((replacement.installed.clone(), Some(backup)));
     }
@@ -174,6 +166,19 @@ pub fn swap_all(replacements: &[Replacement]) -> Result<Vec<PathBuf>, SwapError>
         }
     }
     Ok(left_behind)
+}
+
+/// Undo pass 1 after it failed at `path`: rolled back when every moved-aside
+/// file went back, inconsistent — naming the stranded backups — when one did
+/// not, so the caller never reports "nothing changed" over a missing binary.
+fn pass_one_failed(moved: &[(PathBuf, Option<PathBuf>)], path: &Path, err: std::io::Error) -> SwapError {
+    let failed = undo_moves(moved);
+    let detail = err.to_string();
+    if failed.is_empty() {
+        SwapError::RolledBack { path: path.to_path_buf(), detail }
+    } else {
+        SwapError::Inconsistent { path: path.to_path_buf(), detail, backups: failed }
+    }
 }
 
 /// Put every moved-aside binary back. Returns the ones that could not be

@@ -95,17 +95,6 @@ pub struct HostSelection {
     pub dir: Option<PathBuf>,
 }
 
-impl HostSelection {
-    /// Whether this resolves to this machine's own socket — no `--host`, no
-    /// `OXIMUX_HOST`, no recorded default — by the same order
-    /// [`Client::resolve_and_connect`] follows.
-    pub fn is_local(&self) -> Result<bool, Failure> {
-        let env = std::env::var(HOST_ENV_VAR).ok();
-        let config = crate::hosts_store::config_dir()?;
-        let hosts = HostsFile::load(&config)?;
-        Ok(hosts.resolve(self.flag.as_deref(), env.as_deref())?.is_none())
-    }
-}
 
 impl Client {
     /// Connect to whichever host the resolution order picks: `--host` →

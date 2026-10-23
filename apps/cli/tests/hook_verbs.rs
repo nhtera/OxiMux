@@ -88,6 +88,9 @@ fn hook(daemon: &Daemon, args: &[&str], stdin: &str) -> std::process::Output {
         .args(args)
         .env("HOME", daemon.home.path())
         .env_remove("XDG_DATA_HOME")
+        // Run from inside an OxiMux pane, the test runner would otherwise
+        // hand the verbs the real relay's socket.
+        .env_remove("OXIMUX_SOCKET_PATH")
         .env("OXIMUX_PTY_ID", &daemon.pty_id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -145,6 +148,28 @@ fn agent_status_frames_the_state_on_the_pane() {
     assert!(framed.is_some(), "the status never reached the pane");
 }
 
+/// A pane names the relay that spawned it (`OXIMUX_SOCKET_PATH`), which may
+/// serve another data root than this machine's default: that one is used.
+#[test]
+fn the_panes_own_relay_wins_over_the_default_data_root() {
+    let daemon = boot();
+    let (_sub, mut rx) = daemon.client.subscribe_pty(&daemon.pty_id);
+    let socket = oximux_relay_supervisor::RelaySupervisor::new(runtime_dir(daemon.home.path()), PathBuf::new())
+        .socket_path();
+    let elsewhere = tempfile::Builder::new().tempdir_in("/tmp").expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_oximux-cli"))
+        .args(["notify", "--title", "T", "--body", "B"])
+        .env("HOME", elsewhere.path())
+        .env_remove("XDG_DATA_HOME")
+        .env("OXIMUX_SOCKET_PATH", &socket)
+        .env("OXIMUX_PTY_ID", &daemon.pty_id)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(next_matching(&daemon, &mut rx, |n| matches!(n, Notification::Attention { .. })).is_some());
+}
+
 #[test]
 fn outside_oximux_both_verbs_stay_out_of_the_way() {
     // No daemon and no pane: an agent run from some other terminal. Exit 0
@@ -155,6 +180,7 @@ fn outside_oximux_both_verbs_stay_out_of_the_way() {
             .args(args)
             .env("HOME", home.path())
             .env_remove("XDG_DATA_HOME")
+            .env_remove("OXIMUX_SOCKET_PATH")
             .env("OXIMUX_PTY_ID", "pane-1")
             .stdin(Stdio::null())
             .output()

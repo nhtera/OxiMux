@@ -34,9 +34,11 @@
 //! That is why the desktop puts the `oximux` it ships on the PATH of its
 //! interactive shells only, and not of the agents it spawns
 //! (`apps/desktop/src/platform/bundled_cli.rs`): an agent there could still
-//! dial this socket, but nothing hands it the tool. An agent a person starts by
-//! hand in one of those shells inherits the shell's PATH, and with it the
-//! operator's authority.
+//! dial this socket, but the desktop does not hand it the tool. That is about
+//! the bundled copy only — a separately installed `oximux` on the user's own
+//! PATH reaches spawned agents too, since they inherit the app's environment.
+//! And an agent a person starts by hand in one of those shells inherits the
+//! shell's PATH, bundled copy included, and with it the operator's authority.
 //!
 //! What the mechanism buys where it *is* wired: an agent handed a per-session
 //! secret and asked to misuse the protocol — naming operator scope, or another

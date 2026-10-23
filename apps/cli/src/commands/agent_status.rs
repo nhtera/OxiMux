@@ -59,7 +59,7 @@ pub fn run() -> u8 {
     // The host's data root, the same one `oximux serve` defaults to and the
     // desktop computes for itself. A host serving a `--data-dir` elsewhere is
     // not reachable from here: the hook is handed no way to learn about it.
-    let Some(runtime_dir) = oximux_remote_local::default_runtime_dir() else {
+    let Some(runtime_dir) = hook_relay::runtime_dir() else {
         eprintln!("oximux agent-status: this platform reports no local data directory");
         return exit::OK;
     };

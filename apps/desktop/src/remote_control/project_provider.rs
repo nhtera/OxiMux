@@ -65,8 +65,14 @@ impl ProjectProvider for RepoProjects {
         let (repo, path) = (self.repo.clone(), path.to_owned());
         // The filesystem walk and the project read both block: off the reactor.
         let (root, worktree) = tokio::task::spawn_blocking(move || {
-            let known: Vec<String> =
-                repo.list_ordered(KNOWN_PROJECTS_LIMIT).unwrap_or_default().into_iter().map(|p| p.root_path).collect();
+            // A failed read is not "no projects": matching against nothing
+            // would register a known project a second time.
+            let known: Vec<String> = repo
+                .list_ordered(KNOWN_PROJECTS_LIMIT)
+                .map_err(|_| OpenProjectError::Unavailable)?
+                .into_iter()
+                .map(|p| p.root_path)
+                .collect();
             super::open_bridge::resolve(&path, &known)
         })
         .await

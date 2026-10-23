@@ -131,10 +131,18 @@ fn refresh_windows_copy(install: &Path) -> std::io::Result<Option<PathBuf>> {
         if let Ok(modified) = source.modified() {
             std::fs::File::options().write(true).open(&fresh)?.set_modified(modified)?;
         }
-        if copy.exists() {
-            std::fs::rename(&copy, oximux_auto_update::release::swap::backup_path(&copy))?;
+        let aside = copy.exists().then(|| oximux_auto_update::release::swap::backup_path(&copy));
+        if let Some(aside) = &aside {
+            std::fs::rename(&copy, aside)?;
         }
-        std::fs::rename(&fresh, &copy)?;
+        if let Err(err) = std::fs::rename(&fresh, &copy) {
+            // Put the old copy back rather than leave `bin\` empty until the
+            // updater's next boot sweep restores it.
+            if let Some(aside) = &aside {
+                let _ = std::fs::rename(aside, &copy);
+            }
+            return Err(err);
+        }
     }
     Ok(Some(dir))
 }

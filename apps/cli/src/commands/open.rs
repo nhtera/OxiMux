@@ -123,16 +123,22 @@ fn folder(path: &Path) -> Result<PathBuf, Failure> {
     }
 }
 
-/// Connect to the selected host, starting the app first when the selection is
-/// this machine's default host and nothing answers there. Never for `--dir`:
-/// the app would start on its own data directory, not the one named, and the
-/// wait that follows could only time out.
+/// Connect to this machine's desktop — always local: a folder is opened where
+/// it is, and a remote host refuses the request anyway — starting the app first
+/// when nothing answers. A recorded default host is not followed; a host named
+/// with `--host` or `OXIMUX_HOST` is refused up front. Never starts the app for
+/// `--dir`: it would start on its own data directory, not the one named.
 async fn connect_or_launch(selection: HostSelection, timeout: u64) -> Result<Client, Failure> {
-    let first = match Client::resolve_and_connect(selection.clone(), timeout).await {
+    let named = selection.flag.clone().or_else(|| std::env::var(crate::hosts_store::HOST_ENV_VAR).ok());
+    if named.is_some_and(|name| !name.is_empty()) {
+        return Err(Failure::new("usage", exit::USAGE, "`oximux open` opens a folder on this machine only")
+            .with_steps(["run it without --host (and with OXIMUX_HOST unset)".into()]));
+    }
+    let first = match Client::connect(selection.dir.clone(), timeout).await {
         Ok(client) => return Ok(client),
         Err(failure) => failure,
     };
-    if first.code != "unreachable" || selection.dir.is_some() || !selection.is_local()? {
+    if first.code != "unreachable" || selection.dir.is_some() {
         return Err(first);
     }
     launch_app()?;
@@ -203,14 +209,18 @@ fn enclosing_bundle(exe: &Path) -> Option<PathBuf> {
 /// install under `local_app_data`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_app_exe(exe: &Path, local_app_data: Option<&Path>) -> Option<PathBuf> {
+    // An `oximux.exe` is the app only beside the screen gate, which ships with
+    // the app alone: `install-cli.ps1`'s own `Programs\oximux\oximux.exe` is the
+    // same path as the app's default (Windows ignores case), and starting that
+    // would start another CLI with no arguments.
+    let app_in = |install: &Path| {
+        let candidate = install.join("oximux.exe");
+        (candidate.is_file() && candidate != exe && install.join("oximux-screen-gate.exe").is_file())
+            .then_some(candidate)
+    };
     let dir = exe.parent()?;
     let install = if dir.file_name().is_some_and(|name| name == "bin") { dir.parent()? } else { dir };
-    let beside = install.join("oximux.exe");
-    if beside.is_file() && beside != exe {
-        return Some(beside);
-    }
-    let default = local_app_data?.join("Programs").join("OxiMux").join("oximux.exe");
-    default.is_file().then_some(default)
+    app_in(install).or_else(|| app_in(&local_app_data?.join("Programs").join("OxiMux")))
 }
 
 #[cfg(test)]
@@ -277,6 +287,7 @@ mod tests {
         let install = root.path().join("OxiMux");
         std::fs::create_dir_all(install.join("bin")).expect("mkdir");
         std::fs::write(install.join("oximux.exe"), "").expect("write");
+        std::fs::write(install.join("oximux-screen-gate.exe"), "").expect("write");
         // The install's own copies: the app sits beside, or one level up.
         for exe in [install.join("oximux-cli.exe"), install.join("bin").join("oximux.exe")] {
             assert_eq!(windows_app_exe(&exe, None), Some(install.join("oximux.exe")));
@@ -287,6 +298,9 @@ mod tests {
         std::fs::create_dir_all(&default).expect("mkdir");
         std::fs::write(default.join("oximux.exe"), "").expect("write");
         let elsewhere = root.path().join("tools").join("oximux.exe");
+        // A standalone CLI there (no screen gate) is not the app.
+        assert_eq!(windows_app_exe(&elsewhere, Some(&local)), None);
+        std::fs::write(default.join("oximux-screen-gate.exe"), "").expect("write");
         assert_eq!(windows_app_exe(&elsewhere, Some(&local)), Some(default.join("oximux.exe")));
         assert_eq!(windows_app_exe(&elsewhere, None), None);
     }

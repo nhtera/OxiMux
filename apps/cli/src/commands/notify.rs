@@ -29,7 +29,7 @@ pub fn run() -> u8 {
         eprintln!("oximux notify: OXIMUX_PTY_ID not set (run inside an OxiMux terminal)");
         return exit::OK;
     };
-    let Some((socket, token)) = oximux_remote_local::default_runtime_dir().and_then(|dir| hook_relay::endpoint(&dir))
+    let Some((socket, token)) = hook_relay::runtime_dir().and_then(|dir| hook_relay::endpoint(&dir))
     else {
         eprintln!("oximux notify: no OxiMux terminal daemon is running");
         return exit::OK;
