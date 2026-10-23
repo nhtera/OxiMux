@@ -25,7 +25,8 @@ use oximux_pty::{TerminalEvent, TerminalSessionId};
 use tokio::sync::watch;
 
 use crate::osc_sideband::AgentOscScanner;
-use crate::status_machine::StatusMachine;
+use crate::program_status::map_program_status;
+use crate::status_machine::{StatusMachine, StatusSource};
 
 /// Process one drained batch of terminal events for `term_id`. Returns
 /// `true` when an `Exit` event was seen (the caller breaks the poll loop).
@@ -124,6 +125,24 @@ pub fn process_poll_events(
                             detail: Some(sb.detail),
                         });
                     }
+                }
+            }
+            // OSC 7501 program status, parsed by the backend. This runtime
+            // launched the agent, so its reports are trusted even without a
+            // seen query — a replay ring can lose the query and keep the
+            // reports. The message line updates even when the status does not
+            // (a second `done` with a new summary).
+            TerminalEvent::ProgramStatus { id, root, .. } if id == term_id => {
+                machine.feed_program_status(root.as_ref(), true);
+                if let Some(record) = &root
+                    && machine.source() == StatusSource::ProgramStatus
+                    && !machine.current().is_terminal()
+                {
+                    let mut carried = carried_detail(status_tx);
+                    if let (_, Some(message)) = map_program_status(record) {
+                        carried.last_message = Some(message);
+                    }
+                    let _ = status_tx.send(status_snapshot(machine.current().clone(), last_prompt, carried));
                 }
             }
             TerminalEvent::Exit { id, code } if id == term_id => {
@@ -670,5 +689,47 @@ mod tests {
         assert_eq!(snap.status, AgentStatus::Done { code: Some(0) });
         // Force-guard kept it terminal; detail stays cleared.
         assert!(snap.detail.is_none());
+    }
+
+    fn program_status(p: &str) -> TerminalEvent {
+        let mut store = oximux_pty::program_status::ProgramStatusStore::new();
+        store.apply(oximux_pty::program_status::parse_report(p.as_bytes()).unwrap());
+        TerminalEvent::ProgramStatus { id: TERM, root: store.root().cloned(), handshake: false }
+    }
+
+    /// Program status wins the status, but the hook sideband keeps supplying
+    /// the detail it alone carries (the prompt that titles the row).
+    #[test]
+    fn program_status_owns_the_status_while_hooks_keep_the_detail() {
+        let mut machine = approval_pattern_machine();
+        let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
+        let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
+        let cancel = AtomicBool::new(false);
+        let events = vec![
+            program_status("state=working:app=a"),
+            TerminalEvent::Output { id: TERM, bytes: b"Approval needed".to_vec() },
+            TerminalEvent::Output {
+                id: TERM,
+                bytes: osc(r#"{"v":1,"state":"idle","prompt":"fix the parser"}"#),
+            },
+        ];
+        process_poll_events(events, TERM, &mut machine, &mut scanner, &tx, &mut last_prompt, &cancel, Instant::now());
+        let snap = rx.borrow().clone();
+        assert_eq!(snap.status, AgentStatus::Running);
+        assert_eq!(snap.detail.and_then(|d| d.prompt).as_deref(), Some("fix the parser"));
+
+        let done = format!("state=done:msg={}", base64_of("Refactored the parser."));
+        process_poll_events(vec![program_status(&done)], TERM, &mut machine, &mut scanner, &tx, &mut last_prompt, &cancel, Instant::now());
+        let snap = rx.borrow().clone();
+        assert_eq!(snap.status, AgentStatus::Idle);
+        let detail = snap.detail.expect("detail");
+        assert_eq!(detail.last_message.as_deref(), Some("Refactored the parser."));
+        assert_eq!(detail.prompt.as_deref(), Some("fix the parser"));
+    }
+
+    fn base64_of(s: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(s)
     }
 }

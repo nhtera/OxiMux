@@ -731,6 +731,12 @@ actions!(
         /// to a no-op if fewer than two prompt marks are present. Bound
         /// to Cmd+Shift+O ("Output to agent").
         SendLastCommandOutputToAgent,
+        /// Pick a file or directory and type its path at the focused
+        /// terminal's cursor, quoted for the shell (never as control bytes).
+        InsertPathIntoTerminal,
+        /// Lock or unlock the focused terminal against input from every
+        /// OxiMux path (views, paired phone); scroll, select, copy still work.
+        ToggleTerminalReadOnly,
         /// Reshape the active project's pane groups into a single vertical
         /// stack (all panes top-to-bottom). Tab content is preserved.
         ApplyLayoutStacked,

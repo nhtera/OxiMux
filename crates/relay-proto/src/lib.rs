@@ -2,6 +2,7 @@
 // daemon (`crates/relay`). Pure data + framing — no I/O, no async.
 
 pub mod auth;
+pub mod checkpoint_codec;
 pub mod endpoint;
 pub mod error;
 pub mod frame;

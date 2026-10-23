@@ -295,10 +295,9 @@ pub enum Notification {
         attachment_id: u64,
         code: Option<i32>,
     },
-    /// Explicit attention raised via `Request::Notify`. The client maps
-    /// this to a pane attention signal (ring + tab dot). `title`/`body`
-    /// are carried for a future OS-banner surface; today the client only
-    /// uses it to flag attention.
+    /// Explicit attention raised via `Request::Notify` (`oximux notify`). The
+    /// client raises pane attention and a desktop banner showing `title` /
+    /// `body` (sanitized there).
     Attention {
         pty_id: String,
         title: String,

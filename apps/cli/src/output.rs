@@ -52,6 +52,14 @@ impl Failure {
     }
 }
 
+/// Host-supplied text (a session title, a terminal's cwd) as it may be shown
+/// in a terminal: control characters would act — move the cursor, set a
+/// title, open a hyperlink — instead of appear, so each becomes `\u{FFFD}`.
+/// JSON output needs none of this: the encoder escapes them.
+pub fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
+}
+
 /// Print a verb's outcome and return the process exit code.
 pub fn render(json_mode: bool, outcome: Result<(Value, String), Failure>) -> u8 {
     match outcome {

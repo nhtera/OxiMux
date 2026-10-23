@@ -24,9 +24,9 @@ use crate::actions::{
     SelectSimulatorTab,
     SelectSearchTab,
     SelectSourceControlTab,
-    SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
+    InsertPathIntoTerminal, SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
     SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleChatTerminalView,
-    ToggleDictation, ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar,
+    ToggleDictation, ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar, ToggleTerminalReadOnly,
     ToggleZoomSubPane, UiZoomIn, UiZoomOut, UiZoomReset,
 };
 // The AppKit application menu's actions, bound only where that menu exists.
@@ -272,6 +272,8 @@ pub const ACTIONS: &[ActionSpec] = &[
         "secondary-shift-o",
         SendLastCommandOutputToAgent
     ),
+    entry!("insert_path", "Insert path into terminal", Terminal, "alt-cmd-p", InsertPathIntoTerminal),
+    entry!("toggle_terminal_read_only", "Toggle read-only terminal", Terminal, "", ToggleTerminalReadOnly),
     // ---- Source Control ----------------------------------------------
     entry!("open_commit_dialog", "Commit dialog", Scm, "secondary-k", OpenCommitDialog),
     entry!(

@@ -73,7 +73,7 @@ async fn checkpoint_written_on_tick_and_removed_on_close() {
     wait_until("scrollback checkpoint to appear", || {
         registry.checkpoint_all();
         std::fs::read(pty_dir.join("scrollback.bin"))
-            .map(|b| !b.is_empty())
+            .map(|b| !oximux_relay_proto::checkpoint_codec::decode(&b).is_empty())
             .unwrap_or(false)
     })
     .await;
@@ -297,7 +297,9 @@ async fn seeded_history_is_checkpointed_even_when_the_shell_is_silent() {
 
     registry.checkpoint_all();
 
-    let written = std::fs::read(base.join(&pty_id).join("scrollback.bin")).unwrap_or_default();
+    let written = oximux_relay_proto::checkpoint_codec::decode(
+        &std::fs::read(base.join(&pty_id).join("scrollback.bin")).unwrap_or_default(),
+    );
     assert_eq!(written, b"restored history\r\n");
     let _ = registry.begin_close(&pty_id);
 }

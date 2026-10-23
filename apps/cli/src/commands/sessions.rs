@@ -46,9 +46,10 @@ pub async fn ls(client: &Client) -> Result<(Value, String), Failure> {
                 };
                 let model = s["model"].as_str().unwrap_or("-");
                 format!(
-                    "{}  {}  ({model}){flag}",
-                    s["session_id"].as_str().unwrap_or("?"),
-                    s["title"].as_str().unwrap_or("")
+                    "{}  {}  ({}){flag}",
+                    crate::output::printable(s["session_id"].as_str().unwrap_or("?")),
+                    crate::output::printable(s["title"].as_str().unwrap_or("")),
+                    crate::output::printable(model),
                 )
             })
             .collect::<Vec<_>>()

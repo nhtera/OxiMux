@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,11 +12,11 @@ use oximux_relay_proto::{
 use oximux_shell_env::{clear_inherited_colour_suppression, seed_utf8_locale};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use crate::checkpoint::CheckpointStore;
-use crate::ring_buffer::RingBuffer;
+use crate::pty_writer::PtyWriter;
+use crate::reader::{ReplayLog, fan_out, reader_loop};
 
 // Bounded per-subscriber channel. The session writer task drains it;
 // if it falls behind, fan_out drops notifications rather than growing
@@ -31,16 +30,16 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 /// gap. The flag lives beside the sender rather than inside the channel
 /// because a full queue — the only way a gap occurs — has no room to carry
 /// the notice at the moment it is needed.
-struct Subscriber {
+pub(crate) struct Subscriber {
     /// The attachment this sender belongs to, so `detach` can drop it by name.
     ///
     /// Without it the only thing that ever removed a subscriber was `fan_out`
     /// noticing a closed receiver — which requires the PTY to produce output.
     /// A client that leaves while its shell sits quietly at a prompt would
     /// otherwise leave its sender in here indefinitely.
-    attachment_id: u64,
-    tx: Sender<Notification>,
-    gapped: bool,
+    pub(crate) attachment_id: u64,
+    pub(crate) tx: Sender<Notification>,
+    pub(crate) gapped: bool,
 }
 
 // 1 MiB per PTY — the plan's "Locked decisions" section, larger than
@@ -49,7 +48,7 @@ struct Subscriber {
 // for byte-for-byte replay to look correct.
 pub const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 
-const READ_CHUNK_BYTES: usize = 8 * 1024;
+pub(crate) const READ_CHUNK_BYTES: usize = 8 * 1024;
 
 // After an effective PTY resize, re-assert the same size a couple of
 // times shortly after (a resize-confirm nudge). Some TUIs miss the first
@@ -114,9 +113,11 @@ struct Entry {
     // reader has its own cloned fd. `Arc` so the resend-confirm task can
     // share the handle without holding the registry entry.
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    // Input goes through the writer thread so the reader never blocks on it.
+    writer: PtyWriter,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    ring: Arc<Mutex<RingBuffer>>,
+    // Recent output and the modes it leaves set, one lock (see `reader`).
+    ring: Arc<Mutex<ReplayLog>>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     // Flipped by `reader_loop` immediately before the Exit fan-out.
     // The `close` grace poll watches this to skip the full SIGKILL
@@ -143,6 +144,9 @@ struct Entry {
     bytes_in: AtomicU64,
     bytes_out: Arc<AtomicU64>,
     started_at: Instant,
+    // When the last repaint nudge went out (see `repaint_nudge`), shared by
+    // every attachment so an attach burst signals the program once.
+    last_nudge: Mutex<Option<Instant>>,
     // `bytes_out` value at the last disk checkpoint. The checkpoint tick
     // compares against the live counter and skips PTYs with no new
     // output, so idle shells cost zero disk writes.
@@ -283,14 +287,12 @@ impl PtyRegistry {
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
+        let writer = PtyWriter::spawn(&pty_id, pair.master.take_writer().context("take writer")?)?;
 
         let seeded_history = !args.prefill.is_empty();
-        let mut seeded = RingBuffer::new(REPLAY_BUFFER_BYTES);
-        // Before the reader thread exists, so no child output can land ahead
-        // of the restored history.
-        seeded.push(&args.prefill);
-        let ring = Arc::new(Mutex::new(seeded));
+        // Seeded before the reader thread exists, so no child output can land
+        // ahead of the restored history.
+        let ring = Arc::new(Mutex::new(ReplayLog::new(REPLAY_BUFFER_BYTES, &args.prefill)));
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::new(Mutex::new(Vec::new()));
         let child_exited = Arc::new(AtomicBool::new(false));
         let exit_code = Arc::new(AtomicI32::new(EXIT_CODE_NONE));
@@ -307,6 +309,7 @@ impl PtyRegistry {
         let bytes_out_for_reader = Arc::clone(&bytes_out);
         let checkpoints_for_reader = self.checkpoints.clone();
         let restarting_for_reader = Arc::clone(&self.restarting);
+        let writer_for_reader = writer.clone();
         std::thread::Builder::new()
             .name(format!("relay-pty-{pty_id}"))
             .spawn(move || {
@@ -321,6 +324,7 @@ impl PtyRegistry {
                     bytes_out_for_reader,
                     checkpoints_for_reader,
                     restarting_for_reader,
+                    writer_for_reader,
                 )
             })
             .context("spawn reader thread")?;
@@ -347,7 +351,7 @@ impl PtyRegistry {
             attachments: Mutex::new(HashMap::new()),
             resize_seq: AtomicU64::new(0),
             master: Arc::new(Mutex::new(pair.master)),
-            writer: Mutex::new(writer),
+            writer,
             killer: Mutex::new(killer),
             ring,
             subscribers,
@@ -359,6 +363,7 @@ impl PtyRegistry {
             bytes_in: AtomicU64::new(0),
             bytes_out,
             started_at: Instant::now(),
+            last_nudge: Mutex::new(None),
             // Seeded history is in the ring but not in `bytes_out`: start it
             // unwritten, or a shell that prints nothing never checkpoints it
             // and the next restart loses it.
@@ -376,19 +381,36 @@ impl PtyRegistry {
     /// the smallest-screen-wins `min`, so recovering from a dropped frame
     /// would resize the live process. This answers only "what is on screen
     /// now?".
-    pub fn replay(&self, pty_id: &str) -> Result<(Vec<u8>, u16, u16), RegistryError> {
+    ///
+    /// `requester` is the asking connection's notification sender. Its
+    /// subscriber on this PTY gets an empty `Output` — a fence — queued right
+    /// behind the snapshot, under the same lock as every publish: output before
+    /// the fence is already in the replay, output after it is not. A full queue
+    /// gaps the subscriber instead, so it is told to resync again.
+    pub fn replay(&self, pty_id: &str, requester: &Sender<Notification>) -> Result<(Vec<u8>, u16, u16), RegistryError> {
         let entry = self
             .entries
             .get(pty_id)
             .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
-        // Ring first, matching the lock order `attach` and `fan_out` use, so a
-        // snapshot taken here can never interleave with a push mid-write.
+        // Lock order: ring, then subscribers — the same as `attach` and `publish`.
         let ring = entry.ring.lock().expect("ring poisoned");
         let replay = ring.snapshot();
+        for sub in entry.subscribers.lock().expect("subs poisoned").iter_mut() {
+            if sub.tx.same_channel(requester) {
+                let fence = Notification::Output { pty_id: pty_id.to_owned(), attachment_id: sub.attachment_id, bytes: Vec::new() };
+                sub.gapped |= sub.tx.try_send(fence).is_err();
+            }
+        }
         drop(ring);
+        let replay = replay.build();
+        // As on attach: an alternate-screen frame the ring no longer holds is
+        // the program's to redraw, and a quiet one would otherwise stay blank.
+        if replay.alt_screen {
+            crate::repaint_nudge::nudge(&entry.master, entry.pid, &entry.last_nudge);
+        }
         let cols = *entry.cols.lock().expect("cols poisoned");
         let rows = *entry.rows.lock().expect("rows poisoned");
-        Ok((replay, cols, rows))
+        Ok((replay.bytes, cols, rows))
     }
 
     /// Attach a subscriber and return `(replay, cols, rows, attachment_id)`
@@ -412,12 +434,9 @@ impl PtyRegistry {
             .entries
             .get(pty_id)
             .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
-        // Hold BOTH locks across snapshot + push so the operation is
-        // atomic vs. `fan_out` (which takes the same two locks: ring
-        // first while in `reader_loop`, then subscribers). Without
-        // this, bytes that land in the ring between snapshot and
-        // push would be in the next attacher's replay but missing
-        // from this attacher's live stream — a silent gap.
+        // Hold BOTH locks across snapshot + push. `publish` holds the ring
+        // through its fan-out, so each byte is either in this snapshot or
+        // delivered to the subscriber pushed below — never both, never neither.
         let ring = entry.ring.lock().expect("ring poisoned");
         let mut subs = entry.subscribers.lock().expect("subs poisoned");
         let replay = ring.snapshot();
@@ -452,6 +471,7 @@ impl PtyRegistry {
         });
         drop(subs);
         drop(ring);
+        let replay = replay.build();
         let cols = *entry.cols.lock().expect("cols poisoned");
         let rows = *entry.rows.lock().expect("rows poisoned");
         entry
@@ -459,7 +479,12 @@ impl PtyRegistry {
             .lock()
             .expect("attachments poisoned")
             .insert(attachment_id, (cols, rows));
-        Ok((replay, cols, rows, attachment_id))
+        // An alternate-screen program's frame is not in the replay; ask it to
+        // repaint for the newcomer.
+        if replay.alt_screen {
+            crate::repaint_nudge::nudge(&entry.master, entry.pid, &entry.last_nudge);
+        }
+        Ok((replay.bytes, cols, rows, attachment_id))
     }
 
     pub fn write(&self, pty_id: &str, bytes: &[u8]) -> Result<(), RegistryError> {
@@ -467,9 +492,7 @@ impl PtyRegistry {
             .entries
             .get(pty_id)
             .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
-        let mut w = entry.writer.lock().expect("writer poisoned");
-        w.write_all(bytes).context("pty write")?;
-        w.flush().context("pty flush")?;
+        entry.writer.write(bytes)?;
         entry
             .bytes_in
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -719,8 +742,8 @@ impl PtyRegistry {
         // — no PTYs, or none with new output — and indistinguishable from a
         // broken flush unless the pass says which it was.
         let (mut written, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-        for kv in self.entries.iter() {
-            let e = kv.value();
+        let entries: Vec<Arc<Entry>> = self.entries.iter().map(|kv| Arc::clone(kv.value())).collect(); // no shard guard while writing
+        for e in &entries {
             // An ended session's checkpoint is its reader's to keep or remove;
             // writing one here would resurrect a directory it just deleted.
             if e.child_exited.load(Ordering::Acquire) {
@@ -732,20 +755,20 @@ impl PtyRegistry {
                 skipped += 1;
                 continue;
             }
-            let bytes = e.ring.lock().expect("ring poisoned").snapshot();
+            let bytes = e.ring.lock().expect("ring poisoned").raw();
             let cols = *e.cols.lock().expect("cols poisoned");
             let rows = *e.rows.lock().expect("rows poisoned");
-            // Live cwd straight from the kernel (one proc_pidinfo per
-            // ACTIVE pty per tick) — shells don't reliably announce cwd
-            // changes in-band, and the cold-restore consumer wants the
-            // directory the user was actually in when the daemon died.
+            // Live cwd from the kernel: shells don't reliably announce it, and a
+            // cold restore wants where the user really was.
             let live_cwd = e.pid.and_then(oximux_proc_cwd::cwd_of_pid);
             match store.write_scrollback(&e.pty_id, &bytes, cols, rows, live_cwd.as_deref()) {
-                // Store the pre-snapshot counter: output that landed
-                // mid-write is picked up by the next pass.
+                // Pre-snapshot counter: output landing mid-write goes next pass.
                 Ok(()) => {
                     e.checkpointed_bytes_out.store(seen, Ordering::Relaxed);
                     written += 1;
+                    if e.child_exited.load(Ordering::Acquire) && !self.restarting.load(Ordering::SeqCst) { // ended mid-write
+                        let _ = store.remove(&e.pty_id);
+                    }
                 }
                 Err(err) => {
                     failed += 1;
@@ -1000,219 +1023,7 @@ fn signal_group(pid: Option<u32>, signal: nix::sys::signal::Signal) {
 /// detach where `Child::wait` returned `None`. Distinguishes a real `0`
 /// (clean exit) from "unknown" so `attach` can replay the correct
 /// `Notification::Exit { code }` (`None` here) to a late-reconnecting client.
-const EXIT_CODE_NONE: i32 = i32::MIN;
-
-/// How long [`reader_loop`] keeps draining output after the child has been
-/// reaped, before it publishes `Exit`.
-///
-/// The daemon cannot key exit off the reader seeing EOF, because on Windows it
-/// never does: a ConPTY's output pipe belongs to the pseudoconsole, which
-/// outlives the child and is released only when the master is dropped at
-/// `close`. A shell that exits on its own — `exit`, a crash, a finished agent —
-/// produces no EOF at all, so an EOF-only loop would never fan out
-/// `Notification::Exit`, never drop the checkpoint, and leave the entry looking
-/// live to `list` forever.
-///
-/// The window covers the hand-off race: `child.wait()` can return while the last
-/// bytes the child wrote are still in flight, and those belong in the ring ahead
-/// of `Exit`. It only ever delays a session that has already ended.
-///
-/// A deadline from the moment of reaping rather than an idle timeout, for the same
-/// reason as its twin in `oximux-pty`: a detached grandchild that inherits the pty
-/// and keeps writing would hold an idle timeout open forever, and the session
-/// would never report `Exit` — the original bug, reintroduced.
-const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
-
-/// Wake-up granularity for the drain loop while no output is arriving.
-const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-// The reader task owns the PTY's full I/O state (reader, child handle, ring,
-// subscribers, exit flags); threading it as discrete args keeps the spawn site
-// explicit rather than hiding it behind a bag struct.
-#[allow(clippy::too_many_arguments)]
-fn reader_loop(
-    pty_id: String,
-    mut reader: Box<dyn Read + Send>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    ring: Arc<Mutex<RingBuffer>>,
-    subscribers: Arc<Mutex<Vec<Subscriber>>>,
-    child_exited: Arc<AtomicBool>,
-    exit_code: Arc<AtomicI32>,
-    bytes_out: Arc<AtomicU64>,
-    checkpoints: Option<Arc<CheckpointStore>>,
-    restarting: Arc<AtomicBool>,
-) {
-    // Reap on a thread of its own rather than after the read loop, and read on a
-    // thread of its own rather than inline, so the loop below can end the session
-    // on whichever comes first: EOF, or the child being reaped plus a short
-    // drain. Waiting for EOF alone is what does not port — see `POST_EXIT_DRAIN`.
-    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<Option<i32>>(1);
-    std::thread::spawn(move || {
-        let code = child.wait().ok().map(|s| s.exit_code() as i32);
-        let _ = exit_tx.send(code);
-    });
-
-    // Dropping `bytes_tx` is how the reader reports EOF, keeping the unix path's
-    // "pty closed, session over" behaviour exactly as it was.
-    let (bytes_tx, bytes_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
-    let pty_id_for_reader = pty_id.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; READ_CHUNK_BYTES];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => return,
-                Ok(n) => {
-                    // Blocking send: these bytes are the scrollback, so applying
-                    // backpressure to the pty is right and dropping them is not.
-                    if bytes_tx.send(buf[..n].to_vec()).is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(?e, pty_id = pty_id_for_reader, "reader EOF/err");
-                    return;
-                }
-            }
-        }
-    });
-
-    let publish = |bytes: &[u8]| {
-        bytes_out.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        // Lock-order discipline: ring before subscribers, same
-        // order `attach` uses, to keep snapshot+push atomic.
-        let mut rb = ring.lock().expect("ring poisoned");
-        rb.push(bytes);
-        drop(rb);
-        fan_out(
-            &subscribers,
-            Notification::Output {
-                pty_id: pty_id.clone(),
-                attachment_id: UNROUTED_ATTACHMENT,
-                bytes: bytes.to_vec(),
-            },
-        );
-    };
-
-    let mut reaped: Option<Option<i32>> = None;
-    let mut drain_deadline: Option<Instant> = None;
-    // Whether a daemon restart ended this session, decided the moment the end
-    // is first seen — not after the drain, when a restart that began since
-    // would claim a session that had already ended on its own.
-    let mut ended_by_restart: Option<bool> = None;
-    loop {
-        match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
-            Ok(chunk) => publish(&chunk),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                ended_by_restart.get_or_insert_with(|| restarting.load(Ordering::SeqCst));
-                break;
-            }
-        }
-        if reaped.is_none()
-            && let Ok(code) = exit_rx.try_recv()
-        {
-            ended_by_restart.get_or_insert_with(|| restarting.load(Ordering::SeqCst));
-            reaped = Some(code);
-            drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
-        }
-        if let Some(deadline) = drain_deadline
-            && Instant::now() >= deadline
-        {
-            break;
-        }
-    }
-
-    // Output the reader already handed over belongs in the ring ahead of `Exit`.
-    while let Ok(chunk) = bytes_rx.try_recv() {
-        publish(&chunk);
-    }
-
-    // On the EOF route the reaper has not been consulted yet, and its status is
-    // worth blocking for: EOF means the pty is gone, so `wait` is about to
-    // return. On the reaped route the code is already in hand.
-    let code = match reaped {
-        Some(code) => code,
-        None => exit_rx.recv().unwrap_or(None),
-    };
-    // Stash the status BEFORE flipping `child_exited`, so any reader that
-    // observes the flag (here or in `attach`) also sees the final code.
-    exit_code.store(code.unwrap_or(EXIT_CODE_NONE), Ordering::Release);
-    // Release-ordered so the corresponding Acquire load in `close`
-    // observes the flag flip without sequencing the fan_out below.
-    child_exited.store(true, Ordering::Release);
-    // Ended by a daemon restart, not by itself: keep the checkpoint the app
-    // restores from, and stay quiet — see `PtyRegistry::restarting`.
-    if ended_by_restart.unwrap_or_else(|| restarting.load(Ordering::SeqCst)) {
-        tracing::debug!(pty_id, "session ended by a daemon restart; keeping its checkpoint");
-        return;
-    }
-    // Natural child exit is a clean end — drop the disk checkpoint so
-    // an exited shell never cold-restores on the next launch. (The
-    // `close` path removes too; remove is idempotent.)
-    if let Some(store) = &checkpoints {
-        let _ = store.remove(&pty_id);
-    }
-    fan_out(
-        &subscribers,
-        Notification::Exit {
-            pty_id: pty_id.clone(),
-            attachment_id: UNROUTED_ATTACHMENT,
-            code,
-        },
-    );
-}
-
-fn fan_out(subscribers: &Arc<Mutex<Vec<Subscriber>>>, notif: Notification) {
-    let mut subs = subscribers.lock().expect("subs poisoned");
-    // Drop subscribers whose receiver has been dropped. For "full" we keep the
-    // subscriber but discard the message — the replay ring is the source of
-    // truth for a slow client. Discarding *silently* is what this used to do,
-    // and it made that recovery unreachable: the client had no way to learn it
-    // had missed anything, so it never re-attached and kept rendering a
-    // terminal with a hole in it.
-    subs.retain_mut(|sub| {
-        // A pending gap is announced before any further output, so the client
-        // re-attaches rather than compositing new bytes onto a stale grid.
-        // This cannot be sent at the moment the gap opens: the queue being
-        // full is precisely what caused it, so the signal waits for room.
-        if sub.gapped {
-            match sub.tx.try_send(Notification::Gapped {
-                pty_id: pty_id_of(&notif).to_owned(),
-                attachment_id: sub.attachment_id,
-            }) {
-                Ok(()) => sub.gapped = false,
-                // Still backed up. Keep the flag and try again next time
-                // rather than dropping the notice along with the bytes.
-                Err(TrySendError::Full(_)) => return true,
-                Err(TrySendError::Closed(_)) => return false,
-            }
-        }
-        // Address each copy to the attachment it is going to. The daemon
-        // already sent one per attachment; naming it is what lets a client
-        // holding several on one PTY route them to the right subscriber
-        // instead of showing every byte once per attachment it holds.
-        match sub.tx.try_send(notif.clone().addressed_to(sub.attachment_id)) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                tracing::warn!("subscriber queue full; dropping notification");
-                sub.gapped = true;
-                true
-            }
-            Err(TrySendError::Closed(_)) => false,
-        }
-    });
-}
-
-/// The session a notification belongs to. Every variant carries one, so a gap
-/// notice can be addressed to the same session as the output it displaced.
-fn pty_id_of(notif: &Notification) -> &str {
-    match notif {
-        Notification::Output { pty_id, .. }
-        | Notification::Exit { pty_id, .. }
-        | Notification::Attention { pty_id, .. }
-        | Notification::Gapped { pty_id, .. } => pty_id,
-    }
-}
+pub(crate) const EXIT_CODE_NONE: i32 = i32::MIN;
 
 #[cfg(test)]
 mod detach_tests {
@@ -1487,8 +1298,9 @@ mod close_tests {
             })
             .expect("spawn");
         let mut replay = Vec::new();
+        let (requester, _rx) = tokio::sync::mpsc::channel(8);
         for _ in 0..100 {
-            replay = reg.replay(&pty_id).expect("replay").0;
+            replay = reg.replay(&pty_id, &requester).expect("replay").0;
             if String::from_utf8_lossy(&replay).contains("fresh") {
                 break;
             }

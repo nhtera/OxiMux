@@ -725,7 +725,7 @@ async fn handle_request(
         },
         // No `owned.push` here, unlike Attach: this mints no attachment, so
         // there is nothing for the connection teardown to release.
-        Request::Replay { pty_id } => match registry.replay(&pty_id) {
+        Request::Replay { pty_id } => match registry.replay(&pty_id, notif_tx) {
             Ok((replay, cols, rows)) => Response::ReplayOk { replay, cols, rows },
             Err(e) => err_from(&e),
         },

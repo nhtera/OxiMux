@@ -13,13 +13,16 @@ use crate::actions::{
     OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, OpenWorkspaceCreate, ReloadCustomCommands,
     RevealActiveWorkspace, Search, SelectSourceControlTab, ShowWelcomeWizard, RestartTerminalDaemon, KillAllTerminalSessions, SplitHorizontal,
     SplitVertical, ToggleLeftSidebar,
-    ToggleRightSidebar, UiZoomIn, UiZoomOut, UiZoomReset,
+    ToggleRightSidebar, UiZoomIn, UiZoomOut, UiZoomReset, InsertPathIntoTerminal, ToggleTerminalReadOnly,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
     QuickOpen,
     Commands,
+    /// Pick a path to type into a terminal (its own index, rooted at the
+    /// terminal's directory; see `insert_path.rs`).
+    InsertPath,
 }
 
 /// One actionable command shown in the Command Palette mode.
@@ -68,6 +71,8 @@ pub const PALETTE_KEYWORDS: &[(&str, &str)] = &[
     ("New Workspace", "new workspace worktree branch create"),
     ("Restart Terminal Daemon", "relay daemon pty restart"),
     ("Kill All Terminal Sessions", "relay daemon pty kill end close sessions"),
+    ("Insert Path into Terminal", "file folder directory path type paste"),
+    ("Toggle Read-Only Terminal", "lock unlock readonly read only input protect"),
 ];
 
 /// The text the matcher scores for a built-in command: name + keywords.
@@ -209,6 +214,16 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         name: "Mobile Emulator: Show Device Logs",
         action_id: None,
         make_action: || Box::new(crate::actions::SimOpenLogs),
+    },
+    CommandEntry {
+        name: "Insert Path into Terminal",
+        action_id: Some("insert_path"),
+        make_action: || Box::new(InsertPathIntoTerminal),
+    },
+    CommandEntry {
+        name: "Toggle Read-Only Terminal",
+        action_id: Some("toggle_terminal_read_only"),
+        make_action: || Box::new(ToggleTerminalReadOnly),
     },
     CommandEntry {
         name: "Search Pane",
@@ -372,14 +387,15 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_thirty_seven_entries() {
+    fn palette_commands_has_thirty_nine_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
         // + "Reveal Active Workspace" + "Show Mobile Emulator"
         // + the Android "Back" and "Recents" simulator rows
         // + "Restart Terminal Daemon" + "Kill All Terminal Sessions"
-        // + a real phone's Volume Up / Volume Down and the iPhone's Action.
-        assert_eq!(PALETTE_COMMANDS.len(), 37);
+        // + a real phone's Volume Up / Volume Down and the iPhone's Action
+        // + "Insert Path into Terminal" + "Toggle Read-Only Terminal".
+        assert_eq!(PALETTE_COMMANDS.len(), 39);
     }
 
     /// The daemon commands answer to what people call the thing.

@@ -222,6 +222,7 @@ fn snapshot_sub_pane_tree(
                         cwd,
                         surface_id: view.surface_id().to_string(),
                         tab_id: view.tab_id().to_string(),
+                        read_only: view.is_read_only(),
                     }
                 })
                 .collect(),
@@ -234,6 +235,7 @@ fn snapshot_sub_pane_tree(
         let cwd = active.and_then(|t| t.cwd.clone());
         let surface_id = active.map(|t| t.surface_id.clone()).unwrap_or_default();
         let tab_id = active.map(|t| t.tab_id.clone()).unwrap_or_default();
+        let read_only = active.is_some_and(|t| t.read_only);
         // Only emit the `tabs` list for genuine multi-tab leaves so
         // single-tab leaves keep the compact legacy blob shape.
         let (tabs, active_tab) = if tabs.len() > 1 {
@@ -247,6 +249,7 @@ fn snapshot_sub_pane_tree(
             tab_id,
             tabs,
             active_tab,
+            read_only,
         });
     }
     let active_dfs_pos = leaves

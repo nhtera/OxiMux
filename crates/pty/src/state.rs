@@ -27,8 +27,10 @@ use alacritty_terminal::vte::ansi::{
 };
 
 use crate::backend::TerminalSessionId;
-use crate::events::TerminalEvent;
+use crate::events::{CommandMarkKind, TerminalEvent};
 use crate::osc7::{OscHit, OscScanner};
+use crate::program_status::ReplyTicket;
+use crate::program_status::tracker::{ProgramStatusTracker, RootChange};
 use crate::polarity::{BackgroundPolarity, background_polarity};
 use crate::snapshot::{Cell, CellColor, HyperlinkSpan, NamedColor16, TerminalSnapshot};
 
@@ -127,6 +129,9 @@ pub struct TerminalState {
     /// reflowing resize) invalidates every one of them, so the drop is
     /// reported as [`TerminalEvent::ScrollbackReset`].
     last_history: usize,
+    /// OSC 7501 records, the handshake bit, and — when this terminal owns the
+    /// PTY's replies — the reply gate. See `program_status`.
+    program_status: ProgramStatusTracker,
 }
 
 impl TerminalState {
@@ -160,6 +165,7 @@ impl TerminalState {
             bell,
             sink,
             last_history: 0,
+            program_status: ProgramStatusTracker::default(),
         }
     }
 
@@ -188,6 +194,99 @@ impl TerminalState {
             self.advance(bytes);
         }
         self.clear_collected();
+    }
+
+    /// Replay a daemon's buffered output (attach, gap resync) into a fresh
+    /// grid. Like [`advance`](Self::advance) + [`clear_collected`](Self::clear_collected),
+    /// except that program-status records are kept, so a re-attached agent's
+    /// last reported state is not lost. Nothing in it is ever answered: those
+    /// queries were the live stream's, and were answered then.
+    pub fn replay(&mut self, bytes: &[u8]) {
+        let mut hits: Vec<OscHit> = Vec::new();
+        self.scanner.feed(bytes, |h| {
+            if matches!(
+                h,
+                OscHit::ProgramStatusQuery
+                    | OscHit::ProgramStatus(_)
+                    | OscHit::Ris
+                    | OscHit::CommandMark { kind: CommandMarkKind::PromptStart, .. }
+            ) {
+                hits.push(h)
+            }
+        });
+        let now = std::time::Instant::now();
+        for hit in hits {
+            let _ = self.apply_program_status_hit(hit, false, now);
+        }
+        self.advance(bytes);
+        self.clear_collected();
+    }
+
+    /// Whether this terminal answers OSC 7501 feature queries itself. Set by a
+    /// backend that owns the PTY's replies; off for a mirror of a stream someone
+    /// else answers (a current relay daemon answers its own PTYs).
+    pub fn set_answers_program_status(&mut self, answers: bool) {
+        self.program_status.set_answers_queries(answers);
+    }
+
+    /// Take the program-status reply the last live chunk earned, if any. The
+    /// backend writes [`PROGRAM_STATUS_REPLY`](crate::program_status::PROGRAM_STATUS_REPLY)
+    /// off the read path, then calls `mark_written` on the ticket.
+    pub fn take_program_status_reply(&mut self) -> Option<std::sync::Arc<ReplyTicket>> {
+        self.program_status.take_reply()
+    }
+
+    /// The current root status as an event, for a backend to queue right after
+    /// a replay so consumers start from it. `None` when nothing is reporting.
+    pub fn program_status_event(&self, id: TerminalSessionId) -> Option<TerminalEvent> {
+        let root = self.program_status.consumer_root()?;
+        Some(TerminalEvent::ProgramStatus {
+            id,
+            root: Some(root),
+            handshake: self.program_status.handshake(),
+        })
+    }
+
+    /// The root status consumers hold now (`None`: nobody is reporting).
+    pub fn program_status_root(&self) -> Option<crate::program_status::ProgramRecord> {
+        self.program_status.consumer_root()
+    }
+
+    /// After a rebuild (gap resync), the event that brings consumers from
+    /// `before` to what the replay shows, if they differ — a change that fell
+    /// inside the gap is otherwise never announced.
+    pub fn program_status_change_since(
+        &self,
+        id: TerminalSessionId,
+        before: Option<&crate::program_status::ProgramRecord>,
+    ) -> Option<TerminalEvent> {
+        let root = self.program_status.consumer_root();
+        (root.as_ref() != before).then(|| TerminalEvent::ProgramStatus {
+            id,
+            root,
+            handshake: self.program_status.handshake(),
+        })
+    }
+
+    /// Carry program-status ownership and handshake into a rebuilt state (a gap
+    /// resync replaces the whole terminal).
+    pub fn inherit_program_status(&mut self, from: &TerminalState) {
+        self.program_status.inherit(&from.program_status);
+    }
+
+    /// Route one hit to the program-status tracker. `Some(root)` is a change
+    /// consumers must hear about.
+    fn apply_program_status_hit(&mut self, hit: OscHit, live: bool, now: std::time::Instant) -> RootChange {
+        match hit {
+            OscHit::ProgramStatusQuery => {
+                self.program_status.on_query(live, now);
+                None
+            }
+            OscHit::ProgramStatus(report) => self.program_status.on_report(report),
+            OscHit::Ris => self.program_status.on_reset(),
+            OscHit::CommandMark { kind: CommandMarkKind::PromptStart, .. } => self.program_status.on_prompt(),
+            _ => None,
+        }
     }
 
     /// Feed live PTY bytes and return everything that warrants a backend
@@ -231,6 +330,7 @@ impl TerminalState {
             let history = self.term.grid().history_size() as u64;
             let cursor_line = self.term.grid().cursor.point.line.0.max(0) as u64;
             let line = history + cursor_line;
+            let now = std::time::Instant::now();
             for hit in hits {
                 match hit {
                     OscHit::Cwd(path) => out.push(TerminalEvent::CwdChanged { id, path }),
@@ -240,7 +340,10 @@ impl TerminalState {
                             kind,
                             exit,
                             line,
-                        })
+                        });
+                        if kind == CommandMarkKind::PromptStart {
+                            self.push_program_status(id, hit_prompt_start(), now, &mut out);
+                        }
                     }
                     OscHit::Progress { state, value } => {
                         out.push(TerminalEvent::Progress { id, state, value })
@@ -251,6 +354,15 @@ impl TerminalState {
                     // Pushed in stream order, so a prompt mark that follows the
                     // wipe in the same read lands after it and survives.
                     OscHit::HistoryWiped => out.push(TerminalEvent::ScrollbackReset { id }),
+                    hit @ (OscHit::Ris | OscHit::ProgramStatusQuery | OscHit::ProgramStatus(_)) => {
+                        self.push_program_status(id, hit, now, &mut out)
+                    }
+                    OscHit::Notify { title, body } => out.push(TerminalEvent::Notify {
+                        id,
+                        title,
+                        body,
+                        explicit: false,
+                    }),
                 }
             }
         }
@@ -279,6 +391,19 @@ impl TerminalState {
             }
         }
         out
+    }
+
+    fn push_program_status(
+        &mut self,
+        id: TerminalSessionId,
+        hit: OscHit,
+        now: std::time::Instant,
+        out: &mut Vec<TerminalEvent>,
+    ) {
+        if let Some(root) = self.apply_program_status_hit(hit, true, now) {
+            let handshake = self.program_status.handshake();
+            out.push(TerminalEvent::ProgramStatus { id, root, handshake });
+        }
     }
 
     /// Discard events accumulated by `advance` during a replay — a restored
@@ -522,6 +647,12 @@ impl TerminalState {
             snap.cells.push(row_cells);
         }
     }
+}
+
+/// A prompt-start hit for the tracker, rebuilt after the original was moved
+/// into its `CommandMark` event.
+fn hit_prompt_start() -> OscHit {
+    OscHit::CommandMark { kind: CommandMarkKind::PromptStart, exit: None }
 }
 
 fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {

@@ -42,6 +42,9 @@ pub struct PersistedFloatingTab {
     pub surface_id: String,
     #[serde(default)]
     pub tab_id: String,
+    /// The terminal is read-only (see `terminal_locks`). `false` for older blobs.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// The whole per-window blob.
@@ -100,6 +103,7 @@ mod tests {
                     external_id: Some("ext-1".into()),
                     surface_id: "surface-a".into(),
                     tab_id: "tab-a".into(),
+                    read_only: true,
                 },
                 PersistedFloatingTab {
                     custom_title: Some("build".into()),

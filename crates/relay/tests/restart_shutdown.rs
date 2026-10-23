@@ -31,7 +31,9 @@ fn sh(script: &str) -> SpawnArgs {
 }
 
 fn scrollback(base: &Path, pty_id: &str) -> String {
-    String::from_utf8_lossy(&std::fs::read(base.join(pty_id).join("scrollback.bin")).unwrap_or_default())
+    String::from_utf8_lossy(&oximux_relay_proto::checkpoint_codec::decode(
+        &std::fs::read(base.join(pty_id).join("scrollback.bin")).unwrap_or_default(),
+    ))
         .into_owned()
 }
 

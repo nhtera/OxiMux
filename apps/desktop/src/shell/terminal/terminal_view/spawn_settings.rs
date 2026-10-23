@@ -109,6 +109,12 @@ fn spawn_shell() -> Option<ResolvedShell> {
         .clone()
 }
 
+/// The program a new interactive pane runs: the user's pick, else the
+/// platform default. Insert Path quotes for it.
+pub(super) fn spawn_shell_program() -> String {
+    spawn_shell().map(|s| s.program).unwrap_or_else(oximux_shell_env::default_shell)
+}
+
 /// A [`SpawnConfig`] whose shell honors the user's resolved choice, falling
 /// back to whatever the platform resolver picked.
 ///

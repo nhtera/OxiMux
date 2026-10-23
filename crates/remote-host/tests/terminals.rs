@@ -87,6 +87,10 @@ impl TerminalSource for FakeTerminals {
     }
 
     async fn input(&self, pty_id: &str, bytes: &[u8]) -> Result<(), TerminalError> {
+        // Locked read-only by the desktop that hosts it.
+        if pty_id == "pty-locked" {
+            return Err(TerminalError::ReadOnly);
+        }
         if pty_id != "pty-1" {
             return Err(TerminalError::NotFound);
         }
@@ -218,6 +222,40 @@ async fn a_full_access_device_lists_attaches_and_types() {
         &[b"ls\n".to_vec()],
         "the keystrokes actually reached the terminal",
     );
+}
+
+/// Input needs no attach (`oximux term send`), and a terminal locked on the
+/// desktop answers with the one message clients map to "denied". Pinned here
+/// because the CLI's exit code matches it exactly: a host that rendered the
+/// error some other way would turn a lock into a generic failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_without_an_attach_lands_and_a_locked_terminal_refuses_it() {
+    let h = harness(None);
+    let pubkey = [0x33; 32];
+    let (client, server) = duplex_pair();
+    let serve = h.dispatcher.serve(&server);
+    let typed = Arc::clone(&h.typed);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey, None))).await
+        else {
+            panic!("expected Registered");
+        };
+        let ack = call(&client, Request::TermInput { pty_id: "pty-1".into(), bytes: b"ls\r".to_vec() })
+            .await;
+        assert_eq!(ack, Response::Ack, "no attach is needed to type");
+        let refused =
+            call(&client, Request::TermInput { pty_id: "pty-locked".into(), bytes: b"rm\r".to_vec() })
+                .await;
+        assert_eq!(
+            refused,
+            Response::Error(RpcError::BadRequest(oximux_remote_proto::READ_ONLY_TERMINAL.into()))
+        );
+    };
+
+    futures::future::join(serve, script).await;
+    assert_eq!(typed.lock().await.as_slice(), &[b"ls\r".to_vec()], "the locked one got nothing");
 }
 
 /// A read-only device watches a terminal it cannot drive.

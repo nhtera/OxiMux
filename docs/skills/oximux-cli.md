@@ -62,7 +62,10 @@ stopped waiting.
 | 3 | no host answered — retrying may help |
 | 4 | timed out |
 | 5 | not allowed — retrying will not help |
+| 6 | `serve` only: another host holds the data directory — do not restart |
 | 7 | waiting on the user (`sim` consent) — wait, then retry |
+| 8 | a short id or prefix matched nothing, or several — nothing was sent (a full UUID the host does not know is 1) |
+| 130 | stopped with Ctrl+C |
 
 Branch on the number. `--json` prints `{"ok":true,"data":…}` or
 `{"ok":false,"error":{code,message,next_steps}}`; streaming verbs emit NDJSON
@@ -120,6 +123,31 @@ do: a session parked on a permission request has not ended its turn, so
 `--until done` keeps waiting and then exits 4 on the timeout — it does not
 return early. Waiting on `needs-approval` in parallel, or polling
 `permit ls`, is how you find out that a decision is what the turn is missing.
+
+Every session or terminal UUID also takes a unique prefix of 4+ characters
+(`oximux stop 1f3a`); other ids are given in full. A prefix that matches
+nothing, or several, exits **8** and sends nothing; the candidates go to
+stderr. `--json` output always carries
+full ids.
+
+To watch many sessions at once, stream changes instead of polling `ls`:
+
+```sh
+oximux events --json                          # NDJSON: added / removed / changed
+oximux events --until awaiting-permission     # exit 0 once any session needs a decision
+```
+
+Ctrl+C stops it with exit 130.
+
+## Typing into a terminal
+
+```sh
+oximux term ls
+oximux term send 7a2c 'npm test' --enter      # no attach; no newline unless --enter
+oximux term send 7a2c --keys ctrl-c           # named keys: up, esc, f5, ctrl-<a-z>, alt-<c>…
+```
+
+A terminal locked read-only in the desktop app refuses input with exit 5.
 
 ## Deciding for an agent
 

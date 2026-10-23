@@ -79,6 +79,10 @@ impl WorkspaceRoot {
         );
         let mut specs = Vec::new();
         for tab in &blob.tabs {
+            // Locked again before the view mounts, so no input reaches it.
+            if tab.read_only {
+                crate::shell::terminal::terminal_locks::set(&tab.tab_id, tab.external_id.as_deref(), true);
+            }
             let ids = SurfaceIds::restored(tab.cwd.clone(), tab.surface_id.clone(), tab.tab_id.clone());
             let reattached = tab.external_id.as_deref().and_then(|ext| {
                 (session_ok && snap.live_external_ids.contains(ext))
@@ -177,6 +181,19 @@ impl WorkspaceRoot {
                 }
                 FloatingTerminalEvent::RenameRequested { idx } => {
                     this.open_floating_rename_dialog(*idx, window, cx);
+                }
+                FloatingTerminalEvent::Banner { session, label, cwd, kind, body, explicit, pane_visible } => {
+                    this.notifier.notify(crate::notifier::NotificationRequest {
+                        source: crate::notifier::NotificationSource::TerminalBell,
+                        kind: *kind,
+                        tab_id: crate::notifier::TabId(session.0),
+                        workspace_key: crate::notifier::terminal_burst_key(cwd, *explicit),
+                        label: label.clone(),
+                        body: body.clone(),
+                        window_active: window.is_window_active(),
+                        pane_visible: *pane_visible,
+                        coalesce_until_focus: false,
+                    });
                 }
             },
         ));

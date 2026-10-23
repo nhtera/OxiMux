@@ -8,9 +8,10 @@
 //   `TerminalState` per session for snapshot/search/serialize calls
 //   that should stay local (no socket round trip).
 
+mod attach;
 pub mod backend;
 pub mod client;
 mod codec;
 
-pub use backend::RelayBackend;
+pub use backend::{PROGRAM_STATUS_REPLIES_SINCE, RelayBackend, daemon_answers_program_status};
 pub use client::{ClientError, RelayClient, endpoint_answers};

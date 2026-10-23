@@ -43,7 +43,9 @@ uuid = { workspace = true }
 # `user` for `User::from_uid` — the getpwuid probe in `host_lookup`. It rides in
 # on nix's defaults today; naming it keeps that from becoming a silent
 # compile break if anyone ever sets `default-features = false` here.
-nix = { version = "0.25", features = ["signal", "user"] }
+# `process` for `getsid`/`getpgrp`: the reattach repaint nudge checks that the
+# PTY's foreground group belongs to the session it spawned before signalling.
+nix = { version = "0.25", features = ["signal", "user", "process"] }
 
 # Windows-only. `widestring` hands the pipe's security descriptor to
 # `interprocess` as UTF-16; the job object is the process group's stand-in, so a

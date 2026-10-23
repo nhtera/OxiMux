@@ -23,6 +23,9 @@ pub enum LinkTarget {
         line: Option<u32>,
         col: Option<u32>,
     },
+    /// An OSC 8 hyperlink whose scheme is not one OxiMux will hand to the
+    /// system (see [`classify_osc8_target`]). Shown, never opened.
+    Blocked { uri: String, scheme: String },
 }
 
 /// A detected link plus the inclusive column span it occupies on the row, so
@@ -111,10 +114,15 @@ pub fn classify_link(token: &str) -> Option<LinkTarget> {
     classify_path(token)
 }
 
+/// `s` begins with the scheme prefix `sc`, in any case (`HTTPS://…`).
+fn has_scheme_prefix(s: &str, sc: &str) -> bool {
+    s.get(..sc.len()).is_some_and(|p| p.eq_ignore_ascii_case(sc))
+}
+
 fn scheme_len(s: &str) -> usize {
     SCHEMES
         .iter()
-        .find(|sc| s.starts_with(**sc))
+        .find(|sc| has_scheme_prefix(s, sc))
         .map(|sc| sc.len())
         .unwrap_or(0)
 }
@@ -122,7 +130,7 @@ fn scheme_len(s: &str) -> usize {
 fn classify_url(token: &str) -> Option<String> {
     SCHEMES
         .iter()
-        .any(|sc| token.starts_with(sc))
+        .any(|sc| has_scheme_prefix(token, sc))
         .then(|| token.to_string())
 }
 
@@ -235,9 +243,180 @@ fn looks_like_path(s: &str) -> bool {
     false
 }
 
+/// What an OSC 8 hyperlink may do when clicked. A program chooses the target
+/// freely and the text it shows independently, so only schemes that cannot
+/// run anything go to the system handler: a `file:` URL handed to it would
+/// let LaunchServices execute the file (a `.command`, an app bundle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Osc8Action {
+    /// `http`, `https` or `mailto`: the system handler.
+    Open(String),
+    /// `file://`: OxiMux's own editor, never the system handler.
+    OpenInEditor(PathBuf),
+    /// Anything else — `ssh`, `git`, custom app schemes, `javascript:`, a bare
+    /// path — carrying the scheme for the "Blocked link" message.
+    Blocked(String),
+}
+
+/// Classify an OSC 8 target. Shared by Cmd-click and the context menu.
+pub fn classify_osc8_target(uri: &str) -> Osc8Action {
+    let Some(scheme) = uri_scheme(uri) else {
+        return Osc8Action::Blocked("none".into());
+    };
+    match scheme.as_str() {
+        "http" | "https" | "mailto" => Osc8Action::Open(uri.to_string()),
+        "file" => match file_url_path(uri) {
+            Some(path) => Osc8Action::OpenInEditor(path),
+            None => Osc8Action::Blocked(scheme),
+        },
+        _ => Osc8Action::Blocked(scheme),
+    }
+}
+
+/// The OSC 8 target as a [`LinkTarget`], so a hyperlink shares every path
+/// the plain-text links take (underline, context menu, open).
+pub fn osc8_link_target(uri: &str) -> LinkTarget {
+    match classify_osc8_target(uri) {
+        Osc8Action::Open(url) => LinkTarget::Url(url),
+        Osc8Action::OpenInEditor(path) => LinkTarget::Path { path, line: None, col: None },
+        Osc8Action::Blocked(scheme) => LinkTarget::Blocked { uri: uri.to_string(), scheme },
+    }
+}
+
+/// The lowercase scheme of `uri` (`[A-Za-z][A-Za-z0-9+.-]*` before `:`).
+fn uri_scheme(uri: &str) -> Option<String> {
+    let (scheme, _) = uri.split_once(':')?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+    valid.then(|| scheme.to_ascii_lowercase())
+}
+
+/// Whether `uri` is a `file:` URL, in any case — decided by the scheme alone,
+/// so one that fails to parse is still known to be a file URL.
+pub fn is_file_url(uri: &str) -> bool {
+    uri_scheme(uri).as_deref() == Some("file")
+}
+
+/// The local path of a `file:` URL, any case. `None` for anything else, and
+/// for a file URL that does not parse (see [`is_file_url`]).
+pub fn file_url_path(uri: &str) -> Option<PathBuf> {
+    if !is_file_url(uri) {
+        return None;
+    }
+    // `parse_file_uri` wants the canonical lowercase spelling.
+    oximux_pty::osc7::parse_file_uri(&format!("file{}", &uri[4..]))
+}
+
+/// The host of a URL-looking string (`scheme://host…`, or a bare `host.tld…`),
+/// lowercased, for comparing a link's shown text with its real target.
+fn url_host(text: &str) -> Option<String> {
+    let text = text.trim();
+    let rest = match text.split_once("://") {
+        Some((_, rest)) => rest,
+        None if text.contains('.') && !text.contains(char::is_whitespace) => text,
+        None => return None,
+    };
+    let bare = !text.contains("://");
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    // Bare text reads as a host only when it ends in a word-like label, so a
+    // version (`v1.2.3`) or a `file.c:12` reference is not mistaken for one.
+    let tld_like = host
+        .rsplit('.')
+        .next()
+        .is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()));
+    let is_host = if bare { host.contains('.') && tld_like } else { host.contains('.') || host == "localhost" };
+    is_host.then_some(host)
+}
+
+/// Whether an OSC 8 link's visible text claims a different destination than
+/// its target: the text reads as a URL or host, and that host is not the
+/// target's. A link titled "click here" claims nothing and is not flagged.
+pub fn osc8_text_misleads(shown: &str, target: &str) -> bool {
+    // A file link (`ls --hyperlink`, compiler output) shows a file name, which
+    // can look like a host; it misleads only when it spells out another URL.
+    if is_file_url(target) {
+        return shown.contains("://") && !is_file_url(shown.trim());
+    }
+    match (url_host(shown), url_host(target)) {
+        (Some(shown), Some(real)) => shown != real,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc8_opens_only_web_and_mail_links_through_the_system() {
+        for ok in ["https://example.com/x", "HTTPS://Example.com", "http://a.b", "mailto:me@x.org"] {
+            assert!(matches!(classify_osc8_target(ok), Osc8Action::Open(_)), "{ok}");
+        }
+        for (bad, scheme) in [
+            ("ssh://host", "ssh"),
+            ("git://h/r", "git"),
+            ("javascript:alert(1)", "javascript"),
+            ("vscode://file/x", "vscode"),
+            ("x-custom-app:do", "x-custom-app"),
+            ("ftp://h/f", "ftp"),
+            ("/usr/bin/true", "none"),
+            ("relative/path", "none"),
+        ] {
+            assert_eq!(classify_osc8_target(bad), Osc8Action::Blocked(scheme.into()), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_osc8_file_link_goes_to_the_editor_never_the_system() {
+        assert_eq!(
+            classify_osc8_target("file:///tmp/evil.command"),
+            Osc8Action::OpenInEditor(PathBuf::from("/tmp/evil.command"))
+        );
+        assert_eq!(
+            classify_osc8_target("FILE://host/tmp/x.app"),
+            Osc8Action::OpenInEditor(PathBuf::from("/tmp/x.app"))
+        );
+        assert!(matches!(osc8_link_target("file:///tmp/a"), LinkTarget::Path { .. }));
+        assert!(matches!(osc8_link_target("ssh://h"), LinkTarget::Blocked { .. }));
+        // A plain-text `file://` URL is routed to the editor too.
+        assert_eq!(file_url_path("file:///tmp/a.command"), Some(PathBuf::from("/tmp/a.command")));
+        assert_eq!(file_url_path("https://x.org"), None);
+    }
+
+    #[test]
+    fn link_text_that_names_another_host_is_flagged() {
+        assert!(osc8_text_misleads("https://bank.com/login", "https://evil.example/bank"));
+        assert!(osc8_text_misleads("bank.com", "https://evil.example"));
+        assert!(!osc8_text_misleads("https://www.bank.com/a", "https://bank.com/b"));
+        assert!(!osc8_text_misleads("click here", "https://anything.example"));
+        assert!(!osc8_text_misleads("src/main.rs", "file:///repo/src/main.rs"));
+        assert!(!osc8_text_misleads("main.rs", "file:///repo/main.rs"));
+        assert!(!osc8_text_misleads("foo.c:12:3", "file:///repo/foo.c"));
+        assert!(!osc8_text_misleads("v1.2.3", "https://github.com/o/r/releases/v1.2.3"));
+        assert!(osc8_text_misleads("https://bank.com", "file:///tmp/x.command"));
+        assert!(osc8_text_misleads("https://docs.rs", "ssh://attacker"));
+    }
+
+    #[test]
+    fn a_malformed_file_url_is_still_a_file_url() {
+        assert!(is_file_url("file:///x%ZZ/y.command"));
+        assert!(is_file_url("FILE:x"));
+        assert!(file_url_path("file:///x%ZZ/y.command").is_none());
+        assert!(!is_file_url("https://x.org"));
+        // Plain-text detection is case-insensitive on the scheme.
+        assert_eq!(classify_link("HTTPS://Example.com"), Some(LinkTarget::Url("HTTPS://Example.com".into())));
+    }
 
     fn row(s: &str) -> Vec<char> {
         s.chars().collect()

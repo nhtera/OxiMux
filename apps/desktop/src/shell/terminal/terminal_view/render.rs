@@ -83,6 +83,7 @@ impl Render for TerminalView {
             dim: s.dim_alpha,
             unfocused: s.unfocused_alpha,
             unfocused_cursor: s.unfocused_cursor_alpha,
+            min_contrast: s.effective_minimum_contrast(theme.is_light()),
         };
 
         // Build owned paint params (`FnOnce + 'static` requires no
@@ -92,6 +93,7 @@ impl Render for TerminalView {
         let command_badges = self.visible_command_badges(s.exit_badges);
         let hovered_badge = self.label_badge(&command_badges, window);
         let paint_params = PaintParams {
+            radius_xs: self.density.r_xs,
             snapshot: self.snapshot.clone(),
             theme,
             typography: self.typography.clone(),
@@ -105,6 +107,7 @@ impl Render for TerminalView {
             selection: self.selection,
             command_badges,
             hovered_badge,
+            link_label: self.link_label.clone().filter(|_| self.pointer_in_view),
             alphas,
         };
 
@@ -350,6 +353,7 @@ impl Render for TerminalView {
                 this.pointer_in_view = *hovered;
                 if !*hovered {
                     this.set_hovered_badge(None, cx);
+                    this.set_link_label(None, cx);
                 }
             }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
@@ -505,7 +509,7 @@ impl Render for TerminalView {
                 this.on_key_down(event, window, cx);
             }))
             .child(grid_canvas);
-        if let Some(badge) = dormant_badge {
+        if let Some(badge) = dormant_badge.or_else(|| self.read_only_pill()) {
             root = root.child(badge);
         }
         // A pane whose PTY child has exited gets a centered "process exited"

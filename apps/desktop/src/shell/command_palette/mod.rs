@@ -5,6 +5,7 @@
 
 pub mod entry;
 pub mod file_index;
+mod insert_path;
 pub mod match_engine;
 pub mod palette_modal;
 pub mod row_render;
@@ -59,6 +60,8 @@ pub struct PaletteModal {
     index_error: Option<String>,
     /// Owns the in-flight scan-result bridge task; dropped on reuse/teardown.
     _index_task: Option<Task<()>>,
+    /// Insert Path's own index (see `insert_path.rs`).
+    insert_index: insert_path::InsertPathIndex,
     /// The query field. A real text input (not a hand-rolled key-down
     /// buffer) so paste, IME composition, shifted characters, and caret
     /// movement all work. Created lazily on first `open` — the constructor
@@ -117,6 +120,7 @@ impl PaletteModal {
             scanning: false,
             index_error: None,
             _index_task: None,
+            insert_index: Default::default(),
             query_input: None,
             _query_sub: None,
             focus_handle: cx.focus_handle(),
@@ -331,6 +335,7 @@ impl PaletteModal {
         match self.mode {
             PaletteMode::Commands => self.filtered_items().len(),
             PaletteMode::QuickOpen => self.quick_open_matches().len(),
+            PaletteMode::InsertPath => self.insert_path_matches().len(),
         }
     }
 
@@ -348,6 +353,7 @@ impl PaletteModal {
                 self.activate_item(idx, &items, window, cx);
             }
             PaletteMode::QuickOpen => self.activate_file(idx, window, cx),
+            PaletteMode::InsertPath => self.activate_insert_path(idx, cx),
         }
     }
 
@@ -394,6 +400,8 @@ impl PaletteModal {
 /// focus (the palette focuses its query field on open).
 pub enum PaletteEvent {
     Closed,
+    /// Insert Path picked this path (a directory ends in `/`).
+    InsertPath(PathBuf),
 }
 
 impl EventEmitter<PaletteEvent> for PaletteModal {}
@@ -409,6 +417,7 @@ fn placeholder_for(mode: PaletteMode) -> &'static str {
     match mode {
         PaletteMode::QuickOpen => "Search files…",
         PaletteMode::Commands => "Search commands…",
+        PaletteMode::InsertPath => "Path to insert…",
     }
 }
 
@@ -457,6 +466,9 @@ impl Render for PaletteModal {
             PaletteMode::QuickOpen => Rc::new(move |idx, window, cx| {
                 entity.update(cx, |p, cx| p.activate_file(idx, window, cx));
             }),
+            PaletteMode::InsertPath => Rc::new(move |idx, _window, cx| {
+                entity.update(cx, |p, cx| p.activate_insert_path(idx, cx));
+            }),
         };
 
         // Row sources per mode. An empty QuickOpen result
@@ -464,15 +476,16 @@ impl Render for PaletteModal {
         // so nav + Enter are inert).
         let palette_items: Vec<PaletteItem> = match mode {
             PaletteMode::Commands => self.filtered_items(),
-            PaletteMode::QuickOpen => Vec::new(),
+            PaletteMode::QuickOpen | PaletteMode::InsertPath => Vec::new(),
         };
         let file_row_strings: Vec<String> = match mode {
             PaletteMode::Commands => Vec::new(),
             PaletteMode::QuickOpen => self.quick_open_matches(),
+            PaletteMode::InsertPath => self.insert_path_matches(),
         };
         let (file_rows, row_count): (Vec<&str>, usize) = match mode {
             PaletteMode::Commands => (Vec::new(), palette_items.len()),
-            PaletteMode::QuickOpen if !file_row_strings.is_empty() => (
+            PaletteMode::QuickOpen | PaletteMode::InsertPath if !file_row_strings.is_empty() => (
                 file_row_strings.iter().map(String::as_str).collect(),
                 file_row_strings.len(),
             ),
@@ -488,6 +501,7 @@ impl Render for PaletteModal {
                 };
                 (vec![hint], 0)
             }
+            PaletteMode::InsertPath => (vec![self.insert_path_hint()], 0),
         };
 
         build_modal_layout(ModalRenderInput {

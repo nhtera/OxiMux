@@ -4,6 +4,118 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased — Agent status without hooks (OSC 7501 program status)
+
+Agents that report their own status now get it shown exactly, with no hooks
+installed.
+
+- **OxiMux answers the program-status query.** A program that supports the
+  open OSC 7501 protocol asks its terminal once, then reports idle, working,
+  done, or waiting on you (with the reason). OxiMux answers it once per PTY,
+  attached or not, and the report sets the agent's status ahead of hooks and
+  screen matching. Claude Code ≥ 2.1.295 reports this way today.
+- **Survives a reopen.** Re-attaching to a running agent restores its last
+  reported status from the daemon's buffer.
+- **Safe by default.** Report bytes printed by something else (a `cat` in a
+  plain shell) never create an agent row. Status text is sanitized before
+  display. A program that floods queries or echoes the reply cannot stall or
+  loop a pane: replies are debounced and capped, and the daemon now writes to
+  each PTY from a dedicated thread.
+- An older daemon kept after an update (because it has sessions) does not
+  know the protocol; the app answers in its place until that daemon is
+  replaced.
+
+**Terminal notifications and safer links**
+
+- **Program notifications (opt-in).** Settings → Terminal → *Program
+  notifications* shows a desktop banner when a program prints `OSC 9;<text>`
+  or `OSC 777;notify;<title>;<body>`. Off by default, since any program can.
+  The banner title is always "Terminal — <tab>"; a program's own title is
+  quoted in the body, and text is sanitized and length-capped. OSC 9;4
+  progress is unchanged.
+- **`oximux notify` shows its title and body** in the banner (it used to ring
+  the bell only), through the same path.
+- **Terminal banners no longer crowd out agent banners.** Bells and terminal
+  notifications collapse bursts under their own key, so a script printing
+  notifications in a loop cannot suppress an agent's approval banner.
+- **Hyperlinks (OSC 8) only open what is safe.** Cmd-click hands only
+  `http`, `https` and `mailto` to the system; `file://` opens in OxiMux's
+  editor and is never executed; any other scheme is blocked with a toast.
+  Hovering a hyperlink shows its real target, flagged ⚠ when the visible text
+  names a different host.
+
+**Reopening shows what was really on screen**
+
+- **Full-screen programs survive a reopen.** A TUI (an editor, `htop`, an
+  agent) keeps its alternate screen, scroll region, and mouse, paste and key
+  modes when you reopen OxiMux or a second window attaches — even after more
+  output than the replay buffer holds — and is asked to repaint.
+- **No garbled first line, no doubled output.** A reopened terminal's history
+  starts on a clean line, and output arriving during the reattach is neither
+  lost nor shown twice; recovering from a dropped frame no longer repeats it.
+- **Tearing off a pane no longer freezes the window** while it reattaches.
+- An older daemon kept after an update (because it has sessions) still works
+  as before; these improvements apply once it is replaced.
+
+**Insert a path, lock a terminal**
+
+- **Insert Path** (⌥⌘P, or the command palette): pick a file or folder under
+  the terminal's directory and it is typed at the cursor, relative where it
+  can be and quoted only when the shell needs it, the way that shell reads
+  it (POSIX shells, fish, PowerShell, or `cmd`, which refuses a path it
+  cannot quote; read from the pane's own shell process) — never with a trailing newline, and a file name holding a control
+  character is never offered.
+- **Read-only terminals**: *Make Read-Only* in a terminal's right-click menu
+  (or *Toggle Read-Only Terminal* in the palette) stops every input path —
+  keys, paste, dictation, mouse reports, and a paired phone or `oximux term
+  send` through this desktop — while scrolling, selecting and copying keep
+  working. The tab and pane show a lock, and the lock survives a restart
+  (an agent's terminal comes back unlocked). Not covered: a headless `oximux serve`, or a process writing to the
+  terminal daemon's socket directly.
+
+**CLI: type into terminals, stream session changes, short ids**
+
+- **`oximux term send <pty> [TEXT] [--keys …] [--stdin] [--enter]`** types
+  into a terminal without attaching. Named keys (`up`, `esc`, `f5`,
+  `ctrl-c`, `alt-b`, …); `--app-cursor` for full-screen programs. A terminal
+  locked read-only on the desktop exits 5. `term attach` on a locked terminal
+  keeps showing it and says it is watch-only.
+- **`oximux events [--session S] [--until awaiting-permission]`** streams one
+  line per session added, removed or changed (NDJSON with `--json`). Ctrl+C
+  exits 130; `--until` exits 0 once a session waits for a decision; with
+  `--session`, an unknown id exits 1 at once, the stream ends (exit 1) when
+  that session does, and a draft chat is followed onto the agent's own id. Turn status
+  (`--until idle` across sessions) is not in this version.
+- **Short ids.** Every session or terminal UUID takes a unique prefix of 4+
+  characters; other ids (`agent-3`) must be given in full. **Behavior
+  change:** an id that is not a full UUID and matches nothing, or a prefix
+  matching several, now exits **8** instead of 1, with the candidates on
+  stderr. A full UUID unknown to the host still exits 1, and an agent-scoped
+  caller still gets the host's answer (exit 5 for another session).
+- The published exit table now lists 6 (`serve`: data directory held), 8 and
+  130.
+
+**Lighter on idle terminals**
+
+- **Idle terminals cost almost nothing.** The terminal daemon no longer wakes
+  up 50 times a second per terminal, and a terminal's history buffer grows
+  with its output instead of reserving a megabyte up front: in a development
+  build, 200 idle shells went from ~210 MiB and ~8% CPU to ~25 MiB and under
+  1%.
+- **Crash checkpoints are 6–28× smaller** (compressed). Checkpoints written
+  by this version cannot be restored by an older one after a downgrade — a
+  restored pane would show garbage instead of its history.
+- New developer tool: `cargo run -p bench-term` measures the daemon and the
+  terminal model.
+
+**Readable program colors on the light theme**
+
+- **Minimum text contrast.** On the Paper theme, text colors a program chose
+  for dark terminals (256-color and truecolor) are darkened until they read at
+  3:1 against their background, keeping their hue. Settings → Terminal →
+  *Minimum text contrast* picks the theme default, off, 3:1, 4.5:1 or 7:1. The
+  dark theme is unchanged by default.
+
 ### 2026-10-16 — v0.1.42: Mobile Emulator: verify loop, device state, flows, phone view, MCP (#56–#69)
 
 Agents get a tighter loop on the attached device, and you get more ways to

@@ -93,6 +93,12 @@ fn main() {
         );
     }
 
+    // Read-only terminals locked in an earlier run stay locked to remote input
+    // from the first request, not from when their project is next opened.
+    if let Some(dir) = oximux_app::app_paths::data_dir() {
+        oximux_app::shell::terminal::terminal_locks::persist_to(dir.join("locked-terminals"));
+    }
+
     // Before `gpui_platform::application()`, which is where GPUI reads it, and
     // before anything spawns — it writes the environment. Without this the
     // browser pane loads its page and renders nothing: GPUI's composited window
@@ -467,8 +473,12 @@ fn main() {
         }
         // Serve terminals when the relay came up. Absent (in-process PTY
         // fallback), every terminal RPC keeps answering `Unauthorized`.
+        // Behind the read-only lock: a locked terminal takes no remote input.
         if let Some(terminals) = oximux_app::remote_control::relay_terminals::installed() {
-            remote_control.set_terminals(terminals);
+            remote_control.set_terminals(std::sync::Arc::new(oximux_app::remote_control::locked_terminals::LockedTerminals::new(
+                terminals,
+                oximux_app::shell::terminal::terminal_locks::shared_locked_ptys(),
+            )));
         }
         // The inbound half: a phone asking for a new session hands the request
         // to this loop, which opens the tab on the UI thread and answers with
@@ -1504,8 +1514,8 @@ fn boot_relay_supervisor(
             .join()
             .expect("relay handshake thread panicked")
     });
-    let (client, stale_version) = match connect_result {
-        Ok(boot) => (boot.client, boot.stale_version),
+    let (client, stale_version, version_unknown) = match connect_result {
+        Ok(boot) => (boot.client, boot.stale_version, boot.version_unknown),
         Err(SupervisorError::VersionMismatch) => {
             tracing::warn!("relay version mismatch; falling back to in-process PTYs");
             #[cfg(target_os = "macos")]
@@ -1530,7 +1540,12 @@ fn boot_relay_supervisor(
             &client_arc,
         )),
     ));
-    let backend = RelayBackend::new(std::sync::Arc::clone(&client_arc), relay_rt.handle().clone());
+    // A daemon that predates program-status replies (kept after an update, or
+    // of unknown version) leaves them to the client.
+    let client_replies = version_unknown
+        || stale_version.as_deref().is_some_and(|v| !oximux_relay_client::daemon_answers_program_status(v));
+    let backend = RelayBackend::new(std::sync::Arc::clone(&client_arc), relay_rt.handle().clone())
+        .with_program_status_replies(client_replies);
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
     install_shared_backend(shared);

@@ -16,7 +16,10 @@ differs from what is committed.
 | 3 | `host_unreachable` | No host answered. Retrying may help. |
 | 4 | `timeout` | The host did not reply in time. |
 | 5 | `access_denied` | The caller is not allowed to do this. Retrying will not help. |
+| 6 | `data_dir_held` | `serve` only: another host already holds the data directory. Do not restart on it. |
 | 7 | `pending_user` | Waiting on a person (a `sim` verb before the user allowed agents on the device). Wait, then retry. |
+| 8 | `target_not_found` | A short id or prefix matched no session or terminal, or matched several (the candidates go to stderr). Nothing was sent. A full UUID the host does not know exits 1. |
+| 130 | `interrupted` | Stopped with Ctrl+C (a streaming verb such as `events`). |
 
 ## Conventions
 
@@ -75,7 +78,7 @@ Stream a session's live events to the terminal.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `--from` | yes | Replay retained events after this sequence number first (default: attach at the live edge) |
 
 ### `oximux send`
@@ -84,7 +87,7 @@ Send a prompt into an existing session.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<PROMPT>` | yes | The prompt to send, or `-` to read it from stdin |
 | `--output-schema` | yes | Hold the final answer to a JSON Schema — a file path, or the schema itself as inline JSON. The agent is re-prompted with the validation errors up to twice; a still-invalid answer exits 1. Prints the validated JSON. Needs the turn, so it cannot be combined with --no-wait |
 | `--turn-timeout` | yes | Give up on the turn after this many seconds (exit 4). The agent is left running — only this command stops waiting. Without it the stream is unbounded, which is right for a terminal and wrong for a CI job, since a turn parked on a permission request ends only when something decides it. The global --timeout does NOT bound the turn; it bounds one host reply |
@@ -97,7 +100,7 @@ Block until a session reaches a state (or --timeout expires, exit 4).
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `--until` | yes | The state to wait for |
 | `--stalled-after` | yes | Give up if the session produces nothing for this many seconds (exit 4, distinct message). Bounds progress, not total time |
 
@@ -107,7 +110,7 @@ Fetch a session's full transcript (paged under the hood)
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 
 ### `oximux stop`
 
@@ -115,7 +118,7 @@ Interrupt a session's in-flight turn. The session stays open
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 
 ### `oximux steer`
 
@@ -123,7 +126,7 @@ Redirect a mid-turn agent with additional guidance. Needs a backend with a mid-t
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<TEXT>` | yes | The guidance to inject |
 
 ### `oximux permit`
@@ -138,7 +141,7 @@ List a session's pending permission requests and questions
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 
 #### `oximux permit allow`
 
@@ -146,7 +149,7 @@ Approve a pending permission request.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<REQUEST>` | yes | The request id (from `permit ls`; default: the latest pending) |
 | `--input` | yes | Replace the tool's input with this JSON object before approving. `permit ls --json` prints the proposed input to edit from. The object is passed through as given, so it must carry every field the tool needs — it replaces the input, it does not merge into it |
 
@@ -156,7 +159,7 @@ Deny a pending permission request
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<REQUEST>` | yes | The request id (from `permit ls`; default: the latest pending) |
 | `--message` | yes | The reason shown to the agent |
 
@@ -166,7 +169,7 @@ Answer a pending multiple-choice question.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<REQUEST>` | yes | The request id (from `permit ls`; default: the latest pending) |
 | `--answer` | yes | One answer per question, in order (label, 1-based number, or text) |
 
@@ -182,7 +185,7 @@ List the models (and modes) the session's backend offers
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 
 #### `oximux model set`
 
@@ -190,7 +193,7 @@ Switch the session's model. May be refused by backends that fix the model at spa
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<MODEL>` | yes | The model id (from `model ls`) |
 
 ### `oximux mode`
@@ -205,7 +208,7 @@ Switch the session's permission mode (ids from `model ls`)
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<MODE>` | yes | The mode id (from `model ls`) |
 
 ### `oximux git`
@@ -220,7 +223,7 @@ Working-tree status of the session's repository
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 
 #### `oximux git diff`
 
@@ -228,7 +231,7 @@ Diff one path (as listed by `git status`)
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<PATH>` | yes | Repository-relative path, as `git status` listed it |
 | `--staged` | no | Diff the index against HEAD instead of the worktree |
 | `--untracked` | no | The path is untracked (read from disk, not from git) |
@@ -239,7 +242,7 @@ Stage paths into the index
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<PATHS>` | yes | Repository-relative paths, as `git status` listed them |
 
 #### `oximux git unstage`
@@ -248,7 +251,7 @@ Remove paths from the index, leaving the worktree untouched
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<PATHS>` | yes | Repository-relative paths, as `git status` listed them |
 
 #### `oximux git commit`
@@ -257,7 +260,7 @@ Commit what is already staged
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<SESSION>` | yes | The session id (see `oximux ls`) |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `--message` | yes | The commit message |
 
 ### `oximux term`
@@ -278,7 +281,29 @@ Attach to a terminal: keystrokes go to the host, output comes back. Ctrl+] detac
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<PTY>` | yes | The terminal id (see `term ls`) |
+| `<PTY>` | yes | The terminal id, or a unique prefix of it (see `term ls`) |
+
+#### `oximux term send`
+
+Type into a terminal without attaching: text first, then `--keys`, then Enter if `--enter`. Nothing is added — no newline unless asked.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<PTY>` | yes | The terminal id, or a unique prefix of it (see `term ls`) |
+| `<TEXT>` | yes | Text to type, exactly as given |
+| `--keys` | yes | Named keys to press after the text, in order. Repeatable, or comma-separated: `--keys up,up,enter`. Names: enter, tab, esc, backspace, space, up, down, left, right, home, end, pgup, pgdn, insert, delete, f1-f12, ctrl-<a-z>, alt-<char> (any but a comma) |
+| `--stdin` | no | Read the text to type from stdin instead of the argument |
+| `--enter` | no | Press Enter after everything else |
+| `--app-cursor` | no | Send cursor keys in application mode (`ESC O A` rather than `ESC [ A`) |
+
+### `oximux events`
+
+Stream session changes as they happen: one line per session added, removed, or changed (title, model, waiting for permission). Runs until Ctrl+C (exit 130), or until `--until` is met (exit 0).
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--session` | yes | Only this session (its id, or a unique prefix of it) |
+| `--until` | yes | Exit 0 as soon as a watched session reaches this state |
 
 ### `oximux agent`
 

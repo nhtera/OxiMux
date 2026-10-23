@@ -346,6 +346,14 @@ pub(crate) fn build_project_panes(
         panes_entity.update(cx, |p, cx| p.seed_default_terminal(window, cx));
         return (panes_entity, pending);
     };
+    // Read-only locks are back before any view attaches, so not one restored
+    // keystroke (or pre-typed resume command) reaches a locked terminal.
+    for sp in snap.tabs.iter().flat_map(|t| &t.sub_panes) {
+        let locked = sp.tabs.iter().filter(|t| t.read_only).map(|t| t.tab_id.as_str());
+        for tab_id in locked.chain(sp.read_only.then_some(sp.tab_id.as_str())) {
+            crate::shell::terminal::terminal_locks::set(tab_id, None, true);
+        }
+    }
 
     // v3 path: multi-group restore when `group_tree` + `groups` are
     // present. Falls through to the legacy single-group path otherwise.
@@ -922,13 +930,14 @@ fn promote_per_pane_tabs(
     sub_panes: &[PersistedSubPane],
     active_sub_pane: usize,
 ) -> (PersistedTree, Vec<PersistedSubPane>, usize) {
-    fn single(cwd: Option<String>, surface_id: String, tab_id: String) -> PersistedSubPane {
+    fn single(cwd: Option<String>, surface_id: String, tab_id: String, read_only: bool) -> PersistedSubPane {
         PersistedSubPane {
             cwd,
             surface_id,
             tab_id,
             tabs: Vec::new(),
             active_tab: 0,
+            read_only,
         }
     }
     fn walk(
@@ -947,11 +956,11 @@ fn promote_per_pane_tabs(
                 // Empty `tabs` = one implicit terminal carried by the leaf's
                 // top-level fields; otherwise one terminal per per-pane tab.
                 let terminals: Vec<PersistedSubPane> = if sp.tabs.is_empty() {
-                    vec![single(sp.cwd.clone(), sp.surface_id.clone(), sp.tab_id.clone())]
+                    vec![single(sp.cwd.clone(), sp.surface_id.clone(), sp.tab_id.clone(), sp.read_only)]
                 } else {
                     sp.tabs
                         .iter()
-                        .map(|t| single(t.cwd.clone(), t.surface_id.clone(), t.tab_id.clone()))
+                        .map(|t| single(t.cwd.clone(), t.surface_id.clone(), t.tab_id.clone(), t.read_only))
                         .collect()
                 };
                 let base = out.len();
@@ -1722,11 +1731,13 @@ mod tests {
                 cwd: None,
                 surface_id: "s0".into(),
                 tab_id: "t0".into(),
+                read_only: false,
             },
             PersistedLeafTab {
                 cwd: None,
                 surface_id: "s1".into(),
                 tab_id: "t1".into(),
+                read_only: false,
             },
         ];
         let tab = PersistedTab {
@@ -1743,6 +1754,7 @@ mod tests {
             cwd: None,
             surface_id: surface.into(),
             tab_id: tab.into(),
+            read_only: false,
         }
     }
 

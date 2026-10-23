@@ -16,11 +16,13 @@ mod client;
 mod client_identity;
 mod commands;
 mod hosts_store;
+mod key_encode;
 mod output;
 mod output_schema;
 mod remote_client;
 mod render;
 mod serve;
+mod target;
 mod update;
 
 use clap::Parser as _;
@@ -258,6 +260,8 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         // `schedule run-once` does. Must stay ABOVE the catch-all `State` arm
         // below, which would otherwise match it first and claim v18.
         Command::State { command: StateCommand::Watch { .. } } => Some((19, "state watch")),
+        Command::Events { .. } => Some((12, "events")),
+        Command::Term { command: TermCommand::Send { .. } } => Some((6, "term send")),
         // v22: per-role agents. Only a run that actually names one needs the
         // newer verb — `team run` with neither flag is the v18 request, and an
         // older host serves it exactly. Refusing on the *shape* of the command
@@ -383,6 +387,11 @@ fn precheck(command: &mut Command, json_mode: bool) -> Result<(), output::Failur
     {
         commands::worktree::base_and_slug(slug.as_deref(), from.as_deref(), branch.as_deref())?;
     }
+    if let Command::Term { command: TermCommand::Send { text, keys, stdin, enter, app_cursor, .. } } =
+        command
+    {
+        commands::term::check_send(text.is_some() || *stdin, keys, *enter, *app_cursor)?;
+    }
     match command {
         Command::Run { prompt, .. } | Command::Send { prompt, .. } => {
             *prompt = commands::resolve_prompt(std::mem::take(prompt))?;
@@ -457,6 +466,9 @@ fn host_verb(mut args: Cli) -> u8 {
             if let Some((needed, verb)) = required_version(&args.command) {
                 client.require_version(needed, verb)?;
             }
+            // A unique id prefix becomes the full id here, once, so no verb
+            // below ever sees anything but a full id.
+            target::resolve_in_place(&client, &mut args.command).await?;
             match args.command {
                 Command::Status => commands::status::run(&client).await,
                 Command::Ls { .. } => commands::sessions::ls(&client).await,
@@ -608,7 +620,16 @@ fn host_verb(mut args: Cli) -> u8 {
                     TermCommand::Ls => commands::term::ls(&client).await,
                     // `--json` is refused in `precheck`, before any connection.
                     TermCommand::Attach { pty } => commands::term::attach(&client, &pty).await,
+                    TermCommand::Send { pty, text, keys, stdin, enter, app_cursor } => {
+                        match commands::term::input_bytes(text, stdin, &keys, enter, app_cursor) {
+                            Ok(bytes) => commands::term::send(&client, &pty, bytes).await,
+                            Err(failure) => Err(failure),
+                        }
+                    }
                 },
+                Command::Events { session, until } => {
+                    commands::events::run(&client, session.as_deref(), until, json_mode).await
+                }
                 Command::Worktree { command } => match command {
                     WorktreeCommand::Create { slug, project, from, branch } => {
                         commands::worktree::create(

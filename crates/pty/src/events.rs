@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use crate::backend::TerminalSessionId;
+use crate::program_status::ProgramRecord;
 
 /// Shell-integration command-mark phases (OSC 133 / 633). The renderer uses
 /// `PromptStart` to anchor an exit-code badge on the prompt row and
@@ -109,6 +110,30 @@ pub enum TerminalEvent {
         id: TerminalSessionId,
         bytes: Vec<u8>,
     },
+    /// OSC 7501: the program's root status record changed. `None` means no
+    /// program is reporting any more — it cleared its status, the terminal was
+    /// reset, or a new shell prompt began (the program that reported is gone,
+    /// even if its final `done` record is kept).
+    ///
+    /// `handshake` is whether a feature query was seen in this stream before
+    /// the report. A program only reports once answered, so it is evidence the
+    /// report came from the program that asked — but not proof (the query can
+    /// fall out of a replay ring), so consumers combine it with what they know
+    /// about the process.
+    ProgramStatus {
+        id: TerminalSessionId,
+        root: Option<ProgramRecord>,
+        handshake: bool,
+    },
+    /// A request to show a desktop notification. `explicit` is the user's own
+    /// `oximux notify`; otherwise a program printed `OSC 9` / `OSC 777`, which
+    /// is opt-in. Text is raw: whoever displays it sanitizes it.
+    Notify {
+        id: TerminalSessionId,
+        title: Option<String>,
+        body: String,
+        explicit: bool,
+    },
 }
 
 impl TerminalEvent {
@@ -128,9 +153,50 @@ impl TerminalEvent {
             | TerminalEvent::ScrollbackReset { id }
             | TerminalEvent::Progress { id, .. }
             | TerminalEvent::Clipboard { id, .. }
-            | TerminalEvent::PtyReply { id, .. } => *id,
+            | TerminalEvent::PtyReply { id, .. }
+            | TerminalEvent::ProgramStatus { id, .. }
+            | TerminalEvent::Notify { id, .. } => *id,
         }
     }
+}
+
+/// Most events a status-only subscriber (an agent poll loop) keeps queued.
+pub const STATUS_EVENT_CAPACITY: usize = 256;
+
+/// Whether a status-only subscriber wants `event` at all.
+pub fn is_status_event(event: &TerminalEvent) -> bool {
+    matches!(
+        event,
+        TerminalEvent::Output { .. } | TerminalEvent::Exit { .. } | TerminalEvent::ProgramStatus { .. }
+    )
+}
+
+/// Queue `event` for a status-only subscriber, bounded at
+/// [`STATUS_EVENT_CAPACITY`]. Under pressure the oldest `Output` goes first, and
+/// an `Output` is dropped rather than evict anything else: losing a chunk costs
+/// the regex fallback one scan, losing an `Exit` or a status change costs the
+/// truth. Only the latest program status is worth keeping — each one replaces
+/// the whole root record — so a new one supersedes any still queued, which also
+/// keeps a report flood from growing the queue.
+pub fn push_bounded_status(queue: &mut std::collections::VecDeque<TerminalEvent>, event: TerminalEvent) {
+    if matches!(event, TerminalEvent::ProgramStatus { .. })
+        && let Some(index) = queue
+            .iter()
+            .position(|queued| matches!(queued, TerminalEvent::ProgramStatus { .. }))
+    {
+        queue.remove(index);
+    }
+    if queue.len() >= STATUS_EVENT_CAPACITY {
+        if let Some(index) = queue
+            .iter()
+            .position(|queued| matches!(queued, TerminalEvent::Output { .. }))
+        {
+            queue.remove(index);
+        } else if matches!(event, TerminalEvent::Output { .. }) {
+            return;
+        }
+    }
+    queue.push_back(event);
 }
 
 #[cfg(test)]
@@ -156,5 +222,37 @@ mod tests {
             }
             _ => panic!("clone changed variant"),
         }
+    }
+
+    fn status(state: &str) -> TerminalEvent {
+        let report = crate::program_status::parse_report(state.as_bytes()).unwrap();
+        let mut store = crate::program_status::ProgramStatusStore::new();
+        store.apply(report);
+        TerminalEvent::ProgramStatus {
+            id: TerminalSessionId(1),
+            root: store.root().cloned(),
+            handshake: true,
+        }
+    }
+
+    #[test]
+    fn a_status_flood_keeps_only_the_latest_and_survives_output_pressure() {
+        let mut queue = std::collections::VecDeque::new();
+        let id = TerminalSessionId(1);
+        push_bounded_status(&mut queue, status("state=working"));
+        for _ in 0..STATUS_EVENT_CAPACITY * 2 {
+            push_bounded_status(&mut queue, TerminalEvent::Output { id, bytes: vec![b'x'] });
+            push_bounded_status(&mut queue, status("state=blocked"));
+        }
+        push_bounded_status(&mut queue, status("state=idle"));
+        let statuses: Vec<_> = queue
+            .iter()
+            .filter_map(|e| match e {
+                TerminalEvent::ProgramStatus { root, .. } => root.as_ref().map(|r| r.state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec![crate::program_status::ProgramState::Idle]);
+        assert!(queue.len() <= STATUS_EVENT_CAPACITY);
     }
 }

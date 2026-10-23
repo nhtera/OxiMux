@@ -9,6 +9,8 @@
 // with the recovered scrollback, visibly marked as restored history.
 //
 // Layout: `<base>/<pty_id>/meta.json` + `<base>/<pty_id>/scrollback.bin`.
+// `scrollback.bin` is gzip-compressed (see `oximux_relay_proto::checkpoint_codec`;
+// readers also accept a raw file from before compression).
 // All writes are atomic via tmp + rename: reading a slightly stale
 // checkpoint is fine, reading a torn one is not.
 
@@ -111,7 +113,7 @@ impl CheckpointStore {
             meta.cwd = cwd.to_string_lossy().into_owned();
         }
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        write_atomic(&dir.join("scrollback.bin"), bytes)?;
+        write_atomic(&dir.join("scrollback.bin"), &oximux_relay_proto::checkpoint_codec::encode(bytes))?;
         write_atomic(&meta_path, &serde_json::to_vec(&meta)?)
     }
 
@@ -171,7 +173,11 @@ fn epoch_secs() -> u64 {
 // either the old complete file or the new complete file, never a torn
 // one — even if the daemon dies mid-write.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // A temp name of its own: two passes writing at once (the tick and a
+    // last-client flush) must not publish each other's half-written file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))
 }
@@ -208,7 +214,7 @@ mod tests {
         // The spawn-time child pid survives scrollback rewrites.
         assert_eq!(meta.pid, Some(4242));
         assert_eq!(
-            std::fs::read(dir.join("scrollback.bin")).expect("scrollback"),
+            oximux_relay_proto::checkpoint_codec::decode(&std::fs::read(dir.join("scrollback.bin")).expect("scrollback")),
             b"hello scrollback"
         );
 

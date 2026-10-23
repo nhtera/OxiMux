@@ -17,11 +17,20 @@
 //! The title path is kept as a fast presence/liveness signal (an agent that has
 //! launched but not yet emitted a hook still shows up); the sideband, when
 //! present, wins for the status and the descriptor.
+//!
+//! An agent that reports its own status (OSC 7501, parsed by the terminal
+//! backend) outranks the hooks for the *status*; the hooks still supply the
+//! detail only they carry (the prompt that titles the row). A report counts
+//! only while the process tree says an agent is running here: in a plain shell
+//! the bytes could be anyone's — a `cat` of a captured session — and must never
+//! conjure an agent row, least of all one asking for approval.
 
 use std::time::{Duration, Instant};
 
 use oximux_agents::osc_sideband::{AgentOscScanner, map_state_to_status};
+use oximux_agents::program_status::map_program_status;
 use oximux_core::{AgentStatus, SidebandDetail};
+use oximux_pty::ProgramRecord;
 
 /// Six-byte OSC-9999 introducer (`ESC ] 9 9 9 9`). A chunk without it — and
 /// with no sequence mid-parse — cannot complete a sideband event, so the
@@ -35,6 +44,12 @@ const SIDEBAND_MARKER: &[u8] = b"\x1b]9999";
 /// lingers before the title path (or its absence) takes over — mirrors the
 /// reference app's stale-after window.
 const SIDEBAND_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// How long a program-status report may come before the process scan names an
+/// agent and still count as that agent's. An agent reports right after it
+/// starts, a scan or two before it is seen; anything older was printed by
+/// something else.
+const PRE_AGENT_GRACE: Duration = Duration::from_secs(5);
 
 /// A fresh hook-derived reading for one terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +68,15 @@ pub struct AmbientAgentScan {
     /// is re-attached to every reading until the next prompt replaces it.
     cached_prompt: Option<String>,
     last_seen: Option<Instant>,
+    /// The program's own latest root status (OSC 7501).
+    /// Kept even while untrusted, so it takes effect the moment the process
+    /// scan names the agent — the first report often beats that scan. Only
+    /// briefly, though: see [`PRE_AGENT_GRACE`].
+    program: Option<ProgramRecord>,
+    /// When `program` arrived.
+    program_at: Option<Instant>,
+    /// The process tree shows an agent here; see the module docs.
+    agent_present: bool,
 }
 
 impl Default for AmbientAgentScan {
@@ -69,6 +93,9 @@ impl AmbientAgentScan {
             detail: SidebandDetail::default(),
             cached_prompt: None,
             last_seen: None,
+            program: None,
+            program_at: None,
+            agent_present: false,
         }
     }
 
@@ -77,7 +104,10 @@ impl AmbientAgentScan {
     /// prompt and session id belonged to that process, and a reading carried
     /// across would attribute one agent's conversation to the next.
     pub fn reset(&mut self) {
+        // Presence is the process scan's to say, not part of the reading.
+        let agent_present = self.agent_present;
         *self = Self::new();
+        self.agent_present = agent_present;
     }
 
     /// Feed one PTY output chunk. The scanner runs only when a sideband marker
@@ -131,6 +161,34 @@ impl AmbientAgentScan {
         self.last_seen = Some(now);
     }
 
+    /// The program's root status changed (`None`: nobody is reporting). The
+    /// handshake bit is not needed here: trust comes from the process scan.
+    pub fn feed_program_status(&mut self, root: Option<ProgramRecord>, now: Instant) {
+        self.program_at = root.is_some().then_some(now);
+        self.program = root;
+    }
+
+    /// Whether the process tree currently shows an agent in this terminal.
+    /// When one appears, a report that came well before it is dropped: it was
+    /// printed by something else (a `cat` of a captured log, then the agent),
+    /// and would otherwise speak for the new agent until that agent reports —
+    /// which one that never speaks this protocol never does.
+    pub fn set_agent_present(&mut self, present: bool, now: Instant) {
+        if present
+            && !self.agent_present
+            && self.program_at.is_some_and(|at| now.saturating_duration_since(at) > PRE_AGENT_GRACE)
+        {
+            self.program = None;
+            self.program_at = None;
+        }
+        self.agent_present = present;
+    }
+
+    /// The program's status is in force: reported, and trusted.
+    pub fn program_status_in_force(&self) -> bool {
+        self.agent_present && self.program.is_some()
+    }
+
     /// Re-prime the scan from a persisted reading on restore, so a still-running
     /// agent in a re-attached terminal is listed immediately instead of waiting
     /// for its next hook (an agent idle at its prompt emits none). `now` marks
@@ -146,6 +204,19 @@ impl AmbientAgentScan {
     /// The current hook-derived reading, or `None` when no sideband has ever
     /// arrived or the last one is older than [`SIDEBAND_TTL`].
     pub fn current(&self, now: Instant) -> Option<AmbientSideband> {
+        // No TTL: unlike a hook, a reporting program says when it stops (a
+        // release), and an agent idle at its prompt for hours is still idle.
+        if self.agent_present
+            && let Some(record) = &self.program
+        {
+            let (status, message) = map_program_status(record);
+            let mut detail = self.detail.clone();
+            detail.prompt = self.cached_prompt.clone().or(detail.prompt);
+            if message.is_some() {
+                detail.last_message = message;
+            }
+            return Some(AmbientSideband { status, detail });
+        }
         let last = self.last_seen?;
         if now.saturating_duration_since(last) > SIDEBAND_TTL {
             return None;
@@ -306,5 +377,49 @@ mod tests {
         // still be fed — the guard checks `is_active()`.
         scan.feed(tail, now);
         assert_eq!(scan.current(now).map(|c| c.status), Some(AgentStatus::Running));
+    }
+
+    fn program(p: &str) -> Option<ProgramRecord> {
+        let mut store = oximux_pty::program_status::ProgramStatusStore::new();
+        store.apply(oximux_pty::program_status::parse_report(p.as_bytes()).unwrap());
+        store.root().cloned()
+    }
+
+    #[test]
+    fn program_status_in_a_plain_shell_never_registers_an_agent() {
+        let mut scan = AmbientAgentScan::new();
+        let now = Instant::now();
+        scan.feed_program_status(program("state=blocked:kind=permission"), now);
+        assert!(scan.current(now).is_none());
+        assert!(!scan.program_status_in_force());
+    }
+
+    #[test]
+    fn program_status_counts_once_the_process_scan_names_an_agent() {
+        let mut scan = AmbientAgentScan::new();
+        let now = Instant::now();
+        // The report lands first; the process scan catches up a poll later.
+        scan.feed_program_status(program("state=working"), now);
+        scan.set_agent_present(true, now + Duration::from_secs(1));
+        assert_eq!(scan.current(now).unwrap().status, AgentStatus::Running);
+        // It outranks a hook's status, while the hook's prompt still titles it.
+        scan.feed(&osc(r#"{"v":1,"state":"idle","prompt":"fix the parser"}"#), now);
+        let cur = scan.current(now).unwrap();
+        assert_eq!(cur.status, AgentStatus::Running);
+        assert_eq!(cur.detail.prompt.as_deref(), Some("fix the parser"));
+        // Released: the hook reading is back.
+        scan.feed_program_status(None, now);
+        assert_eq!(scan.current(now).unwrap().status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn a_report_printed_long_before_the_agent_started_does_not_speak_for_it() {
+        let mut scan = AmbientAgentScan::new();
+        let t0 = Instant::now();
+        // `cat captured.log` prints a report; minutes later an agent starts.
+        scan.feed_program_status(program("state=blocked:kind=permission"), t0);
+        scan.set_agent_present(true, t0 + PRE_AGENT_GRACE + Duration::from_secs(60));
+        assert!(!scan.program_status_in_force());
+        assert!(scan.current(t0).is_none(), "this agent has reported nothing yet");
     }
 }

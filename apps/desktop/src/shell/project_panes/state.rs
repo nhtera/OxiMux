@@ -178,6 +178,11 @@ impl ProjectPanes {
         self.active_group()?.read(cx).focused_rail_agent(cx)
     }
 
+    /// Every pane group of the project, in no particular order.
+    pub fn groups_iter(&self) -> impl Iterator<Item = &Entity<PaneGroup>> {
+        self.groups.values()
+    }
+
     /// Resolve which agent a "send to agent" action targets. Preference order,
     /// most-specific first, so the send lands on the agent the user is actually
     /// working with rather than an arbitrary one when several exist:

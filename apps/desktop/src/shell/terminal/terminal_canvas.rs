@@ -51,6 +51,9 @@ pub struct Alphas {
     pub dim: f32,
     pub unfocused: f32,
     pub unfocused_cursor: f32,
+    /// Minimum contrast program-chosen text keeps against its cell (1.0 =
+    /// off). Applied before the alphas above, which are deliberate fades.
+    pub min_contrast: f32,
 }
 
 impl Default for Alphas {
@@ -59,8 +62,45 @@ impl Default for Alphas {
             dim: 0.7,
             unfocused: 0.9,
             unfocused_cursor: 0.3,
+            min_contrast: 1.0,
         }
     }
+}
+
+/// The text color to paint for `fg` over `bg` under the minimum-contrast
+/// setting. Left alone where low contrast is the point or the colors are
+/// OxiMux's own: hidden text (fg = bg on purpose), a cell on the theme's own
+/// default colors, the cursor block, and runs made only of "pixel" glyphs
+/// (see [`is_pixel_glyph`]). Search highlights and the selection are painted
+/// over this by their own passes.
+pub fn corrected_fg(fg: Hsla, bg: Hsla, skip: bool, min: f32) -> Hsla {
+    if skip || min <= 1.0 {
+        return fg;
+    }
+    crate::shell::color_contrast::ensure_minimum_contrast_oklab_cached(fg, bg, min)
+}
+
+/// Whether a run's text keeps its color as-is (see [`corrected_fg`]).
+pub(crate) fn keeps_its_color(text: &str, fg: CellColor, bg: CellColor, hidden: bool, is_cursor: bool) -> bool {
+    hidden
+        || is_cursor
+        || (fg == CellColor::Default && bg == CellColor::Default)
+        || (!text.is_empty() && text.chars().all(|c| is_pixel_glyph(c) || c == ' '))
+}
+
+/// Glyphs whose fg and bg are two colors of a picture, not text on a ground:
+/// block elements and sextants (half-block images, color swatches — `▀` is
+/// one pixel in fg and the one below in bg) and the private-use areas, where
+/// powerline separators set fg to the neighbouring cell's bg. Lifting either
+/// would stripe the image or draw a ridge at every seam. A run that also has
+/// ordinary text is still corrected, so an icon cannot shield its label.
+fn is_pixel_glyph(c: char) -> bool {
+    matches!(c,
+        '\u{2580}'..='\u{259F}'
+        | '\u{1FB00}'..='\u{1FBFF}'
+        | '\u{E000}'..='\u{F8FF}'
+        | '\u{F0000}'..='\u{FFFFD}'
+        | '\u{100000}'..='\u{10FFFD}')
 }
 
 /// A finished command's status mark on a visible prompt row. `exit` is kept
@@ -99,6 +139,8 @@ pub struct PaintParams {
     /// strength, so only the find box's caret reads as "type here".
     pub cursor_focused: bool,
     pub pad: f32,
+    /// The density's smallest corner radius (the link-target chip).
+    pub radius_xs: f32,
     /// `(row, col_start, col_end)` of the link the pointer is hovering with
     /// Cmd held — underlined so the user sees it's clickable. `None` = none.
     pub hovered_link: Option<(usize, usize, usize)>,
@@ -115,6 +157,8 @@ pub struct PaintParams {
     /// The badge under the pointer, if any: its exit code is labelled beside
     /// the gutter so the mark explains itself.
     pub hovered_badge: Option<CommandBadge>,
+    /// The OSC 8 hyperlink under the pointer, labelled with its real target.
+    pub link_label: Option<crate::shell::link_hover::LinkLabel>,
     /// Live alpha multipliers (dim / unfocused / unfocused-cursor) from
     /// `TerminalSettings`.
     pub alphas: Alphas,
@@ -489,6 +533,9 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         let row_y = origin.y + line_h * badge.row as f32;
         paint_exit_label(badge, point(bounds.origin.x + px(6.0), row_y), line_h, p, window, cx);
     }
+    if let Some(label) = &p.link_label {
+        crate::shell::link_hover::paint_link_label(label, origin, cell_w, line_h, p, window, cx);
+    }
 }
 
 /// The hover label for a command-status mark: "Exit <code>" in a small chip
@@ -715,7 +762,9 @@ fn group_runs(
 fn effective_colors(run: &Run, pane_focused: bool, theme: &Theme, alphas: Alphas) -> (Hsla, Hsla) {
     let fg = resolve(run.fg, ColorRole::Fg, theme);
     let bg = resolve(run.bg, ColorRole::Bg, theme);
-    let (mut fg, mut bg) = if run.inverse { (bg, fg) } else { (fg, bg) };
+    let (fg, mut bg) = if run.inverse { (bg, fg) } else { (fg, bg) };
+    let skip = keeps_its_color(&run.text, run.fg, run.bg, run.hidden, run.is_cursor);
+    let mut fg = corrected_fg(fg, bg, skip, alphas.min_contrast);
     if run.dim {
         fg.a *= alphas.dim;
     }
@@ -892,7 +941,10 @@ fn effective_fg_for_cell(
     let fg = resolve(cell.fg, ColorRole::Fg, theme);
     let bg = resolve(cell.bg, ColorRole::Bg, theme);
     let inverse = cell.inverse || is_cursor;
-    let mut fg = if inverse { bg } else { fg };
+    let (fg, under) = if inverse { (bg, fg) } else { (fg, bg) };
+    let mut buf = [0u8; 4];
+    let skip = keeps_its_color(cell.ch.encode_utf8(&mut buf), cell.fg, cell.bg, cell.hidden, is_cursor);
+    let mut fg = corrected_fg(fg, under, skip, alphas.min_contrast);
     if cell.dim {
         fg.a *= alphas.dim;
     }
@@ -1186,5 +1238,62 @@ mod tests {
         // After swap, fg becomes the canvas bg and bg becomes the text fg.
         assert_eq!(fg, theme.bg_base);
         assert_eq!(bg, theme.fg_base);
+    }
+
+    fn colored_run(fg: CellColor, bg: CellColor) -> Run {
+        Run { text: "x".into(), fg, bg, ..Run::default() }
+    }
+
+    fn with_contrast(min: f32) -> Alphas {
+        Alphas { min_contrast: min, ..Alphas::default() }
+    }
+
+    #[test]
+    fn every_256_color_reads_on_paper_at_the_configured_ratio() {
+        let theme = Theme::paper();
+        for min in [3.0, 4.5] {
+            for idx in 0..=255u8 {
+                let run = colored_run(CellColor::Indexed(idx), CellColor::Default);
+                let (fg, bg) = effective_colors(&run, true, &theme, with_contrast(min));
+                let ratio = crate::shell::color_contrast::contrast_ratio(fg, bg);
+                assert!(ratio >= min - 0.02, "index {idx} @ {min}: {ratio}");
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_off_gives_todays_colors_exactly() {
+        let theme = Theme::paper();
+        for idx in 0..=255u8 {
+            let run = colored_run(CellColor::Indexed(idx), CellColor::Rgb(250, 250, 240));
+            let raw = (resolve(run.fg, ColorRole::Fg, &theme), resolve(run.bg, ColorRole::Bg, &theme));
+            assert_eq!(effective_colors(&run, true, &theme, with_contrast(1.0)), raw, "index {idx}");
+        }
+    }
+
+    #[test]
+    fn hidden_default_cursor_and_powerline_cells_keep_their_color() {
+        let theme = Theme::paper();
+        let yellow = CellColor::Rgb(255, 255, 0);
+        let raw = resolve(yellow, ColorRole::Fg, &theme);
+        let cases = [
+            Run { hidden: true, ..colored_run(yellow, CellColor::Default) },
+            Run { is_cursor: true, ..colored_run(yellow, CellColor::Default) },
+            Run { text: "\u{E0B0}".into(), ..colored_run(yellow, CellColor::Default) },
+            Run { text: "▀▀ █".into(), ..colored_run(yellow, CellColor::Rgb(255, 250, 200)) },
+        ];
+        for run in cases {
+            assert_eq!(effective_colors(&run, true, &theme, with_contrast(7.0)).0, raw);
+        }
+        // An icon in a run of text does not exempt the text.
+        let labelled = Run { text: "\u{F115} src".into(), ..colored_run(yellow, CellColor::Default) };
+        assert_ne!(effective_colors(&labelled, true, &theme, with_contrast(3.0)).0, raw);
+        let plain = colored_run(CellColor::Default, CellColor::Default);
+        assert_eq!(effective_colors(&plain, true, &theme, with_contrast(7.0)).0, theme.fg_base);
+        // A corrected color still takes the dim fade afterwards.
+        let dim = Run { dim: true, ..colored_run(yellow, CellColor::Default) };
+        let (fg, _) = effective_colors(&dim, true, &theme, with_contrast(3.0));
+        assert!((fg.a - Alphas::default().dim).abs() < 1e-6);
+        assert_ne!(Hsla { a: 1.0, ..fg }, raw);
     }
 }

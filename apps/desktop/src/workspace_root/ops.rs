@@ -489,7 +489,7 @@ impl WorkspaceRoot {
     /// receive dictated text: a terminal's active sub-pane, or a code editor's
     /// input. `None` for diff / browser / tasks / chat (chat dictates through the
     /// composer's own handler, never here).
-    fn focused_dictation_sink(
+    pub(super) fn focused_dictation_sink(
         &self,
         cx: &gpui::App,
     ) -> Option<crate::shell::agent_chat::HudSink> {
@@ -1618,14 +1618,15 @@ impl WorkspaceRoot {
     /// `window_factory::open_workspace_window_with`) when a pending tear-off
     /// entry is found for this window's id.
     ///
-    /// For each relay PTY leaf in the entry: attach the existing relay PTY,
-    /// mount a fresh `TerminalView`, and push it as a tab into the active
-    /// pane group. The tab inherits the label, color, and custom title from
-    /// the source window.
+    /// For each relay PTY leaf in the entry: mount a pending `TerminalView`,
+    /// push it as a tab into the active pane group (inheriting the label,
+    /// color, and custom title from the source window), and attach the
+    /// existing relay PTY off the main thread — the round-trip and replay
+    /// parse must not freeze the window — adopting it when it lands.
     ///
-    /// On failure (e.g. `attach_pty_existing` returns `None`): logs a loud
-    /// warning. The PTY is orphaned in the relay daemon and will be reaped by
-    /// the daemon's idle-gc. No silent swallowing.
+    /// On failure (`attach_pty_existing` returns `None`): logs a loud
+    /// warning and shows the tab as exited. The PTY is orphaned in the relay
+    /// daemon and will be reaped by the daemon's idle-gc. No silent swallowing.
     pub fn mount_pending_tearoff(
         &mut self,
         tearoff: crate::window_registry::PendingTearOff,
@@ -1649,16 +1650,11 @@ impl WorkspaceRoot {
         let workspace_id = panes.read(cx).cwd().to_string_lossy().into_owned();
 
         for leaf in &tearoff.leaves {
-            let Some((backend, session_id)) =
-                crate::shell::terminal_view::attach_pty_existing(&leaf.external_id)
-            else {
+            let Some((backend, session_id)) = crate::shell::terminal_view::spawn_pending_placeholder_grid() else {
                 tracing::warn!(
                     external_id = %leaf.external_id,
-                    dest_window_id = %tearoff.dest_window_id,
-                    "mount_pending_tearoff: attach_pty_existing failed; PTY orphaned in relay"
+                    "mount_pending_tearoff: placeholder grid failed; PTY orphaned in relay"
                 );
-                // No view will ever own this terminal again, so no close
-                // will clean its shell history up either.
                 crate::shell::terminal::shell_history::forget(&leaf.tab_id);
                 continue;
             };
@@ -1672,10 +1668,11 @@ impl WorkspaceRoot {
                 leaf.tab_id.clone(),
             );
             let view = cx.new(|cx| {
-                crate::shell::terminal_view::TerminalView::mount(
+                crate::shell::terminal_view::TerminalView::mount_pending(
                     backend,
                     session_id,
                     ids,
+                    Some(leaf.external_id.clone()),
                     theme,
                     density,
                     typography.clone(),
@@ -1683,6 +1680,56 @@ impl WorkspaceRoot {
                     cx,
                 )
             });
+            let external_id = leaf.external_id.clone();
+            let tab_id = leaf.tab_id.clone();
+            let tab_id_for_leak = leaf.tab_id.clone();
+            let dest_window_id = tearoff.dest_window_id.to_string();
+            let pending_view = view.downgrade();
+            let attach = cx
+                .background_executor()
+                .spawn(async move { crate::shell::terminal_view::attach_pty_existing(&external_id) });
+            cx.spawn(async move |_this, cx| {
+                let attached = attach.await;
+                let live = attached.clone();
+                let delivered = pending_view.update(cx, |v, cx| match attached {
+                    Some((backend, session_id)) => {
+                        let adopted = v.adopt_live_session(backend, session_id, cx);
+                        if adopted {
+                            // The surviving PTY may still run a hand-typed agent.
+                            v.seed_ambient_from_persisted();
+                        }
+                        adopted
+                    }
+                    None => {
+                        tracing::warn!(
+                            %dest_window_id,
+                            "mount_pending_tearoff: attach_pty_existing failed; PTY orphaned in relay"
+                        );
+                        // No view will ever own this terminal again, so no close
+                        // will clean its shell history up either.
+                        crate::shell::terminal::shell_history::forget(&tab_id);
+                        v.abandon_pending_attach(cx);
+                        true
+                    }
+                });
+                // The view went away before the attach landed (its tab closed).
+                // Detach rather than close, as the restore reconcile does: the
+                // daemon PTY outlives a view that never showed it. Skipped
+                // during quit; the daemon keeps it for the next launch.
+                if !matches!(delivered, Ok(true))
+                    && let Some((backend, session_id)) = live
+                    && !crate::shell::terminal_view::APP_QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    crate::shell::terminal::shell_history::forget(&tab_id_for_leak);
+                    std::thread::spawn(move || {
+                        if let Ok(mut be) = backend.lock() {
+                            let _ = be.drain_events();
+                            let _ = be.detach(session_id);
+                        }
+                    });
+                }
+            })
+            .detach();
 
             let label_str = tearoff.label.to_string();
             let color_for_tab = tearoff.color;
@@ -1844,6 +1891,9 @@ impl WorkspaceRoot {
             self.push_toast(ToastKind::Info, "Open an agent chat or agent terminal to send this to.", cx);
             return;
         };
+        if self.refuse_locked_agent(session_id, cx) {
+            return;
+        }
         let runtime = self.cli_runtime.clone();
         let text = action.markdown.clone();
         // Same reactor requirement as the `SendTextToActiveAgent`

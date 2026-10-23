@@ -45,6 +45,8 @@ impl TerminalView {
         let mut latest_title: Option<String> = None;
         let mut clipboard_text: Option<String> = None;
         let mut pty_replies: Vec<Vec<u8>> = Vec::new();
+        // Only the last notification of a batch can show anyway (debounce).
+        let mut notification: Option<(Option<String>, String, bool)> = None;
         for ev in &events {
             match ev {
                 TerminalEvent::Output { bytes, .. } => {
@@ -141,9 +143,33 @@ impl TerminalView {
                     } else {
                         Some((*state, *value))
                     };
-                    if matches!(*state, 2 | 4) && !self.focused {
+                    // An agent reporting its own status says when it needs the
+                    // user; its progress errors are not a second alarm.
+                    if matches!(*state, 2 | 4)
+                        && !self.focused
+                        && !self.agent_scan.program_status_in_force()
+                    {
                         got_bell = true;
                     }
+                }
+                // OSC 9 / 777 or `oximux notify`: pane attention like a bell,
+                // plus a banner (see `notify.rs`).
+                TerminalEvent::Notify { title, body, explicit, .. }
+                    if Self::accepts_notification(*explicit, &settings)
+                        && (*explicit || !self.agent_reports_itself()) =>
+                {
+                    if !self.focused {
+                        got_bell = true;
+                    }
+                    // The user's own request is never displaced by a program's
+                    // later in the same batch.
+                    if notification.as_ref().is_none_or(|n| *explicit || !n.2) {
+                        notification = Some((title.clone(), body.clone(), *explicit));
+                    }
+                }
+                // OSC 7501: the program's own status, parsed by the backend.
+                TerminalEvent::ProgramStatus { root, .. } => {
+                    self.agent_scan.feed_program_status(root.clone(), std::time::Instant::now());
                 }
                 _ => {}
             }
@@ -168,6 +194,9 @@ impl TerminalView {
         // silenced by the dispatcher's visible-pane rule.
         if bell_rang && settings.bell == BellStyle::Notify {
             self.maybe_notify_bell(cx);
+        }
+        if let Some((title, body, explicit)) = notification {
+            self.maybe_notify_terminal(title, body, explicit, cx);
         }
         let session_id = self.session_id;
         if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
@@ -260,19 +289,7 @@ impl TerminalView {
             return;
         }
         self.last_bell_banner = Some(now);
-        let session = self.session_id;
-        let pane_visible = self.is_visible();
-        if let Some(opener) = self.opener.clone() {
-            // Deferred, never inline: this runs from `tick`, inside this very
-            // view's entity update. The group's tab walk reads every terminal
-            // view — this one included — and reading a checked-out entity is a
-            // double-lease abort. `defer` lets the current borrow release first.
-            cx.defer(move |cx| {
-                let _ = opener.update(cx, |pg, cx| {
-                    pg.notify_terminal_bell(session, pane_visible, cx);
-                });
-            });
-        }
+        self.route_banner(crate::notifier::NotificationKind::Bell, String::new(), false, cx);
     }
 
     /// Fold a shell-integration command mark into the gutter-badge list. A
@@ -362,6 +379,7 @@ impl TerminalView {
         scan.poll(std::time::Instant::now(), || self.os_pid());
         let changed = scan.current() != before;
         self.proc_scan = scan;
+        self.agent_scan.set_agent_present(self.proc_scan.current().is_some(), std::time::Instant::now());
         if changed {
             tracing::debug!(
                 agent = ?self.proc_scan.current(),
@@ -455,6 +473,10 @@ impl TerminalView {
         let Some(bytes) = self.queued_first_output_input.take() else {
             return;
         };
+        // A pre-typed resume command is input too: a read-only pane gets none.
+        if self.is_read_only() {
+            return;
+        }
         self.queued_input_last_output = None;
         let session_id = self.session_id;
         if let Err(err) = self.with_backend(|be| be.write(session_id, &bytes)) {

@@ -9,6 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 bincode = { workspace = true }
+# Checkpoint scrollback is stored gzip'd; both the daemon and the app decode it.
+flate2 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 # The handshake proofs. Pure computation, so this stays a crate with no I/O and

@@ -420,6 +420,28 @@ impl PaneGroup {
         })
     }
 
+    /// Whether the terminal running agent `session_id` is read-only. Checks the
+    /// agent's own PTY view (`term`), not whichever split is focused: a side
+    /// shell added with Cmd+D must neither unlock nor lock the agent. With no
+    /// `term` (the runtime no longer knows it), any locked view in its tab
+    /// refuses.
+    pub fn agent_session_read_only(
+        &self,
+        session_id: AgentSessionId,
+        term: Option<TerminalSessionId>,
+        cx: &gpui::App,
+    ) -> bool {
+        self.tabs.iter().any(|t| {
+            let is_agent = matches!(&t.kind, PaneGroupTabKind::Agent { session_id: sid, .. } if *sid == session_id);
+            let PaneContent::Terminal(tree) = &t.content else { return false };
+            is_agent
+                && tree.iter_all_views().any(|(_, _, v)| {
+                    let v = v.read(cx);
+                    term.is_none_or(|id| v.session_id() == id) && v.is_read_only()
+                })
+        })
+    }
+
     /// First agent session id found anywhere in this group's tab list,
     /// regardless of active state. Fallback target when no active agent
     /// tab is available (e.g. terminal in active tab, agent in a
@@ -769,16 +791,16 @@ impl PaneGroup {
         })
     }
 
-    /// Dispatch a terminal-bell banner for `session` through the
-    /// notification pipeline. Called by the ringing `TerminalView` (which
-    /// owns the per-pane debounce); this end contributes the request
-    /// context the view can't see: the tab label, the workspace key for
-    /// burst collapse, and the live window-active flag. The dispatcher
-    /// applies the master/source gates, visible-pane suppression, and the
-    /// focus gate.
-    pub fn notify_terminal_bell(
+    /// One path for every terminal-sourced banner (bell, OSC 9/777,
+    /// `oximux notify`). The title is fixed to the tab's own label, and the
+    /// terminal source collapses bursts under its own key, apart from agents
+    /// (`explicit`: the user's `oximux notify`, which has a key of its own).
+    pub fn notify_terminal(
         &self,
         session: TerminalSessionId,
+        kind: crate::notifier::NotificationKind,
+        body: String,
+        explicit: bool,
         pane_visible: bool,
         cx: &gpui::App,
     ) {
@@ -792,14 +814,14 @@ impl PaneGroup {
             .unwrap_or_else(|| tab.label.clone());
         self.notifier.notify(crate::notifier::NotificationRequest {
             source: crate::notifier::NotificationSource::TerminalBell,
-            kind: crate::notifier::NotificationKind::Bell,
-            // Bell banners carry the raw terminal session id in the tab_id
+            kind,
+            // Terminal banners carry the raw terminal session id in the tab_id
             // slot; the `bell:` identifier namespace keeps it from ever
-            // being read as an agent tab id.
+            // being read as an agent tab id, and routes a click to the pane.
             tab_id: TabId(session.0),
-            workspace_key: self.cwd.to_string_lossy().into_owned(),
+            workspace_key: crate::notifier::terminal_burst_key(&self.cwd.to_string_lossy(), explicit),
             label: label.to_string(),
-            body: String::new(),
+            body,
             window_active: self.window_active.load(Ordering::Relaxed),
             pane_visible,
             // A bell is a one-shot event, not a sticky state — no until-focus coalescing.

@@ -19,10 +19,9 @@ impl Render for WorkspaceRoot {
         self.refresh_left_rail(cx);
         self.sync_simulator_visibility(window, cx);
 
-        // Tell the panes whether a modal/overlay is covering them this frame,
-        // so any embedded browser webview (a native view above the GPU canvas)
-        // hides instead of floating over the modal. Set before the panes
-        // render below.
+        // Tell the panes whether a modal/overlay covers them this frame, so an
+        // embedded webview (a native view above the GPU canvas) hides instead
+        // of floating over it. Set before the panes render below.
         let panes_covered = self.palette.read(cx).is_open()
             || self.search_palette.read(cx).is_open()
             || self.project_picker.read(cx).is_open()
@@ -440,6 +439,7 @@ impl Render for WorkspaceRoot {
                     },
                 ),
             )
+            .map(|el| super::terminal_actions::register(el, cx))
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
@@ -487,15 +487,14 @@ impl Render for WorkspaceRoot {
                         tracing::debug!("send-to-agent: no agent session available");
                         return;
                     };
+                    if this.refuse_locked_agent(session_id, cx) { return; }
                     let runtime = this.cli_runtime.clone();
                     let text = action.text.clone();
-                    // `send_agent_paste` offloads the PTY write via
-                    // `tokio::spawn_blocking`, which needs a live Tokio reactor.
-                    // GPUI's background executor has none, so run on the app
-                    // runtime (entered on the main thread for the app's life;
-                    // this listener fires there) — same rationale as
-                    // `run_diff_refresh_round`. `background_spawn` here aborts
-                    // the process with "no reactor running".
+                    // `send_agent_paste` offloads the PTY write via `spawn_blocking`,
+                    // which needs a live Tokio reactor; GPUI's background executor
+                    // has none, so run on the app runtime (entered on the main
+                    // thread; this listener fires there), as `run_diff_refresh_round`
+                    // does. `background_spawn` here aborts with "no reactor running".
                     let Ok(handle) = tokio::runtime::Handle::try_current() else {
                         tracing::warn!(?session_id, "no tokio runtime; send-to-agent dropped");
                         return;
@@ -758,8 +757,8 @@ impl Render for WorkspaceRoot {
                     return;
                 }
                 this.close_modal_overlays(cx);
-                this.palette
-                    .update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
+                this.remember_palette_terminal(window, cx);
+                this.palette.update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenSessionHistory, window, cx| {
                 if this.confirm_pending(cx) {

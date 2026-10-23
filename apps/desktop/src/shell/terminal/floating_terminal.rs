@@ -99,6 +99,7 @@ struct FloatingTab {
     /// Brings the tab back when its daemon is replaced, and refreshes the ids
     /// above once it is.
     _daemon_loss: gpui::Subscription,
+    _banners: gpui::Subscription,
 }
 
 /// Positional default title: first tab keeps the original single-session
@@ -214,6 +215,20 @@ impl FloatingTerminal {
             // The floating card keeps an exited shell on screen.
             TerminalViewEvent::CleanExit { .. } => {}
         });
+        // No pane group titles and routes this card's banners: the window's
+        // owner does, with the tab's own name.
+        let banners = cx.subscribe(&view, |this, view, ev: &crate::shell::terminal_view::TerminalBanner, cx| {
+            let Some(tab) = this.tabs.iter().find(|t| t.view == view) else { return };
+            cx.emit(FloatingTerminalEvent::Banner {
+                session: tab.session_id,
+                label: tab.custom_title.clone().unwrap_or_else(|| "Floating terminal".into()),
+                cwd: tab.cwd.clone(),
+                kind: ev.kind,
+                body: ev.body.clone(),
+                explicit: ev.explicit,
+                pane_visible: ev.pane_visible,
+            });
+        });
         FloatingTab {
             view,
             session_id: spec.session_id,
@@ -223,6 +238,7 @@ impl FloatingTerminal {
             surface_id,
             tab_id,
             _daemon_loss: daemon_loss,
+            _banners: banners,
         }
     }
 
@@ -340,6 +356,11 @@ impl FloatingTerminal {
         self.tabs.iter().map(|t| &t.view)
     }
 
+    /// The terminal on screen in the floating window.
+    pub fn active_view(&self) -> Option<&Entity<TerminalView>> {
+        self.tabs.get(self.active).map(|t| &t.view)
+    }
+
     /// Number of open tabs (root-side guards + tests).
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
@@ -425,6 +446,7 @@ impl FloatingTerminal {
                     external_id: t.external_id.clone(),
                     surface_id: t.surface_id.clone(),
                     tab_id: t.tab_id.clone(),
+                    read_only: crate::shell::terminal::terminal_locks::is_locked(&t.tab_id),
                 })
                 .collect(),
         }
@@ -706,6 +728,16 @@ pub enum FloatingTerminalEvent {
     ExpandActiveRequested,
     /// Double-click on a tab chip: open the rename dialog for `idx`.
     RenameRequested { idx: usize },
+    /// A tab's bell or notification, for the window's notifier.
+    Banner {
+        session: TerminalSessionId,
+        label: String,
+        cwd: String,
+        kind: crate::notifier::NotificationKind,
+        body: String,
+        explicit: bool,
+        pane_visible: bool,
+    },
 }
 
 impl gpui::EventEmitter<FloatingTerminalEvent> for FloatingTerminal {}

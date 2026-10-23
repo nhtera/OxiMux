@@ -236,16 +236,17 @@ pub fn relay_state_snapshot() -> RelayStateSnapshot {
 /// (caller falls back to spawn + visual prefill).
 pub fn attach_pty_existing(external_id: &str) -> Option<(SharedBackend, TerminalSessionId)> {
     let shared = SHARED_BACKEND.get()?;
-    // Attach is a synchronous daemon round-trip on the calling thread
-    // (background executor from the restore reconcile; main thread from
-    // tear-off). Hold off App Nap for its duration.
+    // A synchronous daemon round-trip on a background executor; hold off App
+    // Nap for it. The shared backend is held only to take the job, so every
+    // other pane keeps drawing and typing while it runs.
     let _nap = crate::app_nap::prevent("relay attach");
-    let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    match guard.attach_existing(external_id) {
-        Ok(session_id) => {
-            drop(guard);
-            Some((Arc::clone(shared), session_id))
-        }
+    let lock = || shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let job = lock().begin_attach_existing(external_id);
+    // A daemon respawn may have swapped the backend while the job ran, and the
+    // session went to the one it replaced: report failure, not a dead pane.
+    let landed = |id: TerminalSessionId| lock().external_id_of(id).is_some().then_some(id).ok_or_else(|| anyhow::anyhow!("backend replaced during attach"));
+    match job.map_or_else(|| lock().attach_existing(external_id), |job| job().and_then(landed)) {
+        Ok(session_id) => Some((Arc::clone(shared), session_id)),
         Err(err) => {
             tracing::debug!(?err, external_id, "attach_existing failed");
             None
@@ -514,6 +515,11 @@ pub enum TerminalViewEvent {
     Recovered { session_id: TerminalSessionId },
 }
 
+/// A bell or notification banner, for an owner that is not a pane group (a
+/// floating terminal) — see `notify.rs`.
+pub struct TerminalBanner { pub kind: crate::notifier::NotificationKind, pub body: String, pub explicit: bool, pub pane_visible: bool }
+impl EventEmitter<TerminalBanner> for TerminalView {}
+
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
 
 pub struct TerminalView {
@@ -654,6 +660,9 @@ pub struct TerminalView {
     /// The command-status mark whose gutter the pointer is in, labelled with
     /// its exit code. Set on mouse-move, dropped when the pointer leaves.
     hovered_badge: Option<CommandBadge>,
+    /// The OSC 8 hyperlink under the pointer, labelled with its real target
+    /// (see `link_label.rs`). Tracked on mouse-move so a change repaints.
+    link_label: Option<crate::shell::link_hover::LinkLabel>,
     /// The pointer is over this pane: gates the exit-code label, re-hit-tested each render.
     pointer_in_view: bool,
     /// Last bell-banner dispatch instant, rate-limiting BEL storms (a
@@ -662,6 +671,11 @@ pub struct TerminalView {
     /// collapses further, but that one is shared across panes -- this
     /// keeps a single pane from monopolizing it.
     last_bell_banner: Option<std::time::Instant>,
+    /// When this pane last raised a terminal-notification banner (OSC 9/777,
+    /// `oximux notify`); see `notify.rs`.
+    last_notify_banner: [Option<std::time::Instant>; 2],
+    /// When the read-only toast was last shown here (`read_only.rs`).
+    read_only_notice_at: Option<std::time::Instant>,
     /// Async path-existence answers for detected `path:line` links, keyed by
     /// resolved absolute path. Hover/paint/click consult it without touching
     /// the filesystem; misses spawn a background stat (see
@@ -775,6 +789,10 @@ mod restore_notice;
 mod state;
 mod daemon_recovery;
 mod command_badge_hover;
+mod insert_path;
+mod link_label;
+mod notify;
+mod read_only;
 #[cfg(test)]
 mod daemon_loss_tests;
 #[cfg(test)]

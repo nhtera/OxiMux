@@ -539,7 +539,8 @@ editor is an `InputState` on the modal (persists on blur/Enter, not per-key).
 | `state.rs` | `TerminalState`: alacritty_terminal + vte processor; user-tunable scrollback (default 5000) |
 | `snapshot.rs` | `TerminalSnapshot`: cells grid + cursor; grid-text extractors `rows_text` / `get_content` / `last_n_non_empty_lines`; `abs_line_to_screen_row` maps OSC 133/633 mark lines into the visible viewport |
 | `events.rs` | `TerminalEvent` enum: Output/Exit/Resize/TitleChange/Bell/CwdChanged/CommandMark/Progress/Clipboard/PtyReply |
-| `osc7.rs` | `OscScanner`: OSC 7 (cwd) + OSC 133/633 (command marks) + OSC 9;4 (progress) sequence extractor — events alacritty doesn't expose |
+| `osc7.rs` | `OscScanner`: OSC 7 (cwd) + OSC 133/633 (command marks) + OSC 9;4 (progress) + OSC 9 / 777 (notification requests) + OSC 7501 (program status) + RIS/`CSI 3J` sequence extractor — events alacritty doesn't expose |
+| `program_status.rs` (+ `program_status/tracker.rs`) | OSC 7501 program status: report grammar and limits, per-terminal record store and lifetime rules, reply gate, shared `sanitize_display_text`; the tracker is `TerminalState`'s per-terminal glue |
 | `close_grace.rs` | `term_step` SIGTERM-to-process-group + `close_with_grace(WatcherHandle, term_fn, kill_fn, GRACE, POLL)` orchestrator (5 s SIGTERM grace → SIGKILL fallback) |
 
 ---

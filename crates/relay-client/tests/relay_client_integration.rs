@@ -704,3 +704,190 @@ fn a_replacement_backend_never_re_mints_an_earlier_id() {
     let _ = replacement.close(fresh);
     let _ = fx.backend.close(earlier);
 }
+
+// --- OSC 7501 program status over the relay (unix: POSIX shell scripts) ---
+
+/// The reply, as `od -An -tx1` prints it.
+#[cfg(unix)]
+const PROGRAM_STATUS_REPLY_HEX: &str = "1b 5d 37 35 30 31 3b 3f 1b 5c";
+
+/// Ask once, report, then print every input byte received within a second of
+/// quiet as hex, then `DONE`, then idle (so the session outlives the drain).
+#[cfg(unix)]
+fn program_status_script(report: &str) -> SpawnConfig {
+    SpawnConfig {
+        shell: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "stty raw -echo min 0 time 10; printf '\\033]7501;?\\007\\033]7501;{report}\\007'; \
+                 dd bs=1 count=64 2>/dev/null | od -An -tx1 | tr -d '\\n'; printf '\\r\\nDONE\\r\\n'; \
+                 while :; do sleep 1; done"
+            ),
+        ],
+        cwd: test_cwd(),
+        cols: 200,
+        rows: 24,
+        ..SpawnConfig::default()
+    }
+}
+
+#[cfg(unix)]
+fn output_text(events: &[TerminalEvent]) -> String {
+    let mut bytes = Vec::new();
+    for ev in events {
+        if let TerminalEvent::Output { bytes: b, .. } = ev {
+            bytes.extend_from_slice(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(unix)]
+fn reported_states(events: &[TerminalEvent]) -> Vec<(Option<oximux_pty::ProgramState>, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TerminalEvent::ProgramStatus { root, handshake, .. } => {
+                Some((root.as_ref().map(|r| r.state), *handshake))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn until_done(backend: &mut RelayBackend) -> Vec<TerminalEvent> {
+    drain_until(backend, Duration::from_secs(10), |e| {
+        matches!(e, TerminalEvent::Output { bytes, .. } if String::from_utf8_lossy(bytes).contains("DONE"))
+    })
+}
+
+/// A current daemon answers; the client parses the reports but never answers
+/// itself, so the program hears exactly one reply.
+#[cfg(unix)]
+#[test]
+fn program_status_a_current_daemon_answers_once_and_reports_reach_the_client() {
+    let mut fx = boot_fixture();
+    let id = fx.backend.spawn(program_status_script("state=working:app=t")).expect("spawn");
+    let events = until_done(&mut fx.backend);
+    let text = output_text(&events);
+    assert!(text.contains("DONE"), "{text:?}");
+    assert_eq!(text.matches(PROGRAM_STATUS_REPLY_HEX).count(), 1, "{text:?}");
+    assert_eq!(reported_states(&events), vec![(Some(oximux_pty::ProgramState::Working), true)]);
+    let _ = fx.backend.close(id);
+}
+
+/// A second window attaching later starts from the program's last report,
+/// recovered from the replay ring, without answering the replayed query.
+#[cfg(unix)]
+#[test]
+fn program_status_an_attach_restores_the_reported_root_from_the_replay() {
+    let mut fx = boot_fixture();
+    let id = fx
+        .backend
+        .spawn(program_status_script("state=blocked:kind=permission"))
+        .expect("spawn");
+    let text = output_text(&until_done(&mut fx.backend));
+    assert_eq!(text.matches(PROGRAM_STATUS_REPLY_HEX).count(), 1, "{text:?}");
+    let pty = fx.backend.external_id_of(id).expect("relay id");
+
+    let mut second =
+        RelayBackend::new(Arc::clone(fx.backend.client()), fx._runtime.handle().clone());
+    let attached = second.attach_existing(&pty).expect("attach");
+    let events = second.drain_events_for(attached);
+    assert_eq!(
+        reported_states(&events),
+        vec![(Some(oximux_pty::ProgramState::Blocked), true)],
+        "the attach must seed the replayed root"
+    );
+    let _ = second.detach(attached);
+    let _ = fx.backend.close(id);
+}
+
+/// For a daemon that predates program-status replies, the client answers
+/// instead. Production enables this only for such a daemon (see
+/// `daemon_answers_program_status`); forcing it on against this current daemon
+/// makes two replies — the daemon's and the client's — which is how this test
+/// sees that the client's reply path works at all.
+#[cfg(unix)]
+#[test]
+fn program_status_a_client_answering_for_an_older_daemon_sends_its_reply() {
+    let fx = boot_fixture();
+    let mut backend = RelayBackend::new(Arc::clone(fx.backend.client()), fx._runtime.handle().clone())
+        .with_program_status_replies(true);
+    let id = backend.spawn(program_status_script("state=idle")).expect("spawn");
+    let text = output_text(&until_done(&mut backend));
+    assert_eq!(text.matches(PROGRAM_STATUS_REPLY_HEX).count(), 2, "{text:?}");
+    let _ = backend.close(id);
+}
+
+// --- Reattach fidelity (unix: POSIX shell scripts) ---
+
+#[cfg(unix)]
+fn screen_text(backend: &RelayBackend, id: TerminalSessionId) -> (Vec<String>, (usize, usize)) {
+    let snap = backend.snapshot(id).expect("snapshot");
+    let rows = snap
+        .cells
+        .iter()
+        .map(|row| row.iter().map(|c| if c.ch == '\0' { ' ' } else { c.ch }).collect::<String>().trim_end().to_owned())
+        .collect();
+    (rows, (snap.cursor.0 as usize, snap.cursor.1 as usize))
+}
+
+/// A second client attaching after more than a ring's worth of output sees
+/// the same screen and cursor as the client that watched it all live.
+#[cfg(unix)]
+#[test]
+fn a_reattach_after_a_wrapped_ring_shows_the_same_screen_and_cursor() {
+    let mut fx = boot_fixture();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "i=0; while [ $i -lt 40000 ]; do echo \"line $i with some padding text here\"; i=$((i+1)); done; \
+             printf '\\033[2J\\033[Htop row\\033[12;7Hmiddle\\033[20;3HREADY'; sleep 30"
+                .into(),
+        ],
+        cwd: test_cwd(),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    let id = fx.backend.spawn(cfg).expect("spawn");
+    let events = drain_until(&mut fx.backend, Duration::from_secs(30), |e| {
+        matches!(e, TerminalEvent::Output { bytes, .. } if String::from_utf8_lossy(bytes).contains("READY"))
+    });
+    assert!(!events.is_empty(), "no output");
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = fx.backend.drain_events();
+    let live = screen_text(&fx.backend, id);
+
+    let pty = fx.backend.external_id_of(id).expect("relay id");
+    let mut second =
+        RelayBackend::new(Arc::clone(fx.backend.client()), fx._runtime.handle().clone());
+    let attached = second.attach_existing(&pty).expect("attach");
+    let replayed = screen_text(&second, attached);
+    assert_eq!(replayed.0, live.0, "screen differs");
+    assert_eq!(replayed.1, live.1, "cursor differs");
+    assert!(live.0.iter().any(|r| r.contains("middle")));
+    let _ = second.detach(attached);
+    let _ = fx.backend.close(id);
+}
+
+/// The off-lock attach job registers its session with the backend it came
+/// from.
+#[cfg(unix)]
+#[test]
+fn a_deferred_attach_job_registers_its_session() {
+    let mut fx = boot_fixture();
+    let id = fx.backend.spawn(program_status_script("state=idle")).expect("spawn");
+    let pty = fx.backend.external_id_of(id).expect("relay id");
+    let mut second =
+        RelayBackend::new(Arc::clone(fx.backend.client()), fx._runtime.handle().clone());
+    let job = second.begin_attach_existing(&pty).expect("relay backends split the attach");
+    let attached = job().expect("attach");
+    assert_eq!(second.external_id_of(attached).as_deref(), Some(pty.as_str()));
+    let _ = second.detach(attached);
+    let _ = fx.backend.close(id);
+}

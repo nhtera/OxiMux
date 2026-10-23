@@ -10,6 +10,7 @@ pub mod agents_dashboard;
 pub mod automations_view;
 pub mod browser_view;
 pub mod chrome;
+pub mod color_contrast;
 pub mod command_palette;
 pub mod commit_dialog;
 pub mod compose_bar;
@@ -82,7 +83,7 @@ pub mod terminal;
 #[doc(inline)]
 pub use terminal::{
     adapter_picker, box_drawing, cell_metrics, floating_terminal, floating_terminal_host,
-    floating_terminal_persistence, key_input, mouse_report, terminal_canvas, terminal_context_menu,
+    floating_terminal_persistence, key_input, link_hover, mouse_report, terminal_canvas, terminal_context_menu,
     terminal_links, terminal_palette, terminal_row, terminal_scrollbar, terminal_search,
     terminal_search_overlay, terminal_search_state, terminal_view,
 };

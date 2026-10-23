@@ -35,8 +35,9 @@ const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 9] = [
         |s| &s.source_agent_state,
     ),
     (
-        "Terminal bell banners",
-        "Banner when a hidden terminal rings the bell (Terminal → Bell set to Notify).",
+        "Terminal banners",
+        "Banner when a hidden terminal rings the bell (Terminal → Bell set to Notify), runs `oximux notify`, \
+         or asks for one (Terminal → Program notifications).",
         keys::SOURCE_TERMINAL_BELL,
         |s| &s.source_terminal_bell,
     ),

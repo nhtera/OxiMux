@@ -390,6 +390,26 @@ impl Render for TerminalContextMenu {
             }),
         ));
 
+        // Read-only lock: the label says what clicking will do.
+        let view_lock = target.view.clone();
+        let locked = view_lock.upgrade().is_some_and(|v| v.read(cx).is_read_only());
+        card = card.child(MenuRow::new(
+            "term-ctx-read-only",
+            if locked { "Allow Input" } else { "Make Read-Only" },
+            theme,
+            density,
+            typography.clone(),
+            )
+            .enabled(true)
+            .build(
+            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                if let Some(v) = view_lock.upgrade() {
+                    v.update(cx, |v, cx| v.toggle_read_only(cx));
+                }
+                this.close(cx);
+            }),
+        ));
+
         card = card.child(MenuRow::new(
             "term-ctx-close-tab",
             "Close Tab",
