@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### Unreleased — v0.1.44: The `oximux` CLI comes with the app; `oximux .` opens a folder
+### 2026-10-24 — v0.1.44: The `oximux` CLI comes with the app; `oximux .` opens a folder (#71)
 
 - **Nothing to install.** The desktop app now ships the `oximux` command line
   tool, and every new shell OxiMux opens has it first on `PATH` — always the
