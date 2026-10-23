@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### Unreleased — Agent status without hooks (OSC 7501 program status)
+### 2026-10-23 — v0.1.43: Terminal: agent status without hooks, exact reattach, read-only terminals, insert path, CLI term send and events (#70)
 
 Agents that report their own status now get it shown exactly, with no hooks
 installed.
