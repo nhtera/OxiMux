@@ -211,7 +211,10 @@ pub fn backup_original(backup: &str) -> Option<&str> {
     (!original.is_empty() && hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(original)
 }
 
-fn backup_path(installed: &Path) -> PathBuf {
+/// A fresh backup name beside `installed`, in the one shape
+/// [`backup_original`] recognises. Public for the desktop, which sets its own
+/// copy of the command line tool aside the same way when it is still running.
+pub fn backup_path(installed: &Path) -> PathBuf {
     let mut suffix = [0u8; 4];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut suffix);
     let name = installed.file_name().unwrap_or_else(|| OsStr::new("oximux")).to_string_lossy();

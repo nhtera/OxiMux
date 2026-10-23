@@ -112,6 +112,12 @@ fn main() {
     // precede the first thread — it writes the environment.
     oximux_app::platform::claude_session_env::scrub_inherited_claude_session_markers();
 
+    // Before anything spawns, for the same reason: launched from an OxiMux
+    // pane (a `cargo run`, a second copy, a beta), the process inherits that
+    // build's command line tool directory, which its shells export. It must
+    // not become this build's. Must precede the first thread.
+    oximux_app::platform::bundled_cli::scrub_inherited();
+
     // Before the runtime, and before anything spawns: a GUI launch inherits the
     // session manager's stub PATH on every platform, and every agent CLI
     // installs outside it. Must precede the first thread — it writes the
@@ -125,6 +131,13 @@ fn main() {
     let subcommand = std::env::args().nth(1);
     if !matches!(subcommand.as_deref(), Some("notify" | "agent-status")) {
         oximux_app::platform::login_path::adopt_login_shell_path();
+        // Resolve the bundled command line tool off the main thread before
+        // the first terminal asks for it: on Windows that refreshes the
+        // install's `bin\oximux.exe` copy, a file copy no window should wait
+        // on. After every environment write above, as the first thread.
+        std::thread::spawn(|| {
+            oximux_app::platform::bundled_cli::bin_dir();
+        });
     }
 
     // Boot the tokio runtime that every git op + status poller relies on.

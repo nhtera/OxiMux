@@ -24,6 +24,9 @@ pub(crate) fn serialize_input_state() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub mod app_nap;
+// The `oximux` command line tool the app ships: where it sits in the bundle
+// or install, and the env an interactive shell gets for it.
+pub mod bundled_cli;
 pub mod claude_session_env;
 // Unconditional rather than `#[cfg(windows)]`: the entry point calls it on
 // every platform and the function is the no-op, so the one Windows quirk

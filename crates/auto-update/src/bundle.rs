@@ -59,10 +59,7 @@ pub struct InstalledApp {
 pub fn eligibility(exe: &Path) -> Result<InstalledApp, UnsupportedReason> {
     let bundle_root = bundle_root_of(exe).ok_or(UnsupportedReason::NotABundle)?;
 
-    if bundle_root
-        .components()
-        .any(|c| c.as_os_str() == "AppTranslocation")
-    {
+    if is_translocated(&bundle_root) {
         return Err(UnsupportedReason::Translocated);
     }
 
@@ -106,10 +103,15 @@ pub fn bundle_root_of(exe: &Path) -> Option<PathBuf> {
     Some(root.to_path_buf())
 }
 
+/// Whether `bundle_root` runs from Gatekeeper's App Translocation: a
+/// read-only mirror at a random path, gone once the app quits.
+pub fn is_translocated(bundle_root: &Path) -> bool {
+    bundle_root.components().any(|c| c.as_os_str() == "AppTranslocation")
+}
+
 /// Probed by creating a file — directory permission bits under-report on
 /// macOS.
-#[cfg(target_os = "macos")]
-fn dir_is_writable(dir: &Path) -> bool {
+pub fn dir_is_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".oximux-write-probe-{}", std::process::id()));
     let ok = std::fs::write(&probe, b"").is_ok();
     if ok {
