@@ -190,6 +190,33 @@ jobs:
             echo "OxiMux itself must not carry the camera entitlement" >&2; exit 1
           fi
 
+      # The bundled command line tool: present, linked where the terminals'
+      # PATH expects it, the release's own version, no entitlements, and no GUI
+      # framework linked in (a build sharing the app's cargo invocation would
+      # unify the app's gpui features into it while every other check passed).
+      - name: Check the bundled command line tool
+        run: |
+          contents=dist/OxiMux.app/Contents
+          cli=$contents/MacOS/oximux-cli
+          link=$contents/Resources/bin/oximux
+          [[ -x "$cli" ]] || { echo "the bundle has no $cli" >&2; exit 1; }
+          [[ "$(readlink "$link")" == "../../MacOS/oximux-cli" ]] \
+            || { echo "$link must link to ../../MacOS/oximux-cli" >&2; exit 1; }
+          want="oximux $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          got="$("$link" --version)"
+          [[ "$got" == "$want" ]] || { echo "the bundled CLI says '$got', want '$want'" >&2; exit 1; }
+          # The whole bundle, nested code and the Resources/bin link included.
+          codesign --verify --deep --strict --verbose=2 dist/OxiMux.app
+          codesign --verify --strict "$cli"
+          if codesign -d --entitlements - "$cli" 2>/dev/null | grep -q .; then
+            echo "the command line tool must carry no entitlements" >&2; exit 1
+          fi
+          codesign -d --verbose=2 "$cli" 2>&1 | grep -q 'flags=.*runtime' \
+            || { echo "the command line tool must have the hardened runtime" >&2; exit 1; }
+          if otool -L "$cli" | grep -Eq '/(AppKit|Metal|QuartzCore)\.framework/'; then
+            echo "the command line tool must not link GUI frameworks:" >&2; otool -L "$cli" >&2; exit 1
+          fi
+
       # Dry run only: prove the Developer-ID-signed, hardened-runtime helper
       # passes library validation when it dlopens Xcode's simulator
       # frameworks, by streaming real frames from a booted simulator.
@@ -422,6 +449,29 @@ jobs:
       - name: Build and package
         shell: pwsh
         run: ./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip -Installer
+
+      # The payload must carry the command line tool, top-level: the swap of
+      # an installed (older) updater renames files into place and creates no
+      # folders, so a new folder in the zip would fail every update to here.
+      - name: Check the payload carries the command line tool
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist/OxiMux-*-windows-*.zip | Select-Object -First 1
+          if (-not $zip) { throw 'no zip in dist/ - did bundle-windows.ps1 run?' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          try { $names = @($archive.Entries | ForEach-Object FullName) } finally { $archive.Dispose() }
+          if (-not ($names | Where-Object { $_ -match '^OxiMux[/\\]oximux-cli\.exe$' })) {
+            throw "the zip has no top-level oximux-cli.exe"
+          }
+          $nested = @($names | Where-Object { $_ -match '^[^/\\]+[/\\][^/\\]+[/\\]' })
+          if ($nested) {
+            throw "the zip must carry no folder inside OxiMux/ (an installed updater cannot create one): $($nested[0])"
+          }
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+                    Select-Object -First 1).Matches[0].Groups[1].Value
+          $got = & dist/OxiMux/oximux-cli.exe --version
+          if ($got -ne "oximux $cargo") { throw "the bundled CLI says '$got', want 'oximux $cargo'" }
 
       - name: Upload zip and installer to the release
         shell: pwsh

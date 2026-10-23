@@ -27,6 +27,14 @@
                               input needs no permission there, so the hook is
                               the only thing watching. See
                               docs/windows-port-exclusions.md.
+      oximux-cli.exe          the `oximux` command line tool (the build the
+                              Homebrew formula and install-cli.ps1 ship). The
+                              app copies it to bin\oximux.exe at boot and puts
+                              bin\ first on its terminals' PATH. It ships here,
+                              top-level, because the quit-time swap of an
+                              installed updater renames files into place and
+                              creates no folders: a bin\ in the payload would
+                              fail every update from a release before it.
       rg.exe                  ripgrep, for the search panel and Quick Open.
                               Missing, search reports "ripgrep missing".
       *.dll                   the voice-dictation engine (onnxruntime +
@@ -108,7 +116,7 @@ try {
     if ($Target) { $CargoFlags += @('--target', $Target) }
 
     if (-not $SkipBuild) {
-        Write-Host "==> Building oximux + oximux-relay + oximux-screen-gate ($Profile)"
+        Write-Host "==> Building oximux + oximux-relay + oximux-screen-gate + oximux-cli ($Profile)"
         # One cargo invocation, not three: the three binaries share almost their
         # whole dependency graph, and three invocations serialise what cargo
         # would otherwise overlap.
@@ -116,6 +124,11 @@ try {
             -p oximux-app --bin oximux `
             -p oximux-relay --bin oximux-relay `
             -p oximux-computer-use --bin oximux-screen-gate
+        if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+        # The CLI never joins that invocation: cargo unifies features across the
+        # packages of one build, which would compile the app's gpui support into
+        # the CLI's dependencies.
+        & cargo build @CargoFlags -p oximux-cli --bin oximux-cli
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
     }
 
@@ -125,7 +138,7 @@ try {
     # "Access to the path 'onnxruntime.dll' is denied" - which names a file
     # nobody touched and says nothing about the app in the taskbar. Check for
     # the process instead, and say what to do about it.
-    $running = @(Get-Process -Name 'oximux', 'oximux-relay' -ErrorAction SilentlyContinue |
+    $running = @(Get-Process -Name 'oximux', 'oximux-relay', 'oximux-cli' -ErrorAction SilentlyContinue |
                  Where-Object { $_.Path -and $_.Path.StartsWith($AppDir, [StringComparison]::OrdinalIgnoreCase) })
     if ($running) {
         $list = ($running | ForEach-Object { "$($_.ProcessName) (pid $($_.Id))" }) -join ', '
@@ -139,14 +152,15 @@ Windows cannot replace a running executable or a mapped DLL. Quit that OxiMux
     if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
 
-    foreach ($exe in 'oximux.exe', 'oximux-relay.exe', 'oximux-screen-gate.exe') {
+    $executables = 'oximux.exe', 'oximux-relay.exe', 'oximux-screen-gate.exe', 'oximux-cli.exe'
+    foreach ($exe in $executables) {
         $src = Join-Path $ArtifactDir $exe
         if (-not (Test-Path $src)) {
             throw "$exe is missing from $ArtifactDir. Build it, or drop -SkipBuild."
         }
         Copy-Item -Path $src -Destination (Join-Path $AppDir $exe) -Force
     }
-    Write-Host '==> Copied 3 executables'
+    Write-Host "==> Copied $($executables.Count) executables"
 
     # The dictation engine's native libraries. Cargo stages every dynamic native
     # dependency at the profile root, so a glob is both complete and
