@@ -113,6 +113,53 @@ packages producing one bin name would make `cargo build --workspace`
 overwrite whichever built second. The installer still places `apps/cli`'s
 binary on `PATH` under the name users actually type, `oximux`.
 
+### The CLI inside the desktop app
+
+The desktop ships the CLI, so its terminals need nothing installed:
+
+- **Layout.** macOS: `OxiMux.app/Contents/MacOS/oximux-cli` (beside the relay,
+  found as a sibling) and `Contents/Resources/bin/oximux`, a relative link to
+  it. Windows: `oximux-cli.exe` at the top of the install — the swap of a
+  v0.1.43 or older updater renames files into place and creates no folders —
+  copied by the app at boot to `<install>\bin\oximux.exe`
+  (`platform/bundled_cli.rs`; never in a cargo build tree). Built in its own cargo invocation (no gpui
+  feature unification) and signed with the hardened runtime and no
+  entitlements; `release.yml` checks both.
+- **PATH, interactive shells only.** `shell_spawn_config` adds
+  `OXIMUX_CLI_BIN_DIR`, `OXIMUX_CLI` (absolute, for a login sub-shell that
+  rebuilds PATH) and a `PATH` with that directory first. The shell integration
+  overlays put it first again after the user's `.zshrc`/`.bashrc`/`config.fish`
+  ran. Only that directory ever goes on PATH — `Contents/MacOS` would expose the
+  app binary as `oximux`. Nothing is added for a translocated or DMG-run bundle,
+  or for a dev build, which can opt in with `OXIMUX_DEV_CLI_BIN_DIR` (read by
+  debug builds only). Only shells spawned after this exist get it; ones the
+  daemon restores keep the environment they started with.
+- **Boot scrub.** An OxiMux started from an OxiMux pane (a `cargo run`, a
+  second copy) drops the inherited `OXIMUX_CLI_BIN_DIR`/`OXIMUX_CLI` and that
+  directory from its PATH before anything spawns: those are outputs, never
+  inputs, so one build never adopts another's CLI.
+- **Not for agents.** Agent Chat, one-click agent terminals and ACP spawns are
+  untouched, and the app's own PATH is unchanged: desktop agents carry no
+  per-session credential yet (`remote_control.rs`, `grant_agent_credential`),
+  so a CLI on their PATH would act with the operator's full scope. An agent a
+  person starts by hand in a shell inherits that shell's PATH.
+- **Updates.** The bundled copy refuses `oximux update`; the app's updater
+  replaces it with everything else. A copy reached through a link finds its
+  relay because the sibling lookup resolves links (`crates/sibling-binary`).
+- **Hook verbs.** `notify` and `agent-status` are parsed before clap in both
+  binaries (agent hooks append arguments of their own) and dial the relay's
+  own socket. The CLI's copies exit 0 on every runtime outcome — a hook must
+  not fail an agent's turn — and non-zero only for a malformed hook entry; the
+  app binary's keep their own codes.
+- **`oximux open` / `oximux .`.** `Request::OpenProject` (wire v35) over the
+  local control socket, local operator only. The desktop resolves the folder's
+  project off the UI (`remote_control/open_bridge.rs`): the deepest known
+  project holding it, in its registered spelling, else the nearest `.git` — a
+  linked worktree's main repository, its worktree selected when the rail lists
+  it. It is registered as a dropped folder is (`shell/workspace/open_folder.rs`).
+  The CLI starts the app first when nothing answers on the default local
+  socket (never for `--dir`).
+
 ### `oximux serve` topology (headless host)
 
 `apps/cli/src/serve/` runs the same `Dispatcher` / `SessionRegistry` /
@@ -1119,6 +1166,8 @@ Every spawned terminal receives an `OXIMUX_*` env block minted at spawn time:
 | `OXIMUX_TAB_ID` | UUID minted per tab within leaf |
 | `OXIMUX_SOCKET_PATH` | relay Unix socket path |
 | `OXIMUX_PTY_ID` | injected by relay daemon at fork |
+| `OXIMUX_CLI_BIN_DIR` | interactive shells only: the bundled CLI's directory, first on `PATH` |
+| `OXIMUX_CLI` | interactive shells only: the bundled CLI's absolute path |
 
 `SurfaceIds` (`shell/context_env.rs`) builds the env list. Ids persist in the per-pane layout blob (serde-default) and are re-injected on dormant respawn. Agent CLI PTYs excluded until a follow-on.
 
