@@ -73,6 +73,15 @@
 # the agent's own CLI. Missing from the bundle, the hook command fails to
 # run and the chat drives the screen with nothing enforcing it.
 #
+# oximux-cli is the `oximux` command line tool, the same binary Homebrew and
+# install-cli.sh ship. It sits beside the relay, which it finds as a sibling,
+# and Contents/Resources/bin/oximux links to it: that directory, and only it,
+# is put first on PATH in OxiMux's terminals (Contents/MacOS would also expose
+# the app binary as `oximux`). Built in a cargo invocation of its own, so the
+# app's features (gpui) are not unified into its dependency graph. Signed
+# with the hardened runtime and NO entitlements: scripts and agents run it,
+# and it records nothing.
+#
 # oximux-sim-helper streams and drives the iOS Simulator for the Simulator
 # panel over stdin/stdout. It is NOT built here: scripts/fetch-sim-helper.sh
 # fetches a pinned, sha256-verified release from our serve-sim fork
@@ -180,15 +189,18 @@ sign_bundle() {
     for dylib in "$APP_DIR/Contents/MacOS"/*.dylib; do
         [[ -f "$dylib" && ! -L "$dylib" ]] && codesign "${opts[@]}" "$dylib"
     done
-    # The simulator helper gets the hardened runtime but no entitlements —
-    # see the header note. Guarded like rg: a --debug-fast refresh of an
-    # older bundle may not have it.
+    # The simulator helper and the command line tool get the hardened
+    # runtime but no entitlements — see the header note. Guarded like rg: a
+    # --debug-fast refresh of an older bundle may not have them.
+    local helper_opts=(--force -s "$sign_id")
+    if [[ "$HARDENED" -eq 1 ]]; then
+        helper_opts+=(--options runtime --timestamp)
+    fi
     if [[ -f "$APP_DIR/Contents/MacOS/oximux-sim-helper" ]]; then
-        local helper_opts=(--force -s "$sign_id")
-        if [[ "$HARDENED" -eq 1 ]]; then
-            helper_opts+=(--options runtime --timestamp)
-        fi
         codesign "${helper_opts[@]}" "$APP_DIR/Contents/MacOS/oximux-sim-helper"
+    fi
+    if [[ -f "$APP_DIR/Contents/MacOS/oximux-cli" ]]; then
+        codesign "${helper_opts[@]}" "$APP_DIR/Contents/MacOS/oximux-cli"
     fi
     # The iPhone capture app: its own bundle, signed with the camera
     # entitlement and nothing else (an iPhone's screen is a camera to macOS;
@@ -416,6 +428,15 @@ bundle_runner_sources() {
     done
 }
 
+# The command line tool and its PATH link (see the header note). `$1` = the
+# target subdir. The link is relative so it survives the bundle being moved.
+bundle_cli() {
+    cp -f "target/$1/oximux-cli" "$APP_DIR/Contents/MacOS/oximux-cli"
+    mkdir -p "$APP_DIR/Contents/Resources/bin"
+    ln -sfn ../../MacOS/oximux-cli "$APP_DIR/Contents/Resources/bin/oximux"
+    echo "==> Bundled oximux-cli (on PATH as Resources/bin/oximux)"
+}
+
 # Fast path: refresh the bundled binary in place. Fail loudly if there
 # is no existing bundle to refresh — implicit `mkdir` would mask a
 # missing full-bundle step and surface as a launch failure later.
@@ -439,6 +460,12 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
     cp -f "target/debug/oximux-relay" "$APP_DIR/Contents/MacOS/oximux-relay"
     if [[ -f "target/debug/oximux-screen-gate" ]]; then
         cp -f "target/debug/oximux-screen-gate" "$APP_DIR/Contents/MacOS/oximux-screen-gate"
+    fi
+    if [[ -f "target/debug/oximux-cli" ]]; then
+        bundle_cli debug
+    else
+        echo "warning: no target/debug/oximux-cli; the bundle keeps its old copy" >&2
+        echo "         (cargo build -p oximux-cli --bin oximux-cli to refresh it)" >&2
     fi
     # Keep Info.plist + app icon in sync too, so a fast refresh produces a
     # complete bundle (correct menu-bar name + Dock icon), not just binaries.
@@ -494,12 +521,14 @@ if [[ "$NOTARIZE" -eq 1 ]]; then
     require_notary_profile
 fi
 
-echo "==> Building oximux + oximux-relay + oximux-screen-gate ($PROFILE)"
+echo "==> Building oximux + oximux-relay + oximux-screen-gate + oximux-cli ($PROFILE)"
 # `${CARGO_FLAGS[@]+...}` guards the expansion so an empty array (debug
 # profile) doesn't trip `set -u` ("unbound variable") on bash < 4.4.
 cargo build -p oximux-app --bin oximux ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 cargo build -p oximux-relay --bin oximux-relay ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 cargo build -p oximux-computer-use --bin oximux-screen-gate ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
+# Its own invocation, never folded into the app's: see the header note.
+cargo build -p oximux-cli --bin oximux-cli ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 
 echo "==> Assembling $APP_DIR"
 rm -rf "$APP_DIR"
@@ -509,6 +538,7 @@ cp "target/$TARGET_SUBDIR/oximux" "$APP_DIR/Contents/MacOS/oximux"
 cp "target/$TARGET_SUBDIR/oximux-relay" "$APP_DIR/Contents/MacOS/oximux-relay"
 cp "target/$TARGET_SUBDIR/oximux-screen-gate" "$APP_DIR/Contents/MacOS/oximux-screen-gate"
 cp "assets/Info.plist" "$APP_DIR/Contents/Info.plist"
+bundle_cli "$TARGET_SUBDIR"
 
 # App icon — charcoal rounded tile + terminal prompt glyph (matches the
 # in-app welcome-view brand). Regenerate from assets/AppIcon.icns.

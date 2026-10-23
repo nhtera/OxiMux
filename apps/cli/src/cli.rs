@@ -74,7 +74,8 @@ pub struct Cli {
     /// Seconds to wait for a host reply before giving up (exit 4). For `wait`,
     /// this is the overall bound on the wait itself. It does NOT bound an
     /// agent's turn: `run`/`send` stream until the turn ends, and `attach`
-    /// until Ctrl+C. Bound a turn with `run`/`send --turn-timeout`.
+    /// until Ctrl+C. Bound a turn with `run`/`send --turn-timeout`. `open`
+    /// waits at least 30 s for its reply, which can follow starting the app.
     #[arg(long, global = true, default_value_t = 10, value_name = "SECS")]
     pub timeout: u64,
 
@@ -313,6 +314,23 @@ pub enum Command {
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
+    },
+    /// Open a folder as a project in the OxiMux app (`oximux .` for this one).
+    ///
+    /// A project OxiMux already knows that holds the folder is selected again,
+    /// not added twice. Otherwise the folder's git work tree opens (a linked
+    /// worktree opens its main repository, with the worktree selected when
+    /// OxiMux lists it); a plain folder opens as itself. The app comes
+    /// forward, and is started first when it is not running.
+    ///
+    /// `oximux <folder>` is the same: a first argument that is `.`, `..`, or
+    /// starts with `/`, `./`, `../` or `~` — or names an existing folder that is
+    /// not one of these commands — opens it. A folder named like a command
+    /// (`term`) needs `./term`.
+    #[command(verbatim_doc_comment)]
+    Open {
+        /// The folder to open.
+        path: PathBuf,
     },
     /// Project verbs.
     Projects {

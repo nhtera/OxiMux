@@ -644,6 +644,87 @@ impl oximux_remote_host::ProjectProvider for ScriptedProjects {
     async fn projects(&self) -> Vec<oximux_remote_proto::ProjectSummaryWire> {
         self.0.clone()
     }
+
+    /// Opens whatever it is asked to, as itself.
+    async fn open(
+        &self,
+        path: &str,
+    ) -> Result<oximux_remote_host::OpenedProject, oximux_remote_host::OpenProjectError> {
+        Ok(oximux_remote_host::OpenedProject {
+            project: oximux_remote_proto::ProjectSummaryWire { name: "opened".into(), path: path.into() },
+            worktree: None,
+        })
+    }
+}
+
+/// Opening a folder is the person at the machine's: the local operator gets it,
+/// while a fully authorized paired device is refused — it would change what
+/// someone else is looking at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_local_operator_opens_a_folder() {
+    let open = || Request::OpenProject { path: "/work/repo".into() };
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_projects(projects(vec![]));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, oximux_remote_host::LocalScope::Full);
+    let script = async move {
+        assert_eq!(
+            call(&client, open()).await,
+            Response::ProjectOpened {
+                project: oximux_remote_proto::ProjectSummaryWire { name: "opened".into(), path: "/work/repo".into() },
+                worktree: None,
+            }
+        );
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(call(&client, open()).await, Response::Error(RpcError::Unauthorized));
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
+/// A host with no windows (headless `oximux serve`: no provider, or one that
+/// keeps the default) says so to the operator rather than pretending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_without_windows_cannot_open_a_folder() {
+    struct ListOnly;
+    #[async_trait::async_trait]
+    impl oximux_remote_host::ProjectProvider for ListOnly {
+        async fn projects(&self) -> Vec<oximux_remote_proto::ProjectSummaryWire> {
+            Vec::new()
+        }
+    }
+    for with_provider in [false, true] {
+        let auth = Arc::new(AuthStore::new());
+        let mut dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth).with_clock(clock);
+        if with_provider {
+            dispatcher = dispatcher.with_projects(Arc::new(ListOnly));
+        }
+        let (client, server) = duplex_pair();
+        let serve = dispatcher.serve_local(&server, oximux_remote_host::LocalScope::Full);
+        let script = async move {
+            assert_eq!(
+                call(&client, Request::OpenProject { path: "/work".into() }).await,
+                Response::Error(RpcError::Unsupported)
+            );
+            drop(client);
+        };
+        futures::future::join(serve, script).await;
+    }
 }
 
 fn projects(

@@ -88,12 +88,14 @@ a key under the cert).
 
 ## Gatekeeper facts worth remembering
 
-- Sign inside-out, never `--deep`: dylibs → `oximux-sim-helper` → `rg` →
-  `oximux-relay` → `oximux-screen-gate` → `oximux` → the bundle.
+- Sign inside-out, never `--deep`: dylibs → `oximux-sim-helper` →
+  `oximux-cli` → `rg` → `oximux-relay` → `oximux-screen-gate` → `oximux` → the
+  bundle.
   `bundle-macos.sh` encodes this order.
 - Hardened runtime (`--options runtime`) and a secure timestamp are notarization requirements for every binary.
   - Our own binaries also get `assets/OxiMux.entitlements`, which is currently mic-only.
   - `oximux-sim-helper` deliberately gets **no** entitlements. It only dlopens Apple-signed simulator frameworks, and the app's grants must not extend to private-framework code.
+  - `oximux-cli`, the bundled command line tool, gets **no** entitlements either: scripts and agents run it, and it records nothing. `release.yml` checks it.
 - "Apple Development" certs sign locally but are REJECTED at notarization;
   only "Developer ID Application" works. Both scripts check this up front.
 - Notary wait is usually 1–15 min; occasionally much longer. The service keeps

@@ -11,6 +11,8 @@ pub mod discovery;
 pub mod focus_follow;
 pub mod merge_notices;
 pub mod merge_ops;
+// `oximux open`'s landing point on the workspace root.
+pub mod open_folder;
 pub mod project_picker;
 pub mod provision_card;
 pub mod provision_progress;

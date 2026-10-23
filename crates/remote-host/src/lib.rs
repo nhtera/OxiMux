@@ -34,7 +34,7 @@ pub use auth::{
 pub use dispatcher::Dispatcher;
 pub use identity::HostIdentity;
 pub use launcher::{LaunchError, SessionLauncher};
-pub use projects::ProjectProvider;
+pub use projects::{OpenProjectError, OpenedProject, ProjectProvider};
 pub use rewind::{RewindError, RewindService};
 pub use schedule_runner::{RunNowError, ScheduleRunner, TickerRunner, schedule_run_to_wire};
 pub use simulator::{SimPrincipal, SimViewFeed, SimViewOut, SimViewSource, SimViewer, SimulatorControl};

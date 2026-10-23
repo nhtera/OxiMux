@@ -123,6 +123,12 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
+[InstallDelete]
+; The app's own copy of the command line tool, recreated from oximux-cli.exe at
+; boot. Removed on every install so a reinstall or a downgrade never leaves a
+; newer copy beside an older app.
+Type: filesandordirs; Name: "{app}\bin"
+
 [UninstallDelete]
 ; Files the app writes into its own directory are not supposed to exist -- see
 ; app_paths.rs -- but a crash dump or a log dropped beside the exe would leave

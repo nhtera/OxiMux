@@ -18,14 +18,16 @@ missing. `scripts/bundle-windows.ps1` is where the noticing lives.
 ## What is in the directory, and what happens without it
 
 Everything OxiMux locates at runtime, it locates as a **sibling of the running
-executable** (`current_exe().parent()`), which is why the layout is flat and why
-the script asserts rather than copies-and-hopes.
+executable** (`current_exe().parent()`), which is why the payload is flat and why
+the script asserts rather than copies-and-hopes. The one folder an install ever
+has, `bin\`, is not in the payload: the app creates it at boot (below).
 
 | File | Missing means |
 |---|---|
 | `oximux.exe` | — |
 | `oximux-relay.exe` | Terminals fall back to an in-process backend that dies on quit. Sessions never survive a relaunch. |
 | `oximux-screen-gate.exe` | **Every agent chat runs unenforced.** One warning in the log, otherwise indistinguishable from normal. |
+| `oximux-cli.exe` | OxiMux's terminals have no `oximux` command. The app copies it to `bin\oximux.exe` at boot and puts `bin\` first on its shells' PATH; it ships top-level because a v0.1.43 or older updater's swap creates no folders, so a folder in the payload would fail every update from one. |
 | `rg.exe` | Search and Quick Open report "ripgrep missing". |
 | `onnxruntime.dll`, `sherpa-onnx-*.dll`, `cargs.dll` | The app does not start at all. Windows resolves imports at load time, so there is no degraded mode. |
 

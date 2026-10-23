@@ -341,6 +341,33 @@ impl Dispatcher {
         }
     }
 
+    /// Open a folder as a project in the desktop (`oximux open`, `oximux .`).
+    ///
+    /// The local operator only. It changes what the person at the machine is
+    /// looking at, which a paired device away from it — or an agent confined
+    /// to one session — has no business doing.
+    pub(super) async fn open_project(&self, peer: &Peer, path: &str) -> Response {
+        if !peer.is_local_operator() {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(provider) = self.projects.as_ref() else {
+            return Response::Error(RpcError::Unsupported);
+        };
+        match provider.open(path).await {
+            Ok(opened) => Response::ProjectOpened { project: opened.project, worktree: opened.worktree },
+            Err(crate::OpenProjectError::Unsupported) => Response::Error(RpcError::Unsupported),
+            Err(crate::OpenProjectError::NotADirectory) => {
+                Response::Error(RpcError::BadRequest(format!("{path} is not a directory")))
+            }
+            Err(crate::OpenProjectError::Unavailable) => {
+                Response::Error(RpcError::Internal(
+                    "the desktop did not take it (no window open yet, or it is busy); try again".into(),
+                ))
+            }
+            Err(crate::OpenProjectError::Failed(why)) => Response::Error(RpcError::Internal(why)),
+        }
+    }
+
     /// Rewind a session to an earlier turn.
     ///
     /// Gated on `may_write` like every state-changing RPC — and unlike

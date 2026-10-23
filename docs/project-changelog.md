@@ -4,6 +4,36 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### Unreleased — v0.1.44: The `oximux` CLI comes with the app; `oximux .` opens a folder
+
+- **Nothing to install.** The desktop app now ships the `oximux` command line
+  tool, and every new shell OxiMux opens has it first on `PATH` — always the
+  same version as the app, ahead of a Homebrew copy even when your `.zshrc`,
+  `.bashrc` or `config.fish` puts one first (with shell integration on, the
+  default). `$OXIMUX_CLI` holds its full path for scripts and login shells. It
+  updates with the app, and `oximux update` from it says so. Not when OxiMux
+  runs straight from the disk image: move it to Applications first.
+- **`oximux .`** (or `oximux open <folder>`) opens a folder as a project. A
+  project OxiMux already knows is selected again, not added twice; otherwise a
+  folder in a git repository opens the repository, and one in a linked worktree
+  opens its main repository, with the worktree selected when OxiMux lists it.
+  The app comes forward, and is started first when it is not running.
+- **Agents don't get the bundled copy on their `PATH`.** Agents OxiMux starts
+  would act with your full access through it, so it stays off their `PATH`
+  until each agent gets a credential of its own. A separately installed
+  `oximux` already on your `PATH` stays reachable to them, as before. An agent
+  you start yourself in an OxiMux shell inherits that shell's `PATH`, bundled
+  copy included, and that access.
+- **Hook fixes.** The separate CLI's `agent-status` hook dialed the wrong
+  socket and silently reported nothing; it now reaches the terminal. The CLI
+  also answers `oximux notify`, and both hooks ignore extra arguments an agent
+  passes.
+- **Shell integration fix.** With `setopt nounset` in your `.zshrc`, OxiMux's
+  command marks and per-terminal history were silently off; they work now.
+- **Windows:** `install-cli.ps1` no longer overwrites the app when pointed at
+  its install folder — its default, since Windows ignores case. Choose another
+  folder with `-Dir`, or `$env:OXIMUX_INSTALL_DIR` when piping the script.
+
 ### 2026-10-23 — v0.1.43: Terminal: agent status without hooks, exact reattach, read-only terminals, insert path, CLI term send and events (#70)
 
 Agents that report their own status now get it shown exactly, with no hooks

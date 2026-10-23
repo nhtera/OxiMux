@@ -92,6 +92,20 @@ See [docs/cli-reference.md](docs/cli-reference.md) for every command and flag.
 It's generated straight from the parser (`scripts/gen-cli-docs.sh`), so it
 can't drift from what the binary actually accepts.
 
+**With the desktop app, there is nothing to install.** The app ships the CLI,
+and every new shell OxiMux opens has it first on `PATH` as `oximux` (and at
+`$OXIMUX_CLI`), always the same version as the app — even ahead of a copy your
+own startup files put first, while shell integration is on (the default). `oximux .` opens the
+folder you are in as a project.
+
+Agents the app starts do not get the bundled copy on their `PATH`: the desktop
+does not yet give each agent a credential of its own, so through the CLI an
+agent would act with your full access. (A separately installed `oximux` already
+on your `PATH` stays reachable to them.) An agent you start yourself in an OxiMux shell inherits
+that shell's `PATH` — and that access.
+
+For a server, a machine without the app, or terminals outside OxiMux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nhtera/OxiMux/main/scripts/install-cli.sh | sh
 ```
@@ -101,8 +115,11 @@ irm https://raw.githubusercontent.com/nhtera/OxiMux/main/scripts/install-cli.ps1
 ```
 
 Installs `oximux` and `oximux-relay` into `~/.local/bin` (macOS/Linux) or
-`%LOCALAPPDATA%\Programs\oximux` (Windows). Both binaries, always: they speak a
-handshake versioned in lockstep, so one without the other cannot talk to itself.
+`%LOCALAPPDATA%\Programs\oximux` (Windows). On Windows that is the app's own
+install folder too (paths ignore case), so with the app installed choose
+another: `$env:OXIMUX_INSTALL_DIR = '<folder>'` before piping the script.
+Both binaries, always: they speak a handshake versioned in lockstep, so one
+without the other cannot talk to itself.
 
 Afterwards it updates itself:
 

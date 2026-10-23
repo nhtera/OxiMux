@@ -173,6 +173,17 @@ try {
         }
     }
 
+    # The desktop app installs per user to %LOCALAPPDATA%\Programs\OxiMux,
+    # which is this script's default too: Windows paths ignore case. Unpacking
+    # there would replace the app's own oximux.exe with the CLI and its relay
+    # with another build, and leave the app's updater fighting this one. The
+    # screen gate ships only with the app, so it marks that folder.
+    if (Test-Path -LiteralPath (Join-Path $Dir 'oximux-screen-gate.exe')) {
+        Die ("$Dir is the OxiMux app's install folder. Since 0.1.44 the app puts its own oximux " +
+             "command line tool in its terminals. To install a separate copy, choose another folder: " +
+             '-Dir <folder>, or $env:OXIMUX_INSTALL_DIR = ''<folder>'' before piping this script to iex.')
+    }
+
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
 
     # Absolute from here on: the PATH block below writes this into the user's

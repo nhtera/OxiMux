@@ -133,6 +133,38 @@ impl StatusArgs {
     }
 }
 
+/// A parsed `oximux notify` invocation: the attention banner a hook or script
+/// raises for the pane it runs in.
+///
+/// Parsed like [`StatusArgs`], and for the same reason: agent hooks run it, and
+/// one of them (Codex's `notify`) appends its own JSON payload as an extra
+/// argument. Unknown arguments are ignored and a flag with no value reads as
+/// empty — including one followed straight by another flag, which is that
+/// flag, not this one's value — so no invocation is ever refused — there is nothing a caller could
+/// get wrong that is worth failing its turn over.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NotifyArgs {
+    pub title: String,
+    pub body: String,
+}
+
+impl NotifyArgs {
+    /// `args` is everything after the `notify` verb itself.
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
+        let mut parsed = Self::default();
+        let mut args = args.into_iter().peekable();
+        while let Some(a) = args.next() {
+            let slot = match a.as_str() {
+                "--title" => &mut parsed.title,
+                "--body" => &mut parsed.body,
+                _ => continue,
+            };
+            *slot = args.next_if(|next| next != "--title" && next != "--body").unwrap_or_default();
+        }
+        parsed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +263,26 @@ mod tests {
         // Without the key there is no key — the reader keeps its cached id.
         let bare = r#"{"hook_event_name":"PreToolUse","tool_name":"Edit"}"#;
         assert!(decode(&working.payload(bare).unwrap()).get("session_id").is_none());
+    }
+
+    #[test]
+    fn notify_reads_its_two_flags_and_ignores_everything_else() {
+        let parsed = NotifyArgs::parse(args(&[
+            "--title",
+            "Build",
+            r#"{"type":"agent-turn-complete"}"#,
+            "--body",
+            "done",
+            "--unknown",
+        ]));
+        assert_eq!(parsed, NotifyArgs { title: "Build".into(), body: "done".into() });
+        // A flag left without its value is empty, not an error.
+        assert_eq!(NotifyArgs::parse(args(&["--title"])), NotifyArgs::default());
+        // …and the next flag is never taken for its value.
+        assert_eq!(
+            NotifyArgs::parse(args(&["--title", "--body", "done"])),
+            NotifyArgs { title: String::new(), body: "done".into() }
+        );
     }
 
     #[test]

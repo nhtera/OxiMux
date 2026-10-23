@@ -22,6 +22,7 @@ pub fn run(check_only: bool) -> Result<(Value, String), Failure> {
     let fetcher = HttpFetcher;
     let key = build_info::release_public_key();
     let current = build_info::VERSION;
+    update::refuse_if_bundled_with_the_app().map_err(update::into_failure)?;
 
     if check_only {
         let manifest = update::fetch_verified_manifest(&fetcher, key)

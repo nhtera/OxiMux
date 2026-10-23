@@ -113,20 +113,23 @@ pub fn swap_all(replacements: &[Replacement]) -> Result<Vec<PathBuf>, SwapError>
 
     // Pass 1: vacate every installed name. A binary that is not installed yet
     // — a hand-copied CLI with no relay beside it — has nothing to vacate and
-    // is simply placed in pass 2; undoing that means deleting it again.
+    // is simply placed in pass 2; undoing that means deleting it again. Its
+    // directory may not exist yet either (a release that adds a folder), and
+    // pass 2's rename creates none, so it is made here.
     let mut moved_aside: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     for replacement in replacements {
         if !replacement.installed.exists() {
+            if let Some(parent) = replacement.installed.parent()
+                && let Err(err) = fs::create_dir_all(parent)
+            {
+                return Err(pass_one_failed(&moved_aside, &replacement.installed, err));
+            }
             moved_aside.push((replacement.installed.clone(), None));
             continue;
         }
         let backup = backup_path(&replacement.installed);
         if let Err(err) = fs::rename(&replacement.installed, &backup) {
-            undo_moves(&moved_aside);
-            return Err(SwapError::RolledBack {
-                path: replacement.installed.clone(),
-                detail: err.to_string(),
-            });
+            return Err(pass_one_failed(&moved_aside, &replacement.installed, err));
         }
         moved_aside.push((replacement.installed.clone(), Some(backup)));
     }
@@ -165,6 +168,19 @@ pub fn swap_all(replacements: &[Replacement]) -> Result<Vec<PathBuf>, SwapError>
     Ok(left_behind)
 }
 
+/// Undo pass 1 after it failed at `path`: rolled back when every moved-aside
+/// file went back, inconsistent — naming the stranded backups — when one did
+/// not, so the caller never reports "nothing changed" over a missing binary.
+fn pass_one_failed(moved: &[(PathBuf, Option<PathBuf>)], path: &Path, err: std::io::Error) -> SwapError {
+    let failed = undo_moves(moved);
+    let detail = err.to_string();
+    if failed.is_empty() {
+        SwapError::RolledBack { path: path.to_path_buf(), detail }
+    } else {
+        SwapError::Inconsistent { path: path.to_path_buf(), detail, backups: failed }
+    }
+}
+
 /// Put every moved-aside binary back. Returns the ones that could not be
 /// restored — a non-empty result is the inconsistent case.
 fn undo_moves(moved: &[(PathBuf, Option<PathBuf>)]) -> Vec<PathBuf> {
@@ -191,7 +207,19 @@ fn staged_of(replacements: &[Replacement], installed: &Path) -> PathBuf {
         .unwrap_or_else(|| installed.with_extension("rollback"))
 }
 
-fn backup_path(installed: &Path) -> PathBuf {
+/// The name `backup` was moved aside from, if it is a backup: exactly the
+/// `<name>.old-<8 hex>` [`backup_path`] writes. Anything looser would let the
+/// boot sweep — which claims every name in the app's install — delete or
+/// rename a file that merely has `.old-` in it (`notes.old-draft`).
+pub fn backup_original(backup: &str) -> Option<&str> {
+    let (original, hex) = backup.rsplit_once(BACKUP_INFIX)?;
+    (!original.is_empty() && hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(original)
+}
+
+/// A fresh backup name beside `installed`, in the one shape
+/// [`backup_original`] recognises. Public for the desktop, which sets its own
+/// copy of the command line tool aside the same way when it is still running.
+pub fn backup_path(installed: &Path) -> PathBuf {
     let mut suffix = [0u8; 4];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut suffix);
     let name = installed.file_name().unwrap_or_else(|| OsStr::new("oximux")).to_string_lossy();
@@ -226,7 +254,7 @@ fn make_executable(_path: &Path) -> Result<(), SwapError> {
 /// desktop app owns its install directory outright and claims all of them. A
 /// built-in answer would be wrong for one of them, silently.
 pub fn sweep_backups(install_dir: &Path, ours: impl Fn(&str) -> bool) {
-    for (backup, _) in backups_in(install_dir, ours) {
+    for (backup, _) in backups_in(install_dir, &ours, false) {
         let _ = fs::remove_file(backup);
     }
 }
@@ -243,8 +271,13 @@ pub fn sweep_backups(install_dir: &Path, ours: impl Fn(&str) -> bool) {
 /// Not needed by the CLI, whose two binaries are replaced in a single call the
 /// user is watching; very much needed by the desktop app, which replaces a
 /// directory's worth of files during quit and can be killed at any point in it.
+///
+/// Walks the install directory's subfolders too, since a payload's files may
+/// live in them. Only this caller recurses: the desktop owns its directory
+/// outright, while the CLI's plain sweep runs in a `bin` shared with every
+/// other tool on the machine.
 pub fn restore_or_sweep_backups(install_dir: &Path, ours: impl Fn(&str) -> bool) {
-    for (backup, original) in backups_in(install_dir, ours) {
+    for (backup, original) in backups_in(install_dir, &ours, true) {
         if original.exists() {
             let _ = fs::remove_file(backup);
         } else {
@@ -254,25 +287,29 @@ pub fn restore_or_sweep_backups(install_dir: &Path, ours: impl Fn(&str) -> bool)
 }
 
 /// Every `<name>.old-<hex>` in `dir` that `ours` claims, paired with the
-/// `<name>` it was moved aside from.
-fn backups_in(dir: &Path, ours: impl Fn(&str) -> bool) -> Vec<(PathBuf, PathBuf)> {
+/// `<name>` it was moved aside from — and, with `recursive`, in every folder
+/// below it (not through links, so a link cannot lead the sweep outside).
+fn backups_in(dir: &Path, ours: &impl Fn(&str) -> bool, recursive: bool) -> Vec<(PathBuf, PathBuf)> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let original = name.split(BACKUP_INFIX).next()?;
-            // `split` yields the whole string when the infix is absent, so the
-            // length check is what actually decides whether this is a backup.
-            if original.len() == name.len() || !ours(&name) {
-                return None;
-            }
-            Some((entry.path(), dir.join(original)))
-        })
-        .collect()
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        if recursive && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.extend(backups_in(&entry.path(), ours, true));
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(original) = backup_original(&name) else {
+            continue;
+        };
+        if !ours(&name) {
+            continue;
+        }
+        found.push((entry.path(), dir.join(original)));
+    }
+    found
 }
 
 #[cfg(test)]
@@ -434,6 +471,83 @@ mod tests {
         assert!(dir.path().join("onnxruntime.dll").is_file(), "…by being renamed back");
         assert!(!superseded.exists(), "a backup whose original is present is still swept");
         assert!(live.is_file());
+    }
+
+    /// A release that adds a folder: the install has no `bin` yet, and the
+    /// swap must create it rather than fail every update into it.
+    #[test]
+    fn a_binary_in_a_folder_the_install_lacks_is_placed_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut plan = install(dir.path(), &[("oximux", "app v1", "app v2")]);
+        let staged = dir.path().join(".bin-oximux.new");
+        fs::write(&staged, "cli v2").expect("write");
+        let fresh = dir.path().join("bin").join("oximux");
+        plan.push(Replacement { installed: fresh.clone(), staged });
+
+        swap_all(&plan).expect("swaps");
+        assert_eq!(read(&fresh), "cli v2");
+        assert_eq!(read(&plan[0].installed), "app v2");
+    }
+
+    /// The same kill-between-passes repair, for a file in a subfolder.
+    #[test]
+    fn a_backup_in_a_subfolder_is_restored_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).expect("mkdir");
+        let orphaned = bin.join("oximux.exe.old-deadbeef");
+        fs::write(&orphaned, "x").expect("write");
+
+        restore_or_sweep_backups(dir.path(), |_| true);
+
+        assert!(!orphaned.exists());
+        assert!(bin.join("oximux.exe").is_file(), "renamed back in its own folder");
+    }
+
+    /// Only the exact names this module writes are backups: a sweep that owns
+    /// a whole directory must not touch a file that merely contains `.old-`.
+    #[test]
+    fn a_lookalike_name_is_not_a_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let decoys = ["notes.old-draft", "notes.old-deadbee", "notes.old-deadbeef0", ".old-deadbeef"];
+        for name in decoys {
+            fs::write(dir.path().join(name), "x").expect("write");
+        }
+        restore_or_sweep_backups(dir.path(), |_| true);
+        for name in decoys {
+            assert!(dir.path().join(name).exists(), "{name} must be left alone");
+        }
+        assert!(!dir.path().join("notes").exists(), "nothing was renamed back");
+        assert_eq!(backup_original("oximux.exe.old-0a1b2c3d"), Some("oximux.exe"));
+    }
+
+    /// A link inside the install is never followed by the recursive sweep.
+    #[cfg(unix)]
+    #[test]
+    fn the_recursive_sweep_does_not_follow_links() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let theirs = outside.path().join("oximux.old-deadbeef");
+        fs::write(&theirs, "x").expect("write");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("elsewhere")).expect("symlink");
+
+        restore_or_sweep_backups(dir.path(), |_| true);
+
+        assert!(theirs.exists(), "a backup reached only through a link is not ours");
+    }
+
+    /// The CLI's sweep runs in a shared `bin` and never looks below it.
+    #[test]
+    fn the_plain_sweep_stays_out_of_subfolders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("someone-elses");
+        fs::create_dir(&nested).expect("mkdir");
+        let theirs = nested.join("oximux.old-deadbeef");
+        fs::write(&theirs, "x").expect("write");
+
+        sweep_backups(dir.path(), |name| name.starts_with("oximux"));
+
+        assert!(theirs.exists());
     }
 
     #[test]

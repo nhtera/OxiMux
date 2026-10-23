@@ -98,6 +98,7 @@ fn local_session_scope_is_confined_to_its_session() {
             ("terminal list", Request::ListTerminals),
             ("schedule list", Request::ListSchedules),
             ("project list", Request::ListProjects),
+            ("opening a folder", Request::OpenProject { path: "/tmp".into() }),
         ] {
             assert_eq!(
                 call(&client, req).await,

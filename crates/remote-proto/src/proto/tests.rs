@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 34,
-        "v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+        PROTOCOL_VERSION, 35,
+        "v35 = opening a folder in the desktop (OpenProject, ProjectOpened). v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
          status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
@@ -136,6 +136,7 @@ fn requests_round_trip_via_postcard() {
         Request::SetPermissionMode { session_id: "s1".into(), mode: "plan".into() },
         Request::FetchTranscript { session_id: "s1".into() },
         Request::ListProjects,
+        Request::OpenProject { path: "/Users/me/Code/OxiMux".into() },
     ];
     for req in requests {
         let bytes = req.to_bytes().expect("encode");
@@ -199,6 +200,10 @@ fn send_prompt_and_responses_round_trip() {
             name: "OxiMux".into(),
             path: "/Users/me/Code/OxiMux".into(),
         }]),
+        Response::ProjectOpened {
+            project: ProjectSummaryWire { name: "OxiMux".into(), path: "/Users/me/Code/OxiMux".into() },
+            worktree: Some("/Users/me/Code/OxiMux-feature".into()),
+        },
     ];
     for resp in responses {
         let bytes = resp.to_bytes().expect("encode");
@@ -295,6 +300,14 @@ fn early_variants_keep_their_literal_ordinals() {
     // is the 41st Request variant (index 40, a unit variant, so its whole encoding
     // is that single ordinal byte).
     assert_eq!(Request::ListProjects.to_bytes().expect("encode"), vec![40]);
+    // The v35 folder open, appended last: `OpenProject` is Request ordinal 73
+    // and its `ProjectOpened` reply Response ordinal 55.
+    assert_eq!(Request::OpenProject { path: String::new() }.to_bytes().expect("encode")[0], 73);
+    let opened = Response::ProjectOpened {
+        project: ProjectSummaryWire { name: String::new(), path: String::new() },
+        worktree: None,
+    };
+    assert_eq!(opened.to_bytes().expect("encode")[0], 55);
     // `SessionsChanged` is the 29th Response variant (index 28); pin the
     // discriminant, the `Vec` payload follows.
     let changed = Response::SessionsChanged(vec![]);

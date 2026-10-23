@@ -960,6 +960,61 @@ impl oximux_remote_host::ProjectProvider for StubProjects {
     }
 }
 
+/// A desktop's project provider for `oximux open`: opens whatever folder it is
+/// handed, as itself.
+struct OpeningProjects;
+
+#[async_trait::async_trait]
+impl oximux_remote_host::ProjectProvider for OpeningProjects {
+    async fn projects(&self) -> Vec<oximux_remote_proto::messages::ProjectSummaryWire> {
+        Vec::new()
+    }
+
+    async fn open(
+        &self,
+        path: &str,
+    ) -> Result<oximux_remote_host::OpenedProject, oximux_remote_host::OpenProjectError> {
+        Ok(oximux_remote_host::OpenedProject {
+            project: oximux_remote_proto::messages::ProjectSummaryWire { name: "proj".into(), path: path.into() },
+            worktree: None,
+        })
+    }
+}
+
+/// `oximux open <folder>` and the bare `oximux <folder>` hand the host the
+/// folder's absolute path; a file is refused before anything is sent.
+#[test]
+fn open_hands_the_host_an_absolute_folder() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let project = {
+        let p = dir.path().join("proj");
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        p.canonicalize().unwrap()
+    };
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::new(AuthStore::new()))
+        .with_projects(Arc::new(OpeningProjects));
+    serve_dispatcher(&rt, &runtime_dir, dispatcher);
+
+    let opened = |args: &[&str], cwd: &Path| {
+        let out = bin(&runtime_dir).args(args).current_dir(cwd).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        json_stdout(&out)["data"]["opened"].as_str().unwrap().to_owned()
+    };
+    let expected = project.to_string_lossy();
+    assert_eq!(opened(&["--json", "open", "."], &project), expected);
+    // The bare form, relative to where it runs.
+    assert_eq!(opened(&["--json", ".."], &project.join("src")), expected);
+    assert_eq!(opened(&["--json", project.to_str().unwrap()], dir.path()), expected);
+
+    let file = project.join("notes.txt");
+    std::fs::write(&file, "").unwrap();
+    let out = bin(&runtime_dir).args(["--json", "open", file.to_str().unwrap()]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json_stdout(&out)["error"]["code"], "not_found");
+}
+
 /// A host that lists one project and echoes worktree creates, serving on a
 /// fresh runtime dir until the runtime drops.
 fn serve_worktree_host(rt: &tokio::runtime::Runtime, runtime_dir: &Path, project_root: &Path) {

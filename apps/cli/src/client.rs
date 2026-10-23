@@ -87,12 +87,14 @@ pub fn unexpected_reply(what: &str, got: &Response) -> Failure {
 }
 
 /// How a verb was told which host to reach.
+#[derive(Clone)]
 pub struct HostSelection {
     /// The `--host` flag, if given.
     pub flag: Option<String>,
     /// The runtime dir override, for the local path only.
     pub dir: Option<PathBuf>,
 }
+
 
 impl Client {
     /// Connect to whichever host the resolution order picks: `--host` →

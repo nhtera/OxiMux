@@ -119,6 +119,9 @@ oximux-job-object = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The hook verbs' delivery test boots the real daemon in-process, the way the
+# relay client's own integration suite does.
+oximux-relay = { workspace = true }
 # Mint real minisign signatures in tests. The verifier is a third-party crate,
 # so fixtures it produced itself would prove nothing — the testkit builds the
 # wire format `minisign -S` writes (prehashed Blake2b-512, plus the second

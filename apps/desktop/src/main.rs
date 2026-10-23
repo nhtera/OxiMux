@@ -47,7 +47,7 @@ use tracing_subscriber::EnvFilter;
 
 use oximux_app::app_paths;
 // The hook verb's decision half, shared with `oximux-cli` (see the crate).
-use oximux_agent_hooks::report::StatusArgs;
+use oximux_agent_hooks::report::{NotifyArgs, StatusArgs};
 /// Scope for the remote-control host key. The host is process-wide (it serves every
 /// workspace's sessions from one registry), so it uses ONE app-level identity rather
 /// than `HostIdentity`'s per-workspace keying.
@@ -112,6 +112,12 @@ fn main() {
     // precede the first thread — it writes the environment.
     oximux_app::platform::claude_session_env::scrub_inherited_claude_session_markers();
 
+    // Before anything spawns, for the same reason: launched from an OxiMux
+    // pane (a `cargo run`, a second copy, a beta), the process inherits that
+    // build's command line tool directory, which its shells export. It must
+    // not become this build's. Must precede the first thread.
+    oximux_app::platform::bundled_cli::scrub_inherited();
+
     // Before the runtime, and before anything spawns: a GUI launch inherits the
     // session manager's stub PATH on every platform, and every agent CLI
     // installs outside it. Must precede the first thread — it writes the
@@ -125,6 +131,13 @@ fn main() {
     let subcommand = std::env::args().nth(1);
     if !matches!(subcommand.as_deref(), Some("notify" | "agent-status")) {
         oximux_app::platform::login_path::adopt_login_shell_path();
+        // Resolve the bundled command line tool off the main thread before
+        // the first terminal asks for it: on Windows that refreshes the
+        // install's `bin\oximux.exe` copy, a file copy no window should wait
+        // on. After every environment write above, as the first thread.
+        std::thread::spawn(|| {
+            oximux_app::platform::bundled_cli::bin_dir();
+        });
     }
 
     // Boot the tokio runtime that every git op + status poller relies on.
@@ -569,8 +582,13 @@ fn main() {
         // Projects the phone can start a session in without typing a path: the same
         // recent-projects store the desktop sidebar lists, read directly (no UI hop)
         // since it is durable data, not live view state.
+        // `oximux open` / `oximux .` rides the same provider: the folder hops to
+        // this loop, which opens it in the frontmost window and brings it forward.
+        let (opener, opens) = oximux_app::remote_control::open_bridge::open_bridge();
+        oximux_app::remote_control::open_bridge::serve_opens(opens, cx);
         remote_control.set_project_provider(std::sync::Arc::new(
-            oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo()),
+            oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo())
+                .with_opener(opener),
         ));
         // Worktrees the CLI can create, list, and remove: the same repos and
         // host-derived path scheme the desktop's New-Worktree flow uses, so a
@@ -1287,16 +1305,7 @@ fn restrict_db_files(db_path: &std::path::Path) {
 /// the supervisor does, connects, and sends `Request::Notify` for the pane
 /// named by `OXIMUX_PTY_ID`. Returns a process exit code (0 = ok).
 fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
-    let mut title = String::new();
-    let mut body = String::new();
-    let mut args = std::env::args().skip(2);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--title" => title = args.next().unwrap_or_default(),
-            "--body" => body = args.next().unwrap_or_default(),
-            _ => {}
-        }
-    }
+    let NotifyArgs { title, body } = NotifyArgs::parse(std::env::args().skip(2));
     let pty_id = match std::env::var("OXIMUX_PTY_ID") {
         Ok(id) if !id.is_empty() => id,
         _ => {

@@ -74,10 +74,59 @@ pub fn locate(stem: &str, env_override: Option<&str>) -> Result<PathBuf, LocateE
         return Ok(path);
     }
     let exe = std::env::current_exe().map_err(|e| LocateError::NoCurrentExe(e.to_string()))?;
+    let exe = resolve_links(exe);
     let dir = exe
         .parent()
         .ok_or_else(|| LocateError::NoCurrentExe("current_exe has no parent".into()))?;
-    sibling_in(dir, stem, env_override)
+    locate_from(dir, stem, env_override, cfg!(windows))
+}
+
+/// The file a binary path names. A binary started through a symlink — the
+/// app's `Resources/bin/oximux`, a `~/.local/bin` link, Homebrew's `bin/` —
+/// reports the link's path on macOS, and its helpers sit beside the file the
+/// link names, not beside the link. Unresolvable paths are kept as given.
+fn resolve_links(exe: PathBuf) -> PathBuf {
+    // Not on Windows: nothing there is reached through a link (the app's
+    // `bin\` holds a copy), and canonicalize answers with a `\\?\` path that
+    // would then surface in logs and the settings pane.
+    if cfg!(windows) {
+        return exe;
+    }
+    std::fs::canonicalize(&exe).unwrap_or(exe)
+}
+
+/// [`locate`]'s lookup from the running binary's directory. With `bin_fallback`
+/// (Windows), a binary in the app install's `bin\` — the copy of the CLI the
+/// app puts on its terminals' PATH — finds its helpers one level up, but only
+/// when that level really is the app's install: it must hold the app and its
+/// relay, so a stray `bin` directory never borrows a neighbour's helpers.
+fn locate_from(
+    dir: &Path,
+    stem: &str,
+    env_override: Option<&str>,
+    bin_fallback: bool,
+) -> Result<PathBuf, LocateError> {
+    let found = sibling_in(dir, stem, env_override);
+    if found.is_err()
+        && bin_fallback
+        && let Some(install) = app_install_above_bin(dir)
+        && let Ok(path) = sibling_in(install, stem, env_override)
+    {
+        return Ok(path);
+    }
+    found
+}
+
+/// The app install directory `dir` is the `bin` of, if it is one.
+fn app_install_above_bin(dir: &Path) -> Option<&Path> {
+    if dir.file_name()? != "bin" {
+        return None;
+    }
+    let install = dir.parent()?;
+    let is_app = ["oximux", "oximux-relay"]
+        .iter()
+        .all(|stem| install.join(sibling_file_name(stem)).is_file());
+    is_app.then_some(install)
 }
 
 /// [`locate`]'s sibling half against an explicit directory, so it can be
@@ -136,6 +185,56 @@ mod tests {
                 expected.display()
             )
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_run_through_a_link_finds_the_helpers_beside_its_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("MacOS");
+        let links = dir.path().join("bin");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        std::fs::create_dir_all(&links).expect("mkdir");
+        std::fs::write(real.join("oximux-cli"), "").expect("write");
+        std::fs::write(real.join("oximux-relay"), "").expect("write");
+        let link = links.join("oximux");
+        std::os::unix::fs::symlink("../MacOS/oximux-cli", &link).expect("symlink");
+
+        let exe = resolve_links(link);
+        let found = locate_from(exe.parent().expect("parent"), "oximux-relay", None, false);
+        assert_eq!(
+            found.expect("found").canonicalize().expect("canonical"),
+            real.join("oximux-relay").canonicalize().expect("canonical")
+        );
+    }
+
+    #[test]
+    fn a_bin_dir_inside_the_app_install_finds_the_helpers_above_it() {
+        let install = tempfile::tempdir().expect("tempdir");
+        for stem in ["oximux", "oximux-relay"] {
+            std::fs::write(install.path().join(sibling_file_name(stem)), "").expect("write");
+        }
+        let bin = install.path().join("bin");
+        std::fs::create_dir(&bin).expect("mkdir");
+        let relay = install.path().join(sibling_file_name("oximux-relay"));
+        assert_eq!(locate_from(&bin, "oximux-relay", None, true).expect("found"), relay);
+        // Only where the fallback applies (Windows) — elsewhere it is not taken.
+        assert!(locate_from(&bin, "oximux-relay", None, false).is_err());
+    }
+
+    #[test]
+    fn a_bin_dir_elsewhere_borrows_nothing_from_its_parent() {
+        // A parent with the relay but not the app is not the app's install.
+        let parent = tempfile::tempdir().expect("tempdir");
+        std::fs::write(parent.path().join(sibling_file_name("oximux-relay")), "").expect("write");
+        let bin = parent.path().join("bin");
+        std::fs::create_dir(&bin).expect("mkdir");
+        assert!(locate_from(&bin, "oximux-relay", None, true).is_err());
+        // And a directory not named `bin` never looks up at all.
+        let other = parent.path().join("tools");
+        std::fs::create_dir(&other).expect("mkdir");
+        std::fs::write(parent.path().join(sibling_file_name("oximux")), "").expect("write");
+        assert!(locate_from(&other, "oximux-relay", None, true).is_err());
     }
 
     #[test]

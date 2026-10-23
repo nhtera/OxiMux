@@ -184,7 +184,7 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
             migrate_zsh_overlay(&dir, &zsh_home(orig));
             write_if_changed(&dir.join(".zshenv"), scripts::ZSH_ZSHENV)?;
             write_if_changed(&dir.join(".zprofile"), scripts::ZSH_ZPROFILE)?;
-            let zshrc = format!("{}{}", scripts::ZSH_ZSHRC, history::scripts::ZSH_BLOCK);
+            let zshrc = format!("{}{}{}", scripts::ZSH_ZSHRC, scripts::ZSH_CLI_PATH, history::scripts::ZSH_BLOCK);
             write_if_changed(&dir.join(".zshrc"), &zshrc)?;
             write_if_changed(&dir.join(".zlogin"), scripts::ZSH_ZLOGIN)?;
             let mut env = vec![("ZDOTDIR".to_string(), dir.to_string_lossy().into_owned())];
@@ -195,7 +195,7 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
         }
         ShellKind::Bash => {
             let rcfile = base.join("bash").join("rcfile");
-            let rc = format!("{}{}", scripts::BASH_RCFILE, history::scripts::BASH_BLOCK);
+            let rc = format!("{}{}{}", scripts::BASH_RCFILE, scripts::BASH_CLI_PATH, history::scripts::BASH_BLOCK);
             write_if_changed(&rcfile, &rc)?;
             Ok(Integration {
                 env: Vec::new(),
@@ -208,7 +208,7 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
             env: Vec::new(),
             args: vec![
                 "-C".to_string(),
-                format!("{}{}", scripts::FISH_INIT, history::scripts::FISH_BLOCK),
+                format!("{}{}{}", scripts::FISH_INIT, scripts::FISH_CLI_PATH, history::scripts::FISH_BLOCK),
             ],
         }),
         // PowerShell has no "extra profile" flag, so the hook is dot-sourced by
@@ -219,7 +219,10 @@ fn install(kind: ShellKind, base: &Path, orig: Option<&str>) -> io::Result<Integ
         // marks, not the shell.
         ShellKind::PowerShell => {
             let script = base.join("powershell").join("oximux.ps1");
-            write_if_changed(&script, scripts::POWERSHELL_HOOK)?;
+            // The PATH block first: a throw in the hook (caught by the
+            // `try` below) must not cost the shell its `oximux`.
+            let hook = format!("{}{}", scripts::POWERSHELL_CLI_PATH, scripts::POWERSHELL_HOOK);
+            write_if_changed(&script, &hook)?;
             let dot_source =
                 format!("try {{ . '{}' }} catch {{ }}", ps_single_quote(&script.to_string_lossy()));
             Ok(Integration {
@@ -358,7 +361,9 @@ fi
 # already emits an OSC 133 mark, a second emitter would double the marks and
 # break the output band, so skip ours entirely.
 __oximux_emits_133=0
-for __oximux_f in $precmd_functions $preexec_functions; do
+# `:-` because both arrays are unset in a plain zsh, and a user's
+# `setopt nounset` would otherwise abort the rest of this file right here.
+for __oximux_f in ${precmd_functions:-} ${preexec_functions:-}; do
   if [[ \"${functions[$__oximux_f]:-}\" == *\"133;\"* ]]; then
     __oximux_emits_133=1
     break
@@ -512,6 +517,83 @@ if (-not (Test-Path Variable:\\__OxiMuxShellIntegration) `
 }
 ";
 
+    /// The bundled command line tool's directory, put first on PATH after the
+    /// user's own startup files ran (they may prepend another `oximux`, a
+    /// package manager's). One per shell; each runs whenever its overlay does,
+    /// whatever the OSC 133 guard decided, and only for a value that is
+    /// absolute, free of PATH separators and holding an `oximux` — anything
+    /// else (a relative value would put a cwd-relative directory first) is
+    /// ignored. zsh runs under `emulate -L zsh` so the user's options
+    /// (`sh_word_split`, `glob_subst`, `nounset`) cannot reshape it; bash and
+    /// fish read the variable only after testing it. See
+    /// [`crate::platform::bundled_cli`].
+    pub const ZSH_CLI_PATH: &str = r#"# Put the oximux command line tool OxiMux ships first on PATH, after your rc
+# had its say: it may prepend another copy (a package manager's).
+() {
+  emulate -L zsh
+  local __oximux_d="${OXIMUX_CLI_BIN_DIR:-}"
+  [[ "$__oximux_d" == /* && "$__oximux_d" != *:* && -x "$__oximux_d/oximux" ]] || return 0
+  path=("$__oximux_d" "${(@)path:#$__oximux_d}")
+}
+"#;
+
+    /// bash: as [`ZSH_CLI_PATH`]; `set -u` safe, bash 3.2 compatible, and
+    /// converting the Windows path Git Bash is handed.
+    pub const BASH_CLI_PATH: &str = r#"# Put the oximux command line tool OxiMux ships first on PATH, after your rc
+# had its say: it may prepend another copy (a package manager's).
+__oximux_d="${OXIMUX_CLI_BIN_DIR:-}"
+# Git Bash on Windows is handed a `C:\...` path; its PATH speaks `/c/...`.
+case "${OSTYPE:-}" in
+  msys*|cygwin*) [[ -n "$__oximux_d" ]] && command -v cygpath >/dev/null 2>&1 \
+                   && __oximux_d="$(cygpath -u "$__oximux_d")" ;;
+esac
+if [[ "$__oximux_d" == /* && "$__oximux_d" != *:* && -x "$__oximux_d/oximux" ]]; then
+  __oximux_rest=":${PATH:-}:"
+  # Stops once a pass removes nothing: under `nocasematch` the test matches a
+  # case-variant entry that the replacement does not, which would never end.
+  while [[ "$__oximux_rest" == *":$__oximux_d:"* ]]; do
+    __oximux_prev="$__oximux_rest"
+    __oximux_rest="${__oximux_rest/":$__oximux_d:"/:}"
+    [[ ${#__oximux_rest} -lt ${#__oximux_prev} ]] || break
+  done
+  __oximux_rest="${__oximux_rest#:}"
+  __oximux_rest="${__oximux_rest%:}"
+  PATH="$__oximux_d${__oximux_rest:+:$__oximux_rest}"
+fi
+unset __oximux_d __oximux_rest __oximux_prev
+"#;
+
+    /// fish: as [`ZSH_CLI_PATH`]. Edits `PATH` itself rather than
+    /// `fish_add_path`, which without `--path` would shadow the user's
+    /// universal `fish_user_paths` for the session.
+    pub const FISH_CLI_PATH: &str = r#"# Put the oximux command line tool OxiMux ships first on PATH, after your
+# config had its say: it may prepend another copy (a package manager's).
+if set -q OXIMUX_CLI_BIN_DIR; and string match -q -- '/*' "$OXIMUX_CLI_BIN_DIR"; and not string match -q -- '*:*' "$OXIMUX_CLI_BIN_DIR"; and test -x "$OXIMUX_CLI_BIN_DIR/oximux"
+  set -l __oximux_rest
+  for __oximux_e in $PATH
+    test "$__oximux_e" = "$OXIMUX_CLI_BIN_DIR"; or set __oximux_rest $__oximux_rest $__oximux_e
+  end
+  set -gx PATH $OXIMUX_CLI_BIN_DIR $__oximux_rest
+end
+"#;
+
+    /// PowerShell: as [`ZSH_CLI_PATH`], after `$PROFILE`, ahead of the hook.
+    pub const POWERSHELL_CLI_PATH: &str = r#"# Put the oximux command line tool OxiMux ships first on PATH, after your
+# profile had its say: it may prepend another copy (a package manager's).
+# Strict-mode safe, like the hook above: nothing is read before it is tested.
+$__oximux_dir = $env:OXIMUX_CLI_BIN_DIR
+$__oximux_sep = [IO.Path]::PathSeparator
+if ($__oximux_dir -and [IO.Path]::IsPathRooted($__oximux_dir) -and
+    -not $__oximux_dir.Contains([string]$__oximux_sep) -and
+    ((Test-Path -LiteralPath (Join-Path $__oximux_dir 'oximux.exe')) -or
+     (Test-Path -LiteralPath (Join-Path $__oximux_dir 'oximux')))) {
+  $__oximux_rest = @($env:PATH -split [regex]::Escape([string]$__oximux_sep) |
+    Where-Object { $_ -and $_ -ne $__oximux_dir })
+  $env:PATH = (@($__oximux_dir) + $__oximux_rest) -join $__oximux_sep
+}
+Remove-Variable -Name __oximux_dir, __oximux_sep, __oximux_rest -ErrorAction SilentlyContinue
+"#;
+
     /// fish `--init-command`. Registers event functions for prompt (`A`),
     /// pre-exec (`C`), and post-exec (`D;$status`). Runs after the user's
     /// config, so it coexists with their setup.
@@ -558,7 +640,7 @@ mod tests {
         let base = temp_base("zsh-guard");
         install(ShellKind::Zsh, &base, None).expect("install");
         let rc = fs::read_to_string(base.join("zsh").join(".zshrc")).expect("read rc");
-        assert!(rc.contains("precmd_functions $preexec_functions"));
+        assert!(rc.contains("${precmd_functions:-} ${preexec_functions:-}"));
         assert!(rc.contains("__oximux_emits_133=1"));
         assert!(rc.contains("\"$__oximux_emits_133\" == \"0\""));
         let _ = fs::remove_dir_all(&base);
@@ -801,6 +883,103 @@ mod tests {
         let fish = install(ShellKind::Fish, &base, None).expect("fish");
         assert!(fish.args[1].starts_with(scripts::FISH_INIT));
         assert!(fish.args[1].ends_with(history::scripts::FISH_BLOCK));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn every_overlay_puts_the_bundled_cli_first_after_the_users_rc() {
+        // After the user's startup files (which may prepend another copy) and
+        // before the history block, in every shell OxiMux integrates.
+        let base = temp_base("cli-path");
+        install(ShellKind::Zsh, &base, None).expect("zsh");
+        let zshrc = fs::read_to_string(base.join("zsh").join(".zshrc")).expect("zshrc");
+        let rc_end = zshrc.find("source \"$OXIMUX_ORIG_ZDOTDIR/.zshrc\"").expect("sources the user's rc");
+        let cli = zshrc.find(scripts::ZSH_CLI_PATH).expect("zsh snippet");
+        assert!(rc_end < cli && cli < zshrc.find(history::scripts::ZSH_BLOCK).unwrap());
+        install(ShellKind::Bash, &base, None).expect("bash");
+        let rc = fs::read_to_string(base.join("bash").join("rcfile")).expect("rcfile");
+        assert!(rc.find(".bashrc").unwrap() < rc.find(scripts::BASH_CLI_PATH).expect("bash snippet"));
+        let fish = install(ShellKind::Fish, &base, None).expect("fish");
+        assert!(fish.args[1].contains(scripts::FISH_CLI_PATH));
+        install(ShellKind::PowerShell, &base, None).expect("pwsh");
+        let ps = fs::read_to_string(base.join("powershell").join("oximux.ps1")).expect("ps1");
+        assert!(ps.starts_with(scripts::POWERSHELL_CLI_PATH));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The overlays against real shells: the user's own startup file puts
+    /// another `oximux` first (a package manager's `shellenv`), and the copy
+    /// OxiMux ships must still be the one that runs. Skips a shell this
+    /// machine does not have.
+    #[cfg(unix)]
+    #[test]
+    fn the_bundled_cli_wins_over_a_users_rc_in_real_shells() {
+        use std::process::Command;
+        let base = temp_base("cli-path-live");
+        let home = base.join("home");
+        // A space in the name, as `Application Support` has.
+        let bundled = base.join("bundled bin");
+        let theirs = base.join("brew");
+        for (dir, says) in [(&bundled, "bundled"), (&theirs, "theirs")] {
+            fs::create_dir_all(dir).expect("mkdir");
+            let exe = dir.join("oximux");
+            fs::write(&exe, format!("#!/bin/sh\necho {says}\n")).expect("write");
+            let mut perms = fs::metadata(&exe).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            fs::set_permissions(&exe, perms).expect("chmod");
+        }
+        let theirs_s = theirs.to_string_lossy().into_owned();
+        fs::create_dir_all(home.join(".config/fish")).expect("mkdir");
+        fs::write(home.join(".zshrc"), format!("setopt sh_word_split glob_subst nounset\nexport PATH=\"{theirs_s}:$PATH\"\n")).unwrap();
+        fs::write(home.join(".bashrc"), format!("set -u\nexport PATH=\"{theirs_s}:$PATH\"\n")).unwrap();
+        fs::write(home.join(".config/fish/config.fish"), format!("set -gx PATH {theirs_s} $PATH\n")).unwrap();
+        let run = |shell: &str, args: &[String], dir: &str| -> Option<String> {
+            let program = ["/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(shell))
+                .find(|p| p.is_file())?;
+            let out = Command::new(program)
+                .args(args)
+                .env_clear()
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("PATH", "/usr/bin:/bin")
+                .env("TERM", "dumb")
+                .env("ZDOTDIR", base.join("zsh"))
+                .env("OXIMUX_ORIG_ZDOTDIR", &home)
+                .env(crate::platform::bundled_cli::BIN_DIR_ENV, dir)
+                .current_dir(&base)
+                .output()
+                .expect("run shell");
+            // The last line, past any command mark the shell's own hook printed.
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let last = stdout.trim().lines().last().unwrap_or("");
+            Some(last.rsplit('\u{7}').next().unwrap_or("").to_owned())
+        };
+        install(ShellKind::Zsh, &base, Some(&home.to_string_lossy())).expect("zsh");
+        let rcfile = install(ShellKind::Bash, &base, None).expect("bash").args;
+        let fish = install(ShellKind::Fish, &base, None).expect("fish").args;
+        let probe = "oximux".to_string();
+        let cases = [
+            ("zsh", vec!["-i".to_string(), "-c".to_string(), probe.clone()]),
+            ("bash", [rcfile, vec!["-i".to_string(), "-c".to_string(), probe.clone()]].concat()),
+            ("fish", [fish, vec!["-c".to_string(), probe.clone()]].concat()),
+        ];
+        let mut ran = 0;
+        for (shell, args) in &cases {
+            if let Some(said) = run(shell, args, &bundled.to_string_lossy()) {
+                assert_eq!(said, "bundled", "{shell} ran another oximux");
+                ran += 1;
+            }
+            // A value that is relative, or holds a PATH separator, is ignored:
+            // the user's own order stands.
+            for bad in ["bundled bin", "/x:/y"] {
+                if let Some(said) = run(shell, args, bad) {
+                    assert_eq!(said, "theirs", "{shell} took {bad:?}");
+                }
+            }
+        }
+        assert!(ran >= 2, "zsh and bash ship with macOS and every CI image");
         let _ = fs::remove_dir_all(&base);
     }
 
