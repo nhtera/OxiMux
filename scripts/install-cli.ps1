@@ -179,8 +179,9 @@ try {
     # with another build, and leave the app's updater fighting this one. The
     # screen gate ships only with the app, so it marks that folder.
     if (Test-Path -LiteralPath (Join-Path $Dir 'oximux-screen-gate.exe')) {
-        Die ("$Dir is the OxiMux app's install folder. OxiMux 0.1.44 and later put the " +
-             "oximux command line tool in their terminals; to install a separate copy, pass -Dir <another folder>.")
+        Die ("$Dir is the OxiMux app's install folder. Since 0.1.44 the app puts its own oximux " +
+             "command line tool in its terminals. To install a separate copy, choose another folder: " +
+             '-Dir <folder>, or $env:OXIMUX_INSTALL_DIR = ''<folder>'' before piping this script to iex.')
     }
 
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null

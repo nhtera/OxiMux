@@ -1,5 +1,5 @@
 //! `oximux open <folder>` and `oximux <folder>`: open a folder as a project in
-//! the OxiMux app, like `code .`.
+//! the OxiMux app.
 //!
 //! The folder goes to the desktop over the local control socket — not as
 //! launch arguments, which a running app on macOS never receives. When nothing

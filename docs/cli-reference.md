@@ -386,7 +386,7 @@ Say what is happening in a worktree — a one-line comment, a work phase, or bot
 
 ### `oximux open`
 
-Open a folder as a project in the OxiMux app, like `code .`.
+Open a folder as a project in the OxiMux app (`oximux .` for this one).
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |

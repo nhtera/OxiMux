@@ -123,7 +123,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(commands::notify::run());
     }
 
-    // `oximux <folder>` is `oximux open <folder>`, like `code .`: decided on
+    // `oximux <folder>` is `oximux open <folder>`: decided on
     // the raw arguments, before clap would call the folder an unknown command.
     let argv = commands::open::with_bare_path_as_open(std::env::args_os().collect(), &command_names(), std::path::Path::is_dir);
 

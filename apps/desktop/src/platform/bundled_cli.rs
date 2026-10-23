@@ -51,18 +51,29 @@ fn resolve() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     if cfg!(target_os = "macos") {
         macos_bin_dir(&std::fs::canonicalize(&exe).unwrap_or(exe))
-    } else if cfg!(windows) {
-        let install = exe.parent()?;
-        match refresh_windows_copy(install) {
-            Ok(dir) => dir,
-            Err(err) => {
-                tracing::warn!(%err, "could not refresh the bundled oximux command; terminals start without it");
-                None
-            }
-        }
     } else {
-        None
+        windows_bin_dir(&exe)
     }
+}
+
+/// The install's `bin\`, refreshed. Not from a cargo build tree — the
+/// updater's own test for "is this an install" — so `cargo run` neither grows a
+/// `bin\` in `target\debug` nor puts a build's CLI on its terminals' PATH.
+#[cfg(windows)]
+fn windows_bin_dir(exe: &Path) -> Option<PathBuf> {
+    let install = oximux_auto_update::windows::install::install_dir_of(exe)?;
+    match refresh_windows_copy(&install) {
+        Ok(dir) => dir,
+        Err(err) => {
+            tracing::warn!(%err, "could not refresh the bundled oximux command; terminals start without it");
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_bin_dir(_exe: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// `…/X.app/Contents/Resources/bin` for an app binary in `…/X.app/Contents/MacOS`
@@ -102,6 +113,7 @@ fn usable_dir(dir: &Path) -> bool {
 /// copy still running (an `oximux events` left open) cannot be overwritten but
 /// can be renamed: it is moved aside under the `.old-` name the updater's own
 /// boot sweep already retires once nothing holds it.
+#[cfg_attr(not(windows), allow(dead_code, reason = "tested on every platform, used on Windows"))]
 fn refresh_windows_copy(install: &Path) -> std::io::Result<Option<PathBuf>> {
     let suffix = std::env::consts::EXE_SUFFIX;
     let shipped = install.join(format!("oximux-cli{suffix}"));
