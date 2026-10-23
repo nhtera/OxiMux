@@ -234,6 +234,49 @@ fn a_homebrew_install_is_told_to_use_brew() {
 }
 
 #[test]
+fn the_cli_inside_the_macos_app_is_the_apps_to_update() {
+    for exe in [
+        "/Applications/OxiMux.app/Contents/MacOS/oximux-cli",
+        "/Users/me/Applications/OxiMux.app/Contents/MacOS/oximux-cli",
+    ] {
+        let err = Install::at(Path::new(exe)).expect_err("must refuse");
+        assert!(matches!(err, UpdateError::ManagedInstall { manager: "the OxiMux app", .. }), "{err}");
+        assert!(into_failure(err).next_steps.iter().any(|s| s.contains("Update OxiMux itself")));
+    }
+}
+
+#[test]
+fn the_cli_in_the_windows_app_install_is_the_apps_to_update() {
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let install = tempfile::tempdir().expect("tempdir");
+    for stem in ["oximux", "oximux-relay", "oximux-cli"] {
+        std::fs::write(install.path().join(format!("{stem}{suffix}")), "").expect("write");
+    }
+    let bin = install.path().join("bin");
+    std::fs::create_dir(&bin).expect("mkdir");
+    // Beside the app, and the copy the app keeps in its `bin`.
+    for exe in [install.path().join(format!("oximux-cli{suffix}")), bin.join(format!("oximux{suffix}"))] {
+        assert!(super::bundled_layout(&exe, true), "{}", exe.display());
+        // The layout is Windows': a cargo `target/` dir holding the same three
+        // names elsewhere is a build tree, not the app.
+        assert!(!super::bundled_layout(&exe, false), "{}", exe.display());
+    }
+}
+
+#[test]
+fn an_ordinary_install_beside_its_relay_is_not_the_app() {
+    // `install-cli.sh` keeps `oximux` next to `oximux-relay`, with no
+    // `oximux-cli` — that is the user's to update.
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let dir = tempfile::tempdir().expect("tempdir");
+    for stem in ["oximux", "oximux-relay"] {
+        std::fs::write(dir.path().join(format!("{stem}{suffix}")), "").expect("write");
+    }
+    let exe = dir.path().join(format!("oximux{suffix}"));
+    assert!(Install::at(&exe).is_ok());
+}
+
+#[test]
 fn an_ordinary_install_is_not_mistaken_for_a_managed_one() {
     let install = Install::at(Path::new("/home/dev/.local/bin/oximux")).expect("plain install");
     assert_eq!(install.dir, Path::new("/home/dev/.local/bin"));

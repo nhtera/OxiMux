@@ -18,7 +18,9 @@
 //! exactly the failure the paragraph above forbids.
 
 use oximux_agent_hooks::report::StatusArgs;
+use oximux_relay_proto::Request;
 
+use super::hook_relay;
 use crate::cli::exit;
 
 /// True when this invocation is the hook verb, which is dispatched before the
@@ -59,48 +61,21 @@ pub fn run() -> u8 {
     // not reachable from here: the hook is handed no way to learn about it.
     let Some(runtime_dir) = oximux_remote_local::default_runtime_dir() else {
         eprintln!("oximux agent-status: this platform reports no local data directory");
-        return exit::ERROR;
-    };
-    let token = match std::fs::read_to_string(oximux_remote_local::token_path(&runtime_dir)) {
-        Ok(token) => token.trim().to_owned(),
-        // No relay running — the common case outside OxiMux, and nothing the
-        // agent should hear about.
-        Err(_) => return exit::OK,
-    };
-    let socket = oximux_remote_local::socket_path(&runtime_dir);
-
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
         return exit::OK;
     };
-    rt.block_on(async move {
-        // Bounded, because the whole exchange sits in front of the user's next
-        // reply on every agent that runs its hooks synchronously.
-        //
-        // Not a hypothetical: the relay does not answer `AgentStatus` for a pty
-        // it does not know, and a pane closed while its agent was mid-turn is
-        // exactly that. Unbounded, the hook then waits forever — and on the
-        // dialects that run ours asynchronously (no timeout of their own, since
-        // an async hook cannot hold anything up) it would leak one stuck
-        // process per event. Generous for a local socket round-trip, so a
-        // loaded machine still reports.
-        let deadline = std::time::Duration::from_secs(3);
-        let sent = tokio::time::timeout(deadline, async {
-            let client = oximux_relay_client::RelayClient::connect(&socket, &token).await.ok()?;
-            client
-                .request(oximux_relay_proto::Request::AgentStatus { pty_id, payload })
-                .await
-                .ok()
-        })
-        .await;
-        // Every outcome is exit 0. A stale socket outliving its daemon, a pane
-        // that has gone away, a relay too busy to answer — none of them are the
-        // agent's problem, and none are worth failing its turn over.
-        let _ = sent;
-        exit::OK
-    })
+    // No relay running — the common case outside OxiMux, and nothing the
+    // agent should hear about.
+    let Some((socket, token)) = hook_relay::endpoint(&runtime_dir) else {
+        return exit::OK;
+    };
+    let Some(rt) = hook_relay::runtime() else {
+        return exit::OK;
+    };
+    // Every outcome is exit 0. A stale socket outliving its daemon, a pane
+    // that has gone away, a relay too busy to answer — none of them are the
+    // agent's problem, and none are worth failing its turn over.
+    let _ = rt.block_on(hook_relay::deliver(&socket, &token, Request::AgentStatus { pty_id, payload }));
+    exit::OK
 }
 
 #[cfg(test)]

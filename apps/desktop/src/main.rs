@@ -47,7 +47,7 @@ use tracing_subscriber::EnvFilter;
 
 use oximux_app::app_paths;
 // The hook verb's decision half, shared with `oximux-cli` (see the crate).
-use oximux_agent_hooks::report::StatusArgs;
+use oximux_agent_hooks::report::{NotifyArgs, StatusArgs};
 /// Scope for the remote-control host key. The host is process-wide (it serves every
 /// workspace's sessions from one registry), so it uses ONE app-level identity rather
 /// than `HostIdentity`'s per-workspace keying.
@@ -1287,16 +1287,7 @@ fn restrict_db_files(db_path: &std::path::Path) {
 /// the supervisor does, connects, and sends `Request::Notify` for the pane
 /// named by `OXIMUX_PTY_ID`. Returns a process exit code (0 = ok).
 fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
-    let mut title = String::new();
-    let mut body = String::new();
-    let mut args = std::env::args().skip(2);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--title" => title = args.next().unwrap_or_default(),
-            "--body" => body = args.next().unwrap_or_default(),
-            _ => {}
-        }
-    }
+    let NotifyArgs { title, body } = NotifyArgs::parse(std::env::args().skip(2));
     let pty_id = match std::env::var("OXIMUX_PTY_ID") {
         Ok(id) if !id.is_empty() => id,
         _ => {

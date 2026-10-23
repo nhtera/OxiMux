@@ -170,6 +170,12 @@ impl Install {
 /// installation neither side can reason about, so the answer is their command,
 /// not ours.
 fn managed_by(exe: &Path) -> Option<(&'static str, String)> {
+    if bundled_with_the_app(exe) {
+        return Some((
+            "the OxiMux app",
+            "Update OxiMux itself; this command line tool comes with it.".to_string(),
+        ));
+    }
     let path = exe.to_string_lossy().replace('\\', "/");
     if path.contains("/Cellar/") || path.contains("/homebrew/") {
         return Some(("Homebrew", "brew upgrade oximux".to_string()));
@@ -178,6 +184,60 @@ fn managed_by(exe: &Path) -> Option<(&'static str, String)> {
         return Some(("Nix", "Update through your Nix configuration.".to_string()));
     }
     None
+}
+
+/// Whether `exe` (already resolved through links) is the CLI the desktop app
+/// ships: inside a macOS `.app`, or — on Windows — the app's install. Its
+/// files are the app's updater's: a swap in place would break the bundle's
+/// signature on macOS and fight the app's own file-by-file update on Windows.
+fn bundled_with_the_app(exe: &Path) -> bool {
+    bundled_layout(exe, cfg!(windows))
+}
+
+/// [`bundled_with_the_app`] with the Windows install layout as a parameter, so
+/// it is tested everywhere: the `oximux-cli.exe` beside the app's own
+/// `oximux.exe` and relay, or the copy of it the app keeps in that install's
+/// `bin\`. Keyed on `oximux-cli` beside the app binary, never on `oximux`
+/// alone: an ordinary install also keeps `oximux` next to `oximux-relay`.
+fn bundled_layout(exe: &Path, windows_install: bool) -> bool {
+    if exe.to_string_lossy().replace('\\', "/").contains(".app/Contents/") {
+        return true;
+    }
+    if !windows_install {
+        return false;
+    }
+    let holds = |dir: &Path, stems: &[&str]| {
+        stems.iter().all(|stem| dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX)).is_file())
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let app_files = ["oximux", "oximux-relay", "oximux-cli"];
+    let beside_the_app = exe.file_stem().is_some_and(|stem| stem == "oximux-cli") && holds(dir, &app_files);
+    let in_its_bin = dir.file_name().is_some_and(|name| name == "bin")
+        && dir.parent().is_some_and(|install| holds(install, &app_files));
+    beside_the_app || in_its_bin
+}
+
+/// This binary, resolved through links, when it can be found.
+fn this_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+/// Whether the running binary is the CLI the desktop app ships.
+pub fn is_bundled_with_the_app() -> bool {
+    this_binary().is_some_and(|exe| bundled_with_the_app(&exe))
+}
+
+/// Refuse when this binary is the CLI the desktop app ships, before anything
+/// else — `--check` included, which would otherwise advertise an
+/// `oximux update` that then refuses.
+pub fn refuse_if_bundled_with_the_app() -> Result<(), UpdateError> {
+    match this_binary().filter(|exe| bundled_with_the_app(exe)).and_then(|exe| managed_by(&exe)) {
+        Some((manager, command)) => Err(UpdateError::ManagedInstall { manager, command }),
+        None => Ok(()),
+    }
 }
 
 /// What an update did, for the verb to render.

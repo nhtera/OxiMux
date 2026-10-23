@@ -103,6 +103,11 @@ fn main() -> std::process::ExitCode {
     if commands::agent_status::is_hook_invocation() {
         return std::process::ExitCode::from(commands::agent_status::run());
     }
+    // `notify` likewise: hooks run it too, and one of them appends an argument
+    // of its own.
+    if commands::notify::is_invocation() {
+        return std::process::ExitCode::from(commands::notify::run());
+    }
 
     // Usage errors exit 2 here, printing clap's own message — before any I/O.
     let args = match Cli::try_parse() {
@@ -119,7 +124,12 @@ fn main() -> std::process::ExitCode {
     // unless one of those deletions failed, the one case nothing else cleans
     // up. Cheap (one readdir), silent, and unconditional: the very next
     // invocation after an update is the first chance to finish it.
+    //
+    // Never for the CLI the desktop app ships: it swaps nothing of its own,
+    // and the backups beside it are the app updater's — after a quit-time swap
+    // killed half-way, the only copy of a file it is about to restore.
     if let Ok(exe) = std::env::current_exe()
+        && !update::is_bundled_with_the_app()
         && let Some(dir) = exe.parent()
     {
         // Only names this CLI installed: the directory is usually

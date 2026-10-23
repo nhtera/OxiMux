@@ -8317,6 +8317,7 @@ dependencies = [
  "oximux-job-object",
  "oximux-macos-trust",
  "oximux-owner-only",
+ "oximux-relay",
  "oximux-relay-client",
  "oximux-relay-proto",
  "oximux-relay-supervisor",
