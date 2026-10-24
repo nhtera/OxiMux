@@ -301,6 +301,7 @@ pub fn connect(mut spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Recei
                 spec.effort.as_deref(),
                 posture,
                 &spec.env,
+                &spec.mcp_servers,
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }

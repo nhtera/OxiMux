@@ -229,7 +229,11 @@ impl AgentChatView {
             tracing::debug!("no oximux binary to run; the agent gets no delegation tools");
             return;
         };
-        if let Err(err) = spec.add_mcp_server(orchestration_server(&cli, &file, adapter_id.unwrap_or("claude-code"))) {
+        let default_agent = adapter_id.unwrap_or(match spec.transport {
+            Transport::AppServer => "codex",
+            _ => "claude-code",
+        });
+        if let Err(err) = spec.add_mcp_server(orchestration_server(&cli, &file, default_agent)) {
             tracing::warn!(%err, "delegation tools not declared");
         }
     }
@@ -243,11 +247,12 @@ impl AgentChatView {
 }
 
 /// Whether a spawn gets the delegation tools: the setting is on, the agent
-/// speaks MCP through a host declaration this build wires (Claude), and it is
-/// not held to a read-only posture.
+/// takes MCP servers the host declares (Claude's `--mcp-config`, Codex's
+/// thread config, ACP's `session/new`), and it is not held to a read-only
+/// posture. Pi and omp have no MCP: their agents use the `oximux` command.
 pub(super) fn wants_delegation_tools(expose_tools: bool, spec: &ConnectSpec) -> bool {
     expose_tools
-        && spec.transport == Transport::StreamJson
+        && matches!(spec.transport, Transport::StreamJson | Transport::AppServer | Transport::Acp)
         && spec.posture == oximux_agents::thread::launch_posture::SpawnPosture::Default
 }
 
@@ -282,15 +287,18 @@ mod tests {
     }
 
     /// Review and Verify agents only read: no delegation tools, whatever the
-    /// setting. Nor does a transport this build does not wire them for.
+    /// setting. Nor does an agent with no MCP.
     #[test]
-    fn only_a_default_claude_agent_gets_the_delegation_tools() {
-        assert!(wants_delegation_tools(true, &spec(Transport::StreamJson, SpawnPosture::Default)));
-        assert!(!wants_delegation_tools(false, &spec(Transport::StreamJson, SpawnPosture::Default)));
-        for posture in [SpawnPosture::Review, SpawnPosture::Verify] {
-            assert!(!wants_delegation_tools(true, &spec(Transport::StreamJson, posture)), "{posture:?}");
+    fn only_a_default_mcp_agent_gets_the_delegation_tools() {
+        for transport in [Transport::StreamJson, Transport::AppServer, Transport::Acp] {
+            assert!(wants_delegation_tools(true, &spec(transport, SpawnPosture::Default)), "{transport:?}");
+            assert!(!wants_delegation_tools(false, &spec(transport, SpawnPosture::Default)), "{transport:?}");
+            for posture in [SpawnPosture::Review, SpawnPosture::Verify] {
+                assert!(!wants_delegation_tools(true, &spec(transport, posture)), "{transport:?} {posture:?}");
+            }
         }
-        for transport in [Transport::Acp, Transport::AppServer, Transport::Rpc] {
+        // No MCP: these agents delegate through the `oximux` command.
+        for transport in [Transport::Rpc, Transport::OmpRpc] {
             assert!(!wants_delegation_tools(true, &spec(transport, SpawnPosture::Default)), "{transport:?}");
         }
     }

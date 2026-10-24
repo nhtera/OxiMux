@@ -93,9 +93,45 @@ pub fn to_claude_mcp_config(specs: &[McpServerSpec]) -> Option<String> {
     Some(json!({ "mcpServers": Value::Object(servers) }).to_string())
 }
 
+/// Render `specs` as the `config` overrides Codex's app-server takes on
+/// `thread/start` and `thread/resume` (its `mcp_servers` table, as in its own
+/// `config.toml`). `None` for an empty slice, so a launch that declares nothing
+/// sends no `config` at all.
+///
+/// Codex starts stdio servers with a short allow-list of environment
+/// variables, so nothing a server needs may ride in the inherited environment
+/// (checked against codex-cli 0.164: an inherited variable did not arrive).
+pub fn to_codex_mcp_config(specs: &[McpServerSpec]) -> Option<Value> {
+    if specs.is_empty() {
+        return None;
+    }
+    let servers: Map<String, Value> = specs
+        .iter()
+        .map(|s| {
+            let mut entry = json!({ "command": s.command, "args": s.args });
+            if !s.env.is_empty() {
+                let env: Map<String, Value> = s.env.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+                entry["env"] = Value::Object(env);
+            }
+            (s.name.clone(), entry)
+        })
+        .collect();
+    Some(json!({ "mcp_servers": Value::Object(servers) }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_gets_its_own_table_shape_and_nothing_when_empty() {
+        assert_eq!(to_codex_mcp_config(&[]), None);
+        let spec = McpServerSpec::new("oximux", "/bin/oximux").args(vec!["mcp".into(), "--tools".into(), "orchestrate".into()]);
+        assert_eq!(
+            to_codex_mcp_config(&[spec]),
+            Some(json!({ "mcp_servers": { "oximux": { "command": "/bin/oximux", "args": ["mcp", "--tools", "orchestrate"] } } }))
+        );
+    }
 
     #[test]
     fn empty_specs_render_no_config() {

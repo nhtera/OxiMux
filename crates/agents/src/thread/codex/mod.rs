@@ -74,6 +74,9 @@ enum Outbound {
 /// turn ids, and the latest token usage (attached to the next `TurnEnded`).
 #[derive(Default)]
 struct CodexState {
+    /// The host's MCP servers as thread `config` (see
+    /// `to_codex_mcp_config`), sent on `thread/start` and `thread/resume`.
+    mcp_config: Option<Value>,
     thread_id: Option<String>,
     current_turn_id: Option<String>,
     last_usage: Option<TurnUsage>,
@@ -153,6 +156,7 @@ impl CodexAppServerConnection {
         effort: Option<&str>,
         posture: Option<(&str, &str)>,
         env: &[(String, String)],
+        mcp_servers: &[oximux_agent_core::thread::mcp_server_spec::McpServerSpec],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (rpc, inbound_rx, child) = RpcClient::spawn(cwd, env)?;
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
@@ -162,6 +166,7 @@ impl CodexAppServerConnection {
         // picker labels — reflect the tab's choice. A restored posture overrides
         // the default; a fresh session starts at on-request/workspace-write.
         if let Ok(mut s) = state.lock() {
+            s.mcp_config = oximux_agent_core::thread::mcp_server_spec::to_codex_mcp_config(mcp_servers);
             s.current_model = model.map(str::to_string);
             s.current_effort = effort.map(str::to_string);
             s.cwd = cwd.to_path_buf();
@@ -573,9 +578,9 @@ fn worker_loop(
 
     // Snapshot the seeded posture (owned, so it outlives the state lock) and
     // send it on thread/start & thread/resume.
-    let (approval, sandbox) = match state.lock() {
-        Ok(s) => (s.approval_policy.clone(), s.sandbox.clone()),
-        Err(_) => (protocol::DEFAULT_APPROVAL_POLICY.into(), protocol::DEFAULT_SANDBOX.into()),
+    let (approval, sandbox, mcp_config) = match state.lock() {
+        Ok(s) => (s.approval_policy.clone(), s.sandbox.clone(), s.mcp_config.clone()),
+        Err(_) => (protocol::DEFAULT_APPROVAL_POLICY.into(), protocol::DEFAULT_SANDBOX.into(), None),
     };
     let posture = protocol::Posture { approval_policy: &approval, sandbox: &sandbox };
 
@@ -594,7 +599,7 @@ fn worker_loop(
     let res = match resume_id {
         None => match rpc.request(
             protocol::M_THREAD_START,
-            protocol::thread_start_params(model.as_deref(), &cwd, posture),
+            protocol::thread_start_params(model.as_deref(), &cwd, posture, mcp_config.as_ref()),
             HANDSHAKE_TIMEOUT,
         ) {
             Ok(r) => r,
@@ -604,7 +609,7 @@ fn worker_loop(
             }
         },
         Some(tid) => {
-            let params = protocol::thread_resume_params(tid, model.as_deref(), posture);
+            let params = protocol::thread_resume_params(tid, model.as_deref(), posture, mcp_config.as_ref());
             match rpc.request(protocol::M_THREAD_RESUME, params.clone(), HANDSHAKE_TIMEOUT) {
                 Ok(r) => r,
                 Err(e) => {
