@@ -19,6 +19,7 @@ use std::thread;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
+use super::launch_posture::ClaudePosture;
 use super::claude_catalog::{shared_claude_catalog, ClaudeCatalog};
 use super::connection::{
     apply_flag_settings_json, control_response_json, interrupt_json, question_answer_json,
@@ -220,6 +221,10 @@ pub struct HostInjection<'a> {
     /// Mutually exclusive with the `resume_session_id` argument — one names a
     /// conversation that already exists, the other one about to.
     pub fresh_session_id: Option<&'a str>,
+    /// The flags a locked spawn posture adds: the `--tools` allow-list,
+    /// `--permission-prompts none` and `--strict-mcp-config` (see
+    /// [`super::launch_posture`]). `None` for an ordinary chat.
+    pub posture: Option<&'a ClaudePosture>,
 }
 
 /// Same as [`build_args`], plus `--resume <session_id>` when restoring a
@@ -306,6 +311,19 @@ pub fn build_args_with_resume(
     if let Some(settings) = host.settings.map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--settings".to_string());
         args.push(settings.to_string());
+    }
+    // A locked spawn posture. `--tools` is variadic too, so its list travels
+    // as one comma-joined argument and a flag follows it.
+    if let Some(posture) = host.posture {
+        args.push("--tools".to_string());
+        args.push(posture.tools_allow.join(","));
+        if posture.no_prompts {
+            args.push("--permission-prompts".to_string());
+            args.push("none".to_string());
+        }
+        if posture.strict_mcp {
+            args.push("--strict-mcp-config".to_string());
+        }
     }
     // Variadic (`--disallowedTools <tools...>`), so it goes last: it swallows
     // every following argument that does not begin with a dash. Nothing is
@@ -946,6 +964,29 @@ mod tests {
             .iter()
             .any(|x| x == "--settings")
         );
+    }
+
+    #[test]
+    fn a_locked_posture_adds_its_flags_before_the_variadic_tail() {
+        let posture = ClaudePosture {
+            tools_allow: vec!["Read".into(), "Grep".into(), "Glob".into()],
+            no_prompts: true,
+            strict_mcp: true,
+        };
+        let tools = vec!["mcp__x__y".to_string()];
+        let a = build_args_with_resume(
+            None,
+            None,
+            Some("dontAsk"),
+            None,
+            &HostInjection { disallowed_tools: &tools, posture: Some(&posture), ..Default::default() },
+        );
+        let at = |flag: &str| a.iter().position(|x| x == flag).unwrap_or_else(|| panic!("{flag} in {a:?}"));
+        assert_eq!(a[at("--tools") + 1], "Read,Grep,Glob", "one comma-joined argument");
+        assert_eq!(a[at("--permission-prompts") + 1], "none");
+        assert_eq!(a[at("--permission-mode") + 1], "dontAsk");
+        assert!(at("--strict-mcp-config") < at("--disallowedTools"));
+        assert_eq!(a.last().map(String::as_str), Some("mcp__x__y"), "--disallowedTools stays last");
     }
 
     #[test]

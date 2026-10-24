@@ -53,6 +53,12 @@ pub struct SessionStatus {
     pub last_seq: Seq,
     /// At least one permission request is outstanding (awaiting Allow/Deny).
     pub awaiting_permission: bool,
+    /// The session is doing something: a turn is running or a permission or
+    /// question prompt is waiting on someone. Published by whoever drives the
+    /// session (the desktop view, the headless host), because only it knows
+    /// when a turn begins — the event stream carries the end but not the start.
+    /// The host parks an idle spawned child off this flag, freeing its slot.
+    pub working: bool,
 }
 
 /// How a session presents itself in a remote client's session list. Lives here
@@ -117,8 +123,21 @@ pub struct RemotePrompt {
 struct PendingPermission {
     /// The tool call the request gated, when it named one.
     tool_use_id: Option<String>,
+    /// The tool asking, and what kind of request it is: a parent agent may
+    /// answer only some of them (see [`SessionHandle::pending_permission`]).
+    tool_name: String,
+    kind: crate::thread::PermissionKind,
     /// The input the agent proposed.
     input: serde_json::Value,
+}
+
+/// An undecided permission request, as a decider must see it before choosing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPermissionView {
+    pub tool_name: String,
+    pub kind: crate::thread::PermissionKind,
+    /// The input the agent proposed.
+    pub input: serde_json::Value,
 }
 
 /// Which picker a [`RemoteChoice`] carries.
@@ -258,10 +277,17 @@ impl SessionHandle {
     pub fn ingest(&self, mut event: ThreadEvent) -> Seq {
         // Track outstanding permission requests for the coarse status snapshot —
         // and keep the proposal, so a decision that edits it can be recorded.
-        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, input, .. } = &event {
+        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, tool_name, input, kind, .. } =
+            &event
+        {
             self.pending.lock().unwrap().insert(
                 request_id.clone(),
-                PendingPermission { tool_use_id: tool_use_id.clone(), input: input.clone() },
+                PendingPermission {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    kind: *kind,
+                    input: input.clone(),
+                },
             );
         }
 
@@ -305,6 +331,15 @@ impl SessionHandle {
             .filter(|(seq, _)| *seq > after_seq)
             .cloned()
             .collect()
+    }
+
+    /// The undecided request `request_id`, if it is still pending.
+    pub fn pending_permission(&self, request_id: &str) -> Option<PendingPermissionView> {
+        self.pending.lock().unwrap().get(request_id).map(|p| PendingPermissionView {
+            tool_name: p.tool_name.clone(),
+            kind: p.kind,
+            input: p.input.clone(),
+        })
     }
 
     /// The single atomic gate for deciding a permission. Returns `Ok(true)` for the
@@ -635,6 +670,21 @@ impl SessionHandle {
         // A title/model change is visible in the session-list row.
         self.bump_changed();
         true
+    }
+
+    /// Publish whether the session is working (see [`SessionStatus::working`]).
+    /// Returns whether it changed; a flip nudges the session-list generation so
+    /// the host's lineage subscriber parks or revives the row.
+    pub fn set_working(&self, working: bool) -> bool {
+        let mut flipped = false;
+        self.status_tx.send_modify(|status| {
+            flipped = status.working != working;
+            status.working = working;
+        });
+        if flipped {
+            self.bump_changed();
+        }
+        flipped
     }
 
     /// Nudge the registry-wide session-list generation so a subscriber re-snapshots.

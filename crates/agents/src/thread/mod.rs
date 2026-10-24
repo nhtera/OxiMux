@@ -20,6 +20,8 @@ pub mod codex;
 pub mod codex_session_import;
 pub mod connect;
 pub mod connection;
+pub mod launch_posture;
+pub mod spec_merge;
 pub mod ndjson_transport;
 pub mod omp;
 pub mod pi;
