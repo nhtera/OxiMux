@@ -260,11 +260,14 @@ fn mirrored_holds_carry_the_steer_state() {
 fn a_stop_takes_back_only_what_was_not_started() {
     let mut gate = SendGate::new();
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    gate.note_steered(a);
-    gate.note_steered(b);
-    gate.note_accepted(&a.to_string());
-    assert_eq!(gate.take_unstarted(), [b]);
+    gate.note_steered(a, None);
+    gate.note_steered(b, Some("typed".into()));
+    assert!(gate.awaiting_steer());
+    assert_eq!(gate.note_accepted(&a.to_string()), Some(false));
+    assert_eq!(gate.note_accepted("someone-elses"), None);
+    assert_eq!(gate.take_unstarted(), [(b, Some("typed".to_string()))]);
     assert!(gate.take_unstarted().is_empty());
+    assert!(!gate.awaiting_steer());
 }
 
 /// Another agent's message waits after a Stop like child events: only a
@@ -289,4 +292,27 @@ fn an_item_put_back_goes_first() {
     gate.on_turn_end();
     gate.requeue_front(a);
     assert_eq!(gate.take_next_if_open().unwrap().text, "a");
+}
+
+#[test]
+fn an_unreported_line_is_accepted_on_the_first_frame_and_delivered_at_turn_end() {
+    let mut gate = SendGate::new();
+    let u = Uuid::new_v4();
+    assert_eq!(gate.unreported_delivered(), None);
+    gate.note_unreported(u);
+    assert_eq!(gate.unreported_delivered(), None, "not taken yet");
+    assert_eq!(gate.unreported_accepted(), Some(u));
+    assert_eq!(gate.unreported_accepted(), None, "once");
+    assert_eq!(gate.unreported_delivered(), Some(u));
+    assert_eq!(gate.unreported_delivered(), None);
+}
+
+#[test]
+fn a_stop_from_elsewhere_wakes_the_owner_once() {
+    let mut gate = SendGate::new();
+    let n = wakes(&mut gate);
+    gate.request_stop();
+    assert_eq!(n.load(Ordering::SeqCst), 1);
+    assert!(gate.take_stop_request());
+    assert!(!gate.take_stop_request());
 }

@@ -162,8 +162,15 @@ pub struct SendGate {
     /// Who started the running turn.
     turn_source: Option<SendSource>,
     /// Lines written into a running turn that the agent has not started on
-    /// yet: a Stop takes these back before it interrupts.
-    unstarted: Vec<Uuid>,
+    /// yet, with the text when a person sent it: a Stop takes these back
+    /// before it interrupts, and gives a person's back to the composer.
+    unstarted: Vec<(Uuid, Option<String>)>,
+    /// A Stop asked for from elsewhere (a phone, the CLI): the owner runs its
+    /// own Stop, which takes steered lines back first.
+    stop_requested: bool,
+    /// A line written to an agent that reports no receipts, and whether its
+    /// first frame (acceptance) has been seen: the owner stands in for them.
+    unreported: Option<(Uuid, bool)>,
 }
 
 impl std::fmt::Debug for SendGate {
@@ -342,18 +349,68 @@ impl SendGate {
 
     /// A steered line went into the running turn: until the agent starts on
     /// it, a Stop must take it back.
-    pub fn note_steered(&mut self, uuid: Uuid) {
-        self.unstarted.push(uuid);
+    pub fn note_steered(&mut self, uuid: Uuid, user_text: Option<String>) {
+        self.unstarted.push((uuid, user_text));
     }
 
-    /// The agent started on the line sent under `uuid`.
-    pub fn note_accepted(&mut self, uuid: &str) {
-        self.unstarted.retain(|u| u.to_string() != uuid);
+    /// The agent started on the line sent under `uuid`. For a steered line,
+    /// returns whether a person sent it.
+    pub fn note_accepted(&mut self, uuid: &str) -> Option<bool> {
+        let at = self.unstarted.iter().position(|(u, _)| u.to_string() == uuid)?;
+        Some(self.unstarted.remove(at).1.is_some())
     }
 
-    /// Steered lines the agent has not started on; cleared (a Stop takes them).
-    pub fn take_unstarted(&mut self) -> Vec<Uuid> {
+    /// Whether a steered line has not started yet. The agent may still run
+    /// it as a turn of its own after the current one ends, so the turn is not
+    /// over until it has started.
+    pub fn awaiting_steer(&self) -> bool {
+        !self.unstarted.is_empty()
+    }
+
+    /// Steered lines the agent has not started on, with a person's text;
+    /// cleared (a Stop takes them).
+    pub fn take_unstarted(&mut self) -> Vec<(Uuid, Option<String>)> {
         std::mem::take(&mut self.unstarted)
+    }
+
+    /// Ask the owner to stop the turn (a Stop from elsewhere). Wakes it.
+    pub fn request_stop(&mut self) {
+        self.stop_requested = true;
+        if let Some(waker) = &self.waker {
+            waker();
+        }
+    }
+
+    pub fn take_stop_request(&mut self) -> bool {
+        std::mem::take(&mut self.stop_requested)
+    }
+
+    /// A line went to an agent that reports no receipts.
+    pub fn note_unreported(&mut self, uuid: Uuid) {
+        self.unreported = Some((uuid, false));
+    }
+
+    /// The agent produced a frame: the first one after an unreported line is
+    /// its acceptance. Returns the line's id the first time.
+    pub fn unreported_accepted(&mut self) -> Option<Uuid> {
+        match &mut self.unreported {
+            Some((uuid, seen @ false)) => {
+                *seen = true;
+                Some(*uuid)
+            }
+            _ => None,
+        }
+    }
+
+    /// The turn ended: the unreported line was delivered (if it was taken).
+    pub fn unreported_delivered(&mut self) -> Option<Uuid> {
+        match self.unreported.take() {
+            Some((uuid, true)) => Some(uuid),
+            other => {
+                self.unreported = other;
+                None
+            }
+        }
     }
 
     /// The user's Send now on a queued item: steer it if possible. `None`

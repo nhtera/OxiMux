@@ -2043,36 +2043,6 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Hand a message to the turn that is already streaming (a queued chip's ↑ on
-    /// a `supports_steer` backend). The agent picks it up at the next turn
-    /// boundary and changes course.
-    ///
-    /// Deliberately not routed through [`Self::send_text`]. That path is the
-    /// *start* of a turn: it binds an unbound draft, respawns an interrupted
-    /// child, generates the tab title and takes the pre-turn checkpoint. None of
-    /// that applies to a message going into a turn that is already running — and
-    /// the checkpoint especially must not: it anchors rewind to the repo as it
-    /// stood *before* a turn, and taking one now would capture a tree the running
-    /// turn's own tools are halfway through editing.
-    fn steer_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.is_empty() || !self.thread.turn_active {
-            return;
-        }
-        let Some(conn) = &self.connection else { return };
-        // The bubble goes in at the point the user sent it, which is also where
-        // the agent will act on it — the turn's remaining output lands after.
-        match conn.steer(&text) {
-            Ok(()) => {
-                self.thread.push_user_message(&text);
-                self.note_chat_prompt_sent();
-            }
-            Err(e) => self.thread.last_error = Some(format!("Steer failed: {e}")),
-        }
-        self.follow_bottom();
-        self.sync_composer(cx);
-        cx.notify();
-    }
-
     /// Start a fresh conversation in this tab without closing it (the CLI's
     /// `/clear`). Blanks the transcript, drops any transient UI bound to it, and
     /// respawns a **non-resumed** session (the cleared thread has no session id,
@@ -3139,6 +3109,7 @@ impl AgentChatView {
             && !self.interrupted
             && !self.disconnected
             && !self.retry.is_armed()
+            && !self.awaiting_steer()
         {
             // A turn just completed — decide whether it changed repo state, so
             // the rewind "restore files" affordance only lights up when there's

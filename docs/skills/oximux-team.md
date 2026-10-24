@@ -210,7 +210,7 @@ Five things to copy from that loop, whatever shape yours takes:
 ## Delegating from inside an agent
 
 A team run is the operator splitting work. An agent can also start its own
-helpers for parts of its task. OxiMux gives a Claude chat these as tools
+helpers for parts of its task. OxiMux gives its Claude, Codex and ACP chats these as tools
 (`oximux_spawn_agent`, `oximux_wait_agents`, `oximux_read_agent`,
 `oximux_send_agent`, `oximux_cancel_agent`, `oximux_list_children`,
 `oximux_answer_permit`, `oximux_state_get`, `oximux_state_cas`); any agent can

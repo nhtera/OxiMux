@@ -122,7 +122,7 @@ child only reads; `verify` may build and test but not edit; neither prompts.
 which no posture inspects. If `spawn` reports the prompt was not delivered,
 send it with `oximux send <child> "…"` or cancel the child.
 
-A Claude chat also has these as tools (`oximux_spawn_agent`,
+A Claude, Codex or ACP chat also has these as tools (`oximux_spawn_agent`,
 `oximux_wait_agents`, …), and a child's events reach its parent on their own
 when it finishes or gets stuck. See `oximux-team` › "Delegating from inside an
 agent" for how to wait and what the events look like.

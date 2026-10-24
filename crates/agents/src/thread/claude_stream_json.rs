@@ -667,13 +667,12 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         let (id, request) = interrupt_request();
         let reply = self.controls.request(&id, &request, REPLY_WITHIN, |line| self.write_line(line));
         for uuid in reply.map(|r| still_queued(&r)).unwrap_or_default() {
-            // Something will still run after the interrupt. If it is one of
-            // ours it slipped between the take-back and the interrupt; if not,
-            // the host never wrote it. Either way, take it back now.
+            // Something will still run after the interrupt. One of ours slipped
+            // between the take-back and the interrupt: take it back now. A line
+            // the host did not write is not ours to drop.
             if !unstarted.contains(&uuid) {
-                tracing::warn!(%uuid, "a line the host did not send was queued at a Stop");
-            }
-            if dequeue(&uuid) && unstarted.contains(&uuid) && !taken.contains(&uuid) {
+                tracing::warn!(%uuid, "a line the host did not send is still queued after a Stop");
+            } else if !taken.contains(&uuid) && dequeue(&uuid) {
                 taken.push(uuid);
             }
         }

@@ -504,6 +504,9 @@ impl SessionHandle {
     /// [`Self::send_prompt`] for a sender other than a phone (another agent's
     /// `send_agent`), which a Stop holds.
     pub fn send_prompt_from(&self, text: &str, images: &[ChatImage], source: crate::send_gate::SendSource) -> Result<()> {
+        if text.trim().is_empty() && images.is_empty() {
+            anyhow::bail!("an empty prompt");
+        }
         // A driver with a send gate takes it from here: the prompt waits behind
         // a running turn, a Stop or an open prompt like a typed one would, and
         // the driver writes it (and shows it) when it may.
@@ -572,8 +575,17 @@ impl SessionHandle {
         self.conn().capabilities()
     }
 
-    /// Interrupt the current turn.
+    /// Interrupt the current turn. A driver with a send gate runs its own
+    /// Stop (it takes lines written into the turn back first, and holds child
+    /// events afterwards); otherwise the agent is interrupted directly.
     pub fn cancel(&self) -> Result<()> {
+        if let Some(gate) = self.gate() {
+            let mut gate = gate.lock().unwrap();
+            if gate.has_waker() {
+                gate.request_stop();
+                return Ok(());
+            }
+        }
         self.conn().cancel()
     }
 

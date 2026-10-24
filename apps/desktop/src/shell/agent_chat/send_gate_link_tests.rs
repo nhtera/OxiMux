@@ -250,3 +250,101 @@ async fn an_event_started_turn_cannot_leave_plan_mode(cx: &mut TestAppContext) {
         .unwrap();
     assert!(stub.sent().iter().any(|l| l["response"]["response"]["behavior"] == "deny"), "{:?}", stub.sent());
 }
+
+/// A steered line the agent did not fold in runs as its own next turn, after
+/// the turn's end: until it starts, the chat does not treat the turn as over
+/// (nothing else is sent), and when it starts the chat shows it running, as a
+/// turn child events started.
+#[gpui::test]
+async fn a_steered_line_that_runs_next_keeps_the_turn_open(cx: &mut TestAppContext) {
+    use oximux_agents::thread::connection::AgentCapabilities;
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        let rc = RemoteControl::new();
+        rc.set_enabled(true);
+        cx.set_global(rc);
+    });
+    let stub = Arc::new(StubConnection::default().with_capabilities(AgentCapabilities { supports_steer: true, ..Default::default() }));
+    let conn = stub.clone();
+    let window = cx.add_window(move |window, cx| {
+        AgentChatView::with_connection_for_test(conn, Theme::default(), Density::default(), Typography::default(), window, cx)
+    });
+    cx.run_until_parked();
+    window.update(cx, |view, _window, cx| view.bind_remote(cx)).unwrap();
+    let key = uuid::Uuid::new_v4();
+    window
+        .update(cx, |view, _window, cx| {
+            view.send_text("first".into(), vec![], cx);
+            view.on_event(ThreadEvent::AssistantTextDelta("working".into()), cx);
+            view.send_gate.lock().unwrap().push("<oximux-events>e</oximux-events>".into(), vec![], SendSource::ParentEvent, DeliveryMode::Steer, Some(key));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _window, cx| {
+            assert!(view.awaiting_steer(), "steered, not started yet");
+            // A phone's prompt waiting behind the turn.
+            view.send_gate.lock().unwrap().push("from the phone".into(), vec![], SendSource::Remote, DeliveryMode::Queue, None);
+            end_turn(view, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!user_lines(&stub).iter().any(|l| l["message"]["content"] == "from the phone"), "the turn is not over yet");
+    window
+        .update(cx, |view, _window, cx| {
+            view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: key.to_string() }], cx);
+            assert!(view.thread.turn_active, "the steered line runs as its own turn");
+            assert!(view.send_gate.lock().unwrap().turn_started_by_events());
+            end_turn(view, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(user_lines(&stub).iter().any(|l| l["message"]["content"] == "from the phone"), "then the queue moves on");
+}
+
+/// A Stop asked for from a phone or the CLI runs the chat's own Stop.
+#[gpui::test]
+async fn a_remote_stop_runs_the_chats_own_stop(cx: &mut TestAppContext) {
+    let (window, stub) = bound_chat(cx);
+    let handle = window
+        .update(cx, |view, _window, cx| {
+            view.send_text("first".into(), vec![], cx);
+            cx.global::<RemoteControl>().registry().get(&view.remote_session_id).unwrap()
+        })
+        .unwrap();
+    handle.cancel().unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _window, _cx| {
+            assert!(view.interrupted, "stopped the way the button stops");
+            assert!(view.send_gate.lock().unwrap().stopped_by_user());
+        })
+        .unwrap();
+    let _ = stub;
+}
+
+/// An agent that reports no receipts (Codex, ACP): its first frame after a
+/// line stands in for acceptance and the turn's end for delivery, so the host
+/// can settle child events it sent there instead of calling them unconfirmed.
+#[gpui::test]
+async fn an_agent_without_receipts_gets_stand_in_receipts(cx: &mut TestAppContext) {
+    let (window, _stub) = bound_chat(cx);
+    let key = uuid::Uuid::new_v4();
+    let mut receipts = window
+        .update(cx, |view, _window, cx| {
+            view.backend.transport = Transport::AppServer;
+            cx.global::<RemoteControl>().registry().get(&view.remote_session_id).unwrap().subscribe_receipts()
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _window, _cx| {
+            view.send_gate.lock().unwrap().push("<oximux-events>e</oximux-events>".into(), vec![], SendSource::ParentEvent, DeliveryMode::Queue, Some(key));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(receipts.try_recv().is_err(), "nothing yet: the agent has not answered");
+    window.update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::AssistantTextDelta("ok".into())], cx)).unwrap();
+    assert_eq!(receipts.try_recv().unwrap(), ThreadEvent::UserMessageAccepted { uuid: key.to_string() });
+    window.update(cx, |view, _window, cx| end_turn(view, cx)).unwrap();
+    assert_eq!(receipts.try_recv().unwrap(), ThreadEvent::UserMessagesDelivered { uuids: vec![key.to_string()] });
+}
