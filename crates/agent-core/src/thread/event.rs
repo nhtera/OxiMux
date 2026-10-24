@@ -570,9 +570,28 @@ pub enum ThreadEvent {
         /// displayed for the ones we do not.
         terminal_reason: Option<String>,
     },
+    /// The CLI started on the stdin line it was sent under `uuid` (Claude's
+    /// `command_lifecycle` `started`). From here the line must never be
+    /// resent: the agent has it.
+    ///
+    /// A receipt for the host's send bookkeeping, not transcript content: the
+    /// fold ignores it and the session handle keeps it out of the event ring
+    /// remote clients read ([`Self::is_receipt`]).
+    UserMessageAccepted { uuid: String },
+    /// The lines sent under these uuids were carried by the turn that just
+    /// ended (the `result`'s `user_message_uuids`, or `command_lifecycle`
+    /// `completed`). Rides just ahead of the `TurnEnded` it belongs to. A
+    /// receipt, like [`Self::UserMessageAccepted`].
+    UserMessagesDelivered { uuids: Vec<String> },
 }
 
 impl ThreadEvent {
+    /// A receipt about the host's own sends rather than something the agent
+    /// said: never folded into the transcript, never shown to remote clients.
+    pub fn is_receipt(&self) -> bool {
+        matches!(self, Self::UserMessageAccepted { .. } | Self::UserMessagesDelivered { .. })
+    }
+
     /// Whether this event only extends content the transcript already shows — a
     /// streamed token, a growing tool argument or output, a usage tick — rather
     /// than changing its shape.

@@ -23,7 +23,7 @@ use super::launch_posture::ClaudePosture;
 use super::claude_catalog::{shared_claude_catalog, ClaudeCatalog};
 use super::connection::{
     apply_flag_settings_json, control_response_json, interrupt_json, question_answer_json,
-    set_permission_mode_json, user_message_json, user_message_json_with_images,
+    set_permission_mode_json, user_message_json, user_message_json_tagged, user_message_json_with_images,
     AgentCapabilities, AgentConnection, EffortChoice, FeatureControl, FeatureKind, FeatureValue,
     ModeChoice, ModelChoice,
 };
@@ -613,6 +613,10 @@ impl AgentConnection for ClaudeStreamJsonConnection {
 
     fn send_user_message_with_images(&self, text: &str, images: &[ChatImage]) -> Result<()> {
         self.write_line(&user_message_json_with_images(text, images))
+    }
+
+    fn send_user_message_tagged(&self, text: &str, images: &[ChatImage], uuid: &str) -> Result<()> {
+        self.write_line(&user_message_json_tagged(text, images, uuid))
     }
 
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {

@@ -197,6 +197,10 @@ pub struct SessionHandle {
     /// Live fan-out for remote subscribers. Bounded; a slow subscriber that lags
     /// recovers via [`Self::events_since`], not by growing this ring.
     live: broadcast::Sender<(Seq, ThreadEvent)>,
+    /// Receipts for the host's own sends ([`ThreadEvent::is_receipt`]): which
+    /// lines the agent started on and which a turn carried. Kept apart from
+    /// `live` and the backlog, which remote clients read.
+    receipts: broadcast::Sender<ThreadEvent>,
     /// Request-ids that have been decided. Insertion is the atomic gate: the
     /// caller whose `insert` returns `true` is the one that fires the transport.
     decided: Mutex<HashSet<String>>,
@@ -275,6 +279,13 @@ impl SessionHandle {
     /// append ahead of it — reordering the backlog `events_since` promises is
     /// ascending.
     pub fn ingest(&self, mut event: ThreadEvent) -> Seq {
+        // A receipt is bookkeeping about the host's sends, not something the
+        // agent said: it goes to the host's receipt listeners and never into the
+        // ring remote clients read (an older client could not decode it).
+        if event.is_receipt() {
+            let _ = self.receipts.send(event);
+            return self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        }
         // Track outstanding permission requests for the coarse status snapshot —
         // and keep the proposal, so a decision that edits it can be recorded.
         if let ThreadEvent::PermissionRequested { request_id, tool_use_id, tool_name, input, kind, .. } =
@@ -312,6 +323,11 @@ impl SessionHandle {
 
         self.update_status(Some(seq));
         seq
+    }
+
+    /// Receipts for the host's sends to this session, from now on.
+    pub fn subscribe_receipts(&self) -> broadcast::Receiver<ThreadEvent> {
+        self.receipts.subscribe()
     }
 
     /// Subscribe to the live edge. Pair with [`Self::events_since`] on (re)subscribe
@@ -792,6 +808,7 @@ impl SessionRegistry {
             return existing.clone();
         }
         let (live, _) = broadcast::channel(broadcast_cap.max(1));
+        let (receipts, _) = broadcast::channel(64);
         let (status_tx, _) = watch::channel(SessionStatus::default());
         let handle = Arc::new(SessionHandle {
             conn: Mutex::new(conn),
@@ -799,6 +816,7 @@ impl SessionRegistry {
             backlog: Mutex::new(VecDeque::new()),
             backlog_cap: backlog_cap.max(1),
             live,
+            receipts,
             decided: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             status_tx,
@@ -1365,5 +1383,20 @@ mod tests {
             }),
             "dropping the model is a change",
         );
+    }
+
+    /// Receipts reach the host's listeners and never the ring remote clients
+    /// read: they take no sequence number and are not replayed.
+    #[test]
+    fn receipts_stay_out_of_the_event_ring() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(crate::thread::StubConnection::default()));
+        let mut receipts = handle.subscribe_receipts();
+        let seq = handle.ingest(ThreadEvent::Notice("before".into()));
+        let receipt = ThreadEvent::UserMessageAccepted { uuid: "u-1".into() };
+        assert_eq!(handle.ingest(receipt.clone()), seq, "no sequence number of its own");
+        assert_eq!(handle.events_since(0).len(), 1, "not retained");
+        assert_eq!(receipts.try_recv().unwrap(), receipt);
+        assert_eq!(handle.ingest(ThreadEvent::Notice("after".into())), seq + 1);
     }
 }

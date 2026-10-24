@@ -176,6 +176,19 @@ pub trait AgentConnection: Send + Sync {
         self.send_user_message(text)
     }
 
+    /// [`Self::send_user_message_with_images`], with the id the CLI is to
+    /// report the line by (its acceptance and the turn that carried it come
+    /// back as [`ThreadEvent::UserMessageAccepted`] and
+    /// [`ThreadEvent::UserMessagesDelivered`]). A backend with no such report
+    /// ignores the id and sends as before.
+    ///
+    /// [`ThreadEvent::UserMessageAccepted`]: super::event::ThreadEvent::UserMessageAccepted
+    /// [`ThreadEvent::UserMessagesDelivered`]: super::event::ThreadEvent::UserMessagesDelivered
+    fn send_user_message_tagged(&self, text: &str, images: &[ChatImage], uuid: &str) -> Result<()> {
+        let _ = uuid;
+        self.send_user_message_with_images(text, images)
+    }
+
     /// Send a message into the turn that is already streaming, to redirect it.
     ///
     /// Only meaningful for an [`AgentCapabilities::supports_steer`] backend. The
@@ -410,6 +423,15 @@ pub fn user_message_json_with_images(text: &str, images: &[ChatImage]) -> Value 
     json!({"type": "user", "message": {"role": "user", "content": content}})
 }
 
+/// [`user_message_json_with_images`] carrying the sender's `uuid`, the id the
+/// CLI reports the line by (`command_lifecycle`, a result's
+/// `user_message_uuids`).
+pub fn user_message_json_tagged(text: &str, images: &[ChatImage], uuid: &str) -> Value {
+    let mut line = user_message_json_with_images(text, images);
+    line["uuid"] = Value::String(uuid.to_string());
+    line
+}
+
 /// Build the stdin `control_response` JSON answering a `can_use_tool` request.
 ///
 /// Fail-closed contract (verified against the live CLI):
@@ -584,6 +606,11 @@ impl AgentConnection for StubConnection {
         self.record(user_message_json(text));
         Ok(())
     }
+    /// Recorded with its uuid, as the Claude backend writes it.
+    fn send_user_message_tagged(&self, text: &str, images: &[ChatImage], uuid: &str) -> Result<()> {
+        self.record(user_message_json_tagged(text, images, uuid));
+        Ok(())
+    }
     /// Recorded distinctly from a plain send so a test can tell a message that
     /// went INTO a running turn from one that started a new one. Honours
     /// `supports_steer` so an unconfigured stub still refuses, like the default.
@@ -690,6 +717,15 @@ mod tests {
         let id2 = apply_flag_settings_json(json!({}))["request_id"].as_str().unwrap().to_string();
         assert!(id1.starts_with("oximux-apply-settings-"));
         assert_ne!(id1, id2, "each request mints a fresh id");
+    }
+
+    #[test]
+    fn a_tagged_line_carries_the_uuid_the_cli_reports_it_by() {
+        let line = user_message_json_tagged("hi", &[], "00dad500-b85d-4a13-a756-c904e97ad49a");
+        assert_eq!(
+            line,
+            json!({"type": "user", "message": {"role": "user", "content": "hi"}, "uuid": "00dad500-b85d-4a13-a756-c904e97ad49a"})
+        );
     }
 
     #[test]

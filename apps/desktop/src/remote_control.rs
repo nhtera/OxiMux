@@ -164,7 +164,8 @@ impl RemoteBinding {
         // The event ring exists for remote readers. With nobody able to
         // connect, a chat is registered only for the host core (which reads
         // the working flag, not events), so the copy is skipped.
-        if self.exposed() {
+        // Receipts are for the host core itself, so they pass either way.
+        if self.exposed() || event.is_receipt() {
             self.handle.ingest(event);
         }
     }
