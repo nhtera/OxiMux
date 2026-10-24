@@ -444,3 +444,64 @@ async fn team_run_roles_are_recorded_under_the_run() {
     assert_eq!(row.parent_id, format!("team:{}", run_id.lock().unwrap()));
     assert_eq!(row.depth, 1);
 }
+
+/// Starts each child under a placeholder id and renames it a moment later,
+/// as a provider that names its own session (Codex) does.
+struct SelfNamingLauncher {
+    registry: Arc<SessionRegistry>,
+    lineage: LineageStore,
+    cwd: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SessionLauncher for SelfNamingLauncher {
+    async fn create(&self, cwd: &str, agent: Option<&str>, model: Option<&str>) -> Result<String, LaunchError> {
+        self.create_child(cwd, agent, model, ChildCtx::default()).await
+    }
+
+    async fn create_child(&self, _: &str, _: Option<&str>, _: Option<&str>, _: ChildCtx) -> Result<String, LaunchError> {
+        let placeholder = "agent-17928600000000001".to_string();
+        let handle = self.registry.register(placeholder.clone(), Arc::new(StubConnection::default()));
+        handle.set_meta(SessionMeta { cwd: Some(self.cwd.clone()), ..Default::default() });
+        let (registry, lineage, old) = (self.registry.clone(), self.lineage.clone(), placeholder.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            registry.register("codex-thread-1".into(), Arc::new(StubConnection::default()));
+            lineage.rekey(&old, "codex-thread-1").unwrap();
+            registry.unregister(&old);
+        });
+        Ok(placeholder)
+    }
+}
+
+/// The id a spawn reply names is the one the child keeps: a self-naming
+/// provider's placeholder would stop matching it moments later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_replies_with_the_id_a_self_naming_child_settles_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(SessionRegistry::new());
+    let parent = registry.register("parent".into(), Arc::new(StubConnection::default()));
+    parent.set_meta(SessionMeta { cwd: Some(dir.path().to_path_buf()), ..Default::default() });
+    let db = oximux_storage::db::open_memory().unwrap();
+    let lineage = LineageStore::new(db.conn());
+    let core = HostCore::new(HostCoreDeps {
+        rt: tokio::runtime::Handle::current(),
+        lineage: lineage.clone(),
+        registry: registry.clone(),
+        config: HostConfig::default(),
+    });
+    core.start(PriorOwner::None);
+    let launcher = Arc::new(SelfNamingLauncher { registry: registry.clone(), lineage, cwd: dir.path().to_path_buf() });
+    let dispatcher = Dispatcher::new(registry.clone(), Arc::new(AuthStore::new())).with_launcher(launcher).with_host_core(core);
+    let (client, server) = duplex_pair();
+    let client: Arc<dyn Transport> = Arc::new(client);
+    let serve = dispatcher.serve_local(&server, LocalScope::Session("parent".into()));
+    join(serve, async move {
+        let Response::AgentSpawned(r) = call(&*client, Request::SpawnAgent(spawn("codex-1"))).await else {
+            panic!("expected AgentSpawned");
+        };
+        assert_eq!(r.session_id, "codex-thread-1", "the settled id, not the placeholder");
+        drop(client);
+    })
+    .await;
+}

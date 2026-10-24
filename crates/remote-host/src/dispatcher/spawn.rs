@@ -25,6 +25,15 @@ use oximux_remote_proto::lineage::{
 use oximux_remote_proto::messages::CreateBaseWire;
 use oximux_remote_proto::proto::{Response, RpcError};
 
+/// How long a spawn waits for a self-naming child's real session id.
+const SETTLE_ID_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A launch-time id the desktop gives a session until its provider names it
+/// (`agent-` and digits).
+fn is_placeholder(id: &str) -> bool {
+    id.strip_prefix("agent-").is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 use super::Dispatcher;
 use crate::auth::Peer;
 use crate::launcher::{ChildCtx, LaunchError};
@@ -380,6 +389,11 @@ impl LaunchJob {
         if !delivered {
             tracing::warn!(session_id, "spawned child opened but its prompt was not delivered");
         }
+        // A provider that names its own session (Codex, Pi, ACP agents) starts
+        // under a placeholder and is rekeyed once it reports its id. The caller
+        // keeps whatever id this reply names, so wait briefly for the real one:
+        // a placeholder would stop matching the child moments later.
+        let session_id = if delivered { self.settled_id(session_id).await } else { session_id };
         Response::AgentSpawned(SpawnAgentResult {
             session_id,
             parent_id: self.parent,
@@ -388,6 +402,28 @@ impl LaunchJob {
             replayed: false,
             prompt_delivered: delivered,
         })
+    }
+
+    /// The child's id once its provider has named the session, or the one it
+    /// launched under when that takes longer than [`SETTLE_ID_WITHIN`] (the
+    /// lineage row is rekeyed either way; `ListChildren` shows the final id).
+    async fn settled_id(&self, launched: String) -> String {
+        if !is_placeholder(&launched) {
+            return launched;
+        }
+        let deadline = tokio::time::Instant::now() + SETTLE_ID_WITHIN;
+        while tokio::time::Instant::now() < deadline {
+            match self.core.lineage().session_of_row(self.row_id) {
+                Ok(Some(id)) if id != launched => return id,
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "reading a child's settled id failed");
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        launched
     }
 
     fn now(&self) -> chrono::DateTime<chrono::Local> {

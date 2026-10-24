@@ -727,6 +727,16 @@ impl LineageStore {
         row_by_session(&self.conn.lock().unwrap(), session_id)
     }
 
+    /// The session id a row holds now: a provider that names its own session
+    /// is rekeyed onto that name after launch, under the same row.
+    pub fn session_of_row(&self, row_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT session_id FROM agent_lineage WHERE id = ?1", params![row_id], |r| r.get(0))
+            .optional()?
+            .flatten())
+    }
+
     /// The row a request id produced under a parent.
     pub fn find_by_request(&self, parent_id: &str, request_id: &str) -> Result<Option<LineageRow>> {
         row_by_request(&self.conn.lock().unwrap(), parent_id, request_id)
