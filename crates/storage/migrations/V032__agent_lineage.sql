@@ -75,14 +75,16 @@ CREATE TABLE agent_event_outbox (
     id              INTEGER PRIMARY KEY,
     parent_session  TEXT NOT NULL,
     child           TEXT NOT NULL,
-    -- 'done' | 'failed' | 'interrupted' | 'needs_permission' | 'needs_input' ...
+    -- 'finished' | 'failed' | 'interrupted' | 'cancelled' | 'needs_permission' |
+    -- 'needs_input'.
     kind            TEXT NOT NULL,
     -- The event's identity: the child's completed-turn ordinal or the permit
     -- request id. With the columns above it makes a second watcher pass a no-op.
     edge_id         TEXT NOT NULL,
     payload         TEXT NOT NULL,
-    -- 'pending' | 'claimed' | 'accepted' | 'delivered' | 'unconfirmed' |
-    -- 'undeliverable'. accepted = the CLI took the line (never resend it);
+    -- 'pending' | 'claimed' | 'sent' | 'accepted' | 'delivered' | 'unconfirmed'
+    -- | 'undeliverable'. claimed = handed to the parent's send gate; sent = the
+    -- line was written; accepted = the CLI started on it (never resend it);
     -- delivered = the turn that carried it reported it.
     state           TEXT NOT NULL DEFAULT 'pending',
     -- The delivery's idempotency key (one per drained batch).
