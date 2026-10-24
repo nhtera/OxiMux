@@ -9,7 +9,7 @@
 
 use gpui::{App, Context};
 use oximux_agents::session_registry::SessionMeta;
-use oximux_agents::thread::ConnectSpec;
+use oximux_agents::thread::{ConnectSpec, McpServerSpec, Transport};
 
 use super::{AgentChatView, RemoteControl};
 
@@ -193,17 +193,36 @@ impl AgentChatView {
     /// respawned process gets a fresh one and the old one is revoked). Without
     /// one — confinement off, or local access off — the agent keeps the reach
     /// it had before confinement existed.
-    pub(super) fn add_spawn_credential(spec: &mut ConnectSpec, remote_session_id: &str, cx: &App) {
-        let Some(env) = cx.try_global::<RemoteControl>().and_then(|rc| rc.mint_chat_credential(remote_session_id))
-        else {
-            return;
-        };
-        for (key, value) in env {
-            if let Err(err) = spec.set_env(&key, &value) {
+    ///
+    /// With a credential, a Claude agent in the `Default` posture also gets
+    /// the delegation tools (`oximux mcp --tools orchestrate`), reading the
+    /// credential from its file. A Review or Verify agent never does, as it
+    /// gets no computer-use server: it only reads.
+    pub(super) fn add_spawn_credential(
+        spec: &mut ConnectSpec,
+        remote_session_id: &str,
+        adapter_id: Option<&str>,
+        cx: &App,
+    ) {
+        let Some(rc) = cx.try_global::<RemoteControl>() else { return };
+        let Some(access) = rc.mint_chat_credential(remote_session_id) else { return };
+        for (key, value) in &access.env {
+            if let Err(err) = spec.set_env(key, value) {
                 // A user-configured env var of the same name: the agent runs
                 // with what the user set, unconfined, and the log says why.
                 tracing::warn!(%err, "chat credential not injected");
             }
+        }
+        let Some(file) = access.credential_file else { return };
+        if !wants_delegation_tools(rc.host_config().expose_tools, spec) {
+            return;
+        }
+        let Some(cli) = crate::platform::bundled_cli::cli_path() else {
+            tracing::debug!("no oximux binary to run; the agent gets no delegation tools");
+            return;
+        };
+        if let Err(err) = spec.add_mcp_server(orchestration_server(&cli, &file, adapter_id.unwrap_or("claude-code"))) {
+            tracing::warn!(%err, "delegation tools not declared");
         }
     }
 
@@ -212,5 +231,73 @@ impl AgentChatView {
         if let Some(rc) = cx.try_global::<RemoteControl>() {
             rc.revoke_chat_credential(&self.remote_session_id);
         }
+    }
+}
+
+/// Whether a spawn gets the delegation tools: the setting is on, the agent
+/// speaks MCP through a host declaration this build wires (Claude), and it is
+/// not held to a read-only posture.
+pub(super) fn wants_delegation_tools(expose_tools: bool, spec: &ConnectSpec) -> bool {
+    expose_tools
+        && spec.transport == Transport::StreamJson
+        && spec.posture == oximux_agents::thread::launch_posture::SpawnPosture::Default
+}
+
+/// The delegation tool server a chat agent starts: the CLI's `mcp`, with the
+/// agent's credential file (never the token itself) in its arguments.
+pub(super) fn orchestration_server(cli: &std::path::Path, credential: &std::path::Path, agent: &str) -> McpServerSpec {
+    McpServerSpec::new("oximux", cli.to_string_lossy()).args(vec![
+        "mcp".into(),
+        "--tools".into(),
+        "orchestrate".into(),
+        "--credential-file".into(),
+        credential.to_string_lossy().into_owned(),
+        "--default-agent".into(),
+        agent.into(),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use oximux_agents::thread::ChatBackend;
+    use oximux_agents::thread::launch_posture::SpawnPosture;
+
+    use super::*;
+
+    fn spec(transport: Transport, posture: SpawnPosture) -> ConnectSpec {
+        let backend = ChatBackend { transport, ..ChatBackend::stream_json() };
+        let mut spec = ConnectSpec::for_backend(&backend, "/repo".into(), None, None, None, None);
+        spec.posture = posture;
+        spec
+    }
+
+    /// Review and Verify agents only read: no delegation tools, whatever the
+    /// setting. Nor does a transport this build does not wire them for.
+    #[test]
+    fn only_a_default_claude_agent_gets_the_delegation_tools() {
+        assert!(wants_delegation_tools(true, &spec(Transport::StreamJson, SpawnPosture::Default)));
+        assert!(!wants_delegation_tools(false, &spec(Transport::StreamJson, SpawnPosture::Default)));
+        for posture in [SpawnPosture::Review, SpawnPosture::Verify] {
+            assert!(!wants_delegation_tools(true, &spec(Transport::StreamJson, posture)), "{posture:?}");
+        }
+        for transport in [Transport::Acp, Transport::AppServer, Transport::Rpc] {
+            assert!(!wants_delegation_tools(true, &spec(transport, SpawnPosture::Default)), "{transport:?}");
+        }
+    }
+
+    /// The server's command line names the credential file, never the token:
+    /// argv is visible to every local user.
+    #[test]
+    fn the_delegation_server_carries_the_credential_path_not_the_token() {
+        let server = orchestration_server(Path::new("/app/bin/oximux"), Path::new("/data/agent-credentials/agent-x"), "claude-code");
+        assert_eq!(server.name, "oximux");
+        assert_eq!(server.command, "/app/bin/oximux");
+        assert_eq!(
+            server.args,
+            ["mcp", "--tools", "orchestrate", "--credential-file", "/data/agent-credentials/agent-x", "--default-agent", "claude-code"]
+        );
+        assert!(server.env.is_empty());
     }
 }

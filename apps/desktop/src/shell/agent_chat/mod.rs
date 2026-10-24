@@ -2215,7 +2215,7 @@ impl AgentChatView {
             old.shutdown();
         }
         let mut spec = self.respawn_spec(env, auth_method);
-        Self::add_spawn_credential(&mut spec, &self.remote_session_id, cx);
+        Self::add_spawn_credential(&mut spec, &self.remote_session_id, self.backend.adapter_id.as_deref(), cx);
         match computer_use::connect_declaring(spec, &self.screen_control, cx) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);

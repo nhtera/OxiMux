@@ -156,11 +156,28 @@ pub(super) fn entries(
         },
         cx,
     );
+    let expose = toggle_switch(
+        "delegation-expose-tools",
+        config.expose_tools,
+        theme,
+        |this: &mut SettingsModal, _w, cx| {
+            let mut next = current(cx);
+            next.expose_tools = !next.expose_tools;
+            apply(this, next, cx);
+        },
+        cx,
+    );
     vec![
         entry(
             "Agent delegation",
             "Chat agents may start helper agents (`oximux delegate spawn`).",
             delegation,
+        ),
+        entry(
+            "Delegation tools for agents",
+            "Claude chats get spawn, wait and the rest as tools, beside the `oximux` command. \
+             Applies to agents started from now on.",
+            expose,
         ),
         entry(
             "Confine chat agents to their own sessions",

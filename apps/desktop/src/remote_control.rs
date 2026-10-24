@@ -361,6 +361,19 @@ struct ChatCredential {
     /// What the agent's `OXIMUX_SESSION_ID` carries.
     label: String,
     secret: String,
+    /// The same credential as an owner-only file, for the delegation tool
+    /// server the agent starts. Removed with the credential.
+    file: Option<std::path::PathBuf>,
+}
+
+/// What a chat's spawn carries to reach the host as its own session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatAccess {
+    /// `OXIMUX_SESSION_ID` and `OXIMUX_SESSION_TOKEN`.
+    pub env: Vec<(String, String)>,
+    /// The credential as a file (`oximux mcp --credential-file`), when it
+    /// could be written.
+    pub credential_file: Option<std::path::PathBuf>,
 }
 
 impl Global for RemoteControl {}
@@ -973,7 +986,7 @@ impl RemoteControl {
     /// registry id, which may still be a placeholder: the process's environment
     /// is fixed at spawn, so a later rekey re-points the credential
     /// ([`Self::rekey_session`]) rather than the agent learning a new secret.
-    pub fn mint_chat_credential(&self, session_id: &str) -> Option<Vec<(String, String)>> {
+    pub fn mint_chat_credential(&self, session_id: &str) -> Option<ChatAccess> {
         if !self.host_core.as_ref().is_none_or(|core| core.config().confine_chat) {
             return None;
         }
@@ -982,15 +995,22 @@ impl RemoteControl {
         let label = oximux_remote_local::credential_label();
         let secret = handle.grant_session(&label);
         handle.bind_session(&label, session_id);
-        let previous = self
-            .chat_credentials
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), ChatCredential { label: label.clone(), secret: secret.clone() });
+        let file = write_credential_file(&handle.credential_dir(), &label, &secret);
+        let previous = self.chat_credentials.lock().unwrap().insert(
+            session_id.to_string(),
+            ChatCredential { label: label.clone(), secret: secret.clone(), file: file.clone() },
+        );
         if let Some(previous) = previous {
             handle.revoke_session(&previous.label);
+            remove_credential_file(previous.file);
         }
-        Some(oximux_remote_local::credential_env(&label, &secret))
+        Some(ChatAccess { env: oximux_remote_local::credential_env(&label, &secret), credential_file: file })
+    }
+
+    /// The host settings in force, or the defaults before the core is
+    /// installed.
+    pub fn host_config(&self) -> oximux_remote_host::HostConfig {
+        self.host_core.as_ref().map_or_else(Default::default, |core| core.config())
     }
 
     /// Give every open chat whose agent has no credential one, by respawning it
@@ -1020,6 +1040,7 @@ impl RemoteControl {
         if let Some(handle) = self.local.lock().unwrap().as_ref() {
             handle.revoke_session(&credential.label);
         }
+        remove_credential_file(credential.file);
     }
 
     /// Flip local CLI access off: the listener, its socket file, and every
@@ -1037,6 +1058,34 @@ impl RemoteControl {
             // it back, the core writes nothing (guest mode).
             core.release();
         }
+    }
+}
+
+/// Write a chat agent's credential file in `dir` (owner-only). The first
+/// write of a run clears the directory: files left by an earlier run belong
+/// to agents that died with it. `None`, logged, when it cannot be written:
+/// the agent then runs without the delegation tools, nothing else changes.
+fn write_credential_file(dir: &std::path::Path, label: &str, secret: &str) -> Option<std::path::PathBuf> {
+    static CLEARED: std::sync::Once = std::sync::Once::new();
+    CLEARED.call_once(|| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    let path = dir.join(label);
+    let written = oximux_owner_only::prepare_owner_only_dir(dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| oximux_remote_local::write_credential_file(&path, label, secret));
+    match written {
+        Ok(()) => Some(path),
+        Err(err) => {
+            tracing::warn!(%err, "chat credential file not written; the agent gets no delegation tools");
+            None
+        }
+    }
+}
+
+fn remove_credential_file(file: Option<std::path::PathBuf>) {
+    if let Some(file) = file {
+        let _ = std::fs::remove_file(file);
     }
 }
 
@@ -1356,18 +1405,25 @@ mod tests {
         let handle = local_listener::start(dispatcher, dir.path().to_path_buf(), rt.handle().clone()).unwrap();
         *rc.local.lock().unwrap() = Some(handle);
 
-        let env = rc.mint_chat_credential("agent-1").expect("a credential");
+        let access = rc.mint_chat_credential("agent-1").expect("a credential");
+        let env = &access.env;
         let label = env.iter().find(|(k, _)| k == oximux_remote_local::SESSION_ENV_VAR).unwrap().1.clone();
         assert!(label.starts_with("agent-"), "an opaque label, not the session id: {label}");
         assert!(env.iter().any(|(k, v)| k == oximux_remote_local::SESSION_TOKEN_ENV_VAR && !v.is_empty()));
+        // The same credential as a file, for the agent's tool server.
+        let file = access.credential_file.clone().expect("a credential file");
+        assert!(file.starts_with(dir.path()));
+        assert_eq!(oximux_remote_local::read_credential_file(&file).unwrap().0, label);
         let again = rc.mint_chat_credential("agent-1").unwrap();
-        assert_ne!(again, env, "a respawn gets a fresh credential");
+        assert_ne!(again, access, "a respawn gets a fresh credential");
+        assert!(!file.exists(), "the old file goes with the old credential");
         assert_eq!(rc.chat_credentials.lock().unwrap().len(), 1, "one per chat");
 
         rc.rekey_session("agent-1", "claude-abc");
         assert!(rc.chat_credentials.lock().unwrap().contains_key("claude-abc"));
         rc.revoke_chat_credential("claude-abc");
         assert!(rc.chat_credentials.lock().unwrap().is_empty());
+        assert!(!again.credential_file.unwrap().exists(), "revoked with its credential");
 
         rc.host_core().unwrap().set_config(oximux_remote_host::HostConfig {
             confine_chat: false,

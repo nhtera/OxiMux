@@ -161,7 +161,7 @@ impl AgentChatView {
                 claude_fast_mode_to_apply(posture.claude_fast_mode, model.as_deref());
             spec.posture = spawn_posture;
             spec.fresh_session_id = fresh_session_id.clone();
-            Self::add_spawn_credential(&mut spec, &remote_session_id, cx);
+            Self::add_spawn_credential(&mut spec, &remote_session_id, backend.adapter_id.as_deref(), cx);
             match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
