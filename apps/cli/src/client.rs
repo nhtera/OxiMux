@@ -413,12 +413,30 @@ pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
     use oximux_remote_proto::proto::RpcError;
     match err {
         RpcError::Unauthorized => {
-            Failure::new("denied", exit::DENIED, "the host refused this call").with_steps([
-                format!(
+            // A caller holding an agent's credential is told what it may do,
+            // never how to step outside it: "run without the session variable"
+            // is an instruction to escape the confinement.
+            let steps = if std::env::var_os(SESSION_ENV_VAR).is_some() {
+                vec![
+                    "this agent's credential reaches its own session and the agents it spawned".to_string(),
+                    "to start a helper, use `oximux delegate spawn` (or the oximux_spawn_agent tool)".into(),
+                ]
+            } else {
+                vec![format!(
                     "agent-scoped invocations (${SESSION_ENV_VAR} set) reach only their own session"
-                ),
-                "operator access covers everything — run without the session variable".into(),
-            ])
+                )]
+            };
+            Failure::new("denied", exit::DENIED, "the host refused this call").with_steps(steps)
+        }
+        // The host wrote the message for whoever is reading — often an agent —
+        // and it ends with what to do instead.
+        RpcError::Spawn(refusal) => {
+            use oximux_remote_proto::lineage::SpawnErrorKind;
+            let code = match refusal.kind {
+                SpawnErrorKind::NotInSubtree | SpawnErrorKind::NotAllowed => exit::DENIED,
+                _ => exit::ERROR,
+            };
+            Failure::new("spawn-refused", code, refusal.message)
         }
         RpcError::UnknownSession => {
             let mut steps = vec!["run `oximux ls` to list sessions".to_string()];

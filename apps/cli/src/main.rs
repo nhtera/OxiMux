@@ -28,13 +28,13 @@ mod update;
 use clap::Parser as _;
 
 use cli::{
-    Cli, Command, GitCommand, HeartbeatCommand, HostsCommand, ModeCommand, ModelCommand,
+    Cli, Command, DelegateCommand, GitCommand, HeartbeatCommand, HostsCommand, ModeCommand, ModelCommand,
     PermitCommand, ProjectsCommand, ScheduleCommand, StateCommand, TeamCommand, TeamReportStatus,
     TermCommand, WorktreeCommand, SimButtonArg, SimCommand,
 };
 use client::Client;
 use oximux_remote_proto::proto::{
-    CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
+    CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SPAWN_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
     SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_EXEC_MIN_VERSION, SIMULATOR_FLOW_MIN_VERSION, SIMULATOR_RN_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
@@ -349,6 +349,9 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         } => Some((SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, "sim button (Android)")),
         // v25: the iOS Simulator.
         Command::Sim { .. } => Some((SIMULATOR_MIN_VERSION, "sim")),
+        // v36: agent delegation.
+        Command::Delegate { .. } => Some((SPAWN_MIN_VERSION, "delegate")),
+        Command::Whoami => Some((SPAWN_MIN_VERSION, "whoami")),
         // v18: the automation surface.
         Command::Heartbeat { .. } => Some((18, "heartbeat")),
         Command::Team { .. } => Some((18, "team")),
@@ -718,6 +721,39 @@ fn host_verb(mut args: Cli) -> u8 {
                     TeamCommand::Status { run } => commands::team::status(&client, &run).await,
                     TeamCommand::Ls => commands::team::ls(&client).await,
                 },
+                Command::Delegate { command } => match command {
+                    DelegateCommand::Spawn {
+                        agent,
+                        model,
+                        posture,
+                        notify,
+                        allow_parent_permits,
+                        cwd,
+                        parent,
+                        request_id,
+                        prompt,
+                    } => {
+                        let args = commands::delegate::SpawnArgs {
+                            agent,
+                            model,
+                            posture,
+                            notify,
+                            allow_parent_permits,
+                            cwd,
+                            parent,
+                            request_id,
+                            prompt,
+                        };
+                        commands::delegate::spawn(&client, args).await
+                    }
+                    DelegateCommand::Children { of, recursive } => {
+                        commands::delegate::children(&client, of, recursive).await
+                    }
+                    DelegateCommand::Cancel { id, cascade } => {
+                        commands::delegate::cancel(&client, &id, cascade).await
+                    }
+                },
+                Command::Whoami => commands::delegate::whoami(&client).await,
                 Command::State { command } => match command {
                     StateCommand::Get { key } => commands::state::get(&client, &key).await,
                     StateCommand::Set { key, value, if_version } => {

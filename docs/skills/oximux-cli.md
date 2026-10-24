@@ -100,6 +100,25 @@ inline JSON). The agent is re-prompted with the validation errors up to twice;
 a still-invalid answer exits 1. It needs the turn, so it cannot be combined
 with `--bg`.
 
+## Starting helper agents
+
+From inside an agent, start a child with `delegate spawn`, not `run`: your
+credential reaches your own session and the agents you spawn, nothing else.
+
+```sh
+oximux whoami                                  # may you spawn, at what depth, which agents
+oximux delegate spawn --agent claude-code "review crates/agents for unwrap()s"
+oximux delegate spawn --agent codex --posture review --cwd worktree:review "…"
+oximux delegate children                       # your children and where each stands
+oximux delegate cancel <child> --cascade       # end one (and everything it spawned)
+```
+
+The host caps the tree (depth 1 by default, so a child cannot spawn its own;
+a few working children per parent; a lifetime budget). A refusal exits 1 or 5
+and says what to do instead — usually "wait on a child, cancel one, or do it
+yourself". `--request-id` makes a retry return the same child. A `review`
+child only reads; `verify` may build and test but not edit; neither prompts.
+
 ## Watching it finish
 
 ```sh

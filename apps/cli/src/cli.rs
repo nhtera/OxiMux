@@ -390,6 +390,20 @@ pub enum Command {
         #[command(subcommand)]
         command: TeamCommand,
     },
+    /// Start helper agents from inside an agent, and track them.
+    ///
+    /// The child joins your subtree: you can list, message and cancel it, and
+    /// its events come back to you. The host caps how deep and how wide a tree
+    /// may grow; a refusal says what to do instead. Run `oximux whoami` to see
+    /// whether you may spawn and which agents are installed.
+    #[command(verbatim_doc_comment)]
+    Delegate {
+        #[command(subcommand)]
+        command: DelegateCommand,
+    },
+    /// Who this caller is to the host: its scope, its session, and whether it
+    /// may spawn agents (and which).
+    Whoami,
     /// The shared coordination blackboard: versioned keys agents read and write.
     ///
     /// Use `--if-version` for anything two agents might write at once: the
@@ -1181,6 +1195,84 @@ pub enum HeartbeatCommand {
         /// The heartbeat id.
         id: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DelegateCommand {
+    /// Start a child agent with a prompt.
+    ///
+    /// Async: returns once the child has started and been given its prompt,
+    /// not when it is done. Its events reach you as it works; `children` shows
+    /// where each one stands.
+    #[command(verbatim_doc_comment)]
+    Spawn {
+        /// Which installed agent (`oximux whoami` lists them).
+        #[arg(long, value_name = "AGENT_ID")]
+        agent: String,
+        /// A model for it (fixed at start; default: the agent's own).
+        #[arg(long)]
+        model: Option<String>,
+        /// What the child may do: default, review (reads only), verify (may
+        /// build and test, no edits). Never more than you have yourself.
+        #[arg(long, value_enum, default_value_t = PostureArg::Default)]
+        posture: PostureArg,
+        /// Which of its events reach you: auto (all), stuck (failed, waiting
+        /// on someone), off.
+        #[arg(long, value_enum, default_value_t = NotifyArg::Auto)]
+        notify: NotifyArg,
+        /// Let yourself answer its permission prompts (Deny, or Allow
+        /// unchanged; never for commands or edits).
+        #[arg(long)]
+        allow_parent_permits: bool,
+        /// Where it works: `inherit` (your directory), `worktree` or
+        /// `worktree:NAME` (a fresh worktree), or a path inside yours.
+        #[arg(long, default_value = "inherit")]
+        cwd: String,
+        /// The parent session (operator only; an agent spawns under itself).
+        #[arg(long, value_name = "SESSION")]
+        parent: Option<String>,
+        /// An idempotency key: the same key returns the same child instead
+        /// of starting another (default: a fresh one each call).
+        #[arg(long, value_name = "ID")]
+        request_id: Option<String>,
+        /// The child's first message.
+        #[arg(required = true, num_args = 1.., value_name = "PROMPT")]
+        prompt: Vec<String>,
+    },
+    /// The agents you spawned and where each stands.
+    Children {
+        /// Whose children (default: your own session).
+        #[arg(long, value_name = "SESSION")]
+        of: Option<String>,
+        /// Include grandchildren.
+        #[arg(long)]
+        recursive: bool,
+    },
+    /// End a child (and with --cascade everything it spawned). Ends a
+    /// finished child without reopening it.
+    Cancel {
+        /// The child's session id (or, for the operator, `team:<run>`).
+        id: String,
+        /// Also end everything beneath it.
+        #[arg(long)]
+        cascade: bool,
+    },
+}
+
+/// `delegate spawn --posture`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostureArg {
+    Default,
+    Review,
+    Verify,
+}
+
+/// `delegate spawn --notify`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotifyArg {
+    Auto,
+    Stuck,
+    Off,
 }
 
 #[derive(Subcommand, Debug)]
