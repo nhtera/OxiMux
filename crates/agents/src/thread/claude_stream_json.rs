@@ -355,6 +355,9 @@ pub struct ClaudeStreamJsonConnection {
     /// is the truth: without an overlay the CLI applies the user's own
     /// `settings.json`, which the app cannot see any other way.
     fast_mode: Arc<AtomicBool>,
+    /// Replies the host waits on, and whether this session takes mid-turn
+    /// lines (`claude_control`). The reader thread holds the other clone.
+    controls: Arc<super::claude_control::Controls>,
     // Windows stand-in for the process group `claude` would otherwise be killed
     // through. `claude` runs tools as its own children — a `bash` tool can be
     // holding a build or a dev server — and `Child::kill` ends only `claude`
@@ -433,10 +436,16 @@ impl ClaudeStreamJsonConnection {
         let ring_out = ring.clone();
         let fast_mode = Arc::new(AtomicBool::new(false));
         let fast_mode_reader = fast_mode.clone();
+        let controls = Arc::new(super::claude_control::Controls::default());
+        let controls_reader = controls.clone();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let Ok(line) = line else { break }; // read error — treat as EOF
+                // A reply the host is waiting on goes to it, not the transcript.
+                if controls_reader.observe_line(&line) {
+                    continue;
+                }
                 // The init line says whether the CLI actually runs fast — from
                 // our overlay or from the user's settings.json. Recorded before
                 // the SessionInit event is forwarded, so the app's resync on
@@ -491,6 +500,7 @@ impl ClaudeStreamJsonConnection {
                 child: Mutex::new(child),
                 model: None,
                 fast_mode,
+                controls,
                 #[cfg(windows)]
                 job,
             },
@@ -506,6 +516,20 @@ impl ClaudeStreamJsonConnection {
     /// sent, and without one the report is the only source there is.
     pub fn seed_fast_mode(&self, on: bool) {
         self.fast_mode.store(on, Ordering::Relaxed);
+    }
+
+    /// Find out, off this thread, whether the installed CLI is new enough to
+    /// take mid-turn lines and say what became of each (`command_lifecycle`,
+    /// `cancel_async_message`). Until the answer lands the session queues
+    /// instead: a first `--version` can take seconds, and connecting runs on
+    /// the UI thread. The probe is cached by binary and mtime, so it is usually
+    /// the one the posture gate already ran.
+    pub fn probe_steer_support(&self) {
+        let controls = self.controls.clone();
+        thread::spawn(move || {
+            let version = super::agent_binary::cli_version(&crate::cli::program_for_spawn("claude"));
+            controls.set_version_ok(version.is_some_and(|v| v >= super::launch_posture::CLAUDE_MIN_ORCH));
+        });
     }
 
     /// The wire this session runs on: the one it was spawned with, else the
@@ -616,7 +640,44 @@ impl AgentConnection for ClaudeStreamJsonConnection {
     }
 
     fn send_user_message_tagged(&self, text: &str, images: &[ChatImage], uuid: &str) -> Result<()> {
-        self.write_line(&user_message_json_tagged(text, images, uuid))
+        self.write_line(&user_message_json_tagged(text, images, uuid))?;
+        self.controls.note_tagged_send();
+        Ok(())
+    }
+
+    /// A mid-turn line is an ordinary user line: the CLI queues it and folds
+    /// it in at the next tool boundary, or runs it as the next turn.
+    fn steer(&self, text: &str) -> Result<()> {
+        self.steer_tagged(text, &uuid::Uuid::new_v4().to_string())
+    }
+
+    fn steer_tagged(&self, text: &str, uuid: &str) -> Result<()> {
+        self.send_user_message_tagged(text, &[], uuid)
+    }
+
+    /// Take back what has not started, then interrupt (in that order: a line
+    /// still queued at the interrupt runs as the next turn).
+    fn stop_turn(&self, unstarted: &[String]) -> Result<Vec<String>> {
+        use super::claude_control::{REPLY_WITHIN, cancel_queued_request, interrupt_request, still_queued, was_dequeued};
+        let dequeue = |uuid: &str| {
+            let (id, request) = cancel_queued_request(uuid);
+            self.controls.request(&id, &request, REPLY_WITHIN, |line| self.write_line(line)).is_ok_and(|r| was_dequeued(&r))
+        };
+        let mut taken: Vec<String> = unstarted.iter().filter(|uuid| dequeue(uuid)).cloned().collect();
+        let (id, request) = interrupt_request();
+        let reply = self.controls.request(&id, &request, REPLY_WITHIN, |line| self.write_line(line));
+        for uuid in reply.map(|r| still_queued(&r)).unwrap_or_default() {
+            // Something will still run after the interrupt. If it is one of
+            // ours it slipped between the take-back and the interrupt; if not,
+            // the host never wrote it. Either way, take it back now.
+            if !unstarted.contains(&uuid) {
+                tracing::warn!(%uuid, "a line the host did not send was queued at a Stop");
+            }
+            if dequeue(&uuid) && unstarted.contains(&uuid) && !taken.contains(&uuid) {
+                taken.push(uuid);
+            }
+        }
+        Ok(taken)
     }
 
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
@@ -647,7 +708,9 @@ impl AgentConnection for ClaudeStreamJsonConnection {
             supports_config: true,  // reasoning effort via `--effort <level>`
             emits_usage: true,      // result + stream_event carry token/cost usage
             supports_rewind: true,  // keeps ~/.claude/projects/*.jsonl for truncate-fork
-            supports_steer: false,  // stdin mid-turn has no queue to land in
+            // The CLI queues a mid-turn line and reports it (from 2.1.310),
+            // unless this session failed its self-check.
+            supports_steer: self.controls.steer_available(),
         }
     }
 

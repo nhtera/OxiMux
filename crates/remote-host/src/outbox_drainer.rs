@@ -5,7 +5,8 @@
 //! a running turn, an armed retry or an open prompt holds them like any other
 //! send; the gate's owner writes the line when it may. Rows are settled from
 //! what comes back, never from the write itself:
-//! - the owner reports the write (`sent`), or its failure (the batch backs off);
+//! - the owner reports the write (`sent`), or its failure (the batch backs off),
+//!   or a line it took back at a Stop (pending again, held for the user);
 //! - the CLI's receipt says it started on the line (`accepted`) and which turn
 //!   carried it (`delivered`);
 //! - no receipt within [`ACCEPT_WITHIN`] of the write: `unconfirmed`, shown and
@@ -18,7 +19,7 @@
 //! deliver; its rows wait for the next time it binds.
 
 use std::collections::HashMap;
-use std::sync::Weak;
+use std::sync::{Mutex, Weak};
 use std::time::Duration;
 
 use oximux_agents::envelope;
@@ -26,6 +27,7 @@ use oximux_agents::lineage::LineageState;
 use oximux_agents::send_gate::{DeliveryMode, SendGate, SendSource};
 use oximux_agents::session_registry::SessionHandle;
 use oximux_agents::thread::ThreadEvent;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -100,6 +102,7 @@ pub(crate) async fn run(core: Weak<HostCore>, tx: mpsc::UnboundedSender<DrainMsg
             false
         });
         unlink_gone(&core, &mut links);
+        link_in_flight(&core, &tx, &mut links);
         if due.is_some_and(|d| d <= now) || wake_at <= now {
             due = None;
             drain(&core, &tx, &mut links);
@@ -121,7 +124,12 @@ fn handle(core: &HostCore, msg: DrainMsg, awaiting: &mut HashMap<Uuid, Instant>,
                 awaiting.insert(uuid, Instant::now() + ACCEPT_WITHIN);
             }
         }),
-        DrainMsg::Sent { uuid, ok: false } => outbox.release_with_backoff(uuid, now),
+        // Not written (backs off, same key), or written and then taken back
+        // at a Stop before the agent started on it (pending again, new key).
+        DrainMsg::Sent { uuid, ok: false } => {
+            awaiting.remove(&uuid);
+            outbox.release_with_backoff(uuid, now).and_then(|()| outbox.unclaim(uuid).map(drop))
+        }
         DrainMsg::Receipt(ThreadEvent::UserMessageAccepted { uuid }) => match Uuid::parse_str(&uuid) {
             Ok(uuid) => {
                 awaiting.remove(&uuid);
@@ -157,42 +165,70 @@ fn unlink_gone(core: &HostCore, links: &mut HashMap<String, Link>) {
 }
 
 /// Hear what becomes of what is queued in `parent`'s gate: the owner's write
-/// reports and the CLI's receipts. Done before anything is queued there, so
-/// no batch is ever in a gate the drainer is not listening to.
+/// reports and the CLI's receipts. Done before anything is queued there, and
+/// again for any parent with a batch in flight (a rekey moves a held batch to
+/// a new session handle), so no batch is in a gate nobody listens to.
 fn link(
     core: &HostCore,
     tx: &mpsc::UnboundedSender<DrainMsg>,
     links: &mut HashMap<String, Link>,
     parent: &str,
     handle: &SessionHandle,
-    gate: &mut SendGate,
+    gate: &Mutex<SendGate>,
 ) {
     if links.get(parent).is_some_and(|l| l.incarnation == handle.incarnation()) {
         return;
     }
     let sent = tx.clone();
-    gate.set_sent_hook(move |uuid, ok| {
+    gate.lock().unwrap().set_sent_hook(move |uuid, ok| {
         let _ = sent.send(DrainMsg::Sent { uuid, ok });
     });
     let mut receipts = handle.subscribe_receipts();
     let forward = tx.clone();
     let task = core.runtime().spawn(async move {
-        while let Ok(receipt) = receipts.recv().await {
-            if forward.send(DrainMsg::Receipt(receipt)).is_err() {
-                return;
+        loop {
+            match receipts.recv().await {
+                Ok(receipt) => {
+                    if forward.send(DrainMsg::Receipt(receipt)).is_err() {
+                        return;
+                    }
+                }
+                // Missed some: the 30 s window and late proof cover them.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
             }
         }
     });
     links.insert(parent.to_string(), Link { incarnation: handle.incarnation().to_string(), receipts: task.abort_handle() });
 }
 
-/// Move every parent's pending rows into its gate, one batch per parent.
+/// Listen to every registered parent with a batch in its gate or on the wire.
+fn link_in_flight(core: &HostCore, tx: &mpsc::UnboundedSender<DrainMsg>, links: &mut HashMap<String, Link>) {
+    let parents = match core.outbox().parents_in_flight() {
+        Ok(parents) => parents,
+        Err(err) => {
+            tracing::warn!(%err, "outbox: read failed");
+            return;
+        }
+    };
+    for parent in parents {
+        if let Some(handle) = core.registry().get(&parent)
+            && let Some(gate) = handle.gate()
+        {
+            link(core, tx, links, &parent, &handle, &gate);
+        }
+    }
+}
+
+/// Move every parent's due rows into its gate, one batch per parent. The
+/// gate's lock is never held across a database write: the UI takes it on
+/// every repaint.
 fn drain(core: &HostCore, tx: &mpsc::UnboundedSender<DrainMsg>, links: &mut HashMap<String, Link>) {
     if !core.is_owner() {
         return;
     }
     let outbox = core.outbox();
-    let parents = match outbox.parents_with_pending() {
+    let parents = match outbox.parents_with_pending(chrono::Local::now()) {
         Ok(parents) => parents,
         Err(err) => {
             tracing::warn!(%err, "outbox: read failed");
@@ -209,19 +245,24 @@ fn drain(core: &HostCore, tx: &mpsc::UnboundedSender<DrainMsg>, links: &mut Hash
         }
         let Some(handle) = core.registry().get(&parent) else { continue };
         let Some(gate) = handle.gate() else { continue };
-        let mut gate = gate.lock().unwrap();
-        if !gate.has_waker() {
-            continue;
-        }
-        link(core, tx, links, &parent, &handle, &mut gate);
         // A batch still waiting in the gate goes out again with the new rows.
-        let held: Vec<(u64, Uuid)> = gate
-            .queued()
-            .filter(|q| q.source == SendSource::ParentEvent)
-            .map(|q| (q.id, q.uuid))
-            .collect();
-        for (id, uuid) in held {
-            gate.remove(id);
+        let held: Vec<Uuid> = {
+            let mut gate = gate.lock().unwrap();
+            if !gate.has_waker() {
+                continue;
+            }
+            let held: Vec<(u64, Uuid)> = gate
+                .queued()
+                .filter(|q| q.source == SendSource::ParentEvent)
+                .map(|q| (q.id, q.uuid))
+                .collect();
+            held.into_iter().map(|(id, uuid)| {
+                gate.remove(id);
+                uuid
+            }).collect()
+        };
+        link(core, tx, links, &parent, &handle, &gate);
+        for uuid in held {
             if let Err(err) = outbox.unclaim(uuid) {
                 tracing::warn!(%err, "outbox: taking a held batch back failed");
             }
@@ -234,6 +275,7 @@ fn drain(core: &HostCore, tx: &mpsc::UnboundedSender<DrainMsg>, links: &mut Hash
                 continue;
             }
         };
-        gate.push(envelope::render(&batch.events()), Vec::new(), SendSource::ParentEvent, mode, Some(batch.key));
+        let text = envelope::render(&batch.events());
+        gate.lock().unwrap().push(text, Vec::new(), SendSource::ParentEvent, mode, Some(batch.key));
     }
 }

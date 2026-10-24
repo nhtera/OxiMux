@@ -1933,7 +1933,8 @@ impl AgentChatView {
         if text.is_empty() && images.is_empty() {
             return;
         }
-        let text = oximux_agents::envelope::neutralize_forged(&text).into_owned();
+        // A gate item was neutralized when it was queued (a host event never is).
+        let text = if self.pending_send_uuid.is_some() { text } else { oximux_agents::envelope::neutralize_forged(&text).into_owned() };
         // The user is driving again: drop any armed retry and reset the attempt
         // count. The cap is per turn, so a conversation that hits a limit once
         // an hour must not eventually lock itself out.
@@ -1942,7 +1943,7 @@ impl AgentChatView {
         // agent input — reset in place rather than transmitting the literal text
         // to the subprocess (matching the CLI's own TUI). `/compact` stays a
         // pass-through; real compaction is a backend concern.
-        if images.is_empty() && text.trim() == "/clear" {
+        if images.is_empty() && text.trim() == "/clear" && self.pending_send_uuid.is_none() {
             self.new_chat(cx);
             return;
         }
@@ -2139,9 +2140,7 @@ impl AgentChatView {
         if !self.thread.turn_active {
             return; // nothing is streaming
         }
-        if let Some(conn) = &self.connection {
-            let _ = conn.cancel();
-        }
+        self.interrupt_turn(cx);
         self.interrupted = true;
         self.thread.interrupt();
         self.sync_composer(cx);
@@ -2906,6 +2905,7 @@ impl AgentChatView {
                 binding.ingest(ev.clone());
             }
             self.guard_spawn_posture(&ev);
+            self.note_receipt(&ev);
             self.apply_event(ev, cx);
         }
         // A fresh chat is registered under a placeholder id until the agent mints

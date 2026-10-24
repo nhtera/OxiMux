@@ -498,22 +498,24 @@ impl SessionHandle {
     /// optimistic-echo correlation the view/phone use to dedup the arriving stream
     /// copy against their local echo (threaded through once the surfaces echo).
     pub fn send_prompt(&self, text: &str, images: &[ChatImage]) -> Result<()> {
+        self.send_prompt_from(text, images, crate::send_gate::SendSource::Remote)
+    }
+
+    /// [`Self::send_prompt`] for a sender other than a phone (another agent's
+    /// `send_agent`), which a Stop holds.
+    pub fn send_prompt_from(&self, text: &str, images: &[ChatImage], source: crate::send_gate::SendSource) -> Result<()> {
         // A driver with a send gate takes it from here: the prompt waits behind
         // a running turn, a Stop or an open prompt like a typed one would, and
         // the driver writes it (and shows it) when it may.
         if let Some(gate) = self.gate() {
             let mut gate = gate.lock().unwrap();
             if gate.has_waker() {
-                gate.push(
-                    text.to_string(),
-                    images.to_vec(),
-                    crate::send_gate::SendSource::Remote,
-                    crate::send_gate::DeliveryMode::Queue,
-                    None,
-                );
+                gate.push(text.to_string(), images.to_vec(), source, crate::send_gate::DeliveryMode::Queue, None);
                 return Ok(());
             }
         }
+        // Written directly: text that only looks like a host event is text.
+        let text = &*crate::envelope::neutralize_forged(text);
         // Held across the write and both records: a reply produced by this write
         // cannot be folded until the user's bubble has been. See `prompt_order`.
         let _order = self.prompt_order.lock().unwrap();
@@ -542,7 +544,7 @@ impl SessionHandle {
     /// Redirect the agent mid-turn (backends that support it); no-op default
     /// otherwise. Same transport as the desktop composer's steer.
     pub fn steer(&self, text: &str) -> Result<()> {
-        self.conn().steer(text)
+        self.conn().steer(&crate::envelope::neutralize_forged(text))
     }
 
     /// Run `f` — the handoff of one backend event towards whatever folds it — with

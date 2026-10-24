@@ -122,7 +122,7 @@ impl AgentChatView {
             binding.unregister(&self.remote_session_id);
         }
         // Nobody drains the gate now; a later bind arms it again.
-        self.send_gate.lock().unwrap().clear_waker();
+        self.release_gate_events();
     }
 
     /// Push this tab's title + effective model into the registry so a remote

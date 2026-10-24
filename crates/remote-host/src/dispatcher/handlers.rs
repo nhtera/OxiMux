@@ -208,7 +208,14 @@ impl Dispatcher {
     }
 
     pub(super) fn send_prompt(&self, peer: &Peer, req: SendPromptReq) -> Response {
-        self.scoped(peer, &req.session_id, |h| h.send_prompt(&req.text, &req.images))
+        // Another agent's message (its own session credential) does not resume
+        // a session the user stopped; a phone's does.
+        let source = if peer.own_session().is_some() {
+            oximux_agents::send_gate::SendSource::Agent
+        } else {
+            oximux_agents::send_gate::SendSource::Remote
+        };
+        self.scoped(peer, &req.session_id, |h| h.send_prompt_from(&req.text, &req.images, source))
     }
 
     pub(super) fn resolve_permission(&self, peer: &Peer, req: ResolvePermissionReq) -> Response {

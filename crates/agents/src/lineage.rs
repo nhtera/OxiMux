@@ -588,10 +588,16 @@ impl LineageStore {
         tx.execute("UPDATE agent_lineage SET parent_id = ?2 WHERE parent_id = ?1", params![old, new])?;
         tx.execute("UPDATE agent_lineage SET root_id = ?2 WHERE root_id = ?1", params![old, new])?;
         tx.execute(
-            "UPDATE agent_event_outbox SET parent_session = ?2 WHERE parent_session = ?1",
+            "UPDATE OR REPLACE agent_event_outbox SET parent_session = ?2 WHERE parent_session = ?1",
             params![old, new],
         )?;
-        tx.execute("UPDATE agent_event_outbox SET child = ?2 WHERE child = ?1", params![old, new])?;
+        // The payload names the child too (the envelope shows it). `OR REPLACE`:
+        // the same edge recorded under both ids is one event.
+        tx.execute(
+            "UPDATE OR REPLACE agent_event_outbox SET child = ?2, payload = json_set(payload, '$.child', ?2) \
+             WHERE child = ?1",
+            params![old, new],
+        )?;
         tx.execute(
             "UPDATE OR REPLACE agent_spawn_failures SET parent_id = ?2 WHERE parent_id = ?1",
             params![old, new],

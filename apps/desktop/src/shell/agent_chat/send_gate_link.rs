@@ -14,8 +14,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use gpui::Context;
-use oximux_agents::send_gate::{Holds, SendGate, SendSource};
+use gpui::{AppContext as _, Context};
+use oximux_agents::send_gate::{Holds, Ready, SendGate, SendSource};
+use oximux_agents::thread::ThreadEntry;
 use oximux_agents::thread::{ChatImage, ThreadEvent};
 use uuid::Uuid;
 
@@ -28,6 +29,18 @@ impl AgentChatView {
     /// A chat's gate; its waker is armed each time the chat binds.
     pub(super) fn new_send_gate() -> Arc<Mutex<SendGate>> {
         Arc::new(Mutex::new(SendGate::new()))
+    }
+
+    /// The chat let go of its session: child events still waiting here go
+    /// back to the host (which hands them out again, under a new id, when the
+    /// chat binds again), so a batch can never be written twice.
+    pub(super) fn release_gate_events(&self) {
+        let mut gate = self.send_gate.lock().unwrap();
+        gate.clear_waker();
+        let events: Vec<u64> = gate.queued().filter(|q| q.source == SendSource::ParentEvent).map(|q| q.id).collect();
+        for id in events {
+            gate.remove(id);
+        }
     }
 
     /// Point the gate's waker at a fresh channel for the relay task to read.
@@ -47,26 +60,99 @@ impl AgentChatView {
             disconnected: self.disconnected || self.unbound || self.auth.is_some() || self.connection.is_none(),
             retry_armed: self.retry.is_armed(),
             prompt_pending: self.thread.pending_permission().is_some() || self.thread.pending_question().is_some(),
+            // The agent has answered something since the prompt.
+            turn_started: !matches!(self.thread.entries.last(), Some(ThreadEntry::User { .. }) | None),
+            steer_supported: self.connection.as_ref().is_some_and(|c| c.capabilities().supports_steer),
         });
+    }
+
+    /// The agent started on (or finished) lines this chat wrote: a Stop no
+    /// longer needs to take them back.
+    pub(super) fn note_receipt(&self, event: &ThreadEvent) {
+        let mut gate = self.send_gate.lock().unwrap();
+        match event {
+            ThreadEvent::UserMessageAccepted { uuid } => gate.note_accepted(uuid),
+            ThreadEvent::UserMessagesDelivered { uuids } => uuids.iter().for_each(|u| gate.note_accepted(u)),
+            _ => {}
+        }
+    }
+
+    /// The Stop button: take back the child events written into this turn that
+    /// the agent has not started on, then interrupt, so none of them starts a
+    /// turn after the Stop. Off the UI thread (each reply is awaited briefly);
+    /// what was taken back returns to the host, held until the user's next
+    /// message. With nothing to take back this is the plain interrupt.
+    pub(super) fn interrupt_turn(&mut self, cx: &mut Context<Self>) {
+        // Held until the user's next message, across any respawn in between.
+        self.send_gate.lock().unwrap().stop_by_user();
+        let Some(conn) = self.connection.clone() else { return };
+        let unstarted: Vec<String> =
+            self.send_gate.lock().unwrap().take_unstarted().iter().map(Uuid::to_string).collect();
+        if unstarted.is_empty() {
+            let _ = conn.cancel();
+            return;
+        }
+        let gate = self.send_gate.clone();
+        cx.background_spawn(async move {
+            match conn.stop_turn(&unstarted) {
+                Ok(taken) => {
+                    let gate = gate.lock().unwrap();
+                    for uuid in taken.iter().filter_map(|u| Uuid::parse_str(u).ok()) {
+                        gate.report_sent(uuid, false);
+                    }
+                }
+                Err(err) => tracing::warn!(%err, "stopping the turn failed"),
+            }
+        })
+        .detach();
     }
 
     /// Send the next item the gate lets go, if any. One per turn: the send
     /// starts a turn, which closes the gate until it ends.
     pub(super) fn flush_send_gate(&mut self, cx: &mut Context<Self>) {
+        if self.send_gate.lock().unwrap().ready() == Ready::Steer {
+            self.steer_from_gate(cx);
+            return;
+        }
         let Some(item) = self.send_gate.lock().unwrap().take_next_if_open() else { return };
-        if item.source == SendSource::Remote {
-            // Nobody is at this screen for a turn a phone started.
+        if item.source.is_remote() {
+            // Nobody is at this screen for a turn a phone, another agent or
+            // child events started (their text may be a child's output).
             self.screen_control.begin_remote_turn();
         }
         // Only a prompt typed here names the tab: a spawned child keeps its
         // `↳` label, and a chat a phone started keeps the name it was given.
         self.title_generated = true;
         self.pending_send_uuid = Some(item.uuid);
+        let kept = item.clone();
         self.send_text(item.text, item.images, cx);
-        // A send that stopped before writing (nothing to send to) gives the
-        // item back to whoever queued it.
-        if let Some(uuid) = self.pending_send_uuid.take() {
-            self.send_gate.lock().unwrap().report_sent(uuid, false);
+        // A send that stopped before writing (nothing to send to right now)
+        // puts the item back first in line, so a phone's prompt is never lost
+        // after its sender was told it was taken.
+        if self.pending_send_uuid.take().is_some() {
+            self.send_gate.lock().unwrap().requeue_front(kept);
+        }
+    }
+
+    /// Write the gate's steerable item (child events) into the running turn.
+    /// The agent folds it in at its next tool boundary, or runs it next.
+    fn steer_from_gate(&mut self, cx: &mut Context<Self>) {
+        let (Some(conn), Some(item)) = (self.connection.clone(), self.send_gate.lock().unwrap().take_steerable())
+        else {
+            return;
+        };
+        // Child output goes into this turn: treat it as one nobody watches.
+        self.screen_control.begin_remote_turn();
+        let sent = conn.steer_tagged(&item.text, &item.uuid.to_string());
+        let mut gate = self.send_gate.lock().unwrap();
+        gate.report_sent(item.uuid, sent.is_ok());
+        if sent.is_ok() {
+            gate.note_steered(item.uuid);
+            drop(gate);
+            // Shown where the agent takes it in, like a steer typed here.
+            self.thread.push_user_message(&item.text);
+            self.follow_bottom();
+            cx.notify();
         }
     }
 
@@ -74,7 +160,12 @@ impl AgentChatView {
     /// events the gate held after a Stop go first, in the same line, under
     /// their batch's id (so their receipts settle them).
     pub(super) fn write_prompt(&mut self, text: &str, images: &[ChatImage]) -> anyhow::Result<()> {
-        let held = self.send_gate.lock().unwrap().take_held_events().into_iter().next();
+        // Only after a Stop: events that merely waited for a busy turn go on
+        // their own when it ends.
+        let held = {
+            let mut gate = self.send_gate.lock().unwrap();
+            if gate.stopped_by_user() { gate.take_held_events().into_iter().next() } else { None }
+        };
         let (line, uuid) = match held {
             Some(events) => {
                 if let Some(own) = self.pending_send_uuid.take() {

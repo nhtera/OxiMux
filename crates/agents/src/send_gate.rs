@@ -67,11 +67,26 @@ pub enum DeliveryMode {
 pub enum SendSource {
     /// The user at this desk.
     User,
-    /// A remote client (a phone) or an agent's `send_agent`: nobody is at the
-    /// screen this session drives.
+    /// A remote client (a phone): nobody is at the screen this session
+    /// drives.
     Remote,
+    /// Another agent (`send_agent`): like a phone, and like child events it
+    /// never resumes a session the user stopped.
+    Agent,
     /// A batch of child events for this parent (an outbox delivery).
     ParentEvent,
+}
+
+impl SendSource {
+    /// Waits while the user has the session stopped: only a person resumes it.
+    pub fn held_by_stop(self) -> bool {
+        matches!(self, SendSource::ParentEvent | SendSource::Agent)
+    }
+
+    /// Started by someone not at this screen (a phone, an agent, child events).
+    pub fn is_remote(self) -> bool {
+        self != SendSource::User
+    }
 }
 
 /// What holds a session's sends, as its driver sees it. Mirrored into the
@@ -88,6 +103,10 @@ pub struct Holds {
     pub retry_armed: bool,
     /// A permission or question prompt waits for an answer.
     pub prompt_pending: bool,
+    /// The running turn has produced something (a mid-turn line may go in).
+    pub turn_started: bool,
+    /// The agent takes mid-turn lines and reports them.
+    pub steer_supported: bool,
 }
 
 /// One queued message, in the form it is written to the CLI.
@@ -142,6 +161,9 @@ pub struct SendGate {
     steer_supported: bool,
     /// Who started the running turn.
     turn_source: Option<SendSource>,
+    /// Lines written into a running turn that the agent has not started on
+    /// yet: a Stop takes these back before it interrupts.
+    unstarted: Vec<Uuid>,
 }
 
 impl std::fmt::Debug for SendGate {
@@ -229,7 +251,7 @@ impl SendGate {
 
     /// Why `item` is waiting (or [`SendWait::None`]).
     pub fn wait_of(&self, item: &QueuedSend) -> SendWait {
-        if item.source == SendSource::ParentEvent && self.stopped() {
+        if item.source.held_by_stop() && self.stopped() {
             return SendWait::StoppedByUser;
         }
         if self.disconnected {
@@ -280,7 +302,13 @@ impl SendGate {
         if !self.open() {
             return None;
         }
-        self.queue.iter().position(|q| q.source != SendSource::ParentEvent || !self.stopped())
+        self.queue.iter().position(|q| !q.source.held_by_stop() || !self.stopped())
+    }
+
+    /// Put an item the owner took but could not send back at the front, as it
+    /// was. No wake: whatever stopped the send still holds.
+    pub fn requeue_front(&mut self, item: QueuedSend) {
+        self.queue.push_front(item);
     }
 
     /// The oldest item that may start a turn now. The caller sends it at once
@@ -310,6 +338,22 @@ impl SendGate {
         }
         let at = self.queue.iter().position(|q| q.mode == DeliveryMode::Steer)?;
         self.queue.remove(at)
+    }
+
+    /// A steered line went into the running turn: until the agent starts on
+    /// it, a Stop must take it back.
+    pub fn note_steered(&mut self, uuid: Uuid) {
+        self.unstarted.push(uuid);
+    }
+
+    /// The agent started on the line sent under `uuid`.
+    pub fn note_accepted(&mut self, uuid: &str) {
+        self.unstarted.retain(|u| u.to_string() != uuid);
+    }
+
+    /// Steered lines the agent has not started on; cleared (a Stop takes them).
+    pub fn take_unstarted(&mut self) -> Vec<Uuid> {
+        std::mem::take(&mut self.unstarted)
     }
 
     /// The user's Send now on a queued item: steer it if possible. `None`
@@ -345,6 +389,8 @@ impl SendGate {
             self.turn_source = None;
         }
         self.turn_active = holds.turn_active;
+        self.turn_started = holds.turn_active && holds.turn_started;
+        self.steer_supported = holds.steer_supported;
         self.interrupted = holds.interrupted;
         self.disconnected = holds.disconnected;
         self.retry_armed = holds.retry_armed;

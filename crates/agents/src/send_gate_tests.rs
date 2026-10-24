@@ -240,3 +240,53 @@ fn a_stop_holds_only_child_events() {
         assert_eq!(gate.queued().count(), 1, "the event is still held");
     }
 }
+
+#[test]
+fn mirrored_holds_carry_the_steer_state() {
+    let mut gate = SendGate::new();
+    let running = Holds { turn_active: true, turn_started: true, steer_supported: true, ..Holds::default() };
+    gate.set_holds(running);
+    assert!(gate.steer_available());
+    gate.set_holds(Holds { turn_started: false, ..running });
+    assert!(!gate.steer_available(), "the turn has not said it started");
+    gate.set_holds(Holds { steer_supported: false, ..running });
+    assert!(!gate.steer_available());
+    // An ended turn has not started.
+    gate.set_holds(Holds { turn_active: false, ..running });
+    assert!(!gate.steer_available());
+}
+
+#[test]
+fn a_stop_takes_back_only_what_was_not_started() {
+    let mut gate = SendGate::new();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    gate.note_steered(a);
+    gate.note_steered(b);
+    gate.note_accepted(&a.to_string());
+    assert_eq!(gate.take_unstarted(), [b]);
+    assert!(gate.take_unstarted().is_empty());
+}
+
+/// Another agent's message waits after a Stop like child events: only a
+/// person resumes a stopped session.
+#[test]
+fn an_agents_message_does_not_resume_a_stopped_session() {
+    let mut gate = SendGate::new();
+    gate.stop_by_user();
+    gate.push("from another agent".into(), vec![], SendSource::Agent, DeliveryMode::Queue, None);
+    assert!(gate.take_next_if_open().is_none());
+    assert_eq!(gate.wait_of(gate.queued().next().unwrap()), SendWait::StoppedByUser);
+    gate.clear_stop();
+    assert_eq!(gate.take_next_if_open().unwrap().source, SendSource::Agent);
+}
+
+#[test]
+fn an_item_put_back_goes_first() {
+    let mut gate = SendGate::new();
+    user(&mut gate, "a");
+    user(&mut gate, "b");
+    let a = gate.take_next_if_open().unwrap();
+    gate.on_turn_end();
+    gate.requeue_front(a);
+    assert_eq!(gate.take_next_if_open().unwrap().text, "a");
+}

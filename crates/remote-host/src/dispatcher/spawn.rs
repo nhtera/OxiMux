@@ -368,7 +368,7 @@ impl LaunchJob {
             return Response::Error(RpcError::Internal("the spawn could not be recorded".into()));
         }
         let delivered = self.registry.get(&session_id).is_some_and(|h| {
-            let sent = h.send_prompt(&self.req.prompt, &[]).is_ok();
+            let sent = h.send_prompt_from(&self.req.prompt, &[], oximux_agents::send_gate::SendSource::Agent).is_ok();
             // Working from this moment, not from the child's first event:
             // until it says so itself, an idle reading would let a burst of
             // spawns past the active caps.

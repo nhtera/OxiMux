@@ -15,6 +15,7 @@
 pub(crate) mod agent_binary;
 pub mod acp;
 pub mod claude_catalog;
+mod claude_control;
 pub mod claude_stream_json;
 pub mod codex;
 pub mod codex_session_import;

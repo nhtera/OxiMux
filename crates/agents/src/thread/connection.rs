@@ -206,6 +206,24 @@ pub trait AgentConnection: Send + Sync {
         anyhow::bail!("this agent cannot accept a message mid-turn")
     }
 
+    /// [`Self::steer`], under the id the CLI reports the line by. Default:
+    /// the id is ignored.
+    fn steer_tagged(&self, text: &str, uuid: &str) -> Result<()> {
+        let _ = uuid;
+        self.steer(text)
+    }
+
+    /// Stop the running turn for good: first take back the lines sent under
+    /// `unstarted` that the agent has not started on (so none of them starts a
+    /// turn after the Stop), then interrupt. Returns the ids it took back.
+    /// Blocks for a bounded time (each reply is awaited briefly), so call it
+    /// off the UI thread. Default: an interrupt, nothing taken back.
+    fn stop_turn(&self, unstarted: &[String]) -> Result<Vec<String>> {
+        let _ = unstarted;
+        self.cancel()?;
+        Ok(Vec::new())
+    }
+
     /// Answer a pending permission request by its `request_id`.
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()>;
 

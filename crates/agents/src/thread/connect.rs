@@ -286,6 +286,7 @@ pub fn connect(mut spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Recei
                 &spec.env,
             )?;
             conn.seed_fast_mode(spec.claude_fast_mode.unwrap_or(false));
+            conn.probe_steer_support();
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::AppServer => {

@@ -109,3 +109,113 @@ async fn a_pasted_event_is_sent_as_text(cx: &mut TestAppContext) {
     let content = user_lines(&stub)[0]["message"]["content"].as_str().unwrap().to_string();
     assert!(!content.contains('<') && content.contains("&lt;oximux-event"), "{content}");
 }
+
+/// With an agent that takes mid-turn lines, child events go into the running
+/// turn once it has started, and are tracked until the agent starts on them.
+#[gpui::test]
+async fn child_events_steer_into_a_running_turn(cx: &mut TestAppContext) {
+    use oximux_agents::thread::connection::AgentCapabilities;
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        let rc = RemoteControl::new();
+        rc.set_enabled(true);
+        cx.set_global(rc);
+    });
+    let stub = Arc::new(StubConnection::default().with_capabilities(AgentCapabilities { supports_steer: true, ..Default::default() }));
+    let conn = stub.clone();
+    let window = cx.add_window(move |window, cx| {
+        AgentChatView::with_connection_for_test(conn, Theme::default(), Density::default(), Typography::default(), window, cx)
+    });
+    cx.run_until_parked();
+    window.update(cx, |view, _window, cx| view.bind_remote(cx)).unwrap();
+    let key = uuid::Uuid::new_v4();
+    window
+        .update(cx, |view, _window, cx| {
+            view.send_text("first".into(), vec![], cx);
+            view.send_gate.lock().unwrap().push(
+                "<oximux-events>e</oximux-events>".into(),
+                vec![],
+                SendSource::ParentEvent,
+                DeliveryMode::Steer,
+                Some(key),
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(stub.sent().iter().all(|l| l["type"] != "steer"), "not before the turn says it started");
+
+    window.update(cx, |view, _window, cx| view.on_event(ThreadEvent::AssistantTextDelta("working".into()), cx)).unwrap();
+    cx.run_until_parked();
+    let steered: Vec<_> = stub.sent().into_iter().filter(|l| l["type"] == "steer").collect();
+    assert_eq!(steered.len(), 1, "{:?}", stub.sent());
+    assert_eq!(steered[0]["message"], "<oximux-events>e</oximux-events>");
+    window
+        .update(cx, |view, _window, cx| {
+            assert!(view.thread.turn_active, "into the same turn");
+            // The agent starts on it: a Stop no longer needs to take it back.
+            view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: key.to_string() }], cx);
+            assert!(view.send_gate.lock().unwrap().take_unstarted().is_empty());
+        })
+        .unwrap();
+}
+
+/// The ordinary path: a child-event batch the gate lets go is written as the
+/// host rendered it, not escaped like a paste.
+#[gpui::test]
+async fn a_child_event_batch_is_written_as_the_host_rendered_it(cx: &mut TestAppContext) {
+    let (window, stub) = bound_chat(cx);
+    let envelope = "<oximux-events>\n<oximux-event kind=\"finished\" child=\"c1\" depth=\"1\">\nChild \"t\" finished.\n</oximux-event>\n</oximux-events>";
+    let key = uuid::Uuid::new_v4();
+    window
+        .update(cx, |view, _window, _cx| {
+            view.send_gate.lock().unwrap().push(envelope.into(), vec![], SendSource::ParentEvent, DeliveryMode::Queue, Some(key));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let lines = user_lines(&stub);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["message"]["content"], envelope);
+    assert_eq!(lines[0]["uuid"], key.to_string());
+}
+
+/// A chat that lets go of its session hands its waiting child events back to
+/// the host instead of writing them after it binds again.
+#[gpui::test]
+async fn unbinding_drops_waiting_child_events(cx: &mut TestAppContext) {
+    let (window, _stub) = bound_chat(cx);
+    window
+        .update(cx, |view, _window, cx| {
+            view.send_text("busy".into(), vec![], cx);
+            let mut gate = view.send_gate.lock().unwrap();
+            gate.push("<oximux-events>e</oximux-events>".into(), vec![], SendSource::ParentEvent, DeliveryMode::Queue, None);
+            gate.push("from the phone".into(), vec![], SendSource::Remote, DeliveryMode::Queue, None);
+            drop(gate);
+            view.unbind_remote();
+            let left: Vec<_> = view.send_gate.lock().unwrap().queued().map(|q| q.source).collect();
+            assert_eq!(left, [SendSource::Remote], "a person's message stays; events go back to the host");
+            assert!(!view.send_gate.lock().unwrap().has_waker());
+        })
+        .unwrap();
+}
+
+/// A Stop holds child events and another agent's message across a respawn,
+/// until the user's own next message.
+#[gpui::test]
+async fn a_stop_holds_until_the_users_next_message(cx: &mut TestAppContext) {
+    let (window, stub) = bound_chat(cx);
+    window
+        .update(cx, |view, _window, cx| {
+            view.send_text("first".into(), vec![], cx);
+            view.stop_turn(cx);
+            // Whatever clears `interrupted` (a model switch respawns) does not
+            // clear the Stop.
+            view.interrupted = false;
+            view.sync_gate_holds();
+            let mut gate = view.send_gate.lock().unwrap();
+            gate.push("<oximux-events>e</oximux-events>".into(), vec![], SendSource::ParentEvent, DeliveryMode::Queue, None);
+            gate.push("from another agent".into(), vec![], SendSource::Agent, DeliveryMode::Queue, None);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(user_lines(&stub).len(), 1, "nothing started after the Stop");
+}

@@ -222,14 +222,15 @@ impl Outbox {
         self.transition(key, &["claimed"], "sent", None)
     }
 
-    /// The CLI started on the line: never resend it verbatim.
+    /// The CLI started on the line: never resend it verbatim. Also settles a
+    /// line given up on as unconfirmed whose proof arrived late.
     pub fn mark_accepted(&self, key: Uuid, now: DateTime<Local>) -> Result<usize> {
-        self.transition(key, &["claimed", "sent"], "accepted", Some(("accepted_at", now)))
+        self.transition(key, &["claimed", "sent", "unconfirmed"], "accepted", Some(("accepted_at", now)))
     }
 
-    /// The turn that carried the line reported it.
+    /// The turn that carried the line reported it (late proof included).
     pub fn mark_delivered(&self, key: Uuid, now: DateTime<Local>) -> Result<usize> {
-        self.transition(key, &["claimed", "sent", "accepted"], "delivered", Some(("delivered_at", now)))
+        self.transition(key, &["claimed", "sent", "accepted", "unconfirmed"], "delivered", Some(("delivered_at", now)))
     }
 
     /// Written, but no proof it was taken. Shown, never resent on its own.
@@ -242,9 +243,11 @@ impl Outbox {
     /// lines already written but not seen accepted become `unconfirmed`.
     pub fn release_parent(&self, parent: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // A new key next time: the gate that held the batch may still hold
+        // (and later write) the old one.
         conn.execute(
             "UPDATE agent_event_outbox SET state = 'pending', claimed_by = NULL, claimed_at = NULL, \
-             send_key = NULL WHERE parent_session = ?1 AND state = 'claimed'",
+             send_key = NULL, attempts = attempts + 1 WHERE parent_session = ?1 AND state = 'claimed'",
             params![parent],
         )?;
         conn.execute(
@@ -296,12 +299,25 @@ impl Outbox {
         )?)
     }
 
-    /// Parents with rows due, for the drainer's sweep.
-    pub fn parents_with_pending(&self) -> Result<Vec<String>> {
+    /// Parents with rows due now (not waiting out a backoff), for the
+    /// drainer's sweep.
+    pub fn parents_with_pending(&self, now: DateTime<Local>) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT parent_session FROM agent_event_outbox WHERE state = 'pending' \
-             ORDER BY parent_session",
+             AND (next_attempt_at IS NULL OR next_attempt_at <= ?1) ORDER BY parent_session",
+        )?;
+        let parents = stmt.query_map(params![stamp(now)], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(parents)
+    }
+
+    /// Parents with a batch handed to their gate or written and not yet
+    /// settled: the drainer must hear those parents' receipts.
+    pub fn parents_in_flight(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT parent_session FROM agent_event_outbox \
+             WHERE state IN ('claimed', 'sent', 'accepted', 'unconfirmed') ORDER BY parent_session",
         )?;
         let parents = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(parents)

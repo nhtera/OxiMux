@@ -180,7 +180,7 @@ fn a_rekeyed_parent_keeps_its_rows() {
     ob.push("agent-1", &event("c1", ChildEventKind::Finished), "turn-1", t0()).unwrap();
     crate::lineage::LineageStore::new(db.conn()).rekey("agent-1", "claude-abc").unwrap();
     assert_eq!(ob.pending_count("claude-abc").unwrap(), 1);
-    assert_eq!(ob.parents_with_pending().unwrap(), ["claude-abc"]);
+    assert_eq!(ob.parents_with_pending(t0()).unwrap(), ["claude-abc"]);
 }
 
 #[test]
@@ -193,4 +193,36 @@ fn a_parent_that_goes_away_gets_its_held_batch_back_and_its_written_one_unconfir
     ob.claim("p", "host-a", t0()).unwrap().unwrap();
     ob.release_parent("p").unwrap();
     assert_eq!(states(&ob, "p"), [OutboxState::Unconfirmed, OutboxState::Pending]);
+}
+
+#[test]
+fn a_late_receipt_settles_an_unconfirmed_line() {
+    let ob = outbox();
+    ob.push("p", &event("c1", ChildEventKind::Finished), "turn-1", t0()).unwrap();
+    let batch = ob.claim("p", "host-a", t0()).unwrap().unwrap();
+    ob.mark_sent(batch.key).unwrap();
+    ob.mark_unconfirmed(batch.key).unwrap();
+    ob.mark_delivered(batch.key, secs(40)).unwrap();
+    assert_eq!(states(&ob, "p"), [OutboxState::Delivered]);
+}
+
+#[test]
+fn a_parent_waiting_out_a_backoff_is_not_due() {
+    let ob = outbox();
+    ob.push("p", &event("c1", ChildEventKind::Finished), "turn-1", t0()).unwrap();
+    let b = ob.claim("p", "host-a", t0()).unwrap().unwrap();
+    ob.release_with_backoff(b.key, t0()).unwrap();
+    assert!(ob.parents_with_pending(t0()).unwrap().is_empty());
+    assert_eq!(ob.parents_with_pending(secs(5)).unwrap(), ["p"]);
+    assert!(ob.parents_in_flight().unwrap().is_empty());
+}
+
+#[test]
+fn a_rekeyed_child_is_renamed_in_the_envelope_too() {
+    let db = oximux_storage::db::open_memory().unwrap();
+    let ob = Outbox::new(db.conn());
+    ob.push("p", &event("agent-1", ChildEventKind::Finished), "turn-1", t0()).unwrap();
+    crate::lineage::LineageStore::new(db.conn()).rekey("agent-1", "claude-abc").unwrap();
+    let rows = ob.rows_for("p").unwrap();
+    assert_eq!((rows[0].child.as_str(), rows[0].event.child.as_str()), ("claude-abc", "claude-abc"));
 }
