@@ -2904,9 +2904,9 @@ impl AgentChatView {
             if let Some(binding) = &self.remote {
                 binding.ingest(ev.clone());
             }
-            self.guard_spawn_posture(&ev);
-            self.note_receipt(&ev);
+            let refuse_plan = self.before_apply(&ev);
             self.apply_event(ev, cx);
+            self.after_apply(refuse_plan);
         }
         // A fresh chat is registered under a placeholder id until the agent mints
         // its own; once the fold has one, move the session onto it. Checked after

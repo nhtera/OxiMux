@@ -17,10 +17,13 @@ use std::sync::{Arc, Mutex};
 use gpui::{AppContext as _, Context};
 use oximux_agents::send_gate::{Holds, Ready, SendGate, SendSource};
 use oximux_agents::thread::ThreadEntry;
-use oximux_agents::thread::{ChatImage, ThreadEvent};
+use oximux_agents::thread::{ChatImage, PermissionDecision, PermissionKind, ThreadEvent, ToolCallStatus};
 use uuid::Uuid;
 
 use super::AgentChatView;
+
+/// Why a plan approval was refused in a turn child events started.
+const PLAN_REFUSED: &str = "Leaving plan mode needs you: this turn was started by child events, not by you.";
 
 /// What the transcript says when held child events go out with a message.
 const HELD_EVENTS_NOTE: &str = "Child events that arrived after the Stop went with this message.";
@@ -64,6 +67,39 @@ impl AgentChatView {
             turn_started: !matches!(self.thread.entries.last(), Some(ThreadEntry::User { .. }) | None),
             steer_supported: self.connection.as_ref().is_some_and(|c| c.capabilities().supports_steer),
         });
+    }
+
+    /// What the view checks on each event before folding it: the spawn
+    /// posture, receipts for its own lines, and a plan approval asked for in a
+    /// turn child events started (returned, to refuse once it is folded).
+    pub(super) fn before_apply(&mut self, event: &ThreadEvent) -> Option<String> {
+        self.guard_spawn_posture(event);
+        self.note_receipt(event);
+        match event {
+            ThreadEvent::PermissionRequested { request_id, kind: PermissionKind::Plan, .. }
+                if self.send_gate.lock().unwrap().turn_started_by_events() =>
+            {
+                Some(request_id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// A turn child events started may not raise the session's permission
+    /// mode: leaving plan mode is refused there and left to the user. Other
+    /// prompts in such a turn go to the user as usual.
+    pub(super) fn after_apply(&mut self, refuse_plan: Option<String>) {
+        let Some(request_id) = refuse_plan else { return };
+        let Some((tool_id, _)) = self.thread.pending_permission().map(|(t, r)| (t.to_string(), r.request_id.clone()))
+            .filter(|(_, r)| *r == request_id)
+        else {
+            return;
+        };
+        if let Some(conn) = &self.connection {
+            let _ = conn.resolve_permission(&request_id, PermissionDecision::Deny { message: PLAN_REFUSED.into() });
+        }
+        self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
+        self.thread.apply(&ThreadEvent::Notice(PLAN_REFUSED.into()));
     }
 
     /// The agent started on (or finished) lines this chat wrote: a Stop no

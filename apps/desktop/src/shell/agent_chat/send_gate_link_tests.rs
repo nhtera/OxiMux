@@ -219,3 +219,34 @@ async fn a_stop_holds_until_the_users_next_message(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(user_lines(&stub).len(), 1, "nothing started after the Stop");
 }
+
+/// A turn child events started cannot leave plan mode: the request is refused
+/// and the transcript says why. A turn the user started can.
+#[gpui::test]
+async fn an_event_started_turn_cannot_leave_plan_mode(cx: &mut TestAppContext) {
+    use oximux_agents::thread::{PermissionKind, ToolCallStatus};
+    let (window, stub) = bound_chat(cx);
+    let plan = |id: &str| ThreadEvent::PermissionRequested {
+        request_id: id.into(),
+        tool_use_id: Some(format!("tu-{id}")),
+        tool_name: "ExitPlanMode".into(),
+        input: serde_json::json!({ "plan": "do it" }),
+        description: "do it".into(),
+        suggestions: Vec::new(),
+        kind: PermissionKind::Plan,
+    };
+    window
+        .update(cx, |view, _window, _cx| {
+            view.send_gate.lock().unwrap().push("<oximux-events>e</oximux-events>".into(), vec![], SendSource::ParentEvent, DeliveryMode::Queue, None);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _window, cx| {
+            view.apply_batch(vec![ThreadEvent::ToolCallStarted { id: "tu-p1".into(), name: "ExitPlanMode".into(), input: serde_json::json!({}) }, plan("p1")], cx);
+            assert!(view.thread.pending_permission().is_none(), "refused, not left waiting");
+            assert!(view.thread.entries.iter().any(|e| matches!(e, ThreadEntry::ToolCall(tc) if tc.id == "tu-p1" && tc.status == ToolCallStatus::Rejected)));
+        })
+        .unwrap();
+    assert!(stub.sent().iter().any(|l| l["response"]["response"]["behavior"] == "deny"), "{:?}", stub.sent());
+}
