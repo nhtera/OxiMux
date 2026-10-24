@@ -138,6 +138,9 @@ struct CodexState {
 
 pub struct CodexAppServerConnection {
     outbound: Sender<Outbound>,
+    /// The connection's own line into the event stream, for what the host
+    /// decides rather than codex reports (an answered MCP elicitation).
+    events: Sender<ThreadEvent>,
     rpc: RpcClient,
     state: Arc<Mutex<CodexState>>,
     child: Arc<Mutex<Child>>,
@@ -160,6 +163,7 @@ impl CodexAppServerConnection {
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (rpc, inbound_rx, child) = RpcClient::spawn(cwd, env)?;
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
+        let events = event_tx.clone();
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
         let state = Arc::new(Mutex::new(CodexState::default()));
         // Seed the current model/effort + posture so the first turn — and the
@@ -196,6 +200,7 @@ impl CodexAppServerConnection {
         Ok((
             Self {
                 outbound: out_tx,
+                events,
                 rpc,
                 state,
                 child: Arc::new(Mutex::new(child)),
@@ -246,7 +251,20 @@ impl AgentConnection for CodexAppServerConnection {
             }
         };
         match id {
-            Some(id) if elicitation => self.rpc.respond(id, approvals::to_codex_elicitation(&decision)),
+            Some(id) if elicitation => {
+                self.rpc.respond(id, approvals::to_codex_elicitation(&decision))?;
+                // Codex reports nothing more about an elicitation, so its card
+                // (keyed by the request id) is settled here, whoever answered:
+                // a click, a phone, or the CLI.
+                let denied = matches!(decision, PermissionDecision::Deny { .. });
+                let _ = self.events.send(ThreadEvent::ToolResult {
+                    tool_use_id: request_id.to_string(),
+                    content: if denied { "Declined".into() } else { "Allowed".into() },
+                    is_error: denied,
+                    structured: None,
+                });
+                Ok(())
+            }
             Some(id) => self
                 .rpc
                 .respond(id, json!({ "decision": approvals::to_codex_decision(&decision) })),
@@ -842,6 +860,39 @@ fn map_inbound(
 mod tests {
     use super::fork_last_turn_id;
     use super::*;
+
+    /// Codex says nothing more about an MCP elicitation once it is answered,
+    /// so the connection settles the card itself, whoever answered it.
+    #[test]
+    fn an_answered_elicitation_settles_its_card() {
+        let (rpc, _inbound, child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script("read line; sleep 1"))
+                .expect("spawn fake app-server");
+        let (events, rx) = mpsc::channel();
+        let (outbound, _out_rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(CodexState::default()));
+        state.lock().unwrap().pending_elicitations.insert("e-1".into(), json!(7));
+        let conn = CodexAppServerConnection {
+            outbound,
+            events,
+            rpc,
+            state,
+            child: Arc::new(Mutex::new(child)),
+            _worker: thread::spawn(|| {}),
+            _mapper: thread::spawn(|| {}),
+        };
+        conn.resolve_permission("e-1", PermissionDecision::Deny { message: "no".into() }).unwrap();
+        match rx.try_recv().expect("the card is settled") {
+            ThreadEvent::ToolResult { tool_use_id, is_error, .. } => {
+                assert_eq!(tool_use_id, "e-1");
+                assert!(is_error, "a denial reads as one");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+        // An ordinary approval (codex reports its own outcome) adds nothing.
+        conn.resolve_permission("not-pending", PermissionDecision::Deny { message: "no".into() }).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
 
     /// A thread another process is writing must NOT become a fresh thread.
     ///
