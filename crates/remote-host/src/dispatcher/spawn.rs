@@ -144,7 +144,26 @@ impl Dispatcher {
                 tracing::warn!(%err, "lineage reservation failed");
                 return Response::Error(RpcError::Internal("could not reserve the spawn".into()));
             }
-            Ok(Err(refusal)) => return refuse(refusal_kind(&refusal), refusal.to_string()),
+            Ok(Err(refusal)) => {
+                // A cap the human may want to raise: say so where they look,
+                // in the parent's own transcript, not only in the agent's
+                // tool output.
+                if origin == SpawnOrigin::Agent
+                    && matches!(
+                        refusal,
+                        SpawnRefusal::Fanout { .. }
+                            | SpawnRefusal::Open { .. }
+                            | SpawnRefusal::Budget { .. }
+                            | SpawnRefusal::StartFailing { .. }
+                    )
+                    && let Some(h) = self.registry.get(&parent)
+                {
+                    h.post_notice(&format!(
+                        "{refusal} (Settings › Agents › Agent delegation sets these limits.)"
+                    ));
+                }
+                return refuse(refusal_kind(&refusal), refusal.to_string());
+            }
             Ok(Ok(Reservation::Replayed(row))) => {
                 return Response::AgentSpawned(SpawnAgentResult {
                     session_id: row.session_id.unwrap_or_default(),

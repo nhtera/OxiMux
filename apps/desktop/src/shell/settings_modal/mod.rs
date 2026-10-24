@@ -26,6 +26,7 @@ mod pane_simulator;
 #[cfg(windows)]
 mod pane_driver_trust;
 mod pane_agents_launch;
+mod pane_agents_delegation;
 mod pane_agents_session_search;
 mod pane_git;
 mod pane_integrations;

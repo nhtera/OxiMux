@@ -399,6 +399,18 @@ impl SessionHandle {
         Ok(true)
     }
 
+    /// Put a line in this session's transcript that no backend will echo: the
+    /// host's own note (a spawn the caps refused). Same dual path as a
+    /// recorded permission edit — ingested for remote readers and relayed into
+    /// the desktop view's fold.
+    pub fn post_notice(&self, text: &str) {
+        let event = ThreadEvent::Notice(text.to_string());
+        self.ingest(event.clone());
+        if let Some(tx) = self.remote_event_tx.lock().unwrap().as_ref() {
+            let _ = tx.unbounded_send(event);
+        }
+    }
+
     /// Answer an outstanding `AskUserQuestion`, sharing the permission gate so a
     /// question and a permission can never both claim the same `request_id` and
     /// so a racing second answer is refused rather than double-sent.

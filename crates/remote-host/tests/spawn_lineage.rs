@@ -79,6 +79,7 @@ impl SessionLauncher for PlainLauncher {
 
 struct Host {
     dispatcher: Dispatcher,
+    registry: Arc<SessionRegistry>,
     core: Arc<HostCore>,
     launcher: Arc<FakeLauncher>,
     _dir: tempfile::TempDir,
@@ -107,10 +108,10 @@ fn host(owner: bool, roster: Vec<AgentRosterWire>) -> Host {
         contexts: Mutex::new(Vec::new()),
         roster,
     });
-    let dispatcher = Dispatcher::new(registry, Arc::new(AuthStore::new()))
+    let dispatcher = Dispatcher::new(registry.clone(), Arc::new(AuthStore::new()))
         .with_launcher(launcher.clone())
         .with_host_core(core.clone());
-    Host { dispatcher, core, launcher, _dir: dir }
+    Host { dispatcher, registry, core, launcher, _dir: dir }
 }
 
 fn spawn(request: &str) -> SpawnAgentReq {
@@ -372,4 +373,74 @@ async fn a_parent_reaches_its_child_through_the_session_verbs() {
         );
     })
     .await;
+}
+
+/// A cap hit is visible to the human: a notice lands in the parent's
+/// transcript, not only in the agent's tool output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cap_hit_leaves_a_notice_in_the_parents_transcript() {
+    let h = host(true, vec![]);
+    h.core.set_config(HostConfig {
+        caps: oximux_agents::lineage::SpawnCaps { active_per_parent: 1, ..Default::default() },
+        ..HostConfig::default()
+    });
+    let mut events = h.registry.get("parent").unwrap().subscribe();
+    as_agent(&h, "parent", |c| async move {
+        assert!(matches!(call(&*c, Request::SpawnAgent(spawn("r1"))).await, Response::AgentSpawned(_)));
+        let (kind, _) = spawn_error(call(&*c, Request::SpawnAgent(spawn("r2"))).await);
+        assert_eq!(kind, SpawnErrorKind::FanoutExceeded);
+    })
+    .await;
+    let mut saw = false;
+    while let Ok((_, ev)) = events.try_recv() {
+        if let oximux_agent_core::thread::ThreadEvent::Notice(text) = ev {
+            saw = text.contains("1 of 1 active children") && text.contains("Settings");
+        }
+    }
+    assert!(saw, "the parent's transcript names the limit and where to raise it");
+}
+
+/// A team run's roles join the lineage under `team:<run>` at depth 1, so a
+/// role's own helper is depth 2 (refused at the default) and the operator's
+/// `CancelAgent team:<run>` ends the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_run_roles_are_recorded_under_the_run() {
+    use oximux_remote_proto::messages::{TeamRoleSpecWire, TeamRunCreateReq};
+    let h = host(true, vec![]);
+    let db = oximux_storage::db::open_memory().unwrap();
+    let dispatcher = Dispatcher::new(h.registry.clone(), Arc::new(AuthStore::new()))
+        .with_launcher(h.launcher.clone())
+        .with_host_core(h.core.clone())
+        .with_team_store(Arc::new(oximux_agents::team::TeamStore::new(db.conn())));
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, LocalScope::Full);
+    let cwd = h._dir.path().to_string_lossy().into_owned();
+    let run_id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = run_id.clone();
+    join(serve, async move {
+        let reply = call(
+            &client,
+            Request::TeamRunCreate(TeamRunCreateReq {
+                name: "ship".into(),
+                cwd,
+                agent_id: None,
+                worktree_each: false,
+                roles: vec![TeamRoleSpecWire { name: "plan".into(), prompt: "go".into() }],
+            }),
+        )
+        .await;
+        let Response::TeamRun(run) = reply else { panic!("expected TeamRun, got {reply:?}") };
+        *seen.lock().unwrap() = run.id.clone();
+        let Response::AgentsCancelled { ended } =
+            call(&client, Request::CancelAgent { id: format!("team:{}", run.id), cascade: true }).await
+        else {
+            panic!("expected AgentsCancelled");
+        };
+        assert_eq!(ended, vec!["child-0".to_string()]);
+        drop(client);
+    })
+    .await;
+    let row = h.core.lineage().row("child-0").unwrap().unwrap();
+    assert_eq!(row.parent_id, format!("team:{}", run_id.lock().unwrap()));
+    assert_eq!(row.depth, 1);
 }

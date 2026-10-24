@@ -37,6 +37,43 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
+    /// Read the config from a settings store (`get` returns a key's stored
+    /// text). A missing or unreadable value keeps its default; the result is
+    /// sanitized, so a hand-edited depth of 9 reads as 2.
+    pub fn load(get: impl Fn(&str) -> Option<String>) -> Self {
+        let d = Self::default();
+        let flag = |key: &str, default: bool| match get(key).as_deref() {
+            Some("true" | "1" | "on") => true,
+            Some("false" | "0" | "off") => false,
+            _ => default,
+        };
+        let num = |key: &str, default: u32| get(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+        Self {
+            delegation_enabled: flag(keys::DELEGATION_ENABLED, d.delegation_enabled),
+            confine_chat: flag(keys::CONFINE_CHAT, d.confine_chat),
+            caps: SpawnCaps {
+                depth: num(keys::CAP_DEPTH, d.caps.depth),
+                active_per_parent: num(keys::CAP_ACTIVE_PER_PARENT, d.caps.active_per_parent),
+                active_per_root: num(keys::CAP_ACTIVE_PER_ROOT, d.caps.active_per_root),
+                open_per_root: num(keys::CAP_OPEN_PER_ROOT, d.caps.open_per_root),
+                ..d.caps
+            },
+        }
+        .sanitized()
+    }
+
+    /// The config as settings-store entries, for [`Self::load`] to read back.
+    pub fn entries(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (keys::DELEGATION_ENABLED, self.delegation_enabled.to_string()),
+            (keys::CONFINE_CHAT, self.confine_chat.to_string()),
+            (keys::CAP_DEPTH, self.caps.depth.to_string()),
+            (keys::CAP_ACTIVE_PER_PARENT, self.caps.active_per_parent.to_string()),
+            (keys::CAP_ACTIVE_PER_ROOT, self.caps.active_per_root.to_string()),
+            (keys::CAP_OPEN_PER_ROOT, self.caps.open_per_root.to_string()),
+        ]
+    }
+
     /// The config as enforced: the depth never exceeds the ceiling, and every
     /// count cap stays between 1 and its settable maximum, whatever was stored.
     pub fn sanitized(self) -> Self {
@@ -77,6 +114,21 @@ mod tests {
         assert_eq!(wild.caps.active_per_root, 16);
         assert_eq!(wild.caps.open_per_root, 32);
         assert_eq!(wild.caps.lifetime_per_root, 100, "the budget is not settable");
+    }
+
+    #[test]
+    fn settings_round_trip_and_bad_values_keep_defaults() {
+        let custom = HostConfig {
+            delegation_enabled: false,
+            confine_chat: true,
+            caps: SpawnCaps { depth: 2, active_per_parent: 3, ..SpawnCaps::default() },
+        };
+        let stored: std::collections::HashMap<&str, String> = custom.entries().into_iter().collect();
+        assert_eq!(HostConfig::load(|k| stored.get(k).cloned()), custom);
+        let junk = |k: &str| (k == keys::CAP_DEPTH).then(|| "nine".to_string());
+        assert_eq!(HostConfig::load(junk), HostConfig::default());
+        let deep = |k: &str| (k == keys::CAP_DEPTH).then(|| "9".to_string());
+        assert_eq!(HostConfig::load(deep).caps.depth, 2, "clamped to the ceiling");
     }
 
     #[test]

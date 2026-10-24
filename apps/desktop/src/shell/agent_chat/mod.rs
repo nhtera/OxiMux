@@ -49,6 +49,7 @@ mod jump_menu;
 mod child;
 mod login_card;
 mod remote_link;
+mod respawn_gate;
 mod sign_in;
 mod message_rail;
 mod pending_edit;
@@ -574,6 +575,8 @@ pub struct AgentChatView {
     /// What this chat may do, fixed at spawn (a reviewer, a verifier); applied
     /// on every respawn and never changed by the mode picker.
     spawn_posture: oximux_agents::thread::launch_posture::SpawnPosture,
+    /// A respawn asked for mid-turn, run when the turn ends (`respawn_gate`).
+    pending_respawn: bool,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`
@@ -2251,6 +2254,9 @@ impl AgentChatView {
     /// `self.permission_mode` / `self.effort`, so callers set those first.
     /// Degrades to a read-only error state if the respawn fails.
     fn respawn(&mut self, cx: &mut Context<Self>) {
+        if self.defer_respawn_mid_turn() {
+            return;
+        }
         self.respawn_with_env(Vec::new(), None, cx);
     }
 
@@ -2272,6 +2278,7 @@ impl AgentChatView {
         // rather than signalling the process, so after one the child is still
         // *alive* and this is what ends it; it also harvests a child that died
         // on its own.
+        self.pending_respawn = false; // this respawn satisfies a deferred one
         if let Some(old) = self.connection.take() {
             old.shutdown();
         }
@@ -2671,6 +2678,7 @@ impl AgentChatView {
             connection: Some(connection),
             remote_session_id,
             spawn_posture: Default::default(),
+            pending_respawn: false,
             remote,
             backend: ChatBackend::stream_json(),
             composer,
@@ -3193,6 +3201,7 @@ impl AgentChatView {
             // the rewind "restore files" affordance only lights up when there's
             // something to restore. Background compare against the pre-turn sha.
             self.compare_turn_checkpoint(cx);
+            self.run_pending_respawn(cx);
             self.flush_next_queued(cx);
         }
     }
