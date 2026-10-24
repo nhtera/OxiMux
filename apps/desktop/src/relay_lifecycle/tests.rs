@@ -343,3 +343,88 @@ async fn the_sweep_waits_for_closes_already_under_way() {
     assert!(started.elapsed() >= Duration::from_millis(500), "returned before the session ended");
     assert!(matches!(tab_close.await.expect("join"), Ok(Response::Ok)));
 }
+
+/// A live child that is not us, standing in for a foreign `oximux serve`.
+#[cfg(unix)]
+fn foreign_process() -> std::process::Child {
+    std::process::Command::new("sleep").arg("30").spawn().expect("spawn sleep")
+}
+
+/// Write the holder record the way a host does, with chosen fields.
+fn write_holder_record(dir: &std::path::Path, pid: u32, started: Option<u64>, boot: Option<u64>) {
+    let lock = dir.join(oximux_remote_local::HOST_LOCK_FILENAME);
+    let opt = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_default();
+    std::fs::write(lock.with_extension("pid"), format!("{pid}\n{}\n{}\nserve\n", opt(started), opt(boot)))
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn foreign_serve_holder_accepts_a_live_holder_whose_record_matches() {
+    let dir = TempDir::new().unwrap();
+    let mut child = foreign_process();
+    let pid = child.id();
+    let started = oximux_proc_tree::start_time_of_pid(pid);
+    write_holder_record(dir.path(), pid, started, oximux_proc_tree::boot_time_of_system());
+    assert_eq!(foreign_serve_holder(dir.path()), Some(pid));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn foreign_serve_holder_rejects_a_recycled_pid() {
+    // The pid is alive, but its process started long after the record says,
+    // which is what a pid recycled by an unrelated process looks like.
+    let dir = TempDir::new().unwrap();
+    let mut child = foreign_process();
+    let pid = child.id();
+    let started = oximux_proc_tree::start_time_of_pid(pid).map(|t| t - 600);
+    write_holder_record(dir.path(), pid, started, oximux_proc_tree::boot_time_of_system());
+    assert_eq!(foreign_serve_holder(dir.path()), None);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn foreign_serve_holder_rejects_a_record_from_another_boot() {
+    let dir = TempDir::new().unwrap();
+    let mut child = foreign_process();
+    let pid = child.id();
+    let started = oximux_proc_tree::start_time_of_pid(pid);
+    let old_boot = oximux_proc_tree::boot_time_of_system().map(|b| b - 3600);
+    write_holder_record(dir.path(), pid, started, old_boot);
+    assert_eq!(foreign_serve_holder(dir.path()), None);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn foreign_serve_holder_keeps_trusting_a_live_one_line_record() {
+    // An older serve wrote only its pid. It is alive, so it is still reported.
+    let dir = TempDir::new().unwrap();
+    let mut child = foreign_process();
+    let pid = child.id();
+    let lock = dir.path().join(oximux_remote_local::HOST_LOCK_FILENAME);
+    std::fs::write(lock.with_extension("pid"), format!("{pid}\n")).unwrap();
+    assert_eq!(foreign_serve_holder(dir.path()), Some(pid));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn foreign_serve_holder_ignores_our_own_record_and_an_unreadable_one() {
+    let dir = TempDir::new().unwrap();
+    write_holder_record(
+        dir.path(),
+        std::process::id(),
+        oximux_proc_tree::start_time_of_pid(std::process::id()),
+        oximux_proc_tree::boot_time_of_system(),
+    );
+    assert_eq!(foreign_serve_holder(dir.path()), None, "our own record is not foreign");
+    let lock = dir.path().join(oximux_remote_local::HOST_LOCK_FILENAME);
+    std::fs::write(lock.with_extension("pid"), "garbage\n").unwrap();
+    assert_eq!(foreign_serve_holder(dir.path()), None);
+}

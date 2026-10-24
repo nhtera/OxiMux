@@ -74,7 +74,7 @@ impl AgentChatView {
     /// No-op when remote is disabled, or when the transcript will not serialize
     /// (a half-serialized snapshot is worse than keeping the prior one).
     pub(super) fn publish_remote_transcript(&self) {
-        let Some(binding) = &self.remote else {
+        let Some(binding) = self.remote.as_ref().filter(|b| b.exposed()) else {
             return;
         };
         let Ok(entries_json) = serde_json::to_string(&self.thread.entries) else {
@@ -96,7 +96,7 @@ impl AgentChatView {
         // `remote` is `None` and this whole path must cost nothing; starting an
         // interval or spawning a timer for a publish that will early-return is
         // work on behalf of a peer that does not exist.
-        if self.remote.is_none() {
+        if !self.remote.as_ref().is_some_and(|b| b.exposed()) {
             return;
         }
         let since = self.publish_throttle.last.get().elapsed();

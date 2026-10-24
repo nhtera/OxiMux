@@ -292,7 +292,9 @@ impl AgentChatView {
                 permission_mode: connection.as_ref().and_then(|c| c.default_mode()),
                 cwd: Some(cwd.clone()),
             });
-            if let Ok(entries_json) = serde_json::to_string(&thread.entries) {
+            if binding.exposed()
+                && let Ok(entries_json) = serde_json::to_string(&thread.entries)
+            {
                 binding.publish_transcript(entries_json, model);
             }
             // Relay remotely-injected prompts (phone sends) into this tab so the

@@ -541,6 +541,18 @@ fn main() {
             std::sync::Arc::new(app_state.team_store()),
             std::sync::Arc::new(app_state.coord_store()),
         );
+        // The host core (spawn lineage, host config): built once, always on,
+        // on the process runtime `_rt_guard` keeps entered for the app's life.
+        // Handed the handle explicitly, so its background work never depends on
+        // which thread later calls into it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => remote_control.install_host_core(
+                rt,
+                app_state.lineage_store(),
+                oximux_remote_host::HostConfig::default(),
+            ),
+            Err(_) => tracing::warn!("no tokio runtime; agent orchestration host core not started"),
+        }
         // The scheduled-run ticker. Installed unconditionally when this process
         // wins the data dir's ticker lock: with no schedules it costs one
         // indexed read every tick and takes no keep-awake hold, and gating it

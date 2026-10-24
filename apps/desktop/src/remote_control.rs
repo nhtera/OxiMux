@@ -138,12 +138,27 @@ pub fn remote_session_id_for(agent_session_id: Option<&str>) -> String {
 pub struct RemoteBinding {
     registry: Arc<SessionRegistry>,
     handle: Arc<SessionHandle>,
+    /// Whether anyone can connect right now (remote or local access on).
+    /// Shared with [`RemoteControl`], so a toggle reaches every live binding.
+    exposed: Arc<AtomicBool>,
 }
 
 impl RemoteBinding {
     /// Fan one backend event into the bound session (assign seq, store, broadcast).
     pub fn ingest(&self, event: oximux_agents::thread::ThreadEvent) {
-        self.handle.ingest(event);
+        // The event ring exists for remote readers. With nobody able to
+        // connect, a chat is registered only for the host core (which reads
+        // the working flag, not events), so the copy is skipped.
+        if self.exposed() {
+            self.handle.ingest(event);
+        }
+    }
+
+    /// Whether anyone can connect (remote or local access on). Callers skip
+    /// work done only for remote readers — serializing the transcript — when
+    /// it is false.
+    pub fn exposed(&self) -> bool {
+        self.exposed.load(Ordering::Acquire)
     }
 
     /// Publish the session's display metadata (title/model) so a remote client's
@@ -152,12 +167,21 @@ impl RemoteBinding {
         self.handle.set_meta(meta);
     }
 
+    /// Publish whether the session is working (a turn running, or a prompt
+    /// waiting), which the host's lineage subscriber parks or revives a spawned
+    /// child from.
+    pub fn set_working(&self, working: bool) {
+        self.handle.set_working(working);
+    }
+
     /// Publish the folded transcript so a remote client opening this session sees
     /// its full history — including one restored from disk after a restart, which
     /// never entered the event ring. `entries_json` is the folded `Vec<ThreadEntry>`
     /// as JSON; the registry pairs it with the current seq for the client's resume.
     pub fn publish_transcript(&self, entries_json: String, model: Option<String>) {
-        self.handle.publish_transcript(entries_json, model);
+        if self.exposed() {
+            self.handle.publish_transcript(entries_json, model);
+        }
     }
 
     /// Register the sink that relays remotely-injected prompts (phone sends) back to
@@ -278,14 +302,20 @@ pub struct RemoteControl {
     /// id — and since a paired phone dials by that id, every restart would silently
     /// invalidate every pairing. `None` = ephemeral identity (tests).
     endpoint_secret: Option<[u8; 32]>,
-    /// Local CLI access — a second, independent switch beside `enabled`. Either
-    /// one populates the session registry; both off keeps the tested
-    /// `disabled_binds_nothing` invariant: no registry rows, no socket, no token.
+    /// Local CLI access — a second, independent switch beside `enabled`. Both
+    /// off keeps the tested `disabled_binds_nothing` invariant: no socket, no
+    /// token, nothing on the network. Registry rows are allowed either way:
+    /// the host core reads them (spawned children park and revive off them)
+    /// whether or not anyone can connect.
     local_enabled: AtomicBool,
     /// The running local listener, once bound. Dropping the handle aborts the
     /// accept loop AND every in-flight CLI connection — the local analogue of
     /// dropping the iroh `HostHandle`.
     local: Mutex<Option<local_listener::LocalHandle>>,
+    /// `enabled || local_enabled`, shared with every [`RemoteBinding`] so the
+    /// remote-only work (event ring, transcript) stops while nobody can
+    /// connect, though chats stay registered for the host core.
+    exposed: Arc<AtomicBool>,
     /// Proof that this process, and no other, is the host for the data
     /// directory — the same advisory lock `oximux serve` takes.
     ///
@@ -302,6 +332,10 @@ pub struct RemoteControl {
     /// Remote legitimately rebinds over our own live listener. Taking it only
     /// when it is not already held keeps that path working.
     host_lock: Mutex<Option<oximux_single_instance::SingleInstanceGuard>>,
+    /// The process-wide orchestration state (spawn lineage, host config), built
+    /// once at boot and shared by both dispatchers. `None` until installed
+    /// (tests, and the brief window before boot wires it).
+    host_core: Option<Arc<oximux_remote_host::HostCore>>,
 }
 
 impl Global for RemoteControl {}
@@ -339,7 +373,9 @@ impl RemoteControl {
             endpoint_secret: None,
             local_enabled: AtomicBool::new(false),
             local: Mutex::new(None),
+            exposed: Arc::new(AtomicBool::new(false)),
             host_lock: Mutex::new(None),
+            host_core: None,
         }
     }
 
@@ -390,6 +426,28 @@ impl RemoteControl {
     ) {
         self.teams = Some(teams);
         self.coord = Some(coord);
+    }
+
+    /// Build the host core over this host's registry. Called once at boot, with
+    /// the process runtime and the shared database's lineage store; the core
+    /// runs from then on whether or not any listener is enabled.
+    pub fn install_host_core(
+        &mut self,
+        rt: tokio::runtime::Handle,
+        lineage: oximux_agents::lineage::LineageStore,
+        config: oximux_remote_host::HostConfig,
+    ) {
+        self.host_core = Some(oximux_remote_host::HostCore::new(oximux_remote_host::HostCoreDeps {
+            rt,
+            lineage,
+            registry: self.registry.clone(),
+            config,
+        }));
+    }
+
+    /// The host core, once installed.
+    pub fn host_core(&self) -> Option<Arc<oximux_remote_host::HostCore>> {
+        self.host_core.clone()
     }
 
     /// Install the transcriber the host serves. Called once at boot with a
@@ -443,15 +501,20 @@ impl RemoteControl {
         self.registry.clone()
     }
 
-    /// Drop a session from the registry by id.
-    ///
-    /// For the one case a [`RemoteBinding`] cannot cover: a view re-keying itself
-    /// onto the agent's own session id has to remove the entry it was registered
-    /// under before, and by then its binding is already pointing at the new one.
-    /// Ordinary teardown goes through the binding, which carries the registry
-    /// with it precisely so `Drop` needs no context.
-    pub fn unregister(&self, id: &str) {
-        self.registry.unregister(id);
+    /// A chat moved from `old` to the agent's own session id `new` (the view
+    /// has already registered under `new`). The one place every record keyed
+    /// by a session id follows it: the spawn lineage (its row, its children,
+    /// its tree, the outbox) and the registry entry. Each of those joins on the
+    /// id and fails *closed* on a stale one — a child would silently lose its
+    /// parking, its parent's authority and its notifications — so none of them
+    /// may be renamed anywhere else.
+    pub fn rekey_session(&self, old: &str, new: &str) {
+        if let Some(core) = &self.host_core
+            && let Err(err) = core.lineage().rekey(old, new)
+        {
+            tracing::warn!(%err, old, new, "lineage rekey failed");
+        }
+        self.registry.unregister(old);
     }
 
     pub fn enabled(&self) -> bool {
@@ -460,6 +523,11 @@ impl RemoteControl {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Release);
+        self.refresh_exposed();
+    }
+
+    fn refresh_exposed(&self) {
+        self.exposed.store(self.enabled() || self.local_enabled(), Ordering::Release);
     }
 
     pub fn local_enabled(&self) -> bool {
@@ -468,6 +536,7 @@ impl RemoteControl {
 
     pub fn set_local_enabled(&self, on: bool) {
         self.local_enabled.store(on, Ordering::Release);
+        self.refresh_exposed();
     }
 
     /// Assemble a fresh dispatcher + CSPRNG seed for a host bind. Serves
@@ -557,6 +626,10 @@ impl RemoteControl {
         }
         if let Some(coord) = &self.coord {
             dispatcher = dispatcher.with_coord_store(Arc::clone(coord));
+        }
+        // The same core in every dispatcher this host builds, remote and local.
+        if let Some(core) = &self.host_core {
+            dispatcher = dispatcher.with_host_core(Arc::clone(core));
         }
         if let Some(runner) = &self.schedule_runner {
             dispatcher = dispatcher.with_schedule_runner(Arc::clone(runner));
@@ -735,17 +808,18 @@ impl RemoteControl {
         .detach();
     }
 
-    /// Register `id`→`conn` and return the binding **iff some control surface
-    /// is enabled** — remote, local CLI, or both. `None` with both off, so the
-    /// caller does no work and holds no binding: population is gated, never
-    /// unconditional, which is what keeps `disabled_binds_nothing` true for
-    /// users who enabled neither.
+    /// Register `id`→`conn` and return the binding, whatever the listeners say.
+    ///
+    /// The registry is the host's view of its live chats, not only what remote
+    /// clients see: the host core parks and revives spawned children from it,
+    /// so a chat registers even with remote and local access both off. What
+    /// those switches gate is the front door — no socket is bound, no token
+    /// written and nothing reachable from the network while both are off
+    /// (`disabled_binds_nothing`). Always `Some`; the `Option` stays for the
+    /// callers' teardown shape.
     pub fn bind(&self, id: &str, conn: Arc<dyn AgentConnection>) -> Option<RemoteBinding> {
-        if !(self.enabled() || self.local_enabled()) {
-            return None;
-        }
         let handle = self.registry.register(id.to_string(), conn);
-        Some(RemoteBinding { registry: self.registry.clone(), handle })
+        Some(RemoteBinding { registry: self.registry.clone(), handle, exposed: self.exposed.clone() })
     }
 
     /// Assemble the dispatcher a local listener serves. Shares the live host's
@@ -812,8 +886,13 @@ impl RemoteControl {
             return true;
         }
         let path = dir.join(oximux_remote_local::HOST_LOCK_FILENAME);
-        match oximux_single_instance::try_acquire(&path) {
+        match oximux_single_instance::try_acquire_as(&path, "desktop") {
             Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => {
+                // This process now owns the data dir: let the host core settle
+                // what the previous owner left (it is provably gone).
+                if let Some(core) = &self.host_core {
+                    core.start(oximux_remote_host::PriorOwner::from_previous(guard.previous()));
+                }
                 *held = Some(guard);
                 true
             }
@@ -875,7 +954,13 @@ impl RemoteControl {
         // still bound would let a waiting `serve` win the role and unlink a live
         // node — the exact race the lock exists to prevent, run backwards.
         self.local.lock().unwrap().take();
-        self.host_lock.lock().unwrap().take();
+        if self.host_lock.lock().unwrap().take().is_some()
+            && let Some(core) = &self.host_core
+        {
+            // Another host may take the data dir now; until this process wins
+            // it back, the core writes nothing (guest mode).
+            core.release();
+        }
     }
 }
 
@@ -1092,13 +1177,17 @@ mod tests {
         let rc = RemoteControl::new();
         assert!(!rc.enabled());
         assert!(!rc.local_enabled(), "local CLI access defaults off too");
-        assert!(rc.bind("agent-1", a_conn()).is_none());
-        assert!(rc.registry().is_empty(), "no session registered while disabled");
+        // The session registers (the host core reads it) ...
+        assert!(rc.bind("agent-1", a_conn()).is_some());
+        assert!(rc.registry().get("agent-1").is_some());
+        // ... but nothing is reachable: no host, no local listener, no auth.
+        assert!(rc.host.lock().unwrap().is_none(), "no remote endpoint while disabled");
+        assert!(rc.local.lock().unwrap().is_none(), "no local socket while disabled");
+        assert!(rc.auth.lock().unwrap().is_none(), "no live auth store while disabled");
     }
 
-    /// Local CLI access alone populates the registry — the gate is widened to
-    /// either switch, not moved: with remote still off, sessions register for
-    /// the local listener to serve.
+    /// Local CLI access alone serves the registry; turning it off again stops
+    /// the listener but keeps registering sessions for the host core.
     #[test]
     fn local_access_alone_binds_sessions() {
         let rc = RemoteControl::new();
@@ -1106,10 +1195,9 @@ mod tests {
         assert!(!rc.enabled(), "remote stays off");
         assert!(rc.bind("agent-1", a_conn()).is_some());
         assert!(!rc.registry().is_empty());
-        // And turning it off again restores the empty-gate behavior for NEW
-        // sessions (live bindings are cut by the listener teardown, not here).
         rc.stop_local();
-        assert!(rc.bind("agent-2", a_conn()).is_none());
+        assert!(rc.bind("agent-2", a_conn()).is_some());
+        assert!(rc.local.lock().unwrap().is_none(), "the listener is gone");
     }
 
     /// Enabled binds a session whose teed events reach a live subscriber in order.
@@ -1131,6 +1219,45 @@ mod tests {
 
         binding.unregister("agent-1");
         assert!(rc.registry().get("agent-1").is_none(), "unregister evicts the session");
+    }
+
+    /// A chat re-keyed onto its agent's id takes its spawn tree with it: the
+    /// children's rows name the new parent, and the placeholder is gone from the
+    /// registry.
+    #[test]
+    fn rekey_session_moves_lineage_and_the_registry_entry() {
+        use oximux_agents::lineage::{
+            LineageStore, NotifyParent, Reservation, SpawnCaps, SpawnOrigin, SpawnParent, SpawnSpec,
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let db = oximux_storage::db::open_memory().unwrap();
+        let lineage = LineageStore::new(db.conn());
+        let mut rc = RemoteControl::new();
+        rc.install_host_core(rt.handle().clone(), lineage.clone(), oximux_remote_host::HostConfig::default());
+        rc.bind("agent-7", a_conn());
+        let spec = SpawnSpec {
+            request_id: "r1".into(),
+            origin: SpawnOrigin::Agent,
+            posture: Default::default(),
+            notify_parent: NotifyParent::Auto,
+            allow_parent_permits: false,
+            preassigned_id: None,
+            fingerprint_input: String::new(),
+        };
+        let now = chrono::Local::now();
+        let Ok(Reservation::Fresh { row_id, .. }) = lineage
+            .reserve(&SpawnParent::Session("agent-7".into()), &spec, SpawnCaps::default(), &|_: &str| true, now)
+            .unwrap()
+        else {
+            panic!("reserve");
+        };
+        lineage.finalize(row_id, "child-1", now).unwrap();
+
+        rc.bind("claude-abc", a_conn());
+        rc.rekey_session("agent-7", "claude-abc");
+        assert_eq!(lineage.row("child-1").unwrap().unwrap().parent_id, "claude-abc");
+        assert!(rc.registry().get("agent-7").is_none(), "the placeholder is unregistered");
+        assert!(rc.registry().get("claude-abc").is_some());
     }
 
     /// The host role is one per data directory, and re-taking our own is free.
