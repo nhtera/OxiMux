@@ -438,11 +438,27 @@ pub enum Command {
     /// (`{"command": "oximux", "args": ["mcp", "--worktree", "/path/to/repo"]}`).
     /// Six tools: status, observe, act, app, screenshot, wait-consent. The
     /// client asks the user for its own permission, apart from agents'.
+    ///
+    /// `--tools orchestrate` serves the delegation tools instead (spawn, wait,
+    /// send, read, cancel, list children, answer a permit, shared state) to an
+    /// agent OxiMux started, with its own session credential. OxiMux wires it
+    /// into the agents it starts; an outside client never gets these tools.
     Mcp {
-        /// The worktree whose device to serve. Required unless the current
-        /// directory is a worktree OxiMux knows.
+        /// The worktree whose device to serve. Required for the `sim` tools
+        /// unless the current directory is a worktree OxiMux knows.
         #[arg(long, value_name = "PATH")]
         worktree: Option<PathBuf>,
+        /// Which tool sets to serve: `sim`, `orchestrate`, or both.
+        #[arg(long, value_delimiter = ',', default_value = "sim", value_name = "SETS")]
+        tools: Vec<McpToolset>,
+        /// The agent session credential for the `orchestrate` tools (a file
+        /// OxiMux wrote, owner-only). Without it the environment's is used.
+        #[arg(long, value_name = "PATH")]
+        credential_file: Option<PathBuf>,
+        /// The agent `oximux_spawn_agent` starts when none is named (the
+        /// calling agent's own).
+        #[arg(long, value_name = "ID")]
+        default_agent: Option<String>,
     },
     /// Run this machine as a headless OxiMux host.
     ///
@@ -1265,6 +1281,15 @@ pub enum PostureArg {
     Default,
     Review,
     Verify,
+}
+
+/// A tool set `oximux mcp` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum McpToolset {
+    /// The worktree's simulator (for an outside MCP client).
+    Sim,
+    /// Delegation, for an agent OxiMux started.
+    Orchestrate,
 }
 
 /// `delegate spawn --notify`.

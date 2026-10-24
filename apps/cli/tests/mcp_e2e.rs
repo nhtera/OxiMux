@@ -14,9 +14,16 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use oximux_agents::session_registry::SessionRegistry;
-use oximux_remote_host::{AuthStore, Dispatcher, LocalScope, SimPrincipal, SimulatorControl};
+use oximux_agents::lineage::LineageStore;
+use oximux_agents::session_registry::{SessionMeta, SessionRegistry};
+use oximux_agents::thread::{StubConnection, ThreadEvent};
+use oximux_remote_host::launcher::ChildCtx;
+use oximux_remote_host::{
+    AuthStore, Dispatcher, HostConfig, HostCore, HostCoreDeps, LaunchError, LocalScope, PriorOwner, SessionLauncher,
+    SimPrincipal, SimulatorControl,
+};
 use oximux_remote_local::{LocalClaim, LocalControlListener, generate_token};
+use oximux_remote_proto::lineage::AgentRosterWire;
 use oximux_remote_proto::simulator::*;
 use serde_json::{Value, json};
 
@@ -91,6 +98,10 @@ fn serve(rt: &tokio::runtime::Runtime, runtime_dir: &Path, stub: Arc<Stub>) {
         LocalControlListener::bind(runtime_dir, &generate_token()).unwrap()
     };
     listener.grant_mcp(runtime_dir).unwrap();
+    accept(rt, listener, dispatcher);
+}
+
+fn accept(rt: &tokio::runtime::Runtime, listener: LocalControlListener, dispatcher: Arc<Dispatcher>) {
     rt.spawn(async move {
         while let Ok(pending) = listener.accept_pending().await {
             let dispatcher = dispatcher.clone();
@@ -125,8 +136,12 @@ struct Server {
 
 impl Server {
     fn start(runtime_dir: &Path, worktree: &str) -> Self {
+        Self::with_args(runtime_dir, &["mcp", "--worktree", worktree])
+    }
+
+    fn with_args(runtime_dir: &Path, args: &[&str]) -> Self {
         let mut child = cli(runtime_dir)
-            .args(["mcp", "--worktree", worktree])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -270,4 +285,127 @@ fn an_mcp_server_never_starts_in_the_home_directory() {
     assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--worktree"));
     assert!(out.stdout.is_empty(), "nothing on stdout but JSON-RPC");
+}
+
+// ── the delegation tools ────────────────────────────────────────────────────
+
+/// Starts each child as a stub session that reports working.
+struct ChildLauncher {
+    registry: Arc<SessionRegistry>,
+    cwd: std::path::PathBuf,
+    launched: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SessionLauncher for ChildLauncher {
+    async fn create(&self, cwd: &str, agent: Option<&str>, model: Option<&str>) -> Result<String, LaunchError> {
+        self.create_child(cwd, agent, model, ChildCtx::default()).await
+    }
+
+    async fn create_child(&self, _: &str, _: Option<&str>, _: Option<&str>, _: ChildCtx) -> Result<String, LaunchError> {
+        let id = format!("child-{}", self.launched.fetch_add(1, Ordering::SeqCst));
+        let handle = self.registry.register(id.clone(), Arc::new(StubConnection::default()));
+        handle.set_meta(SessionMeta { cwd: Some(self.cwd.clone()), ..Default::default() });
+        handle.set_working(true);
+        Ok(id)
+    }
+
+    fn roster(&self) -> Vec<AgentRosterWire> {
+        vec![AgentRosterWire {
+            agent_id: "claude-code".into(),
+            display: "Claude Code".into(),
+            default_model: None,
+            models: vec![],
+            postures: vec![],
+            installed: true,
+        }]
+    }
+}
+
+/// A desktop-like host with delegation on and one chat, `parent`, whose
+/// agent holds the session credential written to the returned file.
+fn serve_delegation(rt: &tokio::runtime::Runtime, dir: &Path) -> (Arc<SessionRegistry>, std::path::PathBuf) {
+    let runtime_dir = dir.join("host");
+    let registry = Arc::new(SessionRegistry::new());
+    let parent = registry.register("parent".into(), Arc::new(StubConnection::default()));
+    parent.set_meta(SessionMeta { cwd: Some(dir.to_path_buf()), ..Default::default() });
+    let db = oximux_storage::db::open_memory().unwrap();
+    let core = HostCore::new(HostCoreDeps {
+        rt: rt.handle().clone(),
+        lineage: LineageStore::new(db.conn()),
+        registry: registry.clone(),
+        config: HostConfig::default(),
+    });
+    core.start(PriorOwner::None);
+    let launcher = Arc::new(ChildLauncher { registry: registry.clone(), cwd: dir.to_path_buf(), launched: Default::default() });
+    let dispatcher = Arc::new(
+        Dispatcher::new(registry.clone(), Arc::new(AuthStore::new())).with_launcher(launcher).with_host_core(core),
+    );
+    let listener = {
+        let _guard = rt.enter();
+        LocalControlListener::bind(&runtime_dir, &generate_token()).unwrap()
+    };
+    let label = "agent-parent-credential";
+    let secret = listener.grant_session(label);
+    listener.bind_session(label, "parent");
+    let credential = dir.join("parent.cred");
+    oximux_remote_local::write_credential_file(&credential, label, &secret).unwrap();
+    accept(rt, listener, dispatcher);
+    (registry, credential)
+}
+
+#[test]
+fn an_agent_delegates_over_mcp_with_its_own_credential() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, credential) = serve_delegation(&rt, dir.path());
+    let runtime_dir = dir.path().join("host");
+    // No --worktree: the delegation set needs none.
+    let mut server = Server::with_args(
+        &runtime_dir,
+        &["mcp", "--tools", "orchestrate", "--credential-file", credential.to_str().unwrap(), "--default-agent", "claude-code"],
+    );
+
+    let init = server.request("initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }));
+    assert!(init["result"]["instructions"].as_str().unwrap().contains("helper agents"), "{init}");
+    let tools = server.request("tools/list", json!({}));
+    let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"oximux_spawn_agent"), "{names:?}");
+    assert!(names.iter().all(|n| n.starts_with("oximux_")), "no simulator tools: {names:?}");
+
+    let spawned = server.call("oximux_spawn_agent", json!({ "prompt": "summarize the README", "request_id": "r1" }));
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    assert!(text(&spawned).contains("child-0"), "{spawned}");
+    let children = server.call("oximux_list_children", json!({}));
+    assert!(text(&children).contains("child-0"), "{children}");
+
+    // Still working: the wait gives up at its timeout and says so.
+    let waited = server.call("oximux_wait_agents", json!({ "ids": ["child-0"], "timeout_ms": 1000 }));
+    assert_eq!(waited["isError"], false, "{waited}");
+    let report: Value = serde_json::from_str(&text(&waited)).unwrap();
+    assert_eq!(report["timed_out"], true, "{report}");
+    assert_eq!(report["children"][0]["terminal"], false, "{report}");
+
+    // Its turn ends: the next wait answers at once.
+    registry.ingest("child-0", ThreadEvent::UserMessage { text: "summarize the README".into(), images: vec![] });
+    registry.ingest("child-0", ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None });
+    let waited = server.call("oximux_wait_agents", json!({ "ids": ["child-0"], "timeout_ms": 20000 }));
+    let report: Value = serde_json::from_str(&text(&waited)).unwrap();
+    assert_eq!(report["children"][0]["state"], "finished", "{report}");
+    assert_eq!(report["timed_out"], false, "{report}");
+
+    // Only its own subtree: the parent itself is not a child to wait on.
+    let stranger = server.call("oximux_wait_agents", json!({ "ids": ["parent"] }));
+    assert!(stranger["isError"] == true && text(&stranger).contains("not an agent you started"), "{stranger}");
+}
+
+/// The delegation set is for an agent OxiMux started. A process holding no
+/// agent credential (an outside client, or the operator) is refused at start.
+#[test]
+fn the_delegation_set_needs_an_agent_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = cli(&dir.path().join("host")).args(["mcp", "--tools", "orchestrate"]).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("agent session credential"));
+    assert!(out.stdout.is_empty());
 }

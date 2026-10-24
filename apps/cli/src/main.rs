@@ -261,7 +261,15 @@ fn main() -> std::process::ExitCode {
         }
         // An MCP server on stdio: its own runtime, and stdout carries only
         // JSON-RPC.
-        Command::Mcp { worktree } => commands::mcp::run(args.dir.clone(), worktree.clone()),
+        Command::Mcp { worktree, tools, credential_file, default_agent } => commands::mcp::run(
+            args.dir.clone(),
+            commands::mcp::Options {
+                worktree: worktree.clone(),
+                tools: tools.clone(),
+                credential_file: credential_file.clone(),
+                default_agent: default_agent.clone(),
+            },
+        ),
         // Host verbs: build the runtime, connect lazily, run the verb.
         _ => host_verb(args),
     };

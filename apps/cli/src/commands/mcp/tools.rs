@@ -151,7 +151,7 @@ async fn run(ctx: &Ctx, name: &str, args: &Value, deadline: Instant) -> Result<V
             Ok(out)
         }
         "sim_act" => act(&client, ctx, args, deadline).await.map(|text| vec![text_item(&text)]),
-        "sim_app" => Ok(vec![text_item(&sim(&client, ctx, app_words(args, &ctx.worktree)?).await?.1)]),
+        "sim_app" => Ok(vec![text_item(&sim(&client, ctx, app_words(args, ctx.worktree())?).await?.1)]),
         "sim_screenshot" => screenshot(&client, ctx, args.get("output").and_then(Value::as_str) != Some("path")).await,
         "sim_wait_consent" => {
             let secs = args.get("timeout_s").and_then(Value::as_u64).unwrap_or(MAX_CONSENT_WAIT).clamp(1, MAX_CONSENT_WAIT);
@@ -168,7 +168,7 @@ fn words<const N: usize>(w: [&str; N]) -> Vec<String> {
 /// One `sim` verb, as the CLI runs it: parsed, version-gated, run.
 async fn sim(client: &Client, ctx: &Ctx, words: Vec<String>) -> Result<(Value, String), String> {
     let command = Words::try_parse_from(&words).map_err(|e| format!("bad step `{}`: {}", words.join(" "), first_line(&e.to_string())))?.command;
-    let command = Command::Sim { worktree: Some(ctx.worktree.clone()), command };
+    let command = Command::Sim { worktree: Some(ctx.worktree().to_path_buf()), command };
     if let Some((needed, verb)) = crate::required_version(&command) {
         client.require_version(needed, verb).map_err(|f| failure_text(&f))?;
     }
@@ -209,7 +209,7 @@ async fn act(client: &Client, ctx: &Ctx, args: &Value, deadline: Instant) -> Res
                     Run::Words(words) => sim(client, ctx, words).await,
                     Run::TypeInto(target, text) => {
                         let settle = SettleArgs { settle, settle_timeout: None };
-                        super::super::sim_verify::type_into_target(client, &ctx.worktree, target, text, false, &settle)
+                        super::super::sim_verify::type_into_target(client, ctx.worktree(), target, text, false, &settle)
                             .await
                             .map_err(|f| failure_text(&f))
                     }
@@ -394,7 +394,7 @@ async fn screenshot(client: &Client, ctx: &Ctx, image: bool) -> Result<Vec<Value
     Ok(out)
 }
 
-fn text_item(text: &str) -> Value {
+pub(super) fn text_item(text: &str) -> Value {
     json!({ "type": "text", "text": text })
 }
 
@@ -404,7 +404,7 @@ fn first_line(s: &str) -> &str {
 
 /// A failure as the agent should read it: the CLI's own words, with the
 /// consent steps named as this server's tools.
-fn failure_text(f: &Failure) -> String {
+pub(super) fn failure_text(f: &Failure) -> String {
     match f.code {
         "consent-pending" => "Waiting for the user to allow this MCP client to control the device in OxiMux. Call sim_wait_consent, then retry.".into(),
         "timeout" if f.message.contains("answer") => "The user has not answered yet. Call sim_wait_consent again.".into(),

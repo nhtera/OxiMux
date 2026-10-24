@@ -1077,7 +1077,10 @@ Serve the attached simulator to an outside MCP client over stdio (`{"command": "
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `--worktree` | yes | The worktree whose device to serve. Required unless the current directory is a worktree OxiMux knows |
+| `--worktree` | yes | The worktree whose device to serve. Required for the `sim` tools unless the current directory is a worktree OxiMux knows |
+| `--tools` | yes | Which tool sets to serve: `sim`, `orchestrate`, or both |
+| `--credential-file` | yes | The agent session credential for the `orchestrate` tools (a file OxiMux wrote, owner-only). Without it the environment's is used |
+| `--default-agent` | yes | The agent `oximux_spawn_agent` starts when none is named (the calling agent's own) |
 
 ### `oximux serve`
 

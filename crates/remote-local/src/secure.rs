@@ -80,6 +80,38 @@ pub fn write_token_file(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write an agent's session credential for a tool server it starts (the
+/// orchestration MCP server): the label on the first line, the secret on the
+/// second, owner-only like the token file. A file because the server's command
+/// line is visible to every local user (`ps`) and its environment is the
+/// agent CLI's to pass on or not; only the path goes in argv.
+pub fn write_credential_file(path: &Path, label: &str, secret: &str) -> Result<()> {
+    write_token_file(path, &format!("{label}\n{secret}"))
+}
+
+/// Read a file [`write_credential_file`] wrote. Refused unless it is still
+/// owner-only: a credential another user could have read, or swapped, proves
+/// nothing.
+pub fn read_credential_file(path: &Path) -> io::Result<(String, String)> {
+    if !oximux_owner_only::is_restricted_to_owner(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is readable by other users; it is not a credential", path.display()),
+        ));
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let mut lines = raw.lines().map(str::trim);
+    match (lines.next(), lines.next()) {
+        (Some(label), Some(secret)) if !label.is_empty() && !secret.is_empty() => {
+            Ok((label.to_string(), secret.to_string()))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} does not hold a session credential", path.display()),
+        )),
+    }
+}
+
 /// Read the token back. `NotFound` means local access has never been enabled
 /// on this host — callers map it to their "turn the toggle on" guidance.
 pub fn read_token_file(path: &Path) -> io::Result<String> {
@@ -90,6 +122,20 @@ pub fn read_token_file(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_credential_file_reads_back_and_a_loose_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.cred");
+        write_credential_file(&path, "agent-label", "s3cret").unwrap();
+        assert_eq!(read_credential_file(&path).unwrap(), ("agent-label".into(), "s3cret".into()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(read_credential_file(&path).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
 
     #[test]
     fn token_file_is_created_owner_only_and_reads_back() {

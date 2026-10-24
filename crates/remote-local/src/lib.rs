@@ -56,9 +56,11 @@ mod secure;
 mod serve;
 mod transport;
 
-pub use dial::{DialError, credential, dial, dial_as, dial_mcp};
+pub use dial::{DialError, credential, dial, dial_as, dial_mcp, dial_session_file};
 pub use hello::{LocalClaim, LocalIdentity};
-pub use secure::{generate_token, read_token_file, write_token_file};
+pub use secure::{
+    generate_token, read_credential_file, read_token_file, write_credential_file, write_token_file,
+};
 pub use serve::{LocalControlListener, PendingConnection};
 pub use transport::{LocalSocketTransport, MAX_FRAME};
 

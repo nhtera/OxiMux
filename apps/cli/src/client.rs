@@ -25,6 +25,17 @@ use crate::cli::exit;
 use crate::hosts_store::{HOST_ENV_VAR, HostEntry, HostsFile};
 use crate::output::Failure;
 
+/// Which credential a connection presents.
+enum Credential {
+    /// Whatever this process holds: an agent's session secret from the
+    /// environment, else the operator token.
+    Ambient,
+    /// The runtime dir's MCP token (`oximux mcp` for an outside client).
+    Mcp,
+    /// An agent session's credential file (the orchestration tool server).
+    File(PathBuf),
+}
+
 /// Which host a client is talking to — the one fact a verb may need beyond the
 /// transport itself, since a remote host's name belongs in `--json` output and
 /// in the fleet table's host column.
@@ -148,20 +159,40 @@ impl Client {
     /// Dial the local socket, authenticate, and exchange versions. Every
     /// failure carries its exit class and a concrete next step.
     pub async fn connect(dir: Option<PathBuf>, timeout_secs: u64) -> Result<Self, Failure> {
-        Self::connect_as(dir, timeout_secs, false).await
+        Self::connect_as(dir, timeout_secs, Credential::Ambient).await
     }
 
     /// [`Self::connect`] as an outside MCP client (`oximux mcp`), with the MCP
     /// credential: the host keeps its consent apart from agents'.
     pub async fn connect_mcp(dir: Option<PathBuf>, timeout_secs: u64) -> Result<Self, Failure> {
-        Self::connect_as(dir, timeout_secs, true).await
+        Self::connect_as(dir, timeout_secs, Credential::Mcp).await
     }
 
-    async fn connect_as(dir: Option<PathBuf>, timeout_secs: u64, mcp: bool) -> Result<Self, Failure> {
+    /// [`Self::connect`] as the agent session whose credential is in
+    /// `credential_file` when one is given (the orchestration tool server),
+    /// else as whatever the environment holds.
+    pub async fn connect_session(
+        dir: Option<PathBuf>,
+        timeout_secs: u64,
+        credential_file: Option<&std::path::Path>,
+    ) -> Result<Self, Failure> {
+        let how = match credential_file {
+            Some(path) => Credential::File(path.to_path_buf()),
+            None => Credential::Ambient,
+        };
+        Self::connect_as(dir, timeout_secs, how).await
+    }
+
+    async fn connect_as(dir: Option<PathBuf>, timeout_secs: u64, how: Credential) -> Result<Self, Failure> {
+        let mcp = matches!(how, Credential::Mcp);
         let runtime_dir = runtime_dir(dir)?;
         let timeout = Duration::from_secs(timeout_secs.max(1));
         let dialing = async {
-            if mcp { oximux_remote_local::dial_mcp(&runtime_dir).await } else { dial(&runtime_dir).await }
+            match &how {
+                Credential::Mcp => oximux_remote_local::dial_mcp(&runtime_dir).await,
+                Credential::File(path) => oximux_remote_local::dial_session_file(&runtime_dir, path).await,
+                Credential::Ambient => dial(&runtime_dir).await,
+            }
         };
         let dialed = tokio::time::timeout(timeout, dialing).await.map_err(|_| timed_out("connecting to the host"))?;
         let transport = dialed.map_err(|e| match e {
@@ -213,7 +244,8 @@ impl Client {
             // `NoCredential` arm above already makes this distinction; this one
             // did not, and gave every caller the operator's answer.
             DialError::Denied(_) => {
-                let steps = if std::env::var_os(SESSION_ENV_VAR).is_some() {
+                let agent = std::env::var_os(SESSION_ENV_VAR).is_some() || matches!(how, Credential::File(_));
+                let steps = if agent {
                     vec![
                         "this agent's session credential is no longer honoured — its \
                          session most likely ended, or the host restarted"
