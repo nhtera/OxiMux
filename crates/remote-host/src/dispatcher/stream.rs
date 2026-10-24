@@ -242,7 +242,7 @@ impl Dispatcher {
         cursors: &mut HashMap<SessionId, Seq>,
         peer_version: u32,
     ) -> (Response, Option<BoxStream<'static, LiveFrame>>) {
-        if !self.auth.is_allowed_for(peer, session_id) {
+        if !self.may_read_session(peer, session_id) {
             return (Response::Error(RpcError::Unauthorized), None);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -315,7 +315,7 @@ impl Dispatcher {
     ) -> bool {
         // Revocation / scope bites the live stream too: suppress silently but keep
         // the connection open (other sessions may still be permitted).
-        if !self.auth.is_allowed_for(peer, &frame.session_id) {
+        if !self.may_read_session(peer, &frame.session_id) {
             return true;
         }
         // Never re-send a `seq` already covered by the backlog batch (or an

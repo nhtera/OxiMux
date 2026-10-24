@@ -331,3 +331,45 @@ async fn a_parent_lists_and_cancels_its_children_but_not_a_strangers() {
     .await;
     assert_eq!(h.core.lineage().row("child-0").unwrap().unwrap().state, LineageState::Ended);
 }
+
+/// The Critical row "parent reads/waits/sends to its own child": the session
+/// verbs reach a confined caller's subtree, and a stranger's child stays out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parent_reaches_its_child_through_the_session_verbs() {
+    use oximux_remote_proto::messages::SendPromptReq;
+    let h = host(true, vec![]);
+    let child = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let child_id = child.clone();
+    as_agent(&h, "parent", |c| async move {
+        let Response::AgentSpawned(r) = call(&*c, Request::SpawnAgent(spawn("r1"))).await else {
+            panic!("expected AgentSpawned");
+        };
+        *child_id.lock().unwrap() = r.session_id.clone();
+        let send = Request::SendPrompt(SendPromptReq {
+            session_id: r.session_id.clone(),
+            text: "also check the tests".into(),
+            images: vec![],
+            corr_id: 1,
+        });
+        assert_eq!(call(&*c, send).await, Response::Ack, "a parent sends to its child");
+        assert!(
+            matches!(call(&*c, Request::EventsSince { session_id: r.session_id.clone(), after_seq: 0 }).await, Response::Events(_)),
+            "a parent reads its child's events"
+        );
+        assert!(
+            matches!(call(&*c, Request::GetSessionInfo { session_id: r.session_id.clone() }).await, Response::SessionInfo(_)),
+            "a parent reads its child's info"
+        );
+    })
+    .await;
+    let child = child.lock().unwrap().clone();
+    as_agent(&h, "stranger", |c| async move {
+        let send = Request::SendPrompt(SendPromptReq { session_id: child.clone(), text: "x".into(), images: vec![], corr_id: 1 });
+        assert_eq!(call(&*c, send).await, Response::Error(RpcError::Unauthorized));
+        assert_eq!(
+            call(&*c, Request::EventsSince { session_id: child, after_seq: 0 }).await,
+            Response::Error(RpcError::Unauthorized)
+        );
+    })
+    .await;
+}

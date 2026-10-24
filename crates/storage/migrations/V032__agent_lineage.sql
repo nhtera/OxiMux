@@ -10,7 +10,9 @@
 -- later costs another migration and a backfill for rows already written.
 
 CREATE TABLE agent_lineage (
-    id                   INTEGER PRIMARY KEY,
+    -- AUTOINCREMENT: a deleted reservation's id is never handed out again, so
+    -- a launch that outlived its reservation cannot finalize someone else's.
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     -- NULL while `reserved` for a provider that names its own session after
     -- launch (Codex, Pi). Claude children are pre-assigned their id, so theirs
     -- is set at reservation. Rewritten only by a rekey.

@@ -16,6 +16,11 @@ fn secs(n: i64) -> DateTime<Local> {
     t0() + chrono::Duration::seconds(n)
 }
 
+/// A clock past the grace a freshly active row gets.
+fn settled() -> DateTime<Local> {
+    secs(ACTIVE_GRACE_S + 1)
+}
+
 fn spec(request: &str) -> SpawnSpec {
     SpawnSpec {
         request_id: request.into(),
@@ -124,7 +129,7 @@ fn finished_children_park_and_free_their_slot() {
     let s = store();
     for i in 0..8 {
         spawn(&s, "root", &format!("r{i}"), &format!("c{i}"));
-        assert!(s.park(&format!("c{i}"), t0()).unwrap());
+        assert!(s.park(&format!("c{i}"), settled()).unwrap());
     }
     spawn(&s, "root", "r8", "c8");
     assert_eq!(s.row("c8").unwrap().unwrap().state, LineageState::Active);
@@ -137,7 +142,10 @@ fn reserve_reconciles_idle_active_rows_to_parked() {
     for i in 0..8 {
         spawn(&s, "root", &format!("r{i}"), &format!("c{i}"));
     }
-    match s.reserve(&parent("root"), &spec("r8"), caps(), &none_working, t0()).unwrap() {
+    // Within the grace a just-started child counts as working whatever it says.
+    let early = s.reserve(&parent("root"), &spec("r8"), caps(), &none_working, t0()).unwrap();
+    assert_eq!(early, Err(SpawnRefusal::Fanout { active: 8, limit: 8 }));
+    match s.reserve(&parent("root"), &spec("r8"), caps(), &none_working, settled()).unwrap() {
         Ok(Reservation::Fresh { .. }) => {}
         other => panic!("reconcile should have freed the slots: {other:?}"),
     }
@@ -150,7 +158,7 @@ fn reviving_a_parked_child_at_the_cap_needs_no_slot() {
     for i in 0..8 {
         spawn(&s, "root", &format!("r{i}"), &format!("c{i}"));
     }
-    s.park("c0", t0()).unwrap();
+    s.park("c0", settled()).unwrap();
     spawn(&s, "root", "r8", "c8"); // takes the freed slot: 8 active again
     assert!(s.activate("c0", t0()).unwrap(), "revive is allowed over the cap");
     // Nine working now; the next spawn waits until the count drops.
@@ -162,7 +170,7 @@ fn the_seventeenth_open_child_is_refused_with_parked_ids() {
     let s = store();
     for i in 0..16 {
         spawn(&s, "root", &format!("r{i}"), &format!("c{i:02}"));
-        s.park(&format!("c{i:02}"), t0()).unwrap();
+        s.park(&format!("c{i:02}"), settled()).unwrap();
     }
     match refusal(&s, "root", "r16", caps()) {
         SpawnRefusal::Open { open, limit, parked_ids } => {
@@ -333,7 +341,7 @@ fn quitting_never_ends_rows() {
     let s = store();
     for i in 0..3 {
         spawn(&s, "root", &format!("r{i}"), &format!("c{i}"));
-        s.park(&format!("c{i}"), t0()).unwrap();
+        s.park(&format!("c{i}"), settled()).unwrap();
     }
     s.boot_reconcile(secs(100)).unwrap();
     assert!(s.children("root", false).unwrap().iter().all(|r| r.state == LineageState::Parked));
@@ -499,7 +507,46 @@ fn ending_a_dormant_child_needs_no_session() {
     // Answered from the table alone: nothing to open.
     let s = store();
     spawn(&s, "root", "r1", "c1");
-    s.park("c1", t0()).unwrap();
+    s.park("c1", settled()).unwrap();
     assert_eq!(s.mark_ended("c1", false, t0()).unwrap(), vec!["c1".to_string()]);
     assert_eq!(s.row("c1").unwrap().unwrap().state, LineageState::Ended);
+}
+
+#[test]
+fn a_just_started_child_is_not_parked_by_an_idle_report() {
+    let s = store();
+    spawn(&s, "root", "r1", "c1");
+    assert!(!s.park("c1", secs(5)).unwrap(), "inside the grace");
+    assert!(s.park("c1", settled()).unwrap());
+}
+
+#[test]
+fn a_cancelled_parent_cannot_spawn() {
+    let s = store();
+    let deep = SpawnCaps { depth: 2, ..caps() };
+    spawn(&s, "root", "r1", "c1");
+    s.mark_ended("c1", false, t0()).unwrap();
+    let r = s.reserve(&parent("c1"), &spec("r2"), deep, &all_working, t0()).unwrap();
+    assert_eq!(r, Err(SpawnRefusal::ParentEnded));
+}
+
+#[test]
+fn a_late_finalize_cannot_take_over_a_reused_slot() {
+    // The slow launch's reservation is reclaimed and another parent reserves;
+    // ids are never reused, so the late finalize fails instead of hijacking.
+    let s = store();
+    let Ok(Reservation::Fresh { row_id: slow, .. }) =
+        s.reserve(&parent("a"), &spec("slow"), caps(), &all_working, t0()).unwrap()
+    else {
+        panic!()
+    };
+    let Ok(Reservation::Fresh { row_id: fresh, .. }) =
+        s.reserve(&parent("a"), &spec("slow"), caps(), &all_working, secs(RESERVATION_TIMEOUT_S + 1)).unwrap()
+    else {
+        panic!()
+    };
+    assert_ne!(slow, fresh, "a reclaimed id is not handed out again");
+    assert!(s.finalize(slow, "late-child", secs(400)).is_err(), "the slow launch lost its slot");
+    s.finalize(fresh, "c1", secs(400)).unwrap();
+    assert!(s.row("late-child").unwrap().is_none());
 }

@@ -48,10 +48,16 @@ fn spawn_child(f: &Fixture, parent: &str, child: &str, posture: SpawnPosture) {
     let r = f
         .core
         .lineage()
-        .reserve(&SpawnParent::Session(parent.into()), &spec(child, posture), caps, &f.core.working(), chrono::Local::now())
+        .reserve(&SpawnParent::Session(parent.into()), &spec(child, posture), caps, &f.core.working(), settled_ago())
         .unwrap();
     let Ok(Reservation::Fresh { row_id, .. }) = r else { panic!("{r:?}") };
-    f.core.lineage().finalize(row_id, child, chrono::Local::now()).unwrap();
+    f.core.lineage().finalize(row_id, child, settled_ago()).unwrap();
+}
+
+/// A start time past the grace a freshly active row gets, so these tests can
+/// watch idle reports park a child.
+fn settled_ago() -> chrono::DateTime<chrono::Local> {
+    chrono::Local::now() - chrono::Duration::seconds(oximux_agents::lineage::ACTIVE_GRACE_S + 5)
 }
 
 fn register(f: &Fixture, id: &str) -> Arc<oximux_agents::session_registry::SessionHandle> {

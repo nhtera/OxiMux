@@ -45,6 +45,10 @@ pub const MAX_DEPTH: u32 = 2;
 /// second child (the slow one's `finalize` then fails and it is stopped).
 pub const RESERVATION_TIMEOUT_S: i64 = 300;
 
+/// How long a freshly active row is counted as working whatever its session
+/// reports: a child just launched has not said it is working yet.
+pub const ACTIVE_GRACE_S: i64 = 30;
+
 /// Consecutive failed launches after which a parent's spawns are refused.
 pub const START_FAILURE_LIMIT: u32 = 3;
 
@@ -237,6 +241,8 @@ pub enum SpawnRefusal {
     IdempotencyConflict,
     /// The same spawn is still launching.
     InProgress,
+    /// The parent itself was cancelled.
+    ParentEnded,
 }
 
 impl std::fmt::Display for SpawnRefusal {
@@ -276,6 +282,10 @@ impl std::fmt::Display for SpawnRefusal {
             SpawnRefusal::InProgress => write!(
                 f,
                 "Spawn refused: the same request is still launching. Wait for it to finish."
+            ),
+            SpawnRefusal::ParentEnded => write!(
+                f,
+                "Spawn refused: this agent was cancelled. Stop and report what you have."
             ),
         }
     }
@@ -368,6 +378,10 @@ impl LineageStore {
             SpawnParent::UserRoot => (0, String::new()),
             SpawnParent::Run(run) => (1, run.clone()),
             SpawnParent::Session(id) => match row_by_session(&tx, id)? {
+                // A cancelled agent that is still running spawns nothing more.
+                Some(row) if row.state == LineageState::Ended => {
+                    return Ok(Err(SpawnRefusal::ParentEnded));
+                }
                 Some(row) => (row.depth + 1, row.root_id),
                 // A session no row names as a child is a root.
                 None => (1, id.clone()),
@@ -465,7 +479,7 @@ impl LineageStore {
             SpawnOrigin::User => {}
         }
 
-        let stamp = now.to_rfc3339();
+        let stamp = stamp(now);
         // A user root is its own root; with no id yet, `finalize` sets it.
         let stored_root = match parent {
             SpawnParent::UserRoot => spec.preassigned_id.clone().unwrap_or_default(),
@@ -504,16 +518,21 @@ impl LineageStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("begin lineage finalize")?;
         let parent: String = tx
-            .query_row("SELECT parent_id FROM agent_lineage WHERE id = ?1", params![row_id], |r| {
-                r.get(0)
-            })
-            .context("finalize: no such reservation")?;
-        tx.execute(
-            "UPDATE agent_lineage SET session_id = ?2, state = 'active', updated_at = ?3, \
-             root_id = CASE WHEN parent_id = ?4 THEN ?2 ELSE root_id END WHERE id = ?1",
-            params![row_id, session_id, now.to_rfc3339(), USER_ROOT],
-        )
-        .context("finalize lineage row")?;
+            .query_row(
+                "SELECT parent_id FROM agent_lineage WHERE id = ?1 AND state = 'reserved'",
+                params![row_id],
+                |r| r.get(0),
+            )
+            .context("finalize: the reservation is gone (reclaimed or its parent ended)")?;
+        let changed = tx
+            .execute(
+                "UPDATE agent_lineage SET session_id = ?2, state = 'active', updated_at = ?3, \
+                 root_id = CASE WHEN parent_id = ?4 THEN ?2 ELSE root_id END \
+                 WHERE id = ?1 AND state = 'reserved'",
+                params![row_id, session_id, stamp(now), USER_ROOT],
+            )
+            .context("finalize lineage row")?;
+        anyhow::ensure!(changed == 1, "finalize: the reservation is gone");
         tx.execute("DELETE FROM agent_spawn_failures WHERE parent_id = ?1", params![parent])?;
         tx.commit().context("commit lineage finalize")?;
         Ok(())
@@ -541,7 +560,7 @@ impl LineageStore {
                 "INSERT INTO agent_spawn_failures (parent_id, count, last_reason, last_at) \
                  VALUES (?1, 1, ?2, ?3) ON CONFLICT(parent_id) DO UPDATE SET \
                  count = count + 1, last_reason = excluded.last_reason, last_at = excluded.last_at",
-                params![parent, reason, now.to_rfc3339()],
+                params![parent, reason, stamp(now)],
             )?;
         }
         tx.commit().context("commit lineage rollback")?;
@@ -580,9 +599,19 @@ impl LineageStore {
         self.set_state(session_id, "parked", LineageState::Active, now)
     }
 
-    /// A working child went idle with nothing pending (or failed).
+    /// A working child went idle with nothing pending (or failed). A row made
+    /// active in the last [`ACTIVE_GRACE_S`] stays active: a child that has
+    /// just started has not reported working yet, and parking it would let a
+    /// burst of spawns slip past the active caps.
     pub fn park(&self, session_id: &str, now: DateTime<Local>) -> Result<bool> {
-        self.set_state(session_id, "active", LineageState::Parked, now)
+        let settled = stamp(now - chrono::Duration::seconds(ACTIVE_GRACE_S));
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE agent_lineage SET state = 'parked', updated_at = ?3 \
+             WHERE session_id = ?1 AND state = 'active' AND updated_at < ?2",
+            params![session_id, settled, stamp(now)],
+        )?;
+        Ok(n > 0)
     }
 
     fn set_state(
@@ -596,7 +625,7 @@ impl LineageStore {
         let n = conn.execute(
             "UPDATE agent_lineage SET state = ?3, updated_at = ?4 \
              WHERE session_id = ?1 AND state = ?2",
-            params![session_id, from, to.as_text(), now.to_rfc3339()],
+            params![session_id, from, to.as_text(), stamp(now)],
         )?;
         Ok(n > 0)
     }
@@ -627,7 +656,7 @@ impl LineageStore {
                 i += 1;
             }
         }
-        let stamp = now.to_rfc3339();
+        let stamp = stamp(now);
         for sid in frontier.iter().rev() {
             let n = tx.execute(
                 "UPDATE agent_lineage SET state = 'ended', ended_at = ?2, updated_at = ?2 \
@@ -662,7 +691,7 @@ impl LineageStore {
         conn.execute("DELETE FROM agent_lineage WHERE state = 'reserved'", [])?;
         conn.execute(
             "UPDATE agent_lineage SET state = 'parked', updated_at = ?1 WHERE state = 'active'",
-            params![now.to_rfc3339()],
+            params![stamp(now)],
         )?;
         Ok(())
     }
@@ -759,7 +788,7 @@ fn reconcile_tree(
     working: &dyn WorkingSessions,
     now: DateTime<Local>,
 ) -> Result<()> {
-    let cutoff = (now - chrono::Duration::seconds(RESERVATION_TIMEOUT_S)).to_rfc3339();
+    let cutoff = stamp(now - chrono::Duration::seconds(RESERVATION_TIMEOUT_S));
     conn.execute(
         "DELETE FROM agent_lineage WHERE state = 'reserved' AND updated_at < ?1",
         params![cutoff],
@@ -767,14 +796,15 @@ fn reconcile_tree(
     if root_id.is_empty() {
         return Ok(());
     }
+    let settled = stamp(now - chrono::Duration::seconds(ACTIVE_GRACE_S));
     let active: Vec<String> = conn
         .prepare(
-            "SELECT session_id FROM agent_lineage \
-             WHERE root_id = ?1 AND state = 'active' AND session_id IS NOT NULL",
+            "SELECT session_id FROM agent_lineage WHERE root_id = ?1 AND state = 'active' \
+             AND session_id IS NOT NULL AND updated_at < ?2",
         )?
-        .query_map(params![root_id], |r| r.get(0))?
+        .query_map(params![root_id, settled], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let stamp = now.to_rfc3339();
+    let stamp = stamp(now);
     for sid in active.iter().filter(|s| !working.is_working(s)) {
         conn.execute(
             "UPDATE agent_lineage SET state = 'parked', updated_at = ?2 \
@@ -875,6 +905,13 @@ fn fingerprint(parent_id: &str, spec: &SpawnSpec) -> String {
         h.update([0]);
     }
     format!("{:x}", h.finalize())
+}
+
+/// Timestamps are stored in UTC so that comparing them as text (the stale
+/// sweep does, in SQL) orders them correctly across a DST change or a moved
+/// time zone.
+fn stamp(at: DateTime<Local>) -> String {
+    at.with_timezone(&chrono::Utc).to_rfc3339()
 }
 
 /// Unparseable timestamps read as the epoch: old enough to be reclaimed, never

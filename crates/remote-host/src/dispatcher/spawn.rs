@@ -157,105 +157,29 @@ impl Dispatcher {
             Ok(Ok(Reservation::Fresh { row_id, depth, root_id })) => (row_id, depth, root_id),
         };
 
-        // Resources the attempt creates, released if the launch fails.
-        let mut worktree_id = None;
-        let cwd = match cwd_path {
-            Some(cwd) => cwd,
-            None => {
-                let name = match &req.cwd {
-                    SpawnCwdWire::NewWorktree { name } => name.as_deref(),
-                    _ => None,
-                };
-                match self.worktree_for_child(&parent_cwd, name, &req.request_id).await {
-                    Ok((id, path)) => {
-                        worktree_id = Some(id);
-                        path
-                    }
-                    Err(detail) => {
-                        self.rollback_spawn(row_id, &detail, None).await;
-                        return Response::Error(RpcError::BadRequest(detail));
-                    }
-                }
-            }
+        // From here on the attempt runs as its own task on the host's runtime:
+        // a caller that goes away mid-launch (its connection dropped, local
+        // access switched off) must not abandon a reservation half-settled or
+        // a child the tree never learns about.
+        let job = LaunchJob {
+            core: core.clone(),
+            launcher,
+            registry: self.registry.clone(),
+            worktrees: self.worktrees.clone(),
+            now_secs: self.now_secs,
+            row_id,
+            depth,
+            root_id,
+            parent,
+            parent_cwd,
+            cwd_path,
+            posture,
+            req,
         };
-
-        let ctx = ChildCtx { parent_session_id: Some(parent.clone()), activate: false, posture };
-        match launcher.create_child(&cwd, Some(&req.agent_id), req.model.as_deref(), ctx).await {
-            Ok(session_id) => {
-                if let Err(err) = core.lineage().finalize(row_id, &session_id, self.now_local()) {
-                    // The reservation was reclaimed under a launch slower than
-                    // the timeout: a replay may own the slot now. Stop this
-                    // child rather than leave one the tree does not know.
-                    tracing::warn!(%err, session_id, "spawned child could not be finalized; stopping it");
-                    if let Some(h) = self.registry.get(&session_id) {
-                        let _ = h.cancel();
-                    }
-                    return Response::Error(RpcError::Internal("the spawn could not be recorded".into()));
-                }
-                let delivered = self
-                    .registry
-                    .get(&session_id)
-                    .is_some_and(|h| h.send_prompt(&req.prompt, &[]).is_ok());
-                if !delivered {
-                    tracing::warn!(session_id, "spawned child opened but its prompt was not delivered");
-                }
-                Response::AgentSpawned(SpawnAgentResult {
-                    session_id,
-                    parent_id: parent,
-                    root_id,
-                    depth,
-                    replayed: false,
-                })
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "child launch failed");
-                self.rollback_spawn(row_id, launch_reason(&err), worktree_id.as_deref()).await;
-                match err {
-                    LaunchError::PostureUnenforceable(why) => refuse(
-                        SpawnErrorKind::PostureUnenforceable,
-                        format!("{why}. Spawn a Claude or Codex agent for this posture."),
-                    ),
-                    other => Response::Error(RpcError::BadRequest(other.to_string())),
-                }
-            }
-        }
-    }
-
-    /// Undo a reservation whose launch did not happen, releasing what the
-    /// attempt created, and count it against the parent's breaker.
-    async fn rollback_spawn(&self, row_id: i64, reason: &str, worktree_id: Option<&str>) {
-        if let Some(core) = &self.host_core
-            && let Err(err) = core.lineage().rollback(row_id, reason, self.now_local())
-        {
-            tracing::warn!(%err, "lineage rollback failed");
-        }
-        if let (Some(id), Some(worktrees)) = (worktree_id, self.worktrees.as_ref())
-            && worktrees.remove(id).await.is_err()
-        {
-            tracing::warn!(id, "a failed spawn's worktree could not be removed");
-        }
-    }
-
-    /// A fresh worktree for a child, named by the caller or by its request id.
-    /// Returns `(id, path)`.
-    async fn worktree_for_child(
-        &self,
-        parent_cwd: &str,
-        name: Option<&str>,
-        request_id: &str,
-    ) -> Result<(String, String), String> {
-        let Some(worktrees) = self.worktrees.as_ref() else {
-            return Err("this host cannot create worktrees".into());
-        };
-        let slug = super::team::slugify(name.unwrap_or(request_id));
-        if slug.is_empty() {
-            return Err("that worktree name has nothing a branch can be named after".into());
-        }
-        worktrees
-            .create(parent_cwd, &slug, &CreateBaseWire::Default)
-            .await
-            .map(|row| (row.id, row.path))
-            .map_err(|_| "the child's worktree could not be created".to_string())
+        core.runtime().spawn(job.run()).await.unwrap_or_else(|err| {
+            tracing::warn!(%err, "spawn task failed");
+            Response::Error(RpcError::Internal("the spawn did not complete".into()))
+        })
     }
 
     pub(super) fn list_children(&self, peer: &Peer, of: &str, recursive: bool) -> Response {
@@ -348,6 +272,134 @@ impl Dispatcher {
     }
 }
 
+/// One reserved spawn being launched, owning everything it needs so it can
+/// finish (or roll back) without the connection that asked for it.
+struct LaunchJob {
+    core: std::sync::Arc<crate::HostCore>,
+    launcher: std::sync::Arc<dyn crate::launcher::SessionLauncher>,
+    registry: std::sync::Arc<oximux_agents::session_registry::SessionRegistry>,
+    worktrees: Option<std::sync::Arc<dyn crate::worktrees::WorktreeService>>,
+    now_secs: fn() -> u64,
+    row_id: i64,
+    depth: u32,
+    root_id: String,
+    parent: String,
+    parent_cwd: String,
+    /// Resolved before reserving, unless the child gets a new worktree.
+    cwd_path: Option<String>,
+    posture: SpawnPosture,
+    req: SpawnAgentReq,
+}
+
+impl LaunchJob {
+    async fn run(self) -> Response {
+        // Resources the attempt creates, released if the launch fails.
+        let mut worktree_id = None;
+        let cwd = match self.cwd_path.clone() {
+            Some(cwd) => cwd,
+            None => {
+                let name = match &self.req.cwd {
+                    SpawnCwdWire::NewWorktree { name } => name.as_deref(),
+                    _ => None,
+                };
+                match self.worktree_for_child(name).await {
+                    Ok((id, path)) => {
+                        worktree_id = Some(id);
+                        path
+                    }
+                    Err(detail) => {
+                        self.rollback(&detail, None).await;
+                        return Response::Error(RpcError::BadRequest(detail));
+                    }
+                }
+            }
+        };
+
+        let ctx = ChildCtx { parent_session_id: Some(self.parent.clone()), activate: false, posture: self.posture };
+        let launched =
+            self.launcher.create_child(&cwd, Some(&self.req.agent_id), self.req.model.as_deref(), ctx).await;
+        let session_id = match launched {
+            Ok(session_id) => session_id,
+            Err(err) => {
+                tracing::warn!(error = %err, "child launch failed");
+                self.rollback(launch_reason(&err), worktree_id.as_deref()).await;
+                return match err {
+                    LaunchError::PostureUnenforceable(why) => refuse(
+                        SpawnErrorKind::PostureUnenforceable,
+                        format!("{why}. Spawn a Claude or Codex agent for this posture."),
+                    ),
+                    other => Response::Error(RpcError::BadRequest(other.to_string())),
+                };
+            }
+        };
+        if let Err(err) = self.core.lineage().finalize(self.row_id, &session_id, self.now()) {
+            // The reservation is gone (reclaimed under a launch slower than the
+            // timeout, or its parent was cancelled meanwhile). Interrupt this
+            // child rather than let it work for a tree that does not know it.
+            tracing::warn!(%err, session_id, "spawned child could not be recorded; interrupting it");
+            if let Some(h) = self.registry.get(&session_id) {
+                let _ = h.cancel();
+            }
+            return Response::Error(RpcError::Internal("the spawn could not be recorded".into()));
+        }
+        let delivered = self.registry.get(&session_id).is_some_and(|h| {
+            let sent = h.send_prompt(&self.req.prompt, &[]).is_ok();
+            // Working from this moment, not from the child's first event:
+            // until it says so itself, an idle reading would let a burst of
+            // spawns past the active caps.
+            if sent {
+                h.set_working(true);
+            }
+            sent
+        });
+        if !delivered {
+            tracing::warn!(session_id, "spawned child opened but its prompt was not delivered");
+        }
+        Response::AgentSpawned(SpawnAgentResult {
+            session_id,
+            parent_id: self.parent,
+            root_id: self.root_id,
+            depth: self.depth,
+            replayed: false,
+        })
+    }
+
+    fn now(&self) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone as _;
+        chrono::Local.timestamp_opt((self.now_secs)() as i64, 0).single().unwrap_or_else(chrono::Local::now)
+    }
+
+    /// Undo the reservation, release what the attempt created, and count the
+    /// failure against the parent's breaker.
+    async fn rollback(&self, reason: &str, worktree_id: Option<&str>) {
+        if let Err(err) = self.core.lineage().rollback(self.row_id, reason, self.now()) {
+            tracing::warn!(%err, "lineage rollback failed");
+        }
+        if let (Some(id), Some(worktrees)) = (worktree_id, self.worktrees.as_ref())
+            && worktrees.remove(id).await.is_err()
+        {
+            tracing::warn!(id, "a failed spawn's worktree could not be removed");
+        }
+    }
+
+    /// A fresh worktree for the child, named by the caller or by its request
+    /// id. Returns `(id, path)`.
+    async fn worktree_for_child(&self, name: Option<&str>) -> Result<(String, String), String> {
+        let Some(worktrees) = self.worktrees.as_ref() else {
+            return Err("this host cannot create worktrees".into());
+        };
+        let slug = super::team::slugify(name.unwrap_or(&self.req.request_id));
+        if slug.is_empty() {
+            return Err("that worktree name has nothing a branch can be named after".into());
+        }
+        worktrees
+            .create(&self.parent_cwd, &slug, &CreateBaseWire::Default)
+            .await
+            .map(|row| (row.id, row.path))
+            .map_err(|_| "the child's worktree could not be created".to_string())
+    }
+}
+
 fn refusal_kind(refusal: &SpawnRefusal) -> SpawnErrorKind {
     match refusal {
         SpawnRefusal::Depth { .. } => SpawnErrorKind::DepthExceeded,
@@ -357,6 +409,7 @@ fn refusal_kind(refusal: &SpawnRefusal) -> SpawnErrorKind {
         SpawnRefusal::StartFailing { .. } => SpawnErrorKind::StartFailing,
         SpawnRefusal::IdempotencyConflict => SpawnErrorKind::IdempotencyConflict,
         SpawnRefusal::InProgress => SpawnErrorKind::InProgress,
+        SpawnRefusal::ParentEnded => SpawnErrorKind::NotAllowed,
     }
 }
 

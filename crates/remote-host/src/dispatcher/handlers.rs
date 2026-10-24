@@ -133,7 +133,7 @@ impl Dispatcher {
     /// An empty base (`"[]"`, seq 0) is returned when the view has not published yet,
     /// so the client opens cleanly and the live stream fills it rather than erroring.
     pub(super) fn fetch_transcript(&self, peer: &Peer, session_id: &str) -> Response {
-        if !self.auth.is_allowed_for(peer, session_id) {
+        if !self.may_read_session(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         // A live session's fold is authoritative. A dormant one is read from disk
@@ -185,7 +185,7 @@ impl Dispatcher {
     }
 
     pub(super) fn session_info(&self, peer: &Peer, session_id: &str) -> Response {
-        if !self.auth.is_allowed_for(peer, session_id) {
+        if !self.may_read_session(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -275,7 +275,7 @@ impl Dispatcher {
         after_seq: u64,
         peer_version: u32,
     ) -> Response {
-        if !self.auth.is_allowed_for(peer, session_id) {
+        if !self.may_read_session(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -571,7 +571,7 @@ impl Dispatcher {
     /// `Unsupported` is a fixed variant carrying no host-authored text, so this states
     /// the cause without reopening the leak `set_choice` documents.
     pub(super) fn steer(&self, peer: &Peer, session_id: &str, text: &str) -> Response {
-        if !self.auth.may_write(peer, session_id) {
+        if !self.may_drive_session(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -599,7 +599,7 @@ impl Dispatcher {
     where
         F: FnOnce(&SessionHandle) -> anyhow::Result<()>,
     {
-        if !self.auth.may_write(peer, session_id) {
+        if !self.may_drive_session(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -617,6 +617,27 @@ impl Dispatcher {
 }
 
 impl Dispatcher {
+    /// May `peer` read `session_id`: its own scope, or — for an agent's
+    /// confined credential — a session in the subtree it spawned.
+    pub(super) fn may_read_session(&self, peer: &Peer, session_id: &str) -> bool {
+        self.auth.is_allowed_for(peer, session_id) || self.in_own_subtree(peer, session_id)
+    }
+
+    /// May `peer` drive `session_id` (send to it, steer or cancel its turn):
+    /// its write tier, or a session in its own subtree.
+    pub(super) fn may_drive_session(&self, peer: &Peer, session_id: &str) -> bool {
+        self.auth.may_write(peer, session_id) || self.in_own_subtree(peer, session_id)
+    }
+
+    /// Whether `session_id` is a descendant of the confined caller's own
+    /// session. Lineage widens nothing for the operator or a paired device.
+    fn in_own_subtree(&self, peer: &Peer, session_id: &str) -> bool {
+        let (Some(own), Some(core)) = (peer.own_session(), self.host_core.as_ref()) else {
+            return false;
+        };
+        core.lineage().is_descendant(own, session_id).unwrap_or(false)
+    }
+
     /// The posture a session was spawned under, when it is a locked one.
     fn locked_posture(&self, session_id: &str) -> Option<oximux_agents::thread::launch_posture::SpawnPosture> {
         let row = self.host_core.as_ref()?.lineage().row(session_id).ok().flatten()?;
