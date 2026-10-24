@@ -13,6 +13,7 @@ pub mod keys {
     pub const DELEGATION_ENABLED: &str = "agents.delegation.enabled";
     pub const CONFINE_CHAT: &str = "agents.delegation.confine_chat";
     pub const EXPOSE_TOOLS: &str = "agents.delegation.expose_tools";
+    pub const STEER_EVENTS: &str = "agents.delegation.steer_events";
     pub const CAP_DEPTH: &str = "agents.delegation.cap.depth";
     pub const CAP_ACTIVE_PER_PARENT: &str = "agents.delegation.cap.active_per_parent";
     pub const CAP_ACTIVE_PER_ROOT: &str = "agents.delegation.cap.active_per_root";
@@ -30,13 +31,22 @@ pub struct HostConfig {
     /// Chat agents get the delegation tools over MCP (`oximux mcp --tools
     /// orchestrate`), beside the `oximux delegate` command line.
     pub expose_tools: bool,
+    /// A child's events go into its parent's running turn when the parent's
+    /// CLI takes mid-turn messages, instead of waiting for the turn to end.
+    pub steer_events: bool,
     /// The spawn caps. The depth is clamped to the hard ceiling on every read.
     pub caps: SpawnCaps,
 }
 
 impl Default for HostConfig {
     fn default() -> Self {
-        Self { delegation_enabled: true, confine_chat: true, expose_tools: true, caps: SpawnCaps::default() }
+        Self {
+            delegation_enabled: true,
+            confine_chat: true,
+            expose_tools: true,
+            steer_events: true,
+            caps: SpawnCaps::default(),
+        }
     }
 }
 
@@ -56,6 +66,7 @@ impl HostConfig {
             delegation_enabled: flag(keys::DELEGATION_ENABLED, d.delegation_enabled),
             confine_chat: flag(keys::CONFINE_CHAT, d.confine_chat),
             expose_tools: flag(keys::EXPOSE_TOOLS, d.expose_tools),
+            steer_events: flag(keys::STEER_EVENTS, d.steer_events),
             caps: SpawnCaps {
                 depth: num(keys::CAP_DEPTH, d.caps.depth),
                 active_per_parent: num(keys::CAP_ACTIVE_PER_PARENT, d.caps.active_per_parent),
@@ -73,6 +84,7 @@ impl HostConfig {
             (keys::DELEGATION_ENABLED, self.delegation_enabled.to_string()),
             (keys::CONFINE_CHAT, self.confine_chat.to_string()),
             (keys::EXPOSE_TOOLS, self.expose_tools.to_string()),
+            (keys::STEER_EVENTS, self.steer_events.to_string()),
             (keys::CAP_DEPTH, self.caps.depth.to_string()),
             (keys::CAP_ACTIVE_PER_PARENT, self.caps.active_per_parent.to_string()),
             (keys::CAP_ACTIVE_PER_ROOT, self.caps.active_per_root.to_string()),
@@ -128,6 +140,7 @@ mod tests {
             delegation_enabled: false,
             confine_chat: true,
             expose_tools: false,
+            steer_events: false,
             caps: SpawnCaps { depth: 2, active_per_parent: 3, ..SpawnCaps::default() },
         };
         let stored: std::collections::HashMap<&str, String> = custom.entries().into_iter().collect();

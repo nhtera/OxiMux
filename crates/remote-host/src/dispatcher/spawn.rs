@@ -239,6 +239,7 @@ impl Dispatcher {
         // A run is always cancelled as a whole.
         match core.lineage().mark_ended(id, cascade || is_run, self.now_local()) {
             Ok(ended) => {
+                core.note_ended(&ended);
                 // Stop any turn still running; a dormant child has nothing to
                 // stop and is not opened.
                 for session in &ended {

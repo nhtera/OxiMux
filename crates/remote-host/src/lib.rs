@@ -15,11 +15,13 @@
 
 pub mod auth;
 pub mod catalog;
+mod child_watcher;
 pub mod dispatcher;
 pub mod host_config;
 pub mod host_core;
 pub mod identity;
 pub mod launcher;
+mod outbox_drainer;
 pub mod projects;
 pub mod rewind;
 pub mod schedule_runner;

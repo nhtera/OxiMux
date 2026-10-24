@@ -237,6 +237,23 @@ impl Outbox {
         self.transition(key, &["sent"], "unconfirmed", None)
     }
 
+    /// The parent's session went away (its tab closed, its process ended):
+    /// batches its gate still held go back to `pending` for the next bind;
+    /// lines already written but not seen accepted become `unconfirmed`.
+    pub fn release_parent(&self, parent: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_event_outbox SET state = 'pending', claimed_by = NULL, claimed_at = NULL, \
+             send_key = NULL WHERE parent_session = ?1 AND state = 'claimed'",
+            params![parent],
+        )?;
+        conn.execute(
+            "UPDATE agent_event_outbox SET state = 'unconfirmed' WHERE parent_session = ?1 AND state = 'sent'",
+            params![parent],
+        )?;
+        Ok(())
+    }
+
     /// Everything still owed to a parent that has ended becomes a UI-only
     /// record.
     pub fn settle_undeliverable(&self, parent: &str) -> Result<usize> {

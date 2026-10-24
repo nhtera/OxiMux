@@ -350,6 +350,12 @@ impl LineageStore {
         Self { conn }
     }
 
+    /// The child-event outbox in the same database (the two tables move
+    /// together on a rekey).
+    pub fn outbox(&self) -> crate::outbox::Outbox {
+        crate::outbox::Outbox::new(self.conn.clone())
+    }
+
     /// Take a slot for a child of `parent`, or refuse.
     ///
     /// In one `BEGIN IMMEDIATE` transaction: reconcile the parent's tree

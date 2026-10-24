@@ -98,6 +98,7 @@ pub enum Ready {
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
+type SentHook = Arc<dyn Fn(Uuid, bool) + Send + Sync>;
 
 /// The gate. See the module docs.
 #[derive(Default)]
@@ -105,6 +106,9 @@ pub struct SendGate {
     queue: VecDeque<QueuedSend>,
     next_id: u64,
     waker: Option<Waker>,
+    /// Told when the owner wrote an item (or failed to): the host settles the
+    /// child events it queued by the item's uuid.
+    sent_hook: Option<SentHook>,
     /// A turn is running (from the first send until its end frame).
     turn_active: bool,
     /// The running turn has said it started (a steer may be written).
@@ -144,6 +148,20 @@ impl SendGate {
 
     pub fn clear_waker(&mut self) {
         self.waker = None;
+    }
+
+    /// Who to tell when an item was written. Called with the gate's lock
+    /// held, so it must only signal.
+    pub fn set_sent_hook(&mut self, hook: impl Fn(Uuid, bool) + Send + Sync + 'static) {
+        self.sent_hook = Some(Arc::new(hook));
+    }
+
+    /// The owner wrote the item queued under `uuid` (`ok`), or the write
+    /// failed.
+    pub fn report_sent(&self, uuid: Uuid, ok: bool) {
+        if let Some(hook) = &self.sent_hook {
+            hook(uuid, ok);
+        }
     }
 
     /// Whether an owner is listening. Without one, a sender writes directly.

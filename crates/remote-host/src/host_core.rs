@@ -3,8 +3,8 @@
 //! State both dispatchers (remote and local) must share lives here, built once
 //! per process and injected into each, never constructed per dispatcher: the
 //! spawn lineage, the host config, and the runtime the host's background work
-//! runs on. Later phases add the child watcher, the outbox drainer, attention
-//! and push to it.
+//! runs on, the child watcher and the outbox drainer that bring a child's
+//! events to its parent. Later phases add attention and push.
 //!
 //! **Always on.** On the desktop the core runs whether or not a remote or local
 //! listener is enabled; the listeners are only front doors. Its background
@@ -21,14 +21,23 @@
 //! nothing, and reports that spawning needs the host role.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use oximux_agents::envelope::{ChildEvent, ChildEventKind};
 use oximux_agents::lineage::{LineageState, LineageStore, WorkingSessions};
+use oximux_agents::outbox::Outbox;
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::launch_posture::SpawnPosture;
 use oximux_single_instance::HolderRecord;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
+use crate::child_watcher::ChildWatcher;
 use crate::host_config::HostConfig;
+use crate::outbox_drainer::{self, DrainMsg};
+
+/// How long a recorded child event waits for others before it is delivered,
+/// so children that finish together reach their parent as one message.
+pub const EVENT_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Who held the data directory before this host won its lock.
 ///
@@ -89,22 +98,36 @@ pub struct HostCore {
     config: watch::Sender<HostConfig>,
     /// `Some` while this process owns the data dir: who owned it before.
     prior: Mutex<Option<PriorOwner>>,
+    /// This process's id as a host, for outbox claims.
+    instance: String,
+    outbox: Outbox,
+    watcher: ChildWatcher,
+    drain: mpsc::UnboundedSender<DrainMsg>,
+    debounce: Mutex<Duration>,
 }
 
 impl HostCore {
     /// Build the core and start its always-on work: the status subscriber that
     /// parks a spawned child when its session goes idle and revives it when it
-    /// works again.
+    /// works again (and keeps the child watcher attached), and the outbox
+    /// drainer.
     pub fn new(deps: HostCoreDeps) -> Arc<Self> {
         let (config, _) = watch::channel(deps.config.sanitized());
+        let (drain, drain_rx) = mpsc::unbounded_channel();
         let core = Arc::new(Self {
             rt: deps.rt,
+            outbox: deps.lineage.outbox(),
             lineage: deps.lineage,
             registry: deps.registry,
             config,
             prior: Mutex::new(None),
+            instance: uuid::Uuid::new_v4().to_string(),
+            watcher: ChildWatcher::default(),
+            drain: drain.clone(),
+            debounce: Mutex::new(EVENT_DEBOUNCE),
         });
         core.spawn_status_subscriber();
+        core.rt.spawn(outbox_drainer::run(Arc::downgrade(&core), drain, drain_rx));
         core
     }
 
@@ -120,6 +143,12 @@ impl HostCore {
         }
         if let Err(err) = self.lineage.boot_reconcile(chrono::Local::now()) {
             tracing::warn!(%err, "lineage boot reconcile failed");
+        }
+        // Whatever the previous owner had in flight: claims it never wrote go
+        // back to pending, lines it wrote but never saw accepted are shown as
+        // unconfirmed (never resent on their own).
+        if let Err(err) = self.outbox.take_over(&self.instance) {
+            tracing::warn!(%err, "outbox take-over failed");
         }
         tracing::info!(?prior, "host started");
         *slot = Some(prior);
@@ -148,6 +177,72 @@ impl HostCore {
 
     pub fn lineage(&self) -> &LineageStore {
         &self.lineage
+    }
+
+    /// Child events waiting to reach their parents.
+    pub fn outbox(&self) -> &Outbox {
+        &self.outbox
+    }
+
+    pub(crate) fn registry(&self) -> &SessionRegistry {
+        &self.registry
+    }
+
+    /// This process's id as a host (outbox claims carry it).
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// Child events still on their way to `parent` (pending, or held in its
+    /// send gate), for "N child events waiting".
+    pub fn pending_events(&self, parent: &str) -> u32 {
+        self.outbox.pending_count(parent).unwrap_or(0)
+    }
+
+    /// How long a child event waits for others before delivery.
+    pub fn event_debounce(&self) -> Duration {
+        *self.debounce.lock().unwrap()
+    }
+
+    /// Change [`Self::event_debounce`] (tests shorten it).
+    pub fn set_event_debounce(&self, debounce: Duration) {
+        *self.debounce.lock().unwrap() = debounce;
+    }
+
+    /// Write an event a child owes `parent`; a new one wakes the drainer.
+    pub(crate) fn record_child_event(&self, parent: &str, event: &ChildEvent, edge_id: &str) {
+        match self.outbox.push(parent, event, edge_id, chrono::Local::now()) {
+            Ok(true) => {
+                let _ = self.drain.send(DrainMsg::Wake);
+            }
+            Ok(false) => {}
+            Err(err) => tracing::warn!(%err, parent, "child event not recorded"),
+        }
+    }
+
+    /// These children were cancelled: each owes its parent one `cancelled`.
+    pub fn note_ended(&self, ended: &[String]) {
+        if !self.is_owner() {
+            return;
+        }
+        for child in ended {
+            let Ok(Some(row)) = self.lineage.row(child) else { continue };
+            let Some(parent) = crate::child_watcher::session_parent(&row) else { continue };
+            if !oximux_agents::envelope::admitted(row.notify_parent, ChildEventKind::Cancelled) {
+                continue;
+            }
+            let title = self.registry.get(child).and_then(|h| h.meta_snapshot().title).unwrap_or_else(|| child.clone());
+            let event = ChildEvent {
+                kind: ChildEventKind::Cancelled,
+                child: child.clone(),
+                depth: row.depth,
+                title,
+                status: None,
+                result: None,
+                permit: None,
+            };
+            self.record_child_event(parent, &event, "ended");
+        }
     }
 
     pub fn runtime(&self) -> &tokio::runtime::Handle {
@@ -243,6 +338,9 @@ impl HostCore {
             loop {
                 let Some(core) = weak.upgrade() else { return };
                 core.sync_lineage_states();
+                if core.is_owner() {
+                    core.watcher.sync(&core);
+                }
                 drop(core);
                 if changes.changed().await.is_err() {
                     return;

@@ -182,3 +182,15 @@ fn a_rekeyed_parent_keeps_its_rows() {
     assert_eq!(ob.pending_count("claude-abc").unwrap(), 1);
     assert_eq!(ob.parents_with_pending().unwrap(), ["claude-abc"]);
 }
+
+#[test]
+fn a_parent_that_goes_away_gets_its_held_batch_back_and_its_written_one_unconfirmed() {
+    let ob = outbox();
+    ob.push("p", &event("c1", ChildEventKind::Finished), "turn-1", t0()).unwrap();
+    let written = ob.claim("p", "host-a", t0()).unwrap().unwrap();
+    ob.mark_sent(written.key).unwrap();
+    ob.push("p", &event("c2", ChildEventKind::Finished), "turn-1", t0()).unwrap();
+    ob.claim("p", "host-a", t0()).unwrap().unwrap();
+    ob.release_parent("p").unwrap();
+    assert_eq!(states(&ob, "p"), [OutboxState::Unconfirmed, OutboxState::Pending]);
+}

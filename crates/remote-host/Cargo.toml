@@ -35,6 +35,7 @@ oximux-single-instance = { workspace = true }
 # Schedule rows carry `DateTime<Local>` fires; this boundary formats them to
 # RFC-3339 for the wire and derives the tick clock from the injected `now_secs`.
 chrono = { workspace = true }
+uuid = { workspace = true }
 # Voice-dictation clips cross the wire base64-encoded (the same encoding the
 # composer's image attachments use); this boundary decodes them before handing
 # raw bytes to the transcription seam.

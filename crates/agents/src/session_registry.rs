@@ -201,6 +201,17 @@ pub struct SessionHandle {
     /// lines the agent started on and which a turn carried. Kept apart from
     /// `live` and the backlog, which remote clients read.
     receipts: broadcast::Sender<ThreadEvent>,
+    /// This handle's own id, new each time a session registers: two runs of
+    /// one session (a respawn after a restart, a rekey) never share it, so it
+    /// tells their event sequence numbers apart.
+    incarnation: String,
+    /// The host watches this session (a delegated child): its events go into
+    /// the ring even while no remote reader could connect.
+    watched: std::sync::atomic::AtomicBool,
+    /// The queue every send to this session goes through, owned by whoever
+    /// drives the session (the desktop view) and attached here so remote sends
+    /// and the host's own deliveries join it. `None`: sends write directly.
+    gate: Mutex<Option<Arc<Mutex<crate::send_gate::SendGate>>>>,
     /// Request-ids that have been decided. Insertion is the atomic gate: the
     /// caller whose `insert` returns `true` is the one that fires the transport.
     decided: Mutex<HashSet<String>>,
@@ -323,6 +334,30 @@ impl SessionHandle {
 
         self.update_status(Some(seq));
         seq
+    }
+
+    /// See the `incarnation` field.
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
+    /// Mark this session watched by the host (its events are always kept).
+    pub fn set_watched(&self, watched: bool) {
+        self.watched.store(watched, Ordering::Release);
+    }
+
+    pub fn watched(&self) -> bool {
+        self.watched.load(Ordering::Acquire)
+    }
+
+    /// Attach (or detach) the send gate of whoever drives this session.
+    pub fn set_gate(&self, gate: Option<Arc<Mutex<crate::send_gate::SendGate>>>) {
+        *self.gate.lock().unwrap() = gate;
+    }
+
+    /// The driver's send gate, if one is attached.
+    pub fn gate(&self) -> Option<Arc<Mutex<crate::send_gate::SendGate>>> {
+        self.gate.lock().unwrap().clone()
     }
 
     /// Receipts for the host's sends to this session, from now on.
@@ -817,6 +852,9 @@ impl SessionRegistry {
             backlog_cap: backlog_cap.max(1),
             live,
             receipts,
+            incarnation: uuid::Uuid::new_v4().to_string(),
+            watched: std::sync::atomic::AtomicBool::new(false),
+            gate: Mutex::new(None),
             decided: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             status_tx,
