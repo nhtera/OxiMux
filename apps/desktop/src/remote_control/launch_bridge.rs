@@ -52,9 +52,17 @@ const QUEUE: usize = 16;
 #[derive(Clone)]
 pub struct BridgeLauncher {
     tx: mpsc::Sender<LaunchRequest>,
+    /// The agents a spawn may name, kept by the UI side (the dispatcher's
+    /// thread cannot read the launch settings, a GPUI global).
+    roster: std::sync::Arc<std::sync::Mutex<Vec<oximux_remote_proto::lineage::AgentRosterWire>>>,
 }
 
 impl BridgeLauncher {
+    /// Replace the roster `Whoami` reports and spawns are checked against.
+    pub fn set_roster(&self, roster: Vec<oximux_remote_proto::lineage::AgentRosterWire>) {
+        *self.roster.lock().unwrap() = roster;
+    }
+
     /// Open a session, optionally seeding its first message — the scheduler's
     /// entry point. The plain [`SessionLauncher::create`] delegates here with
     /// no prompt.
@@ -100,7 +108,7 @@ impl BridgeLauncher {
 /// answer once the window that would host the tab is gone.
 pub fn launch_bridge() -> (BridgeLauncher, mpsc::Receiver<LaunchRequest>) {
     let (tx, rx) = mpsc::channel(QUEUE);
-    (BridgeLauncher { tx }, rx)
+    (BridgeLauncher { tx, roster: Default::default() }, rx)
 }
 
 #[async_trait::async_trait]
@@ -126,6 +134,41 @@ impl SessionLauncher for BridgeLauncher {
     ) -> Result<String, LaunchError> {
         self.send(cwd, agent_id, model, None, Some(ctx)).await
     }
+
+    fn roster(&self) -> Vec<oximux_remote_proto::lineage::AgentRosterWire> {
+        self.roster.lock().unwrap().clone()
+    }
+}
+
+/// The agents a spawn may name: every chat-capable, enabled agent, with the
+/// postures its transport can be held to (the spike's mapping: Claude and
+/// Codex all three, Pi Default and Review, ACP and omp Default only).
+///
+/// `models` is empty (the plan allows a cold catalog; the agent's default
+/// applies) and `installed` means configured: telling a missing binary apart
+/// is the provisioning work's job.
+pub fn roster_from(settings: &oximux_settings::AgentLaunchSettings) -> Vec<oximux_remote_proto::lineage::AgentRosterWire> {
+    use oximux_remote_proto::lineage::{AgentRosterWire, SpawnPostureWire as P};
+    use oximux_settings::Transport;
+    const BUILTINS: [(&str, &str); 4] = [("claude-code", "Claude"), ("codex", "Codex"), ("pi", "Pi"), ("omp", "omp")];
+    let configured = settings.agents.keys().filter(|id| !BUILTINS.iter().any(|(b, _)| b == id)).map(|id| (id.as_str(), id.as_str()));
+    BUILTINS
+        .into_iter()
+        .chain(configured)
+        .filter(|(id, _)| settings.chat_capable(id) && !settings.is_disabled(id))
+        .map(|(id, display)| AgentRosterWire {
+            agent_id: id.to_string(),
+            display: display.to_string(),
+            default_model: None,
+            models: Vec::new(),
+            postures: match settings.transport_for(id) {
+                Transport::StreamJson | Transport::AppServer => vec![P::Default, P::Review, P::Verify],
+                Transport::Rpc => vec![P::Default, P::Review],
+                _ => vec![P::Default],
+            },
+            installed: true,
+        })
+        .collect()
 }
 
 /// Whether `cwd` is a directory this desktop can actually open a session in.
@@ -359,6 +402,21 @@ mod tests {
         };
         assert_eq!(launcher.create_child("/work", Some("claude-code"), None, ctx).await.unwrap(), "child-1");
         ui.await.unwrap();
+    }
+
+    /// The roster offers what the posture mapping can hold, per transport.
+    #[test]
+    fn the_roster_lists_chat_agents_with_their_enforceable_postures() {
+        use oximux_remote_proto::lineage::SpawnPostureWire as P;
+        let roster = roster_from(&oximux_settings::AgentLaunchSettings::default());
+        let claude = roster.iter().find(|a| a.agent_id == "claude-code").expect("claude is a chat agent");
+        assert_eq!(claude.postures, vec![P::Default, P::Review, P::Verify]);
+        for agent in &roster {
+            assert!(agent.postures.contains(&P::Default), "{}", agent.agent_id);
+            if agent.agent_id == "omp" {
+                assert_eq!(agent.postures, vec![P::Default], "omp stays Default-only");
+            }
+        }
     }
 
     /// No UI side at all — the window is gone, or remote was enabled before one

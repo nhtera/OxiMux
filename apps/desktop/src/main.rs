@@ -503,6 +503,15 @@ fn main() {
             // A clone of the same queue for the scheduler's firer below — one
             // GPUI drain loop serves phone launches and scheduled fires alike.
             let for_scheduler = launcher.clone();
+            // What `oximux whoami` lists and a spawn is checked against,
+            // refreshed whenever the launch settings change.
+            let roster = launcher.clone();
+            let seed = cx.try_global::<oximux_settings::AgentLaunchSettings>().cloned().unwrap_or_default();
+            roster.set_roster(oximux_app::remote_control::launch_bridge::roster_from(&seed));
+            cx.observe_global::<oximux_settings::AgentLaunchSettings>(move |cx| {
+                roster.set_roster(oximux_app::remote_control::launch_bridge::roster_from(cx.global()));
+            })
+            .detach();
             remote_control.set_launcher(std::sync::Arc::new(launcher));
             oximux_app::remote_control::launch_bridge::serve_launches(requests, cx);
             for_scheduler
