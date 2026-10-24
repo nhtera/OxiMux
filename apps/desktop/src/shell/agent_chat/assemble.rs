@@ -343,6 +343,7 @@ impl AgentChatView {
             connection,
             remote_session_id,
             spawn_posture,
+            posture_refused: None,
             pending_respawn: false,
             remote,
             backend,

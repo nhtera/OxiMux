@@ -689,6 +689,96 @@
             .expect("window update");
     }
 
+    /// A reviewer whose agent announces a mode its posture forbids is stopped,
+    /// and stays stopped: no respawn path (a send after Stop, a remote open,
+    /// Retry) may revive a process that would take the next prompt unconfined.
+    /// A Default chat with the same init is left alone.
+    #[gpui::test]
+    async fn a_child_that_ignored_its_posture_is_stopped_and_stays_stopped(cx: &mut TestAppContext) {
+        use oximux_agents::thread::launch_posture::SpawnPosture;
+
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let init = |mode: &str| ThreadEvent::SessionInit {
+            session_id: "s".into(),
+            model: "m".into(),
+            permission_mode: mode.into(),
+            slash_commands: Vec::new(),
+            meta: oximux_agents::thread::SessionMeta { tools: vec!["Read".into(), "Bash".into()], ..Default::default() },
+        };
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.backend = ChatBackend::stream_json();
+                view.guard_spawn_posture(&init("default"));
+                assert!(view.connection.is_some(), "a Default chat is not judged");
+
+                view.spawn_posture = SpawnPosture::Review;
+                view.interrupted = true; // a user Stop raced the init
+                view.guard_spawn_posture(&init("dontAsk"));
+                assert!(view.connection.is_none(), "Bash outside Review stops the agent");
+                assert!(!view.interrupted, "the exit is not a resumable Stop");
+                let why = view.thread.last_error.clone().expect("the chat says why");
+                assert!(why.contains("Bash"), "{why}");
+
+                view.thread.last_error = None;
+                view.respawn(cx);
+                assert!(view.connection.is_none(), "no respawn revives it");
+                assert!(view.disconnected);
+                assert_eq!(view.thread.last_error.as_deref(), Some(why.as_str()));
+            })
+            .expect("window update");
+    }
+
+    /// A Claude chat told its id up front keeps it across a respawn until a
+    /// prompt has reached the agent (Claude refuses a used `--session-id`);
+    /// a placeholder or a non-Claude chat never passes one.
+    #[gpui::test]
+    async fn an_unprompted_claude_respawn_keeps_its_preassigned_id(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                let id = uuid::Uuid::new_v4().to_string();
+                view.backend = ChatBackend::stream_json();
+                view.remote_session_id = id.clone();
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, Some(id.clone()));
+
+                view.backend = ChatBackend::from(Transport::Rpc);
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, None, "not Claude");
+
+                view.backend = ChatBackend::stream_json();
+                view.remote_session_id = "agent-17000000000001".into();
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, None, "a placeholder");
+
+                view.remote_session_id = id;
+                view.thread.push_user_message("go");
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, None, "already prompted");
+            })
+            .expect("window update");
+    }
+
     /// A backend that describes its own commands drives the palette's grouping,
     /// descriptions and attribution — no on-disk scan of another CLI's config.
     #[gpui::test]

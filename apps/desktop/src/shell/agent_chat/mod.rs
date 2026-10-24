@@ -575,6 +575,9 @@ pub struct AgentChatView {
     /// What this chat may do, fixed at spawn (a reviewer, a verifier); applied
     /// on every respawn and never changed by the mode picker.
     spawn_posture: oximux_agents::thread::launch_posture::SpawnPosture,
+    /// Why the agent was stopped for not holding its posture; no respawn
+    /// revives it (`child.rs`).
+    posture_refused: Option<String>,
     /// A respawn asked for mid-turn, run when the turn ends (`respawn_gate`).
     pending_respawn: bool,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
@@ -1229,21 +1232,8 @@ impl AgentChatView {
         spec.claude_fast_mode =
             claude_fast_mode_to_apply(self.claude_fast_mode_snapshot(), self.model.as_deref());
         spec.posture = self.spawn_posture;
+        spec.fresh_session_id = self.unused_preassigned_id();
         spec
-    }
-
-    /// Claude's fast-mode pick as the user last set it, read from the composer's
-    /// feature picks. `None` for a non-Claude chat or when the toggle was never
-    /// touched. This is what persists; whether it is *applied* to a spawn is
-    /// [`claude_fast_mode_to_apply`]'s call.
-    fn claude_fast_mode_snapshot(&self) -> Option<bool> {
-        if self.backend.transport != Transport::StreamJson {
-            return None;
-        }
-        match self.feature_values.get(oximux_agents::thread::FEATURE_FAST_MODE) {
-            Some(FeatureValue::Bool(on)) => Some(*on),
-            _ => None,
-        }
     }
 
     /// Push the stored fast-mode pick onto the live Claude session once the
@@ -2217,6 +2207,9 @@ impl AgentChatView {
         // rather than signalling the process, so after one the child is still
         // *alive* and this is what ends it; it also harvests a child that died
         // on its own.
+        if self.respawn_refused_for_posture() {
+            return;
+        }
         self.pending_respawn = false; // this respawn satisfies a deferred one
         if let Some(old) = self.connection.take() {
             old.shutdown();
@@ -2617,6 +2610,7 @@ impl AgentChatView {
             connection: Some(connection),
             remote_session_id,
             spawn_posture: Default::default(),
+            posture_refused: None,
             pending_respawn: false,
             remote,
             backend: ChatBackend::stream_json(),

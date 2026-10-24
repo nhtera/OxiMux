@@ -1,6 +1,6 @@
 //! The per-backend postures a chat persists and respawns under (Pi's tool
-//! gate, omp's approval mode, Codex's approval policy and sandbox), read back
-//! from the composer's feature picks. Moved verbatim out of `mod.rs` for
+//! gate, omp's approval mode, Codex's approval policy and sandbox, Claude's
+//! fast mode), read back from the composer's feature picks. Moved verbatim out of `mod.rs` for
 //! file-size headroom.
 
 use oximux_agents::thread::pi::posture::{self as pi_posture, PiPosture};
@@ -9,6 +9,20 @@ use oximux_agents::thread::{FeatureValue, Transport};
 use super::AgentChatView;
 
 impl AgentChatView {
+    /// Claude's fast-mode pick as the user last set it, read from the composer's
+    /// feature picks. `None` for a non-Claude chat or when the toggle was never
+    /// touched. This is what persists; whether it is *applied* to a spawn is
+    /// [`super::claude_fast_mode_to_apply`]'s call.
+    pub(super) fn claude_fast_mode_snapshot(&self) -> Option<bool> {
+        if self.backend.transport != Transport::StreamJson {
+            return None;
+        }
+        match self.feature_values.get(oximux_agents::thread::FEATURE_FAST_MODE) {
+            Some(FeatureValue::Bool(on)) => Some(*on),
+            _ => None,
+        }
+    }
+
     /// Pi's tool posture, read from the composer's feature picks. `None` for a
     /// non-Pi chat or when nothing was changed (restore then applies the
     /// deliberate default).

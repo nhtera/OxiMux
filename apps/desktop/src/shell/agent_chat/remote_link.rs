@@ -14,6 +14,21 @@ use oximux_agents::thread::ConnectSpec;
 use super::{AgentChatView, RemoteControl};
 
 impl AgentChatView {
+    /// The id a Claude respawn should start under: the one chosen up front
+    /// (`assemble`), while no prompt has reached it. Claude records a session
+    /// on its first prompt and refuses the same `--session-id` after that; a
+    /// session never prompted leaves nothing behind, so reusing the id keeps the
+    /// registry, lineage and credential on it across an early respawn (a model
+    /// switch, local access turned on, Retry). A placeholder (`agent-…`, a
+    /// draft) is not a Claude id and is never passed.
+    pub(super) fn unused_preassigned_id(&self) -> Option<String> {
+        let unused = self.backend.transport == oximux_agents::thread::Transport::StreamJson
+            && self.thread.session_id.is_none()
+            && !self.thread.entries.iter().any(|e| matches!(e, super::ThreadEntry::User { .. }))
+            && uuid::Uuid::parse_str(&self.remote_session_id).is_ok();
+        unused.then(|| self.remote_session_id.clone())
+    }
+
     /// Move this session onto the agent's own id once the agent has minted one.
     ///
     /// A chat that has never run is registered under a positional placeholder,
