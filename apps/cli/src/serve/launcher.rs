@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::{ConnectSpec, ThreadEvent, Transport, connect};
 use oximux_remote_host::{LaunchError, SessionLauncher};
-use oximux_remote_local::{
-    LocalControlListener, SESSION_ENV_VAR, SESSION_TOKEN_ENV_VAR, generate_token,
-};
+use oximux_remote_local::{LocalControlListener, credential_env, credential_label};
 use oximux_storage::SettingsRepo;
 
 use super::blob::ChatBlob;
@@ -114,26 +112,6 @@ pub struct HeadlessLauncher {
     index: Arc<SessionIndex>,
     /// The local socket, for minting each agent's own confined credential.
     local: Arc<LocalControlListener>,
-}
-
-/// The environment an agent carries: which credential it holds, and the secret
-/// proving it. Both or neither — a token with no label names nothing to look
-/// up, and a label with no token proves nothing.
-pub fn credential_env(label: &str, secret: &str) -> Vec<(String, String)> {
-    vec![
-        (SESSION_ENV_VAR.to_string(), label.to_string()),
-        (SESSION_TOKEN_ENV_VAR.to_string(), secret.to_string()),
-    ]
-}
-
-/// An opaque handle naming one spawn's credential.
-///
-/// Minted with the credential generator even though a label is not itself a
-/// secret: it is the lookup key a caller must name to be *offered* the proof,
-/// and a predictable key would let any same-user process aim the handshake at
-/// a specific agent's credential instead of having to guess both halves.
-fn credential_label() -> String {
-    format!("agent-{}", generate_token())
 }
 
 impl HeadlessLauncher {

@@ -878,7 +878,7 @@ impl PaneGroup {
         });
         // Pushed before sending so the tab is in the tree when the first turn
         // starts streaming into it.
-        let idx = self.push_agent_chat_view(view.clone(), cwd, model, window, cx);
+        let idx = self.push_agent_chat_view(view.clone(), cwd, model, true, window, cx);
         if let Some(prompt) = initial_prompt {
             view.update(cx, |view, cx| view.send_text(prompt, Vec::new(), cx));
         }
@@ -913,7 +913,7 @@ impl PaneGroup {
                 cx,
             )
         });
-        self.push_agent_chat_view(view, cwd, None, window, cx)
+        self.push_agent_chat_view(view, cwd, None, true, window, cx)
     }
 
     /// Restore an Agent Chat tab: rehydrate the transcript and spawn the
@@ -970,7 +970,7 @@ impl PaneGroup {
         if let Some(saved) = pending_retry {
             view.update(cx, |v, cx| v.restore_pending_retry(saved, cx));
         }
-        self.push_agent_chat_view(view, cwd, model, window, cx)
+        self.push_agent_chat_view(view, cwd, model, true, window, cx)
     }
 
     /// Restore an UNBOUND *New Agent* draft: rebuild the unbound picker shape
@@ -1005,16 +1005,19 @@ impl PaneGroup {
         if draft.is_some() || !queued.is_empty() {
             view.update(cx, |v, cx| v.seed_draft_and_queue(draft, queued, window, cx));
         }
-        self.push_agent_chat_view(view, cwd, None, window, cx)
+        self.push_agent_chat_view(view, cwd, None, true, window, cx)
     }
 
     /// Shared tab-push for a freshly-built chat view (new or restored): assigns
     /// the running `Chat N` label, wires the repaint observer, and activates it.
-    fn push_agent_chat_view(
+    pub(super) fn push_agent_chat_view(
         &mut self,
         view: Entity<crate::shell::agent_chat::AgentChatView>,
         cwd: PathBuf,
         model: Option<String>,
+        // `false` for a spawned child: it opens beside its parent and never
+        // takes focus or the active slot from the user.
+        activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1060,10 +1063,12 @@ impl PaneGroup {
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
         self.tab_order.push(new_idx);
-        self.active = new_idx;
-        self.bump_mru(new_idx);
-        self.focus_active(window, cx);
-        self.pin_tab_strip_to_end();
+        if activate {
+            self.active = new_idx;
+            self.bump_mru(new_idx);
+            self.focus_active(window, cx);
+            self.pin_tab_strip_to_end();
+        }
         // Seed the remote registry with the tab's starting label so a paired
         // device shows "Chat N" (or a restored custom title) rather than agent-N.
         self.sync_remote_tab_title(new_idx, cx);
@@ -2010,7 +2015,7 @@ impl PaneGroup {
                 cx,
             )
         });
-        self.push_agent_chat_view(view, cwd, None, window, cx);
+        self.push_agent_chat_view(view, cwd, None, true, window, cx);
     }
 
     /// Open or activate a commit-detail tab. Dedup key is the full

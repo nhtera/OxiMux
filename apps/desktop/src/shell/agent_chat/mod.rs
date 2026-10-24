@@ -46,6 +46,7 @@ mod forge_picker;
 mod image_attach;
 mod image_cache;
 mod jump_menu;
+mod child;
 mod login_card;
 mod remote_link;
 mod sign_in;
@@ -570,6 +571,9 @@ pub struct AgentChatView {
     /// (maybe-not-yet-known) session id — remote just needs a key stable for the
     /// view's lifetime.
     remote_session_id: String,
+    /// What this chat may do, fixed at spawn (a reviewer, a verifier); applied
+    /// on every respawn and never changed by the mode picker.
+    spawn_posture: oximux_agents::thread::launch_posture::SpawnPosture,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`
@@ -1221,6 +1225,7 @@ impl AgentChatView {
         // a Stop-then-resume — when the new model supports it.
         spec.claude_fast_mode =
             claude_fast_mode_to_apply(self.claude_fast_mode_snapshot(), self.model.as_deref());
+        spec.posture = self.spawn_posture;
         spec
     }
 
@@ -2270,7 +2275,8 @@ impl AgentChatView {
         if let Some(old) = self.connection.take() {
             old.shutdown();
         }
-        let spec = self.respawn_spec(env, auth_method);
+        let mut spec = self.respawn_spec(env, auth_method);
+        Self::add_spawn_credential(&mut spec, &self.remote_session_id, cx);
         match computer_use::connect_declaring(spec, &self.screen_control, cx) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
@@ -2382,7 +2388,9 @@ impl AgentChatView {
     fn change_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
         // Unreachable pre-bind (the mode picker is hidden on an unbound draft),
         // but guard anyway so a stray pick can't early-spawn the subprocess.
-        if self.unbound {
+        // A reviewer or verifier keeps its mode for life (the host refuses the
+        // same change from a phone).
+        if self.unbound || self.spawn_posture != Default::default() {
             return;
         }
         // The baseline ("no flag") mode comes from the backend, not a const —
@@ -2662,6 +2670,7 @@ impl AgentChatView {
             thread: ChatThread::new(),
             connection: Some(connection),
             remote_session_id,
+            spawn_posture: Default::default(),
             remote,
             backend: ChatBackend::stream_json(),
             composer,
@@ -3271,6 +3280,7 @@ impl AgentChatView {
         // The live process is gone: drop the remote binding so the phone's session
         // list reflects only live sessions (a resume respawns + re-binds).
         self.unbind_remote();
+        self.revoke_spawn_credential(cx);
         let pending = self
             .thread
             .pending_permission()

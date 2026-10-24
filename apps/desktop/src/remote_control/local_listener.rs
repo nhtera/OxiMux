@@ -39,6 +39,18 @@ impl LocalHandle {
     pub fn revoke_session(&self, session_id: &str) {
         self.listener.revoke_session(session_id);
     }
+
+    /// Point the credential `label` at `session_id` (a fresh spawn's real
+    /// id, or a chat re-keyed onto its agent's id).
+    pub fn bind_session(&self, label: &str, session_id: &str) {
+        self.listener.bind_session(label, session_id);
+    }
+
+    /// Re-register a credential this listener did not mint (local access
+    /// switched off and on: the agent still holds its secret).
+    pub fn restore_session(&self, label: &str, secret: &str, session_id: &str) {
+        self.listener.restore_session(label, secret, session_id);
+    }
 }
 
 impl Drop for LocalHandle {

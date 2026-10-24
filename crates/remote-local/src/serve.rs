@@ -211,6 +211,17 @@ impl LocalControlListener {
         }
     }
 
+    /// Re-register a credential minted earlier (by a listener since dropped)
+    /// with this one, already pointing at `session_id`. For a host whose local
+    /// access was switched off and on again: the agent still holds the secret
+    /// it was spawned with, and handing it a new one would mean a respawn.
+    pub fn restore_session(&self, label: &str, secret: &str, session_id: &str) {
+        self.credentials.lock().unwrap().insert(
+            LocalIdentity::Session(label.to_string()),
+            (secret.to_string(), LocalClaim::Session(session_id.to_string())),
+        );
+    }
+
     /// Mint the MCP client's credential, register it, and write it to the
     /// runtime dir's MCP token file (owner-only, like the operator's). A
     /// connection presenting it is the `Mcp` principal: a scope of its own,

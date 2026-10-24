@@ -13,6 +13,7 @@
 //! manager. File-open and split actions target the active group.
 
 mod render;
+mod child_tabs;
 mod ops;
 mod state;
 

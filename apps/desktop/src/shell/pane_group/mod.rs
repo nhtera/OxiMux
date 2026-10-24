@@ -21,6 +21,7 @@ mod daemon_loss_tests;
 mod history_tests;
 mod actions;
 mod agent_restore;
+mod child_tabs;
 mod kill_all;
 mod state;
 mod tabs;

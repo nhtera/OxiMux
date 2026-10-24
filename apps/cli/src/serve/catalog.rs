@@ -161,7 +161,7 @@ impl HeadlessCatalog {
         // is known here, so the credential is granted under it and is correctly
         // scoped from its very first use.
         let secret = self.local.grant_session(session_id);
-        spec.env = super::launcher::credential_env(session_id, &secret);
+        spec.env = oximux_remote_local::credential_env(session_id, &secret);
         // `connect` spawns a process: off the async reactor.
         let spawned = tokio::task::spawn_blocking(move || connect(spec)).await;
         let (conn, events) = match spawned {

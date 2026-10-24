@@ -62,6 +62,9 @@ pub struct RestoredPosture {
     pub omp: Option<oximux_agents::thread::omp::posture::OmpPosture>,
     /// Claude's fast-mode toggle. `None` = never touched.
     pub claude_fast_mode: Option<bool>,
+    /// A spawned child's posture. A resumed chat takes it from its lineage
+    /// row instead when it has one (see `assemble`).
+    pub spawn: oximux_agents::thread::launch_posture::SpawnPosture,
 }
 
 /// Build the initial composer feature-pick overlay for a restored chat, so the

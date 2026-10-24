@@ -107,6 +107,21 @@ impl AgentChatView {
         // A resumed thread carries the prior session id; a fresh one is `None`
         // (spawn a new session). Either way the subprocess is spawned the same.
         let resume_session_id = thread.session_id.clone();
+        // Keyed on the agent's own session id when the thread has one — a
+        // restored chat always does — so a remote client's reference to this
+        // session survives the restart that just rebuilt this view. Known
+        // before the spawn: the agent's credential is scoped to it.
+        let remote_session_id = remote_session_id_for(thread.session_id.as_deref());
+        // A spawned child's posture: its lineage row is the authority (a
+        // persisted chat blob is not — it could be edited), the restored value
+        // only the fallback for a host with no core.
+        let spawn_posture = resume_session_id
+            .as_deref()
+            .and_then(|sid| {
+                let core = cx.try_global::<RemoteControl>()?.host_core()?;
+                core.lineage().row(sid).ok().flatten()
+            })
+            .map_or(posture.spawn, |row| row.posture);
         let mut connection: Option<Arc<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
@@ -133,6 +148,8 @@ impl AgentChatView {
             spec.omp_posture = posture.omp;
             spec.claude_fast_mode =
                 claude_fast_mode_to_apply(posture.claude_fast_mode, model.as_deref());
+            spec.posture = spawn_posture;
+            Self::add_spawn_credential(&mut spec, &remote_session_id, cx);
             match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
@@ -256,10 +273,6 @@ impl AgentChatView {
             .to_string()
         });
 
-        // Keyed on the agent's own session id when the thread has one — a
-        // restored chat always does — so a remote client's reference to this
-        // session survives the restart that just rebuilt this view.
-        let remote_session_id = remote_session_id_for(thread.session_id.as_deref());
         // Bind this session into the remote-control registry now if remote control
         // is enabled (else `None` — nothing registered, nothing teed).
         let remote = connection.clone().and_then(|conn| {
@@ -317,6 +330,7 @@ impl AgentChatView {
             thread,
             connection,
             remote_session_id,
+            spawn_posture,
             remote,
             backend,
             composer,

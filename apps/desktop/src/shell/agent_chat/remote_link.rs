@@ -7,8 +7,9 @@
 //! view file headroom under the file-size ratchet; the orchestration work
 //! (spawn credentials, lineage rekey, the working flag) lands here.
 
-use gpui::Context;
+use gpui::{App, Context};
 use oximux_agents::session_registry::SessionMeta;
+use oximux_agents::thread::ConnectSpec;
 
 use super::{AgentChatView, RemoteControl};
 
@@ -41,10 +42,11 @@ impl AgentChatView {
         }
     }
 
-    /// (Re)bind this session into the remote-control registry: drop any prior
-    /// binding, then register the current connection under [`Self::remote_session_id`]
-    /// — but only while remote control is enabled, so a disabled desktop registers
-    /// nothing and clones no events. Called on connect and on respawn.
+    /// (Re)bind this session into the remote-control registry under
+    /// [`Self::remote_session_id`]. Always registers (the host core reads the
+    /// working flag); the event ring and transcript cost nothing until remote
+    /// or local access is on (`RemoteBinding::exposed`). Called on connect and
+    /// on respawn.
     pub(super) fn bind_remote(&mut self, cx: &mut Context<Self>) {
         // Deliberately does NOT unregister first. On a respawn this runs again for
         // the same session id, and `register` swaps the backend in place — keeping
@@ -170,5 +172,30 @@ impl AgentChatView {
         }
         self.remote_tab_title = title;
         self.publish_remote_meta();
+    }
+
+    /// Put this chat's credential in a spawn's environment (every spawn: a
+    /// respawned process gets a fresh one and the old one is revoked). Without
+    /// one — confinement off, or local access off — the agent keeps the reach
+    /// it had before confinement existed.
+    pub(super) fn add_spawn_credential(spec: &mut ConnectSpec, remote_session_id: &str, cx: &App) {
+        let Some(env) = cx.try_global::<RemoteControl>().and_then(|rc| rc.mint_chat_credential(remote_session_id))
+        else {
+            return;
+        };
+        for (key, value) in env {
+            if let Err(err) = spec.set_env(&key, &value) {
+                // A user-configured env var of the same name: the agent runs
+                // with what the user set, unconfined, and the log says why.
+                tracing::warn!(%err, "chat credential not injected");
+            }
+        }
+    }
+
+    /// The agent process is gone: its credential stops working with it.
+    pub(super) fn revoke_spawn_credential(&self, cx: &App) {
+        if let Some(rc) = cx.try_global::<RemoteControl>() {
+            rc.revoke_chat_credential(&self.remote_session_id);
+        }
     }
 }

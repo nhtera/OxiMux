@@ -24,6 +24,7 @@ pub mod sim_view;
 pub mod locked_terminals;
 pub mod relay_terminals;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -99,16 +100,30 @@ use oximux_remote_proto::PairingTicket;
 /// Monotonic source of *placeholder* remote session ids, for a chat that has not
 /// yet been given an agent session id of its own.
 ///
-/// Positional and per-process, so it names a view's build order rather than the
-/// conversation — worthless to a client once the desktop restarts. Everything with
-/// a real id uses that instead ([`remote_session_id_for`]); this only has to be
-/// collision-free for the run it exists in.
+/// Positional, so it names a view's build order rather than the conversation —
+/// worthless to a client once the desktop restarts. Everything with a real id
+/// uses that instead ([`remote_session_id_for`]).
 static REMOTE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Mint the next placeholder remote session id (`"agent-N"`), for a chat with no
-/// agent session id yet. Prefer [`remote_session_id_for`], which falls back here.
+/// Mint the next placeholder remote session id (`"agent-<digits>"`), for a chat
+/// with no agent session id yet. Prefer [`remote_session_id_for`], which falls
+/// back here.
+///
+/// Unique across runs, not only within one: the spawn lineage stores a child's
+/// id, and a child that never reports its own id keeps its placeholder there.
+/// A bare counter restarts at 1 every launch, so that row would attach to an
+/// unrelated chat in a later run (inheriting its parent, depth and permit
+/// authority). The run's start time, in milliseconds, prefixes the counter;
+/// the result stays `agent-` plus digits, which is how clients recognise a
+/// placeholder.
 pub fn next_remote_session_id() -> String {
-    format!("agent-{}", REMOTE_SEQ.fetch_add(1, Ordering::Relaxed))
+    static RUN: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    });
+    format!("agent-{run}{:04}", REMOTE_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 /// The id a session is known by remotely.
@@ -336,6 +351,16 @@ pub struct RemoteControl {
     /// once at boot and shared by both dispatchers. `None` until installed
     /// (tests, and the brief window before boot wires it).
     host_core: Option<Arc<oximux_remote_host::HostCore>>,
+    /// Each live chat's credential, by registry id: kept so a rekey can
+    /// re-point it and a listener started again can re-register it.
+    chat_credentials: Mutex<HashMap<String, ChatCredential>>,
+}
+
+/// One chat agent's local-control credential.
+struct ChatCredential {
+    /// What the agent's `OXIMUX_SESSION_ID` carries.
+    label: String,
+    secret: String,
 }
 
 impl Global for RemoteControl {}
@@ -376,6 +401,7 @@ impl RemoteControl {
             exposed: Arc::new(AtomicBool::new(false)),
             host_lock: Mutex::new(None),
             host_core: None,
+            chat_credentials: Mutex::new(HashMap::new()),
         }
     }
 
@@ -514,6 +540,14 @@ impl RemoteControl {
         {
             tracing::warn!(%err, old, new, "lineage rekey failed");
         }
+        let mut credentials = self.chat_credentials.lock().unwrap();
+        if let Some(credential) = credentials.remove(old) {
+            if let Some(handle) = self.local.lock().unwrap().as_ref() {
+                handle.bind_session(&credential.label, new);
+            }
+            credentials.insert(new.to_string(), credential);
+        }
+        drop(credentials);
         self.registry.unregister(old);
     }
 
@@ -864,7 +898,14 @@ impl RemoteControl {
             return;
         }
         match local_listener::start(dispatcher, dir, rt) {
-            Ok(handle) => *rc.local.lock().unwrap() = Some(handle),
+            Ok(handle) => {
+                // Chats spawned while an earlier listener ran still hold their
+                // secrets: re-register them rather than respawning anyone.
+                for (session_id, credential) in rc.chat_credentials.lock().unwrap().iter() {
+                    handle.restore_session(&credential.label, &credential.secret, session_id);
+                }
+                *rc.local.lock().unwrap() = Some(handle);
+            }
             // The flag stays on so the UI reflects the user's choice, but with
             // nothing bound the CLI reports the host unreachable — which is
             // true, and better than a toggle that looks on and answers nothing.
@@ -917,32 +958,46 @@ impl RemoteControl {
         }
     }
 
-    /// Mint a credential confining one agent process to `session_id`, for the
-    /// spawner to inject into that process's environment. `None` when local
-    /// access is off — there is no listener to honor it, and an agent that
-    /// receives no credential simply cannot reach the control socket.
+    /// Mint the credential a chat's agent process is spawned with: the
+    /// `OXIMUX_SESSION_ID` / `OXIMUX_SESSION_TOKEN` pair confining it to its own
+    /// session and the agents it spawns. Called on every (re)spawn; the
+    /// previous process's credential is revoked as the new one is minted.
     ///
-    /// **Nothing calls this yet, and the confinement is therefore not in force:**
-    /// an agent that runs `oximux` reads the operator token file (it is the same
-    /// OS user) and is served full scope. Wiring it is not a matter of finding
-    /// the spawn site. A chat's `remote_session_id` starts as a placeholder and
-    /// is REKEYED once the agent reports its own id
-    /// (`rekey_remote_session_if_needed`), while a child's environment is fixed
-    /// at spawn and cannot be revised afterwards — so either the credential is
-    /// minted against a spawn-time identity the listener then re-maps on rekey,
-    /// or the id has to be known before the process exists. That choice belongs
-    /// with the phase that wires it, not here.
-    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
-    pub fn grant_agent_credential(&self, session_id: &str) -> Option<String> {
-        self.local.lock().unwrap().as_ref().map(|h| h.grant_session(session_id))
+    /// `None` when confinement is off (the agent keeps operator reach, as
+    /// before) or local access is off (no listener to honor a credential; the
+    /// agent cannot reach the socket at all).
+    ///
+    /// Minted against an opaque label and bound to `session_id`, the chat's
+    /// registry id, which may still be a placeholder: the process's environment
+    /// is fixed at spawn, so a later rekey re-points the credential
+    /// ([`Self::rekey_session`]) rather than the agent learning a new secret.
+    pub fn mint_chat_credential(&self, session_id: &str) -> Option<Vec<(String, String)>> {
+        if !self.host_core.as_ref().is_none_or(|core| core.config().confine_chat) {
+            return None;
+        }
+        let local = self.local.lock().unwrap();
+        let handle = local.as_ref()?;
+        let label = oximux_remote_local::credential_label();
+        let secret = handle.grant_session(&label);
+        handle.bind_session(&label, session_id);
+        let previous = self
+            .chat_credentials
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), ChatCredential { label: label.clone(), secret: secret.clone() });
+        if let Some(previous) = previous {
+            handle.revoke_session(&previous.label);
+        }
+        Some(oximux_remote_local::credential_env(&label, &secret))
     }
 
-    /// Drop an agent's credential when its session ends. Unused for as long as
-    /// [`grant_agent_credential`](Self::grant_agent_credential) is.
-    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
-    pub fn revoke_agent_credential(&self, session_id: &str) {
+    /// Drop a chat's credential when its agent process is gone.
+    pub fn revoke_chat_credential(&self, session_id: &str) {
+        let Some(credential) = self.chat_credentials.lock().unwrap().remove(session_id) else {
+            return;
+        };
         if let Some(handle) = self.local.lock().unwrap().as_ref() {
-            handle.revoke_session(session_id);
+            handle.revoke_session(&credential.label);
         }
     }
 
@@ -1258,6 +1313,46 @@ mod tests {
         assert_eq!(lineage.row("child-1").unwrap().unwrap().parent_id, "claude-abc");
         assert!(rc.registry().get("agent-7").is_none(), "the placeholder is unregistered");
         assert!(rc.registry().get("claude-abc").is_some());
+    }
+
+    /// A chat's credential: minted only with a listener to honor it, one per
+    /// chat (a respawn replaces it), following a rekey, gone on revoke, and
+    /// never minted while confinement is off.
+    #[test]
+    fn chat_credentials_follow_the_chat() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut rc = RemoteControl::new();
+        let db = oximux_storage::db::open_memory().unwrap();
+        rc.install_host_core(
+            rt.handle().clone(),
+            oximux_agents::lineage::LineageStore::new(db.conn()),
+            oximux_remote_host::HostConfig::default(),
+        );
+        assert!(rc.mint_chat_credential("agent-1").is_none(), "no listener, no credential");
+
+        let dispatcher = Arc::new(rc.dispatcher(Arc::new(AuthStore::new())));
+        let handle = local_listener::start(dispatcher, dir.path().to_path_buf(), rt.handle().clone()).unwrap();
+        *rc.local.lock().unwrap() = Some(handle);
+
+        let env = rc.mint_chat_credential("agent-1").expect("a credential");
+        let label = env.iter().find(|(k, _)| k == oximux_remote_local::SESSION_ENV_VAR).unwrap().1.clone();
+        assert!(label.starts_with("agent-"), "an opaque label, not the session id: {label}");
+        assert!(env.iter().any(|(k, v)| k == oximux_remote_local::SESSION_TOKEN_ENV_VAR && !v.is_empty()));
+        let again = rc.mint_chat_credential("agent-1").unwrap();
+        assert_ne!(again, env, "a respawn gets a fresh credential");
+        assert_eq!(rc.chat_credentials.lock().unwrap().len(), 1, "one per chat");
+
+        rc.rekey_session("agent-1", "claude-abc");
+        assert!(rc.chat_credentials.lock().unwrap().contains_key("claude-abc"));
+        rc.revoke_chat_credential("claude-abc");
+        assert!(rc.chat_credentials.lock().unwrap().is_empty());
+
+        rc.host_core().unwrap().set_config(oximux_remote_host::HostConfig {
+            confine_chat: false,
+            ..Default::default()
+        });
+        assert!(rc.mint_chat_credential("agent-2").is_none(), "confinement off: operator reach, as before");
     }
 
     /// The host role is one per data directory, and re-taking our own is free.

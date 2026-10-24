@@ -259,6 +259,8 @@ fn restore_chat_posture(
         pi: t.pi_posture.clone(),
         omp: t.omp_posture,
         claude_fast_mode: t.claude_fast_mode,
+        // Not persisted with the chat: `assemble` reads it from the lineage row.
+        spawn: Default::default(),
     }
 }
 
