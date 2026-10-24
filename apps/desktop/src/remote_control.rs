@@ -382,6 +382,9 @@ pub struct ChatAccess {
     /// The credential as a file (`oximux mcp --credential-file`), when it
     /// could be written.
     pub credential_file: Option<std::path::PathBuf>,
+    /// The host's runtime directory, named to the tool server explicitly: an
+    /// agent CLI may start it with none of the app's environment.
+    pub runtime_dir: std::path::PathBuf,
 }
 
 impl Global for RemoteControl {}
@@ -1012,7 +1015,11 @@ impl RemoteControl {
             handle.revoke_session(&previous.label);
             remove_credential_file(previous.file);
         }
-        Some(ChatAccess { env: oximux_remote_local::credential_env(&label, &secret), credential_file: file })
+        Some(ChatAccess {
+            env: oximux_remote_local::credential_env(&label, &secret),
+            credential_file: file,
+            runtime_dir: handle.runtime_dir().to_path_buf(),
+        })
     }
 
     /// The host settings in force, or the defaults before the core is

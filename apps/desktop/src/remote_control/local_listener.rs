@@ -54,6 +54,11 @@ impl LocalHandle {
         self.listener.restore_session(label, secret, session_id);
     }
 
+    /// The runtime directory this listener serves from.
+    pub fn runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
+    }
+
     /// Where an agent's credential file (for the tool server it starts)
     /// lives, inside the owner-only runtime directory.
     pub fn credential_dir(&self) -> PathBuf {

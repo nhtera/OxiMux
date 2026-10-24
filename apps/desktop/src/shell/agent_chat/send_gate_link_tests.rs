@@ -348,3 +348,30 @@ async fn an_agent_without_receipts_gets_stand_in_receipts(cx: &mut TestAppContex
     window.update(cx, |view, _window, cx| end_turn(view, cx)).unwrap();
     assert_eq!(receipts.try_recv().unwrap(), ThreadEvent::UserMessagesDelivered { uuids: vec![key.to_string()] });
 }
+
+/// A line the user steered that the agent drops unstarted is queued again,
+/// not lost, and the chat stops waiting for it.
+#[gpui::test]
+async fn a_dropped_steer_is_queued_again(cx: &mut TestAppContext) {
+    use oximux_agents::thread::connection::AgentCapabilities;
+    cx.update(gpui_component::init);
+    let stub = Arc::new(StubConnection::default().with_capabilities(AgentCapabilities { supports_steer: true, ..Default::default() }));
+    let conn = stub.clone();
+    let window = cx.add_window(move |window, cx| {
+        AgentChatView::with_connection_for_test(conn, Theme::default(), Density::default(), Typography::default(), window, cx)
+    });
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _window, cx| {
+            view.send_text("first".into(), vec![], cx);
+            view.steer_text("also this".into(), cx);
+            assert!(view.awaiting_steer());
+            let uuid = view.send_gate.lock().unwrap().take_unstarted()[0].0;
+            view.send_gate.lock().unwrap().note_steered(uuid, Some("also this".into()));
+            view.apply_batch(vec![ThreadEvent::UserMessageDropped { uuid: uuid.to_string() }], cx);
+            assert!(!view.awaiting_steer());
+            let queued: Vec<_> = view.send_gate.lock().unwrap().queued().map(|q| (q.text.clone(), q.source)).collect();
+            assert_eq!(queued, [("also this".to_string(), SendSource::User)]);
+        })
+        .unwrap();
+}

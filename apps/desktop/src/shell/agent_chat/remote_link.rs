@@ -226,14 +226,14 @@ impl AgentChatView {
             return;
         }
         let Some(cli) = crate::platform::bundled_cli::cli_path() else {
-            tracing::debug!("no oximux binary to run; the agent gets no delegation tools");
+            tracing::warn!("no oximux binary to run; the agent gets no delegation tools");
             return;
         };
         let default_agent = adapter_id.unwrap_or(match spec.transport {
             Transport::AppServer => "codex",
             _ => "claude-code",
         });
-        if let Err(err) = spec.add_mcp_server(orchestration_server(&cli, &file, default_agent)) {
+        if let Err(err) = spec.add_mcp_server(orchestration_server(&cli, &access.runtime_dir, &file, default_agent)) {
             tracing::warn!(%err, "delegation tools not declared");
         }
     }
@@ -258,8 +258,15 @@ pub(super) fn wants_delegation_tools(expose_tools: bool, spec: &ConnectSpec) -> 
 
 /// The delegation tool server a chat agent starts: the CLI's `mcp`, with the
 /// agent's credential file (never the token itself) in its arguments.
-pub(super) fn orchestration_server(cli: &std::path::Path, credential: &std::path::Path, agent: &str) -> McpServerSpec {
+pub(super) fn orchestration_server(
+    cli: &std::path::Path,
+    runtime_dir: &std::path::Path,
+    credential: &std::path::Path,
+    agent: &str,
+) -> McpServerSpec {
     McpServerSpec::new("oximux", cli.to_string_lossy()).args(vec![
+        "--dir".into(),
+        runtime_dir.to_string_lossy().into_owned(),
         "mcp".into(),
         "--tools".into(),
         "orchestrate".into(),
@@ -307,12 +314,27 @@ mod tests {
     /// argv is visible to every local user.
     #[test]
     fn the_delegation_server_carries_the_credential_path_not_the_token() {
-        let server = orchestration_server(Path::new("/app/bin/oximux"), Path::new("/data/agent-credentials/agent-x"), "claude-code");
+        let server = orchestration_server(
+            Path::new("/app/bin/oximux"),
+            Path::new("/data"),
+            Path::new("/data/agent-credentials/agent-x"),
+            "claude-code",
+        );
         assert_eq!(server.name, "oximux");
         assert_eq!(server.command, "/app/bin/oximux");
         assert_eq!(
             server.args,
-            ["mcp", "--tools", "orchestrate", "--credential-file", "/data/agent-credentials/agent-x", "--default-agent", "claude-code"]
+            [
+                "--dir",
+                "/data",
+                "mcp",
+                "--tools",
+                "orchestrate",
+                "--credential-file",
+                "/data/agent-credentials/agent-x",
+                "--default-agent",
+                "claude-code"
+            ]
         );
         assert!(server.env.is_empty());
     }

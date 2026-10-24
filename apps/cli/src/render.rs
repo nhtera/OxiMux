@@ -253,6 +253,7 @@ pub fn render_event(event: &ThreadEvent) -> Option<String> {
         // Receipts about the host's own sends (never on the wire either).
         | ThreadEvent::UserMessageAccepted { .. }
         | ThreadEvent::UserMessagesDelivered { .. }
+        | ThreadEvent::UserMessageDropped { .. }
         | ThreadEvent::TitleUpdated { .. } => None,
     }
 }

@@ -66,6 +66,7 @@ fn decode_command_lifecycle(v: &Value) -> Vec<ThreadEvent> {
     match v.get("state").and_then(Value::as_str) {
         Some("started") => vec![ThreadEvent::UserMessageAccepted { uuid: uuid.to_string() }],
         Some("completed") => vec![ThreadEvent::UserMessagesDelivered { uuids: vec![uuid.to_string()] }],
+        Some("cancelled") => vec![ThreadEvent::UserMessageDropped { uuid: uuid.to_string() }],
         _ => Vec::new(),
     }
 }

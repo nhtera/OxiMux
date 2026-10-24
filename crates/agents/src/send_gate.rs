@@ -360,6 +360,13 @@ impl SendGate {
         Some(self.unstarted.remove(at).1.is_some())
     }
 
+    /// Stop tracking the steered line sent under `uuid` (the agent dropped
+    /// it). For a steered line, returns the text when a person sent it.
+    pub fn take_steered(&mut self, uuid: &str) -> Option<Option<String>> {
+        let at = self.unstarted.iter().position(|(u, _)| u.to_string() == uuid)?;
+        Some(self.unstarted.remove(at).1)
+    }
+
     /// Whether a steered line has not started yet. The agent may still run
     /// it as a turn of its own after the current one ends, so the turn is not
     /// over until it has started.

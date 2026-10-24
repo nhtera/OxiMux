@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Context};
-use oximux_agents::send_gate::{Holds, Ready, SendGate, SendSource};
+use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource};
 use oximux_agents::thread::ThreadEntry;
 use oximux_agents::thread::{ChatImage, PermissionDecision, PermissionKind, ThreadEvent, ToolCallStatus, Transport};
 use uuid::Uuid;
@@ -27,6 +27,10 @@ const PLAN_REFUSED: &str = "Leaving plan mode needs you: this turn was started b
 
 /// What the transcript says when held child events go out with a message.
 const HELD_EVENTS_NOTE: &str = "Child events that arrived after the Stop went with this message.";
+
+/// How long after its turn ended a steered line may take to start (or be
+/// reported dropped) before the chat stops waiting for it.
+const STEER_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the transcript says when a Stop takes back a line the user steered.
 const STEER_TAKEN_BACK: &str = "The Stop took back a message the agent had not started on; it is queued again below.";
@@ -103,9 +107,9 @@ impl AgentChatView {
     /// What the view checks on each event before folding it: the spawn
     /// posture, receipts for its own lines, and a plan approval asked for in a
     /// turn child events started (returned, to refuse once it is folded).
-    pub(super) fn before_apply(&mut self, event: &ThreadEvent) -> Option<String> {
+    pub(super) fn before_apply(&mut self, event: &ThreadEvent, cx: &mut Context<Self>) -> Option<String> {
         self.guard_spawn_posture(event);
-        self.note_receipt(event);
+        self.note_receipt(event, cx);
         match event {
             ThreadEvent::PermissionRequested { request_id, kind: PermissionKind::Plan, .. }
                 if self.send_gate.lock().unwrap().turn_started_by_events() =>
@@ -138,10 +142,24 @@ impl AgentChatView {
     /// shows that turn as running (a Stop can end it). For an agent with no
     /// receipts, its first frame after a line stands in for acceptance and the
     /// turn's end for delivery, so the host can settle what it sent.
-    fn note_receipt(&mut self, event: &ThreadEvent) {
+    fn note_receipt(&mut self, event: &ThreadEvent, cx: &mut Context<Self>) {
         let mut gate = self.send_gate.lock().unwrap();
         let mut stand_in = None;
+        if matches!(event, ThreadEvent::TurnEnded { .. }) && gate.awaiting_steer() {
+            // Backstop: a steered line that neither starts nor is reported
+            // dropped would otherwise hold the chat's queue forever.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(STEER_START_WITHIN).await;
+                let _ = this.update(cx, |view, _cx| view.give_up_on_steers());
+            })
+            .detach();
+        }
         match event {
+            ThreadEvent::UserMessageDropped { uuid } => {
+                if let Some(Some(text)) = gate.take_steered(uuid) {
+                    gate.push(text, Vec::new(), SendSource::User, DeliveryMode::Queue, None);
+                }
+            }
             ThreadEvent::UserMessageAccepted { uuid } => {
                 if let Some(person) = gate.note_accepted(uuid)
                     && !self.thread.turn_active
@@ -165,6 +183,26 @@ impl AgentChatView {
         }
     }
 
+    /// A steered line still not started well after its turn ended: stop
+    /// waiting for it. Child events go back to the host (which sends them
+    /// again); a line the user steered is queued again.
+    fn give_up_on_steers(&mut self) {
+        if self.thread.turn_active {
+            return;
+        }
+        let mut gate = self.send_gate.lock().unwrap();
+        for (uuid, text) in gate.take_unstarted() {
+            match text {
+                Some(text) => {
+                    gate.push(text, Vec::new(), SendSource::User, DeliveryMode::Queue, None);
+                }
+                None => gate.report_sent(uuid, false),
+            }
+        }
+        drop(gate);
+        self.sync_gate_holds();
+    }
+
     /// The Stop button (and a Stop from a phone or the CLI): take back the
     /// lines written into this turn that the agent has not started on, then
     /// interrupt, so none of them starts a turn after the Stop. Off the UI
@@ -184,17 +222,20 @@ impl AgentChatView {
         let ids: Vec<String> = unstarted.iter().map(|(u, _)| u.to_string()).collect();
         let stopping = cx.background_spawn(async move { conn.stop_turn(&ids) });
         cx.spawn(async move |this, cx| {
-            let taken = match stopping.await {
-                Ok(taken) => taken,
-                Err(err) => {
-                    tracing::warn!(%err, "stopping the turn failed");
-                    return;
-                }
-            };
+            let taken = stopping.await.unwrap_or_else(|err| {
+                tracing::warn!(%err, "stopping the turn failed");
+                Vec::new()
+            });
             let _ = this.update(cx, |view, cx| {
                 let mut typed = Vec::new();
-                let gate = view.send_gate.lock().unwrap();
-                for (uuid, text) in unstarted.into_iter().filter(|(u, _)| taken.contains(&u.to_string())) {
+                let mut gate = view.send_gate.lock().unwrap();
+                for (uuid, text) in unstarted {
+                    if !taken.contains(&uuid.to_string()) {
+                        // Not confirmed taken back (no reply in time): it may
+                        // still run, so keep tracking it as steered.
+                        gate.note_steered(uuid, text);
+                        continue;
+                    }
                     match text {
                         Some(text) => typed.push(text),
                         None => gate.report_sent(uuid, false),

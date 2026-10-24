@@ -145,6 +145,14 @@ fn handle(core: &HostCore, msg: DrainMsg, awaiting: &mut HashMap<Uuid, Instant>,
             }
             result
         }
+        // The CLI dropped the line unstarted: the rows go out again (new key).
+        DrainMsg::Receipt(ThreadEvent::UserMessageDropped { uuid }) => match Uuid::parse_str(&uuid) {
+            Ok(uuid) => {
+                awaiting.remove(&uuid);
+                outbox.unclaim(uuid).map(drop)
+            }
+            Err(_) => Ok(()),
+        },
         DrainMsg::Receipt(_) => Ok(()),
     };
     if let Err(err) = result {

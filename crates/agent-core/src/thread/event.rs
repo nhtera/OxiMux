@@ -583,13 +583,19 @@ pub enum ThreadEvent {
     /// `completed`). Rides just ahead of the `TurnEnded` it belongs to. A
     /// receipt, like [`Self::UserMessageAccepted`].
     UserMessagesDelivered { uuids: Vec<String> },
+    /// The CLI dropped the line sent under `uuid` without starting on it
+    /// (`command_lifecycle` `cancelled`). A receipt, like the two above.
+    UserMessageDropped { uuid: String },
 }
 
 impl ThreadEvent {
     /// A receipt about the host's own sends rather than something the agent
     /// said: never folded into the transcript, never shown to remote clients.
     pub fn is_receipt(&self) -> bool {
-        matches!(self, Self::UserMessageAccepted { .. } | Self::UserMessagesDelivered { .. })
+        matches!(
+            self,
+            Self::UserMessageAccepted { .. } | Self::UserMessagesDelivered { .. } | Self::UserMessageDropped { .. }
+        )
     }
 
     /// Whether this event only extends content the transcript already shows — a

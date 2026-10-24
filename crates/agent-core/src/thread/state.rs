@@ -553,7 +553,9 @@ impl ChatThread {
                 self.last_rate_limit = Some(info.clone());
             }
             // Receipts about the host's own sends: nothing to show.
-            ThreadEvent::UserMessageAccepted { .. } | ThreadEvent::UserMessagesDelivered { .. } => {}
+            ThreadEvent::UserMessageAccepted { .. }
+            | ThreadEvent::UserMessagesDelivered { .. }
+            | ThreadEvent::UserMessageDropped { .. } => {}
             ThreadEvent::TurnEnded { is_error, result, usage, turn_diff } => {
                 self.turn_active = false;
                 // Clear a dangling compaction spinner if the turn ended without a

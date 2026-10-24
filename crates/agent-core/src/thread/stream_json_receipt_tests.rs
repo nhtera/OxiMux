@@ -30,6 +30,8 @@ fn a_sent_line_is_accepted_on_started_and_delivered_by_the_result() {
     );
     assert!(matches!(evs[1], ThreadEvent::TurnEnded { is_error: false, .. }), "just ahead of its turn end");
     assert!(evs[0].is_receipt() && !evs[1].is_receipt());
+    let dropped = json!({"type":"command_lifecycle","command_uuid":"u-2","state":"cancelled","uuid":"f"}).to_string();
+    assert_eq!(decode_line(&dropped), vec![ThreadEvent::UserMessageDropped { uuid: "u-2".into() }]);
     // A result with no uuids (an older CLI) carries no receipt.
     let plain = json!({"type":"result","subtype":"success"}).to_string();
     assert!(decode_line(&plain).iter().all(|e| !e.is_receipt()));

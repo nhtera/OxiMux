@@ -2874,7 +2874,7 @@ impl AgentChatView {
             if let Some(binding) = &self.remote {
                 binding.ingest(ev.clone());
             }
-            let refuse_plan = self.before_apply(&ev);
+            let refuse_plan = self.before_apply(&ev, cx);
             self.apply_event(ev, cx);
             self.after_apply(refuse_plan);
         }
