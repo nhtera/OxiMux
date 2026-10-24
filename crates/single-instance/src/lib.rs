@@ -38,6 +38,94 @@ fn pid_path_for(lock_path: &Path) -> PathBuf {
     lock_path.with_extension("pid")
 }
 
+/// Seconds two readings of one process's start time may differ by and still
+/// name the same process (the kernels report whole seconds; allow rounding).
+const START_SLACK_S: u64 = 2;
+
+/// Seconds two readings of the boot instant may differ by within one boot
+/// (exact on macOS and Linux; Windows derives it from the uptime counter).
+const BOOT_SLACK_S: u64 = 5;
+
+/// What a holder writes beside its lock: who it is, when it started, which
+/// boot it ran in, and the role it holds the lock for.
+///
+/// The lock alone answers "is someone holding this?". The record answers the
+/// questions the lock cannot: whether a pid read later still names the
+/// process that wrote it (pids are recycled), and, after this process wins a
+/// lock someone else held, whether that holder crashed or the machine
+/// rebooted in between. It carries no paths and no secrets.
+///
+/// On disk: four lines, `pid` first so a reader that only knows the old
+/// one-line format still gets the pid. An unknown field is an empty line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HolderRecord {
+    pub pid: u32,
+    /// When the holder process started, whole seconds since the Unix epoch.
+    pub started_at_unix_s: Option<u64>,
+    /// When the machine booted, as the holder saw it.
+    pub boot_time_unix_s: Option<u64>,
+    /// The caller-chosen role name (for example `desktop` or `serve`).
+    pub role: Option<String>,
+}
+
+impl HolderRecord {
+    /// The record this process writes on winning a lock.
+    fn current(role: Option<&str>) -> Self {
+        let pid = std::process::id();
+        Self {
+            pid,
+            started_at_unix_s: oximux_proc_tree::start_time_of_pid(pid),
+            boot_time_unix_s: oximux_proc_tree::boot_time_of_system(),
+            role: role.map(str::to_owned),
+        }
+    }
+
+    fn encode(&self) -> String {
+        let opt = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_default();
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            self.pid,
+            opt(self.started_at_unix_s),
+            opt(self.boot_time_unix_s),
+            self.role.as_deref().unwrap_or_default()
+        )
+    }
+
+    /// Parse a record. Only the pid line is required, so a one-line file from
+    /// an older build reads as a record with every other field unknown.
+    fn decode(text: &str) -> Option<Self> {
+        let mut lines = text.lines().map(str::trim);
+        let pid = lines.next()?.parse().ok()?;
+        let mut num = || lines.next().and_then(|l| l.parse().ok());
+        let started_at_unix_s = num();
+        let boot_time_unix_s = num();
+        let role = lines.next().filter(|l| !l.is_empty()).map(str::to_owned);
+        Some(Self { pid, started_at_unix_s, boot_time_unix_s, role })
+    }
+
+    /// Whether this record was written during the machine's current boot.
+    /// `None` when either side is unknown, which a caller must treat as
+    /// "can't tell", never as "same boot".
+    pub fn same_boot(&self) -> Option<bool> {
+        let then = self.boot_time_unix_s?;
+        let now = oximux_proc_tree::boot_time_of_system()?;
+        Some(then.abs_diff(now) <= BOOT_SLACK_S)
+    }
+
+    /// Whether the process that wrote this record is still running: its pid
+    /// is alive, started when the record says, in this boot. Any unknown
+    /// field answers `false`, because a recycled pid looks alive too.
+    pub fn is_live(&self) -> bool {
+        let Some(recorded) = self.started_at_unix_s else {
+            return false;
+        };
+        let Some(actual) = oximux_proc_tree::start_time_of_pid(self.pid) else {
+            return false;
+        };
+        recorded.abs_diff(actual) <= START_SLACK_S && self.same_boot() == Some(true)
+    }
+}
+
 /// Held for the whole process lifetime. Dropping it (or process exit) closes
 /// the underlying descriptor, which releases the advisory lock.
 pub struct SingleInstanceGuard {
@@ -45,6 +133,20 @@ pub struct SingleInstanceGuard {
     // keeping the `File` alive is the entire mechanism. The field is never read
     // — it is held for its Drop, which closes the file and frees the lock.
     _lock: fd_lock::RwLock<std::fs::File>,
+    previous: Option<HolderRecord>,
+}
+
+impl SingleInstanceGuard {
+    /// The record the previous holder left beside the lock, read before this
+    /// process overwrote it. `None` for a fresh data directory or an
+    /// unreadable record.
+    ///
+    /// Winning the lock proves that holder is gone (the OS released its lock),
+    /// so this is the evidence for "the previous host died" and, through
+    /// [`HolderRecord::same_boot`], for "the machine rebooted".
+    pub fn previous(&self) -> Option<&HolderRecord> {
+        self.previous.as_ref()
+    }
 }
 
 /// Outcome of trying to take the single-instance lock.
@@ -64,6 +166,16 @@ pub enum AcquireOutcome {
 /// holder. `Err` — an unexpected filesystem/lock error; the caller should log
 /// and degrade rather than refuse to start.
 pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
+    acquire(lock_path, None)
+}
+
+/// [`try_acquire`], recording `role` in the holder record so a later reader
+/// can tell which kind of process held the lock.
+pub fn try_acquire_as(lock_path: &Path, role: &str) -> std::io::Result<AcquireOutcome> {
+    acquire(lock_path, Some(role))
+}
+
+fn acquire(lock_path: &Path, role: Option<&str>) -> std::io::Result<AcquireOutcome> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -75,16 +187,17 @@ pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
     // The result is reduced to a bool inside this statement so the borrow of
     // `lock` ends with it — the guard borrows `lock`, and `lock` has to be
     // movable into the returned guard below.
+    let mut previous = None;
     let won = match lock.try_write() {
         Ok(guard) => {
-            // We own the lock. Record our PID beside it — see `pid_path_for` for
-            // why beside and not inside — so a later contender can name (and
-            // activate) us. Best-effort: a write failure here doesn't lose the
-            // lock, it only leaves the contender without a PID to report.
-            let _ = std::fs::write(
-                pid_path_for(lock_path),
-                format!("{}\n", std::process::id()),
-            );
+            // We own the lock. Keep the record the last holder left (it is the
+            // only evidence of who that was), then record ourselves beside it —
+            // see `pid_path_for` for why beside and not inside — so a later
+            // contender can name (and activate) us. Best-effort: a write failure
+            // here doesn't lose the lock, it only leaves the contender without a
+            // record to report.
+            previous = read_holder_record(lock_path);
+            write_record(lock_path, &HolderRecord::current(role));
 
             // Deliberate: the guard's `Drop` unlocks, and we want the lock held
             // for the life of the process. Forgetting it leaves the lock on the
@@ -104,7 +217,7 @@ pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
     };
 
     if won {
-        Ok(AcquireOutcome::Acquired(SingleInstanceGuard { _lock: lock }))
+        Ok(AcquireOutcome::Acquired(SingleInstanceGuard { _lock: lock, previous }))
     } else {
         Ok(AcquireOutcome::AlreadyRunning {
             holder_pid: read_holder_pid(lock_path),
@@ -120,11 +233,25 @@ pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
 /// outlives its writer, so the pid may name a process that has since exited:
 /// check it is alive before trusting it.
 pub fn read_holder_pid(lock_path: &Path) -> Option<u32> {
-    std::fs::read_to_string(pid_path_for(lock_path))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    read_holder_record(lock_path).map(|r| r.pid)
+}
+
+/// Read the whole record the current (or last) holder wrote beside the lock.
+/// Like [`read_holder_pid`] it may name a process that has since exited; use
+/// [`HolderRecord::is_live`] before trusting it.
+pub fn read_holder_record(lock_path: &Path) -> Option<HolderRecord> {
+    HolderRecord::decode(&std::fs::read_to_string(pid_path_for(lock_path)).ok()?)
+}
+
+/// Write `record` beside the lock atomically (temp file, then rename), so a
+/// reader never sees a half-written record. Best-effort, like the lock's
+/// bookkeeping in general.
+fn write_record(lock_path: &Path, record: &HolderRecord) {
+    let path = pid_path_for(lock_path);
+    let tmp = path.with_extension(format!("pid.tmp{}", std::process::id()));
+    if std::fs::write(&tmp, record.encode()).is_err() || std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +336,109 @@ mod tests {
             AcquireOutcome::Acquired(_) => {}
             AcquireOutcome::AlreadyRunning { .. } => panic!("ticker role must acquire"),
         }
+    }
+
+    fn acquired(outcome: AcquireOutcome) -> SingleInstanceGuard {
+        match outcome {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::AlreadyRunning { .. } => panic!("must acquire"),
+        }
+    }
+
+    #[test]
+    fn the_record_is_four_lines_with_the_pid_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.lock");
+        let _g = acquired(try_acquire_as(&path, "desktop").unwrap());
+        let text = std::fs::read_to_string(pid_path_for(&path)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "record: {text:?}");
+        assert_eq!(lines[0], std::process::id().to_string(), "pid stays on line one");
+        assert_eq!(lines[3], "desktop");
+        // The pid-only reader still works against the longer record.
+        assert_eq!(read_holder_pid(&path), Some(std::process::id()));
+        let rec = read_holder_record(&path).unwrap();
+        assert!(rec.is_live(), "our own fresh record names a live process: {rec:?}");
+        assert_eq!(rec.same_boot(), Some(true));
+    }
+
+    #[test]
+    fn a_fresh_directory_has_no_previous_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = acquired(try_acquire(&dir.path().join("host.lock")).unwrap());
+        assert_eq!(g.previous(), None);
+    }
+
+    #[test]
+    fn winning_a_released_lock_reports_the_previous_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.lock");
+        drop(acquired(try_acquire_as(&path, "serve").unwrap()));
+        let g = acquired(try_acquire_as(&path, "desktop").unwrap());
+        let prev = g.previous().expect("the last holder's record");
+        assert_eq!(prev.role.as_deref(), Some("serve"));
+        assert_eq!(prev.pid, std::process::id());
+        assert_eq!(prev.same_boot(), Some(true));
+        // And ours replaced it.
+        assert_eq!(read_holder_record(&path).unwrap().role.as_deref(), Some("desktop"));
+    }
+
+    #[test]
+    fn a_stale_one_line_pid_file_is_read_then_rewritten() {
+        // An older build wrote only "<pid>\n" and crashed; the lock is free.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.lock");
+        std::fs::write(pid_path_for(&path), "4242\n").unwrap();
+        let g = acquired(try_acquire(&path).unwrap());
+        let prev = g.previous().unwrap();
+        assert_eq!(prev.pid, 4242);
+        assert_eq!(prev.started_at_unix_s, None);
+        assert_eq!(prev.same_boot(), None, "no boot time recorded means unknown, not same");
+        assert!(!prev.is_live(), "an old record without a start time is never trusted");
+        assert_eq!(read_holder_pid(&path), Some(std::process::id()), "rewritten with ours");
+    }
+
+    #[test]
+    fn a_held_lock_with_an_unreadable_record_is_still_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.lock");
+        let _g = acquired(try_acquire(&path).unwrap());
+        std::fs::write(pid_path_for(&path), "garbage\n").unwrap();
+        match try_acquire(&path).unwrap() {
+            AcquireOutcome::AlreadyRunning { holder_pid } => assert_eq!(holder_pid, None),
+            AcquireOutcome::Acquired(_) => panic!("an unreadable record never frees the lock"),
+        }
+    }
+
+    #[test]
+    fn a_record_from_another_boot_is_neither_same_boot_nor_live() {
+        let mut rec = HolderRecord::current(Some("serve"));
+        rec.boot_time_unix_s = rec.boot_time_unix_s.map(|b| b - 3600);
+        assert_eq!(rec.same_boot(), Some(false));
+        assert!(!rec.is_live(), "a reboot ended every process from before it");
+    }
+
+    #[test]
+    fn a_recycled_pid_is_not_live() {
+        // The pid is alive (it is us) but started at a different time than
+        // the record says, which is what a recycled pid looks like.
+        let mut rec = HolderRecord::current(None);
+        rec.started_at_unix_s = rec.started_at_unix_s.map(|t| t - 600);
+        assert!(!rec.is_live());
+        assert!(HolderRecord::current(None).is_live());
+    }
+
+    #[test]
+    fn decode_round_trips_and_tolerates_missing_fields() {
+        let rec = HolderRecord {
+            pid: 7,
+            started_at_unix_s: Some(100),
+            boot_time_unix_s: None,
+            role: Some("serve".into()),
+        };
+        assert_eq!(HolderRecord::decode(&rec.encode()), Some(rec));
+        assert_eq!(HolderRecord::decode("not-a-pid\n"), None);
+        assert_eq!(HolderRecord::decode("9").map(|r| r.pid), Some(9));
     }
 
     #[test]

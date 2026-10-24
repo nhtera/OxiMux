@@ -23,3 +23,7 @@ pub(crate) fn parent_of_pid(_pid: u32) -> Option<u32> {
 pub(crate) fn start_time_of_pid(_pid: u32) -> Option<u64> {
     None
 }
+
+pub(crate) fn boot_time_of_system() -> Option<u64> {
+    None
+}

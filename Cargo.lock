@@ -8653,6 +8653,7 @@ dependencies = [
  "oximux-git",
  "oximux-owner-only",
  "oximux-remote-proto",
+ "oximux-single-instance",
  "oximux-storage",
  "rand 0.8.6",
  "serde_json",
@@ -8799,6 +8800,7 @@ name = "oximux-single-instance"
 version = "0.1.44"
 dependencies = [
  "fd-lock",
+ "oximux-proc-tree",
  "tempfile",
 ]
 

@@ -112,6 +112,19 @@ pub(crate) fn parent_of_pid(_pid: u32) -> Option<u32> {
     None
 }
 
+/// Now minus the uptime counter. Both are read back to back, so two readings
+/// in one boot differ by rounding only (the caller allows a few seconds).
+pub(crate) fn boot_time_of_system() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    // SAFETY: no arguments; returns milliseconds since boot.
+    let up_ms = unsafe { GetTickCount64() };
+    now.checked_sub(up_ms / 1000)
+}
+
 /// FILETIME ticks (100 ns) between 1601-01-01 and the Unix epoch.
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 

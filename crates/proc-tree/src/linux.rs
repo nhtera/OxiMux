@@ -78,7 +78,11 @@ pub(crate) fn start_time_of_pid(pid: u32) -> Option<u64> {
     // Fields after comm start at field 3 (state); starttime is field 22.
     let after_comm = &stat[stat.rfind(')')? + 1..];
     let ticks: u64 = after_comm.split_whitespace().nth(22 - 3)?.parse().ok()?;
-    let boot = fs::read_to_string("/proc/stat").ok()?;
-    let btime: u64 = boot.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()?;
-    Some(btime + ticks / USER_HZ)
+    Some(boot_time_of_system()? + ticks / USER_HZ)
+}
+
+/// `btime` in `/proc/stat`: the boot instant in seconds since the epoch.
+pub(crate) fn boot_time_of_system() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    stat.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()
 }
