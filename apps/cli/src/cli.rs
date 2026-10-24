@@ -247,8 +247,8 @@ pub enum Command {
         session: String,
     },
     /// Redirect a mid-turn agent with additional guidance. Needs a backend with a
-    /// mid-turn message queue; claude and codex have none and refuse it, so on those
-    /// use `stop` and then `send`
+    /// mid-turn message queue (pi, omp, claude 2.1.310 or later); codex and ACP
+    /// agents refuse it, so on those use `stop` and then `send`
     Steer {
         /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,

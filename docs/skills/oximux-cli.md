@@ -193,8 +193,9 @@ was allowed and runs your arguments instead of its own. It replaces the input
 rather than merging into it, so pass every field the tool needs.
 
 To redirect a running agent, `oximux steer S "check the null case first"`. It
-needs a backend with a mid-turn message queue; claude and codex have none and
-refuse it. There, use `oximux stop S` and then `oximux send S "…"`.
+needs a backend with a mid-turn message queue (pi, omp, claude 2.1.310 or
+later); codex and ACP agents refuse it. There, use `oximux stop S` and then
+`oximux send S "…"`.
 
 ## Worktrees
 
