@@ -26,9 +26,8 @@
 # Down again before the agent-orchestration work needs room in the view: the
 # sign-in banner and the auth card's interactive half moved verbatim to
 # `agent_chat/sign_in.rs`.
-# The registry glue then moved to `agent_chat/remote_link.rs` too, without
-# lowering this row: that headroom is what the orchestration P1 view wiring
-# (spawn credentials, lineage rekey) spends. The row comes down to the final
-# size in the same branch, before it merges.
-apps/desktop/src/shell/agent_chat/mod.rs 4796
+# The registry glue then moved to `agent_chat/remote_link.rs` too; the
+# orchestration P1 view wiring (spawn posture, credentials, the respawn gate)
+# spent part of that headroom and the row came down to what was left.
+apps/desktop/src/shell/agent_chat/mod.rs 4671
 apps/desktop/src/shell/agent_chat/composer.rs 3523
