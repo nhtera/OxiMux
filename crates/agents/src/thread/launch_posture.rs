@@ -139,6 +139,29 @@ pub struct ClaudePosture {
     pub strict_mcp: bool,
 }
 
+/// Whether a Claude session's `system/init` shows its posture actually held:
+/// the no-prompt mode, and no built-in tool outside the posture's allow-list.
+/// MCP tools are not judged here — under `--strict-mcp-config` they can only
+/// be the host's own servers. The flags were verified on one CLI build; this
+/// catches a later build that ignores one of them, before the child acts.
+pub fn claude_init_holds(posture: SpawnPosture, permission_mode: &str, tools: &[String]) -> Result<(), String> {
+    if posture == SpawnPosture::Default {
+        return Ok(());
+    }
+    if permission_mode != "dontAsk" {
+        return Err(format!("the agent started in `{permission_mode}` mode, not `dontAsk`"));
+    }
+    let allowed = |t: &str| {
+        t.starts_with("mcp__")
+            || CLAUDE_REVIEW_TOOLS.contains(&t)
+            || (posture == SpawnPosture::Verify && t == "Bash")
+    };
+    match tools.iter().find(|t| !allowed(t)) {
+        Some(extra) => Err(format!("the agent started with the `{extra}` tool, outside its posture")),
+        None => Ok(()),
+    }
+}
+
 /// Apply `spec.posture` to `spec` for its transport. `claude_version` is asked
 /// only for a locked Claude posture. Returns the Claude flags to add, if any.
 pub fn apply(
@@ -279,6 +302,17 @@ mod tests {
                 assert!(matches!(apply(&mut spec(t, p), || None), Err(PostureUnenforceable::Adapter { .. })));
             }
         }
+    }
+
+    #[test]
+    fn an_init_that_ignored_the_posture_is_caught() {
+        let tools = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let review = SpawnPosture::Review;
+        assert!(claude_init_holds(review, "dontAsk", &tools(&["Glob", "Grep", "Read", "mcp__oximux__x"])).is_ok());
+        assert!(claude_init_holds(review, "default", &tools(&["Read"])).is_err(), "wrong mode");
+        assert!(claude_init_holds(review, "dontAsk", &tools(&["Read", "Bash"])).is_err(), "Bash leaked");
+        assert!(claude_init_holds(SpawnPosture::Verify, "dontAsk", &tools(&["Read", "Bash"])).is_ok());
+        assert!(claude_init_holds(SpawnPosture::Default, "default", &tools(&["Bash", "Edit"])).is_ok());
     }
 
     #[test]

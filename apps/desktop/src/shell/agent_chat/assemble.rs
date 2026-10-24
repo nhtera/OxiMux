@@ -111,7 +111,18 @@ impl AgentChatView {
         // restored chat always does — so a remote client's reference to this
         // session survives the restart that just rebuilt this view. Known
         // before the spawn: the agent's credential is scoped to it.
-        let remote_session_id = remote_session_id_for(thread.session_id.as_deref());
+        // A fresh Claude chat connecting now is told its id up front
+        // (`--session-id`): the registry, the spawn lineage and the agent's
+        // credential then start on the id it keeps, with no placeholder to
+        // re-key later. Other providers name themselves after launch.
+        let fresh_session_id = (mode == ConnectMode::Connect
+            && thread.session_id.is_none()
+            && backend.transport == oximux_agents::thread::Transport::StreamJson)
+            .then(|| uuid::Uuid::new_v4().to_string());
+        let remote_session_id = match &fresh_session_id {
+            Some(id) => id.clone(),
+            None => remote_session_id_for(thread.session_id.as_deref()),
+        };
         // A spawned child's posture: its lineage row is the authority (a
         // persisted chat blob is not — it could be edited), the restored value
         // only the fallback for a host with no core.
@@ -149,6 +160,7 @@ impl AgentChatView {
             spec.claude_fast_mode =
                 claude_fast_mode_to_apply(posture.claude_fast_mode, model.as_deref());
             spec.posture = spawn_posture;
+            spec.fresh_session_id = fresh_session_id.clone();
             Self::add_spawn_credential(&mut spec, &remote_session_id, cx);
             match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {

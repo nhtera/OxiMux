@@ -351,6 +351,7 @@ pub fn build_tab_strip_for(
                 pinned: t.pinned,
                 is_preview: t.is_preview,
                 external_mutation: t.external_mutation,
+                tooltip: t.tooltip.clone(),
             }
         })
         .collect();
@@ -399,6 +400,7 @@ struct PaneGroupTabHeader {
     /// On-disk mutation of the backing file (deleted/renamed) — rendered as a
     /// strikethrough label plus a trailing suffix.
     external_mutation: Option<super::ExternalMutation>,
+    tooltip: Option<SharedString>,
 }
 
 #[derive(Clone, Copy)]
@@ -782,6 +784,7 @@ fn build_tab_strip_from_headers(
             header.pinned,
             header.is_preview,
             header.external_mutation,
+            header.tooltip.clone(),
             tokens,
             workspace_tint,
             entity.clone(),
@@ -1174,6 +1177,7 @@ fn render_tab_chip(
     is_pinned: bool,
     is_preview: bool,
     external_mutation: Option<super::ExternalMutation>,
+    tooltip: Option<SharedString>,
     tokens: &TabTokens<'_>,
     workspace_tint: Option<super::TabColor>,
     entity: Entity<PaneGroup>,
@@ -1292,6 +1296,9 @@ fn render_tab_chip(
             "pane-group-tab-{entity_id_raw}-{ix}"
         )))
         .group(group_name.clone())
+        .when_some(tooltip, |el, text| {
+            el.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(text.clone()).build(window, cx))
+        })
         .flex()
         .flex_row()
         .items_center()

@@ -42,6 +42,9 @@ impl PaneGroup {
         let ix = self.push_agent_chat_view(view, cwd, model, false, window, cx);
         let label = format!("↳ {}", self.tabs[ix].label);
         self.tabs[ix].label = SharedString::from(label);
+        let parent_tab = &self.tabs[parent_ix];
+        let parent_name = parent_tab.custom_title.clone().unwrap_or_else(|| parent_tab.label.clone());
+        self.tabs[ix].tooltip = Some(SharedString::from(format!("Spawned by {parent_name}")));
         self.place_after_family(ix, parent_ix, parent, cx);
         self.sync_remote_tab_title(ix, cx);
         cx.notify();

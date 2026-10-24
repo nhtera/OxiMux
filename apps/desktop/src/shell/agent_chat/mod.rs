@@ -49,6 +49,7 @@ mod jump_menu;
 mod child;
 mod login_card;
 mod remote_link;
+mod posture_snapshot;
 mod respawn_gate;
 mod sign_in;
 mod message_rail;
@@ -527,7 +528,6 @@ use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
-use oximux_agents::thread::pi::posture::{self as pi_posture, PiPosture};
 use oximux_agents::thread::{
     probe_catalog, AgentConnection, AssistantMessage, ChatBackend, ChatImage,
     ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue, PermissionDecision,
@@ -1261,67 +1261,6 @@ impl AgentChatView {
             && let Err(e) = conn.set_feature(oximux_agents::thread::FEATURE_FAST_MODE, FeatureValue::Bool(on))
         {
             tracing::warn!(error = %e, "could not re-apply claude fast mode");
-        }
-    }
-
-    /// Pi's tool posture, read from the composer's feature picks. `None` for a
-    /// non-Pi chat or when nothing was changed (restore then applies the
-    /// deliberate default).
-    ///
-    /// Unlike Codex's, this posture is the session's ONLY tool gate — pi never
-    /// asks before running anything — so it is snapshotted for persistence
-    /// rather than left to be re-derived.
-    fn pi_posture_snapshot(&self) -> Option<PiPosture> {
-        if self.backend.transport != Transport::Rpc {
-            return None;
-        }
-        let tools = match self.feature_values.get(pi_posture::FEATURE_TOOLS) {
-            Some(FeatureValue::Choice(wire)) => Some(wire.clone()),
-            _ => None,
-        };
-        let context_files = match self.feature_values.get(pi_posture::FEATURE_CONTEXT_FILES) {
-            Some(FeatureValue::Bool(on)) => Some(*on),
-            _ => None,
-        };
-        if tools.is_none() && context_files.is_none() {
-            return None;
-        }
-        Some(PiPosture::from_parts(tools.as_deref(), context_files))
-    }
-
-    /// omp's approval posture, read from the composer's feature picks. `None`
-    /// for a non-omp chat or when the picker was never touched (restore then
-    /// applies the deliberate Write default — the spawn flag stays explicit
-    /// either way, so omp's own yolo default is unreachable).
-    fn omp_posture_snapshot(&self) -> Option<oximux_agents::thread::omp::posture::OmpPosture> {
-        if self.backend.transport != Transport::OmpRpc {
-            return None;
-        }
-        match self.feature_values.get(oximux_agents::thread::omp::posture::FEATURE_APPROVALS) {
-            Some(FeatureValue::Choice(wire)) => {
-                oximux_agents::thread::omp::posture::OmpPosture::from_wire(wire)
-            }
-            _ => None,
-        }
-    }
-
-    /// The Codex posture `(approval_policy, sandbox)` the user has selected, read
-    /// from the composer's feature picks. `None` for a non-Codex chat or when the
-    /// posture was never changed from the default (nothing to persist).
-    fn codex_posture_snapshot(&self) -> Option<(String, String)> {
-        if self.backend.transport != Transport::AppServer {
-            return None;
-        }
-        let choice = |id: &str| match self.feature_values.get(id) {
-            Some(FeatureValue::Choice(wire)) => Some(wire.clone()),
-            _ => None,
-        };
-        match (choice("codex_approval_policy"), choice("codex_sandbox")) {
-            (None, None) => None,
-            (approval, sandbox) => Some((
-                approval.unwrap_or_else(|| "on-request".to_string()),
-                sandbox.unwrap_or_else(|| "workspace-write".to_string()),
-            )),
         }
     }
 
@@ -2963,6 +2902,7 @@ impl AgentChatView {
             if let Some(binding) = &self.remote {
                 binding.ingest(ev.clone());
             }
+            self.guard_spawn_posture(&ev);
             self.apply_event(ev, cx);
         }
         // A fresh chat is registered under a placeholder id until the agent mints

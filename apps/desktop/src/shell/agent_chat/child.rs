@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use gpui::{Context, Window};
-use oximux_agents::thread::launch_posture::SpawnPosture;
-use oximux_agents::thread::{ChatBackend, ChatThread};
+use oximux_agents::thread::launch_posture::{SpawnPosture, claude_init_holds};
+use oximux_agents::thread::{ChatBackend, ChatThread, ThreadEvent, Transport};
 use oximux_settings::{Density, Theme, Typography};
 
 use super::session_persistence::ConnectMode;
@@ -41,5 +41,26 @@ impl AgentChatView {
             window,
             cx,
         )
+    }
+
+    /// A reviewer or verifier whose agent announced, at start, a mode or a tool
+    /// its posture does not allow is stopped before it acts: the launch flags
+    /// were verified on one CLI build, and a later one could ignore one. The
+    /// chat says why; nothing downgrades silently.
+    pub(super) fn guard_spawn_posture(&mut self, ev: &ThreadEvent) {
+        let ThreadEvent::SessionInit { permission_mode, meta, .. } = ev else { return };
+        if self.spawn_posture == SpawnPosture::Default || self.backend.transport != Transport::StreamJson {
+            return;
+        }
+        if let Err(why) = claude_init_holds(self.spawn_posture, permission_mode, &meta.tools) {
+            tracing::warn!(%why, "posture not held; stopping the child");
+            self.thread.last_error = Some(format!(
+                "Stopped: this {} agent could not be held to its posture ({why}).",
+                self.spawn_posture.as_text()
+            ));
+            if let Some(conn) = self.connection.take() {
+                conn.shutdown();
+            }
+        }
     }
 }

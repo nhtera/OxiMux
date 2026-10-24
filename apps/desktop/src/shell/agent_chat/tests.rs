@@ -5,6 +5,7 @@
 //! unchanged.
 
     use super::*;
+    use oximux_agents::thread::pi::posture as pi_posture;
     use gpui::TestAppContext;
     use oximux_agents::thread::connection::AgentCapabilities;
     use oximux_agents::thread::StubConnection;
