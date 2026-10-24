@@ -27,6 +27,16 @@ impl AgentChatView {
         busy
     }
 
+    /// Respawn so the next process starts with this chat's credential (local
+    /// access or confinement was just switched on). Deferred like any other
+    /// respawn while a turn is live; nothing to do for a chat not yet spawned,
+    /// which picks one up when it connects.
+    pub(crate) fn respawn_for_credential(&mut self, cx: &mut Context<Self>) {
+        if !self.unbound && self.connection.is_some() {
+            self.respawn(cx);
+        }
+    }
+
     /// The turn ended: run the respawn a mid-turn change asked for, if any,
     /// before anything else uses the connection.
     pub(super) fn run_pending_respawn(&mut self, cx: &mut Context<Self>) {

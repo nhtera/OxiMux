@@ -171,6 +171,8 @@ impl Dispatcher {
                     root_id: row.root_id,
                     depth: row.depth,
                     replayed: true,
+                    // The original call delivered it (or said it did not).
+                    prompt_delivered: true,
                 });
             }
             Ok(Ok(Reservation::Fresh { row_id, depth, root_id })) => (row_id, depth, root_id),
@@ -208,6 +210,9 @@ impl Dispatcher {
         if !self.may_reach(peer, of) {
             return refuse(SpawnErrorKind::NotInSubtree, "That session is not in your subtree.");
         }
+        // Settle states first: the change feed only ticks on a flip, so a child
+        // that went quiet inside its grace would otherwise still read working.
+        core.sync_lineage_states();
         match core.lineage().children(of, recursive) {
             Ok(rows) => Response::Children(rows.into_iter().filter_map(lineage_to_wire).collect()),
             Err(err) => {
@@ -380,6 +385,7 @@ impl LaunchJob {
             root_id: self.root_id,
             depth: self.depth,
             replayed: false,
+            prompt_delivered: delivered,
         })
     }
 

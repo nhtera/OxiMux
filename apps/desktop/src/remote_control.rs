@@ -905,6 +905,8 @@ impl RemoteControl {
                     handle.restore_session(&credential.label, &credential.secret, session_id);
                 }
                 *rc.local.lock().unwrap() = Some(handle);
+                // Chats opened while it was off have no credential yet.
+                RemoteControl::refresh_chat_credentials(cx);
             }
             // The flag stays on so the UI reflects the user's choice, but with
             // nothing bound the CLI reports the host unreachable — which is
@@ -989,6 +991,25 @@ impl RemoteControl {
             handle.revoke_session(&previous.label);
         }
         Some(oximux_remote_local::credential_env(&label, &secret))
+    }
+
+    /// Give every open chat whose agent has no credential one, by respawning it
+    /// (after its turn, if one is running). For local access or confinement
+    /// switched on while chats were open: until then their agents keep the
+    /// operator reach they were spawned with.
+    pub fn refresh_chat_credentials(cx: &mut gpui::App) {
+        let Some(rc) = cx.try_global::<RemoteControl>() else { return };
+        let have: std::collections::HashSet<String> = rc.chat_credentials.lock().unwrap().keys().cloned().collect();
+        let views: Vec<_> = crate::platform::window_registry::all_windows(cx)
+            .into_iter()
+            .flat_map(|(_, workspace)| workspace.read(cx).all_project_panes())
+            .flat_map(|panes| panes.read(cx).agent_chat_views(cx))
+            .collect();
+        for view in views {
+            if !have.contains(view.read(cx).remote_session_id()) {
+                view.update(cx, |view, cx| view.respawn_for_credential(cx));
+            }
+        }
     }
 
     /// Drop a chat's credential when its agent process is gone.

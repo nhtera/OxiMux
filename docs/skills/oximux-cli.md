@@ -118,6 +118,9 @@ a few working children per parent; a lifetime budget). A refusal exits 1 or 5
 and says what to do instead — usually "wait on a child, cancel one, or do it
 yourself". `--request-id` makes a retry return the same child. A `review`
 child only reads; `verify` may build and test but not edit; neither prompts.
+`verify` trusts the repository: its test runner is the project's own code,
+which no posture inspects. If `spawn` reports the prompt was not delivered,
+send it with `oximux send <child> "…"` or cancel the child.
 
 ## Watching it finish
 

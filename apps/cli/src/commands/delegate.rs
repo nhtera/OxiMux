@@ -77,12 +77,19 @@ pub async fn spawn(client: &Client, args: SpawnArgs) -> Result<(Value, String), 
                 "root_id": r.root_id,
                 "depth": r.depth,
                 "replayed": r.replayed,
+                "prompt_delivered": r.prompt_delivered,
             });
-            let human = if r.replayed {
+            let mut human = if r.replayed {
                 format!("already spawned {} (same request id)", r.session_id)
             } else {
                 format!("spawned {} under {} (depth {})", r.session_id, r.parent_id, r.depth)
             };
+            if !r.prompt_delivered {
+                human.push_str(&format!(
+                    "\nits prompt was not delivered: `oximux send {} \"…\"`, or cancel it",
+                    r.session_id
+                ));
+            }
             Ok((data, human))
         }
         Response::Error(e) => Err(rpc_failure(e)),

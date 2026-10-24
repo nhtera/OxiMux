@@ -48,6 +48,17 @@ impl PaneGroup {
         self.chat_session_id_at(ix, cx)
     }
 
+    /// Every chat view in this group.
+    pub fn agent_chat_views(&self) -> Vec<Entity<crate::shell::agent_chat::AgentChatView>> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                PaneContent::AgentChat(view) => Some(view.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The tab index of the chat bound to `remote_session_id`, if this group
     /// holds it.
     pub fn chat_tab_index_by_remote_id(&self, remote_session_id: &str, cx: &App) -> Option<usize> {

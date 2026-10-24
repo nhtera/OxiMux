@@ -1039,3 +1039,69 @@ assertions = [
   "every_ci_check_runs_in_ci",
   "a_check_absent_from_the_workflow_would_be_caught",
 ]
+
+# ---------------------------------------------------------------------------
+# agent delegation (orchestration P1)
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "delegation.spawn-caps-hold"
+title = "An agent cannot spawn past the caps, even in a burst"
+status = "stable"
+owner = "agents"
+invariant = """
+Every agent- or run-origin child is created through `LineageStore::reserve`, \
+which checks depth, working-per-parent, working-per-root, open-per-root, the \
+lifetime budget and the failed-start breaker in one immediate transaction \
+before anything launches. A launch that outlived its reservation cannot \
+finalize into another spawn's slot, and a child that has just started counts \
+as working until it says otherwise."""
+oracle = """
+Race two reservations for the last slot from two connections and assert one \
+wins; reserve with idle children inside and past the grace and assert they \
+park only past it; reclaim a slow reservation, let another reserve, and assert \
+the late finalize fails. Over the wire: three failed launches refuse the \
+fourth, and a cap-hit refusal names the limit in the parent's transcript."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only: the store and dispatcher tests run in the macOS workspace job. \
+The logic is SQLite and platform-free, but the Windows and Linux jobs do not \
+name these crates. Proven on the desktop host only; the headless host joins in \
+Phase 4b."""
+test_files = ["crates/agents/src/lineage_tests.rs", "crates/remote-host/tests/spawn_lineage.rs"]
+assertions = [
+  "concurrent_reservations_at_seven_active_admit_exactly_one",
+  "a_late_finalize_cannot_take_over_a_reused_slot",
+  "a_just_started_child_is_not_parked_by_an_idle_report",
+  "three_failed_launches_trip_the_breaker_and_leave_no_reservation",
+  "a_cap_hit_leaves_a_notice_in_the_parents_transcript",
+]
+
+[[gate]]
+id = "delegation.confinement-is-the-subtree"
+title = "A confined agent reaches its own session and its spawned subtree, nothing else"
+status = "stable"
+owner = "remote-host"
+invariant = """
+A chat agent's credential reaches its own session and the sessions it \
+spawned (read, send, cancel), never another's. It never answers its own \
+permission or question prompts; a parent answers a child's only if the child \
+opted in, and then only Deny or an unchanged Allow for read-only tools."""
+oracle = """
+The ACL matrix asks every predicate of every caller class, including the \
+confined agent, and fails if a predicate is added without a column. Over the \
+wire, a parent sends to and reads its child while a stranger is refused, and a \
+stranger cannot list or cancel another agent's children."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, for the same reason as the caps gate. Confinement is a guardrail, \
+not isolation: any process running as the user can read the operator token."""
+test_files = ["crates/remote-host/src/auth/acl_matrix.rs", "crates/remote-host/tests/spawn_lineage.rs"]
+assertions = [
+  "a_session_confined_agent_reaches_only_its_own_session",
+  "the_matrix_covers_every_predicate",
+  "a_parent_reaches_its_child_through_the_session_verbs",
+  "a_parent_lists_and_cancels_its_children_but_not_a_strangers",
+]

@@ -225,6 +225,7 @@ fn send_prompt_and_responses_round_trip() {
             root_id: "s1".into(),
             depth: 1,
             replayed: false,
+            prompt_delivered: true,
         }),
         Response::Children(vec![crate::lineage::LineageWire {
             session_id: "c1".into(),

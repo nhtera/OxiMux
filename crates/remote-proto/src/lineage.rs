@@ -84,6 +84,9 @@ pub struct SpawnAgentResult {
     pub depth: u32,
     /// `true` when this was a replay of an earlier request: nothing new started.
     pub replayed: bool,
+    /// Whether the child was given its prompt. `false` means it opened but is
+    /// sitting idle: send it the task, or cancel it.
+    pub prompt_delivered: bool,
 }
 
 /// Where a child stands.

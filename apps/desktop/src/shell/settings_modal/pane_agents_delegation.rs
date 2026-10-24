@@ -25,6 +25,7 @@ fn current(cx: &gpui::App) -> HostConfig {
 /// Store `next` in the settings keys and hand it to the running core.
 fn apply(modal: &SettingsModal, next: HostConfig, cx: &mut gpui::Context<SettingsModal>) {
     let next = next.sanitized();
+    let confinement_switched_on = next.confine_chat && !current(cx).confine_chat;
     for (key, value) in next.entries() {
         if let Err(err) = modal.notify_repo.set(key, &value) {
             tracing::warn!(%err, key, "agent delegation setting not saved");
@@ -32,6 +33,11 @@ fn apply(modal: &SettingsModal, next: HostConfig, cx: &mut gpui::Context<Setting
     }
     if let Some(core) = cx.try_global::<RemoteControl>().and_then(|rc| rc.host_core()) {
         core.set_config(next);
+    }
+    if confinement_switched_on {
+        // Open chats' agents were spawned without a credential: respawn them
+        // (after any running turn) so they pick one up.
+        cx.defer(RemoteControl::refresh_chat_credentials);
     }
     cx.notify();
 }
