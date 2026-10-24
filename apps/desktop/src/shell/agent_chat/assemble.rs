@@ -298,6 +298,7 @@ impl AgentChatView {
         // covers cold restore, where `self` does not exist yet so the binding is
         // driven directly from the locals that seed the struct below.
         let mut remote_prompt_task = None;
+        let send_gate = Self::new_send_gate();
         let mut remote_choice_task = None;
         let mut remote_choice_sender = None;
         if let Some(binding) = &remote {
@@ -328,7 +329,9 @@ impl AgentChatView {
             binding.set_prompt_sink(tx);
             let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
             binding.set_event_sink(event_tx);
-            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, cx));
+            binding.set_gate(Some(send_gate.clone()));
+            let wake_rx = Self::arm_send_gate(&send_gate);
+            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, wake_rx, cx));
             // Complete model/mode picks the backend fixes at spawn, which only
             // this view can carry out (it owns the respawn).
             let (choice_tx, choice_rx) = futures::channel::mpsc::unbounded();
@@ -345,6 +348,8 @@ impl AgentChatView {
             spawn_posture,
             posture_refused: None,
             pending_respawn: false,
+            send_gate,
+            pending_send_uuid: None,
             remote,
             backend,
             composer,
@@ -450,6 +455,8 @@ impl AgentChatView {
     /// composer so its status line, Send button, and bottom-toolbar pickers all
     /// reflect reality. Cheap no-op when nothing changed (both setters guard).
     pub(super) fn sync_composer(&self, cx: &mut Context<Self>) {
+        // Every change the composer reflects also changes what holds sends.
+        self.sync_gate_holds();
         // A rewind in flight — or a pending ACP auth prompt (the session can't
         // accept input until the user signs in) — disables the composer just like
         // a disconnect until it resolves. A worktree create in flight (or one

@@ -86,11 +86,16 @@ impl AgentChatView {
                 // Re-arm the remote-prompt echo relay against the new binding.
                 let (tx, rx) = futures::channel::mpsc::unbounded();
                 let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
+                // Remote prompts and the host's child events queue in this
+                // chat's gate from now on; its waker rides the same relay.
+                let wake_rx = Self::arm_send_gate(&self.send_gate);
                 if let Some(binding) = &self.remote {
                     binding.set_prompt_sink(tx);
                     binding.set_event_sink(event_tx);
+                    binding.set_gate(Some(self.send_gate.clone()));
                 }
-                self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, cx));
+                self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, wake_rx, cx));
+                self.sync_gate_holds();
                 // Point the *existing* choice relay at the new binding rather than
                 // starting a fresh one. This path runs inside `change_model` →
                 // `respawn`, so the relay is mid-flight on the very pick that
@@ -113,8 +118,11 @@ impl AgentChatView {
     /// dropping the view's handle alone would not evict the session.
     pub(super) fn unbind_remote(&mut self) {
         if let Some(binding) = self.remote.take() {
+            binding.set_gate(None);
             binding.unregister(&self.remote_session_id);
         }
+        // Nobody drains the gate now; a later bind arms it again.
+        self.send_gate.lock().unwrap().clear_waker();
     }
 
     /// Push this tab's title + effective model into the registry so a remote

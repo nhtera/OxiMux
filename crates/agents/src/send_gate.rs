@@ -65,10 +65,29 @@ pub enum DeliveryMode {
 /// Who an item came from. Set by the host, never inferred from the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendSource {
-    /// The user, on any device, or an agent's `send_agent`.
+    /// The user at this desk.
     User,
+    /// A remote client (a phone) or an agent's `send_agent`: nobody is at the
+    /// screen this session drives.
+    Remote,
     /// A batch of child events for this parent (an outbox delivery).
     ParentEvent,
+}
+
+/// What holds a session's sends, as its driver sees it. Mirrored into the
+/// gate in one call after every change ([`SendGate::set_holds`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Holds {
+    /// A turn is running.
+    pub turn_active: bool,
+    /// The user stopped the session; it resumes on their next message.
+    pub interrupted: bool,
+    /// Nothing to send to: the process is gone, not started, or signing in.
+    pub disconnected: bool,
+    /// A provider limit closed the last turn and a retry is armed.
+    pub retry_armed: bool,
+    /// A permission or question prompt waits for an answer.
+    pub prompt_pending: bool,
 }
 
 /// One queued message, in the form it is written to the CLI.
@@ -182,6 +201,12 @@ impl SendGate {
         self.next_id += 1;
         let id = self.next_id;
         let uuid = uuid.unwrap_or_else(Uuid::new_v4);
+        // Only the host's own deliveries are events: text from anyone else that
+        // merely looks like one goes out as plain text.
+        let text = match source {
+            SendSource::ParentEvent => text,
+            _ => crate::envelope::neutralize_forged(&text).into_owned(),
+        };
         self.queue.push_back(QueuedSend { id, uuid, text, images, mode, source });
         self.wake_if_ready();
         (id, uuid)
@@ -204,7 +229,7 @@ impl SendGate {
 
     /// Why `item` is waiting (or [`SendWait::None`]).
     pub fn wait_of(&self, item: &QueuedSend) -> SendWait {
-        if self.stopped_by_user || self.interrupted {
+        if item.source == SendSource::ParentEvent && self.stopped() {
             return SendWait::StoppedByUser;
         }
         if self.disconnected {
@@ -232,29 +257,36 @@ impl SendGate {
         if self.steer_available() && self.queue.iter().any(|q| q.mode == DeliveryMode::Steer) {
             return Ready::Steer;
         }
-        if self.open() && !self.queue.is_empty() {
+        if self.next_sendable().is_some() {
             return Ready::Flush;
         }
         Ready::Idle
     }
 
-    /// A new turn may start: nothing running, nothing holding.
-    fn open(&self) -> bool {
-        !self.turn_active
-            && !self.interrupted
-            && !self.disconnected
-            && !self.retry_armed
-            && !self.prompt_pending
-            && !self.stopped_by_user
+    /// The user stopped the session: child events wait for them.
+    fn stopped(&self) -> bool {
+        self.interrupted || self.stopped_by_user
     }
 
-    /// The oldest item, if a turn may start now. The caller sends it at once
-    /// (the gate counts the turn as running from here).
-    pub fn take_next_if_open(&mut self) -> Option<QueuedSend> {
+    /// A new turn may start: nothing running, nothing holding.
+    fn open(&self) -> bool {
+        !self.turn_active && !self.disconnected && !self.retry_armed && !self.prompt_pending
+    }
+
+    /// Where the oldest item that may start a turn now sits. After a Stop a
+    /// person's message still goes (it resumes the session, and takes the held
+    /// child events with it); child events alone never start a turn then.
+    fn next_sendable(&self) -> Option<usize> {
         if !self.open() {
             return None;
         }
-        let item = self.queue.pop_front()?;
+        self.queue.iter().position(|q| q.source != SendSource::ParentEvent || !self.stopped())
+    }
+
+    /// The oldest item that may start a turn now. The caller sends it at once
+    /// (the gate counts the turn as running from here).
+    pub fn take_next_if_open(&mut self) -> Option<QueuedSend> {
+        let item = self.queue.remove(self.next_sendable()?)?;
         self.begin_turn(item.source);
         Some(item)
     }
@@ -300,6 +332,27 @@ impl SendGate {
     }
 
     // ── what the owner reports ─────────────────────────────────────────────
+
+    /// Mirror the driver's holds in one go; wakes the owner (once) when that
+    /// opens the gate.
+    pub fn set_holds(&mut self, holds: Holds) {
+        let was = self.ready();
+        if holds.turn_active && !self.turn_active {
+            self.turn_started = false;
+        }
+        if !holds.turn_active {
+            self.turn_started = false;
+            self.turn_source = None;
+        }
+        self.turn_active = holds.turn_active;
+        self.interrupted = holds.interrupted;
+        self.disconnected = holds.disconnected;
+        self.retry_armed = holds.retry_armed;
+        self.prompt_pending = holds.prompt_pending;
+        if self.ready() != was {
+            self.wake_if_ready();
+        }
+    }
 
     /// The owner started a turn by itself (a direct send).
     pub fn begin_turn(&mut self, source: SendSource) {

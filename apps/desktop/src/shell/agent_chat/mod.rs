@@ -51,6 +51,7 @@ mod login_card;
 mod remote_link;
 mod posture_snapshot;
 mod respawn_gate;
+mod send_gate_link;
 mod sign_in;
 mod message_rail;
 mod pending_edit;
@@ -61,6 +62,7 @@ mod plan_panel;
 mod publish_throttle;
 mod question_card;
 mod remote_turn;
+mod turn_checkpoint;
 mod turn_summary_card;
 mod rewind_menu;
 mod session_persistence;
@@ -580,6 +582,10 @@ pub struct AgentChatView {
     posture_refused: Option<String>,
     /// A respawn asked for mid-turn, run when the turn ends (`respawn_gate`).
     pending_respawn: bool,
+    /// Sends that did not start in this composer wait here (`send_gate_link`).
+    send_gate: Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>,
+    /// The id the next write goes out under (a gate item's), else a fresh one.
+    pending_send_uuid: Option<uuid::Uuid>,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`
@@ -1927,6 +1933,7 @@ impl AgentChatView {
         if text.is_empty() && images.is_empty() {
             return;
         }
+        let text = oximux_agents::envelope::neutralize_forged(&text).into_owned();
         // The user is driving again: drop any armed retry and reset the attempt
         // count. The cap is per turn, so a conversation that hits a limit once
         // an hour must not eventually lock itself out.
@@ -2011,8 +2018,8 @@ impl AgentChatView {
             self.title_generated = true; // guard a fast double-send from re-firing
             self.spawn_title_generation(text.clone(), cx);
         }
-        if let Some(conn) = &self.connection {
-            match conn.send_user_message_with_images(&text, &images) {
+        if self.connection.is_some() {
+            match self.write_prompt(&text, &images) {
                 // Tee the prompt to remote subscribers only. No backend echoes the
                 // user's own message, so without this a phone renders replies to
                 // prompts it never showed. It is NOT applied to `self.thread` —
@@ -2611,6 +2618,8 @@ impl AgentChatView {
             remote_session_id,
             spawn_posture: Default::default(),
             posture_refused: None,
+            send_gate: Self::new_send_gate(),
+            pending_send_uuid: None,
             pending_respawn: false,
             remote,
             backend: ChatBackend::stream_json(),
@@ -3140,77 +3149,13 @@ impl AgentChatView {
         }
     }
 
-    /// Take a checkpoint anchored to the user entry at `user_index`, off-thread.
-    /// Attaches the sha to that entry when done (a no-op if the thread moved on)
-    /// and records it as the pre-turn snapshot for the turn-end compare.
-    fn take_checkpoint_for(&mut self, user_index: usize, cx: &mut Context<Self>) {
-        let Some(engine) = self.checkpoint_engine.clone() else { return };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
-        // Bind the snapshot to the session it was taken for. A rewind mints a
-        // new session id and renumbers entries, so a straggling callback from a
-        // pre-rewind turn must not misattach onto a same-index entry.
-        let session = self.thread.session_id.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        handle.spawn(async move {
-            let _ = tx.send(engine.create().await.ok());
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Some(sha)) = rx.await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.thread.session_id != session {
-                        return; // stale — the session was rewound out from under us
-                    }
-                    this.thread.attach_checkpoint(user_index, sha.0.clone());
-                    this.pre_turn_checkpoint =
-                        Some((user_index, oximux_git::checkpoint::CheckpointSha(sha.0)));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// After a turn ends, compare a fresh snapshot against the pre-turn one; if
-    /// they differ, light up the rewind "restore files" affordance on that
-    /// turn's user entry. The fresh snapshot is only used for the compare.
-    fn compare_turn_checkpoint(&mut self, cx: &mut Context<Self>) {
-        let (Some(engine), Some((index, pre_sha))) =
-            (self.checkpoint_engine.clone(), self.pre_turn_checkpoint.take())
-        else {
-            return;
-        };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
-        let session = self.thread.session_id.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        handle.spawn(async move {
-            let changed = match engine.create().await {
-                Ok(post) => engine.differs(&pre_sha, &post).await.unwrap_or(false),
-                Err(_) => false,
-            };
-            let _ = tx.send(changed);
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(changed) = rx.await
-                && changed
-            {
-                let _ = this.update(cx, |this, cx| {
-                    if this.thread.session_id != session {
-                        return; // stale — session rewound before the compare landed
-                    }
-                    this.thread.set_checkpoint_show(index, true);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
     /// Send the oldest message the composer parked while a turn streamed, if any.
     /// Driven off the natural turn-end edge in [`Self::on_event`]; since each
     /// completed turn releases exactly one, a lined-up batch drains in order.
     fn flush_next_queued(&mut self, cx: &mut Context<Self>) {
-        if let Some((text, images)) = self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
-            self.send_text(text, images, cx);
+        match self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
+            Some((text, images)) => self.send_text(text, images, cx),
+            None => self.flush_send_gate(cx),
         }
     }
 

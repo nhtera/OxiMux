@@ -498,6 +498,22 @@ impl SessionHandle {
     /// optimistic-echo correlation the view/phone use to dedup the arriving stream
     /// copy against their local echo (threaded through once the surfaces echo).
     pub fn send_prompt(&self, text: &str, images: &[ChatImage]) -> Result<()> {
+        // A driver with a send gate takes it from here: the prompt waits behind
+        // a running turn, a Stop or an open prompt like a typed one would, and
+        // the driver writes it (and shows it) when it may.
+        if let Some(gate) = self.gate() {
+            let mut gate = gate.lock().unwrap();
+            if gate.has_waker() {
+                gate.push(
+                    text.to_string(),
+                    images.to_vec(),
+                    crate::send_gate::SendSource::Remote,
+                    crate::send_gate::DeliveryMode::Queue,
+                    None,
+                );
+                return Ok(());
+            }
+        }
         // Held across the write and both records: a reply produced by this write
         // cannot be folded until the user's bubble has been. See `prompt_order`.
         let _order = self.prompt_order.lock().unwrap();
@@ -1436,5 +1452,26 @@ mod tests {
         assert_eq!(handle.events_since(0).len(), 1, "not retained");
         assert_eq!(receipts.try_recv().unwrap(), receipt);
         assert_eq!(handle.ingest(ThreadEvent::Notice("after".into())), seq + 1);
+    }
+
+    /// With a driver's gate attached, a remote prompt queues there instead of
+    /// going straight to the agent: the driver sends it when the session may
+    /// take it.
+    #[test]
+    fn a_remote_prompt_queues_in_the_drivers_gate() {
+        let reg = SessionRegistry::new();
+        let stub = Arc::new(crate::thread::StubConnection::default());
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        gate.lock().unwrap().set_waker(|| {});
+        handle.set_gate(Some(gate.clone()));
+        handle.send_prompt("from the phone", &[]).unwrap();
+        assert!(stub.sent().is_empty(), "not written yet");
+        let queued: Vec<_> = gate.lock().unwrap().queued().map(|q| (q.text.clone(), q.source)).collect();
+        assert_eq!(queued, [("from the phone".to_string(), crate::send_gate::SendSource::Remote)]);
+        // No driver listening: written directly, as before.
+        gate.lock().unwrap().clear_waker();
+        handle.send_prompt("direct", &[]).unwrap();
+        assert_eq!(stub.sent().len(), 1);
     }
 }

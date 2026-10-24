@@ -171,6 +171,12 @@ impl RemoteBinding {
         }
     }
 
+    /// Attach the view's send gate to the session (remote prompts and the
+    /// host's child events queue there), or detach it.
+    pub fn set_gate(&self, gate: Option<Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>>) {
+        self.handle.set_gate(gate);
+    }
+
     /// Whether anyone can connect (remote or local access on). Callers skip
     /// work done only for remote readers — serializing the transcript — when
     /// it is false.
