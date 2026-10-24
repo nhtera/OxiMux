@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 35,
-        "v35 = opening a folder in the desktop (OpenProject, ProjectOpened). v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+        PROTOCOL_VERSION, 36,
+        "v36 = agent delegation (SpawnAgent, ListChildren, CancelAgent, Whoami, their replies, RpcError::Spawn). v35 = opening a folder in the desktop (OpenProject, ProjectOpened). v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
          status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
@@ -137,6 +137,21 @@ fn requests_round_trip_via_postcard() {
         Request::FetchTranscript { session_id: "s1".into() },
         Request::ListProjects,
         Request::OpenProject { path: "/Users/me/Code/OxiMux".into() },
+        Request::SpawnAgent(crate::lineage::SpawnAgentReq {
+            request_id: "r-1".into(),
+            parent: crate::lineage::SpawnParentWire::Caller,
+            agent_id: "claude-code".into(),
+            model: Some("sonnet".into()),
+            prompt: "review the diff".into(),
+            cwd: crate::lineage::SpawnCwdWire::NewWorktree { name: Some("review".into()) },
+            output_schema: None,
+            notify_parent: crate::lineage::NotifyParentWire::Stuck,
+            allow_parent_permits: true,
+            posture: crate::lineage::SpawnPostureWire::Review,
+        }),
+        Request::ListChildren { of: "s1".into(), recursive: true },
+        Request::CancelAgent { id: "team:run-1".into(), cascade: true },
+        Request::Whoami,
     ];
     for req in requests {
         let bytes = req.to_bytes().expect("encode");
@@ -204,6 +219,45 @@ fn send_prompt_and_responses_round_trip() {
             project: ProjectSummaryWire { name: "OxiMux".into(), path: "/Users/me/Code/OxiMux".into() },
             worktree: Some("/Users/me/Code/OxiMux-feature".into()),
         },
+        Response::AgentSpawned(crate::lineage::SpawnAgentResult {
+            session_id: "c1".into(),
+            parent_id: "s1".into(),
+            root_id: "s1".into(),
+            depth: 1,
+            replayed: false,
+        }),
+        Response::Children(vec![crate::lineage::LineageWire {
+            session_id: "c1".into(),
+            parent_id: "s1".into(),
+            root_id: "s1".into(),
+            depth: 1,
+            posture: crate::lineage::SpawnPostureWire::Default,
+            state: crate::lineage::LineageStateWire::Parked,
+            notify_parent: crate::lineage::NotifyParentWire::Auto,
+            identity_slot: Some(2),
+            created_at: "2026-10-24T12:00:00+07:00".into(),
+        }]),
+        Response::AgentsCancelled { ended: vec!["g1".into(), "c1".into()] },
+        Response::Whoami(crate::lineage::WhoamiWire {
+            scope: "session".into(),
+            session: Some("s1".into()),
+            depth: 0,
+            root_id: Some("s1".into()),
+            spawn_allowed: true,
+            reason: None,
+            agents: vec![crate::lineage::AgentRosterWire {
+                agent_id: "claude-code".into(),
+                display: "Claude".into(),
+                default_model: Some("sonnet".into()),
+                models: vec![],
+                postures: vec![crate::lineage::SpawnPostureWire::Default, crate::lineage::SpawnPostureWire::Review],
+                installed: true,
+            }],
+        }),
+        Response::Error(RpcError::Spawn(crate::lineage::SpawnErrorWire {
+            kind: crate::lineage::SpawnErrorKind::FanoutExceeded,
+            message: "Spawn refused: 8 of 8 active children. Wait on a child, or cancel one.".into(),
+        })),
     ];
     for resp in responses {
         let bytes = resp.to_bytes().expect("encode");
@@ -308,6 +362,22 @@ fn early_variants_keep_their_literal_ordinals() {
         worktree: None,
     };
     assert_eq!(opened.to_bytes().expect("encode")[0], 55);
+    // The v36 delegation verbs, appended after the folder open: Request
+    // ordinals 74..=77, Response ordinals 56..=59, and `RpcError::Spawn` is
+    // error ordinal 8 (after `Unsupported`).
+    assert_eq!(Request::Whoami.to_bytes().expect("encode"), vec![77]);
+    let list = Request::ListChildren { of: String::new(), recursive: false };
+    assert_eq!(list.to_bytes().expect("encode")[0], 75);
+    let cancelled = Response::AgentsCancelled { ended: vec![] };
+    assert_eq!(cancelled.to_bytes().expect("encode")[0], 58);
+    let refused = Response::Error(RpcError::Spawn(crate::lineage::SpawnErrorWire {
+        kind: crate::lineage::SpawnErrorKind::DepthExceeded,
+        message: String::new(),
+    }));
+    let bytes = refused.to_bytes().expect("encode");
+    let unsupported = Response::Error(RpcError::Unsupported).to_bytes().expect("encode");
+    assert_eq!(bytes[0], unsupported[0], "same Response::Error ordinal");
+    assert_eq!(bytes[1], unsupported[1] + 1, "Spawn follows Unsupported");
     // `SessionsChanged` is the 29th Response variant (index 28); pin the
     // discriminant, the `Vec` payload follows.
     let changed = Response::SessionsChanged(vec![]);

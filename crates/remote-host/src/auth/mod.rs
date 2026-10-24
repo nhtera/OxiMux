@@ -28,7 +28,7 @@ mod reconnect;
 #[cfg(test)]
 mod tests;
 
-pub use acl::DeviceInfo;
+pub use acl::{DeviceInfo, PermitAuthority};
 pub use peer::{LocalScope, Peer};
 pub use persistence::{DeviceStore, StorageDeviceStore, StoredDevice};
 // The registration proof is a wire invariant shared with the client, so it lives

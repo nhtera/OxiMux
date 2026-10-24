@@ -24,6 +24,7 @@ mod schedules;
 mod serve;
 mod sim_view;
 mod simulator;
+mod spawn;
 mod state;
 mod stream;
 mod team;
@@ -164,6 +165,10 @@ pub struct Dispatcher {
     /// The coordination blackboard, when the host keeps one. Same
     /// `Unsupported`-for-authorized shape as `teams`.
     coord: Option<Arc<oximux_agents::coord::CoordStore>>,
+    /// The host's orchestration state (spawn lineage, config), shared by every
+    /// dispatcher in the process. `None` answers the lineage verbs
+    /// `Unsupported` and leaves prompts decidable only by their old gate.
+    host_core: Option<Arc<crate::HostCore>>,
     /// Coordination writes, fanned out to `StateWatch` subscribers. The
     /// dispatcher owns this one (unlike `schedule_events`, which the host's
     /// ticker feeds) because every writer goes through these handlers.
@@ -202,6 +207,7 @@ impl Dispatcher {
             schedule_events: None,
             teams: None,
             coord: None,
+            host_core: None,
             state_events: None,
             state_log: state::StateLog::default(),
             simulator: None,
@@ -311,6 +317,13 @@ impl Dispatcher {
     }
 
     /// Let this dispatcher drive the desktop's iOS Simulator.
+    /// Share the process's host core (built once, injected into every
+    /// dispatcher — never constructed per dispatcher).
+    pub fn with_host_core(mut self, core: Arc<crate::HostCore>) -> Self {
+        self.host_core = Some(core);
+        self
+    }
+
     pub fn with_simulator(mut self, simulator: Arc<dyn crate::simulator::SimulatorControl>) -> Self {
         self.simulator = Some(simulator);
         self
@@ -373,6 +386,9 @@ impl Dispatcher {
             }
             Request::SendPrompt(r) => self.send_prompt(peer, r),
             Request::ResolvePermission(r) => self.resolve_permission(peer, r),
+            Request::ListChildren { of, recursive } => self.list_children(peer, &of, recursive),
+            Request::CancelAgent { id, cascade } => self.cancel_agent(peer, &id, cascade),
+            Request::Whoami => self.whoami(peer),
             Request::AnswerQuestion(r) => self.answer_question(peer, r),
             Request::Steer { session_id, text } => self.steer(peer, &session_id, &text),
             Request::Cancel { session_id } => self.scoped(peer, &session_id, |h| h.cancel()),

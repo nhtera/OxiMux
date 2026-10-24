@@ -879,3 +879,66 @@ async fn a_failed_launch_reports_a_category_not_host_detail() {
     };
     futures::future::join(serve, script).await;
 }
+
+/// A reviewer's mode is part of what makes it one: no caller may switch it,
+/// not even a full-access phone, and nothing is forwarded to the backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_posture_locked_session_refuses_a_mode_change() {
+    use oximux_agents::lineage::{
+        LineageStore, NotifyParent, Reservation, SpawnCaps, SpawnOrigin, SpawnParent, SpawnSpec,
+    };
+    use oximux_agents::thread::launch_posture::SpawnPosture;
+
+    let (registry, conn) = switchable_registry();
+    let db = oximux_storage::db::open_memory().unwrap();
+    let lineage = LineageStore::new(db.conn());
+    let spec = SpawnSpec {
+        request_id: "rev".into(),
+        origin: SpawnOrigin::User,
+        posture: SpawnPosture::Review,
+        notify_parent: NotifyParent::Auto,
+        allow_parent_permits: false,
+        preassigned_id: None,
+        fingerprint_input: String::new(),
+    };
+    let now = chrono::Local::now();
+    let Ok(Reservation::Fresh { row_id, .. }) = lineage
+        .reserve(&SpawnParent::Session("root".into()), &spec, SpawnCaps::default(), &|_: &str| true, now)
+        .unwrap()
+    else {
+        panic!("reserve");
+    };
+    lineage.finalize(row_id, "sess-1", now).unwrap();
+    let core = oximux_remote_host::HostCore::new(oximux_remote_host::HostCoreDeps {
+        rt: tokio::runtime::Handle::current(),
+        lineage,
+        registry: registry.clone(),
+        config: oximux_remote_host::HostConfig::default(),
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock).with_host_core(core);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        let set = call(
+            &client,
+            Request::SetPermissionMode { session_id: "sess-1".into(), mode: "plan".into() },
+        )
+        .await;
+        match set {
+            Response::Error(RpcError::BadRequest(msg)) => assert!(msg.contains("review posture"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+    assert!(conn.sent().is_empty(), "nothing reaches the backend: {:?}", conn.sent());
+}

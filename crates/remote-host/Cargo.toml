@@ -10,8 +10,9 @@ rust-version.workspace = true
 # The in-app remote-control host: the transport-agnostic RPC dispatcher, the
 # two-key pairing/auth handshake + ACL, and the host identity. Consumes the
 # Phase-2 `SessionRegistry` (in `oximux-agents`) to serve session list/subscribe/
-# command RPCs. Desktop-only (runs in-process in OxiMux), so depending on the
-# heavier `oximux-agents` is fine — this crate never ships to mobile.
+# command RPCs. Runs in-process in both hosts (the desktop app and `oximux
+# serve`), so depending on the heavier `oximux-agents` is fine — this crate
+# never ships to mobile.
 #
 # The live iroh `Endpoint` binding + QR display live in later slices; everything
 # here is driven over the `remote-proto` `Transport` seam and is unit-testable
@@ -20,8 +21,8 @@ rust-version.workspace = true
 oximux-remote-proto = { workspace = true }
 oximux-agent-core = { workspace = true }
 oximux-agents = { workspace = true }
-# Durable paired-device/ACL persistence (RemoteDeviceRepo). Desktop-only host,
-# so the rusqlite pull-in is fine — this crate never ships to mobile.
+# Durable paired-device/ACL persistence (RemoteDeviceRepo). Host-only (desktop
+# and serve), so the rusqlite pull-in is fine — this crate never ships to mobile.
 oximux-storage = { workspace = true }
 # Git RPCs wrap the existing repository functions; path arguments are contained
 # via `oximux_git::path_guard` at this boundary before any disk access.
@@ -29,6 +30,8 @@ oximux-git = { workspace = true }
 oximux-core = { workspace = true }
 # Owner-only access on the private signing key written by `identity.rs`.
 oximux-owner-only = { workspace = true }
+# The host lock record, for the previous holder handed to `HostCore::start`.
+oximux-single-instance = { workspace = true }
 # Schedule rows carry `DateTime<Local>` fires; this boundary formats them to
 # RFC-3339 for the wire and derives the tick clock from the injected `now_secs`.
 chrono = { workspace = true }
@@ -50,9 +53,11 @@ rand = { workspace = true }
 # so `serve` stays drivable by any executor (the loopback test's futures executor
 # and, in production, the iroh tokio runtime).
 futures = { workspace = true }
-# For the `broadcast::Receiver` the SessionRegistry hands out (sync primitives
-# only — no runtime pulled in; the broadcast wakers are runtime-agnostic).
-tokio = { workspace = true, features = ["sync"] }
+# For the `broadcast::Receiver` the SessionRegistry hands out (the broadcast
+# wakers are runtime-agnostic), plus `rt`/`time` for `HostCore`'s background
+# tasks — which run on a runtime handle the host injects, never one this crate
+# creates or looks up.
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 
 [dev-dependencies]
 oximux-remote-proto = { workspace = true, features = ["testing"] }

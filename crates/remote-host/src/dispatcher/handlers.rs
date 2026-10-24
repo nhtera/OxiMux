@@ -2,7 +2,8 @@
 //! (`is_allowed_for`) before touching the [`SessionRegistry`], so revocation and
 //! per-device scoping bite on every call.
 
-use oximux_agents::session_registry::{ChoiceKind, SessionHandle};
+use oximux_agents::session_registry::{ChoiceKind, PendingPermissionView, SessionHandle};
+use oximux_agents::thread::{PermissionDecision, PermissionKind};
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire,
     SessionSummary, SessionTranscriptWire,
@@ -11,7 +12,7 @@ use oximux_remote_proto::proto::{Choice, Response, RpcError, SessionChoices};
 use oximux_remote_proto::HostEvent;
 
 use super::Dispatcher;
-use crate::auth::Peer;
+use crate::auth::{PermitAuthority, Peer};
 
 /// The project label a phone session row shows for attribution — the final path
 /// component of the session's working directory (its workspace root). `None` when
@@ -211,8 +212,10 @@ impl Dispatcher {
     }
 
     pub(super) fn resolve_permission(&self, peer: &Peer, req: ResolvePermissionReq) -> Response {
-        // Deciding a permission lets an agent act, so it is a write.
-        if !self.auth.may_write(peer, &req.session_id) {
+        // Deciding a permission lets an agent act, so it is a write — and an
+        // agent never decides its own (see `may_answer_permit`).
+        let authority = self.auth.may_answer_permit(peer, &req.session_id, || self.child_link(&req.session_id));
+        if authority == PermitAuthority::Refused {
             return Response::Error(RpcError::Unauthorized);
         }
         let decision = match req.decision() {
@@ -222,6 +225,11 @@ impl Dispatcher {
         let Some(handle) = self.registry.get(&req.session_id) else {
             return Response::Error(RpcError::UnknownSession);
         };
+        if authority == PermitAuthority::ParentLimited
+            && !parent_may_decide(handle.pending_permission(&req.request_id).as_ref(), &decision)
+        {
+            return Response::Error(RpcError::Unauthorized);
+        }
         match handle.resolve_permission(&req.request_id, decision) {
             Ok(true) => Response::Ack,
             // A benign race: someone already decided it. Idempotent — the client
@@ -237,8 +245,12 @@ impl Dispatcher {
     }
 
     pub(super) fn answer_question(&self, peer: &Peer, req: AnswerQuestionReq) -> Response {
-        // Answering releases a blocked turn, so it is a write.
-        if !self.auth.may_write(peer, &req.session_id) {
+        // Answering releases a blocked turn, so it is a write. A question is
+        // the agent asking its human; a parent's limited authority (Deny or an
+        // unchanged Allow) has no counterpart here, so only full authority
+        // answers.
+        let authority = self.auth.may_answer_permit(peer, &req.session_id, || self.child_link(&req.session_id));
+        if authority != PermitAuthority::Full {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(&req.session_id) else {
@@ -486,6 +498,15 @@ impl Dispatcher {
             return Response::Error(RpcError::UnknownSession);
         };
         let what = kind.noun();
+        // A reviewer or verifier holds its posture for life: its mode is part
+        // of what makes it one, so no caller — the user's phone, its parent,
+        // the agent itself — may switch it here.
+        if kind == ChoiceKind::PermissionMode && let Some(posture) = self.locked_posture(session_id) {
+            return Response::Error(RpcError::BadRequest(format!(
+                "this session's permission mode is locked by its {} posture",
+                posture.as_text()
+            )));
+        }
 
         // Refuse an id this session does not offer, BEFORE handing it down.
         //
@@ -593,4 +614,85 @@ impl Dispatcher {
         }
     }
 
+}
+
+impl Dispatcher {
+    /// The posture a session was spawned under, when it is a locked one.
+    fn locked_posture(&self, session_id: &str) -> Option<oximux_agents::thread::launch_posture::SpawnPosture> {
+        let row = self.host_core.as_ref()?.lineage().row(session_id).ok().flatten()?;
+        (row.posture != oximux_agents::thread::launch_posture::SpawnPosture::Default).then_some(row.posture)
+    }
+
+    /// For a session spawned through the grant: its parent, and whether it let
+    /// that parent answer its prompts.
+    fn child_link(&self, session_id: &str) -> Option<(String, bool)> {
+        let row = self.host_core.as_ref()?.lineage().row(session_id).ok().flatten()?;
+        Some((row.parent_id, row.allow_parent_permits))
+    }
+}
+
+/// Whether a parent agent's decision on its child's request stays inside the
+/// limited form it opted into: a Deny is always safe; an Allow must be a plain
+/// tool approval, with the input exactly as proposed, for a tool known to only
+/// read (an allow-list: any tool not on it — Bash, an editor, an MCP tool, a
+/// name this build has never seen — is refused). A request no longer pending
+/// cannot be checked, so it is refused.
+///
+/// Residual by design: a parent can still approve a read its child asked for
+/// (a file outside the project, a web fetch), which the parent then sees.
+fn parent_may_decide(pending: Option<&PendingPermissionView>, decision: &PermissionDecision) -> bool {
+    let Some(pending) = pending else { return false };
+    match decision {
+        PermissionDecision::Deny { .. } => true,
+        PermissionDecision::AllowWithSuggestion { .. } => false,
+        PermissionDecision::Allow { updated_input } => {
+            pending.kind == PermissionKind::Tool
+                && is_read_only_tool(&pending.tool_name)
+                && *updated_input == pending.input
+        }
+    }
+}
+
+/// Tools a parent may approve for its child: ones that only read, across the
+/// adapters' spellings (Claude, Pi/omp, ACP agents such as Gemini).
+fn is_read_only_tool(name: &str) -> bool {
+    const READ_ONLY: &[&str] = &[
+        "read", "grep", "glob", "ls", "find", "lsp", "notebookread", "toolsearch", "webfetch",
+        "websearch", "web_fetch", "web_search", "google_web_search", "read_file",
+        "read_many_files", "list_directory", "search_file_content",
+    ];
+    READ_ONLY.contains(&name.to_ascii_lowercase().as_str())
+}
+
+#[cfg(test)]
+mod parent_permit_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pending(tool: &str, kind: PermissionKind) -> PendingPermissionView {
+        PendingPermissionView { tool_name: tool.into(), kind, input: json!({"url": "https://example.com"}) }
+    }
+
+    #[test]
+    fn a_parent_may_always_deny() {
+        let deny = PermissionDecision::Deny { message: "no".into() };
+        assert!(parent_may_decide(Some(&pending("Bash", PermissionKind::Tool)), &deny));
+        assert!(parent_may_decide(Some(&pending("ExitPlanMode", PermissionKind::Plan)), &deny));
+    }
+
+    #[test]
+    fn a_parent_allows_only_unchanged_input_for_safe_tools() {
+        let same = PermissionDecision::Allow { updated_input: json!({"url": "https://example.com"}) };
+        let edited = PermissionDecision::Allow { updated_input: json!({"url": "https://evil.example"}) };
+        assert!(parent_may_decide(Some(&pending("WebFetch", PermissionKind::Tool)), &same));
+        assert!(!parent_may_decide(Some(&pending("WebFetch", PermissionKind::Tool)), &edited));
+        for tool in [
+            "Bash", "Edit", "Write", "MultiEdit", "apply_patch", "mcp__fs__write_file", "run_shell_command",
+            "write_file", "replace", "edit_file", "Task", "Agent", "a_tool_from_the_future",
+        ] {
+            assert!(!parent_may_decide(Some(&pending(tool, PermissionKind::Tool)), &same), "{tool}");
+        }
+        assert!(!parent_may_decide(Some(&pending("ExitPlanMode", PermissionKind::Plan)), &same));
+        assert!(!parent_may_decide(None, &same), "a decided request cannot be checked");
+    }
 }

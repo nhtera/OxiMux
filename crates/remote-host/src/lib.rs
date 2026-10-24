@@ -16,6 +16,8 @@
 pub mod auth;
 pub mod catalog;
 pub mod dispatcher;
+pub mod host_config;
+pub mod host_core;
 pub mod identity;
 pub mod launcher;
 pub mod projects;
@@ -32,8 +34,10 @@ pub use auth::{
     PairingSlot, StorageDeviceStore, StoredDevice, mint_pairing_secret, registration_proof,
 };
 pub use dispatcher::Dispatcher;
+pub use host_config::HostConfig;
+pub use host_core::{Allowance, HostCore, HostCoreDeps, PriorOwner};
 pub use identity::HostIdentity;
-pub use launcher::{LaunchError, SessionLauncher};
+pub use launcher::{ChildCtx, LaunchError, SessionLauncher};
 pub use projects::{OpenProjectError, OpenedProject, ProjectProvider};
 pub use rewind::{RewindError, RewindService};
 pub use schedule_runner::{RunNowError, ScheduleRunner, TickerRunner, schedule_run_to_wire};

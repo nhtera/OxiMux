@@ -376,13 +376,16 @@ fn launch_detail(err: &crate::launcher::LaunchError) -> &'static str {
             "this agent cannot be given a model when it starts; drop --role-model \
              for this role, or give it an agent that takes one"
         }
+        crate::launcher::LaunchError::PostureUnenforceable(_) => {
+            "this agent cannot be held to the posture asked for"
+        }
     }
 }
 
 /// Lowercase, hyphen-joined, alphanumerics only — the same shape a worktree
 /// slug takes elsewhere, so a role's directory name is predictable and safe to
 /// put in a path.
-fn slugify(text: &str) -> String {
+pub(super) fn slugify(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending_dash = false;
     for ch in text.chars() {

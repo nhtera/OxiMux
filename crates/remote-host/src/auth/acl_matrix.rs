@@ -21,6 +21,7 @@
 use ed25519_dalek::SigningKey;
 use oximux_remote_proto::messages::RegisterReq;
 
+use super::acl::PermitAuthority;
 use super::{AppPubkey, AuthStore, LocalScope, PairingSlot, Peer, registration_proof};
 
 /// The session a scoped caller is confined to, and one it is not. Every
@@ -29,6 +30,8 @@ use super::{AppPubkey, AuthStore, LocalScope, PairingSlot, Peer, registration_pr
 /// pair of them describes confinement.
 const IN_SCOPE: &str = "sess-1";
 const OUT_OF_SCOPE: &str = "sess-2";
+/// A child [`IN_SCOPE`] spawned (see [`in_scope_parent`]).
+const CHILD: &str = "sess-1-child";
 
 /// What one caller class may do. Every field is one predicate; the
 /// [`the_matrix_covers_every_predicate`] test below fails if `acl.rs` grows one
@@ -68,6 +71,17 @@ struct Row {
     control_simulator: bool,
     // Watching a device: local callers as above, plus a full-scope phone.
     view_simulator: bool,
+    // The spawn grant: under the caller's own session, and under another.
+    spawn_own_child: bool,
+    spawn_other_child: bool,
+    // Reach through lineage: a child of the in-scope session, and a stranger.
+    reach_own_child: bool,
+    reach_stranger: bool,
+    // Prompt decisions: on the caller's own session, and on a child of it that
+    // did / did not let its parent answer.
+    answer_own_permit: PermitAuthority,
+    answer_opted_in_child_permit: PermitAuthority,
+    answer_other_child_permit: PermitAuthority,
 }
 
 /// Ask every predicate about one caller.
@@ -97,7 +111,21 @@ fn observe(store: &AuthStore, peer: &Peer) -> Row {
         write_state: store.may_write_state(peer),
         control_simulator: store.may_control_simulator(peer),
         view_simulator: store.may_view_simulator(peer),
+        spawn_own_child: store.may_spawn_child(peer, IN_SCOPE),
+        spawn_other_child: store.may_spawn_child(peer, OUT_OF_SCOPE),
+        reach_own_child: store.may_reach_descendant(peer, CHILD, in_scope_parent),
+        reach_stranger: store.may_reach_descendant(peer, OUT_OF_SCOPE, in_scope_parent),
+        answer_own_permit: store.may_answer_permit(peer, IN_SCOPE, || None),
+        answer_opted_in_child_permit: store
+            .may_answer_permit(peer, CHILD, || Some((IN_SCOPE.to_string(), true))),
+        answer_other_child_permit: store
+            .may_answer_permit(peer, CHILD, || Some((IN_SCOPE.to_string(), false))),
     }
+}
+
+/// The lineage the matrix assumes: [`CHILD`] was spawned by [`IN_SCOPE`].
+fn in_scope_parent(ancestor: &str, target: &str) -> bool {
+    ancestor == IN_SCOPE && target == CHILD
 }
 
 /// A row where everything is refused — the base every deny-shaped class is
@@ -127,6 +155,13 @@ const NOTHING: Row = Row {
     write_state: false,
     control_simulator: false,
     view_simulator: false,
+    spawn_own_child: false,
+    spawn_other_child: false,
+    reach_own_child: false,
+    reach_stranger: false,
+    answer_own_permit: PermitAuthority::Refused,
+    answer_opted_in_child_permit: PermitAuthority::Refused,
+    answer_other_child_permit: PermitAuthority::Refused,
 };
 
 /// A *valid* Ed25519 public key from a seed — `register` verifies the point is
@@ -198,6 +233,13 @@ fn a_local_operator_reaches_everything_including_pairing() {
             write_state: true,
             control_simulator: true,
             view_simulator: true,
+            spawn_own_child: true,
+            spawn_other_child: true,
+            reach_own_child: true,
+            reach_stranger: true,
+            answer_own_permit: PermitAuthority::Full,
+            answer_opted_in_child_permit: PermitAuthority::Full,
+            answer_other_child_permit: PermitAuthority::Full,
         },
         "the local operator is the host's own owner",
     );
@@ -240,6 +282,13 @@ fn a_session_confined_agent_reaches_only_its_own_session() {
             // it reaches the device its own work uses and nothing else.
             control_simulator: true,
             view_simulator: true,
+            // The spawn grant: children only under itself, then reach over
+            // exactly that subtree. Its own prompts are the human's check on it,
+            // so it never answers them; a child's only if the child opted in,
+            // and then only in the limited form.
+            spawn_own_child: true,
+            reach_own_child: true,
+            answer_opted_in_child_permit: PermitAuthority::ParentLimited,
             ..NOTHING
         },
         "session confinement is the only boundary around an agent's own CLI",
@@ -312,6 +361,13 @@ fn a_full_remote_device_reaches_everything_except_pairing() {
             // and ask.
             control_simulator: false,
             view_simulator: true,
+            spawn_own_child: true,
+            spawn_other_child: true,
+            reach_own_child: true,
+            reach_stranger: true,
+            answer_own_permit: PermitAuthority::Full,
+            answer_opted_in_child_permit: PermitAuthority::Full,
+            answer_other_child_permit: PermitAuthority::Full,
         },
         "a paired device may not enroll further devices",
     );
@@ -339,6 +395,10 @@ fn a_read_only_remote_device_watches_but_never_acts() {
             read_state: true,
             // Watching a device acts on nothing.
             view_simulator: true,
+            // Watching reaches every session in scope, children included, but
+            // a watch-only device never decides a prompt.
+            reach_own_child: true,
+            reach_stranger: true,
             ..NOTHING
         },
         "read-only is the tier that separates watching from driving",
@@ -365,6 +425,9 @@ fn a_session_scoped_remote_device_mirrors_the_confined_agent() {
             // The one place the mirror breaks, on purpose: the simulator is a
             // device on the host machine, reachable by local callers only.
             control_simulator: false,
+            // A session-bound phone answers its own session's prompts (that is
+            // the phone's job); lineage widens nothing for a device.
+            answer_own_permit: PermitAuthority::Full,
             ..NOTHING
         },
         "a session-bound pairing confines exactly as a session-scoped local caller does",
