@@ -1,7 +1,7 @@
 //! `Steer` against backends that can and cannot take a message mid-turn.
 //!
-//! Only `pi` advertises `supports_steer`; claude, codex and ACP all fall through to
-//! the default `AgentConnection::steer`, which bails. That refusal used to travel the
+//! `pi`, `omp` and a new enough Claude advertise `supports_steer`; codex and ACP
+//! fall through to the default `AgentConnection::steer`, which bails. That refusal used to travel the
 //! generic session-command path and reach the client as
 //! `Internal("session command failed")` — a transient-looking error for a permanent,
 //! knowable property, with the real sentence going only to the host's log. A caller

@@ -144,3 +144,10 @@ fn a_long_summary_is_cut_on_a_char_boundary() {
     assert_eq!(truncate_chars(&text, 4), ("éééé", 6));
     assert_eq!(truncate_chars("short", 10), ("short", 0));
 }
+
+/// The tools and the guide say the same thing about waiting, word for word.
+#[test]
+fn the_guide_carries_the_wait_guidance() {
+    let guide = include_str!("../../../../../docs/skills/oximux-team.md");
+    assert!(guide.contains(WAIT_GUIDANCE), "docs/skills/oximux-team.md must quote WAIT_GUIDANCE verbatim");
+}

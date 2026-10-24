@@ -569,8 +569,9 @@ impl Dispatcher {
     ///
     /// Separate from [`Self::scoped`] for the same reason [`Self::set_choice`] is:
     /// the generic "session command failed" is right for a genuine internal fault,
-    /// and wrong here. Only `pi` advertises `supports_steer`; claude, codex and ACP
-    /// all reach the default `AgentConnection::steer`, which bails. Routed through
+    /// and wrong here. `pi`, `omp` and a new enough Claude advertise
+    /// `supports_steer`; codex and ACP reach the default `AgentConnection::steer`,
+    /// which bails. Routed through
     /// `scoped` that became `Internal("session command failed")` — a transient-looking
     /// error for a permanent, knowable property, with the actual reason reaching only
     /// the host's log.
