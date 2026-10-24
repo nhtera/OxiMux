@@ -379,6 +379,13 @@ fn an_agent_delegates_over_mcp_with_its_own_credential() {
     let children = server.call("oximux_list_children", json!({}));
     assert!(text(&children).contains("child-0"), "{children}");
 
+    // `mode: steer` goes to the steer verb, which this stub agent does not
+    // take, rather than quietly queueing.
+    let steered = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "check nulls", "mode": "steer" }));
+    assert!(steered["isError"] == true && text(&steered).contains("mid-turn"), "{steered}");
+    let odd = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "x", "mode": "shout" }));
+    assert!(odd["isError"] == true && text(&odd).contains("unknown mode"), "{odd}");
+
     // Still working: the wait gives up at its timeout and says so.
     let waited = server.call("oximux_wait_agents", json!({ "ids": ["child-0"], "timeout_ms": 1000 }));
     assert_eq!(waited["isError"], false, "{waited}");

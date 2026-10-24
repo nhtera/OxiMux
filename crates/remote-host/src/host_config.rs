@@ -18,10 +18,32 @@ pub mod keys {
     pub const CAP_ACTIVE_PER_PARENT: &str = "agents.delegation.cap.active_per_parent";
     pub const CAP_ACTIVE_PER_ROOT: &str = "agents.delegation.cap.active_per_root";
     pub const CAP_OPEN_PER_ROOT: &str = "agents.delegation.cap.open_per_root";
+    pub const VERIFY_ALLOW: &str = "agents.delegation.verify_allow";
 }
 
+/// The commands a Claude verifier may run when nothing else is configured:
+/// builds, tests and lints of the common toolchains, and `git status`. No
+/// `npm run`-style catch-alls, and no `git diff`/`git log` (their `--output`
+/// writes a file). A rule matches a command's start: the flags after it are
+/// the agent's, so a listed tool can still run code it is pointed at.
+pub const DEFAULT_VERIFY_ALLOW: &[&str] = &[
+    "Bash(cargo build:*)",
+    "Bash(cargo check:*)",
+    "Bash(cargo clippy:*)",
+    "Bash(cargo test:*)",
+    "Bash(go build:*)",
+    "Bash(go test:*)",
+    "Bash(go vet:*)",
+    "Bash(make test:*)",
+    "Bash(npm test:*)",
+    "Bash(pnpm test:*)",
+    "Bash(yarn test:*)",
+    "Bash(pytest:*)",
+    "Bash(git status:*)",
+];
+
 /// What the host reads to decide spawns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     /// Agents may spawn agents at all (the spawn grant).
     pub delegation_enabled: bool,
@@ -36,6 +58,10 @@ pub struct HostConfig {
     pub steer_events: bool,
     /// The spawn caps. The depth is clamped to the hard ceiling on every read.
     pub caps: SpawnCaps,
+    /// The Bash rules a Claude verifier runs under (`permissions.allow`). Only
+    /// `Bash(<command>)` rules survive sanitizing: an edit tool, an MCP tool
+    /// or a bare `Bash(*)` would widen the posture past "builds and tests".
+    pub verify_allow: Vec<String>,
 }
 
 impl Default for HostConfig {
@@ -46,6 +72,7 @@ impl Default for HostConfig {
             expose_tools: true,
             steer_events: true,
             caps: SpawnCaps::default(),
+            verify_allow: DEFAULT_VERIFY_ALLOW.iter().map(|r| r.to_string()).collect(),
         }
     }
 }
@@ -74,6 +101,10 @@ impl HostConfig {
                 open_per_root: num(keys::CAP_OPEN_PER_ROOT, d.caps.open_per_root),
                 ..d.caps
             },
+            verify_allow: get(keys::VERIFY_ALLOW)
+                .map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect::<Vec<_>>())
+                .filter(|rules| !rules.is_empty())
+                .unwrap_or(d.verify_allow),
         }
         .sanitized()
     }
@@ -89,11 +120,13 @@ impl HostConfig {
             (keys::CAP_ACTIVE_PER_PARENT, self.caps.active_per_parent.to_string()),
             (keys::CAP_ACTIVE_PER_ROOT, self.caps.active_per_root.to_string()),
             (keys::CAP_OPEN_PER_ROOT, self.caps.open_per_root.to_string()),
+            (keys::VERIFY_ALLOW, self.verify_allow.join("\n")),
         ]
     }
 
-    /// The config as enforced: the depth never exceeds the ceiling, and every
-    /// count cap stays between 1 and its settable maximum, whatever was stored.
+    /// The config as enforced: the depth never exceeds the ceiling, every
+    /// count cap stays between 1 and its settable maximum, and the verifier
+    /// keeps only command rules, whatever was stored.
     pub fn sanitized(self) -> Self {
         let clamp = |v: u32, max: u32| v.clamp(1, max);
         let caps = self.caps.clamped();
@@ -105,9 +138,24 @@ impl HostConfig {
                 open_per_root: clamp(caps.open_per_root, 32),
                 ..caps
             },
+            verify_allow: Some(self.verify_allow.into_iter().filter(|r| is_command_rule(r)).collect::<Vec<_>>())
+                .filter(|rules| !rules.is_empty())
+                .unwrap_or_else(|| Self::default().verify_allow),
             ..self
         }
     }
+}
+
+/// `Bash(<command>)`, optionally ending in `:*` or ` *` (any arguments): a
+/// named command, with no wildcard anywhere else (`Bash(*)`, `Bash(* *)`,
+/// `Bash(*test*)` would match almost anything) and nothing outside the
+/// parentheses.
+fn is_command_rule(rule: &str) -> bool {
+    let Some(inner) = rule.strip_prefix("Bash(").and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    let command = inner.strip_suffix(":*").or_else(|| inner.strip_suffix(" *")).unwrap_or(inner).trim();
+    !command.is_empty() && !command.contains(['*', '(', ')'])
 }
 
 #[cfg(test)]
@@ -142,6 +190,7 @@ mod tests {
             expose_tools: false,
             steer_events: false,
             caps: SpawnCaps { depth: 2, active_per_parent: 3, ..SpawnCaps::default() },
+            verify_allow: vec!["Bash(just test:*)".into(), "Bash(cargo nextest run:*)".into()],
         };
         let stored: std::collections::HashMap<&str, String> = custom.entries().into_iter().collect();
         assert_eq!(HostConfig::load(|k| stored.get(k).cloned()), custom);
@@ -149,6 +198,18 @@ mod tests {
         assert_eq!(HostConfig::load(junk), HostConfig::default());
         let deep = |k: &str| (k == keys::CAP_DEPTH).then(|| "9".to_string());
         assert_eq!(HostConfig::load(deep).caps.depth, 2, "clamped to the ceiling");
+    }
+
+    #[test]
+    fn a_verifier_keeps_only_command_rules() {
+        let stored = |k: &str| {
+            (k == keys::VERIFY_ALLOW)
+                .then(|| "Bash(cargo test:*)\nBash(*)\nBash(:*)\nBash(* *)\nBash(*test*)\nEdit\nmcp__oximux__oximux_spawn_agent\n Bash(go test *) \nBash(x) && Bash(y)".into())
+        };
+        assert_eq!(HostConfig::load(stored).verify_allow, ["Bash(cargo test:*)", "Bash(go test *)"]);
+        assert!(HostConfig::default().verify_allow.iter().all(|r| is_command_rule(r)), "the defaults survive");
+        let only_junk = |k: &str| (k == keys::VERIFY_ALLOW).then(|| "Bash(*)\nEdit".into());
+        assert_eq!(HostConfig::load(only_junk).verify_allow, HostConfig::default().verify_allow, "never left with none");
     }
 
     #[test]

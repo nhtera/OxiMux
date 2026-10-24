@@ -545,9 +545,28 @@ impl SessionHandle {
     }
 
     /// Redirect the agent mid-turn (backends that support it); no-op default
-    /// otherwise. Same transport as the desktop composer's steer.
+    /// otherwise. Same transport as the desktop composer's steer, and tracked
+    /// the same way: with a driver's gate attached and an agent that reports
+    /// receipts, the line is noted as unstarted (before it is written, so its
+    /// receipt cannot beat the note) and a Stop takes it back.
     pub fn steer(&self, text: &str) -> Result<()> {
-        self.conn().steer(&crate::envelope::neutralize_forged(text))
+        self.steer_from(text, crate::send_gate::SendSource::Remote)
+    }
+
+    /// [`Self::steer`], recording who sent it: a line taken back by a Stop or
+    /// dropped by the agent goes back under that sender, so another agent's
+    /// steer stays held by a Stop like its messages do.
+    pub fn steer_from(&self, text: &str, source: crate::send_gate::SendSource) -> Result<()> {
+        let text = crate::envelope::neutralize_forged(text);
+        let conn = self.conn();
+        let Some(gate) = self.gate().filter(|_| conn.reports_receipts()) else {
+            return conn.steer(&text);
+        };
+        let uuid = uuid::Uuid::new_v4();
+        gate.lock().unwrap().note_steered(uuid, Some(crate::send_gate::Steered::new(text.to_string(), source)));
+        conn.steer_tagged(&text, &uuid.to_string()).inspect_err(|_| {
+            gate.lock().unwrap().take_steered(&uuid.to_string());
+        })
     }
 
     /// Run `f` — the handoff of one backend event towards whatever folds it — with
@@ -1466,6 +1485,31 @@ mod tests {
         assert_eq!(handle.events_since(0).len(), 1, "not retained");
         assert_eq!(receipts.try_recv().unwrap(), receipt);
         assert_eq!(handle.ingest(ThreadEvent::Notice("after".into())), seq + 1);
+    }
+
+    /// A steer from the CLI or a phone is tracked in the driver's gate like
+    /// the desktop's own, so a Stop can take it back before it starts.
+    #[test]
+    fn a_remote_steer_is_tracked_until_the_agent_starts_it() {
+        let reg = SessionRegistry::new();
+        let caps = crate::thread::AgentCapabilities { supports_steer: true, ..Default::default() };
+        let stub = Arc::new(crate::thread::StubConnection::default().with_capabilities(caps).with_receipts());
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        handle.set_gate(Some(gate.clone()));
+        handle.steer("check nulls first").unwrap();
+        let uuid = stub.sent()[0]["uuid"].as_str().unwrap().to_string();
+        let taken = gate.lock().unwrap().take_unstarted();
+        assert_eq!(taken.len(), 1);
+        let remote = crate::send_gate::Steered::new("check nulls first", crate::send_gate::SendSource::Remote);
+        assert_eq!((taken[0].0.to_string(), taken[0].1.clone()), (uuid, Some(remote)));
+        // No receipts, nothing to track by: written plainly, as before.
+        let plain = Arc::new(crate::thread::StubConnection::default().with_capabilities(caps));
+        let handle = reg.register("s2".into(), plain.clone());
+        handle.set_gate(Some(gate.clone()));
+        handle.steer("again").unwrap();
+        assert!(!gate.lock().unwrap().awaiting_steer());
+        assert!(plain.sent()[0].get("uuid").is_none());
     }
 
     /// With a driver's gate attached, a remote prompt queues there instead of

@@ -205,13 +205,15 @@ impl AgentChatView {
     /// With a credential, a Claude agent in the `Default` posture also gets
     /// the delegation tools (`oximux mcp --tools orchestrate`), reading the
     /// credential from its file. A Review or Verify agent never does, as it
-    /// gets no computer-use server: it only reads.
+    /// gets no computer-use server: it only reads. A verifier gets its command
+    /// rules here too, since every spawn passes through.
     pub(super) fn add_spawn_credential(
         spec: &mut ConnectSpec,
         remote_session_id: &str,
         adapter_id: Option<&str>,
         cx: &App,
     ) {
+        add_verify_allow(spec, cx);
         let Some(rc) = cx.try_global::<RemoteControl>() else { return };
         let Some(access) = rc.mint_chat_credential(remote_session_id) else { return };
         for (key, value) in &access.env {
@@ -244,6 +246,18 @@ impl AgentChatView {
             rc.revoke_chat_credential(&self.remote_session_id);
         }
     }
+}
+
+/// A verifier's command rules, from the host settings (the defaults before
+/// the core is up). Every launch of a Verify spec gets them, first and respawn
+/// alike; other postures carry none.
+pub(super) fn add_verify_allow(spec: &mut ConnectSpec, cx: &App) {
+    if spec.posture != oximux_agents::thread::launch_posture::SpawnPosture::Verify {
+        return;
+    }
+    spec.posture_allow = cx
+        .try_global::<RemoteControl>()
+        .map_or_else(|| oximux_remote_host::HostConfig::default().verify_allow, |rc| rc.host_config().verify_allow);
 }
 
 /// Whether a spawn gets the delegation tools: the setting is on, the agent
@@ -291,6 +305,22 @@ mod tests {
         let mut spec = ConnectSpec::for_backend(&backend, "/repo".into(), None, None, None, None);
         spec.posture = posture;
         spec
+    }
+
+    /// A verifier launches with the command rules it may run; nothing else
+    /// carries any. With no host core yet, the defaults stand in.
+    #[gpui::test]
+    fn only_a_verifier_gets_command_rules(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut verify = spec(Transport::StreamJson, SpawnPosture::Verify);
+            add_verify_allow(&mut verify, cx);
+            assert!(verify.posture_allow.iter().any(|r| r == "Bash(cargo test:*)"), "{:?}", verify.posture_allow);
+            for posture in [SpawnPosture::Default, SpawnPosture::Review] {
+                let mut other = spec(Transport::StreamJson, posture);
+                add_verify_allow(&mut other, cx);
+                assert!(other.posture_allow.is_empty());
+            }
+        });
     }
 
     /// Review and Verify agents only read: no delegation tools, whatever the

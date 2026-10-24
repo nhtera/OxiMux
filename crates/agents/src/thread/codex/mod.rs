@@ -113,6 +113,9 @@ struct CodexState {
     /// send with no respawn.
     approval_policy: String,
     sandbox: String,
+    /// A reviewer or verifier: its approval policy and sandbox are what make
+    /// it one, so they are neither offered nor changed after spawn.
+    posture_locked: bool,
     /// Set when Stop was pressed before the turn id was known (the `turn/started`
     /// notification hadn't landed yet). The mapper interrupts as soon as the id
     /// arrives, so a fast Send→Stop doesn't silently no-op.
@@ -149,6 +152,14 @@ pub struct CodexAppServerConnection {
 }
 
 impl CodexAppServerConnection {
+    /// Hold the spawn posture for life: the Approvals and Sandbox selects
+    /// are withdrawn and a change to either is ignored.
+    pub fn lock_posture(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.posture_locked = true;
+        }
+    }
+
     /// Spawn `codex app-server` in `cwd` and start streaming decoded events.
     /// Returns immediately; the handshake runs on the worker thread and emits
     /// [`ThreadEvent::SessionInit`] once `thread/start` resolves.
@@ -402,11 +413,14 @@ impl AgentConnection for CodexAppServerConnection {
     /// the session's current posture. The `danger-full-access` / `never` options
     /// carry a ⚠ blurb; defaults stay on-request/workspace-write.
     fn features(&self) -> Vec<FeatureControl> {
-        let (approval, sandbox) = self
+        let (approval, sandbox, locked) = self
             .state
             .lock()
-            .map(|s| (s.approval_policy.clone(), s.sandbox.clone()))
+            .map(|s| (s.approval_policy.clone(), s.sandbox.clone(), s.posture_locked))
             .unwrap_or_default();
+        if locked {
+            return Vec::new();
+        }
         vec![
             FeatureControl {
                 id: FEATURE_APPROVALS.to_string(),
@@ -452,6 +466,9 @@ impl AgentConnection for CodexAppServerConnection {
         };
         let mut s = self.state.lock().map_err(|_| anyhow!("codex state poisoned"))?;
         match id {
+            FEATURE_APPROVALS | FEATURE_SANDBOX if s.posture_locked => {
+                anyhow::bail!("this agent's approvals and sandbox are fixed by its spawn posture")
+            }
             FEATURE_APPROVALS => s.approval_policy = wire,
             FEATURE_SANDBOX => s.sandbox = wire,
             _ => {}
@@ -860,6 +877,34 @@ fn map_inbound(
 mod tests {
     use super::fork_last_turn_id;
     use super::*;
+
+    /// A reviewer's or verifier's sandbox is fixed: no selects are offered,
+    /// and a change sent anyway is refused and changes nothing.
+    #[test]
+    fn a_locked_posture_offers_and_takes_no_sandbox_change() {
+        let (rpc, _inbound, child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script("read line; sleep 1"))
+                .expect("spawn fake app-server");
+        let (events, _rx) = mpsc::channel();
+        let (outbound, _out_rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(CodexState { sandbox: "read-only".into(), ..Default::default() }));
+        let conn = CodexAppServerConnection {
+            outbound,
+            events,
+            rpc,
+            state: state.clone(),
+            child: Arc::new(Mutex::new(child)),
+            _worker: thread::spawn(|| {}),
+            _mapper: thread::spawn(|| {}),
+        };
+        assert_eq!(conn.features().len(), 2, "an ordinary chat offers both selects");
+        conn.lock_posture();
+        assert!(conn.features().is_empty());
+        assert!(conn.set_feature(FEATURE_SANDBOX, FeatureValue::Choice("danger-full-access".into())).is_err());
+        assert!(conn.set_feature(FEATURE_APPROVALS, FeatureValue::Choice("never".into())).is_err());
+        assert_eq!(state.lock().unwrap().sandbox, "read-only");
+        assert_ne!(state.lock().unwrap().approval_policy, "never");
+    }
 
     /// Codex says nothing more about an MCP elicitation once it is answered,
     /// so the connection settles the card itself, whoever answered it.

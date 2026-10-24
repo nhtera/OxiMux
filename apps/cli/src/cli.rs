@@ -1229,7 +1229,8 @@ pub enum DelegateCommand {
         #[arg(long)]
         model: Option<String>,
         /// What the child may do: default, review (reads only), verify (may
-        /// build and test, no edits). Never more than you have yourself.
+        /// build and test; a Codex verifier can also edit inside the
+        /// workspace). Never more than you have yourself.
         #[arg(long, value_enum, default_value_t = PostureArg::Default)]
         posture: PostureArg,
         /// Which of its events reach you: auto (all), stuck (failed, waiting

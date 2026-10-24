@@ -213,6 +213,13 @@ pub trait AgentConnection: Send + Sync {
         self.steer(text)
     }
 
+    /// Whether the agent reports when it starts on a tagged line (Claude's
+    /// `command_lifecycle` receipts), so a steered line can be tracked until
+    /// then and taken back by a Stop. Default: no receipts.
+    fn reports_receipts(&self) -> bool {
+        false
+    }
+
     /// Stop the running turn for good: first take back the lines sent under
     /// `unstarted` that the agent has not started on (so none of them starts a
     /// turn after the Stop), then interrupt. Returns the ids it took back.
@@ -574,6 +581,9 @@ pub struct StubConnection {
     /// unconfigured stub exercises the refusal path rather than a success that
     /// no real backend would give.
     switchable: bool,
+    /// Whether it reports receipts for tagged lines, as Claude does. False by
+    /// default, like the trait.
+    receipts: bool,
 }
 
 impl StubConnection {
@@ -604,6 +614,12 @@ impl StubConnection {
         self.models = models;
         self.modes = modes;
         self.switchable = true;
+        self
+    }
+
+    /// Make the stub report receipts for tagged lines, as Claude does.
+    pub fn with_receipts(mut self) -> Self {
+        self.receipts = true;
         self
     }
 
@@ -638,6 +654,19 @@ impl AgentConnection for StubConnection {
         }
         self.record(json!({"type": "steer", "message": text}));
         Ok(())
+    }
+    /// Recorded with its uuid, so a test can match it to the gate's note.
+    fn steer_tagged(&self, text: &str, uuid: &str) -> Result<()> {
+        self.steer(text)?;
+        if let Ok(mut g) = self.sent.lock()
+            && let Some(last) = g.last_mut()
+        {
+            last["uuid"] = json!(uuid);
+        }
+        Ok(())
+    }
+    fn reports_receipts(&self) -> bool {
+        self.receipts
     }
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         self.record(control_response_json(request_id, &decision));

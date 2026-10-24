@@ -117,9 +117,15 @@ The host caps the tree (depth 1 by default, so a child cannot spawn its own;
 a few working children per parent; a lifetime budget). A refusal exits 1 or 5
 and says what to do instead — usually "wait on a child, cancel one, or do it
 yourself". `--request-id` makes a retry return the same child. A `review`
-child only reads; `verify` may build and test but not edit; neither prompts.
-`verify` trusts the repository: its test runner is the project's own code,
-which no posture inspects. If `spawn` reports the prompt was not delivered,
+child only reads; `verify` may build and test; neither prompts. A Claude
+verifier has no edit tools and may run the commands listed in Settings ›
+Agents › Agent delegation (builds and tests by default) plus whatever your own
+Claude settings allow; a rule matches a command's start, so the tool's own
+flags are the agent's choice. A Codex
+one can edit inside the workspace (its
+sandbox allows builds only that way), so give it `--cwd worktree:…` when your
+tree must stay as it is. `verify` trusts the repository: its test runner is the
+project's own code, which no posture inspects. If `spawn` reports the prompt was not delivered,
 send it with `oximux send <child> "…"` or cancel the child.
 
 A Claude, Codex or ACP chat also has these as tools (`oximux_spawn_agent`,

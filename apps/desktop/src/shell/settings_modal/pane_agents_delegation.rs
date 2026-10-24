@@ -6,7 +6,8 @@
 //! headless `oximux serve` reads, so both hosts enforce the same caps. A change
 //! applies to the next spawn: the host core holds the config in a watch.
 
-use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
+use gpui::{AnyElement, AppContext as _, Entity, IntoElement, prelude::FluentBuilder as _, ParentElement, Styled, Subscription, Window, div, px};
+use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use oximux_remote_host::HostConfig;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -54,6 +55,44 @@ fn blocked_reason(cx: &gpui::App) -> Option<&'static str> {
     None
 }
 
+/// The verifier's command rules editor, seeded from the host config.
+pub(super) fn verify_allow_input(
+    window: &mut Window,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> (Entity<TextareaState>, Subscription) {
+    let seed = current(cx).verify_allow.join("\n");
+    let input = cx.new(|cx| {
+        TextareaState::new(window, cx).auto_grow(4, 10).placeholder("Bash(cargo test:*)").default_value(seed)
+    });
+    let sub = cx.subscribe_in(&input, window, |this, input, ev: &InputEvent, window, cx| {
+        if matches!(ev, InputEvent::Blur) {
+            let raw = input.read(cx).value().to_string();
+            commit_verify_allow(this, &raw, cx);
+            // Show what is in force: rejected lines go, an empty box shows
+            // the defaults it restored.
+            let shown = current(cx).verify_allow.join("\n");
+            if shown != raw.trim() {
+                input.update(cx, |s, cx| s.set_value(shown, window, cx));
+            }
+        }
+    });
+    (input, sub)
+}
+
+/// Store the edited rules, one per line, when they changed. Anything that is
+/// not a `Bash(<command>)` rule is dropped by sanitizing; an empty list means
+/// the defaults.
+pub(super) fn commit_verify_allow(modal: &SettingsModal, raw: &str, cx: &mut gpui::Context<SettingsModal>) {
+    let mut rules: Vec<String> = raw.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+    if rules.is_empty() {
+        rules = HostConfig::default().verify_allow;
+    }
+    let now = current(cx);
+    if rules != now.verify_allow {
+        apply(modal, HostConfig { verify_allow: rules, ..now }, cx);
+    }
+}
+
 pub(super) fn render_section(
     modal: &SettingsModal,
     theme: Theme,
@@ -81,6 +120,18 @@ pub(super) fn render_section(
             density,
             entries_card(theme, density, typography, entries(modal, theme, density, typography, cx)),
         ))
+        .when_some(modal.verify_allow_input.as_ref(), |d, input| {
+            d.child(section_title(
+                "Commands a verifier may run",
+                "One rule per line, like Bash(cargo test:*). A Claude helper spawned to verify may run these, \
+                 and what your own Claude settings allow; anything else is refused without asking. A rule \
+                 matches a command's start, so list only tools you trust with any arguments. Empty restores \
+                 the defaults.",
+                theme,
+                typography,
+            ))
+            .child(Textarea::new(input).text_size(px(typography.t_body_sm)))
+        })
         .child(
             div()
                 .px(px(2.0))

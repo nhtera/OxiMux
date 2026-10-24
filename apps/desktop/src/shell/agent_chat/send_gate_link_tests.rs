@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use gpui::TestAppContext;
-use oximux_agents::send_gate::{DeliveryMode, SendSource};
+use oximux_agents::send_gate::{DeliveryMode, SendSource, Steered};
 use oximux_agents::thread::StubConnection;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -367,11 +367,23 @@ async fn a_dropped_steer_is_queued_again(cx: &mut TestAppContext) {
             view.steer_text("also this".into(), cx);
             assert!(view.awaiting_steer());
             let uuid = view.send_gate.lock().unwrap().take_unstarted()[0].0;
-            view.send_gate.lock().unwrap().note_steered(uuid, Some("also this".into()));
-            view.apply_batch(vec![ThreadEvent::UserMessageDropped { uuid: uuid.to_string() }], cx);
+            view.send_gate.lock().unwrap().note_steered(uuid, Some(Steered::new("also this", SendSource::User)));
+            // Another agent's steer, dropped too, goes back as that agent's.
+            let theirs = uuid::Uuid::new_v4();
+            view.send_gate.lock().unwrap().note_steered(theirs, Some(Steered::new("from the parent", SendSource::Agent)));
+            view.apply_batch(
+                vec![
+                    ThreadEvent::UserMessageDropped { uuid: uuid.to_string() },
+                    ThreadEvent::UserMessageDropped { uuid: theirs.to_string() },
+                ],
+                cx,
+            );
             assert!(!view.awaiting_steer());
             let queued: Vec<_> = view.send_gate.lock().unwrap().queued().map(|q| (q.text.clone(), q.source)).collect();
-            assert_eq!(queued, [("also this".to_string(), SendSource::User)]);
+            assert_eq!(
+                queued,
+                [("also this".to_string(), SendSource::User), ("from the parent".to_string(), SendSource::Agent)]
+            );
         })
         .unwrap();
 }

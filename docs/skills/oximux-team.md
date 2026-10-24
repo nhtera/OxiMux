@@ -241,6 +241,7 @@ command or changes a file still goes to the user.
 
 **Limits.** The host caps how deep the tree goes, how many children work at
 once, and how many a task may start; a refusal says what to do instead. A
-child set to `review` only reads; `verify` may build and test but not edit.
+child set to `review` only reads; `verify` may build and test (a Codex verifier
+can also edit inside the workspace, so give it a worktree when that matters).
 When the user stops you, child events wait for the user's next message.
 

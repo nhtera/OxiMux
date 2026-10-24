@@ -303,6 +303,9 @@ pub fn connect(mut spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Recei
                 &spec.env,
                 &spec.mcp_servers,
             )?;
+            if spec.posture != SpawnPosture::Default {
+                conn.lock_posture();
+            }
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::Acp => {

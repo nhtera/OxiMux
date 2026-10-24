@@ -260,12 +260,15 @@ fn mirrored_holds_carry_the_steer_state() {
 fn a_stop_takes_back_only_what_was_not_started() {
     let mut gate = SendGate::new();
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let c = Uuid::new_v4();
     gate.note_steered(a, None);
-    gate.note_steered(b, Some("typed".into()));
+    gate.note_steered(b, Some(Steered::new("typed", SendSource::User)));
+    gate.note_steered(c, Some(Steered::new("from the parent", SendSource::Agent)));
     assert!(gate.awaiting_steer());
-    assert_eq!(gate.note_accepted(&a.to_string()), Some(false));
+    assert_eq!(gate.note_accepted(&a.to_string()), Some(SendSource::ParentEvent));
+    assert_eq!(gate.note_accepted(&c.to_string()), Some(SendSource::Agent), "keeps who sent it");
     assert_eq!(gate.note_accepted("someone-elses"), None);
-    assert_eq!(gate.take_unstarted(), [(b, Some("typed".to_string()))]);
+    assert_eq!(gate.take_unstarted(), [(b, Some(Steered::new("typed", SendSource::User)))]);
     assert!(gate.take_unstarted().is_empty());
     assert!(!gate.awaiting_steer());
 }

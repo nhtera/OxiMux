@@ -215,6 +215,11 @@ impl Dispatcher {
         } else {
             oximux_agents::send_gate::SendSource::Remote
         };
+        if self.may_drive_session(peer, &req.session_id)
+            && let Some(refused) = self.refuse_ended_helper(peer, &req.session_id)
+        {
+            return refused;
+        }
         self.scoped(peer, &req.session_id, |h| h.send_prompt_from(&req.text, &req.images, source))
     }
 
@@ -582,13 +587,22 @@ impl Dispatcher {
         if !self.may_drive_session(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
+        if let Some(refused) = self.refuse_ended_helper(peer, session_id) {
+            return refused;
+        }
         let Some(handle) = self.registry.get(session_id) else {
             return Response::Error(RpcError::UnknownSession);
         };
         if !handle.capabilities().supports_steer {
             return Response::Error(RpcError::Unsupported);
         }
-        match handle.steer(text) {
+        // As for a message: another agent's steer is held by a Stop.
+        let source = if peer.own_session().is_some() {
+            oximux_agents::send_gate::SendSource::Agent
+        } else {
+            oximux_agents::send_gate::SendSource::Remote
+        };
+        match handle.steer_from(text, source) {
             Ok(()) => Response::Ack,
             Err(e) => {
                 tracing::warn!(error = %e, session = %session_id, "steer failed");

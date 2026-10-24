@@ -315,6 +315,14 @@ pub fn build_args_with_resume(
     // A locked spawn posture. `--tools` is variadic too, so its list travels
     // as one comma-joined argument and a flag follows it.
     if let Some(posture) = host.posture {
+        // With Bash in the posture, only the user's own settings: a
+        // repository's `.claude/settings*.json` could otherwise allow it
+        // commands past the posture's list. A reviewer has no Bash to widen.
+        if posture.tools_allow.iter().any(|t| t == "Bash")
+            && let Some(at) = args.iter().position(|a| a == "--setting-sources")
+        {
+            args[at + 1] = "user".to_string();
+        }
         args.push("--tools".to_string());
         args.push(posture.tools_allow.join(","));
         if posture.no_prompts {
@@ -653,6 +661,10 @@ impl AgentConnection for ClaudeStreamJsonConnection {
 
     fn steer_tagged(&self, text: &str, uuid: &str) -> Result<()> {
         self.send_user_message_tagged(text, &[], uuid)
+    }
+
+    fn reports_receipts(&self) -> bool {
+        true
     }
 
     /// Take back what has not started, then interrupt (in that order: a line
@@ -1051,8 +1063,19 @@ mod tests {
         assert_eq!(a[at("--tools") + 1], "Read,Grep,Glob", "one comma-joined argument");
         assert_eq!(a[at("--permission-prompts") + 1], "none");
         assert_eq!(a[at("--permission-mode") + 1], "dontAsk");
+        assert_eq!(a[at("--setting-sources") + 1], "user,project,local", "a reviewer has no Bash to widen");
         assert!(at("--strict-mcp-config") < at("--disallowedTools"));
         assert_eq!(a.last().map(String::as_str), Some("mcp__x__y"), "--disallowedTools stays last");
+        let verify = ClaudePosture { tools_allow: vec!["Read".into(), "Bash".into()], ..posture };
+        let a = build_args_with_resume(
+            None,
+            None,
+            Some("dontAsk"),
+            None,
+            &HostInjection { posture: Some(&verify), ..Default::default() },
+        );
+        let at = a.iter().position(|x| x == "--setting-sources").unwrap();
+        assert_eq!(a[at + 1], "user", "no repository settings for a verifier");
     }
 
     #[test]

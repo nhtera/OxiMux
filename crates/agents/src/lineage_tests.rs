@@ -364,6 +364,24 @@ fn cancel_with_cascade_ends_the_subtree_deepest_first() {
 }
 
 #[test]
+fn a_cascade_reaches_below_a_child_already_ended_on_its_own() {
+    let s = store();
+    let deep = SpawnCaps { depth: 2, ..caps() };
+    spawn(&s, "root", "r1", "c1");
+    let Ok(Reservation::Fresh { row_id, .. }) =
+        s.reserve(&parent("c1"), &spec("r2"), deep, &all_working, t0()).unwrap()
+    else {
+        panic!()
+    };
+    s.finalize(row_id, "g1", t0()).unwrap();
+    // c1 alone first, leaving its own child g1 working.
+    assert_eq!(s.mark_ended("c1", false, t0()).unwrap(), vec!["c1".to_string()]);
+    assert_ne!(s.row("g1").unwrap().unwrap().state, LineageState::Ended);
+    assert_eq!(s.mark_ended("root", true, t0()).unwrap(), vec!["g1".to_string()]);
+    assert_eq!(s.row("g1").unwrap().unwrap().state, LineageState::Ended);
+}
+
+#[test]
 fn cancelling_a_run_ends_every_role_and_its_helpers() {
     let s = store();
     let run = SpawnParent::Run("team:run-1".into());

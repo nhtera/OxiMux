@@ -654,17 +654,21 @@ impl LineageStore {
         let mut ended = Vec::new();
         let mut frontier = vec![id.to_string()];
         if cascade {
+            // Walk through rows already ended too: a child cancelled on its
+            // own may still have working descendants. Only the UPDATE below
+            // skips ended rows.
+            let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
             let mut i = 0;
             while i < frontier.len() {
                 let parent = frontier[i].clone();
                 let kids: Vec<String> = tx
                     .prepare(
                         "SELECT session_id FROM agent_lineage \
-                         WHERE parent_id = ?1 AND state != 'ended' AND session_id IS NOT NULL",
+                         WHERE parent_id = ?1 AND session_id IS NOT NULL",
                     )?
                     .query_map(params![parent], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
-                frontier.extend(kids);
+                frontier.extend(kids.into_iter().filter(|k| seen.insert(k.clone())));
                 i += 1;
             }
         }

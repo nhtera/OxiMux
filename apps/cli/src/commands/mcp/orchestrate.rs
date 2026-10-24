@@ -28,7 +28,7 @@ use super::tools::{failure_text, text_item};
 use crate::cli::{NotifyArg, PostureArg};
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::commands::attach::{Stop, StreamEnd, StreamOpts, stream_session};
-use crate::commands::{delegate, permit, send, state, transcript};
+use crate::commands::{delegate, permit, send, session_ctl, state, transcript};
 use crate::output::Failure;
 
 /// Every tool here is named with this prefix.
@@ -113,7 +113,7 @@ fn spawn_tool(me: &WhoamiWire, default_agent: Option<&str>) -> Value {
             "request_id": { "type": "string", "description": "A key you choose. Repeating a call with the same key returns the same child instead of starting another." },
             "agent": agent,
             "model": { "type": "string" },
-            "posture": { "type": "string", "enum": ["default", "review", "verify"], "default": "default", "description": "review: reads only. verify: reads and runs tests, no edits." },
+            "posture": { "type": "string", "enum": ["default", "review", "verify"], "default": "default", "description": "review: reads only. verify: reads and runs tests; Claude gets no edit tools, a Codex verifier can edit inside the workspace (use a worktree cwd)." },
             "notify_parent": { "type": "string", "enum": ["auto", "stuck", "off"], "default": "auto", "description": "Which of its events reach you: all, only when stuck, or none." },
             "allow_parent_permits": { "type": "boolean", "default": false, "description": "Let you answer its read-only permission prompts (oximux_answer_permit)." },
             "cwd": { "type": "string", "default": "inherit", "description": "inherit, worktree, worktree:NAME, or a path inside your directory." }
@@ -237,11 +237,13 @@ async fn run(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
         }
         "oximux_wait_agents" => wait_agents(ctx, &client, args).await,
         "oximux_send_agent" => {
-            let id = required("id")?;
-            send::run(&client, &id, &required("text")?, true, None, None, true)
-                .await
-                .map(answer)
-                .map_err(|f| failure_text(&f))
+            let (id, body) = (required("id")?, required("text")?);
+            let sent = match text("mode").as_deref() {
+                None | Some("queue") => send::run(&client, &id, &body, true, None, None, true).await,
+                Some("steer") => session_ctl::steer(&client, &id, &body).await,
+                Some(other) => return Err(format!("unknown mode `{other}`: use queue or steer")),
+            };
+            sent.map(answer).map_err(|f| failure_text(&f))
         }
         "oximux_read_agent" => {
             let tail = args.get("tail").and_then(Value::as_u64).unwrap_or(READ_TAIL_DEFAULT).clamp(1, READ_TAIL_MAX);

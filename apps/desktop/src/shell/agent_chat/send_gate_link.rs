@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Context};
-use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource};
+use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource, Steered};
 use oximux_agents::thread::ThreadEntry;
 use oximux_agents::thread::{ChatImage, PermissionDecision, PermissionKind, ThreadEvent, ToolCallStatus, Transport};
 use uuid::Uuid;
@@ -156,15 +156,15 @@ impl AgentChatView {
         }
         match event {
             ThreadEvent::UserMessageDropped { uuid } => {
-                if let Some(Some(text)) = gate.take_steered(uuid) {
-                    gate.push(text, Vec::new(), SendSource::User, DeliveryMode::Queue, None);
+                if let Some(Some(steer)) = gate.take_steered(uuid) {
+                    gate.push(steer.text, Vec::new(), steer.source, DeliveryMode::Queue, None);
                 }
             }
             ThreadEvent::UserMessageAccepted { uuid } => {
-                if let Some(person) = gate.note_accepted(uuid)
+                if let Some(source) = gate.note_accepted(uuid)
                     && !self.thread.turn_active
                 {
-                    gate.begin_turn(if person { SendSource::User } else { SendSource::ParentEvent });
+                    gate.begin_turn(source);
                     self.thread.turn_active = true;
                 }
             }
@@ -185,16 +185,16 @@ impl AgentChatView {
 
     /// A steered line still not started well after its turn ended: stop
     /// waiting for it. Child events go back to the host (which sends them
-    /// again); a line the user steered is queued again.
+    /// again); a steer is queued again under whoever sent it.
     fn give_up_on_steers(&mut self) {
         if self.thread.turn_active {
             return;
         }
         let mut gate = self.send_gate.lock().unwrap();
-        for (uuid, text) in gate.take_unstarted() {
-            match text {
-                Some(text) => {
-                    gate.push(text, Vec::new(), SendSource::User, DeliveryMode::Queue, None);
+        for (uuid, steer) in gate.take_unstarted() {
+            match steer {
+                Some(steer) => {
+                    gate.push(steer.text, Vec::new(), steer.source, DeliveryMode::Queue, None);
                 }
                 None => gate.report_sent(uuid, false),
             }
@@ -207,9 +207,10 @@ impl AgentChatView {
     /// lines written into this turn that the agent has not started on, then
     /// interrupt, so none of them starts a turn after the Stop. Off the UI
     /// thread (each reply is awaited briefly). Child events taken back return
-    /// to the host, held until the user's next message; a line the user
-    /// steered goes back into the composer. With nothing to take back this is
-    /// the plain interrupt.
+    /// to the host, held until the user's next message; a line a person
+    /// steered (here or from a phone) goes back into the composer, and another
+    /// agent's back into the queue, held like its messages. With nothing to
+    /// take back this is the plain interrupt.
     pub(super) fn interrupt_turn(&mut self, cx: &mut Context<Self>) {
         // Held until the user's next message, across any respawn in between.
         self.send_gate.lock().unwrap().stop_by_user();
@@ -229,15 +230,18 @@ impl AgentChatView {
             let _ = this.update(cx, |view, cx| {
                 let mut typed = Vec::new();
                 let mut gate = view.send_gate.lock().unwrap();
-                for (uuid, text) in unstarted {
+                for (uuid, steer) in unstarted {
                     if !taken.contains(&uuid.to_string()) {
                         // Not confirmed taken back (no reply in time): it may
                         // still run, so keep tracking it as steered.
-                        gate.note_steered(uuid, text);
+                        gate.note_steered(uuid, steer);
                         continue;
                     }
-                    match text {
-                        Some(text) => typed.push(text),
+                    match steer {
+                        Some(s) if s.source == SendSource::Agent => {
+                            gate.push(s.text, Vec::new(), s.source, DeliveryMode::Queue, None);
+                        }
+                        Some(s) => typed.push(s.text),
                         None => gate.report_sent(uuid, false),
                     }
                 }
@@ -339,7 +343,7 @@ impl AgentChatView {
         match sent {
             Ok(()) => {
                 if self.reports_receipts() {
-                    self.send_gate.lock().unwrap().note_steered(uuid, Some(text.clone()));
+                    self.send_gate.lock().unwrap().note_steered(uuid, Some(Steered::new(text.clone(), SendSource::User)));
                 }
                 self.thread.push_user_message(&text);
                 self.note_chat_prompt_sent();

@@ -317,7 +317,17 @@ async fn a_parent_lists_and_cancels_its_children_but_not_a_strangers() {
         else {
             panic!("expected AgentsCancelled");
         };
-        assert_eq!(ended, vec![child.session_id]);
+        assert_eq!(ended, vec![child.session_id.clone()]);
+        // Cancelled is terminal: the parent cannot talk the child back to work.
+        let send = Request::SendPrompt(oximux_remote_proto::messages::SendPromptReq {
+            session_id: child.session_id.clone(),
+            text: "one more thing".into(),
+            images: vec![],
+            corr_id: 1,
+        });
+        let (kind, why) = spawn_error(call(&*c, send).await);
+        assert_eq!(kind, SpawnErrorKind::NotAllowed);
+        assert!(why.contains("cancelled"), "{why}");
         // A run is the operator's to cancel.
         let (kind, _) =
             spawn_error(call(&*c, Request::CancelAgent { id: "team:run-1".into(), cascade: true }).await);

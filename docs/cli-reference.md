@@ -614,7 +614,7 @@ Start a child agent with a prompt.
 | --- | --- | --- |
 | `--agent` | yes | Which installed agent (`oximux whoami` lists them) |
 | `--model` | yes | A model for it (fixed at start; default: the agent's own) |
-| `--posture` | yes | What the child may do: default, review (reads only), verify (may build and test, no edits). Never more than you have yourself |
+| `--posture` | yes | What the child may do: default, review (reads only), verify (may build and test; a Codex verifier can also edit inside the workspace). Never more than you have yourself |
 | `--notify` | yes | Which of its events reach you: auto (all), stuck (failed, waiting on someone), off |
 | `--allow-parent-permits` | no | Let yourself answer its permission prompts (Deny, or Allow unchanged; never for commands or edits) |
 | `--cwd` | yes | Where it works: `inherit` (your directory), `worktree` or `worktree:NAME` (a fresh worktree), or a path inside yours |

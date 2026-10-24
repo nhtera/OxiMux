@@ -89,6 +89,21 @@ impl SendSource {
     }
 }
 
+/// A steer someone sent into a running turn: its text, and who sent it, so a
+/// line taken back or dropped goes back under the same sender (an agent's
+/// stays held by a Stop; only a person's returns to the composer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Steered {
+    pub text: String,
+    pub source: SendSource,
+}
+
+impl Steered {
+    pub fn new(text: impl Into<String>, source: SendSource) -> Self {
+        Self { text: text.into(), source }
+    }
+}
+
 /// What holds a session's sends, as its driver sees it. Mirrored into the
 /// gate in one call after every change ([`SendGate::set_holds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -162,9 +177,9 @@ pub struct SendGate {
     /// Who started the running turn.
     turn_source: Option<SendSource>,
     /// Lines written into a running turn that the agent has not started on
-    /// yet, with the text when a person sent it: a Stop takes these back
-    /// before it interrupts, and gives a person's back to the composer.
-    unstarted: Vec<(Uuid, Option<String>)>,
+    /// yet, with the text and sender for a steer (none for child events): a
+    /// Stop takes these back before it interrupts.
+    unstarted: Vec<(Uuid, Option<Steered>)>,
     /// A Stop asked for from elsewhere (a phone, the CLI): the owner runs its
     /// own Stop, which takes steered lines back first.
     stop_requested: bool,
@@ -349,20 +364,20 @@ impl SendGate {
 
     /// A steered line went into the running turn: until the agent starts on
     /// it, a Stop must take it back.
-    pub fn note_steered(&mut self, uuid: Uuid, user_text: Option<String>) {
-        self.unstarted.push((uuid, user_text));
+    pub fn note_steered(&mut self, uuid: Uuid, steer: Option<Steered>) {
+        self.unstarted.push((uuid, steer));
     }
 
     /// The agent started on the line sent under `uuid`. For a steered line,
-    /// returns whether a person sent it.
-    pub fn note_accepted(&mut self, uuid: &str) -> Option<bool> {
+    /// returns who sent it (child events for a batch of them).
+    pub fn note_accepted(&mut self, uuid: &str) -> Option<SendSource> {
         let at = self.unstarted.iter().position(|(u, _)| u.to_string() == uuid)?;
-        Some(self.unstarted.remove(at).1.is_some())
+        Some(self.unstarted.remove(at).1.map_or(SendSource::ParentEvent, |s| s.source))
     }
 
     /// Stop tracking the steered line sent under `uuid` (the agent dropped
-    /// it). For a steered line, returns the text when a person sent it.
-    pub fn take_steered(&mut self, uuid: &str) -> Option<Option<String>> {
+    /// it). For a steered line, returns its text and sender, if a steer.
+    pub fn take_steered(&mut self, uuid: &str) -> Option<Option<Steered>> {
         let at = self.unstarted.iter().position(|(u, _)| u.to_string() == uuid)?;
         Some(self.unstarted.remove(at).1)
     }
@@ -376,7 +391,7 @@ impl SendGate {
 
     /// Steered lines the agent has not started on, with a person's text;
     /// cleared (a Stop takes them).
-    pub fn take_unstarted(&mut self) -> Vec<(Uuid, Option<String>)> {
+    pub fn take_unstarted(&mut self) -> Vec<(Uuid, Option<Steered>)> {
         std::mem::take(&mut self.unstarted)
     }
 

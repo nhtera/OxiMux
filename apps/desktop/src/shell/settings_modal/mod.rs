@@ -253,6 +253,10 @@ pub struct SettingsModal {
     /// text is owned by the state, so re-seeding it is a rebuild, not a set.
     pub(super) env_input: Option<Entity<TextareaState>>,
     _env_sub: Option<Subscription>,
+    /// The verifier's command rules, one per line (Agent delegation). Built on
+    /// `open()`, written on blur and on close.
+    pub(super) verify_allow_input: Option<Entity<TextareaState>>,
+    _verify_allow_sub: Option<Subscription>,
     /// The env map the editor was seeded with, so `close()` can flush an edit
     /// typed but never committed via blur/Enter — same hazard, and same fix, as
     /// [`Self::custom_words_seed`].
@@ -424,6 +428,8 @@ impl SettingsModal {
             env_profile: None,
             env_input: None,
             _env_sub: None,
+            verify_allow_input: None,
+            _verify_allow_sub: None,
             env_seed: BTreeMap::new(),
             profile_name_input: None,
             profile_name_mode: None,
@@ -687,6 +693,9 @@ impl SettingsModal {
             },
         ));
         self.env_input = Some(env_input);
+        let (verify_input, verify_sub) = pane_agents_delegation::verify_allow_input(window, cx);
+        self.verify_allow_input = Some(verify_input);
+        self._verify_allow_sub = Some(verify_sub);
 
         // The profile list's shared name field. Hidden until an affordance sets
         // a mode; the subscription needs the `Window` to re-seed the env editor
@@ -872,6 +881,11 @@ impl SettingsModal {
         }
         self.env_input = None;
         self._env_sub = None;
+        if let Some(input) = self.verify_allow_input.take() {
+            let raw = input.read(cx).value().to_string();
+            pane_agents_delegation::commit_verify_allow(self, &raw, cx);
+        }
+        self._verify_allow_sub = None;
         self.profile_name_input = None;
         self._profile_name_sub = None;
         self.profile_name_mode = None;

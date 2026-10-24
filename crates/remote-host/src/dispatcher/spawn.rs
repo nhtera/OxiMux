@@ -297,6 +297,20 @@ impl Dispatcher {
         Response::Whoami(WhoamiWire { scope: scope.into(), session, depth, root_id, spawn_allowed, reason, agents })
     }
 
+    /// An agent's message or steer into a helper that was cancelled. Ended is
+    /// terminal: letting it resume would put working agents outside the
+    /// watcher and the working-helper caps. The user can still type into it.
+    pub(super) fn refuse_ended_helper(&self, peer: &Peer, target: &str) -> Option<Response> {
+        peer.own_session()?;
+        let row = self.host_core.as_ref()?.lineage().row(target).ok().flatten()?;
+        (row.state == oximux_agents::lineage::LineageState::Ended).then(|| {
+            refuse(
+                SpawnErrorKind::NotAllowed,
+                "That helper was cancelled and does not take messages. Spawn a new one, or do the work yourself.",
+            )
+        })
+    }
+
     /// Whether `peer` reaches `target` through its own scope or its subtree.
     fn may_reach(&self, peer: &Peer, target: &str) -> bool {
         let Some(core) = self.host_core.as_ref() else { return false };

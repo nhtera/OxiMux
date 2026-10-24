@@ -251,7 +251,7 @@ impl HostCore {
 
     /// The config as enforced right now.
     pub fn config(&self) -> HostConfig {
-        *self.config.borrow()
+        self.config.borrow().clone()
     }
 
     /// Apply new settings. Sanitized on the way in, so a stored depth above the

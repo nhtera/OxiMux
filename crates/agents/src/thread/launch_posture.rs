@@ -1,9 +1,12 @@
 //! Spawn posture: what a child agent may do, fixed when it is spawned.
 //!
 //! A reviewer must never write and never prompt; a verifier may build and run
-//! tests but not edit sources. The posture is chosen at spawn, stored on the
-//! child's lineage row, and reapplied on every respawn, so neither the agent
-//! nor a later mode change can widen it. Mapping a posture onto each adapter's
+//! tests and never prompts. A Claude verifier has no edit tools; a Codex one
+//! writes only inside the workspace sandbox, but can edit there (its builds
+//! need that sandbox), so a tree that must stay as it is gets a worktree. The
+//! posture is chosen at spawn, stored on the child's lineage row, and
+//! reapplied on every respawn, so neither the agent nor a later mode change
+//! can widen it. Mapping a posture onto each adapter's
 //! own flags is `resolve` (see the P1 spike results for the Claude, Codex,
 //! Pi and omp mappings).
 //!
@@ -15,7 +18,7 @@
 //! | Adapter | Review | Verify |
 //! |---|---|---|
 //! | Claude | `--tools Read,Grep,Glob`, `dontAsk`, `--permission-prompts none`, `--strict-mcp-config` | the same plus `Bash`, with the configured commands as `permissions.allow` in `--settings` |
-//! | Codex | `("never", "read-only")` | `("never", "workspace-write")` (network stays off) |
+//! | Codex | `("never", "read-only")` | `("never", "workspace-write")` (network stays off; can edit inside the workspace) |
 //! | Pi | `--tools read,find,grep,ls` | unenforceable (no bash, so no tests) |
 //! | ACP, omp | unenforceable | unenforceable |
 //!
