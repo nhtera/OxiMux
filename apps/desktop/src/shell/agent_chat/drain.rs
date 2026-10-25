@@ -18,6 +18,8 @@ impl AgentChatView {
     pub(super) fn start_drain(&mut self, rx: std::sync::mpsc::Receiver<ThreadEvent>, cx: &mut Context<Self>) {
         self.drain_gen += 1;
         self.health.note_connected();
+        // A new process: no continuation of the old one is running.
+        self.thread.continuations_open = 0;
         self._drain_task = Some(Self::spawn_drain(rx, self.drain_gen, cx));
     }
 

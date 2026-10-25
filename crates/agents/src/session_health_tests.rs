@@ -88,3 +88,31 @@ fn child_activity_counts_only_working_children() {
     let act = child_activity([a.as_ref(), b.as_ref()]);
     assert_eq!(act, ChildActivity { working: 1, last_activity_at: now - MIN });
 }
+
+/// The compatibility promise for older phones and CLIs: turn brackets feed
+/// the host's health and never take a seq in the ring remote clients read.
+#[test]
+fn turn_brackets_never_enter_the_remote_ring() {
+    use crate::thread::ThreadEvent;
+    let (_reg, h) = registry_with("s");
+    h.ingest(ThreadEvent::Notice("before".into()));
+    h.ingest(ThreadEvent::ProviderTurnStarted);
+    h.ingest(ThreadEvent::ContinuationEnded);
+    h.ingest(ThreadEvent::Notice("after".into()));
+    let ring = h.events_since(0);
+    assert_eq!(ring.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![1, 2], "no seq spent on a bracket");
+    assert!(ring.iter().all(|(_, ev)| !ev.is_turn_bracket()));
+}
+
+/// A continuation whose closing frame never came is cleared host-side once
+/// the session has been quiet past the stall window, so the child parks.
+#[test]
+fn a_stale_continuation_stops_counting_as_working_on_the_host_tick() {
+    let (_reg, h) = registry_with("s");
+    let start = now_ms();
+    h.publish_health(HealthInputs { continuations_open: 1, ..live_at(start) });
+    assert!(h.status().borrow().working);
+    h.refresh_health(start + 11 * MIN, ChildActivity::default());
+    assert_eq!(h.health().status, HealthStatus::Idle);
+    assert!(!h.status().borrow().working, "the lineage can park it");
+}

@@ -208,6 +208,11 @@ impl RemoteBinding {
         self.handle.publish_health(inputs);
     }
 
+    /// The health thresholds the host derives with.
+    pub fn health_config(&self) -> oximux_agents::health::HealthConfig {
+        self.handle.health_config()
+    }
+
     /// The registered run's id (new on every registration), for edge ids.
     pub fn incarnation(&self) -> String {
         self.handle.incarnation().to_string()

@@ -218,11 +218,35 @@ fn a_stale_continuation_count_is_detected_only_when_idle_and_quiet() {
 }
 
 #[test]
-fn a_sleeping_clock_forgives_the_gap_and_a_normal_tick_forgives_nothing() {
-    // Ticking every 30 s; the laptop slept 30 minutes.
-    assert_eq!(sleep_gap_ms(0, 30 * MIN + 30_000, 30_000), 30 * MIN);
-    assert_eq!(sleep_gap_ms(0, 30_000, 30_000), 0);
-    assert_eq!(sleep_gap_ms(0, 60_000, 30_000), 0, "a late tick inside twice the interval is not sleep");
+fn a_suspend_shows_as_wall_time_the_monotonic_clock_never_saw() {
+    // Ticking every 30 s. A suspend stops the monotonic clock: the tick sees
+    // 30 s pass while the wall clock moved 30 minutes.
+    assert!(slept(30_000, 30 * MIN + 30_000, 30_000));
+    // App Nap delays the tick itself.
+    assert!(slept(5 * MIN, 5 * MIN, 30_000));
+    // An ordinary tick, and one a little late, are not sleep.
+    assert!(!slept(30_000, 30_050, 30_000));
+    assert!(!slept(55_000, 55_000, 30_000));
+}
+
+#[test]
+fn a_restored_chat_on_a_live_connection_runs_its_turn_but_is_unconfirmed() {
+    let h = health(&HealthInputs {
+        turn_active: true,
+        restored: Some(Restored { was_mid_turn: true, prior_host_gone: true }),
+        ..live()
+    });
+    assert_eq!((h.status, h.liveness), (HealthStatus::Working, Liveness::RestoredUnconfirmed));
+}
+
+#[test]
+fn a_limited_session_says_why() {
+    let h = health(&HealthInputs {
+        limited_until: Some(NOW + MIN),
+        limit_reason: Some("Provider overloaded".into()),
+        ..live()
+    });
+    assert_eq!(h.reason.as_deref(), Some("Provider overloaded"));
 }
 
 #[test]

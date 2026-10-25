@@ -572,6 +572,11 @@ impl ChatThread {
             | ThreadEvent::UserMessagesDelivered { .. }
             | ThreadEvent::UserMessageDropped { .. } => {}
             ThreadEvent::TurnEnded { is_error, result, usage, turn_diff } => {
+                // With no host turn running, a result ends a turn the
+                // provider started itself: close it, whatever its origin says.
+                if !self.turn_active {
+                    self.continuations_open = self.continuations_open.saturating_sub(1);
+                }
                 self.turn_active = false;
                 // Clear a dangling compaction spinner if the turn ended without a
                 // boundary event (e.g. a compaction that failed or was aborted).

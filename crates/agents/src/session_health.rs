@@ -44,6 +44,9 @@ pub struct HealthCell {
     /// The stall clock restarts no earlier than this (the host's last wake).
     forgiven_until: AtomicI64,
     cfg: Arc<RwLock<HealthConfig>>,
+    /// Held across read-inputs → write-health, so a slower derivation (the
+    /// host's tick) never overwrites one made from newer inputs.
+    derive: Mutex<()>,
 }
 
 impl HealthCell {
@@ -56,11 +59,15 @@ impl HealthCell {
             children: Mutex::new(ChildActivity::default()),
             forgiven_until: AtomicI64::new(0),
             cfg,
+            derive: Mutex::new(()),
         }
     }
 
-    /// Re-derive at `now`; returns the new health when it changed.
-    fn recompute(&self, now: i64) -> Option<SessionHealth> {
+    /// Re-derive at `now`. Returns the new health when what a person would
+    /// read changed (status, liveness, stall, reason), and whether the session
+    /// counts as working.
+    fn recompute(&self, now: i64) -> (Option<SessionHealth>, bool) {
+        let _derive = self.derive.lock().unwrap();
         let mut inputs = self.inputs.borrow().clone();
         let children = *self.children.lock().unwrap();
         inputs.children_active = children.working;
@@ -68,17 +75,32 @@ impl HealthCell {
             .last_activity_at
             .max(self.forgiven_until.load(Ordering::Relaxed))
             .max(if children.working > 0 { children.last_activity_at } else { 0 });
-        let next = health::compute(&inputs, now, &self.cfg.read().unwrap());
+        let cfg = *self.cfg.read().unwrap();
+        // A continuation whose closing frame never came would keep an idle
+        // session working forever; past the stall window with no host turn,
+        // the count is stale.
+        if health::continuations_stale(&inputs, now, &cfg) {
+            inputs.continuations_open = 0;
+        }
+        let next = health::compute(&inputs, now, &cfg);
+        let working = matches!(
+            next.status,
+            HealthStatus::Working | HealthStatus::NeedsPermission | HealthStatus::NeedsAnswer
+        );
         let mut changed = None;
         self.health.send_if_modified(|h| {
             if *h == next {
                 return false;
             }
-            changed = Some(next.clone());
+            let readable = (h.status, h.liveness, h.stalled_since.is_some(), &h.reason)
+                != (next.status, next.liveness, next.stalled_since.is_some(), &next.reason);
+            if readable {
+                changed = Some(next.clone());
+            }
             *h = next.clone();
             true
         });
-        changed
+        (changed, working)
     }
 }
 
@@ -88,7 +110,6 @@ impl SessionHandle {
     /// unanswered send counts, so a child still reacting to its background
     /// tasks keeps its slot).
     pub fn publish_health(&self, inputs: HealthInputs) {
-        let working = health::is_working(&inputs) || inputs.prompt.is_some();
         let modified = self.health.inputs.send_if_modified(|current| {
             if *current == inputs {
                 return false;
@@ -97,9 +118,15 @@ impl SessionHandle {
             true
         });
         if modified {
-            self.log_change(self.health.recompute(now_ms()));
+            let (changed, working) = self.health.recompute(now_ms());
+            self.log_change(changed);
+            self.set_working(working);
         }
-        self.set_working(working);
+    }
+
+    /// The thresholds this session derives with (the host config).
+    pub fn health_config(&self) -> HealthConfig {
+        *self.health.cfg.read().unwrap()
     }
 
     /// The facts last published.
@@ -121,8 +148,9 @@ impl SessionHandle {
     /// at `now` (a quiet session crosses the stall threshold here).
     pub fn refresh_health(&self, now: i64, children: ChildActivity) -> Option<SessionHealth> {
         *self.health.children.lock().unwrap() = children;
-        let changed = self.health.recompute(now);
+        let (changed, working) = self.health.recompute(now);
         self.log_change(changed.clone());
+        self.set_working(working);
         changed
     }
 

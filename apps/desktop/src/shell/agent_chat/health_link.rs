@@ -33,6 +33,10 @@ pub(super) struct HealthTrack {
     exits: u32,
     /// Set on restore until the first frame on the new connection.
     restored: Option<Restored>,
+    /// The last turn ended in error (its message); cleared by the next send
+    /// or a turn that ends well. Only a turn's own result, not a failed fork
+    /// or rewind, makes a session read failed.
+    failed_turn: Option<String>,
 }
 
 impl HealthTrack {
@@ -55,6 +59,9 @@ impl HealthTrack {
         self.sent_unanswered = false;
         self.accepted_at = None;
         self.restored = None;
+        if let ThreadEvent::TurnEnded { is_error, result, .. } = ev {
+            self.failed_turn = is_error.then(|| result.clone().unwrap_or_else(|| "Turn failed".into()));
+        }
     }
 
     /// A send was written to the agent.
@@ -64,6 +71,7 @@ impl HealthTrack {
         self.accepted_at = None;
         self.last_activity_at = now;
         self.exit = None;
+        self.failed_turn = None;
     }
 
     /// The process ended. Returns the proof recorded.
@@ -99,12 +107,10 @@ impl AgentChatView {
     pub(super) fn health_inputs(&self) -> HealthInputs {
         let t = &self.health;
         let incarnation = self.remote.as_ref().map(|b| b.incarnation()).unwrap_or_default();
-        let process = if let Some(proof) = t.exit {
-            Process::Exited(proof)
-        } else if t.restored.is_some() || self.connection.is_none() {
-            Process::Dormant
-        } else {
-            Process::Live
+        let process = match (t.exit, &self.connection) {
+            (Some(proof), _) => Process::Exited(proof),
+            (None, Some(_)) => Process::Live,
+            (None, None) => Process::Dormant,
         };
         HealthInputs {
             turn_active: self.thread.turn_active,
@@ -126,7 +132,8 @@ impl AgentChatView {
                 None
             },
             limited_until: self.retry.pending.as_ref().map(|p| p.wake_at_ms),
-            last_turn_failure: self.thread.last_error.clone().filter(|_| !self.thread.turn_active),
+            limit_reason: self.retry.pending.as_ref().map(|p| p.reason.clone()),
+            last_turn_failure: t.failed_turn.clone().filter(|_| !self.thread.turn_active),
             interrupted: self.interrupted,
             process,
             restored: t.restored,
@@ -143,7 +150,7 @@ impl AgentChatView {
     /// here, where the fold lives.
     pub(super) fn publish_health(&mut self) {
         let now = now_ms();
-        let cfg = health::HealthConfig::default();
+        let cfg = self.remote.as_ref().map(|b| b.health_config()).unwrap_or_default();
         if health::continuations_stale(&self.health_inputs(), now, &cfg) {
             tracing::info!(open = self.thread.continuations_open, "health: clearing a stale continuation count");
             self.thread.continuations_open = 0;
@@ -165,12 +172,17 @@ impl AgentChatView {
             return;
         }
         let Some(conn) = self.connection.clone() else { return };
+        let generation = self.drain_gen;
         cx.spawn(async move |this, cx| {
             for _ in 0..40 {
                 cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
                 if let Some(code) = conn.exit_code() {
                     let _ = this.update(cx, |view, cx| {
-                        if view.disconnected && view.health.exit == Some(ExitProof::ConnectionClosed) {
+                        // Only while this process is still the chat's last one.
+                        if view.drain_gen == generation
+                            && view.disconnected
+                            && view.health.exit == Some(ExitProof::ConnectionClosed)
+                        {
                             view.health.exit = Some(ExitProof::ExitCode(code));
                             if view.thread.last_error.as_deref() == Some(exit_message(None).as_str()) {
                                 view.thread.last_error = Some(exit_message(Some(code)));
@@ -194,6 +206,16 @@ impl AgentChatView {
             .and_then(|core| core.prior_owner())
             .is_some_and(|prior| !matches!(prior, oximux_remote_host::PriorOwner::None));
         self.health = HealthTrack::restored(mid_turn, prior_host_gone);
+    }
+
+    /// Whether work was running that a restart would cut short: a turn,
+    /// background tasks, or a continuation that is not stale.
+    pub(super) fn mid_turn(&self) -> bool {
+        let inputs = self.health_inputs();
+        let cfg = self.remote.as_ref().map(|b| b.health_config()).unwrap_or_default();
+        inputs.turn_active
+            || inputs.background_active > 0
+            || (inputs.continuations_open > 0 && !health::continuations_stale(&inputs, now_ms(), &cfg))
     }
 
     /// The error a dead process leaves, with its code when known.
@@ -288,6 +310,53 @@ mod tests {
                 view.on_event(ThreadEvent::ProviderTurnStarted, cx);
                 assert_eq!(health_of(view).0, HealthStatus::Working);
                 view.on_event(ThreadEvent::ContinuationEnded, cx);
+                assert_eq!(health_of(view).0, HealthStatus::Idle);
+            })
+            .expect("window update");
+    }
+
+    /// What the host derives from the inputs the view publishes is exactly
+    /// what the view itself would compute from them.
+    #[gpui::test]
+    async fn the_host_derives_the_health_the_view_computes(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                let registry = oximux_agents::session_registry::SessionRegistry::new();
+                let handle = registry.register("s".into(), Arc::new(StubConnection::default()));
+                view.thread.push_user_message("go");
+                view.health.note_sent(now_ms());
+                for (label, step) in [("sent", 0), ("continuation", 1), ("failed", 2)] {
+                    match step {
+                        1 => {
+                            view.on_event(ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None }, cx);
+                            view.on_event(ThreadEvent::ProviderTurnStarted, cx);
+                        }
+                        2 => {
+                            view.on_event(ThreadEvent::ContinuationEnded, cx);
+                            view.thread.push_user_message("again");
+                            view.on_event(ThreadEvent::TurnEnded { result: Some("API Error: 500".into()), usage: None, is_error: true, turn_diff: None }, cx);
+                        }
+                        _ => {}
+                    }
+                    let inputs = view.health_inputs();
+                    handle.publish_health(inputs.clone());
+                    let mine = compute(&inputs, now_ms(), &HealthConfig::default());
+                    let host = handle.health();
+                    assert_eq!((host.status, host.liveness, host.reason), (mine.status, mine.liveness, mine.reason), "{label}");
+                }
+                assert_eq!(handle.health().status, HealthStatus::Failed);
+            })
+            .expect("window update");
+    }
+
+    /// A failed fork or rewind leaves an error on the chat, not a failed turn.
+    #[gpui::test]
+    async fn a_non_turn_error_does_not_read_failed(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, _cx| {
+                view.thread.last_error = Some("Fork failed: no session".into());
                 assert_eq!(health_of(view).0, HealthStatus::Idle);
             })
             .expect("window update");

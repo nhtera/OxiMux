@@ -596,22 +596,47 @@ pub struct StubConnection {
     exit: Arc<Mutex<Option<i32>>>,
 }
 
-/// Reap `child` without blocking and read its exit code (`128 + signal` when a
-/// signal ended it, the shell's convention). `None` while it still runs.
+/// Read `child`'s exit code without blocking (`128 + signal` when a signal
+/// ended it, the shell's convention). `None` while it still runs.
+///
+/// On Unix this does **not** reap: the exited child stays a zombie, so its pid
+/// (and for a group leader, its process-group id) cannot be reused before the
+/// adapter's own shutdown reaps it. Reaping here would let a later group kill
+/// by that id land on whatever process took the number in the meantime.
 pub(crate) fn reap_exit_code(child: &Mutex<std::process::Child>) -> Option<i32> {
     let mut child = match child.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let status = child.try_wait().ok()??;
     #[cfg(unix)]
     {
-        use std::os::unix::process::ExitStatusExt;
-        status.code().or_else(|| status.signal().map(|s| 128 + s))
+        let _ = &mut child;
+        peek_exit_code(child.id())
     }
     #[cfg(not(unix))]
     {
-        status.code()
+        child.try_wait().ok()??.code()
+    }
+}
+
+/// `waitid(.., WNOWAIT)`: how `pid` ended, leaving it unreaped.
+#[cfg(unix)]
+fn peek_exit_code(pid: u32) -> Option<i32> {
+    // SAFETY: `info` is a plain C struct the call fills; zeroed is a valid
+    // initial value, and `si_pid == 0` after a WNOHANG call means "still
+    // running", which is checked before any other field is read.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        if libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) != 0 || info.si_pid() == 0 {
+            return None;
+        }
+        let status = info.si_status();
+        match info.si_code {
+            libc::CLD_EXITED => Some(status),
+            libc::CLD_KILLED | libc::CLD_DUMPED => Some(128 + status),
+            _ => None,
+        }
     }
 }
 

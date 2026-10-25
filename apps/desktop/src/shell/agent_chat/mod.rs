@@ -2652,6 +2652,7 @@ impl AgentChatView {
         // lands in the same batch). Done here, at the one place every event passes
         // through, rather than at each site that can change them.
         self.publish_remote_meta();
+        self.publish_health();
         if all_delta {
             self.notify_throttled(cx);
         } else {

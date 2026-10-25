@@ -345,18 +345,18 @@ impl HostCore {
     fn spawn_health_ticker(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         self.rt.spawn(async move {
-            let mut last = std::time::Instant::now();
+            let mut last = (std::time::Instant::now(), oximux_agents::session_health::now_ms());
             loop {
                 tokio::time::sleep(HEALTH_TICK).await;
                 let Some(core) = weak.upgrade() else { return };
-                let tick = std::time::Instant::now();
-                let gap = oximux_agents::health::sleep_gap_ms(
-                    0,
-                    tick.duration_since(last).as_millis() as i64,
+                let tick = (std::time::Instant::now(), oximux_agents::session_health::now_ms());
+                let woke = oximux_agents::health::slept(
+                    tick.0.duration_since(last.0).as_millis() as i64,
+                    tick.1 - last.1,
                     HEALTH_TICK.as_millis() as i64,
                 );
                 last = tick;
-                core.refresh_health(oximux_agents::session_health::now_ms(), gap > 0);
+                core.refresh_health(tick.1, woke);
             }
         });
     }

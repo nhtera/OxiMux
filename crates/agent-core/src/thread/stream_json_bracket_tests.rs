@@ -70,3 +70,14 @@ fn task_frames_and_subagent_frames_are_not_brackets() {
         }
     }
 }
+
+/// A provider turn that ends with an origin-less result while no host turn
+/// runs still closes: the count never sticks open on an unexpected origin.
+#[test]
+fn any_result_outside_a_host_turn_closes_a_continuation() {
+    let mut thread = ChatThread::new();
+    thread.apply(&ThreadEvent::ProviderTurnStarted);
+    assert_eq!(thread.continuations_open, 1);
+    thread.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None });
+    assert_eq!(thread.continuations_open, 0);
+}

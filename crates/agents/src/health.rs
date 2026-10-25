@@ -126,6 +126,8 @@ pub struct HealthInputs {
     pub prompt: Option<PromptKind>,
     /// When an armed retry fires because a provider limit closed the turn.
     pub limited_until: Option<i64>,
+    /// Why that retry is armed ("Usage limit reached", "Provider overloaded").
+    pub limit_reason: Option<String>,
     /// The last turn failed (its message), and nothing has run since.
     pub last_turn_failure: Option<String>,
     /// The user stopped the session.
@@ -252,7 +254,9 @@ fn classify(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> (HealthStatus, Li
         }
         Process::Live => {}
     }
-    let live = Liveness::Live;
+    // A restored chat whose new connection has not produced a frame yet: the
+    // process is ours, but nothing has confirmed the session it resumed.
+    let live = if i.restored.is_some() { Liveness::RestoredUnconfirmed } else { Liveness::Live };
     if i.interrupted {
         return (S::Interrupted, live, None, false);
     }
@@ -262,7 +266,7 @@ fn classify(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> (HealthStatus, Li
         None => {}
     }
     if i.limited_until.is_some() {
-        return (S::Limited, live, Some("rate limited".into()), false);
+        return (S::Limited, live, Some(i.limit_reason.clone().unwrap_or_else(|| "rate limited".into())), false);
     }
     if is_working(i) {
         let reason = i
@@ -286,13 +290,15 @@ pub fn continuations_stale(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> bo
 }
 
 /// A clock that sleeps (a laptop lid, App Nap) is not a silent agent. Given
-/// the previous and current readings of a monotonic clock and the interval the
-/// caller ticks at, returns the gap to forgive: how far past twice the
-/// interval this tick came. Shift every `last_activity_at` forward by it
-/// before evaluating, so waking a laptop never reads as a burst of stalls.
-pub fn sleep_gap_ms(prev_tick_ms: i64, now_tick_ms: i64, interval_ms: i64) -> i64 {
-    let elapsed = now_tick_ms.saturating_sub(prev_tick_ms);
-    if elapsed > interval_ms.saturating_mul(2) { elapsed - interval_ms } else { 0 }
+/// how much time passed since the last tick on a monotonic clock and on the
+/// wall clock, and the interval the caller ticks at, says whether the machine
+/// slept in between: the wall clock ran ahead of the monotonic one (macOS and
+/// Linux stop the monotonic clock in suspend) or the tick came far too late.
+/// The caller then forgives the silence so far, so waking never reads as a
+/// burst of stalls.
+pub fn slept(mono_elapsed_ms: i64, wall_elapsed_ms: i64, interval_ms: i64) -> bool {
+    wall_elapsed_ms.saturating_sub(mono_elapsed_ms) > interval_ms
+        || mono_elapsed_ms > interval_ms.saturating_mul(2)
 }
 
 #[cfg(test)]
