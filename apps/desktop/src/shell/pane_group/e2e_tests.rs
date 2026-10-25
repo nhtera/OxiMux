@@ -954,6 +954,7 @@ async fn restored_tabs_settle_into_saved_order_and_cosmetics(cx: &mut TestAppCon
                     pinned: true,
                     color: Some(TabColor::Teal),
                     custom_title: Some("Claude #2".into()),
+                    ..Default::default()
                 },
                 cx,
             );
@@ -978,6 +979,75 @@ async fn restored_tabs_settle_into_saved_order_and_cosmetics(cx: &mut TestAppCon
             Some("Claude #2"),
             "custom title survives restore",
         );
+    });
+}
+
+/// A spawned helper's tab keeps its `↳` label and "Spawned by" tooltip over a
+/// restart, instead of coming back as a plain renumbered tab.
+#[gpui::test]
+async fn restore_keeps_a_helper_tabs_label_and_tooltip(cx: &mut TestAppContext) {
+    use crate::shell::pane_group::RestoredTabMeta;
+    let (window, _dir) = make_group(cx);
+    window
+        .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+        .expect("window update ok")
+        .expect("PTY spawn must succeed");
+    window
+        .update(cx, |group, _win, cx| {
+            group.place_restored_tab(
+                0,
+                RestoredTabMeta {
+                    label: Some("↳ Chat 9".into()),
+                    tooltip: Some("Spawned by Chat 8".into()),
+                    ..Default::default()
+                },
+                cx,
+            );
+        })
+        .expect("window update ok");
+    cx.read(|app| {
+        let tab = &window.read(app).expect("PaneGroup alive").tabs()[0];
+        assert_eq!(tab.label.as_ref(), "↳ Chat 9");
+        assert_eq!(tab.tooltip.as_deref(), Some("Spawned by Chat 8"));
+    });
+}
+
+/// A restored helper names its parent as the parent's tab reads now, not as
+/// it read when the helper was spawned (restored chats are renumbered).
+#[gpui::test]
+async fn a_restored_helper_names_its_parent_as_it_reads_now(cx: &mut TestAppContext) {
+    use crate::shell::agent_chat::AgentChatView;
+    use oximux_agents::thread::StubConnection;
+    cx.update(gpui_component::init);
+    let (window, dir) = make_group(cx);
+    let ids = window
+        .update(cx, |group, win, cx| {
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let view = cx.new(|cx| {
+                    AgentChatView::with_connection_for_test(
+                        Arc::new(StubConnection::default()),
+                        Theme::default(),
+                        Density::default(),
+                        Typography::default(),
+                        win,
+                        cx,
+                    )
+                });
+                let ix = group.push_agent_chat_view(view, dir.path().to_path_buf(), None, true, win, cx);
+                ids.push(group.chat_session_id_at(ix, cx).expect("a chat"));
+            }
+            group.tabs[1].tooltip = Some("Spawned by Chat 8".into());
+            let (parent, child) = (ids[0].clone(), ids[1].clone());
+            group.refresh_spawned_by_with(|sid| (sid == child).then(|| parent.clone()), cx);
+            ids
+        })
+        .expect("window update ok");
+    assert_eq!(ids.len(), 2);
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(group.tabs()[1].tooltip.as_deref(), Some("Spawned by Chat 1"));
+        assert_eq!(group.tabs()[0].tooltip, None, "only a helper carries one");
     });
 }
 

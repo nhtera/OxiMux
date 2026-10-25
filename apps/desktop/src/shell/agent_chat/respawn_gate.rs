@@ -41,13 +41,18 @@ impl AgentChatView {
     /// before anything else uses the connection.
     pub(super) fn run_pending_respawn(&mut self, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.pending_respawn) {
+            #[cfg(test)]
+            if tests::RESPAWN_IN_PLACE.with(std::cell::Cell::get) {
+                self.drain_gen += 1; // what the real respawn's `start_drain` does
+                return;
+            }
             self.respawn_with_env(Vec::new(), None, cx);
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
 
     use gpui::TestAppContext;
@@ -55,6 +60,12 @@ mod tests {
     use oximux_settings::{Density, Theme, Typography};
 
     use super::AgentChatView;
+
+    thread_local! {
+        /// Stand the deferred respawn in with its drain switch alone: a test
+        /// cannot spawn the real agent (see `drain`'s tests).
+        pub(crate) static RESPAWN_IN_PLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     /// Mid-turn, a respawn is recorded instead of reaping the live process,
     /// and several requests in one turn coalesce; idle, nothing waits.

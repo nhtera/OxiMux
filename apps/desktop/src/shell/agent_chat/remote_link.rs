@@ -9,7 +9,7 @@
 
 use gpui::{App, Context};
 use oximux_agents::session_registry::SessionMeta;
-use oximux_agents::thread::{ConnectSpec, McpServerSpec, Transport};
+use oximux_agents::thread::{ConnectSpec, McpServerSpec, ThreadEntry, ThreadEvent, Transport};
 
 use super::{AgentChatView, RemoteControl};
 
@@ -77,6 +77,7 @@ impl AgentChatView {
         match bound {
             Some(binding) => {
                 self.remote = Some(binding);
+                self.carry_running_prompt();
                 // Expose the current transcript at once — on a restart this fold was
                 // restored from disk and never entered the event ring, so a phone
                 // opening the session before the next event would otherwise see it
@@ -110,6 +111,29 @@ impl AgentChatView {
             }
             // No connection — drop any prior binding.
             None => self.unbind_remote(),
+        }
+    }
+
+    /// A rekey binds a fresh event ring under the agent's own id, often mid-turn
+    /// (a Codex thread names itself after its first prompt is written). Carry
+    /// that prompt into the new ring so a reader of the new id (`oximux wait`)
+    /// sees a turn in flight rather than none. Done before the transcript is
+    /// published: a phone resumes after the snapshot's cursor, so it never sees
+    /// the prompt twice. A respawn rebinds the same id, whose ring is kept (and
+    /// it waits for the turn to end, so nothing is carried then).
+    fn carry_running_prompt(&self) {
+        let Some(binding) = self.remote.as_ref().filter(|_| self.thread.turn_active) else {
+            return;
+        };
+        if !binding.is_empty() {
+            return;
+        }
+        let prompt = self.thread.entries.iter().rev().find_map(|e| match e {
+            ThreadEntry::User { text, images, .. } => Some((text.clone(), images.clone())),
+            _ => None,
+        });
+        if let Some((text, images)) = prompt {
+            binding.ingest(ThreadEvent::UserMessage { text, images });
         }
     }
 

@@ -165,7 +165,7 @@ impl AgentChatView {
             match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
-                    drain_task = Some(Self::spawn_drain(rx, cx));
+                    drain_task = Some(Self::spawn_drain(rx, 0, cx));
                 }
                 Err(e) => {
                     thread.last_error = Some(format!("Failed to start agent: {e}"));
@@ -409,6 +409,7 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: drain_task,
+            drain_gen: 0,
             _remote_prompt_task: remote_prompt_task,
             _remote_choice_task: remote_choice_task,
             remote_choice_tx: remote_choice_sender,

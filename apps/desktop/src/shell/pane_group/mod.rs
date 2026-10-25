@@ -278,6 +278,10 @@ pub struct RestoredTabMeta {
     pub pinned: bool,
     pub color: Option<TabColor>,
     pub custom_title: Option<SharedString>,
+    /// A spawned helper's saved `↳ …` label and its tooltip, kept over the
+    /// default label a restored tab is given.
+    pub label: Option<SharedString>,
+    pub tooltip: Option<SharedString>,
 }
 
 /// On-disk fate of an open editor file as detected by the file-tree watcher.

@@ -51,6 +51,7 @@ mod login_card;
 mod remote_link;
 mod posture_snapshot;
 mod respawn_gate;
+mod drain;
 mod send_gate_link;
 mod sign_in;
 mod message_rail;
@@ -814,6 +815,8 @@ pub struct AgentChatView {
     /// `Drop::shutdown()` (which kills the child → stdout EOF → both threads
     /// unwind). Keep that the single cleanup owner across future refactors.
     _drain_task: Option<Task<()>>,
+    /// Which drain is current; an older one stops (see `drain`).
+    drain_gen: u64,
     /// Relays remotely-injected prompts (phone sends) into this tab's transcript so
     /// the desktop shows the user's own bubble. Re-created on each (re)bind; dropping
     /// it ends the relay.
@@ -2198,11 +2201,10 @@ impl AgentChatView {
                 // Re-expose the respawned session to remote clients under the same
                 // stable id (drops the old binding, registers the fresh connection).
                 self.bind_remote(cx);
-                // Reassigning drops the old drain task, cancelling its foreground
-                // half; its forwarder thread then exits on the dead child's
-                // stdout EOF. We're single-threaded here, so no stale
-                // `on_disconnect` can interleave onto the fresh connection.
-                self._drain_task = Some(Self::spawn_drain(rx, cx));
+                // The old drain retires (it may be the one running this, when a
+                // turn's end ran the respawn); its forwarder thread exits on the
+                // dead child's stdout EOF, and it never reports that exit here.
+                self.start_drain(rx, cx);
                 self.interrupted = false;
                 self.disconnected = false;
                 self.thread.last_error = None;
@@ -2552,7 +2554,7 @@ impl AgentChatView {
     /// of spawning a real subprocess, and skip the background drain so a
     /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
     #[cfg(test)]
-    fn with_connection_for_test(
+    pub(crate) fn with_connection_for_test(
         connection: Arc<dyn AgentConnection>,
         theme: Theme,
         density: Density,
@@ -2648,6 +2650,7 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: None,
+            drain_gen: 0,
             _remote_prompt_task: None,
             _remote_choice_task: None,
             remote_choice_tx: None,
@@ -2765,43 +2768,6 @@ impl AgentChatView {
         !self.unbound && self.connection.is_some()
     }
 
-    /// Bridge the connection's blocking `std::mpsc` receiver onto the
-    /// foreground: a dedicated OS thread forwards each decoded event to an async
-    /// channel a `cx.spawn` task awaits and applies. The forwarder exits when
-    /// the process closes stdout, which ends the async channel and triggers the
-    /// fail-closed disconnect handler.
-    fn spawn_drain(
-        rx: std::sync::mpsc::Receiver<ThreadEvent>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        let (fwd_tx, mut fwd_rx) = futures::channel::mpsc::unbounded::<ThreadEvent>();
-        std::thread::spawn(move || {
-            while let Ok(ev) = rx.recv() {
-                if fwd_tx.unbounded_send(ev).is_err() {
-                    break; // view gone
-                }
-            }
-            // `rx` disconnected (stdout EOF / process exit): `fwd_tx` drops here,
-            // so the foreground task observes the channel end and fails closed.
-        });
-        cx.spawn(async move |this: WeakEntity<Self>, cx| {
-            while let Some(ev) = fwd_rx.next().await {
-                // Drain whatever else is already queued behind this event and
-                // apply the lot as one batch: under a burst (a fast model's
-                // token stream) this collapses N repaints into one for free,
-                // with no added latency — these events had all arrived anyway.
-                let mut batch = vec![ev];
-                while let Ok(queued) = fwd_rx.try_recv() {
-                    batch.push(queued);
-                }
-                if this.update(cx, |view, cx| view.apply_batch(batch, cx)).is_err() {
-                    return; // view dropped
-                }
-            }
-            let _ = this.update(cx, |view, cx| view.on_disconnect(cx));
-        })
-    }
-
     /// The sender for this tab's choice relay, starting the relay on first use.
     ///
     /// One relay per view for its whole life, rather than one per binding: a
@@ -2866,7 +2832,13 @@ impl AgentChatView {
     /// message); anything else paints at once.
     fn apply_batch(&mut self, batch: Vec<ThreadEvent>, cx: &mut Context<Self>) {
         let all_delta = batch.iter().all(ThreadEvent::is_delta);
+        let generation = self.drain_gen;
         for ev in batch {
+            // A respawn run by an earlier event (the turn's end) replaced the
+            // process the rest of this batch came from.
+            if self.drain_gen != generation {
+                break;
+            }
             // Tee each event to any remote subscribers (gated: `remote` is `Some`
             // only while remote control is enabled, so this clone never runs on a
             // disabled desktop). The desktop UI keeps its own dedicated channel —

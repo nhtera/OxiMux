@@ -171,6 +171,11 @@ impl RemoteBinding {
         }
     }
 
+    /// Whether the session's event ring holds nothing yet (a fresh registration).
+    pub fn is_empty(&self) -> bool {
+        self.handle.events_since(0).is_empty()
+    }
+
     /// Attach the view's send gate to the session (remote prompts and the
     /// host's child events queue there), or detach it.
     pub fn set_gate(&self, gate: Option<Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>>) {

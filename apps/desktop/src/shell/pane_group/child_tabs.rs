@@ -42,9 +42,7 @@ impl PaneGroup {
         let ix = self.push_agent_chat_view(view, cwd, model, false, window, cx);
         let label = format!("↳ {}", self.tabs[ix].label);
         self.tabs[ix].label = SharedString::from(label);
-        let parent_tab = &self.tabs[parent_ix];
-        let parent_name = parent_tab.custom_title.clone().unwrap_or_else(|| parent_tab.label.clone());
-        self.tabs[ix].tooltip = Some(SharedString::from(format!("Spawned by {parent_name}")));
+        self.tabs[ix].tooltip = Some(spawned_by(&self.tabs[parent_ix]));
         self.place_after_family(ix, parent_ix, parent, cx);
         self.sync_remote_tab_title(ix, cx);
         cx.notify();
@@ -98,4 +96,37 @@ impl PaneGroup {
         }
         self.tab_order.insert(at, ix);
     }
+
+    /// A restored helper's "Spawned by …" names its parent as the parent's tab
+    /// reads now: a restored chat is renumbered, so the saved text could name
+    /// another tab. A helper whose parent is not open here keeps the saved text.
+    pub(super) fn refresh_spawned_by(&mut self, cx: &App) {
+        let lineage = cx
+            .try_global::<crate::remote_control::RemoteControl>()
+            .and_then(|rc| rc.host_core())
+            .map(|core| core.lineage().clone());
+        let Some(lineage) = lineage else { return };
+        self.refresh_spawned_by_with(|sid| lineage.row(sid).ok().flatten().map(|row| row.parent_id), cx);
+    }
+
+    /// [`Self::refresh_spawned_by`] over any spawn tree (`parent_of`).
+    pub(super) fn refresh_spawned_by_with(&mut self, parent_of: impl Fn(&str) -> Option<String>, cx: &App) {
+        for ix in 0..self.tabs.len() {
+            if self.tabs[ix].tooltip.is_none() {
+                continue;
+            }
+            let Some(parent) = self.chat_session_id_at(ix, cx).and_then(|sid| parent_of(&sid)) else {
+                continue;
+            };
+            if let Some(parent_ix) = self.chat_tab_index_by_remote_id(&parent, cx) {
+                self.tabs[ix].tooltip = Some(spawned_by(&self.tabs[parent_ix]));
+            }
+        }
+    }
+}
+
+/// A child tab's hover text, naming its parent as the parent's tab reads.
+fn spawned_by(parent: &PaneGroupTab) -> SharedString {
+    let name = parent.custom_title.clone().unwrap_or_else(|| parent.label.clone());
+    SharedString::from(format!("Spawned by {name}"))
 }

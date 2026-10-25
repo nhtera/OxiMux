@@ -229,6 +229,52 @@
         });
     }
 
+    /// A Codex thread names itself after its first prompt is written, so the
+    /// session is rekeyed mid-turn onto a fresh event ring. The running prompt
+    /// comes along: `oximux wait` on the new id must see a turn in flight, and a
+    /// phone resuming from the snapshot must not see the prompt twice.
+    #[gpui::test]
+    async fn a_mid_turn_rekey_carries_the_running_prompt(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            let rc = crate::remote_control::RemoteControl::new();
+            rc.set_enabled(true);
+            cx.set_global(rc);
+        });
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let id = "22222222-3333-4444-5555-666666666666";
+        window
+            .update(cx, |view, _window, cx| {
+                view.send_text("summarize the repo".into(), Vec::new(), cx);
+                view.thread.turn_active = true;
+                view.thread.session_id = Some(id.into());
+                view.on_event(ThreadEvent::AssistantTextDelta("Look".into()), cx);
+                assert_eq!(view.remote_session_id(), id);
+            })
+            .unwrap();
+        cx.update(|cx| {
+            let handle = cx.global::<crate::remote_control::RemoteControl>().registry().get(id).expect("rekeyed");
+            let events = handle.events_since(0);
+            let prompts: Vec<_> = events
+                .iter()
+                .filter(|(_, ev)| matches!(ev, ThreadEvent::UserMessage { text, .. } if text == "summarize the repo"))
+                .collect();
+            assert_eq!(prompts.len(), 1, "the running prompt is in the new ring once: {events:?}");
+            let snapshot = handle.transcript_snapshot().expect("published");
+            assert!(snapshot.seq >= prompts[0].0, "a phone resumes after it, never replaying it");
+        });
+    }
+
     /// A normal streamed turn folds into user + assistant entries via `on_event`.
     #[gpui::test]
     async fn on_event_builds_transcript(cx: &mut TestAppContext) {

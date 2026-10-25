@@ -781,6 +781,7 @@ impl ProjectPanes {
                     pinned: tab.pinned,
                     color: tab.color.map(|c| c.slug().to_string()),
                     custom_title: tab.custom_title.as_ref().map(|t| t.to_string()),
+                    tooltip: tab.tooltip.as_ref().map(|t| t.to_string()),
                 });
                 orig_to_emitted.insert(idx, emitted_in_group);
                 emitted_in_group += 1;
