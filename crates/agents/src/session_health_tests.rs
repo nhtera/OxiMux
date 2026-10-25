@@ -144,3 +144,24 @@ fn a_prompt_decided_through_the_host_is_answered_at_once() {
     assert!(h.resolve_permission("req-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap());
     assert_eq!(h.health().status, HealthStatus::Working);
 }
+
+/// A new process numbers its requests afresh: an id answered for the old one
+/// must neither hide nor refuse the new one's prompt.
+#[test]
+fn a_respawn_forgets_the_old_processes_decided_requests() {
+    use crate::health::PromptKind;
+    use crate::thread::PermissionDecision;
+    let (reg, h) = registry_with("s");
+    let allow = || PermissionDecision::Allow { updated_input: serde_json::Value::Null };
+    assert!(h.resolve_permission("3", allow()).unwrap());
+    let (respawned, _rx, _tx) = StubConnection::new();
+    reg.register("s".into(), Arc::new(respawned));
+    h.publish_health(HealthInputs {
+        turn_active: true,
+        prompt: Some(PromptKind::Permission),
+        prompt_request: Some("3".into()),
+        ..live_at(now_ms())
+    });
+    assert_eq!(h.health().status, HealthStatus::NeedsPermission, "the new prompt shows");
+    assert!(h.resolve_permission("3", allow()).unwrap(), "and can be answered");
+}

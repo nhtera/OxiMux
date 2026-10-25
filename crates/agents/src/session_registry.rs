@@ -642,7 +642,18 @@ impl SessionHandle {
     /// such frame as an already-seen duplicate and silently drops it, with no gap
     /// to trigger a resync. Swapping keeps the stream monotonic instead.
     pub fn swap_connection(&self, conn: Arc<dyn AgentConnection>) {
-        *self.conn.lock().unwrap() = conn;
+        let mut current = self.conn.lock().unwrap();
+        if Arc::ptr_eq(&current, &conn) {
+            return; // the same process re-bound (access switched back on)
+        }
+        *current = conn;
+        drop(current);
+        // A new process numbers its requests afresh (Codex reuses JSON-RPC
+        // ids from 1): an id decided for the old one must not read as decided,
+        // or refuse an answer, for the new one's prompt.
+        self.decided.lock().unwrap().clear();
+        self.pending.lock().unwrap().clear();
+        self.update_status(None);
     }
 
     /// The models this session's backend offers, for a remote picker.
