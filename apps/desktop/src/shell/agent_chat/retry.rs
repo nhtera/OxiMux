@@ -351,6 +351,7 @@ impl AgentChatView {
                         Ok(()) => {
                             self.thread.last_error = None;
                             self.thread.turn_active = true;
+                            self.health.note_sent(oximux_agents::session_health::now_ms());
                             true
                         }
                         Err(e) => {

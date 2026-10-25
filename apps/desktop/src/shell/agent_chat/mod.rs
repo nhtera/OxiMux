@@ -52,6 +52,7 @@ mod remote_link;
 mod posture_snapshot;
 mod respawn_gate;
 mod drain;
+mod health_link;
 mod lifecycle;
 mod overlays;
 #[cfg(test)]
@@ -591,6 +592,8 @@ pub struct AgentChatView {
     send_gate: Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>,
     /// The id the next write goes out under (a gate item's), else a fresh one.
     pending_send_uuid: Option<uuid::Uuid>,
+    /// Health facts the fold does not keep (`health_link.rs`).
+    health: health_link::HealthTrack,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`
@@ -2120,6 +2123,7 @@ impl AgentChatView {
         self.interrupt_turn(cx);
         self.interrupted = true;
         self.thread.interrupt();
+        self.publish_health();
         self.sync_composer(cx);
         cx.notify();
     }
@@ -2632,6 +2636,7 @@ impl AgentChatView {
             if let Some(binding) = &self.remote {
                 binding.ingest(ev.clone());
             }
+            self.health.note_event(&ev, oximux_agents::session_health::now_ms());
             let refuse_plan = self.before_apply(&ev, cx);
             self.apply_event(ev, cx);
             self.after_apply(refuse_plan);

@@ -783,6 +783,7 @@ impl ChatThread {
     pub fn interrupt(&mut self) {
         self.touch();
         self.turn_active = false;
+        self.continuations_open = 0;
         // A tool whose arguments were still streaming (`content_block_start` opened
         // the card, the finalized `tool_use` block never arrived) would otherwise
         // show "streaming…" forever after the turn is killed. Stop tracking it and

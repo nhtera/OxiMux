@@ -187,7 +187,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn decode_system(v: &Value) -> Vec<ThreadEvent> {
     match v.get("subtype").and_then(Value::as_str) {
-        Some("init") => vec![ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit {
+        Some("init") => vec![ThreadEvent::SessionInit {
             session_id: str_field(v, "session_id"),
             model: str_field(v, "model"),
             permission_mode: str_field(v, "permissionMode"),
@@ -198,7 +198,7 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
                 mcp_servers: mcp_servers(v),
                 agents: str_list_field(v, "agents"),
             },
-        }],
+        }, ThreadEvent::ProviderTurnStarted],
         Some("post_turn_summary") => vec![ThreadEvent::TurnSummary {
             detail: str_field(v, "status_detail"),
             category: str_field(v, "status_category"),
@@ -755,11 +755,11 @@ mod tests {
         let l = json!({"type":"system","subtype":"init","session_id":"sid-1",
             "model":"claude-sonnet-5","permissionMode":"default","extra":"ignored",
             "slash_commands":["compact","research",42,"codex:rescue"]}).to_string();
-        assert_eq!(decode_line(&l), vec![ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit {
+        assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
             session_id: "sid-1".into(), model: "claude-sonnet-5".into(),
             permission_mode: "default".into(),
             slash_commands: vec!["compact".into(), "research".into(), "codex:rescue".into()],
-            meta: SessionMeta::default() }]);
+            meta: SessionMeta::default() }, ThreadEvent::ProviderTurnStarted]);
     }
 
     #[test]
@@ -774,7 +774,7 @@ mod tests {
                            {"status":"nameless — skipped"}],
             "agents":["code-reviewer","planner"]}).to_string();
         match &decode_line(&l)[..] {
-            [ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit { meta, .. }] => {
+            [ThreadEvent::SessionInit { meta, .. }, ThreadEvent::ProviderTurnStarted] => {
                 assert_eq!(meta.cwd.as_deref(), Some("/repo"));
                 // Non-string entries are skipped, not fatal.
                 assert_eq!(meta.tools, vec!["Bash".to_string(), "Read".to_string()]);
@@ -795,10 +795,10 @@ mod tests {
         // Absent key → empty vec (older CLI / other backends), no panic.
         let l = json!({"type":"system","subtype":"init","session_id":"s",
             "model":"m","permissionMode":"default"}).to_string();
-        assert_eq!(decode_line(&l), vec![ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit {
+        assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
             session_id: "s".into(), model: "m".into(),
             permission_mode: "default".into(), slash_commands: vec![],
-            meta: SessionMeta::default() }]);
+            meta: SessionMeta::default() }, ThreadEvent::ProviderTurnStarted]);
     }
 
     #[test]

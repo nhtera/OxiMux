@@ -1186,16 +1186,15 @@ impl ProjectPanes {
         queued: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(group) = self.groups.get(&group_id).cloned() else {
-            return;
-        };
+    ) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+        let group = self.groups.get(&group_id).cloned()?;
         group.update(cx, |g, cx| {
-            g.open_agent_chat_tab_restored(
+            let ix = g.open_agent_chat_tab_restored(
                 cwd, model, backend, session_id, entries, slash_commands, session_meta, thinking_level,
                 posture, pending_retry, draft, queued, window, cx,
             );
-        });
+            g.agent_chat_view_at(ix)
+        })
     }
 
     /// Restore an UNBOUND *New Agent* draft into a SPECIFIC group (multi-group

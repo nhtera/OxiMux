@@ -393,6 +393,9 @@ impl AgentChatView {
             gate.note_unreported(uuid);
         }
         drop(gate);
+        if sent.is_ok() {
+            self.health.note_sent(oximux_agents::session_health::now_ms());
+        }
         sent
     }
 }

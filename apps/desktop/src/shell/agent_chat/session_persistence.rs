@@ -236,6 +236,9 @@ impl AgentChatView {
             // The armed retry, so a turn held for a five-hour window resumes
             // at its reset even across a quit. `None` whenever nothing is armed.
             pending_retry: self.retry.persisted(),
+            mid_turn: self.thread.turn_active
+                || self.thread.continuations_open > 0
+                || self.thread.background_tasks.iter().any(|t| t.status == oximux_agents::thread::TaskStatus::Running),
             choices: PersistedChoices {
                 models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
                 modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),

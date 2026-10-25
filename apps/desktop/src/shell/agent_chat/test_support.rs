@@ -45,6 +45,7 @@ impl AgentChatView {
             posture_refused: None,
             send_gate: Self::new_send_gate(),
             pending_send_uuid: None,
+            health: Default::default(),
             pending_respawn: false,
             remote,
             backend: ChatBackend::stream_json(),

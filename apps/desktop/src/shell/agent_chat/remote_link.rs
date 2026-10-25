@@ -168,12 +168,9 @@ impl AgentChatView {
             cwd: Some(self.cwd.clone()),
         });
         // Every event batch passes through here, so the first batch of a turn
-        // and its `TurnEnded` both reach the host's lineage subscriber.
-        binding.set_working(
-            self.thread.turn_active
-                || self.thread.pending_permission().is_some()
-                || self.thread.pending_question().is_some(),
-        );
+        // and its `TurnEnded` both reach the host (health, and the working flag
+        // its lineage subscriber parks idle children by).
+        binding.publish_health(self.health_inputs());
     }
 
     /// The model this tab is actually running under.

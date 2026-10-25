@@ -20,6 +20,9 @@ impl AgentChatView {
     /// stdin is briefly still writable, then mark the tool `Rejected` so the UI
     /// never shows a dangling approval prompt.
     pub(super) fn on_disconnect(&mut self, cx: &mut Context<Self>) {
+        // Record how the process ended while the session is still bound, so the
+        // host sees the exit before the session leaves its list.
+        self.record_exit(cx);
         // The live process is gone: drop the remote binding so the phone's session
         // list reflects only live sessions (a resume respawns + re-binds).
         self.unbind_remote();
@@ -57,7 +60,7 @@ impl AgentChatView {
         }
         self.disconnected = true;
         if self.thread.last_error.is_none() {
-            self.thread.last_error = Some("Agent process exited.".into());
+            self.thread.last_error = Some(self.exit_error());
         }
         self.sync_composer(cx);
         cx.notify();
