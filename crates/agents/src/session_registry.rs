@@ -297,6 +297,11 @@ impl SessionHandle {
             let _ = self.receipts.send(event);
             return self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
         }
+        // Turn brackets feed the host's health through the driver's fold; the
+        // ring stays in the vocabulary remote clients decode.
+        if event.is_turn_bracket() {
+            return self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        }
         // Track outstanding permission requests for the coarse status snapshot —
         // and keep the proposal, so a decision that edits it can be recorded.
         if let ThreadEvent::PermissionRequested { request_id, tool_use_id, tool_name, input, kind, .. } =

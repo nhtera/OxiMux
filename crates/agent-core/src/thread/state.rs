@@ -80,6 +80,13 @@ pub struct ChatThread {
     /// Whether a turn is currently in flight (between a user send and
     /// `TurnEnded`). Drives the composer's send/stop affordance.
     pub turn_active: bool,
+    /// Continuation turns the provider is running on its own: a Claude parent
+    /// wakes once per finished background task after its user turn ended, and
+    /// nothing in `turn_active` covers that work. Counted from
+    /// [`ThreadEvent::ProviderTurnStarted`] while no host turn runs, down on
+    /// [`ThreadEvent::ContinuationEnded`], floored at 0 (the two can arrive out
+    /// of order). Cleared when the process goes away or is stopped.
+    pub continuations_open: u32,
     /// Whether the backend is compacting context right now (Claude
     /// `system/status status="compacting"`). Set on `CompactionStarted`, cleared
     /// when the `CompactBoundary` divider lands or the turn ends without one — so
@@ -551,6 +558,14 @@ impl ChatThread {
             }
             ThreadEvent::RateLimitUpdated(info) => {
                 self.last_rate_limit = Some(info.clone());
+            }
+            ThreadEvent::ProviderTurnStarted => {
+                if !self.turn_active {
+                    self.continuations_open += 1;
+                }
+            }
+            ThreadEvent::ContinuationEnded => {
+                self.continuations_open = self.continuations_open.saturating_sub(1);
             }
             // Receipts about the host's own sends: nothing to show.
             ThreadEvent::UserMessageAccepted { .. }

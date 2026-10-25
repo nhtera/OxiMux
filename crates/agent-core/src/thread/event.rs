@@ -586,6 +586,15 @@ pub enum ThreadEvent {
     /// The CLI dropped the line sent under `uuid` without starting on it
     /// (`command_lifecycle` `cancelled`). A receipt, like the two above.
     UserMessageDropped { uuid: String },
+    /// The provider started a turn of its own accord (Claude's `system/init`).
+    /// Emitted for every one; the fold counts it as a continuation only when
+    /// no host turn is running ([`Self::ContinuationEnded`]). Host bookkeeping
+    /// like a receipt: kept out of the ring remote clients read.
+    ProviderTurnStarted,
+    /// A continuation turn ended: the provider woke itself for a finished
+    /// background task and is done reacting to it (a `result` marked
+    /// `origin.kind == "task-notification"`). Host bookkeeping.
+    ContinuationEnded,
 }
 
 impl ThreadEvent {
@@ -596,6 +605,13 @@ impl ThreadEvent {
             self,
             Self::UserMessageAccepted { .. } | Self::UserMessagesDelivered { .. } | Self::UserMessageDropped { .. }
         )
+    }
+
+    /// A provider turn bracket ([`Self::ProviderTurnStarted`],
+    /// [`Self::ContinuationEnded`]): it feeds the host's health, not the
+    /// transcript, and an older remote client could not decode it.
+    pub fn is_turn_bracket(&self) -> bool {
+        matches!(self, Self::ProviderTurnStarted | Self::ContinuationEnded)
     }
 
     /// Whether this event only extends content the transcript already shows — a

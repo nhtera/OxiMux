@@ -1,0 +1,20 @@
+{"type": "command_lifecycle", "command_uuid": "653c88eb-41f3-4e55-b4e6-5263bbe4d2ff", "state": "queued", "session_id": "sid-cont"}
+{"type": "command_lifecycle", "command_uuid": "653c88eb-41f3-4e55-b4e6-5263bbe4d2ff", "state": "started", "session_id": "sid-cont"}
+{"type": "system", "subtype": "init", "session_id": "sid-cont", "model": "claude-haiku-5-5", "claude_code_version": "2.1.310", "permissionMode": "default"}
+{"type": "system", "subtype": "task_started", "task_id": "a876d12ceccd52dc1", "session_id": "sid-cont", "task_type": "local_agent", "tool_use_id": "toolu_011WpPm4pteqrSq2voNZpQth", "subagent_type": "general-purpose"}
+{"type": "system", "subtype": "task_started", "task_id": "b45iyegec", "session_id": "sid-cont", "task_type": "local_bash", "tool_use_id": "toolu_0151rc6EvBYPNTSnZ8bi3nWe"}
+{"type": "system", "subtype": "task_started", "task_id": "bpg7kvtl4", "session_id": "sid-cont", "task_type": "local_bash", "tool_use_id": "toolu_017YJJW3VmB4w97CDmooYjnM"}
+{"type": "system", "subtype": "task_notification", "task_id": "bpg7kvtl4", "session_id": "sid-cont", "status": "completed", "tool_use_id": "toolu_017YJJW3VmB4w97CDmooYjnM"}
+{"type": "system", "subtype": "task_notification", "task_id": "a876d12ceccd52dc1", "session_id": "sid-cont", "status": "completed", "tool_use_id": "toolu_011WpPm4pteqrSq2voNZpQth"}
+{"type": "system", "subtype": "task_notification", "task_id": "b45iyegec", "session_id": "sid-cont", "status": "completed", "tool_use_id": "toolu_0151rc6EvBYPNTSnZ8bi3nWe"}
+{"type": "result", "subtype": "success", "is_error": false, "num_turns": 3, "session_id": "sid-cont", "usage": {"output_tokens": 611}, "user_message_uuids": ["653c88eb-41f3-4e55-b4e6-5263bbe4d2ff"], "result": "Both background jobs are started: the Bash `sleep 12 && echo"}
+{"type": "command_lifecycle", "command_uuid": "653c88eb-41f3-4e55-b4e6-5263bbe4d2ff", "state": "completed", "session_id": "sid-cont"}
+{"type": "system", "subtype": "init", "session_id": "sid-cont", "model": "claude-haiku-5-5", "claude_code_version": "2.1.310", "permissionMode": "default"}
+{"type": "result", "subtype": "success", "is_error": false, "num_turns": 0, "session_id": "sid-cont", "usage": {"output_tokens": 0}, "origin": {"kind": "task-notification"}, "result": ""}
+{"type": "system", "subtype": "init", "session_id": "sid-cont", "model": "claude-haiku-5-5", "claude_code_version": "2.1.310", "permissionMode": "default"}
+{"type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "session_id": "sid-cont", "usage": {"output_tokens": 80}, "origin": {"kind": "task-notification"}, "result": "Both background jobs finished:\n\n- **Bash** `sleep 12 && echo"}
+{"type": "command_lifecycle", "command_uuid": "73c3ef56-3b7a-46cd-a279-04e2d701b0a9", "state": "queued", "session_id": "sid-cont"}
+{"type": "command_lifecycle", "command_uuid": "73c3ef56-3b7a-46cd-a279-04e2d701b0a9", "state": "started", "session_id": "sid-cont"}
+{"type": "system", "subtype": "init", "session_id": "sid-cont", "model": "claude-haiku-5-5", "claude_code_version": "2.1.310", "permissionMode": "default"}
+{"type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "session_id": "sid-cont", "usage": {"output_tokens": 4}, "user_message_uuids": ["73c3ef56-3b7a-46cd-a279-04e2d701b0a9"], "result": "OK"}
+{"type": "command_lifecycle", "command_uuid": "73c3ef56-3b7a-46cd-a279-04e2d701b0a9", "state": "completed", "session_id": "sid-cont"}

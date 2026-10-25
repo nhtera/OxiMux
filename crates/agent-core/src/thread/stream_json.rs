@@ -187,7 +187,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn decode_system(v: &Value) -> Vec<ThreadEvent> {
     match v.get("subtype").and_then(Value::as_str) {
-        Some("init") => vec![ThreadEvent::SessionInit {
+        Some("init") => vec![ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit {
             session_id: str_field(v, "session_id"),
             model: str_field(v, "model"),
             permission_mode: str_field(v, "permissionMode"),
@@ -552,11 +552,12 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
     // marked `origin.kind == "task-notification"`. Those are NOT the user's turn
     // ending: honoring them would flip `turn_active` mid-flight and overwrite the
     // real turn's usage footer with a continuation's tiny total. Only the
-    // origin-less `result` (the user's own turn) ends the turn.
+    // origin-less `result` (the user's own turn) ends the turn; a continuation's
+    // closes the continuation the health fold is counting.
     if v.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str)
         == Some("task-notification")
     {
-        return Vec::new();
+        return vec![ThreadEvent::ContinuationEnded];
     }
     // Real error subtypes are `error_max_turns`, `error_during_execution`, …
     let is_error = v
@@ -754,7 +755,7 @@ mod tests {
         let l = json!({"type":"system","subtype":"init","session_id":"sid-1",
             "model":"claude-sonnet-5","permissionMode":"default","extra":"ignored",
             "slash_commands":["compact","research",42,"codex:rescue"]}).to_string();
-        assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
+        assert_eq!(decode_line(&l), vec![ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit {
             session_id: "sid-1".into(), model: "claude-sonnet-5".into(),
             permission_mode: "default".into(),
             slash_commands: vec!["compact".into(), "research".into(), "codex:rescue".into()],
@@ -773,7 +774,7 @@ mod tests {
                            {"status":"nameless — skipped"}],
             "agents":["code-reviewer","planner"]}).to_string();
         match &decode_line(&l)[..] {
-            [ThreadEvent::SessionInit { meta, .. }] => {
+            [ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit { meta, .. }] => {
                 assert_eq!(meta.cwd.as_deref(), Some("/repo"));
                 // Non-string entries are skipped, not fatal.
                 assert_eq!(meta.tools, vec!["Bash".to_string(), "Read".to_string()]);
@@ -794,7 +795,7 @@ mod tests {
         // Absent key → empty vec (older CLI / other backends), no panic.
         let l = json!({"type":"system","subtype":"init","session_id":"s",
             "model":"m","permissionMode":"default"}).to_string();
-        assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
+        assert_eq!(decode_line(&l), vec![ThreadEvent::ProviderTurnStarted, ThreadEvent::SessionInit {
             session_id: "s".into(), model: "m".into(),
             permission_mode: "default".into(), slash_commands: vec![],
             meta: SessionMeta::default() }]);
@@ -1473,7 +1474,11 @@ mod tests {
             "type":"result","subtype":"success","origin":{"kind":"task-notification"},
             "usage":{"output_tokens":30}
         }).to_string();
-        assert!(decode_line(&cont).is_empty(), "task-notification result must not end the turn");
+        assert_eq!(
+            decode_line(&cont),
+            vec![ThreadEvent::ContinuationEnded],
+            "a task-notification result closes a continuation, never the turn"
+        );
         // An origin-less result still ends the turn.
         let real = json!({"type":"result","subtype":"success","usage":{"output_tokens":381}}).to_string();
         assert!(matches!(decode_line(&real).as_slice(), [ThreadEvent::TurnEnded { .. }]));
@@ -1565,3 +1570,7 @@ mod tests {
 #[cfg(test)]
 #[path = "stream_json_receipt_tests.rs"]
 mod receipt_tests;
+
+#[cfg(test)]
+#[path = "stream_json_bracket_tests.rs"]
+mod bracket_tests;
