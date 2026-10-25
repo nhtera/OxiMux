@@ -286,8 +286,11 @@ fn decode_task_notification(v: &Value) -> Vec<ThreadEvent> {
 }
 
 /// Whether a task status string is terminal (completion or a failure/cancel).
+/// `stopped` is what an interrupt leaves (CLI 2.1.310); missing it left every
+/// task a Stop ended "running" for good.
 fn is_terminal_status(s: &str) -> bool {
-    matches!(s, "completed" | "failed" | "cancelled" | "canceled") || s.starts_with("error")
+    matches!(s, "completed" | "failed" | "cancelled" | "canceled" | "stopped" | "killed")
+        || s.starts_with("error")
 }
 
 fn decode_stream_event(v: &Value) -> Vec<ThreadEvent> {

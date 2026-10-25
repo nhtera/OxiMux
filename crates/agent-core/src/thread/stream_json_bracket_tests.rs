@@ -99,3 +99,21 @@ fn a_user_line_folded_into_a_continuation_ends_its_turn() {
         "the folded line is reported delivered"
     );
 }
+
+/// Captured on CLI 2.1.310: a foreground Bash call is a `local_bash` task,
+/// and an interrupt ends it with `status: "stopped"`. That must finish the
+/// task, or it reads running forever (and a saved chat claims a turn ran).
+#[test]
+fn an_interrupted_task_is_finished() {
+    let started = r#"{"type":"system","subtype":"task_started","task_id":"bda6ddvf9","task_type":"local_bash","session_id":"s"}"#;
+    let stopped = r#"{"type":"system","subtype":"task_notification","task_id":"bda6ddvf9","status":"stopped","session_id":"s"}"#;
+    let mut thread = ChatThread::new();
+    for ev in decode_line(started).into_iter().chain(decode_line(stopped)) {
+        thread.apply(&ev);
+    }
+    assert!(
+        thread.background_tasks.iter().all(|t| t.status != crate::thread::background_task::TaskStatus::Running),
+        "{:?}",
+        thread.background_tasks
+    );
+}
