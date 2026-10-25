@@ -22,5 +22,12 @@
 # `assemble` + `sync_composer` moved to `agent_chat/assemble.rs`, and the
 # composer's tests to `agent_chat/composer/tests.rs`. Raising the numbers was
 # considered and refused — this is what the rule above is for.
-apps/desktop/src/shell/agent_chat/mod.rs 5211
+#
+# Down again before the agent-orchestration work needs room in the view: the
+# sign-in banner and the auth card's interactive half moved verbatim to
+# `agent_chat/sign_in.rs`.
+# The registry glue then moved to `agent_chat/remote_link.rs` too; the
+# orchestration P1 view wiring (spawn posture, credentials, the respawn gate)
+# spent part of that headroom and the row came down to what was left.
+apps/desktop/src/shell/agent_chat/mod.rs 4501
 apps/desktop/src/shell/agent_chat/composer.rs 3523

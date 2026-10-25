@@ -164,6 +164,9 @@ fn restored_meta(tab: &PersistedTab, rank: usize) -> RestoredTabMeta {
         pinned: tab.pinned,
         color: tab.color.as_deref().and_then(TabColor::from_slug),
         custom_title: tab.custom_title.clone().map(SharedString::from),
+        // Only a spawned helper carries a tooltip; it keeps its `↳` label too.
+        label: tab.tooltip.as_ref().map(|_| SharedString::from(tab.label.clone())),
+        tooltip: tab.tooltip.clone().map(SharedString::from),
     }
 }
 
@@ -259,6 +262,8 @@ fn restore_chat_posture(
         pi: t.pi_posture.clone(),
         omp: t.omp_posture,
         claude_fast_mode: t.claude_fast_mode,
+        // Not persisted with the chat: `assemble` reads it from the lineage row.
+        spawn: Default::default(),
     }
 }
 
@@ -1692,6 +1697,24 @@ mod tests {
     use super::*;
     use crate::persisted_terminals::{PersistedLeafTab, PersistedSubPane};
     use std::path::Path;
+
+    /// Only a spawned helper's tab (it carries a tooltip) keeps its saved
+    /// label; any other tab is renumbered as before.
+    #[test]
+    fn a_helper_tab_keeps_its_label_and_tooltip() {
+        let helper = PersistedTab {
+            label: "↳ Chat 9".into(),
+            tooltip: Some("Spawned by Chat 8".into()),
+            ..PersistedTab::default()
+        };
+        let meta = restored_meta(&helper, 0);
+        assert_eq!(meta.label.as_deref(), Some("↳ Chat 9"));
+        assert_eq!(meta.tooltip.as_deref(), Some("Spawned by Chat 8"));
+
+        let plain = PersistedTab { label: "Chat 3".into(), ..PersistedTab::default() };
+        let meta = restored_meta(&plain, 0);
+        assert!(meta.label.is_none() && meta.tooltip.is_none());
+    }
 
     fn leaf_sub_pane(surface: &str, tab: &str) -> PersistedSubPane {
         PersistedSubPane {

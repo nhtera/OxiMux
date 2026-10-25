@@ -100,6 +100,39 @@ inline JSON). The agent is re-prompted with the validation errors up to twice;
 a still-invalid answer exits 1. It needs the turn, so it cannot be combined
 with `--bg`.
 
+## Starting helper agents
+
+From inside an agent, start a child with `delegate spawn`, not `run`: your
+credential reaches your own session and the agents you spawn, nothing else.
+
+```sh
+oximux whoami                                  # may you spawn, at what depth, which agents
+oximux delegate spawn --agent claude-code "review crates/agents for unwrap()s"
+oximux delegate spawn --agent codex --posture review --cwd worktree:review "…"
+oximux delegate children                       # your children and where each stands
+oximux delegate cancel <child> --cascade       # end one (and everything it spawned)
+```
+
+The host caps the tree (depth 1 by default, so a child cannot spawn its own;
+a few working children per parent; a lifetime budget). A refusal exits 1 or 5
+and says what to do instead — usually "wait on a child, cancel one, or do it
+yourself". `--request-id` makes a retry return the same child. A `review`
+child only reads; `verify` may build and test; neither prompts. A Claude
+verifier has no edit tools and may run the commands listed in Settings ›
+Agents › Agent delegation (builds and tests by default) plus whatever your own
+Claude settings allow; a rule matches a command's start, so the tool's own
+flags are the agent's choice. A Codex
+one can edit inside the workspace (its
+sandbox allows builds only that way), so give it `--cwd worktree:…` when your
+tree must stay as it is. `verify` trusts the repository: its test runner is the
+project's own code, which no posture inspects. If `spawn` reports the prompt was not delivered,
+send it with `oximux send <child> "…"` or cancel the child.
+
+A Claude, Codex or ACP chat also has these as tools (`oximux_spawn_agent`,
+`oximux_wait_agents`, …), and a child's events reach its parent on their own
+when it finishes or gets stuck. See `oximux-team` › "Delegating from inside an
+agent" for how to wait and what the events look like.
+
 ## Watching it finish
 
 ```sh
@@ -166,8 +199,9 @@ was allowed and runs your arguments instead of its own. It replaces the input
 rather than merging into it, so pass every field the tool needs.
 
 To redirect a running agent, `oximux steer S "check the null case first"`. It
-needs a backend with a mid-turn message queue; claude and codex have none and
-refuse it. There, use `oximux stop S` and then `oximux send S "…"`.
+needs a backend with a mid-turn message queue (pi, omp, claude 2.1.310 or
+later); codex and ACP agents refuse it. There, use `oximux stop S` and then
+`oximux send S "…"`.
 
 ## Worktrees
 

@@ -83,6 +83,18 @@ impl RpcClient {
         let mut child = cmd.spawn().context("spawn codex app-server")?;
         let stdout = child.stdout.take().context("codex stdout missing")?;
         let stdin = child.stdin.take().context("codex stdin missing")?;
+        // Read stderr to the end, always. An unread pipe fills its ~64 KiB OS
+        // buffer and then blocks codex mid-write: with `RUST_LOG` set in the
+        // environment it logs enough to stall the handshake, and `thread/start`
+        // simply never answers. Kept at debug level for diagnosis.
+        if let Some(stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    tracing::debug!(target: "codex_stderr", "{line}");
+                }
+            });
+        }
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::channel();
@@ -282,6 +294,24 @@ sleep 0.2
             }
             other => panic!("expected a notification, got {}", other.is_ok()),
         }
+    }
+
+    /// A chatty app-server (codex with `RUST_LOG` set) writes far more to
+    /// stderr than a pipe holds. Unread, it blocks mid-write and never answers;
+    /// drained, the reply arrives.
+    #[test]
+    fn a_chatty_stderr_never_blocks_the_reply() {
+        let script = r#"
+read line
+head -c 1048576 /dev/zero | tr '\0' 'x' >&2
+printf '{"id":1,"result":{"ok":true}}\n'
+sleep 0.2
+"#;
+        let mut cmd = crate::thread::sh_fixture::sh_command();
+        cmd.arg("-c").arg(script);
+        let (rpc, _inbound, _child) = RpcClient::spawn_command(cmd).expect("spawn fake");
+        let res = rpc.request("initialize", json!({}), Duration::from_secs(10)).expect("a reply despite 1 MiB of stderr");
+        assert_eq!(res["ok"], true);
     }
 
     #[test]

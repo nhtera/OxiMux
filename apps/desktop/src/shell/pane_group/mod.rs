@@ -21,6 +21,7 @@ mod daemon_loss_tests;
 mod history_tests;
 mod actions;
 mod agent_restore;
+mod child_tabs;
 mod kill_all;
 mod state;
 mod tabs;
@@ -233,6 +234,9 @@ pub struct PaneGroupTab {
     /// in `bump_mru`); `0` = never focused this run. Drives the palette's
     /// recent-tabs order. Runtime-only.
     pub last_focused_ms: i64,
+    /// Hover text for the chip (a spawned child's "Spawned by …").
+    /// Runtime-only.
+    pub tooltip: Option<SharedString>,
     pub _observer: Option<Subscription>,
     pub _status_task: Option<Task<()>>,
 }
@@ -256,6 +260,7 @@ impl PaneGroupTab {
             restore_rank: None,
             uid: NEXT_TAB_UID.fetch_add(1, Ordering::Relaxed),
             last_focused_ms: 0,
+            tooltip: None,
             _observer: None,
             _status_task: None,
         }
@@ -273,6 +278,10 @@ pub struct RestoredTabMeta {
     pub pinned: bool,
     pub color: Option<TabColor>,
     pub custom_title: Option<SharedString>,
+    /// A spawned helper's saved `↳ …` label and its tooltip, kept over the
+    /// default label a restored tab is given.
+    pub label: Option<SharedString>,
+    pub tooltip: Option<SharedString>,
 }
 
 /// On-disk fate of an open editor file as detected by the file-tree watcher.

@@ -86,5 +86,7 @@ fn launch_error_detail(err: &LaunchError) -> &'static str {
         LaunchError::Unavailable => "the host could not start a session right now",
         // Unreachable: a schedule names no model, so it never asks for one.
         LaunchError::ModelUnsupported => "this agent cannot be given a model when it starts",
+        // Unreachable too: a schedule launches with no posture.
+        LaunchError::PostureUnenforceable(_) => "this agent cannot be held to that posture",
     }
 }

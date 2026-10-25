@@ -125,6 +125,17 @@ pub fn start_time_of_pid(pid: u32) -> Option<u64> {
     imp::start_time_of_pid(pid)
 }
 
+/// When this machine last booted, in whole seconds since the Unix epoch, or
+/// `None` when the platform cannot tell.
+///
+/// Two readings in the same boot agree to within a few seconds (exactly on
+/// macOS and Linux; Windows derives it from the uptime counter, so allow for
+/// jitter). A different value means the machine rebooted in between, so a
+/// process recorded before it is gone whatever its pid now names.
+pub fn boot_time_of_system() -> Option<u64> {
+    imp::boot_time_of_system()
+}
+
 /// The parent of `pid`, or `None` when the process is gone, unreadable, or
 /// the platform cannot tell.
 pub fn parent_of_pid(pid: u32) -> Option<u32> {
@@ -154,6 +165,19 @@ mod tests {
 
     /// A child spawned just now reports a start time of just now — the
     /// property identity checks lean on to tell a recycled pid apart.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn boot_time_is_in_the_past_and_stable() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let first = boot_time_of_system().expect("boot time on a supported platform");
+        assert!(first < now, "booted {first}, now {now}");
+        let second = boot_time_of_system().unwrap();
+        assert!(first.abs_diff(second) <= 2, "two readings {first} vs {second}");
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn start_time_of_a_fresh_child_is_now() {

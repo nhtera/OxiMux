@@ -24,6 +24,12 @@
 
 set -u
 
+# The real CLI answers `--version` and exits; the host asks once per binary.
+if [ "${1:-}" = "--version" ]; then
+    echo "2.1.310 (Claude Code)"
+    exit 0
+fi
+
 report="${OXIMUX_FAKE_AGENT_REPORT:-}"
 cli="${OXIMUX_FAKE_AGENT_CLI:-}"
 dir="${OXIMUX_FAKE_AGENT_DIR:-}"

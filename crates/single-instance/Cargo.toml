@@ -16,6 +16,9 @@ rust-version.workspace = true
 
 [dependencies]
 fd-lock = "4"
+# Process start time + boot time, so a recorded holder can be told apart from
+# a recycled pid and a crash from a reboot.
+oximux-proc-tree = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

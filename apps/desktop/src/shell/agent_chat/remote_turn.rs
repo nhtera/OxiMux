@@ -1,4 +1,5 @@
-//! Turns that were started from a paired phone rather than from this desk.
+//! Turns that were started from a paired phone rather than from this desk,
+//! and the relay that also wakes the chat's send gate.
 //!
 //! Two things happen when a prompt arrives over the remote RPC. The obvious one
 //! is cosmetic: the desktop shows the user's own bubble, because no backend
@@ -33,20 +34,24 @@ impl AgentChatView {
     pub(super) fn spawn_remote_prompt_relay(
         rx: futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
         events_rx: futures::channel::mpsc::UnboundedReceiver<ThreadEvent>,
+        wake_rx: futures::channel::mpsc::UnboundedReceiver<()>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         enum Relayed {
             Prompt(RemotePrompt),
             Event(ThreadEvent),
+            /// The send gate has something that may go now.
+            Wake,
         }
         let mut merged = futures::stream::select(
-            rx.map(Relayed::Prompt),
-            events_rx.map(Relayed::Event),
+            futures::stream::select(rx.map(Relayed::Prompt), events_rx.map(Relayed::Event)),
+            wake_rx.map(|()| Relayed::Wake),
         );
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
             while let Some(item) = merged.next().await {
                 let folded = this.update(cx, |view, cx| match item {
                     Relayed::Prompt(prompt) => view.push_remote_user_bubble(prompt, cx),
+                    Relayed::Wake => view.flush_send_gate(cx),
                     Relayed::Event(event) => {
                         // Through the fold's own apply — the registry already
                         // ingested it for remote subscribers; this is the copy

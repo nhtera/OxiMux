@@ -192,12 +192,50 @@ impl Dispatcher {
             }
         }
 
-        teams.create(&req.name, &req.cwd, &roles, self.now_local()).map_err(|e| {
+        let run = teams.create(&req.name, &req.cwd, &roles, self.now_local()).map_err(|e| {
             // The store error can name the database path; log it, return
             // the category.
             tracing::warn!(error = %e, "recording a team run failed");
             RpcError::Internal("could not record the run".into())
-        })
+        })?;
+        self.stamp_run_lineage(&run);
+        Ok(run)
+    }
+
+    /// Record the run's roles in the spawn lineage under the synthetic parent
+    /// `team:<run>` (depth 1), so a role's own helpers draw on the run's
+    /// budget and `CancelAgent team:<run>` reaches the whole run. After the
+    /// launch, not before: the run's id exists only once it is recorded, and a
+    /// run's eight roles cannot reach the run lane's ceiling anyway.
+    fn stamp_run_lineage(&self, run: &TeamRun) {
+        use oximux_agents::lineage::{NotifyParent, Reservation, SpawnOrigin, SpawnParent, SpawnSpec};
+        let Some(core) = self.host_core.as_ref().filter(|core| core.is_owner()) else {
+            return;
+        };
+        let parent = SpawnParent::Run(format!("team:{}", run.id));
+        for role in &run.roles {
+            let Some(session_id) = role.session_id.as_deref() else { continue };
+            let spec = SpawnSpec {
+                request_id: role.name.clone(),
+                origin: SpawnOrigin::Team,
+                posture: Default::default(),
+                notify_parent: NotifyParent::Off,
+                allow_parent_permits: false,
+                preassigned_id: Some(session_id.to_string()),
+                fingerprint_input: role.name.clone(),
+            };
+            let now = self.now_local();
+            match core.lineage().reserve(&parent, &spec, core.config().caps, &core.working(), now) {
+                Ok(Ok(Reservation::Fresh { row_id, .. })) => {
+                    if let Err(err) = core.lineage().finalize(row_id, session_id, now) {
+                        tracing::warn!(%err, role = %role.name, "team role lineage not recorded");
+                    }
+                }
+                Ok(Ok(Reservation::Replayed(_))) => {}
+                Ok(Err(refusal)) => tracing::warn!(%refusal, role = %role.name, "team role lineage refused"),
+                Err(err) => tracing::warn!(%err, role = %role.name, "team role lineage not recorded"),
+            }
+        }
     }
 
     /// Give a freshly launched session its opening instruction.
@@ -376,13 +414,16 @@ fn launch_detail(err: &crate::launcher::LaunchError) -> &'static str {
             "this agent cannot be given a model when it starts; drop --role-model \
              for this role, or give it an agent that takes one"
         }
+        crate::launcher::LaunchError::PostureUnenforceable(_) => {
+            "this agent cannot be held to the posture asked for"
+        }
     }
 }
 
 /// Lowercase, hyphen-joined, alphanumerics only — the same shape a worktree
 /// slug takes elsewhere, so a role's directory name is predictable and safe to
 /// put in a path.
-fn slugify(text: &str) -> String {
+pub(super) fn slugify(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending_dash = false;
     for ch in text.chars() {

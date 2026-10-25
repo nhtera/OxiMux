@@ -347,12 +347,12 @@ fn gate_binary() -> Option<PathBuf> {
 /// mechanism, and the others have no equivalent — so there is nowhere to put the
 /// policy, and a capability declared with nothing enforcing it is worse than the
 /// capability being absent.
-fn declare(spec: &mut ConnectSpec, chat: &ScreenControl, cx: &App) {
+fn declare(spec: &mut ConnectSpec, chat: &ScreenControl, cx: &App) -> anyhow::Result<()> {
     let (Some(gate), Ok(host)) = (gate_binary(), std::env::current_exe()) else {
         tracing::warn!(
             "screen-control gate binary not found beside the app; chats will run without it"
         );
-        return;
+        return Ok(());
     };
     let grants = grants_path();
 
@@ -381,12 +381,33 @@ fn declare(spec: &mut ConnectSpec, chat: &ScreenControl, cx: &App) {
             }
         },
     ) else {
-        return;
+        return Ok(());
     };
 
-    spec.mcp_servers = declaration.server.into_iter().collect();
-    spec.disallowed_tools = declaration.disallowed_tools;
-    spec.settings_json = Some(declaration.hook_settings);
+    apply_declaration(spec, declaration)
+}
+
+/// Lay a computer-use declaration onto `spec`. Merged, never assigned: fast
+/// mode, the orchestration MCP, a spawn posture and the host credential write
+/// the same spec, and an assignment here used to erase them.
+///
+/// A posture-locked child (a reviewer, a verifier) never gets the screen:
+/// `--tools` does not reach MCP tools, so the server itself is withheld. The
+/// hook and the stripped tools only restrict (the hook is what stops a shell
+/// driving the screen through `osascript`), so they stay.
+fn apply_declaration(
+    spec: &mut ConnectSpec,
+    declaration: oximux_computer_use::mcp::Declaration,
+) -> anyhow::Result<()> {
+    if spec.posture == oximux_agents::thread::launch_posture::SpawnPosture::Default
+        && let Some(server) = declaration.server
+    {
+        spec.add_mcp_server(server)?;
+    }
+    spec.add_disallowed_tools(declaration.disallowed_tools);
+    let hooks: serde_json::Value = serde_json::from_str(&declaration.hook_settings)?;
+    spec.merge_settings(&hooks)?;
+    Ok(())
 }
 
 /// Open `spec`'s connection with this chat's screen-control policy attached.
@@ -405,7 +426,7 @@ pub fn connect_declaring(
     chat: &ScreenControl,
     cx: &App,
 ) -> anyhow::Result<(Arc<dyn AgentConnection>, Receiver<ThreadEvent>)> {
-    declare(&mut spec, chat, cx);
+    declare(&mut spec, chat, cx)?;
     oximux_agents::thread::connect(spec)
 }
 
@@ -1434,3 +1455,7 @@ mod enablement_tests {
         assert!(!cx.update(|cx| enabled_here(&project, cx)));
     }
 }
+
+#[cfg(test)]
+#[path = "computer_use_merge_tests.rs"]
+mod merge_tests;

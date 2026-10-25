@@ -15,11 +15,14 @@
 pub(crate) mod agent_binary;
 pub mod acp;
 pub mod claude_catalog;
+mod claude_control;
 pub mod claude_stream_json;
 pub mod codex;
 pub mod codex_session_import;
 pub mod connect;
 pub mod connection;
+pub mod launch_posture;
+pub mod spec_merge;
 pub mod ndjson_transport;
 pub mod omp;
 pub mod pi;

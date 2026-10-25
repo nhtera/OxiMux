@@ -145,6 +145,8 @@ pub(super) fn render(
 
     let search_section =
         super::pane_agents_session_search::render_section(modal, theme, density, typography, cx);
+    let delegation_section =
+        super::pane_agents_delegation::render_section(modal, theme, density, typography, cx);
 
     div()
         .flex()
@@ -155,6 +157,7 @@ pub(super) fn render(
         .child(ai_section)
         .child(launch_section)
         .child(env_section)
+        .child(delegation_section)
         .child(search_section)
         .into_any_element()
 }
@@ -188,6 +191,7 @@ pub(super) fn entries(
         modal, theme, density, typography, cx,
     ));
     all.extend(super::pane_agents_session_search::entries(modal, theme, density, typography, cx));
+    all.extend(super::pane_agents_delegation::entries(modal, theme, density, typography, cx));
     all
 }
 

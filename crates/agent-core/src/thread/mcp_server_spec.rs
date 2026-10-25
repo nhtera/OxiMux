@@ -93,9 +93,47 @@ pub fn to_claude_mcp_config(specs: &[McpServerSpec]) -> Option<String> {
     Some(json!({ "mcpServers": Value::Object(servers) }).to_string())
 }
 
+/// Render `specs` as the `config` overrides Codex's app-server takes on
+/// `thread/start` and `thread/resume`: one dotted key per server
+/// (`mcp_servers.<name>`), the shape of its `-c` overrides, so the user's own
+/// servers stay whether Codex merges or replaces at a key (codex-cli 0.164
+/// merges both forms). `None` for an empty slice, so a launch that declares
+/// nothing sends no `config` at all.
+///
+/// Codex starts stdio servers with a short allow-list of environment
+/// variables, so nothing a server needs may ride in the inherited environment
+/// (checked against codex-cli 0.164: an inherited variable did not arrive).
+pub fn to_codex_mcp_config(specs: &[McpServerSpec]) -> Option<Value> {
+    if specs.is_empty() {
+        return None;
+    }
+    let servers: Map<String, Value> = specs
+        .iter()
+        .map(|s| {
+            let mut entry = json!({ "command": s.command, "args": s.args });
+            if !s.env.is_empty() {
+                let env: Map<String, Value> = s.env.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+                entry["env"] = Value::Object(env);
+            }
+            (format!("mcp_servers.{}", s.name), entry)
+        })
+        .collect();
+    Some(Value::Object(servers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_gets_its_own_table_shape_and_nothing_when_empty() {
+        assert_eq!(to_codex_mcp_config(&[]), None);
+        let spec = McpServerSpec::new("oximux", "/bin/oximux").args(vec!["mcp".into(), "--tools".into(), "orchestrate".into()]);
+        assert_eq!(
+            to_codex_mcp_config(&[spec]),
+            Some(json!({ "mcp_servers.oximux": { "command": "/bin/oximux", "args": ["mcp", "--tools", "orchestrate"] } }))
+        );
+    }
 
     #[test]
     fn empty_specs_render_no_config() {

@@ -503,6 +503,15 @@ fn main() {
             // A clone of the same queue for the scheduler's firer below — one
             // GPUI drain loop serves phone launches and scheduled fires alike.
             let for_scheduler = launcher.clone();
+            // What `oximux whoami` lists and a spawn is checked against,
+            // refreshed whenever the launch settings change.
+            let roster = launcher.clone();
+            let seed = cx.try_global::<oximux_settings::AgentLaunchSettings>().cloned().unwrap_or_default();
+            roster.set_roster(oximux_app::remote_control::launch_bridge::roster_from(&seed));
+            cx.observe_global::<oximux_settings::AgentLaunchSettings>(move |cx| {
+                roster.set_roster(oximux_app::remote_control::launch_bridge::roster_from(cx.global()));
+            })
+            .detach();
             remote_control.set_launcher(std::sync::Arc::new(launcher));
             oximux_app::remote_control::launch_bridge::serve_launches(requests, cx);
             for_scheduler
@@ -541,6 +550,20 @@ fn main() {
             std::sync::Arc::new(app_state.team_store()),
             std::sync::Arc::new(app_state.coord_store()),
         );
+        // The host core (spawn lineage, host config): built once, always on,
+        // on the process runtime `_rt_guard` keeps entered for the app's life.
+        // Handed the handle explicitly, so its background work never depends on
+        // which thread later calls into it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                // The same settings keys `oximux serve` reads, from the shared
+                // database, so both hosts enforce the same caps.
+                let settings = app_state.settings_repo();
+                let config = oximux_remote_host::HostConfig::load(|key| settings.get(key).ok().flatten());
+                remote_control.install_host_core(rt, app_state.lineage_store(), config);
+            }
+            Err(_) => tracing::warn!("no tokio runtime; agent orchestration host core not started"),
+        }
         // The scheduled-run ticker. Installed unconditionally when this process
         // wins the data dir's ticker lock: with no schedules it costs one
         // indexed read every tick and takes no keep-awake hold, and gating it

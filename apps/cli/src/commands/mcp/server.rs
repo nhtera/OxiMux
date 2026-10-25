@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::{Ctx, tools};
+use super::{Ctx, orchestrate, tools};
 
 /// The MCP revisions this server speaks, newest first. A client asking for
 /// another gets the newest (the spec's negotiation).
@@ -84,9 +84,18 @@ fn handle(message: Value, ctx: &Arc<Ctx>, out: &mpsc::UnboundedSender<Value>, ca
         return;
     };
     let reply = match method.as_str() {
-        "initialize" => initialize(&params),
+        "initialize" => initialize(&params, ctx),
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": tools::list() }),
+        "tools/list" => {
+            // The delegation tools depend on what the host says the caller may
+            // do right now, which takes a round trip: answered from a task.
+            let (ctx, out) = (ctx.clone(), out.clone());
+            tokio::spawn(async move {
+                let tools = list(&ctx).await;
+                let _ = out.send(json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } }));
+            });
+            return;
+        }
         "tools/call" => {
             let (ctx, out, key, calls_for_task) = (ctx.clone(), out.clone(), id.to_string(), calls.clone());
             let name = params.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -100,7 +109,7 @@ fn handle(message: Value, ctx: &Arc<Ctx>, out: &mpsc::UnboundedSender<Value>, ca
             running.insert(
                 key,
                 tokio::spawn(async move {
-                    let result = tools::call(&ctx, &name, args).await;
+                    let result = call(&ctx, &name, args).await;
                     calls_for_task.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&task_key);
                     let _ = out.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
                 }),
@@ -115,14 +124,45 @@ fn handle(message: Value, ctx: &Arc<Ctx>, out: &mpsc::UnboundedSender<Value>, ca
     let _ = out.send(json!({ "jsonrpc": "2.0", "id": id, "result": reply }));
 }
 
-fn initialize(params: &Value) -> Value {
+/// Every tool this server offers right now.
+async fn list(ctx: &Ctx) -> Value {
+    let mut all = Vec::new();
+    if ctx.sim()
+        && let Value::Array(sim) = tools::list()
+    {
+        all.extend(sim);
+    }
+    if ctx.orchestrate {
+        all.extend(orchestrate::list(ctx).await);
+    }
+    Value::Array(all)
+}
+
+/// Route a call to its tool set. A tool from a set this server does not
+/// serve does not exist.
+async fn call(ctx: &Ctx, name: &str, args: Value) -> Value {
+    if ctx.orchestrate && name.starts_with(orchestrate::PREFIX) {
+        return orchestrate::call(ctx, name, args).await;
+    }
+    if ctx.sim() && name.starts_with("sim_") {
+        return tools::call(ctx, name, args).await;
+    }
+    json!({ "content": [tools::text_item(&format!("no tool `{name}`"))], "isError": true })
+}
+
+fn initialize(params: &Value, ctx: &Ctx) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str);
     let version = asked.filter(|v| PROTOCOL_VERSIONS.contains(v)).unwrap_or(PROTOCOL_VERSIONS[0]);
+    let instructions = [ctx.sim().then_some(INSTRUCTIONS), ctx.orchestrate.then_some(orchestrate::INSTRUCTIONS)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "oximux", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions,
     })
 }
 
@@ -134,10 +174,48 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 mod tests {
     use super::*;
 
+    fn ctx(sim: bool, orchestrate: bool) -> Ctx {
+        Ctx {
+            dir: None,
+            worktree: sim.then(|| "/tmp/repo".into()),
+            orchestrate,
+            credential_file: None,
+            default_agent: None,
+        }
+    }
+
     #[test]
     fn the_protocol_version_is_negotiated() {
-        assert_eq!(initialize(&json!({ "protocolVersion": "2025-06-18" }))["protocolVersion"], "2025-06-18");
-        assert_eq!(initialize(&json!({ "protocolVersion": "1999-01-01" }))["protocolVersion"], PROTOCOL_VERSIONS[0]);
-        assert_eq!(initialize(&json!({}))["capabilities"], json!({ "tools": {} }));
+        let sim = ctx(true, false);
+        assert_eq!(initialize(&json!({ "protocolVersion": "2025-06-18" }), &sim)["protocolVersion"], "2025-06-18");
+        assert_eq!(initialize(&json!({ "protocolVersion": "1999-01-01" }), &sim)["protocolVersion"], PROTOCOL_VERSIONS[0]);
+        assert_eq!(initialize(&json!({}), &sim)["capabilities"], json!({ "tools": {} }));
+    }
+
+    #[test]
+    fn the_instructions_describe_only_the_sets_served() {
+        let text = |c: Ctx| initialize(&json!({}), &c)["instructions"].as_str().unwrap().to_string();
+        assert_eq!(text(ctx(true, false)), INSTRUCTIONS);
+        assert_eq!(text(ctx(false, true)), orchestrate::INSTRUCTIONS);
+        assert!(text(ctx(true, true)).contains(orchestrate::INSTRUCTIONS));
+    }
+
+    /// An outside client (the `sim` set alone) is never offered a delegation
+    /// tool, and cannot call one by name.
+    #[tokio::test]
+    async fn the_sim_set_alone_has_no_delegation_tools() {
+        let sim = ctx(true, false);
+        let names: Vec<String> = list(&sim)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!names.is_empty());
+        assert!(names.iter().all(|n| n.starts_with("sim_")), "{names:?}");
+        let refused = call(&sim, "oximux_spawn_agent", json!({})).await;
+        assert_eq!(refused["isError"], true);
+        assert!(refused["content"][0]["text"].as_str().unwrap().contains("no tool"));
     }
 }

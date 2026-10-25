@@ -16,6 +16,7 @@ use super::codex::CodexAppServerConnection;
 use super::connection::{AgentConnection, ModelChoice};
 use super::event::ThreadEvent;
 use super::mcp_server_spec::McpServerSpec;
+use super::launch_posture::{self, SpawnPosture};
 use super::omp::posture::OmpPosture;
 use super::omp::OmpRpcConnection;
 use super::pi::posture::PiPosture;
@@ -190,6 +191,14 @@ pub struct ConnectSpec {
     /// setting — the value for every launch that never touched the toggle, and
     /// for a model whose catalog row does not support it.
     pub claude_fast_mode: Option<bool>,
+    /// What the agent may do, fixed at spawn (see [`super::launch_posture`]).
+    /// Applied in [`connect`] on every launch, so a respawn can never widen it;
+    /// an adapter that cannot hold it fails the launch.
+    pub posture: SpawnPosture,
+    /// The command allow-list a `Verify` posture runs under (Claude
+    /// `permissions.allow` rules such as `Bash(cargo test:*)`). Ignored for
+    /// every other posture.
+    pub posture_allow: Vec<String>,
 }
 
 impl ConnectSpec {
@@ -233,6 +242,8 @@ impl ConnectSpec {
             disallowed_tools: Vec::new(),
             fresh_session_id: None,
             claude_fast_mode: None,
+            posture: SpawnPosture::Default,
+            posture_allow: Vec::new(),
         }
     }
 }
@@ -241,7 +252,12 @@ impl ConnectSpec {
 /// and the `ThreadEvent` receiver the app drains. Semantics of the StreamJson
 /// arm are identical to constructing `ClaudeStreamJsonConnection::spawn_resumed`
 /// directly (the app's prior call).
-pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<ThreadEvent>)> {
+pub fn connect(mut spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<ThreadEvent>)> {
+    // Every launch passes here, the first and each respawn alike, so this is
+    // where a spawn posture is held. A failure is the launch's failure.
+    let claude_posture = launch_posture::apply(&mut spec, || {
+        super::agent_binary::cli_version(&crate::cli::program_for_spawn("claude"))
+    })?;
     match spec.transport {
         Transport::StreamJson => {
             // Fast mode rides the one inline `--settings`, merged over whatever
@@ -265,10 +281,12 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                     settings: settings.as_deref(),
                     disallowed_tools: &spec.disallowed_tools,
                     fresh_session_id: spec.fresh_session_id.as_deref(),
+                    posture: claude_posture.as_ref(),
                 },
                 &spec.env,
             )?;
             conn.seed_fast_mode(spec.claude_fast_mode.unwrap_or(false));
+            conn.probe_steer_support();
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::AppServer => {
@@ -283,7 +301,11 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                 spec.effort.as_deref(),
                 posture,
                 &spec.env,
+                &spec.mcp_servers,
             )?;
+            if spec.posture != SpawnPosture::Default {
+                conn.lock_posture();
+            }
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::Acp => {
@@ -435,6 +457,8 @@ mod tests {
             disallowed_tools: vec![],
             fresh_session_id: None,
             claude_fast_mode: None,
+            posture: SpawnPosture::Default,
+            posture_allow: Vec::new(),
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -472,6 +496,8 @@ mod tests {
             disallowed_tools: vec![],
             fresh_session_id: None,
             claude_fast_mode: None,
+            posture: SpawnPosture::Default,
+            posture_allow: Vec::new(),
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

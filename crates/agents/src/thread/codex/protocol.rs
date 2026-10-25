@@ -81,7 +81,7 @@ pub fn initialize_params() -> Value {
 /// sandbox mode; the composer's Approvals/Sandbox selects, defaulting to
 /// on-request/workspace-write). `model` is omitted when `None` (Codex picks its
 /// configured default).
-pub fn thread_start_params(model: Option<&str>, cwd: &Path, posture: Posture) -> Value {
+pub fn thread_start_params(model: Option<&str>, cwd: &Path, posture: Posture, config: Option<&Value>) -> Value {
     let mut p = json!({
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": posture.approval_policy,
@@ -90,12 +90,15 @@ pub fn thread_start_params(model: Option<&str>, cwd: &Path, posture: Posture) ->
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
         p["model"] = json!(m);
     }
+    if let Some(config) = config {
+        p["config"] = config.clone();
+    }
     p
 }
 
 /// `thread/resume` params — reconnect an existing thread by id under `posture`,
 /// optionally overriding the model.
-pub fn thread_resume_params(thread_id: &str, model: Option<&str>, posture: Posture) -> Value {
+pub fn thread_resume_params(thread_id: &str, model: Option<&str>, posture: Posture, config: Option<&Value>) -> Value {
     let mut p = json!({
         "threadId": thread_id,
         "approvalPolicy": posture.approval_policy,
@@ -103,6 +106,9 @@ pub fn thread_resume_params(thread_id: &str, model: Option<&str>, posture: Postu
     });
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
         p["model"] = json!(m);
+    }
+    if let Some(config) = config {
+        p["config"] = config.clone();
     }
     p
 }
@@ -383,20 +389,33 @@ mod tests {
 
     #[test]
     fn thread_start_omits_blank_model_and_sets_posture() {
-        let p = thread_start_params(None, &PathBuf::from("/tmp/x"), Posture::default());
+        let p = thread_start_params(None, &PathBuf::from("/tmp/x"), Posture::default(), None);
         assert_eq!(p["approvalPolicy"], "on-request");
         assert_eq!(p["sandbox"], "workspace-write");
         assert!(p.get("model").is_none());
-        let p2 = thread_start_params(Some("gpt-5.5"), &PathBuf::from("/tmp/x"), Posture::default());
+        let p2 = thread_start_params(Some("gpt-5.5"), &PathBuf::from("/tmp/x"), Posture::default(), None);
         assert_eq!(p2["model"], "gpt-5.5");
         // A chosen posture flows through.
         let p3 = thread_start_params(
             None,
             &PathBuf::from("/tmp/x"),
             Posture { approval_policy: APPROVAL_NEVER, sandbox: SANDBOX_READ_ONLY },
+            None,
         );
         assert_eq!(p3["approvalPolicy"], "never");
         assert_eq!(p3["sandbox"], "read-only");
+        assert!(p3.get("config").is_none(), "no host servers, no config");
+    }
+
+    /// The host's MCP servers ride `config` on both start and resume (codex
+    /// starts them per thread; checked against codex-cli 0.164).
+    #[test]
+    fn host_mcp_servers_ride_the_thread_config() {
+        let config = json!({ "mcp_servers": { "oximux": { "command": "/bin/oximux", "args": ["mcp"] } } });
+        let start = thread_start_params(None, &PathBuf::from("/tmp/x"), Posture::default(), Some(&config));
+        assert_eq!(start["config"], config);
+        let resume = thread_resume_params("th_1", None, Posture::default(), Some(&config));
+        assert_eq!(resume["config"], config);
     }
 
     #[test]

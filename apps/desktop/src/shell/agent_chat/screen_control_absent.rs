@@ -187,7 +187,14 @@ pub(super) mod computer_use {
             declaration.server.is_none() && declaration.disallowed_tools.is_empty(),
             "the absent path must never declare a driver"
         );
-        spec.settings_json = Some(declaration.hook_settings);
+        // Merged, never assigned: fast mode, a spawn posture's allow rules and
+        // the orchestration MCP write the same inline settings.
+        let merged = serde_json::from_str::<serde_json::Value>(&declaration.hook_settings)
+            .map_err(|e| e.to_string())
+            .and_then(|hooks| spec.merge_settings(&hooks).map_err(|e| e.to_string()));
+        if let Err(err) = merged {
+            tracing::warn!(%err, "screen-control gate hook could not be declared");
+        }
     }
 
     /// The gate binary, which ships beside the app executable.

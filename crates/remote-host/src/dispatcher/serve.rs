@@ -429,6 +429,15 @@ impl Dispatcher {
             let response = self.list_projects(&peer).await;
             return self.send(transport, response).await;
         }
+        // Spawning launches a child (and may create its worktree), so it is
+        // awaited here like the other launches.
+        if let Request::SpawnAgent(spawn) = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.spawn_agent(&peer, spawn).await;
+            return self.send(transport, response).await;
+        }
         // Opening a folder hops onto the desktop's UI thread, so it is awaited
         // here beside listing projects.
         if let Request::OpenProject { path } = req {

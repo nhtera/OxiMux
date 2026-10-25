@@ -43,6 +43,23 @@ pub enum LaunchError {
     /// contradicts is the one outcome worth refusing a launch over.
     #[error("this agent cannot be given a model when it starts")]
     ModelUnsupported,
+    /// The launcher cannot hold the child to the posture it was asked for (a
+    /// reviewer that could write). The launch is refused, never downgraded.
+    #[error("this agent cannot be held to that posture: {0}")]
+    PostureUnenforceable(String),
+}
+
+/// How a child agent is launched, beyond what [`SessionLauncher::create`]
+/// takes. GPUI-free: no window or pane handle crosses it; a desktop launcher
+/// resolves the parent's window and pane group from `parent_session_id`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildCtx {
+    /// The session that spawned it, so the child opens beside its parent.
+    pub parent_session_id: Option<String>,
+    /// Bring the child to the front. Spawned children never steal focus.
+    pub activate: bool,
+    /// What the child may do, fixed for its life.
+    pub posture: oximux_agents::thread::launch_posture::SpawnPosture,
 }
 
 /// Starting a new agent session on the desktop.
@@ -89,4 +106,30 @@ pub trait SessionLauncher: Send + Sync {
         agent_id: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, LaunchError>;
+
+    /// Start a child agent. The default launches as [`Self::create`] does and
+    /// so cannot place the child beside its parent or apply a posture: a locked
+    /// posture is refused here rather than silently dropped, because a reviewer
+    /// started without its posture is an ordinary agent that can write.
+    async fn create_child(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+        ctx: ChildCtx,
+    ) -> Result<String, LaunchError> {
+        if ctx.posture != oximux_agents::thread::launch_posture::SpawnPosture::Default {
+            return Err(LaunchError::PostureUnenforceable(
+                "this host cannot launch agents under a locked posture".into(),
+            ));
+        }
+        self.create(cwd, agent_id, model).await
+    }
+
+    /// The agents this launcher can start, for `Whoami` and to name the valid
+    /// ids when a spawn names an unknown one. Empty by default: the caller
+    /// then learns the agent is unknown only from the launch itself.
+    fn roster(&self) -> Vec<oximux_remote_proto::lineage::AgentRosterWire> {
+        Vec::new()
+    }
 }

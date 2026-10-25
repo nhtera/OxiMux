@@ -36,8 +36,8 @@ fn steer_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
         .with_steps([
             "wait for the turn to end, then use `oximux send`".into(),
             "or `oximux stop` to interrupt it and send a fresh prompt".into(),
-            "mid-turn steering needs a backend with a message queue (pi); \
-             claude and codex have none"
+            "mid-turn steering needs a backend with a message queue (pi, omp, \
+             claude 2.1.310 or later); codex and ACP agents have none"
                 .into(),
         ]);
     }

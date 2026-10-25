@@ -206,3 +206,42 @@ Five things to copy from that loop, whatever shape yours takes:
   `permit answer --answer …`; passing it to `permit allow` fails.
 - Exit 3 from any of these verbs means the host is unreachable, not that the
   work is done. Treat it as a retry, not as a result.
+
+## Delegating from inside an agent
+
+A team run is the operator splitting work. An agent can also start its own
+helpers for parts of its task. OxiMux gives its Claude, Codex and ACP chats these as tools
+(`oximux_spawn_agent`, `oximux_wait_agents`, `oximux_read_agent`,
+`oximux_send_agent`, `oximux_cancel_agent`, `oximux_list_children`,
+`oximux_answer_permit`, `oximux_state_get`, `oximux_state_cas`); any agent can
+use the same verbs from its shell:
+
+```sh
+oximux whoami                                    # may you spawn, at what depth, which agents
+oximux delegate spawn --agent claude-code --request-id parse-1 "fix the failing parser tests"
+oximux delegate children                         # where each child stands
+oximux wait <child> --until idle --timeout 600   # one child, from a shell
+oximux transcript <child>                        # everything it said
+```
+
+**Waiting.** Do not poll. Call once with the ids you depend on and let it wait. If three waits in a row return nothing new, call oximux_list_children and act on what you see: read a finished result, answer a permit, send a prompt, or cancel.
+
+**Events arrive on their own.** When a child finishes, fails, or waits on a
+permission or a question, a short message reaches you without asking: an
+`<oximux-events>` block with one `<oximux-event kind=… child=…>` per child,
+its last reply inside `<result>` (cut at 4000 characters, with the tool that
+reads the rest). If you are mid-turn it is folded into your turn; otherwise it
+starts your next one. Children that finish together arrive together. There is
+no need to acknowledge these, and a queued status is not a failure, so do not
+resend. Report the results in your own final response.
+
+**Permits.** A child started with `allow_parent_permits` lets you answer its
+read-only permission prompts (deny, or allow unchanged); anything that runs a
+command or changes a file still goes to the user.
+
+**Limits.** The host caps how deep the tree goes, how many children work at
+once, and how many a task may start; a refusal says what to do instead. A
+child set to `review` only reads; `verify` may build and test (a Codex verifier
+can also edit inside the workspace, so give it a worktree when that matters).
+When the user stops you, child events wait for the user's next message.
+

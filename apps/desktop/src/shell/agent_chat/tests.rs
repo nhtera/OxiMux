@@ -5,6 +5,7 @@
 //! unchanged.
 
     use super::*;
+    use oximux_agents::thread::pi::posture as pi_posture;
     use gpui::TestAppContext;
     use oximux_agents::thread::connection::AgentCapabilities;
     use oximux_agents::thread::StubConnection;
@@ -225,6 +226,52 @@
                 rc.registry().get(&placeholder).is_none(),
                 "while the placeholder is gone, so the list shows one session not two",
             );
+        });
+    }
+
+    /// A Codex thread names itself after its first prompt is written, so the
+    /// session is rekeyed mid-turn onto a fresh event ring. The running prompt
+    /// comes along: `oximux wait` on the new id must see a turn in flight, and a
+    /// phone resuming from the snapshot must not see the prompt twice.
+    #[gpui::test]
+    async fn a_mid_turn_rekey_carries_the_running_prompt(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            let rc = crate::remote_control::RemoteControl::new();
+            rc.set_enabled(true);
+            cx.set_global(rc);
+        });
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let id = "22222222-3333-4444-5555-666666666666";
+        window
+            .update(cx, |view, _window, cx| {
+                view.send_text("summarize the repo".into(), Vec::new(), cx);
+                view.thread.turn_active = true;
+                view.thread.session_id = Some(id.into());
+                view.on_event(ThreadEvent::AssistantTextDelta("Look".into()), cx);
+                assert_eq!(view.remote_session_id(), id);
+            })
+            .unwrap();
+        cx.update(|cx| {
+            let handle = cx.global::<crate::remote_control::RemoteControl>().registry().get(id).expect("rekeyed");
+            let events = handle.events_since(0);
+            let prompts: Vec<_> = events
+                .iter()
+                .filter(|(_, ev)| matches!(ev, ThreadEvent::UserMessage { text, .. } if text == "summarize the repo"))
+                .collect();
+            assert_eq!(prompts.len(), 1, "the running prompt is in the new ring once: {events:?}");
+            let snapshot = handle.transcript_snapshot().expect("published");
+            assert!(snapshot.seq >= prompts[0].0, "a phone resumes after it, never replaying it");
         });
     }
 
@@ -684,6 +731,96 @@
                 // A non-omp chat carries nothing here (the field is OmpRpc-only).
                 view.backend = ChatBackend::stream_json();
                 assert_eq!(view.respawn_spec(Vec::new(), None).omp_posture, None);
+            })
+            .expect("window update");
+    }
+
+    /// A reviewer whose agent announces a mode its posture forbids is stopped,
+    /// and stays stopped: no respawn path (a send after Stop, a remote open,
+    /// Retry) may revive a process that would take the next prompt unconfined.
+    /// A Default chat with the same init is left alone.
+    #[gpui::test]
+    async fn a_child_that_ignored_its_posture_is_stopped_and_stays_stopped(cx: &mut TestAppContext) {
+        use oximux_agents::thread::launch_posture::SpawnPosture;
+
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let init = |mode: &str| ThreadEvent::SessionInit {
+            session_id: "s".into(),
+            model: "m".into(),
+            permission_mode: mode.into(),
+            slash_commands: Vec::new(),
+            meta: oximux_agents::thread::SessionMeta { tools: vec!["Read".into(), "Bash".into()], ..Default::default() },
+        };
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.backend = ChatBackend::stream_json();
+                view.guard_spawn_posture(&init("default"));
+                assert!(view.connection.is_some(), "a Default chat is not judged");
+
+                view.spawn_posture = SpawnPosture::Review;
+                view.interrupted = true; // a user Stop raced the init
+                view.guard_spawn_posture(&init("dontAsk"));
+                assert!(view.connection.is_none(), "Bash outside Review stops the agent");
+                assert!(!view.interrupted, "the exit is not a resumable Stop");
+                let why = view.thread.last_error.clone().expect("the chat says why");
+                assert!(why.contains("Bash"), "{why}");
+
+                view.thread.last_error = None;
+                view.respawn(cx);
+                assert!(view.connection.is_none(), "no respawn revives it");
+                assert!(view.disconnected);
+                assert_eq!(view.thread.last_error.as_deref(), Some(why.as_str()));
+            })
+            .expect("window update");
+    }
+
+    /// A Claude chat told its id up front keeps it across a respawn until a
+    /// prompt has reached the agent (Claude refuses a used `--session-id`);
+    /// a placeholder or a non-Claude chat never passes one.
+    #[gpui::test]
+    async fn an_unprompted_claude_respawn_keeps_its_preassigned_id(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                let id = uuid::Uuid::new_v4().to_string();
+                view.backend = ChatBackend::stream_json();
+                view.remote_session_id = id.clone();
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, Some(id.clone()));
+
+                view.backend = ChatBackend::from(Transport::Rpc);
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, None, "not Claude");
+
+                view.backend = ChatBackend::stream_json();
+                view.remote_session_id = "agent-17000000000001".into();
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, None, "a placeholder");
+
+                view.remote_session_id = id;
+                view.thread.push_user_message("go");
+                assert_eq!(view.respawn_spec(Vec::new(), None).fresh_session_id, None, "already prompted");
             })
             .expect("window update");
     }

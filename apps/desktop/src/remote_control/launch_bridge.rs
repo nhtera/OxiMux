@@ -13,7 +13,7 @@
 //! riding along so the caller learns the new session's id rather than polling
 //! for it.
 
-use oximux_remote_host::{LaunchError, SessionLauncher};
+use oximux_remote_host::{ChildCtx, LaunchError, SessionLauncher};
 use tokio::sync::{mpsc, oneshot};
 
 /// One request to open a session, plus where to send the answer.
@@ -27,6 +27,9 @@ pub struct LaunchRequest {
     /// `None` (an empty session for the phone to type into); the scheduler
     /// passes its schedule's prompt.
     pub initial_prompt: Option<String>,
+    /// For a spawned child: its parent (the tab it opens beside) and posture.
+    /// `None` for a phone's or a schedule's ordinary session.
+    pub child: Option<ChildCtx>,
     /// The new session's id, or why it could not be opened.
     ///
     /// A oneshot rather than a fire-and-forget send because the RPC contract
@@ -37,11 +40,11 @@ pub struct LaunchRequest {
 
 /// How many launch requests may queue before the UI thread has drained them.
 ///
-/// Small on purpose. These arrive at human speed — someone tapping "new
-/// session" — so a deep queue would only ever hold requests nobody is waiting on
-/// any more. A full queue is reported as [`LaunchError::Unavailable`], which is
-/// honest: the desktop is not keeping up.
-const QUEUE: usize = 4;
+/// Phones and schedules launch at human speed, but an agent fanning out may
+/// ask for several children at once, so this matches the per-root cap on open
+/// children (16) rather than a phone's handful. A full queue is still reported
+/// as [`LaunchError::Unavailable`]: the desktop is not keeping up.
+const QUEUE: usize = 16;
 
 /// The dispatcher's end of the bridge. Cloneable so the scheduler's firer can
 /// share the same queue the remote launcher uses — one GPUI drain loop serves
@@ -49,9 +52,17 @@ const QUEUE: usize = 4;
 #[derive(Clone)]
 pub struct BridgeLauncher {
     tx: mpsc::Sender<LaunchRequest>,
+    /// The agents a spawn may name, kept by the UI side (the dispatcher's
+    /// thread cannot read the launch settings, a GPUI global).
+    roster: std::sync::Arc<std::sync::Mutex<Vec<oximux_remote_proto::lineage::AgentRosterWire>>>,
 }
 
 impl BridgeLauncher {
+    /// Replace the roster `Whoami` reports and spawns are checked against.
+    pub fn set_roster(&self, roster: Vec<oximux_remote_proto::lineage::AgentRosterWire>) {
+        *self.roster.lock().unwrap() = roster;
+    }
+
     /// Open a session, optionally seeding its first message — the scheduler's
     /// entry point. The plain [`SessionLauncher::create`] delegates here with
     /// no prompt.
@@ -62,12 +73,24 @@ impl BridgeLauncher {
         model: Option<&str>,
         initial_prompt: Option<String>,
     ) -> Result<String, LaunchError> {
+        self.send(cwd, agent_id, model, initial_prompt, None).await
+    }
+
+    async fn send(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+        initial_prompt: Option<String>,
+        child: Option<ChildCtx>,
+    ) -> Result<String, LaunchError> {
         let (reply, answer) = oneshot::channel();
         let request = LaunchRequest {
             cwd: cwd.to_string(),
             agent_id: agent_id.map(str::to_string),
             model: model.map(str::to_string),
             initial_prompt,
+            child,
             reply,
         };
         // `try_send` rather than `send`: a full queue or a dropped receiver
@@ -85,7 +108,7 @@ impl BridgeLauncher {
 /// answer once the window that would host the tab is gone.
 pub fn launch_bridge() -> (BridgeLauncher, mpsc::Receiver<LaunchRequest>) {
     let (tx, rx) = mpsc::channel(QUEUE);
-    (BridgeLauncher { tx }, rx)
+    (BridgeLauncher { tx, roster: Default::default() }, rx)
 }
 
 #[async_trait::async_trait]
@@ -98,6 +121,54 @@ impl SessionLauncher for BridgeLauncher {
     ) -> Result<String, LaunchError> {
         self.create_with_prompt(cwd, agent_id, model, None).await
     }
+
+    /// A spawned child opens in its parent's window and group, beside the
+    /// parent's tab, without focus; its posture rides into the chat view. The
+    /// prompt is delivered by the dispatcher once the tab exists.
+    async fn create_child(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+        ctx: ChildCtx,
+    ) -> Result<String, LaunchError> {
+        self.send(cwd, agent_id, model, None, Some(ctx)).await
+    }
+
+    fn roster(&self) -> Vec<oximux_remote_proto::lineage::AgentRosterWire> {
+        self.roster.lock().unwrap().clone()
+    }
+}
+
+/// The agents a spawn may name: every chat-capable, enabled agent, with the
+/// postures its transport can be held to (the spike's mapping: Claude and
+/// Codex all three, Pi Default and Review, ACP and omp Default only).
+///
+/// `models` is empty (the plan allows a cold catalog; the agent's default
+/// applies) and `installed` means configured: telling a missing binary apart
+/// is the provisioning work's job.
+pub fn roster_from(settings: &oximux_settings::AgentLaunchSettings) -> Vec<oximux_remote_proto::lineage::AgentRosterWire> {
+    use oximux_remote_proto::lineage::{AgentRosterWire, SpawnPostureWire as P};
+    use oximux_settings::Transport;
+    const BUILTINS: [(&str, &str); 4] = [("claude-code", "Claude"), ("codex", "Codex"), ("pi", "Pi"), ("omp", "omp")];
+    let configured = settings.agents.keys().filter(|id| !BUILTINS.iter().any(|(b, _)| b == id)).map(|id| (id.as_str(), id.as_str()));
+    BUILTINS
+        .into_iter()
+        .chain(configured)
+        .filter(|(id, _)| settings.chat_capable(id) && !settings.is_disabled(id))
+        .map(|(id, display)| AgentRosterWire {
+            agent_id: id.to_string(),
+            display: display.to_string(),
+            default_model: None,
+            models: Vec::new(),
+            postures: match settings.transport_for(id) {
+                Transport::StreamJson | Transport::AppServer => vec![P::Default, P::Review, P::Verify],
+                Transport::Rpc => vec![P::Default, P::Review],
+                _ => vec![P::Default],
+            },
+            installed: true,
+        })
+        .collect()
 }
 
 /// Whether `cwd` is a directory this desktop can actually open a session in.
@@ -148,9 +219,10 @@ pub fn serve_launches(rx: tokio::sync::mpsc::Receiver<LaunchRequest>, cx: &mut g
             // for is already open either way.
             // Split before sending: `send` consumes the reply channel, so the
             // request cannot still be borrowed by the closure at that point.
-            let LaunchRequest { cwd, agent_id, model, initial_prompt, reply } = request;
-            let opened = cx.update(|cx| {
-                open_session(&cwd, agent_id.as_deref(), model, initial_prompt, cx)
+            let LaunchRequest { cwd, agent_id, model, initial_prompt, child, reply } = request;
+            let opened = cx.update(|cx| match child {
+                Some(ctx) => open_child_session(&cwd, agent_id.as_deref(), model, ctx, cx),
+                None => open_session(&cwd, agent_id.as_deref(), model, initial_prompt, cx),
             });
             let _ = reply.send(opened);
         }
@@ -171,37 +243,7 @@ pub(crate) fn open_session(
     cx: &mut gpui::App,
 ) -> Result<String, LaunchError> {
     let cwd = usable_working_directory(cwd)?;
-
-    // The adapter the request named, or the desktop's own default — the same
-    // resolution the left rail performs, so a remote launch and a local one
-    // produce the same kind of session rather than two subtly different ones.
-    let settings = cx
-        .try_global::<oximux_settings::AgentLaunchSettings>()
-        .cloned()
-        .unwrap_or_default();
-    // A request that names no agent (a remote quick-add — the local launcher
-    // always names one via its picker) uses the configured default, or falls back
-    // to a chat-capable agent so it still starts before the user has picked a
-    // default. `None` only when the host has no chat-capable agent at all.
-    let adapter_id = match agent_id {
-        Some(id) => id.to_string(),
-        None => settings.default_chat_agent().ok_or(LaunchError::Failed)?,
-    };
-    // Refused rather than silently defaulted: starting a *different* agent than
-    // the one asked for is a worse outcome than starting none, and the phone
-    // cannot tell the difference afterwards.
-    if !settings.chat_capable(&adapter_id) {
-        return Err(LaunchError::Failed);
-    }
-    let backend = crate::workspace_root::chat_backend_for(&settings, &adapter_id);
-    // Refused rather than dropped. ACP takes no model at spawn — `connect`'s
-    // `Transport::Acp` arm never reads `ConnectSpec.model` — so passing one here
-    // would open the session on the agent's default while every record said
-    // otherwise. This is the reachable case: unlike the headless host, the
-    // desktop resolves any chat-capable adapter, ACP presets included.
-    if model.is_some() && !backend.transport.takes_model_at_spawn() {
-        return Err(LaunchError::ModelUnsupported);
-    }
+    let backend = resolve_backend(agent_id, model.is_some(), cx)?;
 
     // The first registered window. A desktop with several open has no signal
     // about which one the phone meant, and asking would defeat the point of
@@ -236,6 +278,83 @@ pub(crate) fn open_session(
         .ok_or(LaunchError::Failed)
 }
 
+/// Open a spawned child beside its parent: in the window and project that hold
+/// the parent's chat, in the parent's own group, without activating it or
+/// switching the user's group, project or window.
+fn open_child_session(
+    cwd: &str,
+    agent_id: Option<&str>,
+    model: Option<String>,
+    ctx: ChildCtx,
+    cx: &mut gpui::App,
+) -> Result<String, LaunchError> {
+    let cwd = usable_working_directory(cwd)?;
+    let backend = resolve_backend(agent_id, model.is_some(), cx)?;
+    let parent = ctx.parent_session_id.ok_or(LaunchError::Unavailable)?;
+    // Every window and project, not only the visible ones: a parent keeps
+    // working in a project the user has switched away from.
+    let (persist_id, panes) = crate::platform::window_registry::all_windows(cx)
+        .into_iter()
+        .find_map(|(persist_id, workspace)| {
+            let panes = workspace
+                .read(cx)
+                .all_project_panes()
+                .into_iter()
+                .find(|panes| panes.read(cx).holds_chat(&parent, cx))?;
+            Some((persist_id, panes))
+        })
+        .ok_or(LaunchError::Unavailable)?;
+    let window = crate::platform::window_registry::window_handle(cx, &persist_id)
+        .ok_or(LaunchError::Unavailable)?;
+    window
+        .update(cx, |_, window, cx| {
+            panes.update(cx, |panes, cx| {
+                panes.open_child_chat_tab(&parent, cwd, model, backend, ctx.posture, window, cx)
+            })
+        })
+        .map_err(|_| LaunchError::Unavailable)?
+        .ok_or(LaunchError::Failed)
+}
+
+/// The backend a launch of `agent_id` (or the desktop's default) opens over.
+fn resolve_backend(
+    agent_id: Option<&str>,
+    wants_model: bool,
+    cx: &gpui::App,
+) -> Result<oximux_agents::thread::ChatBackend, LaunchError> {
+    // The adapter the request named, or the desktop's own default — the same
+    // resolution the left rail performs, so a remote launch and a local one
+    // produce the same kind of session rather than two subtly different ones.
+    let settings = cx
+        .try_global::<oximux_settings::AgentLaunchSettings>()
+        .cloned()
+        .unwrap_or_default();
+    // A request that names no agent (a remote quick-add — the local launcher
+    // always names one via its picker) uses the configured default, or falls back
+    // to a chat-capable agent so it still starts before the user has picked a
+    // default. `None` only when the host has no chat-capable agent at all.
+    let adapter_id = match agent_id {
+        Some(id) => id.to_string(),
+        None => settings.default_chat_agent().ok_or(LaunchError::Failed)?,
+    };
+    // Refused rather than silently defaulted: starting a *different* agent than
+    // the one asked for is a worse outcome than starting none, and the phone
+    // cannot tell the difference afterwards.
+    if !settings.chat_capable(&adapter_id) {
+        return Err(LaunchError::Failed);
+    }
+    let backend = crate::workspace_root::chat_backend_for(&settings, &adapter_id);
+    // Refused rather than dropped. ACP takes no model at spawn — `connect`'s
+    // `Transport::Acp` arm never reads `ConnectSpec.model` — so passing one here
+    // would open the session on the agent's default while every record said
+    // otherwise. This is the reachable case: unlike the headless host, the
+    // desktop resolves any chat-capable adapter, ACP presets included.
+    if wants_model && !backend.transport.takes_model_at_spawn() {
+        return Err(LaunchError::ModelUnsupported);
+    }
+    Ok(backend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +378,45 @@ mod tests {
             "sess-7"
         );
         ui.await.unwrap();
+    }
+
+    /// A spawned child's launch carries its parent and posture to the UI side,
+    /// and no prompt: the dispatcher delivers it once the tab exists.
+    #[tokio::test]
+    async fn a_child_launch_carries_its_parent_and_posture() {
+        use oximux_agents::thread::launch_posture::SpawnPosture;
+        let (launcher, mut rx) = launch_bridge();
+        let ui = tokio::spawn(async move {
+            let req = rx.recv().await.expect("a request");
+            let ctx = req.child.expect("a child context");
+            assert_eq!(ctx.parent_session_id.as_deref(), Some("parent-1"));
+            assert_eq!(ctx.posture, SpawnPosture::Review);
+            assert!(!ctx.activate);
+            assert!(req.initial_prompt.is_none());
+            let _ = req.reply.send(Ok("child-1".into()));
+        });
+        let ctx = ChildCtx {
+            parent_session_id: Some("parent-1".into()),
+            activate: false,
+            posture: SpawnPosture::Review,
+        };
+        assert_eq!(launcher.create_child("/work", Some("claude-code"), None, ctx).await.unwrap(), "child-1");
+        ui.await.unwrap();
+    }
+
+    /// The roster offers what the posture mapping can hold, per transport.
+    #[test]
+    fn the_roster_lists_chat_agents_with_their_enforceable_postures() {
+        use oximux_remote_proto::lineage::SpawnPostureWire as P;
+        let roster = roster_from(&oximux_settings::AgentLaunchSettings::default());
+        let claude = roster.iter().find(|a| a.agent_id == "claude-code").expect("claude is a chat agent");
+        assert_eq!(claude.postures, vec![P::Default, P::Review, P::Verify]);
+        for agent in &roster {
+            assert!(agent.postures.contains(&P::Default), "{}", agent.agent_id);
+            if agent.agent_id == "omp" {
+                assert_eq!(agent.postures, vec![P::Default], "omp stays Default-only");
+            }
+        }
     }
 
     /// No UI side at all — the window is gone, or remote was enabled before one

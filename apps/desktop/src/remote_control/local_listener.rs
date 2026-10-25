@@ -22,6 +22,8 @@ pub struct LocalHandle {
     /// Shared with the accept loop so credentials can be minted and dropped
     /// while it runs.
     listener: Arc<LocalControlListener>,
+    /// Where the socket lives (the app's owner-only data directory).
+    runtime_dir: PathBuf,
 }
 
 impl LocalHandle {
@@ -38,6 +40,29 @@ impl LocalHandle {
     /// Drop a session's credential when its agent ends.
     pub fn revoke_session(&self, session_id: &str) {
         self.listener.revoke_session(session_id);
+    }
+
+    /// Point the credential `label` at `session_id` (a fresh spawn's real
+    /// id, or a chat re-keyed onto its agent's id).
+    pub fn bind_session(&self, label: &str, session_id: &str) {
+        self.listener.bind_session(label, session_id);
+    }
+
+    /// Re-register a credential this listener did not mint (local access
+    /// switched off and on: the agent still holds its secret).
+    pub fn restore_session(&self, label: &str, secret: &str, session_id: &str) {
+        self.listener.restore_session(label, secret, session_id);
+    }
+
+    /// The runtime directory this listener serves from.
+    pub fn runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
+    }
+
+    /// Where an agent's credential file (for the tool server it starts)
+    /// lives, inside the owner-only runtime directory.
+    pub fn credential_dir(&self) -> PathBuf {
+        self.runtime_dir.join("agent-credentials")
     }
 }
 
@@ -119,5 +144,5 @@ pub fn start(
             }
         }
     });
-    Ok(LocalHandle { task, listener })
+    Ok(LocalHandle { task, listener, runtime_dir })
 }

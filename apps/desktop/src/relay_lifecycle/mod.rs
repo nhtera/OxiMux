@@ -96,10 +96,23 @@ pub enum RelayLifecycleEvent {
 /// The pid of an `oximux serve` (or another desktop) holding the local control
 /// role, read without taking the lock. `None` when this process holds it, or
 /// nobody alive does.
+///
+/// The record outlives its writer, and a pid alone is not identity: after a
+/// crash the number can be recycled by an unrelated live process, which
+/// `pid_alive` would report as a foreign serve (and boot would restart daemons
+/// on that false premise). So a record that carries a start time must match
+/// the live process's start time and this boot. A one-line record from an
+/// older build has no start time; it keeps the old liveness check rather than
+/// hiding a real older serve that is still running.
 pub fn foreign_serve_holder(data_dir: &std::path::Path) -> Option<u32> {
     let lock = data_dir.join(oximux_remote_local::HOST_LOCK_FILENAME);
-    oximux_single_instance::read_holder_pid(&lock)
-        .filter(|&pid| pid != std::process::id() && oximux_relay_supervisor::pid_alive(pid))
+    let record = oximux_single_instance::read_holder_record(&lock)?;
+    let live = if record.started_at_unix_s.is_some() {
+        record.is_live()
+    } else {
+        oximux_relay_supervisor::pid_alive(record.pid)
+    };
+    (record.pid != std::process::id() && live).then_some(record.pid)
 }
 
 /// A crash respawn is admitted only while fewer than [`CRASH_LIMIT`] happened

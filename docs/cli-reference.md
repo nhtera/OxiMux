@@ -122,7 +122,7 @@ Interrupt a session's in-flight turn. The session stays open
 
 ### `oximux steer`
 
-Redirect a mid-turn agent with additional guidance. Needs a backend with a mid-turn message queue; claude and codex have none and refuse it, so on those use `stop` and then `send`
+Redirect a mid-turn agent with additional guidance. Needs a backend with a mid-turn message queue (pi, omp, claude 2.1.310 or later); codex and ACP agents refuse it, so on those use `stop` and then `send`
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -600,6 +600,52 @@ Every run this host holds, newest first
 
 _No arguments._
 
+### `oximux delegate`
+
+Start helper agents from inside an agent, and track them.
+
+_No arguments._
+
+#### `oximux delegate spawn`
+
+Start a child agent with a prompt.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | Which installed agent (`oximux whoami` lists them) |
+| `--model` | yes | A model for it (fixed at start; default: the agent's own) |
+| `--posture` | yes | What the child may do: default, review (reads only), verify (may build and test; a Codex verifier can also edit inside the workspace). Never more than you have yourself |
+| `--notify` | yes | Which of its events reach you: auto (all), stuck (failed, waiting on someone), off |
+| `--allow-parent-permits` | no | Let yourself answer its permission prompts (Deny, or Allow unchanged; never for commands or edits) |
+| `--cwd` | yes | Where it works: `inherit` (your directory), `worktree` or `worktree:NAME` (a fresh worktree), or a path inside yours |
+| `--parent` | yes | The parent session (operator only; an agent spawns under itself) |
+| `--request-id` | yes | An idempotency key: the same key returns the same child instead of starting another (default: a fresh one each call) |
+| `<PROMPT>` | yes | The child's first message |
+
+#### `oximux delegate children`
+
+The agents you spawned and where each stands
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--of` | yes | Whose children (default: your own session) |
+| `--recursive` | no | Include grandchildren |
+
+#### `oximux delegate cancel`
+
+End a child (and with --cascade everything it spawned). Ends a finished child without reopening it
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<ID>` | yes | The child's session id (or, for the operator, `team:<run>`) |
+| `--cascade` | no | Also end everything beneath it |
+
+### `oximux whoami`
+
+Who this caller is to the host: its scope, its session, and whether it may spawn agents (and which)
+
+_No arguments._
+
 ### `oximux state`
 
 The shared coordination blackboard: versioned keys agents read and write.
@@ -1031,7 +1077,10 @@ Serve the attached simulator to an outside MCP client over stdio (`{"command": "
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `--worktree` | yes | The worktree whose device to serve. Required unless the current directory is a worktree OxiMux knows |
+| `--worktree` | yes | The worktree whose device to serve. Required for the `sim` tools unless the current directory is a worktree OxiMux knows |
+| `--tools` | yes | Which tool sets to serve: `sim`, `orchestrate`, or both |
+| `--credential-file` | yes | The agent session credential for the `orchestrate` tools (a file OxiMux wrote, owner-only). Without it the environment's is used |
+| `--default-agent` | yes | The agent `oximux_spawn_agent` starts when none is named (the calling agent's own) |
 
 ### `oximux serve`
 

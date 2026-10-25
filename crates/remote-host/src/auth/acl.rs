@@ -2,7 +2,20 @@
 //! authorization (revocation), per-device scope, the device listing, and revoke.
 
 use super::peer::PeerKind;
+use super::LocalScope;
 use super::{AppPubkey, AuthStore, DeviceScope, Peer};
+
+/// Who may decide a prompt on a session (see [`AuthStore::may_answer_permit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermitAuthority {
+    /// Any decision.
+    Full,
+    /// A parent agent answering a direct child that opted in: Deny, or Allow
+    /// with the input unchanged, and never for a Bash- or write-class tool.
+    ParentLimited,
+    /// No decision at all.
+    Refused,
+}
 
 /// One paired device as the desktop UI shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +336,77 @@ impl AuthStore {
     /// narrowing exists to close.
     pub fn may_manage_teams(&self, peer: &Peer) -> bool {
         self.may_create_sessions(peer)
+    }
+
+    /// May this caller spawn a child agent under `parent_session`?
+    ///
+    /// The operator (and a full-scope device that may create sessions) spawns
+    /// under any session. A confined agent spawns only under *itself*: the
+    /// child joins its subtree, which is all it can ever reach. Whether that
+    /// agent is a chat, within its depth and caps, is the host core's call at
+    /// spawn time, not a property of the credential.
+    pub fn may_spawn_child(&self, peer: &Peer, parent_session: &str) -> bool {
+        match peer.kind() {
+            PeerKind::Local(LocalScope::Full) => true,
+            PeerKind::Local(LocalScope::Session(own)) => &**own == parent_session,
+            PeerKind::Local(LocalScope::Mcp) => false,
+            PeerKind::Remote(_) => self.may_create_sessions(peer),
+        }
+    }
+
+    /// May this caller read, wait on, send to or cancel `target`, where
+    /// `is_descendant(ancestor, target)` answers from the spawn lineage?
+    ///
+    /// Everything [`is_allowed_for`](Self::is_allowed_for) admits, plus — for a
+    /// confined agent — every session in its own subtree. Without this a parent
+    /// could spawn children it then could not reach. A remote device gains
+    /// nothing from lineage: its scope is what the user paired. Write-shaped
+    /// verbs still need the device's write tier on top.
+    pub fn may_reach_descendant(
+        &self,
+        peer: &Peer,
+        target: &str,
+        is_descendant: impl Fn(&str, &str) -> bool,
+    ) -> bool {
+        if self.is_allowed_for(peer, target) {
+            return true;
+        }
+        match peer.kind() {
+            PeerKind::Local(LocalScope::Session(own)) => is_descendant(own, target),
+            _ => false,
+        }
+    }
+
+    /// Who may decide a permission or question prompt on `session`, and how.
+    /// `child_link` reports, when `session` was spawned through the grant, its
+    /// parent and whether it let that parent answer its prompts.
+    ///
+    /// An agent never answers its own prompts — the prompt is the human's
+    /// check on that very agent. A parent answers a *direct* child's only if
+    /// the child opted in at spawn, and then only in the limited form (the
+    /// handler enforces Deny or an unchanged Allow, never Bash or write-class
+    /// tools). Everyone else answers as their write tier allows.
+    pub fn may_answer_permit(
+        &self,
+        peer: &Peer,
+        session: &str,
+        child_link: impl FnOnce() -> Option<(String, bool)>,
+    ) -> PermitAuthority {
+        match peer.kind() {
+            PeerKind::Local(LocalScope::Full) => PermitAuthority::Full,
+            PeerKind::Local(LocalScope::Session(own)) => {
+                if &**own == session {
+                    return PermitAuthority::Refused;
+                }
+                match child_link() {
+                    Some((parent, true)) if *parent == **own => PermitAuthority::ParentLimited,
+                    _ => PermitAuthority::Refused,
+                }
+            }
+            PeerKind::Local(LocalScope::Mcp) => PermitAuthority::Refused,
+            PeerKind::Remote(_) if self.may_write(peer, session) => PermitAuthority::Full,
+            PeerKind::Remote(_) => PermitAuthority::Refused,
+        }
     }
 
     /// May this caller read a team run whose roles occupy `sessions`?

@@ -112,6 +112,12 @@ impl AppState {
         oximux_agents::team::TeamStore::new(self.db.conn())
     }
 
+    /// The spawn lineage (who started which agent), shared for the same reason:
+    /// both hosts enforce the caps from one table.
+    pub fn lineage_store(&self) -> oximux_agents::lineage::LineageStore {
+        oximux_agents::lineage::LineageStore::new(self.db.conn())
+    }
+
     /// The coordination blackboard, shared for the same reason — the board only
     /// coordinates if every host reads one set of keys.
     pub fn coord_store(&self) -> oximux_agents::coord::CoordStore {

@@ -176,6 +176,19 @@ pub trait AgentConnection: Send + Sync {
         self.send_user_message(text)
     }
 
+    /// [`Self::send_user_message_with_images`], with the id the CLI is to
+    /// report the line by (its acceptance and the turn that carried it come
+    /// back as [`ThreadEvent::UserMessageAccepted`] and
+    /// [`ThreadEvent::UserMessagesDelivered`]). A backend with no such report
+    /// ignores the id and sends as before.
+    ///
+    /// [`ThreadEvent::UserMessageAccepted`]: super::event::ThreadEvent::UserMessageAccepted
+    /// [`ThreadEvent::UserMessagesDelivered`]: super::event::ThreadEvent::UserMessagesDelivered
+    fn send_user_message_tagged(&self, text: &str, images: &[ChatImage], uuid: &str) -> Result<()> {
+        let _ = uuid;
+        self.send_user_message_with_images(text, images)
+    }
+
     /// Send a message into the turn that is already streaming, to redirect it.
     ///
     /// Only meaningful for an [`AgentCapabilities::supports_steer`] backend. The
@@ -191,6 +204,31 @@ pub trait AgentConnection: Send + Sync {
     /// or cancel. Unsupported by default.
     fn steer(&self, _text: &str) -> Result<()> {
         anyhow::bail!("this agent cannot accept a message mid-turn")
+    }
+
+    /// [`Self::steer`], under the id the CLI reports the line by. Default:
+    /// the id is ignored.
+    fn steer_tagged(&self, text: &str, uuid: &str) -> Result<()> {
+        let _ = uuid;
+        self.steer(text)
+    }
+
+    /// Whether the agent reports when it starts on a tagged line (Claude's
+    /// `command_lifecycle` receipts), so a steered line can be tracked until
+    /// then and taken back by a Stop. Default: no receipts.
+    fn reports_receipts(&self) -> bool {
+        false
+    }
+
+    /// Stop the running turn for good: first take back the lines sent under
+    /// `unstarted` that the agent has not started on (so none of them starts a
+    /// turn after the Stop), then interrupt. Returns the ids it took back.
+    /// Blocks for a bounded time (each reply is awaited briefly), so call it
+    /// off the UI thread. Default: an interrupt, nothing taken back.
+    fn stop_turn(&self, unstarted: &[String]) -> Result<Vec<String>> {
+        let _ = unstarted;
+        self.cancel()?;
+        Ok(Vec::new())
     }
 
     /// Answer a pending permission request by its `request_id`.
@@ -410,6 +448,15 @@ pub fn user_message_json_with_images(text: &str, images: &[ChatImage]) -> Value 
     json!({"type": "user", "message": {"role": "user", "content": content}})
 }
 
+/// [`user_message_json_with_images`] carrying the sender's `uuid`, the id the
+/// CLI reports the line by (`command_lifecycle`, a result's
+/// `user_message_uuids`).
+pub fn user_message_json_tagged(text: &str, images: &[ChatImage], uuid: &str) -> Value {
+    let mut line = user_message_json_with_images(text, images);
+    line["uuid"] = Value::String(uuid.to_string());
+    line
+}
+
 /// Build the stdin `control_response` JSON answering a `can_use_tool` request.
 ///
 /// Fail-closed contract (verified against the live CLI):
@@ -534,6 +581,9 @@ pub struct StubConnection {
     /// unconfigured stub exercises the refusal path rather than a success that
     /// no real backend would give.
     switchable: bool,
+    /// Whether it reports receipts for tagged lines, as Claude does. False by
+    /// default, like the trait.
+    receipts: bool,
 }
 
 impl StubConnection {
@@ -567,6 +617,12 @@ impl StubConnection {
         self
     }
 
+    /// Make the stub report receipts for tagged lines, as Claude does.
+    pub fn with_receipts(mut self) -> Self {
+        self.receipts = true;
+        self
+    }
+
     /// The JSON payloads that were written to the agent's stdin, in order.
     pub fn sent(&self) -> Vec<Value> {
         self.sent.lock().map(|g| g.clone()).unwrap_or_default()
@@ -584,6 +640,11 @@ impl AgentConnection for StubConnection {
         self.record(user_message_json(text));
         Ok(())
     }
+    /// Recorded with its uuid, as the Claude backend writes it.
+    fn send_user_message_tagged(&self, text: &str, images: &[ChatImage], uuid: &str) -> Result<()> {
+        self.record(user_message_json_tagged(text, images, uuid));
+        Ok(())
+    }
     /// Recorded distinctly from a plain send so a test can tell a message that
     /// went INTO a running turn from one that started a new one. Honours
     /// `supports_steer` so an unconfigured stub still refuses, like the default.
@@ -593,6 +654,19 @@ impl AgentConnection for StubConnection {
         }
         self.record(json!({"type": "steer", "message": text}));
         Ok(())
+    }
+    /// Recorded with its uuid, so a test can match it to the gate's note.
+    fn steer_tagged(&self, text: &str, uuid: &str) -> Result<()> {
+        self.steer(text)?;
+        if let Ok(mut g) = self.sent.lock()
+            && let Some(last) = g.last_mut()
+        {
+            last["uuid"] = json!(uuid);
+        }
+        Ok(())
+    }
+    fn reports_receipts(&self) -> bool {
+        self.receipts
     }
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         self.record(control_response_json(request_id, &decision));
@@ -690,6 +764,15 @@ mod tests {
         let id2 = apply_flag_settings_json(json!({}))["request_id"].as_str().unwrap().to_string();
         assert!(id1.starts_with("oximux-apply-settings-"));
         assert_ne!(id1, id2, "each request mints a fresh id");
+    }
+
+    #[test]
+    fn a_tagged_line_carries_the_uuid_the_cli_reports_it_by() {
+        let line = user_message_json_tagged("hi", &[], "00dad500-b85d-4a13-a756-c904e97ad49a");
+        assert_eq!(
+            line,
+            json!({"type": "user", "message": {"role": "user", "content": "hi"}, "uuid": "00dad500-b85d-4a13-a756-c904e97ad49a"})
+        );
     }
 
     #[test]

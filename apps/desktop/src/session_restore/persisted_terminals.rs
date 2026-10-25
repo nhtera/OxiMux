@@ -183,6 +183,11 @@ pub struct PersistedTab {
     /// to the default label. `#[serde(default)]` → `None` for older blobs.
     #[serde(default)]
     pub custom_title: Option<String>,
+    /// A spawned helper's hover text ("Spawned by …"). Such a tab is restored
+    /// with it and with its saved `↳ …` label; other tabs are renumbered.
+    /// `#[serde(default)]` → `None` for every other tab and for older blobs.
+    #[serde(default)]
+    pub tooltip: Option<String>,
 }
 
 /// Per-leaf state captured by `PersistedTab.sub_panes`. Carries enough

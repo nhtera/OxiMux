@@ -107,6 +107,32 @@ impl AgentChatView {
         // A resumed thread carries the prior session id; a fresh one is `None`
         // (spawn a new session). Either way the subprocess is spawned the same.
         let resume_session_id = thread.session_id.clone();
+        // Keyed on the agent's own session id when the thread has one — a
+        // restored chat always does — so a remote client's reference to this
+        // session survives the restart that just rebuilt this view. Known
+        // before the spawn: the agent's credential is scoped to it.
+        // A fresh Claude chat connecting now is told its id up front
+        // (`--session-id`): the registry, the spawn lineage and the agent's
+        // credential then start on the id it keeps, with no placeholder to
+        // re-key later. Other providers name themselves after launch.
+        let fresh_session_id = (mode == ConnectMode::Connect
+            && thread.session_id.is_none()
+            && backend.transport == oximux_agents::thread::Transport::StreamJson)
+            .then(|| uuid::Uuid::new_v4().to_string());
+        let remote_session_id = match &fresh_session_id {
+            Some(id) => id.clone(),
+            None => remote_session_id_for(thread.session_id.as_deref()),
+        };
+        // A spawned child's posture: its lineage row is the authority (a
+        // persisted chat blob is not — it could be edited), the restored value
+        // only the fallback for a host with no core.
+        let spawn_posture = resume_session_id
+            .as_deref()
+            .and_then(|sid| {
+                let core = cx.try_global::<RemoteControl>()?.host_core()?;
+                core.lineage().row(sid).ok().flatten()
+            })
+            .map_or(posture.spawn, |row| row.posture);
         let mut connection: Option<Arc<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
@@ -133,10 +159,13 @@ impl AgentChatView {
             spec.omp_posture = posture.omp;
             spec.claude_fast_mode =
                 claude_fast_mode_to_apply(posture.claude_fast_mode, model.as_deref());
+            spec.posture = spawn_posture;
+            spec.fresh_session_id = fresh_session_id.clone();
+            Self::add_spawn_credential(&mut spec, &remote_session_id, backend.adapter_id.as_deref(), cx);
             match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
-                    drain_task = Some(Self::spawn_drain(rx, cx));
+                    drain_task = Some(Self::spawn_drain(rx, 0, cx));
                 }
                 Err(e) => {
                     thread.last_error = Some(format!("Failed to start agent: {e}"));
@@ -256,10 +285,6 @@ impl AgentChatView {
             .to_string()
         });
 
-        // Keyed on the agent's own session id when the thread has one — a
-        // restored chat always does — so a remote client's reference to this
-        // session survives the restart that just rebuilt this view.
-        let remote_session_id = remote_session_id_for(thread.session_id.as_deref());
         // Bind this session into the remote-control registry now if remote control
         // is enabled (else `None` — nothing registered, nothing teed).
         let remote = connection.clone().and_then(|conn| {
@@ -273,6 +298,7 @@ impl AgentChatView {
         // covers cold restore, where `self` does not exist yet so the binding is
         // driven directly from the locals that seed the struct below.
         let mut remote_prompt_task = None;
+        let send_gate = Self::new_send_gate();
         let mut remote_choice_task = None;
         let mut remote_choice_sender = None;
         if let Some(binding) = &remote {
@@ -292,7 +318,9 @@ impl AgentChatView {
                 permission_mode: connection.as_ref().and_then(|c| c.default_mode()),
                 cwd: Some(cwd.clone()),
             });
-            if let Ok(entries_json) = serde_json::to_string(&thread.entries) {
+            if binding.exposed()
+                && let Ok(entries_json) = serde_json::to_string(&thread.entries)
+            {
                 binding.publish_transcript(entries_json, model);
             }
             // Relay remotely-injected prompts (phone sends) into this tab so the
@@ -301,7 +329,9 @@ impl AgentChatView {
             binding.set_prompt_sink(tx);
             let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
             binding.set_event_sink(event_tx);
-            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, cx));
+            binding.set_gate(Some(send_gate.clone()));
+            let wake_rx = Self::arm_send_gate(&send_gate);
+            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, wake_rx, cx));
             // Complete model/mode picks the backend fixes at spawn, which only
             // this view can carry out (it owns the respawn).
             let (choice_tx, choice_rx) = futures::channel::mpsc::unbounded();
@@ -315,6 +345,11 @@ impl AgentChatView {
             thread,
             connection,
             remote_session_id,
+            spawn_posture,
+            posture_refused: None,
+            pending_respawn: false,
+            send_gate,
+            pending_send_uuid: None,
             remote,
             backend,
             composer,
@@ -374,6 +409,7 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: drain_task,
+            drain_gen: 0,
             _remote_prompt_task: remote_prompt_task,
             _remote_choice_task: remote_choice_task,
             remote_choice_tx: remote_choice_sender,
@@ -420,6 +456,8 @@ impl AgentChatView {
     /// composer so its status line, Send button, and bottom-toolbar pickers all
     /// reflect reality. Cheap no-op when nothing changed (both setters guard).
     pub(super) fn sync_composer(&self, cx: &mut Context<Self>) {
+        // Every change the composer reflects also changes what holds sends.
+        self.sync_gate_holds();
         // A rewind in flight — or a pending ACP auth prompt (the session can't
         // accept input until the user signs in) — disables the composer just like
         // a disconnect until it resolves. A worktree create in flight (or one

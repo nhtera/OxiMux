@@ -46,7 +46,14 @@ mod forge_picker;
 mod image_attach;
 mod image_cache;
 mod jump_menu;
+mod child;
 mod login_card;
+mod remote_link;
+mod posture_snapshot;
+mod respawn_gate;
+mod drain;
+mod send_gate_link;
+mod sign_in;
 mod message_rail;
 mod pending_edit;
 mod retry;
@@ -56,6 +63,7 @@ mod plan_panel;
 mod publish_throttle;
 mod question_card;
 mod remote_turn;
+mod turn_checkpoint;
 mod turn_summary_card;
 mod rewind_menu;
 mod session_persistence;
@@ -128,7 +136,7 @@ use gpui::{
 use gpui_component::Icon;
 use gpui_component::input::Enter as InputEnter;
 use gpui_component::input::Escape as InputEscape;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::InputState;
 use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
@@ -523,9 +531,8 @@ use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
-use oximux_agents::thread::pi::posture::{self as pi_posture, PiPosture};
 use oximux_agents::thread::{
-    probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend, ChatImage,
+    probe_catalog, AgentConnection, AssistantMessage, ChatBackend, ChatImage,
     ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue, PermissionDecision,
     PermissionSuggestion, ProbedCatalog, QuestionAnswers, QuestionRequest, ThreadEntry,
     ThreadEvent, ToolCall, ToolCallStatus, ToolDetail, Transport, TurnUsage,
@@ -568,6 +575,18 @@ pub struct AgentChatView {
     /// (maybe-not-yet-known) session id — remote just needs a key stable for the
     /// view's lifetime.
     remote_session_id: String,
+    /// What this chat may do, fixed at spawn (a reviewer, a verifier); applied
+    /// on every respawn and never changed by the mode picker.
+    spawn_posture: oximux_agents::thread::launch_posture::SpawnPosture,
+    /// Why the agent was stopped for not holding its posture; no respawn
+    /// revives it (`child.rs`).
+    posture_refused: Option<String>,
+    /// A respawn asked for mid-turn, run when the turn ends (`respawn_gate`).
+    pending_respawn: bool,
+    /// Sends that did not start in this composer wait here (`send_gate_link`).
+    send_gate: Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>,
+    /// The id the next write goes out under (a gate item's), else a fresh one.
+    pending_send_uuid: Option<uuid::Uuid>,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`
@@ -796,6 +815,8 @@ pub struct AgentChatView {
     /// `Drop::shutdown()` (which kills the child → stdout EOF → both threads
     /// unwind). Keep that the single cleanup owner across future refactors.
     _drain_task: Option<Task<()>>,
+    /// Which drain is current; an older one stops (see `drain`).
+    drain_gen: u64,
     /// Relays remotely-injected prompts (phone sends) into this tab's transcript so
     /// the desktop shows the user's own bubble. Re-created on each (re)bind; dropping
     /// it ends the relay.
@@ -1219,21 +1240,9 @@ impl AgentChatView {
         // a Stop-then-resume — when the new model supports it.
         spec.claude_fast_mode =
             claude_fast_mode_to_apply(self.claude_fast_mode_snapshot(), self.model.as_deref());
+        spec.posture = self.spawn_posture;
+        spec.fresh_session_id = self.unused_preassigned_id();
         spec
-    }
-
-    /// Claude's fast-mode pick as the user last set it, read from the composer's
-    /// feature picks. `None` for a non-Claude chat or when the toggle was never
-    /// touched. This is what persists; whether it is *applied* to a spawn is
-    /// [`claude_fast_mode_to_apply`]'s call.
-    fn claude_fast_mode_snapshot(&self) -> Option<bool> {
-        if self.backend.transport != Transport::StreamJson {
-            return None;
-        }
-        match self.feature_values.get(oximux_agents::thread::FEATURE_FAST_MODE) {
-            Some(FeatureValue::Bool(on)) => Some(*on),
-            _ => None,
-        }
     }
 
     /// Push the stored fast-mode pick onto the live Claude session once the
@@ -1251,67 +1260,6 @@ impl AgentChatView {
             && let Err(e) = conn.set_feature(oximux_agents::thread::FEATURE_FAST_MODE, FeatureValue::Bool(on))
         {
             tracing::warn!(error = %e, "could not re-apply claude fast mode");
-        }
-    }
-
-    /// Pi's tool posture, read from the composer's feature picks. `None` for a
-    /// non-Pi chat or when nothing was changed (restore then applies the
-    /// deliberate default).
-    ///
-    /// Unlike Codex's, this posture is the session's ONLY tool gate — pi never
-    /// asks before running anything — so it is snapshotted for persistence
-    /// rather than left to be re-derived.
-    fn pi_posture_snapshot(&self) -> Option<PiPosture> {
-        if self.backend.transport != Transport::Rpc {
-            return None;
-        }
-        let tools = match self.feature_values.get(pi_posture::FEATURE_TOOLS) {
-            Some(FeatureValue::Choice(wire)) => Some(wire.clone()),
-            _ => None,
-        };
-        let context_files = match self.feature_values.get(pi_posture::FEATURE_CONTEXT_FILES) {
-            Some(FeatureValue::Bool(on)) => Some(*on),
-            _ => None,
-        };
-        if tools.is_none() && context_files.is_none() {
-            return None;
-        }
-        Some(PiPosture::from_parts(tools.as_deref(), context_files))
-    }
-
-    /// omp's approval posture, read from the composer's feature picks. `None`
-    /// for a non-omp chat or when the picker was never touched (restore then
-    /// applies the deliberate Write default — the spawn flag stays explicit
-    /// either way, so omp's own yolo default is unreachable).
-    fn omp_posture_snapshot(&self) -> Option<oximux_agents::thread::omp::posture::OmpPosture> {
-        if self.backend.transport != Transport::OmpRpc {
-            return None;
-        }
-        match self.feature_values.get(oximux_agents::thread::omp::posture::FEATURE_APPROVALS) {
-            Some(FeatureValue::Choice(wire)) => {
-                oximux_agents::thread::omp::posture::OmpPosture::from_wire(wire)
-            }
-            _ => None,
-        }
-    }
-
-    /// The Codex posture `(approval_policy, sandbox)` the user has selected, read
-    /// from the composer's feature picks. `None` for a non-Codex chat or when the
-    /// posture was never changed from the default (nothing to persist).
-    fn codex_posture_snapshot(&self) -> Option<(String, String)> {
-        if self.backend.transport != Transport::AppServer {
-            return None;
-        }
-        let choice = |id: &str| match self.feature_values.get(id) {
-            Some(FeatureValue::Choice(wire)) => Some(wire.clone()),
-            _ => None,
-        };
-        match (choice("codex_approval_policy"), choice("codex_sandbox")) {
-            (None, None) => None,
-            (approval, sandbox) => Some((
-                approval.unwrap_or_else(|| "on-request".to_string()),
-                sandbox.unwrap_or_else(|| "workspace-write".to_string()),
-            )),
         }
     }
 
@@ -1988,6 +1936,8 @@ impl AgentChatView {
         if text.is_empty() && images.is_empty() {
             return;
         }
+        // A gate item was neutralized when it was queued (a host event never is).
+        let text = if self.pending_send_uuid.is_some() { text } else { oximux_agents::envelope::neutralize_forged(&text).into_owned() };
         // The user is driving again: drop any armed retry and reset the attempt
         // count. The cap is per turn, so a conversation that hits a limit once
         // an hour must not eventually lock itself out.
@@ -1996,7 +1946,7 @@ impl AgentChatView {
         // agent input — reset in place rather than transmitting the literal text
         // to the subprocess (matching the CLI's own TUI). `/compact` stays a
         // pass-through; real compaction is a backend concern.
-        if images.is_empty() && text.trim() == "/clear" {
+        if images.is_empty() && text.trim() == "/clear" && self.pending_send_uuid.is_none() {
             self.new_chat(cx);
             return;
         }
@@ -2072,8 +2022,8 @@ impl AgentChatView {
             self.title_generated = true; // guard a fast double-send from re-firing
             self.spawn_title_generation(text.clone(), cx);
         }
-        if let Some(conn) = &self.connection {
-            match conn.send_user_message_with_images(&text, &images) {
+        if self.connection.is_some() {
+            match self.write_prompt(&text, &images) {
                 // Tee the prompt to remote subscribers only. No backend echoes the
                 // user's own message, so without this a phone renders replies to
                 // prompts it never showed. It is NOT applied to `self.thread` —
@@ -2093,444 +2043,6 @@ impl AgentChatView {
         // Jump to (and re-arm following of) the bottom for the new turn.
         self.follow_bottom();
         self.sync_composer(cx);
-        cx.notify();
-    }
-
-    /// Hand a message to the turn that is already streaming (a queued chip's ↑ on
-    /// a `supports_steer` backend). The agent picks it up at the next turn
-    /// boundary and changes course.
-    ///
-    /// Deliberately not routed through [`Self::send_text`]. That path is the
-    /// *start* of a turn: it binds an unbound draft, respawns an interrupted
-    /// child, generates the tab title and takes the pre-turn checkpoint. None of
-    /// that applies to a message going into a turn that is already running — and
-    /// the checkpoint especially must not: it anchors rewind to the repo as it
-    /// stood *before* a turn, and taking one now would capture a tree the running
-    /// turn's own tools are halfway through editing.
-    fn steer_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.is_empty() || !self.thread.turn_active {
-            return;
-        }
-        let Some(conn) = &self.connection else { return };
-        // The bubble goes in at the point the user sent it, which is also where
-        // the agent will act on it — the turn's remaining output lands after.
-        match conn.steer(&text) {
-            Ok(()) => {
-                self.thread.push_user_message(&text);
-                self.note_chat_prompt_sent();
-            }
-            Err(e) => self.thread.last_error = Some(format!("Steer failed: {e}")),
-        }
-        self.follow_bottom();
-        self.sync_composer(cx);
-        cx.notify();
-    }
-
-    /// True when the latest turn looks like an auth failure the user can fix by
-    /// signing in from a terminal. Some CLIs answer with a plain "Not logged in
-    /// · Please run /login" reply that settles as an ordinary assistant turn
-    /// (no error), so the last assistant text is scanned alongside `last_error`.
-    /// Matched case-insensitively and kept broad on purpose across providers.
-    fn is_signed_out(&self) -> bool {
-        const SIGNATURES: &[&str] = &[
-            "please run /login",
-            "not logged in",
-            "logged out",
-            "signed out",
-            "invalid api key",
-            "authentication_error",
-        ];
-        let hit = |s: &str| {
-            let l = s.to_ascii_lowercase();
-            SIGNATURES.iter().any(|sig| l.contains(sig))
-        };
-        if self.thread.last_error.as_deref().is_some_and(hit) {
-            return true;
-        }
-        // Only the most recent assistant reply counts — an old sign-in prompt
-        // must not keep the banner up after a later turn succeeds.
-        self.thread
-            .entries
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                ThreadEntry::Assistant(m) => Some(hit(&m.text)),
-                _ => None,
-            })
-            .unwrap_or(false)
-    }
-
-    /// The CLI adapter id for this chat's transport when it has an interactive
-    /// binary the user can sign into in a terminal. `None` for ACP presets,
-    /// whose sign-in flow isn't a bundled CLI. Gates the signed-out banner.
-    fn login_adapter_id(&self) -> Option<&'static str> {
-        match self.backend.transport {
-            Transport::StreamJson => Some("claude-code"),
-            Transport::AppServer => Some("codex"),
-            Transport::Acp => None,
-            // Pi's protocol exposes no sign-in command — authentication happens
-            // in the `pi` CLI itself, which is exactly what this banner opens.
-            Transport::Rpc => Some("pi"),
-            // Same story for omp: `/login` lives in the omp TUI.
-            Transport::OmpRpc => Some("omp"),
-        }
-    }
-
-    /// The signed-out banner's action: a link-styled control that asks the host
-    /// to open a terminal running this agent's CLI so `/login` is reachable.
-    fn open_login_terminal_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let typo = &self.typography;
-        div()
-            .id("chat-open-login-terminal")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(5.0))
-            .px(px(10.0))
-            .py(px(4.0))
-            .rounded(px(self.density.r_xs))
-            .cursor_pointer()
-            .bg(theme.status_info.opacity(0.15))
-            .text_size(px(typo.t_body_sm))
-            .text_color(theme.status_info)
-            .hover(|s| s.bg(theme.status_info.opacity(0.28)))
-            .child(
-                Icon::default()
-                    .path("icons/square-terminal.svg")
-                    .size(px(13.0))
-                    .text_color(theme.status_info),
-            )
-            .child(SharedString::from("Open terminal to sign in"))
-            .on_click(cx.listener(|this, _e, _window, cx| this.request_open_login_terminal(cx)))
-    }
-
-    /// Ask the host to spawn a terminal tab running this agent's CLI at the
-    /// chat's cwd. No-op for transports with no interactive login binary (ACP).
-    fn request_open_login_terminal(&mut self, cx: &mut Context<Self>) {
-        if let Some(adapter_id) = self.login_adapter_id() {
-            cx.emit(AgentChatEvent::OpenLoginTerminalRequested {
-                adapter_id,
-                cwd: self.cwd.clone(),
-            });
-        }
-    }
-
-    /// Authenticate with the ACP method the user picked from the auth card: mark
-    /// it pending (spinner), then call the connection's `authenticate`, which runs
-    /// on the worker and retries the session open on the same connection. A
-    /// terminal-kind method mounts its login terminal via a follow-up
-    /// `AuthTerminal` event; success clears the card on `SessionInit`.
-    fn request_authenticate(&mut self, method_id: String, cx: &mut Context<Self>) {
-        if let Some(auth) = self.auth.as_mut() {
-            auth.pending = Some(method_id.clone());
-            auth.error = None;
-        }
-        if let Some(conn) = self.connection.as_ref()
-            && let Err(e) = conn.authenticate(&method_id)
-            && let Some(auth) = self.auth.as_mut()
-        {
-            auth.pending = None;
-            auth.error = Some(e.to_string());
-        }
-        cx.notify();
-    }
-
-    /// Begin a browser OAuth sign-in (Codex "Sign in with ChatGPT"): mark the
-    /// method pending and kick the connection's login (fire-and-forget — the RPC
-    /// runs on the worker, so this click never blocks the UI). The browser URL
-    /// arrives asynchronously as [`ThreadEvent::AuthUrl`] and is opened there; the
-    /// card stays pending until `account/login/completed` → [`ThreadEvent::AuthOutcome`]
-    /// resolves it. A failure to even start surfaces on the card immediately.
-    fn request_browser_login(&mut self, method_id: String, cx: &mut Context<Self>) {
-        if let Some(auth) = self.auth.as_mut() {
-            auth.pending = Some(method_id);
-            auth.error = None;
-        }
-        if let Some(Err(e)) = self.connection.as_ref().map(|c| c.begin_browser_login())
-            && let Some(auth) = self.auth.as_mut()
-        {
-            auth.pending = None;
-            auth.error = Some(e.to_string());
-        }
-        cx.notify();
-    }
-
-    /// A browser-OAuth sign-in pill (Codex). Distinct from [`Self::auth_pill`]
-    /// (which runs ACP `authenticate`): clicking this opens a browser via
-    /// [`Self::request_browser_login`]. Renders a muted "Opening browser…" while
-    /// pending.
-    fn browser_login_pill(
-        &self,
-        method_id: &str,
-        label: &str,
-        pending: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
-        if pending {
-            return div()
-                .px(px(10.0))
-                .py(px(3.0))
-                .text_size(px(typo.t_body_sm))
-                .text_color(theme.fg_muted)
-                .child(SharedString::from("Opening browser…"))
-                .into_any_element();
-        }
-        let id = method_id.to_string();
-        let on_click = cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
-            this.request_browser_login(id.clone(), cx);
-        });
-        tool_card::pill_button(
-            format!("codex-oauth-{method_id}"),
-            label.to_string(),
-            theme.status_info,
-            density,
-            &typo,
-            on_click,
-        )
-    }
-
-    /// One clickable auth pill (Agent/Terminal name, or an EnvVar "Retry"). While
-    /// its method is authenticating it renders a muted "Authenticating…" label
-    /// instead of a button.
-    fn auth_pill(
-        &self,
-        method_id: &str,
-        label: &str,
-        pending: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
-        if pending {
-            return div()
-                .px(px(10.0))
-                .py(px(3.0))
-                .text_size(px(typo.t_body_sm))
-                .text_color(theme.fg_muted)
-                .child(SharedString::from("Authenticating…"))
-                .into_any_element();
-        }
-        let id = method_id.to_string();
-        let on_click = cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
-            this.request_authenticate(id.clone(), cx);
-        });
-        tool_card::pill_button(
-            format!("acp-auth-{method_id}"),
-            label.to_string(),
-            theme.status_info,
-            density,
-            &typo,
-            on_click,
-        )
-    }
-
-    /// Build the ACP auth card from the pending prompt: a pill per Agent/Terminal
-    /// method, an instructions block + Retry for an EnvVar method, an optional
-    /// inline login terminal, and a retry-state error note.
-    fn render_auth_card(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
-        let provider = self.provider_label();
-        let Some(auth) = self.auth.as_ref() else {
-            return div().into_any_element();
-        };
-        let mut rows: Vec<AnyElement> = Vec::new();
-        // `reconcile_env_inputs` builds the masked fields for the FIRST EnvVar
-        // method only, so render the interactive form for that one and skip any
-        // further EnvVar methods — otherwise a second would reuse the first's
-        // fields and submit the wrong variable names. (An agent advertising two
-        // simultaneous EnvVar methods is unheard of; this just fails safe.)
-        let mut env_form_done = false;
-        for m in &auth.methods {
-            let is_pending = auth.pending.as_deref() == Some(m.id.as_str());
-            match &m.kind {
-                // EnvVar: an interactive secret form — a masked field per advertised
-                // variable (built in `reconcile_env_inputs`, so the values never
-                // touch the transcript) + a submit pill that respawns the agent WITH
-                // those values in its env, then authenticates.
-                AuthMethodKind::EnvVar { .. } if env_form_done => continue,
-                AuthMethodKind::EnvVar { link, .. } => {
-                    env_form_done = true;
-                    let field_rows: Vec<AnyElement> = self
-                        .env_inputs
-                        .iter()
-                        .map(|(name, input)| {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(3.0))
-                                .w_full()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .font_family("monospace")
-                                        .text_size(px(typo.t_label_xs))
-                                        .text_color(theme.fg_base)
-                                        .child(SharedString::from(name.clone())),
-                                )
-                                .child(Input::new(input))
-                                .into_any_element()
-                        })
-                        .collect();
-                    let submit = self.env_submit_pill(&m.id, is_pending, cx);
-                    rows.push(auth_card::env_var_form(
-                        m.description.as_deref(),
-                        link.as_deref(),
-                        field_rows,
-                        submit,
-                        theme,
-                        &typo,
-                        density,
-                    ));
-                }
-                // BrowserOauth (Codex ChatGPT) → a pill that opens the browser,
-                // not the ACP `authenticate` path.
-                AuthMethodKind::BrowserOauth => {
-                    let pill = self.browser_login_pill(&m.id, &m.name, is_pending, cx);
-                    let row = match m.description.as_deref() {
-                        Some(desc) => div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(pill)
-                            .child(
-                                div()
-                                    .text_size(px(typo.t_label_xs))
-                                    .text_color(theme.fg_muted)
-                                    .child(SharedString::from(desc.to_string())),
-                            )
-                            .into_any_element(),
-                        None => pill,
-                    };
-                    rows.push(row);
-                }
-                // Agent / Terminal → a single labeled pill (+ its description).
-                _ => {
-                    let pill = self.auth_pill(&m.id, &m.name, is_pending, cx);
-                    let row = match m.description.as_deref() {
-                        Some(desc) => div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(pill)
-                            .child(
-                                div()
-                                    .text_size(px(typo.t_label_xs))
-                                    .text_color(theme.fg_muted)
-                                    .child(SharedString::from(desc.to_string())),
-                            )
-                            .into_any_element(),
-                        None => pill,
-                    };
-                    rows.push(row);
-                }
-            }
-        }
-        let terminal =
-            auth.terminal_id.as_ref().and_then(|_| self.render_embedded_terminal(AUTH_TERMINAL_KEY));
-        auth_card::auth_card(provider, auth.error.as_deref(), rows, terminal, theme, &typo, density)
-    }
-
-    /// The EnvVar-auth submit button: visually a [`Self::auth_pill`], but on click
-    /// it reads the typed secrets and respawns the agent WITH them in its env
-    /// (rather than authenticating the current, env-less process). Renders a muted
-    /// "Connecting…" while that respawn is in flight.
-    fn env_submit_pill(&self, method_id: &str, pending: bool, cx: &mut Context<Self>) -> AnyElement {
-        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
-        if pending {
-            return div()
-                .px(px(10.0))
-                .py(px(3.0))
-                .text_size(px(typo.t_body_sm))
-                .text_color(theme.fg_muted)
-                .child(SharedString::from("Connecting…"))
-                .into_any_element();
-        }
-        let id = method_id.to_string();
-        let on_click = cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
-            this.submit_env_auth(id.clone(), cx);
-        });
-        tool_card::pill_button(
-            format!("acp-env-auth-{method_id}"),
-            "Sign in".to_string(),
-            theme.status_info,
-            density,
-            &typo,
-            on_click,
-        )
-    }
-
-    /// Ensure the masked secret fields match the current EnvVar-auth prompt: one
-    /// [`InputState`] per advertised variable while an EnvVar method is up, torn
-    /// down once the card clears or turns non-EnvVar. Lives here (not the event
-    /// fold) because `InputState::new` needs the `Window`. Rebuilds only when the
-    /// variable set actually changes, so a half-typed secret survives repaints.
-    fn reconcile_env_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Variables the current card wants, in advertised order (first EnvVar method).
-        let wanted: Vec<String> = self
-            .auth
-            .as_ref()
-            .and_then(|a| {
-                a.methods.iter().find_map(|m| match &m.kind {
-                    AuthMethodKind::EnvVar { vars, .. } => Some(vars.clone()),
-                    _ => None,
-                })
-            })
-            .unwrap_or_default();
-        // Already in sync (same vars, same order) → keep the live fields untouched.
-        if self.env_inputs.len() == wanted.len()
-            && self.env_inputs.iter().zip(&wanted).all(|((name, _), w)| name == w)
-        {
-            return;
-        }
-        self.env_inputs.clear();
-        self.env_input_subs.clear();
-        for (i, name) in wanted.iter().enumerate() {
-            let input =
-                cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(name.clone()));
-            // Repaint the chat view on edits so the masked dots appear live (an
-            // embedded `Input` doesn't self-repaint its owner).
-            let sub = cx.subscribe(&input, |_this, _input, _ev: &InputEvent, cx| cx.notify());
-            // Focus the first field so the user can type without clicking first. The
-            // render-time composer-focus fallback only fires when the ROOT holds
-            // focus, so this stays put.
-            if i == 0 {
-                input.read(cx).focus_handle(cx).focus(window, cx);
-            }
-            self.env_inputs.push((name.clone(), input));
-            self.env_input_subs.push(sub);
-        }
-    }
-
-    /// Collect the typed EnvVar-auth secrets and respawn the agent WITH them in its
-    /// environment (which then authenticates) — the only way an env-credentialed
-    /// agent can sign in, since a running process can't gain env after it spawned.
-    /// The values are read straight into the respawn's in-flight `ConnectSpec.env`
-    /// and never persisted. Blank fields are skipped (the agent re-prompts if it
-    /// actually needed them); an all-blank submit keeps the card up with a nudge.
-    fn submit_env_auth(&mut self, method_id: String, cx: &mut Context<Self>) {
-        let env: Vec<(String, String)> = self
-            .env_inputs
-            .iter()
-            .filter_map(|(name, input)| {
-                let value = input.read(cx).value().to_string();
-                (!value.is_empty()).then(|| (name.clone(), value))
-            })
-            .collect();
-        if env.is_empty() {
-            if let Some(auth) = self.auth.as_mut() {
-                auth.error = Some("enter the required value(s) to continue".to_string());
-            }
-            cx.notify();
-            return;
-        }
-        if let Some(auth) = self.auth.as_mut() {
-            auth.pending = Some(method_id.clone());
-            auth.error = None;
-        }
-        // The fresh connection emits SessionInit (→ card clears) on success, or
-        // AuthRequired again (→ card re-shows) if the credential was wrong.
-        self.respawn_with_env(env, Some(method_id), cx);
         cx.notify();
     }
 
@@ -2601,9 +2113,7 @@ impl AgentChatView {
         if !self.thread.turn_active {
             return; // nothing is streaming
         }
-        if let Some(conn) = &self.connection {
-            let _ = conn.cancel();
-        }
+        self.interrupt_turn(cx);
         self.interrupted = true;
         self.thread.interrupt();
         self.sync_composer(cx);
@@ -2652,6 +2162,9 @@ impl AgentChatView {
     /// `self.permission_mode` / `self.effort`, so callers set those first.
     /// Degrades to a read-only error state if the respawn fails.
     fn respawn(&mut self, cx: &mut Context<Self>) {
+        if self.defer_respawn_mid_turn() {
+            return;
+        }
         self.respawn_with_env(Vec::new(), None, cx);
     }
 
@@ -2673,21 +2186,25 @@ impl AgentChatView {
         // rather than signalling the process, so after one the child is still
         // *alive* and this is what ends it; it also harvests a child that died
         // on its own.
+        if self.respawn_refused_for_posture() {
+            return;
+        }
+        self.pending_respawn = false; // this respawn satisfies a deferred one
         if let Some(old) = self.connection.take() {
             old.shutdown();
         }
-        let spec = self.respawn_spec(env, auth_method);
+        let mut spec = self.respawn_spec(env, auth_method);
+        Self::add_spawn_credential(&mut spec, &self.remote_session_id, self.backend.adapter_id.as_deref(), cx);
         match computer_use::connect_declaring(spec, &self.screen_control, cx) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
                 // Re-expose the respawned session to remote clients under the same
                 // stable id (drops the old binding, registers the fresh connection).
                 self.bind_remote(cx);
-                // Reassigning drops the old drain task, cancelling its foreground
-                // half; its forwarder thread then exits on the dead child's
-                // stdout EOF. We're single-threaded here, so no stale
-                // `on_disconnect` can interleave onto the fresh connection.
-                self._drain_task = Some(Self::spawn_drain(rx, cx));
+                // The old drain retires (it may be the one running this, when a
+                // turn's end ran the respawn); its forwarder thread exits on the
+                // dead child's stdout EOF, and it never reports that exit here.
+                self.start_drain(rx, cx);
                 self.interrupted = false;
                 self.disconnected = false;
                 self.thread.last_error = None;
@@ -2788,7 +2305,9 @@ impl AgentChatView {
     fn change_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
         // Unreachable pre-bind (the mode picker is hidden on an unbound draft),
         // but guard anyway so a stray pick can't early-spawn the subprocess.
-        if self.unbound {
+        // A reviewer or verifier keeps its mode for life (the host refuses the
+        // same change from a phone).
+        if self.unbound || self.spawn_posture != Default::default() {
             return;
         }
         // The baseline ("no flag") mode comes from the backend, not a const —
@@ -3035,7 +2554,7 @@ impl AgentChatView {
     /// of spawning a real subprocess, and skip the background drain so a
     /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
     #[cfg(test)]
-    fn with_connection_for_test(
+    pub(crate) fn with_connection_for_test(
         connection: Arc<dyn AgentConnection>,
         theme: Theme,
         density: Density,
@@ -3068,6 +2587,11 @@ impl AgentChatView {
             thread: ChatThread::new(),
             connection: Some(connection),
             remote_session_id,
+            spawn_posture: Default::default(),
+            posture_refused: None,
+            send_gate: Self::new_send_gate(),
+            pending_send_uuid: None,
+            pending_respawn: false,
             remote,
             backend: ChatBackend::stream_json(),
             composer,
@@ -3126,6 +2650,7 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: None,
+            drain_gen: 0,
             _remote_prompt_task: None,
             _remote_choice_task: None,
             remote_choice_tx: None,
@@ -3243,43 +2768,6 @@ impl AgentChatView {
         !self.unbound && self.connection.is_some()
     }
 
-    /// Bridge the connection's blocking `std::mpsc` receiver onto the
-    /// foreground: a dedicated OS thread forwards each decoded event to an async
-    /// channel a `cx.spawn` task awaits and applies. The forwarder exits when
-    /// the process closes stdout, which ends the async channel and triggers the
-    /// fail-closed disconnect handler.
-    fn spawn_drain(
-        rx: std::sync::mpsc::Receiver<ThreadEvent>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        let (fwd_tx, mut fwd_rx) = futures::channel::mpsc::unbounded::<ThreadEvent>();
-        std::thread::spawn(move || {
-            while let Ok(ev) = rx.recv() {
-                if fwd_tx.unbounded_send(ev).is_err() {
-                    break; // view gone
-                }
-            }
-            // `rx` disconnected (stdout EOF / process exit): `fwd_tx` drops here,
-            // so the foreground task observes the channel end and fails closed.
-        });
-        cx.spawn(async move |this: WeakEntity<Self>, cx| {
-            while let Some(ev) = fwd_rx.next().await {
-                // Drain whatever else is already queued behind this event and
-                // apply the lot as one batch: under a burst (a fast model's
-                // token stream) this collapses N repaints into one for free,
-                // with no added latency — these events had all arrived anyway.
-                let mut batch = vec![ev];
-                while let Ok(queued) = fwd_rx.try_recv() {
-                    batch.push(queued);
-                }
-                if this.update(cx, |view, cx| view.apply_batch(batch, cx)).is_err() {
-                    return; // view dropped
-                }
-            }
-            let _ = this.update(cx, |view, cx| view.on_disconnect(cx));
-        })
-    }
-
     /// The sender for this tab's choice relay, starting the relay on first use.
     ///
     /// One relay per view for its whole life, rather than one per binding: a
@@ -3344,7 +2832,13 @@ impl AgentChatView {
     /// message); anything else paints at once.
     fn apply_batch(&mut self, batch: Vec<ThreadEvent>, cx: &mut Context<Self>) {
         let all_delta = batch.iter().all(ThreadEvent::is_delta);
+        let generation = self.drain_gen;
         for ev in batch {
+            // A respawn run by an earlier event (the turn's end) replaced the
+            // process the rest of this batch came from.
+            if self.drain_gen != generation {
+                break;
+            }
             // Tee each event to any remote subscribers (gated: `remote` is `Some`
             // only while remote control is enabled, so this clone never runs on a
             // disabled desktop). The desktop UI keeps its own dedicated channel —
@@ -3352,7 +2846,9 @@ impl AgentChatView {
             if let Some(binding) = &self.remote {
                 binding.ingest(ev.clone());
             }
+            let refuse_plan = self.before_apply(&ev, cx);
             self.apply_event(ev, cx);
+            self.after_apply(refuse_plan);
         }
         // A fresh chat is registered under a placeholder id until the agent mints
         // its own; once the fold has one, move the session onto it. Checked after
@@ -3585,86 +3081,24 @@ impl AgentChatView {
             && !self.interrupted
             && !self.disconnected
             && !self.retry.is_armed()
+            && !self.awaiting_steer()
         {
             // A turn just completed — decide whether it changed repo state, so
             // the rewind "restore files" affordance only lights up when there's
             // something to restore. Background compare against the pre-turn sha.
             self.compare_turn_checkpoint(cx);
+            self.run_pending_respawn(cx);
             self.flush_next_queued(cx);
         }
-    }
-
-    /// Take a checkpoint anchored to the user entry at `user_index`, off-thread.
-    /// Attaches the sha to that entry when done (a no-op if the thread moved on)
-    /// and records it as the pre-turn snapshot for the turn-end compare.
-    fn take_checkpoint_for(&mut self, user_index: usize, cx: &mut Context<Self>) {
-        let Some(engine) = self.checkpoint_engine.clone() else { return };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
-        // Bind the snapshot to the session it was taken for. A rewind mints a
-        // new session id and renumbers entries, so a straggling callback from a
-        // pre-rewind turn must not misattach onto a same-index entry.
-        let session = self.thread.session_id.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        handle.spawn(async move {
-            let _ = tx.send(engine.create().await.ok());
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Some(sha)) = rx.await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.thread.session_id != session {
-                        return; // stale — the session was rewound out from under us
-                    }
-                    this.thread.attach_checkpoint(user_index, sha.0.clone());
-                    this.pre_turn_checkpoint =
-                        Some((user_index, oximux_git::checkpoint::CheckpointSha(sha.0)));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// After a turn ends, compare a fresh snapshot against the pre-turn one; if
-    /// they differ, light up the rewind "restore files" affordance on that
-    /// turn's user entry. The fresh snapshot is only used for the compare.
-    fn compare_turn_checkpoint(&mut self, cx: &mut Context<Self>) {
-        let (Some(engine), Some((index, pre_sha))) =
-            (self.checkpoint_engine.clone(), self.pre_turn_checkpoint.take())
-        else {
-            return;
-        };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
-        let session = self.thread.session_id.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        handle.spawn(async move {
-            let changed = match engine.create().await {
-                Ok(post) => engine.differs(&pre_sha, &post).await.unwrap_or(false),
-                Err(_) => false,
-            };
-            let _ = tx.send(changed);
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(changed) = rx.await
-                && changed
-            {
-                let _ = this.update(cx, |this, cx| {
-                    if this.thread.session_id != session {
-                        return; // stale — session rewound before the compare landed
-                    }
-                    this.thread.set_checkpoint_show(index, true);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
     }
 
     /// Send the oldest message the composer parked while a turn streamed, if any.
     /// Driven off the natural turn-end edge in [`Self::on_event`]; since each
     /// completed turn releases exactly one, a lined-up batch drains in order.
     fn flush_next_queued(&mut self, cx: &mut Context<Self>) {
-        if let Some((text, images)) = self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
-            self.send_text(text, images, cx);
+        match self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
+            Some((text, images)) => self.send_text(text, images, cx),
+            None => self.flush_send_gate(cx),
         }
     }
 
@@ -3673,162 +3107,11 @@ impl AgentChatView {
     /// tool never ran, since the process is gone). Best-effort deny in case
     /// stdin is briefly still writable, then mark the tool `Rejected` so the UI
     /// never shows a dangling approval prompt.
-    /// (Re)bind this session into the remote-control registry: drop any prior
-    /// binding, then register the current connection under [`Self::remote_session_id`]
-    /// — but only while remote control is enabled, so a disabled desktop registers
-    /// nothing and clones no events. Called on connect and on respawn.
-    /// Move this session onto the agent's own id once the agent has minted one.
-    ///
-    /// A chat that has never run is registered under a positional placeholder,
-    /// which is worthless to a remote client the moment the desktop restarts.
-    /// The agent's id names the conversation instead, so the session is re-keyed
-    /// onto it at the first opportunity — which is also the first moment it has
-    /// any history worth reaching from another device.
-    ///
-    /// Re-registering under the new id restarts `seq` at 1, so the old id is
-    /// dropped only after the new one is live: a client subscribed to the
-    /// placeholder sees its stream end and resubscribes, rather than sitting on a
-    /// cursor no future event will ever exceed.
-    fn rekey_remote_session_if_needed(&mut self, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.thread.session_id.clone() else {
-            return;
-        };
-        if agent_id.is_empty() || agent_id == self.remote_session_id {
-            return;
-        }
-        let previous = std::mem::replace(&mut self.remote_session_id, agent_id);
-        // `bind_remote` registers under the field just replaced; the old entry is
-        // removed afterwards so the two never coexist beyond this call.
-        self.bind_remote(cx);
-        if let Some(rc) = cx.try_global::<RemoteControl>() {
-            rc.unregister(&previous);
-        }
-    }
-
-    fn bind_remote(&mut self, cx: &mut Context<Self>) {
-        // Deliberately does NOT unregister first. On a respawn this runs again for
-        // the same session id, and `register` swaps the backend in place — keeping
-        // `seq` monotonic so a subscribed phone keeps receiving. Unregistering here
-        // would mint a fresh handle at seq 1, which every subscriber would silently
-        // discard as already-seen. Teardown paths still call `unbind_remote`.
-        let bound = self
-            .connection
-            .clone()
-            .and_then(|conn| {
-                cx.try_global::<RemoteControl>().and_then(|rc| rc.bind(&self.remote_session_id, conn))
-            });
-        match bound {
-            Some(binding) => {
-                self.remote = Some(binding);
-                // Expose the current transcript at once — on a restart this fold was
-                // restored from disk and never entered the event ring, so a phone
-                // opening the session before the next event would otherwise see it
-                // empty. Meta too, so the row is labelled from the first list.
-                self.publish_remote_meta();
-                self.publish_remote_transcript();
-                // Re-arm the remote-prompt echo relay against the new binding.
-                let (tx, rx) = futures::channel::mpsc::unbounded();
-                let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
-                if let Some(binding) = &self.remote {
-                    binding.set_prompt_sink(tx);
-                    binding.set_event_sink(event_tx);
-                }
-                self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, cx));
-                // Point the *existing* choice relay at the new binding rather than
-                // starting a fresh one. This path runs inside `change_model` →
-                // `respawn`, so the relay is mid-flight on the very pick that
-                // caused it: replacing the task here would drop that future and
-                // cancel its reply, telling the phone a change it just made had
-                // failed. Re-registering the same sender is enough — a rebind may
-                // mint a new handle (after an unbind), and this points it back.
-                let choice_tx = self.choice_relay_sender(cx);
-                if let Some(binding) = &self.remote {
-                    binding.set_choice_sink(choice_tx);
-                }
-            }
-            // No connection, or remote is disabled — drop any prior binding.
-            None => self.unbind_remote(),
-        }
-    }
-
-    /// Drop this session's registry binding (on disconnect / teardown). No-op when
-    /// unbound. Explicit because the registry retains its own handle `Arc`, so
-    /// dropping the view's handle alone would not evict the session.
-    fn unbind_remote(&mut self) {
-        if let Some(binding) = self.remote.take() {
-            binding.unregister(&self.remote_session_id);
-        }
-    }
-
-    /// Push this tab's title + effective model into the registry so a remote
-    /// session list renders them instead of the raw `agent-N` id. No-op when remote
-    /// is disabled (`remote` is `None`); the registry skips unchanged values, which
-    /// is the common case on a per-batch call.
-    fn publish_remote_meta(&self) {
-        let Some(binding) = &self.remote else {
-            return;
-        };
-        binding.set_meta(SessionMeta {
-            // The tab's visible title (a manual rename, else the running label) is
-            // what the desktop shows, so it wins; fall back to the thread's
-            // provider-native title until the pane group has synced one.
-            title: self.remote_tab_title.clone().or_else(|| self.thread.title.clone()),
-            model: self.effective_model(),
-            permission_mode: self.effective_permission_mode(),
-            // Git RPCs resolve their repository from this.
-            cwd: Some(self.cwd.clone()),
-        });
-    }
-
-    /// The model this tab is actually running under.
-    ///
-    /// The same shape as [`Self::effective_permission_mode`], and for the same
-    /// reason: `model` is `None` until the user picks one, so a session that has
-    /// never had a pick would otherwise publish nothing and a remote picker would
-    /// render every model unselected — as if the session were running on no model
-    /// at all. The desktop's own composer resolves it exactly this way, falling
-    /// back to the connection's default when the tab holds no pick.
-    ///
-    /// The thread's negotiated model still wins: once the backend reports what it
-    /// actually loaded, that is the truth, and it can differ from the default the
-    /// child was launched with.
-    fn effective_model(&self) -> Option<String> {
-        self.thread
-            .model
-            .clone()
-            .or_else(|| self.model.clone())
-            .or_else(|| self.connection.as_ref().and_then(|c| c.default_model()))
-    }
-
-    /// The permission mode this tab is actually running under.
-    ///
-    /// `permission_mode` is `None` for the backend's baseline — that is what makes
-    /// `respawn` omit the flag — so the field alone cannot say what is in force.
-    /// A remote picker needs the resolved answer: it holds no connection of its
-    /// own to ask for the baseline.
-    fn effective_permission_mode(&self) -> Option<String> {
-        self.permission_mode
-            .clone()
-            .or_else(|| self.connection.as_ref().and_then(|c| c.default_mode()))
-    }
-
-    /// Record the visible tab title (a manual rename, else the running `Chat N` /
-    /// agent label) the desktop shows for this chat, so a remote session list
-    /// renders the same name instead of the raw `agent-N` id. Pushed by the owning
-    /// pane group on tab create, rename, and ambient title change; re-publishes the
-    /// registry meta only when the title actually changed.
-    pub fn set_remote_tab_title(&mut self, title: Option<String>) {
-        if self.remote_tab_title == title {
-            return;
-        }
-        self.remote_tab_title = title;
-        self.publish_remote_meta();
-    }
-
     fn on_disconnect(&mut self, cx: &mut Context<Self>) {
         // The live process is gone: drop the remote binding so the phone's session
         // list reflects only live sessions (a resume respawns + re-binds).
         self.unbind_remote();
+        self.revoke_spawn_credential(cx);
         let pending = self
             .thread
             .pending_permission()

@@ -22,6 +22,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use super::launch_posture::CliVersion;
+
 /// Upper bound on the login-shell probe. It runs the user's full rc chain on
 /// the UI thread, so it needs a hard ceiling: better an actionable "not
 /// found" than a frozen app behind someone's `.zshrc`.
@@ -120,7 +122,7 @@ fn login_probe_command(bin: &str) -> (String, Vec<String>) {
 fn login_shell_which(bin: &str) -> Option<PathBuf> {
     use oximux_no_window::NoWindow as _;
     let (shell, args) = login_probe_command(bin);
-    let mut child = Command::new(shell)
+    let child = Command::new(shell)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -128,8 +130,21 @@ fn login_shell_which(bin: &str) -> Option<PathBuf> {
         .no_window()
         .spawn()
         .ok()?;
+    let out = bounded_stdout(child, LOGIN_SHELL_PROBE_TIMEOUT, &format!("login-shell probe for `{bin}`"))?;
+    // The LAST non-empty line: an rc file that prints banners ("Now using node
+    // v20.11.0") puts them on stdout ahead of `command -v`'s answer, and
+    // treating the whole blob as one path fails for exactly the
+    // version-manager users this fallback exists to serve.
+    let last = out.lines().rev().find(|l| !l.trim().is_empty())?.trim();
+    let p = PathBuf::from(last);
+    is_executable(&p).then_some(p)
+}
 
-    let deadline = std::time::Instant::now() + LOGIN_SHELL_PROBE_TIMEOUT;
+/// Wait for `child` to exit successfully within `timeout` and return its
+/// stdout. A failure, a timeout or an error is `None`; a child that overstays
+/// is killed rather than left to hang the (UI) thread that asked.
+fn bounded_stdout(mut child: std::process::Child, timeout: Duration, what: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -141,28 +156,50 @@ fn login_shell_which(bin: &str) -> Option<PathBuf> {
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            // Timed out or errored: kill the shell and give up rather than hang.
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                tracing::warn!(
-                    "login-shell probe for `{bin}` exceeded {LOGIN_SHELL_PROBE_TIMEOUT:?}; \
-                     treating it as not found"
-                );
+                tracing::warn!("{what} exceeded {timeout:?}; treating it as not found");
                 return None;
             }
         }
     }
-
     let mut out = String::new();
     child.stdout.take()?.read_to_string(&mut out).ok()?;
-    // The LAST non-empty line: an rc file that prints banners ("Now using node
-    // v20.11.0") puts them on stdout ahead of `command -v`'s answer, and
-    // treating the whole blob as one path fails for exactly the
-    // version-manager users this fallback exists to serve.
-    let last = out.lines().rev().find(|l| !l.trim().is_empty())?.trim();
-    let p = PathBuf::from(last);
-    is_executable(&p).then_some(p)
+    Some(out)
+}
+
+/// Upper bound on a `--version` probe.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What `program --version` reports, or `None` when it cannot be run or read.
+///
+/// Cached by path and modification time rather than for the process: the
+/// Claude CLI updates itself in place, so the binary can change under a
+/// running app, and a stale answer would gate a spawn posture on a CLI that is
+/// no longer the one installed.
+pub fn cli_version(program: &Path) -> Option<CliVersion> {
+    type Key = (PathBuf, Option<std::time::SystemTime>);
+    static CACHE: Mutex<Option<HashMap<Key, Option<CliVersion>>>> = Mutex::new(None);
+    let key: Key = (program.to_path_buf(), std::fs::metadata(program).and_then(|m| m.modified()).ok());
+    if let Some(hit) = CACHE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied())) {
+        return hit;
+    }
+    use oximux_no_window::NoWindow as _;
+    let version = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .no_window()
+        .spawn()
+        .ok()
+        .and_then(|child| bounded_stdout(child, VERSION_PROBE_TIMEOUT, "`--version` probe"))
+        .and_then(|out| CliVersion::parse(&out));
+    if let Ok(mut g) = CACHE.lock() {
+        g.get_or_insert_with(HashMap::new).insert(key, version);
+    }
+    version
 }
 
 #[cfg(unix)]

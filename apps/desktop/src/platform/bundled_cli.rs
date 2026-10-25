@@ -36,6 +36,23 @@ pub const CLI_ENV: &str = "OXIMUX_CLI";
 /// Debug builds only: a directory holding an `oximux` to treat as bundled.
 pub const DEV_OVERRIDE_ENV: &str = "OXIMUX_DEV_CLI_BIN_DIR";
 
+/// The `oximux` binary a chat agent's delegation tool server runs (an
+/// absolute path: the app's own PATH never carries the CLI). The bundled one;
+/// in a debug build without a bundle, the `oximux-cli` cargo built beside the
+/// app binary.
+pub fn cli_path() -> Option<PathBuf> {
+    let bundled = bin_dir().map(|dir| dir.join(if cfg!(windows) { "oximux.exe" } else { "oximux" }));
+    if let Some(path) = bundled.filter(|p| p.is_file()) {
+        return Some(path);
+    }
+    if cfg!(debug_assertions) {
+        let exe = std::env::current_exe().ok()?;
+        let sibling = exe.with_file_name(if cfg!(windows) { "oximux-cli.exe" } else { "oximux-cli" });
+        return sibling.is_file().then_some(sibling);
+    }
+    None
+}
+
 /// The bundled CLI's directory, resolved (and on Windows, refreshed) once.
 pub fn bin_dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();

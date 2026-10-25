@@ -24,6 +24,7 @@ pub mod sim_view;
 pub mod locked_terminals;
 pub mod relay_terminals;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -99,16 +100,30 @@ use oximux_remote_proto::PairingTicket;
 /// Monotonic source of *placeholder* remote session ids, for a chat that has not
 /// yet been given an agent session id of its own.
 ///
-/// Positional and per-process, so it names a view's build order rather than the
-/// conversation — worthless to a client once the desktop restarts. Everything with
-/// a real id uses that instead ([`remote_session_id_for`]); this only has to be
-/// collision-free for the run it exists in.
+/// Positional, so it names a view's build order rather than the conversation —
+/// worthless to a client once the desktop restarts. Everything with a real id
+/// uses that instead ([`remote_session_id_for`]).
 static REMOTE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Mint the next placeholder remote session id (`"agent-N"`), for a chat with no
-/// agent session id yet. Prefer [`remote_session_id_for`], which falls back here.
+/// Mint the next placeholder remote session id (`"agent-<digits>"`), for a chat
+/// with no agent session id yet. Prefer [`remote_session_id_for`], which falls
+/// back here.
+///
+/// Unique across runs, not only within one: the spawn lineage stores a child's
+/// id, and a child that never reports its own id keeps its placeholder there.
+/// A bare counter restarts at 1 every launch, so that row would attach to an
+/// unrelated chat in a later run (inheriting its parent, depth and permit
+/// authority). The run's start time, in milliseconds, prefixes the counter;
+/// the result stays `agent-` plus digits, which is how clients recognise a
+/// placeholder.
 pub fn next_remote_session_id() -> String {
-    format!("agent-{}", REMOTE_SEQ.fetch_add(1, Ordering::Relaxed))
+    static RUN: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    });
+    format!("agent-{run}{:04}", REMOTE_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 /// The id a session is known by remotely.
@@ -138,12 +153,40 @@ pub fn remote_session_id_for(agent_session_id: Option<&str>) -> String {
 pub struct RemoteBinding {
     registry: Arc<SessionRegistry>,
     handle: Arc<SessionHandle>,
+    /// Whether anyone can connect right now (remote or local access on).
+    /// Shared with [`RemoteControl`], so a toggle reaches every live binding.
+    exposed: Arc<AtomicBool>,
 }
 
 impl RemoteBinding {
     /// Fan one backend event into the bound session (assign seq, store, broadcast).
     pub fn ingest(&self, event: oximux_agents::thread::ThreadEvent) {
-        self.handle.ingest(event);
+        // The event ring exists for remote readers. With nobody able to
+        // connect, a chat is registered only for the host core (which reads
+        // the working flag, not events), so the copy is skipped.
+        // Receipts are for the host core itself, and a watched session (a
+        // delegated child) reports to its parent: those pass either way.
+        if self.exposed() || event.is_receipt() || self.handle.watched() {
+            self.handle.ingest(event);
+        }
+    }
+
+    /// Whether the session's event ring holds nothing yet (a fresh registration).
+    pub fn is_empty(&self) -> bool {
+        self.handle.events_since(0).is_empty()
+    }
+
+    /// Attach the view's send gate to the session (remote prompts and the
+    /// host's child events queue there), or detach it.
+    pub fn set_gate(&self, gate: Option<Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>>) {
+        self.handle.set_gate(gate);
+    }
+
+    /// Whether anyone can connect (remote or local access on). Callers skip
+    /// work done only for remote readers — serializing the transcript — when
+    /// it is false.
+    pub fn exposed(&self) -> bool {
+        self.exposed.load(Ordering::Acquire)
     }
 
     /// Publish the session's display metadata (title/model) so a remote client's
@@ -152,12 +195,21 @@ impl RemoteBinding {
         self.handle.set_meta(meta);
     }
 
+    /// Publish whether the session is working (a turn running, or a prompt
+    /// waiting), which the host's lineage subscriber parks or revives a spawned
+    /// child from.
+    pub fn set_working(&self, working: bool) {
+        self.handle.set_working(working);
+    }
+
     /// Publish the folded transcript so a remote client opening this session sees
     /// its full history — including one restored from disk after a restart, which
     /// never entered the event ring. `entries_json` is the folded `Vec<ThreadEntry>`
     /// as JSON; the registry pairs it with the current seq for the client's resume.
     pub fn publish_transcript(&self, entries_json: String, model: Option<String>) {
-        self.handle.publish_transcript(entries_json, model);
+        if self.exposed() {
+            self.handle.publish_transcript(entries_json, model);
+        }
     }
 
     /// Register the sink that relays remotely-injected prompts (phone sends) back to
@@ -278,14 +330,20 @@ pub struct RemoteControl {
     /// id — and since a paired phone dials by that id, every restart would silently
     /// invalidate every pairing. `None` = ephemeral identity (tests).
     endpoint_secret: Option<[u8; 32]>,
-    /// Local CLI access — a second, independent switch beside `enabled`. Either
-    /// one populates the session registry; both off keeps the tested
-    /// `disabled_binds_nothing` invariant: no registry rows, no socket, no token.
+    /// Local CLI access — a second, independent switch beside `enabled`. Both
+    /// off keeps the tested `disabled_binds_nothing` invariant: no socket, no
+    /// token, nothing on the network. Registry rows are allowed either way:
+    /// the host core reads them (spawned children park and revive off them)
+    /// whether or not anyone can connect.
     local_enabled: AtomicBool,
     /// The running local listener, once bound. Dropping the handle aborts the
     /// accept loop AND every in-flight CLI connection — the local analogue of
     /// dropping the iroh `HostHandle`.
     local: Mutex<Option<local_listener::LocalHandle>>,
+    /// `enabled || local_enabled`, shared with every [`RemoteBinding`] so the
+    /// remote-only work (event ring, transcript) stops while nobody can
+    /// connect, though chats stay registered for the host core.
+    exposed: Arc<AtomicBool>,
     /// Proof that this process, and no other, is the host for the data
     /// directory — the same advisory lock `oximux serve` takes.
     ///
@@ -302,6 +360,36 @@ pub struct RemoteControl {
     /// Remote legitimately rebinds over our own live listener. Taking it only
     /// when it is not already held keeps that path working.
     host_lock: Mutex<Option<oximux_single_instance::SingleInstanceGuard>>,
+    /// The process-wide orchestration state (spawn lineage, host config), built
+    /// once at boot and shared by both dispatchers. `None` until installed
+    /// (tests, and the brief window before boot wires it).
+    host_core: Option<Arc<oximux_remote_host::HostCore>>,
+    /// Each live chat's credential, by registry id: kept so a rekey can
+    /// re-point it and a listener started again can re-register it.
+    chat_credentials: Mutex<HashMap<String, ChatCredential>>,
+}
+
+/// One chat agent's local-control credential.
+struct ChatCredential {
+    /// What the agent's `OXIMUX_SESSION_ID` carries.
+    label: String,
+    secret: String,
+    /// The same credential as an owner-only file, for the delegation tool
+    /// server the agent starts. Removed with the credential.
+    file: Option<std::path::PathBuf>,
+}
+
+/// What a chat's spawn carries to reach the host as its own session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatAccess {
+    /// `OXIMUX_SESSION_ID` and `OXIMUX_SESSION_TOKEN`.
+    pub env: Vec<(String, String)>,
+    /// The credential as a file (`oximux mcp --credential-file`), when it
+    /// could be written.
+    pub credential_file: Option<std::path::PathBuf>,
+    /// The host's runtime directory, named to the tool server explicitly: an
+    /// agent CLI may start it with none of the app's environment.
+    pub runtime_dir: std::path::PathBuf,
 }
 
 impl Global for RemoteControl {}
@@ -339,7 +427,10 @@ impl RemoteControl {
             endpoint_secret: None,
             local_enabled: AtomicBool::new(false),
             local: Mutex::new(None),
+            exposed: Arc::new(AtomicBool::new(false)),
             host_lock: Mutex::new(None),
+            host_core: None,
+            chat_credentials: Mutex::new(HashMap::new()),
         }
     }
 
@@ -390,6 +481,28 @@ impl RemoteControl {
     ) {
         self.teams = Some(teams);
         self.coord = Some(coord);
+    }
+
+    /// Build the host core over this host's registry. Called once at boot, with
+    /// the process runtime and the shared database's lineage store; the core
+    /// runs from then on whether or not any listener is enabled.
+    pub fn install_host_core(
+        &mut self,
+        rt: tokio::runtime::Handle,
+        lineage: oximux_agents::lineage::LineageStore,
+        config: oximux_remote_host::HostConfig,
+    ) {
+        self.host_core = Some(oximux_remote_host::HostCore::new(oximux_remote_host::HostCoreDeps {
+            rt,
+            lineage,
+            registry: self.registry.clone(),
+            config,
+        }));
+    }
+
+    /// The host core, once installed.
+    pub fn host_core(&self) -> Option<Arc<oximux_remote_host::HostCore>> {
+        self.host_core.clone()
     }
 
     /// Install the transcriber the host serves. Called once at boot with a
@@ -443,15 +556,28 @@ impl RemoteControl {
         self.registry.clone()
     }
 
-    /// Drop a session from the registry by id.
-    ///
-    /// For the one case a [`RemoteBinding`] cannot cover: a view re-keying itself
-    /// onto the agent's own session id has to remove the entry it was registered
-    /// under before, and by then its binding is already pointing at the new one.
-    /// Ordinary teardown goes through the binding, which carries the registry
-    /// with it precisely so `Drop` needs no context.
-    pub fn unregister(&self, id: &str) {
-        self.registry.unregister(id);
+    /// A chat moved from `old` to the agent's own session id `new` (the view
+    /// has already registered under `new`). The one place every record keyed
+    /// by a session id follows it: the spawn lineage (its row, its children,
+    /// its tree, the outbox) and the registry entry. Each of those joins on the
+    /// id and fails *closed* on a stale one — a child would silently lose its
+    /// parking, its parent's authority and its notifications — so none of them
+    /// may be renamed anywhere else.
+    pub fn rekey_session(&self, old: &str, new: &str) {
+        if let Some(core) = &self.host_core
+            && let Err(err) = core.lineage().rekey(old, new)
+        {
+            tracing::warn!(%err, old, new, "lineage rekey failed");
+        }
+        let mut credentials = self.chat_credentials.lock().unwrap();
+        if let Some(credential) = credentials.remove(old) {
+            if let Some(handle) = self.local.lock().unwrap().as_ref() {
+                handle.bind_session(&credential.label, new);
+            }
+            credentials.insert(new.to_string(), credential);
+        }
+        drop(credentials);
+        self.registry.unregister(old);
     }
 
     pub fn enabled(&self) -> bool {
@@ -460,6 +586,11 @@ impl RemoteControl {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Release);
+        self.refresh_exposed();
+    }
+
+    fn refresh_exposed(&self) {
+        self.exposed.store(self.enabled() || self.local_enabled(), Ordering::Release);
     }
 
     pub fn local_enabled(&self) -> bool {
@@ -468,6 +599,7 @@ impl RemoteControl {
 
     pub fn set_local_enabled(&self, on: bool) {
         self.local_enabled.store(on, Ordering::Release);
+        self.refresh_exposed();
     }
 
     /// Assemble a fresh dispatcher + CSPRNG seed for a host bind. Serves
@@ -557,6 +689,10 @@ impl RemoteControl {
         }
         if let Some(coord) = &self.coord {
             dispatcher = dispatcher.with_coord_store(Arc::clone(coord));
+        }
+        // The same core in every dispatcher this host builds, remote and local.
+        if let Some(core) = &self.host_core {
+            dispatcher = dispatcher.with_host_core(Arc::clone(core));
         }
         if let Some(runner) = &self.schedule_runner {
             dispatcher = dispatcher.with_schedule_runner(Arc::clone(runner));
@@ -735,17 +871,18 @@ impl RemoteControl {
         .detach();
     }
 
-    /// Register `id`→`conn` and return the binding **iff some control surface
-    /// is enabled** — remote, local CLI, or both. `None` with both off, so the
-    /// caller does no work and holds no binding: population is gated, never
-    /// unconditional, which is what keeps `disabled_binds_nothing` true for
-    /// users who enabled neither.
+    /// Register `id`→`conn` and return the binding, whatever the listeners say.
+    ///
+    /// The registry is the host's view of its live chats, not only what remote
+    /// clients see: the host core parks and revives spawned children from it,
+    /// so a chat registers even with remote and local access both off. What
+    /// those switches gate is the front door — no socket is bound, no token
+    /// written and nothing reachable from the network while both are off
+    /// (`disabled_binds_nothing`). Always `Some`; the `Option` stays for the
+    /// callers' teardown shape.
     pub fn bind(&self, id: &str, conn: Arc<dyn AgentConnection>) -> Option<RemoteBinding> {
-        if !(self.enabled() || self.local_enabled()) {
-            return None;
-        }
         let handle = self.registry.register(id.to_string(), conn);
-        Some(RemoteBinding { registry: self.registry.clone(), handle })
+        Some(RemoteBinding { registry: self.registry.clone(), handle, exposed: self.exposed.clone() })
     }
 
     /// Assemble the dispatcher a local listener serves. Shares the live host's
@@ -790,7 +927,16 @@ impl RemoteControl {
             return;
         }
         match local_listener::start(dispatcher, dir, rt) {
-            Ok(handle) => *rc.local.lock().unwrap() = Some(handle),
+            Ok(handle) => {
+                // Chats spawned while an earlier listener ran still hold their
+                // secrets: re-register them rather than respawning anyone.
+                for (session_id, credential) in rc.chat_credentials.lock().unwrap().iter() {
+                    handle.restore_session(&credential.label, &credential.secret, session_id);
+                }
+                *rc.local.lock().unwrap() = Some(handle);
+                // Chats opened while it was off have no credential yet.
+                RemoteControl::refresh_chat_credentials(cx);
+            }
             // The flag stays on so the UI reflects the user's choice, but with
             // nothing bound the CLI reports the host unreachable — which is
             // true, and better than a toggle that looks on and answers nothing.
@@ -812,8 +958,13 @@ impl RemoteControl {
             return true;
         }
         let path = dir.join(oximux_remote_local::HOST_LOCK_FILENAME);
-        match oximux_single_instance::try_acquire(&path) {
+        match oximux_single_instance::try_acquire_as(&path, "desktop") {
             Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => {
+                // This process now owns the data dir: let the host core settle
+                // what the previous owner left (it is provably gone).
+                if let Some(core) = &self.host_core {
+                    core.start(oximux_remote_host::PriorOwner::from_previous(guard.previous()));
+                }
                 *held = Some(guard);
                 true
             }
@@ -838,33 +989,78 @@ impl RemoteControl {
         }
     }
 
-    /// Mint a credential confining one agent process to `session_id`, for the
-    /// spawner to inject into that process's environment. `None` when local
-    /// access is off — there is no listener to honor it, and an agent that
-    /// receives no credential simply cannot reach the control socket.
+    /// Mint the credential a chat's agent process is spawned with: the
+    /// `OXIMUX_SESSION_ID` / `OXIMUX_SESSION_TOKEN` pair confining it to its own
+    /// session and the agents it spawns. Called on every (re)spawn; the
+    /// previous process's credential is revoked as the new one is minted.
     ///
-    /// **Nothing calls this yet, and the confinement is therefore not in force:**
-    /// an agent that runs `oximux` reads the operator token file (it is the same
-    /// OS user) and is served full scope. Wiring it is not a matter of finding
-    /// the spawn site. A chat's `remote_session_id` starts as a placeholder and
-    /// is REKEYED once the agent reports its own id
-    /// (`rekey_remote_session_if_needed`), while a child's environment is fixed
-    /// at spawn and cannot be revised afterwards — so either the credential is
-    /// minted against a spawn-time identity the listener then re-maps on rekey,
-    /// or the id has to be known before the process exists. That choice belongs
-    /// with the phase that wires it, not here.
-    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
-    pub fn grant_agent_credential(&self, session_id: &str) -> Option<String> {
-        self.local.lock().unwrap().as_ref().map(|h| h.grant_session(session_id))
+    /// `None` when confinement is off (the agent keeps operator reach, as
+    /// before) or local access is off (no listener to honor a credential; the
+    /// agent cannot reach the socket at all).
+    ///
+    /// Minted against an opaque label and bound to `session_id`, the chat's
+    /// registry id, which may still be a placeholder: the process's environment
+    /// is fixed at spawn, so a later rekey re-points the credential
+    /// ([`Self::rekey_session`]) rather than the agent learning a new secret.
+    pub fn mint_chat_credential(&self, session_id: &str) -> Option<ChatAccess> {
+        if !self.host_core.as_ref().is_none_or(|core| core.config().confine_chat) {
+            return None;
+        }
+        let local = self.local.lock().unwrap();
+        let handle = local.as_ref()?;
+        let label = oximux_remote_local::credential_label();
+        let secret = handle.grant_session(&label);
+        handle.bind_session(&label, session_id);
+        let file = write_credential_file(&handle.credential_dir(), &label, &secret);
+        let previous = self.chat_credentials.lock().unwrap().insert(
+            session_id.to_string(),
+            ChatCredential { label: label.clone(), secret: secret.clone(), file: file.clone() },
+        );
+        if let Some(previous) = previous {
+            handle.revoke_session(&previous.label);
+            remove_credential_file(previous.file);
+        }
+        Some(ChatAccess {
+            env: oximux_remote_local::credential_env(&label, &secret),
+            credential_file: file,
+            runtime_dir: handle.runtime_dir().to_path_buf(),
+        })
     }
 
-    /// Drop an agent's credential when its session ends. Unused for as long as
-    /// [`grant_agent_credential`](Self::grant_agent_credential) is.
-    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
-    pub fn revoke_agent_credential(&self, session_id: &str) {
-        if let Some(handle) = self.local.lock().unwrap().as_ref() {
-            handle.revoke_session(session_id);
+    /// The host settings in force, or the defaults before the core is
+    /// installed.
+    pub fn host_config(&self) -> oximux_remote_host::HostConfig {
+        self.host_core.as_ref().map_or_else(Default::default, |core| core.config())
+    }
+
+    /// Give every open chat whose agent has no credential one, by respawning it
+    /// (after its turn, if one is running). For local access or confinement
+    /// switched on while chats were open: until then their agents keep the
+    /// operator reach they were spawned with.
+    pub fn refresh_chat_credentials(cx: &mut gpui::App) {
+        let Some(rc) = cx.try_global::<RemoteControl>() else { return };
+        let have: std::collections::HashSet<String> = rc.chat_credentials.lock().unwrap().keys().cloned().collect();
+        let views: Vec<_> = crate::platform::window_registry::all_windows(cx)
+            .into_iter()
+            .flat_map(|(_, workspace)| workspace.read(cx).all_project_panes())
+            .flat_map(|panes| panes.read(cx).agent_chat_views(cx))
+            .collect();
+        for view in views {
+            if !have.contains(view.read(cx).remote_session_id()) {
+                view.update(cx, |view, cx| view.respawn_for_credential(cx));
+            }
         }
+    }
+
+    /// Drop a chat's credential when its agent process is gone.
+    pub fn revoke_chat_credential(&self, session_id: &str) {
+        let Some(credential) = self.chat_credentials.lock().unwrap().remove(session_id) else {
+            return;
+        };
+        if let Some(handle) = self.local.lock().unwrap().as_ref() {
+            handle.revoke_session(&credential.label);
+        }
+        remove_credential_file(credential.file);
     }
 
     /// Flip local CLI access off: the listener, its socket file, and every
@@ -875,7 +1071,41 @@ impl RemoteControl {
         // still bound would let a waiting `serve` win the role and unlink a live
         // node — the exact race the lock exists to prevent, run backwards.
         self.local.lock().unwrap().take();
-        self.host_lock.lock().unwrap().take();
+        if self.host_lock.lock().unwrap().take().is_some()
+            && let Some(core) = &self.host_core
+        {
+            // Another host may take the data dir now; until this process wins
+            // it back, the core writes nothing (guest mode).
+            core.release();
+        }
+    }
+}
+
+/// Write a chat agent's credential file in `dir` (owner-only). The first
+/// write of a run clears the directory: files left by an earlier run belong
+/// to agents that died with it. `None`, logged, when it cannot be written:
+/// the agent then runs without the delegation tools, nothing else changes.
+fn write_credential_file(dir: &std::path::Path, label: &str, secret: &str) -> Option<std::path::PathBuf> {
+    static CLEARED: std::sync::Once = std::sync::Once::new();
+    CLEARED.call_once(|| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    let path = dir.join(label);
+    let written = oximux_owner_only::prepare_owner_only_dir(dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| oximux_remote_local::write_credential_file(&path, label, secret));
+    match written {
+        Ok(()) => Some(path),
+        Err(err) => {
+            tracing::warn!(%err, "chat credential file not written; the agent gets no delegation tools");
+            None
+        }
+    }
+}
+
+fn remove_credential_file(file: Option<std::path::PathBuf>) {
+    if let Some(file) = file {
+        let _ = std::fs::remove_file(file);
     }
 }
 
@@ -1092,13 +1322,17 @@ mod tests {
         let rc = RemoteControl::new();
         assert!(!rc.enabled());
         assert!(!rc.local_enabled(), "local CLI access defaults off too");
-        assert!(rc.bind("agent-1", a_conn()).is_none());
-        assert!(rc.registry().is_empty(), "no session registered while disabled");
+        // The session registers (the host core reads it) ...
+        assert!(rc.bind("agent-1", a_conn()).is_some());
+        assert!(rc.registry().get("agent-1").is_some());
+        // ... but nothing is reachable: no host, no local listener, no auth.
+        assert!(rc.host.lock().unwrap().is_none(), "no remote endpoint while disabled");
+        assert!(rc.local.lock().unwrap().is_none(), "no local socket while disabled");
+        assert!(rc.auth.lock().unwrap().is_none(), "no live auth store while disabled");
     }
 
-    /// Local CLI access alone populates the registry — the gate is widened to
-    /// either switch, not moved: with remote still off, sessions register for
-    /// the local listener to serve.
+    /// Local CLI access alone serves the registry; turning it off again stops
+    /// the listener but keeps registering sessions for the host core.
     #[test]
     fn local_access_alone_binds_sessions() {
         let rc = RemoteControl::new();
@@ -1106,10 +1340,9 @@ mod tests {
         assert!(!rc.enabled(), "remote stays off");
         assert!(rc.bind("agent-1", a_conn()).is_some());
         assert!(!rc.registry().is_empty());
-        // And turning it off again restores the empty-gate behavior for NEW
-        // sessions (live bindings are cut by the listener teardown, not here).
         rc.stop_local();
-        assert!(rc.bind("agent-2", a_conn()).is_none());
+        assert!(rc.bind("agent-2", a_conn()).is_some());
+        assert!(rc.local.lock().unwrap().is_none(), "the listener is gone");
     }
 
     /// Enabled binds a session whose teed events reach a live subscriber in order.
@@ -1131,6 +1364,92 @@ mod tests {
 
         binding.unregister("agent-1");
         assert!(rc.registry().get("agent-1").is_none(), "unregister evicts the session");
+    }
+
+    /// A chat re-keyed onto its agent's id takes its spawn tree with it: the
+    /// children's rows name the new parent, and the placeholder is gone from the
+    /// registry.
+    #[test]
+    fn rekey_session_moves_lineage_and_the_registry_entry() {
+        use oximux_agents::lineage::{
+            LineageStore, NotifyParent, Reservation, SpawnCaps, SpawnOrigin, SpawnParent, SpawnSpec,
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let db = oximux_storage::db::open_memory().unwrap();
+        let lineage = LineageStore::new(db.conn());
+        let mut rc = RemoteControl::new();
+        rc.install_host_core(rt.handle().clone(), lineage.clone(), oximux_remote_host::HostConfig::default());
+        rc.bind("agent-7", a_conn());
+        let spec = SpawnSpec {
+            request_id: "r1".into(),
+            origin: SpawnOrigin::Agent,
+            posture: Default::default(),
+            notify_parent: NotifyParent::Auto,
+            allow_parent_permits: false,
+            preassigned_id: None,
+            fingerprint_input: String::new(),
+        };
+        let now = chrono::Local::now();
+        let Ok(Reservation::Fresh { row_id, .. }) = lineage
+            .reserve(&SpawnParent::Session("agent-7".into()), &spec, SpawnCaps::default(), &|_: &str| true, now)
+            .unwrap()
+        else {
+            panic!("reserve");
+        };
+        lineage.finalize(row_id, "child-1", now).unwrap();
+
+        rc.bind("claude-abc", a_conn());
+        rc.rekey_session("agent-7", "claude-abc");
+        assert_eq!(lineage.row("child-1").unwrap().unwrap().parent_id, "claude-abc");
+        assert!(rc.registry().get("agent-7").is_none(), "the placeholder is unregistered");
+        assert!(rc.registry().get("claude-abc").is_some());
+    }
+
+    /// A chat's credential: minted only with a listener to honor it, one per
+    /// chat (a respawn replaces it), following a rekey, gone on revoke, and
+    /// never minted while confinement is off.
+    #[test]
+    fn chat_credentials_follow_the_chat() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut rc = RemoteControl::new();
+        let db = oximux_storage::db::open_memory().unwrap();
+        rc.install_host_core(
+            rt.handle().clone(),
+            oximux_agents::lineage::LineageStore::new(db.conn()),
+            oximux_remote_host::HostConfig::default(),
+        );
+        assert!(rc.mint_chat_credential("agent-1").is_none(), "no listener, no credential");
+
+        let dispatcher = Arc::new(rc.dispatcher(Arc::new(AuthStore::new())));
+        let handle = local_listener::start(dispatcher, dir.path().to_path_buf(), rt.handle().clone()).unwrap();
+        *rc.local.lock().unwrap() = Some(handle);
+
+        let access = rc.mint_chat_credential("agent-1").expect("a credential");
+        let env = &access.env;
+        let label = env.iter().find(|(k, _)| k == oximux_remote_local::SESSION_ENV_VAR).unwrap().1.clone();
+        assert!(label.starts_with("agent-"), "an opaque label, not the session id: {label}");
+        assert!(env.iter().any(|(k, v)| k == oximux_remote_local::SESSION_TOKEN_ENV_VAR && !v.is_empty()));
+        // The same credential as a file, for the agent's tool server.
+        let file = access.credential_file.clone().expect("a credential file");
+        assert!(file.starts_with(dir.path()));
+        assert_eq!(oximux_remote_local::read_credential_file(&file).unwrap().0, label);
+        let again = rc.mint_chat_credential("agent-1").unwrap();
+        assert_ne!(again, access, "a respawn gets a fresh credential");
+        assert!(!file.exists(), "the old file goes with the old credential");
+        assert_eq!(rc.chat_credentials.lock().unwrap().len(), 1, "one per chat");
+
+        rc.rekey_session("agent-1", "claude-abc");
+        assert!(rc.chat_credentials.lock().unwrap().contains_key("claude-abc"));
+        rc.revoke_chat_credential("claude-abc");
+        assert!(rc.chat_credentials.lock().unwrap().is_empty());
+        assert!(!again.credential_file.unwrap().exists(), "revoked with its credential");
+
+        rc.host_core().unwrap().set_config(oximux_remote_host::HostConfig {
+            confine_chat: false,
+            ..Default::default()
+        });
+        assert!(rc.mint_chat_credential("agent-2").is_none(), "confinement off: operator reach, as before");
     }
 
     /// The host role is one per data directory, and re-taking our own is free.

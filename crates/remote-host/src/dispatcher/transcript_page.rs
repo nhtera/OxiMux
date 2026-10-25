@@ -60,7 +60,7 @@ impl Dispatcher {
         cursor: u64,
         limit: u32,
     ) -> Response {
-        if !self.auth.is_allowed_for(peer, session_id) {
+        if !self.may_read_session(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let (seq, entries_json, model) = match self.registry.get(session_id) {

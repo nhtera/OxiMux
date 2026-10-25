@@ -188,12 +188,18 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// [`Response::ProjectOpened`] reply) — `oximux .`. A v34 host cannot decode
 /// it: see [`OPEN_PROJECT_MIN_VERSION`].
 ///
+/// v36: **agent delegation** ([`Request::SpawnAgent`], [`Request::ListChildren`],
+/// [`Request::CancelAgent`], [`Request::Whoami`], their replies, the
+/// `lineage` wire types, and [`RpcError::Spawn`]): an agent starts child
+/// agents within caps and reaches only its own subtree. A v35 host cannot
+/// decode them: see [`SPAWN_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -316,6 +322,10 @@ pub const SIMULATOR_VIEW_MIN_VERSION: u32 = 34;
 /// Read by the **client**.
 pub const OPEN_PROJECT_MIN_VERSION: u32 = 35;
 
+/// The oldest host that speaks agent delegation (`oximux delegate`,
+/// `oximux whoami`, the orchestration MCP tools). Read by the **client**.
+pub const SPAWN_MIN_VERSION: u32 = 36;
+
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
 /// v17 note above for why pushes, uniquely, need this gate.
@@ -393,6 +403,10 @@ pub enum RpcError {
     /// than "you may not do that", which would send the user to the wrong fix.
     /// Appended last to keep the enum's ordinal encoding append-only (v16).
     Unsupported,
+    /// A delegation call was refused (v36). Only ever sent in reply to a v36
+    /// request, so an older peer never receives it. The message ends with
+    /// what the caller should do instead.
+    Spawn(crate::lineage::SpawnErrorWire),
 }
 
 /// Client → host. Append-only; see the module note.
@@ -963,6 +977,21 @@ pub enum Request {
     /// with [`RpcError::Unauthorized`]); a host with no windows — headless
     /// `oximux serve` — answers [`RpcError::Unsupported`].
     OpenProject { path: String },
+
+    // ---- v36: agent delegation ----
+    /// Start a child agent under `req.parent`, within the host's caps. Replies
+    /// [`Response::AgentSpawned`]; a refusal is [`RpcError::Spawn`].
+    SpawnAgent(crate::lineage::SpawnAgentReq),
+    /// The children of `of` (a session, or a run's synthetic `team:<run>`),
+    /// with `recursive` the whole subtree. Answered from the spawn table: a
+    /// dormant child is listed without being opened.
+    ListChildren { of: String, recursive: bool },
+    /// End `id` (a session, or for the operator a whole run `team:<run>`), and
+    /// with `cascade` everything beneath it. A dormant child is ended without
+    /// being opened.
+    CancelAgent { id: String, cascade: bool },
+    /// Who the caller is to this host, whether it may spawn, and which agents.
+    Whoami,
 }
 
 /// Host → client.
@@ -1204,6 +1233,16 @@ pub enum Response {
     /// linked worktree selected in it when the folder was one the desktop
     /// lists (`None` otherwise, including a worktree it has no row for).
     ProjectOpened { project: ProjectSummaryWire, worktree: Option<String> },
+
+    // ---- v36: agent delegation ----
+    /// Reply to [`Request::SpawnAgent`].
+    AgentSpawned(crate::lineage::SpawnAgentResult),
+    /// Reply to [`Request::ListChildren`].
+    Children(Vec<crate::lineage::LineageWire>),
+    /// Reply to [`Request::CancelAgent`]: the sessions ended, deepest first.
+    AgentsCancelled { ended: Vec<String> },
+    /// Reply to [`Request::Whoami`].
+    Whoami(crate::lineage::WhoamiWire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

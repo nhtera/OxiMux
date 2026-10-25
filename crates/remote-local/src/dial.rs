@@ -113,6 +113,15 @@ pub async fn dial_mcp(runtime_dir: &Path) -> Result<Arc<LocalSocketTransport>, D
     dial_as(runtime_dir, LocalIdentity::Mcp, &token).await
 }
 
+/// Dial as the agent session whose credential is in `path` (written by
+/// [`crate::write_credential_file`]). A file that is missing, loose or
+/// malformed is an access failure, never a fall back to the operator token.
+pub async fn dial_session_file(runtime_dir: &Path, path: &Path) -> Result<Arc<LocalSocketTransport>, DialError> {
+    let (label, secret) = crate::read_credential_file(path)
+        .map_err(|e| DialError::NoCredential(format!("cannot use the credential file: {e}")))?;
+    dial_as(runtime_dir, LocalIdentity::Session(label), &secret).await
+}
+
 /// Dial presenting an explicit identity/secret pair, rather than whichever
 /// credential the environment supplies.
 ///

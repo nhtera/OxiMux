@@ -50,6 +50,23 @@ fn decode_value(v: &Value) -> Vec<ThreadEvent> {
         Some("control_request") => decode_control_request(v),
         Some("result") => decode_result(v),
         Some("rate_limit_event") => decode_rate_limit(v),
+        Some("command_lifecycle") => decode_command_lifecycle(v),
+        _ => Vec::new(),
+    }
+}
+
+/// How far the CLI got with a stdin line it was sent under a uuid. Keyed by
+/// `command_uuid` (the sender's id); the frame's own `uuid` is the frame's.
+/// `queued` only proves the line was parsed (it dies with the process), so it
+/// is not a receipt; `started` is acceptance; `completed` is delivery.
+fn decode_command_lifecycle(v: &Value) -> Vec<ThreadEvent> {
+    let Some(uuid) = v.get("command_uuid").and_then(Value::as_str).filter(|u| !u.is_empty()) else {
+        return Vec::new();
+    };
+    match v.get("state").and_then(Value::as_str) {
+        Some("started") => vec![ThreadEvent::UserMessageAccepted { uuid: uuid.to_string() }],
+        Some("completed") => vec![ThreadEvent::UserMessagesDelivered { uuids: vec![uuid.to_string()] }],
+        Some("cancelled") => vec![ThreadEvent::UserMessageDropped { uuid: uuid.to_string() }],
         _ => Vec::new(),
     }
 }
@@ -576,6 +593,16 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
         if status.is_some() || terminal_reason.is_some() {
             out.push(ThreadEvent::TurnFailed { status, terminal_reason });
         }
+    }
+    // The stdin lines this turn carried, reported by the uuid each was sent
+    // under: the receipt that settles a host send as delivered.
+    let carried: Vec<String> = v
+        .get("user_message_uuids")
+        .and_then(Value::as_array)
+        .map(|uuids| uuids.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    if !carried.is_empty() {
+        out.push(ThreadEvent::UserMessagesDelivered { uuids: carried });
     }
     out.push(ThreadEvent::TurnEnded { result, usage: decode_usage(v), is_error, turn_diff: None });
     out
@@ -1534,3 +1561,7 @@ mod tests {
         assert!(finished >= 2, "both tasks reach a terminal finish, got {finished}");
     }
 }
+
+#[cfg(test)]
+#[path = "stream_json_receipt_tests.rs"]
+mod receipt_tests;

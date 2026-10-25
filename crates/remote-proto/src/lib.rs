@@ -24,6 +24,7 @@
 //! self-describing, handles `Value` natively, and is already the persistence
 //! representation, so encoding is reused rather than reinvented.
 
+pub mod lineage;
 pub mod messages;
 pub mod pairing;
 pub mod proto;

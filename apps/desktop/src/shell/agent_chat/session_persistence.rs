@@ -62,6 +62,9 @@ pub struct RestoredPosture {
     pub omp: Option<oximux_agents::thread::omp::posture::OmpPosture>,
     /// Claude's fast-mode toggle. `None` = never touched.
     pub claude_fast_mode: Option<bool>,
+    /// A spawned child's posture. A resumed chat takes it from its lineage
+    /// row instead when it has one (see `assemble`).
+    pub spawn: oximux_agents::thread::launch_posture::SpawnPosture,
 }
 
 /// Build the initial composer feature-pick overlay for a restored chat, so the
@@ -119,7 +122,8 @@ impl AgentChatView {
     pub fn ensure_connected(&mut self, retry_failed: bool, cx: &mut Context<Self>) {
         // "The deferred connect was tried and its spawn failed" — connection
         // is only `None` while disconnected on the failed-spawn path
-        // (`respawn_with_env` takes the old connection before erroring); a
+        // (`respawn_with_env` takes the old connection before erroring) or
+        // after a posture refusal (which `respawn_with_env` refuses again); a
         // crashed live child keeps its stale handle, so this cannot re-spawn
         // a session the desktop's own error card governs.
         let failed_spawn = self.disconnected && self.connection.is_none();

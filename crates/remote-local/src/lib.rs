@@ -56,9 +56,11 @@ mod secure;
 mod serve;
 mod transport;
 
-pub use dial::{DialError, credential, dial, dial_as, dial_mcp};
+pub use dial::{DialError, credential, dial, dial_as, dial_mcp, dial_session_file};
 pub use hello::{LocalClaim, LocalIdentity};
-pub use secure::{generate_token, read_token_file, write_token_file};
+pub use secure::{
+    generate_token, read_credential_file, read_token_file, write_credential_file, write_token_file,
+};
 pub use serve::{LocalControlListener, PendingConnection};
 pub use transport::{LocalSocketTransport, MAX_FRAME};
 
@@ -121,6 +123,26 @@ pub const SESSION_ENV_VAR: &str = "OXIMUX_SESSION_ID";
 /// separate them at all. An environment variable is inherited only by the
 /// child it was spawned for.
 pub const SESSION_TOKEN_ENV_VAR: &str = "OXIMUX_SESSION_TOKEN";
+
+/// The environment an agent carries: which credential it holds, and the secret
+/// proving it. Both or neither — a token with no label names nothing to look
+/// up, and a label with no token proves nothing.
+pub fn credential_env(label: &str, secret: &str) -> Vec<(String, String)> {
+    vec![
+        (SESSION_ENV_VAR.to_string(), label.to_string()),
+        (SESSION_TOKEN_ENV_VAR.to_string(), secret.to_string()),
+    ]
+}
+
+/// An opaque handle naming one spawn's credential.
+///
+/// Minted with the credential generator even though a label is not itself a
+/// secret: it is the lookup key a caller must name to be *offered* the proof,
+/// and a predictable key would let any same-user process aim the handshake at
+/// a specific agent's credential instead of having to guess both halves.
+pub fn credential_label() -> String {
+    format!("agent-{}", generate_token())
+}
 
 /// The control socket's path inside a host's runtime directory.
 pub fn socket_path(runtime_dir: &Path) -> PathBuf {

@@ -256,6 +256,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "sim_device_approvals",
         sql: include_str!("../migrations/V031__sim_device_approvals.sql"),
     },
+    // V032: the spawn tree (who started which agent, under which caps and
+    // posture), the failed-launch breaker, and the child-event outbox.
+    Migration {
+        version: 32,
+        name: "agent_lineage",
+        sql: include_str!("../migrations/V032__agent_lineage.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

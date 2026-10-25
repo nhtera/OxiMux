@@ -247,8 +247,8 @@ pub enum Command {
         session: String,
     },
     /// Redirect a mid-turn agent with additional guidance. Needs a backend with a
-    /// mid-turn message queue; claude and codex have none and refuse it, so on those
-    /// use `stop` and then `send`
+    /// mid-turn message queue (pi, omp, claude 2.1.310 or later); codex and ACP
+    /// agents refuse it, so on those use `stop` and then `send`
     Steer {
         /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
@@ -390,6 +390,20 @@ pub enum Command {
         #[command(subcommand)]
         command: TeamCommand,
     },
+    /// Start helper agents from inside an agent, and track them.
+    ///
+    /// The child joins your subtree: you can list, message and cancel it, and
+    /// its events come back to you. The host caps how deep and how wide a tree
+    /// may grow; a refusal says what to do instead. Run `oximux whoami` to see
+    /// whether you may spawn and which agents are installed.
+    #[command(verbatim_doc_comment)]
+    Delegate {
+        #[command(subcommand)]
+        command: DelegateCommand,
+    },
+    /// Who this caller is to the host: its scope, its session, and whether it
+    /// may spawn agents (and which).
+    Whoami,
     /// The shared coordination blackboard: versioned keys agents read and write.
     ///
     /// Use `--if-version` for anything two agents might write at once: the
@@ -424,11 +438,27 @@ pub enum Command {
     /// (`{"command": "oximux", "args": ["mcp", "--worktree", "/path/to/repo"]}`).
     /// Six tools: status, observe, act, app, screenshot, wait-consent. The
     /// client asks the user for its own permission, apart from agents'.
+    ///
+    /// `--tools orchestrate` serves the delegation tools instead (spawn, wait,
+    /// send, read, cancel, list children, answer a permit, shared state) to an
+    /// agent OxiMux started, with its own session credential. OxiMux wires it
+    /// into the agents it starts; an outside client never gets these tools.
     Mcp {
-        /// The worktree whose device to serve. Required unless the current
-        /// directory is a worktree OxiMux knows.
+        /// The worktree whose device to serve. Required for the `sim` tools
+        /// unless the current directory is a worktree OxiMux knows.
         #[arg(long, value_name = "PATH")]
         worktree: Option<PathBuf>,
+        /// Which tool sets to serve: `sim`, `orchestrate`, or both.
+        #[arg(long, value_delimiter = ',', default_value = "sim", value_name = "SETS")]
+        tools: Vec<McpToolset>,
+        /// The agent session credential for the `orchestrate` tools (a file
+        /// OxiMux wrote, owner-only). Without it the environment's is used.
+        #[arg(long, value_name = "PATH")]
+        credential_file: Option<PathBuf>,
+        /// The agent `oximux_spawn_agent` starts when none is named (the
+        /// calling agent's own).
+        #[arg(long, value_name = "ID")]
+        default_agent: Option<String>,
     },
     /// Run this machine as a headless OxiMux host.
     ///
@@ -1181,6 +1211,94 @@ pub enum HeartbeatCommand {
         /// The heartbeat id.
         id: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DelegateCommand {
+    /// Start a child agent with a prompt.
+    ///
+    /// Async: returns once the child has started and been given its prompt,
+    /// not when it is done. Its events reach you as it works; `children` shows
+    /// where each one stands.
+    #[command(verbatim_doc_comment)]
+    Spawn {
+        /// Which installed agent (`oximux whoami` lists them).
+        #[arg(long, value_name = "AGENT_ID")]
+        agent: String,
+        /// A model for it (fixed at start; default: the agent's own).
+        #[arg(long)]
+        model: Option<String>,
+        /// What the child may do: default, review (reads only), verify (may
+        /// build and test; a Codex verifier can also edit inside the
+        /// workspace). Never more than you have yourself.
+        #[arg(long, value_enum, default_value_t = PostureArg::Default)]
+        posture: PostureArg,
+        /// Which of its events reach you: auto (all), stuck (failed, waiting
+        /// on someone), off.
+        #[arg(long, value_enum, default_value_t = NotifyArg::Auto)]
+        notify: NotifyArg,
+        /// Let yourself answer its permission prompts (Deny, or Allow
+        /// unchanged; never for commands or edits).
+        #[arg(long)]
+        allow_parent_permits: bool,
+        /// Where it works: `inherit` (your directory), `worktree` or
+        /// `worktree:NAME` (a fresh worktree), or a path inside yours.
+        #[arg(long, default_value = "inherit")]
+        cwd: String,
+        /// The parent session (operator only; an agent spawns under itself).
+        #[arg(long, value_name = "SESSION")]
+        parent: Option<String>,
+        /// An idempotency key: the same key returns the same child instead
+        /// of starting another (default: a fresh one each call).
+        #[arg(long, value_name = "ID")]
+        request_id: Option<String>,
+        /// The child's first message.
+        #[arg(required = true, num_args = 1.., value_name = "PROMPT")]
+        prompt: Vec<String>,
+    },
+    /// The agents you spawned and where each stands.
+    Children {
+        /// Whose children (default: your own session).
+        #[arg(long, value_name = "SESSION")]
+        of: Option<String>,
+        /// Include grandchildren.
+        #[arg(long)]
+        recursive: bool,
+    },
+    /// End a child (and with --cascade everything it spawned). Ends a
+    /// finished child without reopening it.
+    Cancel {
+        /// The child's session id (or, for the operator, `team:<run>`).
+        id: String,
+        /// Also end everything beneath it.
+        #[arg(long)]
+        cascade: bool,
+    },
+}
+
+/// `delegate spawn --posture`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostureArg {
+    Default,
+    Review,
+    Verify,
+}
+
+/// A tool set `oximux mcp` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum McpToolset {
+    /// The worktree's simulator (for an outside MCP client).
+    Sim,
+    /// Delegation, for an agent OxiMux started.
+    Orchestrate,
+}
+
+/// `delegate spawn --notify`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotifyArg {
+    Auto,
+    Stuck,
+    Off,
 }
 
 #[derive(Subcommand, Debug)]

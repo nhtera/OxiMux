@@ -168,6 +168,24 @@ pub(crate) fn start_time_of_pid(pid: u32) -> Option<u64> {
     bsd_info(pid).map(|info| info.pbi_start_tvsec)
 }
 
+pub(crate) fn boot_time_of_system() -> Option<u64> {
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    // SAFETY: `kern.boottime` fills exactly one `timeval`; `tv` is that size
+    // and `size` reports it, so the kernel never writes past the buffer.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&mut tv as *mut libc::timeval).cast::<libc::c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && size == std::mem::size_of::<libc::timeval>() && tv.tv_sec > 0)
+        .then_some(tv.tv_sec as u64)
+}
+
 pub(crate) fn parent_of_pid(pid: u32) -> Option<u32> {
     bsd_info(pid).map(|info| info.pbi_ppid)
 }

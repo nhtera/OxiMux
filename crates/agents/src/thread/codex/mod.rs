@@ -74,6 +74,9 @@ enum Outbound {
 /// turn ids, and the latest token usage (attached to the next `TurnEnded`).
 #[derive(Default)]
 struct CodexState {
+    /// The host's MCP servers as thread `config` (see
+    /// `to_codex_mcp_config`), sent on `thread/start` and `thread/resume`.
+    mcp_config: Option<Value>,
     thread_id: Option<String>,
     current_turn_id: Option<String>,
     last_usage: Option<TurnUsage>,
@@ -110,6 +113,9 @@ struct CodexState {
     /// send with no respawn.
     approval_policy: String,
     sandbox: String,
+    /// A reviewer or verifier: its approval policy and sandbox are what make
+    /// it one, so they are neither offered nor changed after spawn.
+    posture_locked: bool,
     /// Set when Stop was pressed before the turn id was known (the `turn/started`
     /// notification hadn't landed yet). The mapper interrupts as soon as the id
     /// arrives, so a fast Send→Stop doesn't silently no-op.
@@ -135,6 +141,9 @@ struct CodexState {
 
 pub struct CodexAppServerConnection {
     outbound: Sender<Outbound>,
+    /// The connection's own line into the event stream, for what the host
+    /// decides rather than codex reports (an answered MCP elicitation).
+    events: Sender<ThreadEvent>,
     rpc: RpcClient,
     state: Arc<Mutex<CodexState>>,
     child: Arc<Mutex<Child>>,
@@ -143,6 +152,14 @@ pub struct CodexAppServerConnection {
 }
 
 impl CodexAppServerConnection {
+    /// Hold the spawn posture for life: the Approvals and Sandbox selects
+    /// are withdrawn and a change to either is ignored.
+    pub fn lock_posture(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.posture_locked = true;
+        }
+    }
+
     /// Spawn `codex app-server` in `cwd` and start streaming decoded events.
     /// Returns immediately; the handshake runs on the worker thread and emits
     /// [`ThreadEvent::SessionInit`] once `thread/start` resolves.
@@ -153,15 +170,18 @@ impl CodexAppServerConnection {
         effort: Option<&str>,
         posture: Option<(&str, &str)>,
         env: &[(String, String)],
+        mcp_servers: &[oximux_agent_core::thread::mcp_server_spec::McpServerSpec],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (rpc, inbound_rx, child) = RpcClient::spawn(cwd, env)?;
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
+        let events = event_tx.clone();
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
         let state = Arc::new(Mutex::new(CodexState::default()));
         // Seed the current model/effort + posture so the first turn — and the
         // picker labels — reflect the tab's choice. A restored posture overrides
         // the default; a fresh session starts at on-request/workspace-write.
         if let Ok(mut s) = state.lock() {
+            s.mcp_config = oximux_agent_core::thread::mcp_server_spec::to_codex_mcp_config(mcp_servers);
             s.current_model = model.map(str::to_string);
             s.current_effort = effort.map(str::to_string);
             s.cwd = cwd.to_path_buf();
@@ -191,6 +211,7 @@ impl CodexAppServerConnection {
         Ok((
             Self {
                 outbound: out_tx,
+                events,
                 rpc,
                 state,
                 child: Arc::new(Mutex::new(child)),
@@ -241,7 +262,20 @@ impl AgentConnection for CodexAppServerConnection {
             }
         };
         match id {
-            Some(id) if elicitation => self.rpc.respond(id, approvals::to_codex_elicitation(&decision)),
+            Some(id) if elicitation => {
+                self.rpc.respond(id, approvals::to_codex_elicitation(&decision))?;
+                // Codex reports nothing more about an elicitation, so its card
+                // (keyed by the request id) is settled here, whoever answered:
+                // a click, a phone, or the CLI.
+                let denied = matches!(decision, PermissionDecision::Deny { .. });
+                let _ = self.events.send(ThreadEvent::ToolResult {
+                    tool_use_id: request_id.to_string(),
+                    content: if denied { "Declined".into() } else { "Allowed".into() },
+                    is_error: denied,
+                    structured: None,
+                });
+                Ok(())
+            }
             Some(id) => self
                 .rpc
                 .respond(id, json!({ "decision": approvals::to_codex_decision(&decision) })),
@@ -379,11 +413,14 @@ impl AgentConnection for CodexAppServerConnection {
     /// the session's current posture. The `danger-full-access` / `never` options
     /// carry a ⚠ blurb; defaults stay on-request/workspace-write.
     fn features(&self) -> Vec<FeatureControl> {
-        let (approval, sandbox) = self
+        let (approval, sandbox, locked) = self
             .state
             .lock()
-            .map(|s| (s.approval_policy.clone(), s.sandbox.clone()))
+            .map(|s| (s.approval_policy.clone(), s.sandbox.clone(), s.posture_locked))
             .unwrap_or_default();
+        if locked {
+            return Vec::new();
+        }
         vec![
             FeatureControl {
                 id: FEATURE_APPROVALS.to_string(),
@@ -429,6 +466,9 @@ impl AgentConnection for CodexAppServerConnection {
         };
         let mut s = self.state.lock().map_err(|_| anyhow!("codex state poisoned"))?;
         match id {
+            FEATURE_APPROVALS | FEATURE_SANDBOX if s.posture_locked => {
+                anyhow::bail!("this agent's approvals and sandbox are fixed by its spawn posture")
+            }
             FEATURE_APPROVALS => s.approval_policy = wire,
             FEATURE_SANDBOX => s.sandbox = wire,
             _ => {}
@@ -573,9 +613,9 @@ fn worker_loop(
 
     // Snapshot the seeded posture (owned, so it outlives the state lock) and
     // send it on thread/start & thread/resume.
-    let (approval, sandbox) = match state.lock() {
-        Ok(s) => (s.approval_policy.clone(), s.sandbox.clone()),
-        Err(_) => (protocol::DEFAULT_APPROVAL_POLICY.into(), protocol::DEFAULT_SANDBOX.into()),
+    let (approval, sandbox, mcp_config) = match state.lock() {
+        Ok(s) => (s.approval_policy.clone(), s.sandbox.clone(), s.mcp_config.clone()),
+        Err(_) => (protocol::DEFAULT_APPROVAL_POLICY.into(), protocol::DEFAULT_SANDBOX.into(), None),
     };
     let posture = protocol::Posture { approval_policy: &approval, sandbox: &sandbox };
 
@@ -594,7 +634,7 @@ fn worker_loop(
     let res = match resume_id {
         None => match rpc.request(
             protocol::M_THREAD_START,
-            protocol::thread_start_params(model.as_deref(), &cwd, posture),
+            protocol::thread_start_params(model.as_deref(), &cwd, posture, mcp_config.as_ref()),
             HANDSHAKE_TIMEOUT,
         ) {
             Ok(r) => r,
@@ -604,7 +644,7 @@ fn worker_loop(
             }
         },
         Some(tid) => {
-            let params = protocol::thread_resume_params(tid, model.as_deref(), posture);
+            let params = protocol::thread_resume_params(tid, model.as_deref(), posture, mcp_config.as_ref());
             match rpc.request(protocol::M_THREAD_RESUME, params.clone(), HANDSHAKE_TIMEOUT) {
                 Ok(r) => r,
                 Err(e) => {
@@ -837,6 +877,67 @@ fn map_inbound(
 mod tests {
     use super::fork_last_turn_id;
     use super::*;
+
+    /// A reviewer's or verifier's sandbox is fixed: no selects are offered,
+    /// and a change sent anyway is refused and changes nothing.
+    #[test]
+    fn a_locked_posture_offers_and_takes_no_sandbox_change() {
+        let (rpc, _inbound, child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script("read line; sleep 1"))
+                .expect("spawn fake app-server");
+        let (events, _rx) = mpsc::channel();
+        let (outbound, _out_rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(CodexState { sandbox: "read-only".into(), ..Default::default() }));
+        let conn = CodexAppServerConnection {
+            outbound,
+            events,
+            rpc,
+            state: state.clone(),
+            child: Arc::new(Mutex::new(child)),
+            _worker: thread::spawn(|| {}),
+            _mapper: thread::spawn(|| {}),
+        };
+        assert_eq!(conn.features().len(), 2, "an ordinary chat offers both selects");
+        conn.lock_posture();
+        assert!(conn.features().is_empty());
+        assert!(conn.set_feature(FEATURE_SANDBOX, FeatureValue::Choice("danger-full-access".into())).is_err());
+        assert!(conn.set_feature(FEATURE_APPROVALS, FeatureValue::Choice("never".into())).is_err());
+        assert_eq!(state.lock().unwrap().sandbox, "read-only");
+        assert_ne!(state.lock().unwrap().approval_policy, "never");
+    }
+
+    /// Codex says nothing more about an MCP elicitation once it is answered,
+    /// so the connection settles the card itself, whoever answered it.
+    #[test]
+    fn an_answered_elicitation_settles_its_card() {
+        let (rpc, _inbound, child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script("read line; sleep 1"))
+                .expect("spawn fake app-server");
+        let (events, rx) = mpsc::channel();
+        let (outbound, _out_rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(CodexState::default()));
+        state.lock().unwrap().pending_elicitations.insert("e-1".into(), json!(7));
+        let conn = CodexAppServerConnection {
+            outbound,
+            events,
+            rpc,
+            state,
+            child: Arc::new(Mutex::new(child)),
+            _worker: thread::spawn(|| {}),
+            _mapper: thread::spawn(|| {}),
+        };
+        conn.resolve_permission("e-1", PermissionDecision::Deny { message: "no".into() }).unwrap();
+        match rx.try_recv().expect("the card is settled") {
+            ThreadEvent::ToolResult { tool_use_id, is_error, .. } => {
+                assert_eq!(tool_use_id, "e-1");
+                assert!(is_error, "a denial reads as one");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+        // An ordinary approval (codex reports its own outcome) adds nothing.
+        conn.resolve_permission("not-pending", PermissionDecision::Deny { message: "no".into() }).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
 
     /// A thread another process is writing must NOT become a fresh thread.
     ///

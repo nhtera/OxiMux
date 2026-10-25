@@ -53,6 +53,12 @@ pub struct SessionStatus {
     pub last_seq: Seq,
     /// At least one permission request is outstanding (awaiting Allow/Deny).
     pub awaiting_permission: bool,
+    /// The session is doing something: a turn is running or a permission or
+    /// question prompt is waiting on someone. Published by whoever drives the
+    /// session (the desktop view, the headless host), because only it knows
+    /// when a turn begins — the event stream carries the end but not the start.
+    /// The host parks an idle spawned child off this flag, freeing its slot.
+    pub working: bool,
 }
 
 /// How a session presents itself in a remote client's session list. Lives here
@@ -117,8 +123,21 @@ pub struct RemotePrompt {
 struct PendingPermission {
     /// The tool call the request gated, when it named one.
     tool_use_id: Option<String>,
+    /// The tool asking, and what kind of request it is: a parent agent may
+    /// answer only some of them (see [`SessionHandle::pending_permission`]).
+    tool_name: String,
+    kind: crate::thread::PermissionKind,
     /// The input the agent proposed.
     input: serde_json::Value,
+}
+
+/// An undecided permission request, as a decider must see it before choosing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPermissionView {
+    pub tool_name: String,
+    pub kind: crate::thread::PermissionKind,
+    /// The input the agent proposed.
+    pub input: serde_json::Value,
 }
 
 /// Which picker a [`RemoteChoice`] carries.
@@ -178,6 +197,21 @@ pub struct SessionHandle {
     /// Live fan-out for remote subscribers. Bounded; a slow subscriber that lags
     /// recovers via [`Self::events_since`], not by growing this ring.
     live: broadcast::Sender<(Seq, ThreadEvent)>,
+    /// Receipts for the host's own sends ([`ThreadEvent::is_receipt`]): which
+    /// lines the agent started on and which a turn carried. Kept apart from
+    /// `live` and the backlog, which remote clients read.
+    receipts: broadcast::Sender<ThreadEvent>,
+    /// This handle's own id, new each time a session registers: two runs of
+    /// one session (a respawn after a restart, a rekey) never share it, so it
+    /// tells their event sequence numbers apart.
+    incarnation: String,
+    /// The host watches this session (a delegated child): its events go into
+    /// the ring even while no remote reader could connect.
+    watched: std::sync::atomic::AtomicBool,
+    /// The queue every send to this session goes through, owned by whoever
+    /// drives the session (the desktop view) and attached here so remote sends
+    /// and the host's own deliveries join it. `None`: sends write directly.
+    gate: Mutex<Option<Arc<Mutex<crate::send_gate::SendGate>>>>,
     /// Request-ids that have been decided. Insertion is the atomic gate: the
     /// caller whose `insert` returns `true` is the one that fires the transport.
     decided: Mutex<HashSet<String>>,
@@ -256,12 +290,26 @@ impl SessionHandle {
     /// append ahead of it — reordering the backlog `events_since` promises is
     /// ascending.
     pub fn ingest(&self, mut event: ThreadEvent) -> Seq {
+        // A receipt is bookkeeping about the host's sends, not something the
+        // agent said: it goes to the host's receipt listeners and never into the
+        // ring remote clients read (an older client could not decode it).
+        if event.is_receipt() {
+            let _ = self.receipts.send(event);
+            return self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        }
         // Track outstanding permission requests for the coarse status snapshot —
         // and keep the proposal, so a decision that edits it can be recorded.
-        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, input, .. } = &event {
+        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, tool_name, input, kind, .. } =
+            &event
+        {
             self.pending.lock().unwrap().insert(
                 request_id.clone(),
-                PendingPermission { tool_use_id: tool_use_id.clone(), input: input.clone() },
+                PendingPermission {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    kind: *kind,
+                    input: input.clone(),
+                },
             );
         }
 
@@ -288,6 +336,35 @@ impl SessionHandle {
         seq
     }
 
+    /// See the `incarnation` field.
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
+    /// Mark this session watched by the host (its events are always kept).
+    pub fn set_watched(&self, watched: bool) {
+        self.watched.store(watched, Ordering::Release);
+    }
+
+    pub fn watched(&self) -> bool {
+        self.watched.load(Ordering::Acquire)
+    }
+
+    /// Attach (or detach) the send gate of whoever drives this session.
+    pub fn set_gate(&self, gate: Option<Arc<Mutex<crate::send_gate::SendGate>>>) {
+        *self.gate.lock().unwrap() = gate;
+    }
+
+    /// The driver's send gate, if one is attached.
+    pub fn gate(&self) -> Option<Arc<Mutex<crate::send_gate::SendGate>>> {
+        self.gate.lock().unwrap().clone()
+    }
+
+    /// Receipts for the host's sends to this session, from now on.
+    pub fn subscribe_receipts(&self) -> broadcast::Receiver<ThreadEvent> {
+        self.receipts.subscribe()
+    }
+
     /// Subscribe to the live edge. Pair with [`Self::events_since`] on (re)subscribe
     /// to close the gap between the last-seen `seq` and the first live event.
     pub fn subscribe(&self) -> broadcast::Receiver<(Seq, ThreadEvent)> {
@@ -305,6 +382,15 @@ impl SessionHandle {
             .filter(|(seq, _)| *seq > after_seq)
             .cloned()
             .collect()
+    }
+
+    /// The undecided request `request_id`, if it is still pending.
+    pub fn pending_permission(&self, request_id: &str) -> Option<PendingPermissionView> {
+        self.pending.lock().unwrap().get(request_id).map(|p| PendingPermissionView {
+            tool_name: p.tool_name.clone(),
+            kind: p.kind,
+            input: p.input.clone(),
+        })
     }
 
     /// The single atomic gate for deciding a permission. Returns `Ok(true)` for the
@@ -364,6 +450,18 @@ impl SessionHandle {
         Ok(true)
     }
 
+    /// Put a line in this session's transcript that no backend will echo: the
+    /// host's own note (a spawn the caps refused). Same dual path as a
+    /// recorded permission edit — ingested for remote readers and relayed into
+    /// the desktop view's fold.
+    pub fn post_notice(&self, text: &str) {
+        let event = ThreadEvent::Notice(text.to_string());
+        self.ingest(event.clone());
+        if let Some(tx) = self.remote_event_tx.lock().unwrap().as_ref() {
+            let _ = tx.unbounded_send(event);
+        }
+    }
+
     /// Answer an outstanding `AskUserQuestion`, sharing the permission gate so a
     /// question and a permission can never both claim the same `request_id` and
     /// so a racing second answer is refused rather than double-sent.
@@ -400,6 +498,27 @@ impl SessionHandle {
     /// optimistic-echo correlation the view/phone use to dedup the arriving stream
     /// copy against their local echo (threaded through once the surfaces echo).
     pub fn send_prompt(&self, text: &str, images: &[ChatImage]) -> Result<()> {
+        self.send_prompt_from(text, images, crate::send_gate::SendSource::Remote)
+    }
+
+    /// [`Self::send_prompt`] for a sender other than a phone (another agent's
+    /// `send_agent`), which a Stop holds.
+    pub fn send_prompt_from(&self, text: &str, images: &[ChatImage], source: crate::send_gate::SendSource) -> Result<()> {
+        if text.trim().is_empty() && images.is_empty() {
+            anyhow::bail!("an empty prompt");
+        }
+        // A driver with a send gate takes it from here: the prompt waits behind
+        // a running turn, a Stop or an open prompt like a typed one would, and
+        // the driver writes it (and shows it) when it may.
+        if let Some(gate) = self.gate() {
+            let mut gate = gate.lock().unwrap();
+            if gate.has_waker() {
+                gate.push(text.to_string(), images.to_vec(), source, crate::send_gate::DeliveryMode::Queue, None);
+                return Ok(());
+            }
+        }
+        // Written directly: text that only looks like a host event is text.
+        let text = &*crate::envelope::neutralize_forged(text);
         // Held across the write and both records: a reply produced by this write
         // cannot be folded until the user's bubble has been. See `prompt_order`.
         let _order = self.prompt_order.lock().unwrap();
@@ -426,9 +545,28 @@ impl SessionHandle {
     }
 
     /// Redirect the agent mid-turn (backends that support it); no-op default
-    /// otherwise. Same transport as the desktop composer's steer.
+    /// otherwise. Same transport as the desktop composer's steer, and tracked
+    /// the same way: with a driver's gate attached and an agent that reports
+    /// receipts, the line is noted as unstarted (before it is written, so its
+    /// receipt cannot beat the note) and a Stop takes it back.
     pub fn steer(&self, text: &str) -> Result<()> {
-        self.conn().steer(text)
+        self.steer_from(text, crate::send_gate::SendSource::Remote)
+    }
+
+    /// [`Self::steer`], recording who sent it: a line taken back by a Stop or
+    /// dropped by the agent goes back under that sender, so another agent's
+    /// steer stays held by a Stop like its messages do.
+    pub fn steer_from(&self, text: &str, source: crate::send_gate::SendSource) -> Result<()> {
+        let text = crate::envelope::neutralize_forged(text);
+        let conn = self.conn();
+        let Some(gate) = self.gate().filter(|_| conn.reports_receipts()) else {
+            return conn.steer(&text);
+        };
+        let uuid = uuid::Uuid::new_v4();
+        gate.lock().unwrap().note_steered(uuid, Some(crate::send_gate::Steered::new(text.to_string(), source)));
+        conn.steer_tagged(&text, &uuid.to_string()).inspect_err(|_| {
+            gate.lock().unwrap().take_steered(&uuid.to_string());
+        })
     }
 
     /// Run `f` — the handoff of one backend event towards whatever folds it — with
@@ -456,8 +594,17 @@ impl SessionHandle {
         self.conn().capabilities()
     }
 
-    /// Interrupt the current turn.
+    /// Interrupt the current turn. A driver with a send gate runs its own
+    /// Stop (it takes lines written into the turn back first, and holds child
+    /// events afterwards); otherwise the agent is interrupted directly.
     pub fn cancel(&self) -> Result<()> {
+        if let Some(gate) = self.gate() {
+            let mut gate = gate.lock().unwrap();
+            if gate.has_waker() {
+                gate.request_stop();
+                return Ok(());
+            }
+        }
         self.conn().cancel()
     }
 
@@ -637,6 +784,21 @@ impl SessionHandle {
         true
     }
 
+    /// Publish whether the session is working (see [`SessionStatus::working`]).
+    /// Returns whether it changed; a flip nudges the session-list generation so
+    /// the host's lineage subscriber parks or revives the row.
+    pub fn set_working(&self, working: bool) -> bool {
+        let mut flipped = false;
+        self.status_tx.send_modify(|status| {
+            flipped = status.working != working;
+            status.working = working;
+        });
+        if flipped {
+            self.bump_changed();
+        }
+        flipped
+    }
+
     /// Nudge the registry-wide session-list generation so a subscriber re-snapshots.
     fn bump_changed(&self) {
         self.changed.send_modify(|g| *g = g.wrapping_add(1));
@@ -730,6 +892,7 @@ impl SessionRegistry {
             return existing.clone();
         }
         let (live, _) = broadcast::channel(broadcast_cap.max(1));
+        let (receipts, _) = broadcast::channel(64);
         let (status_tx, _) = watch::channel(SessionStatus::default());
         let handle = Arc::new(SessionHandle {
             conn: Mutex::new(conn),
@@ -737,6 +900,10 @@ impl SessionRegistry {
             backlog: Mutex::new(VecDeque::new()),
             backlog_cap: backlog_cap.max(1),
             live,
+            receipts,
+            incarnation: uuid::Uuid::new_v4().to_string(),
+            watched: std::sync::atomic::AtomicBool::new(false),
+            gate: Mutex::new(None),
             decided: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             status_tx,
@@ -1303,5 +1470,66 @@ mod tests {
             }),
             "dropping the model is a change",
         );
+    }
+
+    /// Receipts reach the host's listeners and never the ring remote clients
+    /// read: they take no sequence number and are not replayed.
+    #[test]
+    fn receipts_stay_out_of_the_event_ring() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(crate::thread::StubConnection::default()));
+        let mut receipts = handle.subscribe_receipts();
+        let seq = handle.ingest(ThreadEvent::Notice("before".into()));
+        let receipt = ThreadEvent::UserMessageAccepted { uuid: "u-1".into() };
+        assert_eq!(handle.ingest(receipt.clone()), seq, "no sequence number of its own");
+        assert_eq!(handle.events_since(0).len(), 1, "not retained");
+        assert_eq!(receipts.try_recv().unwrap(), receipt);
+        assert_eq!(handle.ingest(ThreadEvent::Notice("after".into())), seq + 1);
+    }
+
+    /// A steer from the CLI or a phone is tracked in the driver's gate like
+    /// the desktop's own, so a Stop can take it back before it starts.
+    #[test]
+    fn a_remote_steer_is_tracked_until_the_agent_starts_it() {
+        let reg = SessionRegistry::new();
+        let caps = crate::thread::AgentCapabilities { supports_steer: true, ..Default::default() };
+        let stub = Arc::new(crate::thread::StubConnection::default().with_capabilities(caps).with_receipts());
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        handle.set_gate(Some(gate.clone()));
+        handle.steer("check nulls first").unwrap();
+        let uuid = stub.sent()[0]["uuid"].as_str().unwrap().to_string();
+        let taken = gate.lock().unwrap().take_unstarted();
+        assert_eq!(taken.len(), 1);
+        let remote = crate::send_gate::Steered::new("check nulls first", crate::send_gate::SendSource::Remote);
+        assert_eq!((taken[0].0.to_string(), taken[0].1.clone()), (uuid, Some(remote)));
+        // No receipts, nothing to track by: written plainly, as before.
+        let plain = Arc::new(crate::thread::StubConnection::default().with_capabilities(caps));
+        let handle = reg.register("s2".into(), plain.clone());
+        handle.set_gate(Some(gate.clone()));
+        handle.steer("again").unwrap();
+        assert!(!gate.lock().unwrap().awaiting_steer());
+        assert!(plain.sent()[0].get("uuid").is_none());
+    }
+
+    /// With a driver's gate attached, a remote prompt queues there instead of
+    /// going straight to the agent: the driver sends it when the session may
+    /// take it.
+    #[test]
+    fn a_remote_prompt_queues_in_the_drivers_gate() {
+        let reg = SessionRegistry::new();
+        let stub = Arc::new(crate::thread::StubConnection::default());
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        gate.lock().unwrap().set_waker(|| {});
+        handle.set_gate(Some(gate.clone()));
+        handle.send_prompt("from the phone", &[]).unwrap();
+        assert!(stub.sent().is_empty(), "not written yet");
+        let queued: Vec<_> = gate.lock().unwrap().queued().map(|q| (q.text.clone(), q.source)).collect();
+        assert_eq!(queued, [("from the phone".to_string(), crate::send_gate::SendSource::Remote)]);
+        // No driver listening: written directly, as before.
+        gate.lock().unwrap().clear_waker();
+        handle.send_prompt("direct", &[]).unwrap();
+        assert_eq!(stub.sent().len(), 1);
     }
 }

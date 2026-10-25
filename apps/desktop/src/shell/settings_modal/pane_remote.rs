@@ -330,7 +330,7 @@ fn pairing_ticket(cx: &mut gpui::Context<SettingsModal>) -> Option<PairingTicket
 fn status_text(enabled: bool, host_ready: bool, devices: usize, exposed: usize) -> String {
     if !enabled {
         return "Turn on to expose your running agent sessions to the OxiMux mobile app. \
-                Applies to sessions started after it's enabled."
+                Chats already open appear at once; their history fills in from their next reply."
             .to_string();
     }
     if !host_ready {

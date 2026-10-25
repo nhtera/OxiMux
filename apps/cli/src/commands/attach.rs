@@ -24,6 +24,9 @@ pub enum Stop {
     TurnEnded,
     /// Stop when a permission request or question is awaiting a decision.
     NeedsApproval,
+    /// Stop at whichever of the two comes first: the turn ended, or it is
+    /// waiting on a decision (an orchestrating agent's wait on a child).
+    Settled,
 }
 
 /// How a streaming loop ended.
@@ -209,6 +212,8 @@ fn stop_reached(stop: Stop, frame: &HostEvent, event: Option<&ThreadEvent>) -> O
             }
             _ => None,
         },
+        Stop::Settled => stop_reached(Stop::TurnEnded, frame, event)
+            .or_else(|| stop_reached(Stop::NeedsApproval, frame, event)),
         Stop::NeedsApproval => {
             let asked = matches!(
                 event,
