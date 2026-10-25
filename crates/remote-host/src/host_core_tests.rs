@@ -212,3 +212,30 @@ fn prior_owner_classifies_the_previous_record() {
     unknown.boot_time_unix_s = None;
     assert!(matches!(PriorOwner::from_previous(Some(&unknown)), PriorOwner::Unknown { .. }));
 }
+
+/// The stall clock: a parent quiet for longer than the threshold is stalled,
+/// unless a child it spawned is working; a slept clock forgives the silence.
+#[test]
+fn the_health_tick_reads_child_activity_and_forgives_a_sleep() {
+    use oximux_agents::health::{HealthInputs, Process};
+    let f = fixture(HostConfig { stall_after_s: 60, ..HostConfig::default() });
+    f.core.start(PriorOwner::None);
+    let parent = register(&f, "parent");
+    let child = register(&f, "child");
+    child.set_working(true);
+    spawn_child(&f, "parent", "child", SpawnPosture::Default);
+    let t0 = oximux_agents::session_health::now_ms();
+    let quiet = HealthInputs { turn_active: true, process: Process::Live, last_activity_at: t0, ..Default::default() };
+    parent.publish_health(quiet.clone());
+    child.publish_health(HealthInputs { last_activity_at: t0 + 100_000, ..quiet.clone() });
+
+    f.core.refresh_health(t0 + 120_000, false);
+    assert!(parent.health().stalled_since.is_none(), "its child was active 20 s ago");
+
+    child.publish_health(HealthInputs { turn_active: false, last_activity_at: t0 + 100_000, ..quiet });
+    f.core.refresh_health(t0 + 120_000, false);
+    assert_eq!(parent.health().stalled_since, Some(t0), "an idle child does not keep it awake");
+
+    f.core.refresh_health(t0 + 130_000, true);
+    assert!(parent.health().stalled_since.is_none(), "waking from sleep is not silence");
+}

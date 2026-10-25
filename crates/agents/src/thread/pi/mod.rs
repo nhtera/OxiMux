@@ -462,6 +462,10 @@ impl AgentConnection for PiRpcConnection {
         anyhow::bail!("pi has no per-call tool approval; gating is a session-level tool posture")
     }
 
+    fn exit_code(&self) -> Option<i32> {
+        super::connection::reap_exit_code(&self.child)
+    }
+
     fn shutdown(&self) {
         self.rpc.close_stdin();
         self.terminate();

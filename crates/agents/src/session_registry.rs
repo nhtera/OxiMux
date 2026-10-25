@@ -221,6 +221,9 @@ pub struct SessionHandle {
     /// operator-edited approval can be recorded as such.
     pending: Mutex<HashMap<String, PendingPermission>>,
     status_tx: watch::Sender<SessionStatus>,
+    /// The session's health: the driver's published facts and what they mean
+    /// (`session_health.rs`).
+    pub(crate) health: crate::session_health::HealthCell,
     /// Display metadata published by the desktop view (title/model).
     meta: Mutex<SessionMeta>,
     /// The latest folded-transcript snapshot the desktop view published, served to a
@@ -850,12 +853,14 @@ pub struct SessionRegistry {
     /// list-visible state changes. A session-list subscriber awaits this and
     /// re-snapshots, so the phone is pushed the list rather than polling it.
     changed: watch::Sender<u64>,
+    /// The health thresholds every session derives with (the host config).
+    health_cfg: Arc<std::sync::RwLock<crate::health::HealthConfig>>,
 }
 
 impl Default for SessionRegistry {
     fn default() -> Self {
         let (changed, _) = watch::channel(0);
-        Self { sessions: Mutex::new(HashMap::new()), changed }
+        Self { sessions: Mutex::new(HashMap::new()), changed, health_cfg: Default::default() }
     }
 }
 
@@ -912,6 +917,7 @@ impl SessionRegistry {
             decided: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             status_tx,
+            health: crate::session_health::HealthCell::new(self.health_cfg.clone()),
             meta: Mutex::new(SessionMeta::default()),
             transcript: Mutex::new(None),
             remote_prompt_tx: Mutex::new(None),
@@ -941,6 +947,17 @@ impl SessionRegistry {
     /// Look up a live session handle.
     pub fn get(&self, id: &str) -> Option<Arc<SessionHandle>> {
         self.sessions.lock().unwrap().get(id).cloned()
+    }
+
+    /// Every live session, for a periodic look across them.
+    pub fn handles(&self) -> Vec<(SessionId, Arc<SessionHandle>)> {
+        self.sessions.lock().unwrap().iter().map(|(id, h)| (id.clone(), h.clone())).collect()
+    }
+
+    /// Set the health thresholds; every session derives with them from its
+    /// next look.
+    pub fn set_health_config(&self, cfg: crate::health::HealthConfig) {
+        *self.health_cfg.write().unwrap() = cfg;
     }
 
     /// Number of live sessions.

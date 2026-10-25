@@ -250,6 +250,14 @@ pub trait AgentConnection: Send + Sync {
     /// Terminate the session and its process.
     fn shutdown(&self);
 
+    /// How the agent's process ended, once it has, without blocking: its exit
+    /// code (`128 + signal` for one a signal ended). `None` while it runs, or
+    /// for a backend that cannot tell. Read after the output closes, so a dead
+    /// process can be reported with its code rather than as a guess.
+    fn exit_code(&self) -> Option<i32> {
+        None
+    }
+
     /// Interrupt the in-flight turn. Every backend does this over its own
     /// protocol — Claude `{subtype:"interrupt"}`, Codex `turn/interrupt`, pi
     /// `Abort`, ACP `session/cancel` — so none of them depends on a signal, and
@@ -584,6 +592,27 @@ pub struct StubConnection {
     /// Whether it reports receipts for tagged lines, as Claude does. False by
     /// default, like the trait.
     receipts: bool,
+    /// The exit code `exit_code` reports, set by a test playing a dead process.
+    exit: Arc<Mutex<Option<i32>>>,
+}
+
+/// Reap `child` without blocking and read its exit code (`128 + signal` when a
+/// signal ended it, the shell's convention). `None` while it still runs.
+pub(crate) fn reap_exit_code(child: &Mutex<std::process::Child>) -> Option<i32> {
+    let mut child = match child.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let status = child.try_wait().ok()??;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.code().or_else(|| status.signal().map(|s| 128 + s))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code()
+    }
 }
 
 impl StubConnection {
@@ -592,6 +621,11 @@ impl StubConnection {
     pub fn new() -> (Self, Receiver<ThreadEvent>, Sender<ThreadEvent>) {
         let (tx, rx) = mpsc::channel();
         (Self::default(), rx, tx)
+    }
+
+    /// Play a process that exited with `code` (read by `exit_code`).
+    pub fn set_exit_code(&self, code: Option<i32>) {
+        *self.exit.lock().unwrap() = code;
     }
 
     /// Make the stub advertise `caps` (e.g. a rewind-capable Claude-like backend
@@ -636,6 +670,9 @@ impl StubConnection {
 }
 
 impl AgentConnection for StubConnection {
+    fn exit_code(&self) -> Option<i32> {
+        *self.exit.lock().unwrap()
+    }
     fn send_user_message(&self, text: &str) -> Result<()> {
         self.record(user_message_json(text));
         Ok(())

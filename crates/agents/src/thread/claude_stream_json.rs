@@ -882,6 +882,10 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         }
     }
 
+    fn exit_code(&self) -> Option<i32> {
+        super::connection::reap_exit_code(&self.child)
+    }
+
     fn shutdown(&self) {
         // Even if the lock is poisoned (a prior panic while holding it), still
         // kill+reap the child so a `claude` process isn't leaked.
