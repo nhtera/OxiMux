@@ -1068,7 +1068,10 @@ coverage_notes = """
 macOS only: the store and dispatcher tests run in the macOS workspace job. \
 The logic is SQLite and platform-free, but the Windows and Linux jobs do not \
 name these crates. Proven on the desktop host only; the headless host joins in \
-Phase 4b."""
+Phase 4b. Live-checked on the desktop host 2026-10-25 (real Claude and Codex \
+parents in a seeded sandbox): depth 1 by default with the spawn tool absent \
+in a depth-1 child, a cap hit refused with a transcript notice, and the \
+failed-start breaker holding."""
 test_files = ["crates/agents/src/lineage_tests.rs", "crates/remote-host/tests/spawn_lineage.rs"]
 assertions = [
   "concurrent_reservations_at_seven_active_admit_exactly_one",
@@ -1097,7 +1100,10 @@ platforms = ["macos", "windows", "linux"]
 covered_platforms = ["macos"]
 coverage_notes = """
 macOS only, for the same reason as the caps gate. Confinement is a guardrail, \
-not isolation: any process running as the user can read the operator token."""
+not isolation: any process running as the user can read the operator token. \
+Live-checked on the desktop host 2026-10-25: `oximux whoami` inside a chat \
+reads `Session(<id>)`, a parent reads and waits on its children, and the \
+credential reaches the tool server as a file path, never a token in argv."""
 test_files = ["crates/remote-host/src/auth/acl_matrix.rs", "crates/remote-host/tests/spawn_lineage.rs"]
 assertions = [
   "a_session_confined_agent_reaches_only_its_own_session",
