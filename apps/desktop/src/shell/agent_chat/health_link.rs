@@ -133,7 +133,13 @@ impl AgentChatView {
             },
             limited_until: self.retry.pending.as_ref().map(|p| p.wake_at_ms),
             limit_reason: self.retry.pending.as_ref().map(|p| p.reason.clone()),
-            last_turn_failure: t.failed_turn.clone().filter(|_| !self.thread.turn_active),
+            // The fold's message when it has one: it folds in the stderr
+            // diagnostic the raw result lacks.
+            last_turn_failure: t
+                .failed_turn
+                .as_ref()
+                .filter(|_| !self.thread.turn_active)
+                .map(|raw| self.thread.last_error.clone().unwrap_or_else(|| raw.clone())),
             interrupted: self.interrupted,
             process,
             restored: t.restored,

@@ -44,9 +44,14 @@ pub struct HealthCell {
     /// The stall clock restarts no earlier than this (the host's last wake).
     forgiven_until: AtomicI64,
     cfg: Arc<RwLock<HealthConfig>>,
-    /// Held across read-inputs → write-health, so a slower derivation (the
-    /// host's tick) never overwrites one made from newer inputs.
+    /// Held across read-inputs → write-health → set-working, so a slower
+    /// derivation (the host's tick) never overwrites one made from newer
+    /// inputs.
     derive: Mutex<()>,
+    /// The driver has published at least once. Until then the tick leaves the
+    /// session alone: a spawn marks a child working before its view exists,
+    /// and default inputs must not undo that.
+    published: std::sync::atomic::AtomicBool,
 }
 
 impl HealthCell {
@@ -60,13 +65,14 @@ impl HealthCell {
             forgiven_until: AtomicI64::new(0),
             cfg,
             derive: Mutex::new(()),
+            published: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Re-derive at `now`. Returns the new health when what a person would
-    /// read changed (status, liveness, stall, reason), and whether the session
-    /// counts as working.
-    fn recompute(&self, now: i64) -> (Option<SessionHealth>, bool) {
+    /// Re-derive at `now` and hand `set_working` whether the session counts as
+    /// working, under the same lock. Returns the new health when what a person
+    /// would read changed (status, liveness, stall, reason).
+    fn recompute(&self, now: i64, set_working: impl FnOnce(bool)) -> Option<SessionHealth> {
         let _derive = self.derive.lock().unwrap();
         let mut inputs = self.inputs.borrow().clone();
         let children = *self.children.lock().unwrap();
@@ -100,7 +106,8 @@ impl HealthCell {
             *h = next.clone();
             true
         });
-        (changed, working)
+        set_working(working);
+        changed
     }
 }
 
@@ -118,9 +125,11 @@ impl SessionHandle {
             true
         });
         if modified {
-            let (changed, working) = self.health.recompute(now_ms());
+            self.health.published.store(true, Ordering::Relaxed);
+            let changed = self.health.recompute(now_ms(), |working| {
+                self.set_working(working);
+            });
             self.log_change(changed);
-            self.set_working(working);
         }
     }
 
@@ -148,9 +157,13 @@ impl SessionHandle {
     /// at `now` (a quiet session crosses the stall threshold here).
     pub fn refresh_health(&self, now: i64, children: ChildActivity) -> Option<SessionHealth> {
         *self.health.children.lock().unwrap() = children;
-        let (changed, working) = self.health.recompute(now);
+        if !self.health.published.load(Ordering::Relaxed) {
+            return None;
+        }
+        let changed = self.health.recompute(now, |working| {
+            self.set_working(working);
+        });
         self.log_change(changed.clone());
-        self.set_working(working);
         changed
     }
 

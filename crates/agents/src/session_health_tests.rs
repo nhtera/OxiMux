@@ -116,3 +116,13 @@ fn a_stale_continuation_stops_counting_as_working_on_the_host_tick() {
     assert_eq!(h.health().status, HealthStatus::Idle);
     assert!(!h.status().borrow().working, "the lineage can park it");
 }
+
+/// A spawn marks a child working before its view publishes anything; the
+/// host's tick must not undo that from default inputs.
+#[test]
+fn the_tick_leaves_a_session_alone_until_its_driver_publishes() {
+    let (_reg, h) = registry_with("child");
+    h.set_working(true);
+    assert!(h.refresh_health(now_ms() + 60 * MIN, ChildActivity::default()).is_none());
+    assert!(h.status().borrow().working, "the spawn's working flag holds");
+}
