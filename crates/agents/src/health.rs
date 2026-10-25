@@ -124,6 +124,9 @@ pub struct HealthInputs {
     pub children_active: u32,
     /// A prompt waits for a person.
     pub prompt: Option<PromptKind>,
+    /// The request that prompt is for, so a host that decided it (a phone's or
+    /// the CLI's answer) knows it is answered before the driver hears.
+    pub prompt_request: Option<String>,
     /// When an armed retry fires because a provider limit closed the turn.
     pub limited_until: Option<i64>,
     /// Why that retry is armed ("Usage limit reached", "Provider overloaded").

@@ -131,6 +131,11 @@ impl AgentChatView {
             } else {
                 None
             },
+            prompt_request: self
+                .thread
+                .pending_permission()
+                .map(|(_, req)| req.request_id.clone())
+                .or_else(|| self.thread.pending_question().map(|(_, req)| req.request_id.clone())),
             limited_until: self.retry.pending.as_ref().map(|p| p.wake_at_ms),
             limit_reason: self.retry.pending.as_ref().map(|p| p.reason.clone()),
             // The fold's message when it has one: it folds in the stderr

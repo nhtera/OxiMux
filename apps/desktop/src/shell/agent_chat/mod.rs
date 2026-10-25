@@ -3107,6 +3107,7 @@ impl AgentChatView {
             }
         };
         self.thread.set_tool_status(&tool_id, status);
+        self.publish_health();
         cx.notify();
     }
 
@@ -3331,6 +3332,7 @@ impl AgentChatView {
         self.thread.set_tool_status(&tool_id, ToolCallStatus::InProgress);
         self.question_cards.remove(&tool_id);
         self.question_card_subs.remove(&tool_id);
+        self.publish_health();
         cx.notify();
     }
 

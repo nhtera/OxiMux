@@ -455,7 +455,15 @@ impl SessionHandle {
                 let _ = tx.unbounded_send(event);
             }
         }
+        if self.health.published() {
+            self.rederive_health(crate::session_health::now_ms());
+        }
         Ok(true)
+    }
+
+    /// Whether `request_id` was decided through this handle.
+    pub(crate) fn decided_contains(&self, request_id: &str) -> bool {
+        self.decided.lock().unwrap().contains(request_id)
     }
 
     /// Put a line in this session's transcript that no backend will echo: the
@@ -499,6 +507,9 @@ impl SessionHandle {
         }
         self.pending.lock().unwrap().remove(request_id);
         self.update_status(None);
+        if self.health.published() {
+            self.rederive_health(crate::session_health::now_ms());
+        }
         Ok(true)
     }
 

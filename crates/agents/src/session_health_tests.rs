@@ -126,3 +126,21 @@ fn the_tick_leaves_a_session_alone_until_its_driver_publishes() {
     assert!(h.refresh_health(now_ms() + 60 * MIN, ChildActivity::default()).is_none());
     assert!(h.status().borrow().working, "the spawn's working flag holds");
 }
+
+/// A prompt answered through the host (a phone, the CLI) reads answered at
+/// once, though the driver's card only hears from the agent's next frame.
+#[test]
+fn a_prompt_decided_through_the_host_is_answered_at_once() {
+    use crate::health::PromptKind;
+    use crate::thread::PermissionDecision;
+    let (_reg, h) = registry_with("s");
+    h.publish_health(HealthInputs {
+        turn_active: true,
+        prompt: Some(PromptKind::Permission),
+        prompt_request: Some("req-1".into()),
+        ..live_at(now_ms())
+    });
+    assert_eq!(h.health().status, HealthStatus::NeedsPermission);
+    assert!(h.resolve_permission("req-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap());
+    assert_eq!(h.health().status, HealthStatus::Working);
+}

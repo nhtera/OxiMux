@@ -72,9 +72,18 @@ impl HealthCell {
     /// Re-derive at `now` and hand `set_working` whether the session counts as
     /// working, under the same lock. Returns the new health when what a person
     /// would read changed (status, liveness, stall, reason).
-    fn recompute(&self, now: i64, set_working: impl FnOnce(bool)) -> Option<SessionHealth> {
+    fn recompute(
+        &self,
+        now: i64,
+        decided: impl Fn(&str) -> bool,
+        set_working: impl FnOnce(bool),
+    ) -> Option<SessionHealth> {
         let _derive = self.derive.lock().unwrap();
         let mut inputs = self.inputs.borrow().clone();
+        // Answered here (a phone, the CLI) before the driver's card heard.
+        if inputs.prompt_request.as_deref().is_some_and(&decided) {
+            inputs.prompt = None;
+        }
         let children = *self.children.lock().unwrap();
         inputs.children_active = children.working;
         inputs.last_activity_at = inputs
@@ -111,7 +120,19 @@ impl HealthCell {
     }
 }
 
+impl HealthCell {
+    /// Whether the driver has published at least once.
+    pub(crate) fn published(&self) -> bool {
+        self.published.load(Ordering::Relaxed)
+    }
+}
+
 impl SessionHandle {
+    /// Whether `request_id` was decided through this handle.
+    fn is_decided(&self, request_id: &str) -> bool {
+        self.decided_contains(request_id)
+    }
+
     /// Publish the driver's facts. Re-derives the health and the coarse
     /// `working` flag the lineage parks idle children by (a continuation or an
     /// unanswered send counts, so a child still reacting to its background
@@ -126,11 +147,21 @@ impl SessionHandle {
         });
         if modified {
             self.health.published.store(true, Ordering::Relaxed);
-            let changed = self.health.recompute(now_ms(), |working| {
-                self.set_working(working);
-            });
-            self.log_change(changed);
+            self.rederive_health(now_ms());
         }
+    }
+
+    /// Re-derive from the last published facts (a prompt was decided here).
+    pub(crate) fn rederive_health(&self, now: i64) -> Option<SessionHealth> {
+        let changed = self.health.recompute(
+            now,
+            |id| self.is_decided(id),
+            |working| {
+                self.set_working(working);
+            },
+        );
+        self.log_change(changed.clone());
+        changed
     }
 
     /// The thresholds this session derives with (the host config).
@@ -160,11 +191,7 @@ impl SessionHandle {
         if !self.health.published.load(Ordering::Relaxed) {
             return None;
         }
-        let changed = self.health.recompute(now, |working| {
-            self.set_working(working);
-        });
-        self.log_change(changed.clone());
-        changed
+        self.rederive_health(now)
     }
 
     /// The host's clock slept: silence up to `now` is forgiven.
