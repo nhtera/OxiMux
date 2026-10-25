@@ -554,9 +554,18 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
     // real turn's usage footer with a continuation's tiny total. Only the
     // origin-less `result` (the user's own turn) ends the turn; a continuation's
     // closes the continuation the health fold is counting.
-    if v.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str)
-        == Some("task-notification")
-    {
+    //
+    // Except when a user line arrived while the continuation ran: the CLI folds
+    // it into that continuation, and the one result that follows is marked as
+    // the continuation's yet carries the line in `user_message_uuids`. It ends
+    // both, or the user's turn would never end.
+    let continuation = v.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str)
+        == Some("task-notification");
+    let carries_user_line = v
+        .get("user_message_uuids")
+        .and_then(Value::as_array)
+        .is_some_and(|uuids| !uuids.is_empty());
+    if continuation && !carries_user_line {
         return vec![ThreadEvent::ContinuationEnded];
     }
     // Real error subtypes are `error_max_turns`, `error_during_execution`, …
@@ -572,6 +581,9 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
     // state machine. A populated `result` (e.g. a bad-model 404) is the fallback.
     let result = decode_errors(v).or_else(|| v.get("result").and_then(Value::as_str).map(str::to_string));
     let mut out = Vec::new();
+    if continuation {
+        out.push(ThreadEvent::ContinuationEnded);
+    }
     // A stale `--resume` (session gone) needs recovery, not just a message: emit
     // an additive event so the fold clears the dead session id and the next send
     // starts fresh instead of looping the same error. The attempted id is the

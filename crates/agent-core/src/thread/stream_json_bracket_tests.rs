@@ -81,3 +81,21 @@ fn any_result_outside_a_host_turn_closes_a_continuation() {
     thread.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None });
     assert_eq!(thread.continuations_open, 0);
 }
+
+/// Captured on CLI 2.1.310: the user sent a line while a continuation ran.
+/// The CLI folded it in, and the one result that followed is marked as the
+/// continuation's while carrying the line. It must end the user's turn too,
+/// or the chat would stay "running" forever.
+#[test]
+fn a_user_line_folded_into_a_continuation_ends_its_turn() {
+    let fixture = include_str!("testdata/stream_json_folded_continuation_2_1_310.jsonl");
+    let trace = replay(fixture);
+    assert_eq!(trace.last(), Some(&(false, 0)), "turn over, nothing open: {trace:?}");
+    let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
+    let ends = events.iter().filter(|e| matches!(e, ThreadEvent::TurnEnded { .. })).count();
+    assert_eq!(ends, 2, "the first turn's result and the folded line's");
+    assert!(
+        events.iter().any(|e| matches!(e, ThreadEvent::UserMessagesDelivered { uuids } if uuids.len() == 1)),
+        "the folded line is reported delivered"
+    );
+}
