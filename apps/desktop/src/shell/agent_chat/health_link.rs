@@ -212,6 +212,16 @@ impl AgentChatView {
             .and_then(|core| core.prior_owner())
             .is_some_and(|prior| !matches!(prior, oximux_remote_host::PriorOwner::None));
         self.health = HealthTrack::restored(mid_turn, prior_host_gone);
+        // A dormant chat is not bound to the host yet, so this is where its
+        // restored state can be seen.
+        let h = health::compute(&self.health_inputs(), now_ms(), &health::HealthConfig::default());
+        tracing::info!(
+            session = %self.remote_session_id,
+            status = ?h.status,
+            liveness = h.liveness.wire_name(),
+            reason = h.reason.as_deref().unwrap_or(""),
+            "health (restored)"
+        );
     }
 
     /// Whether work was running that a restart would cut short: a turn,
