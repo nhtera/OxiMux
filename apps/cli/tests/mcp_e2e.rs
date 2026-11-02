@@ -386,6 +386,20 @@ fn an_agent_delegates_over_mcp_with_its_own_credential() {
     let odd = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "x", "mode": "shout" }));
     assert!(odd["isError"] == true && text(&odd).contains("unknown mode"), "{odd}");
 
+    // A queued send carries a key; the same key again is not delivered twice.
+    let sent = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "also check nulls" }));
+    assert_eq!(sent["isError"], false, "{sent}");
+    let sent: Value = serde_json::from_str(&text(&sent)).unwrap();
+    assert_eq!(sent["outcome"], "queued", "{sent}");
+    let key = sent["idempotency_key"].as_str().expect("a minted key").to_string();
+    let again = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "also check nulls", "idempotency_key": key }));
+    let again: Value = serde_json::from_str(&text(&again)).unwrap();
+    assert_eq!((again["outcome"].as_str(), again["state"].as_str()), (Some("duplicate"), Some("pending")), "{again}");
+    let delivered = registry.get("child-0").unwrap().events_since(0).into_iter().filter(
+        |(_, e)| matches!(e, ThreadEvent::UserMessage { text, .. } if text == "also check nulls"),
+    );
+    assert_eq!(delivered.count(), 1, "delivered once");
+
     // Still working: the wait gives up at its timeout and says so.
     let waited = server.call("oximux_wait_agents", json!({ "ids": ["child-0"], "timeout_ms": 1000 }));
     assert_eq!(waited["isError"], false, "{waited}");

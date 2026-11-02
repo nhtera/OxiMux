@@ -2,8 +2,9 @@
 //! the Ack means the host took the prompt (queueing mid-turn is normal); the
 //! default mode then streams the turn, `--no-wait` returns immediately.
 
+use oximux_remote_proto::delivery::{ReceiptStateWire, SendOutcomeWire, SendV2Req};
 use oximux_remote_proto::messages::SendPromptReq;
-use oximux_remote_proto::proto::{Request, Response};
+use oximux_remote_proto::proto::{Request, Response, RpcError, SEND_V2_MIN_VERSION};
 use serde_json::{Value, json};
 
 use super::attach::{Stop, StreamEnd, StreamOpts, stream_session};
@@ -48,6 +49,53 @@ pub async fn run_checked(
     let human = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     base["output"] = value;
     Ok((base, human))
+}
+
+/// Send `prompt` under `key` without waiting for the turn: a v37 host sends
+/// a key at most once and answers a repeat with where the first send stands.
+/// An older host, or one that keeps no receipts, gets the plain send.
+pub async fn send_keyed(client: &Client, session: &str, prompt: &str, key: &str) -> Result<(Value, String), Failure> {
+    if client.host_version >= SEND_V2_MIN_VERSION {
+        let req = Request::SendV2(SendV2Req {
+            session_id: session.into(),
+            text: prompt.into(),
+            images: vec![],
+            idempotency_key: key.into(),
+            corr_id: super::next_corr_id(),
+        });
+        match client.call(req).await? {
+            Response::SendOutcome(SendOutcomeWire::Queued) => {
+                let base = json!({ "session_id": session, "accepted": true, "outcome": "queued", "idempotency_key": key });
+                return Ok((base, format!("sent to {session} (key {key})")));
+            }
+            Response::SendOutcome(SendOutcomeWire::Duplicate(state)) => {
+                let state = receipt_word(state);
+                let human = format!(
+                    "not sent again: this key was already sent to {session} ({state}). Use a new key for a new message."
+                );
+                let base = json!({
+                    "session_id": session, "accepted": true, "outcome": "duplicate", "state": state,
+                    "idempotency_key": key, "note": human,
+                });
+                return Ok((base, human));
+            }
+            Response::Error(RpcError::Unsupported) => {}
+            Response::Error(e) => return Err(rpc_failure(e)),
+            other => return Err(unexpected_reply("SendV2", &other)),
+        }
+    }
+    let (mut base, human) = run(client, session, prompt, true, None, None, true).await?;
+    base["outcome"] = json!("sent");
+    Ok((base, human))
+}
+
+fn receipt_word(state: ReceiptStateWire) -> &'static str {
+    match state {
+        ReceiptStateWire::Pending => "pending",
+        ReceiptStateWire::Accepted => "accepted",
+        ReceiptStateWire::Rejected => "rejected",
+        ReceiptStateWire::Unknown => "unknown",
+    }
 }
 
 pub async fn run(
