@@ -242,10 +242,7 @@ async fn run(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
         "oximux_send_agent" => {
             let (id, body) = (required("id")?, required("text")?);
             let sent = match text("mode").as_deref() {
-                None | Some("queue") => {
-                    let key = text("idempotency_key").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    send::send_keyed(&client, &id, &body, &key).await
-                }
+                None | Some("queue") => send::send_keyed(&client, &id, &body, text("idempotency_key").as_deref()).await,
                 Some("steer") => session_ctl::steer(&client, &id, &body).await,
                 Some(other) => return Err(format!("unknown mode `{other}`: use queue or steer")),
             };

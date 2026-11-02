@@ -126,3 +126,41 @@ async fn a_refused_send_ends_rejected_after_the_clis_acknowledgement(cx: &mut Te
     let live = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().retries().live(&session).unwrap());
     assert_eq!(live.map(|l| l.attempts), Some(0), "armed, not yet fired");
 }
+
+/// A refused send retried verbatim goes out under its own id again, so its
+/// receipt reopens (a caller holding its key sees it pending, then taken)
+/// and the retry keeps counting under one turn.
+#[gpui::test]
+async fn a_verbatim_retry_resends_under_the_same_id(cx: &mut TestAppContext) {
+    let (window, _rt) = chat_with_host(cx);
+    let (session, id) = window
+        .update(cx, |view, _window, cx| {
+            view.send_text("hello".into(), Vec::new(), cx);
+            let id = view.health.sent_id().expect("tagged");
+            view.thread.turn_active = false;
+            view.thread.last_turn_failure = Some((Some(529), None));
+            view.thread.last_error = Some("API Error: 529".into());
+            view.arm_retry_if_limited(cx);
+            (view.remote_session_id.clone(), id)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let receipts = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().receipts());
+    let key = key_hash(KeyKind::Gate, &id);
+    assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Rejected));
+
+    window
+        .update(cx, |view, _window, cx| {
+            view.retry_last_turn(cx);
+            assert_eq!(view.health.sent_id().as_deref(), Some(id.as_str()), "the same id again");
+            assert_eq!(view.pending_send_uuid, None, "nothing owed to the next send");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Pending));
+    window
+        .update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: id.clone() }], cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Accepted));
+}

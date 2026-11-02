@@ -132,6 +132,7 @@ impl SessionHandle {
     /// unanswered send counts, so a child still reacting to its background
     /// tasks keeps its slot).
     pub fn publish_health(&self, inputs: HealthInputs) {
+        let first = !self.health.published();
         let modified = self.health.inputs.send_if_modified(|current| {
             if *current == inputs {
                 return false;
@@ -139,14 +140,14 @@ impl SessionHandle {
             *current = inputs;
             true
         });
-        if modified {
-            let first = !self.health.published.swap(true, Ordering::Relaxed);
+        if modified || first {
             self.rederive_health(now_ms());
-            if first {
-                // Followers wait for the first publish; tell them even when
-                // the health reads as it did before it.
-                self.health.health.send_modify(|_| {});
-            }
+        }
+        if first {
+            // Set only now, so nobody reads the default as observed; then
+            // tell followers, even when the health reads as it did before.
+            self.health.published.store(true, Ordering::Relaxed);
+            self.health.health.send_modify(|_| {});
         }
     }
 

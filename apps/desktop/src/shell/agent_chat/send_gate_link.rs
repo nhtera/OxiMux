@@ -405,7 +405,11 @@ impl AgentChatView {
         let (line, uuid) = match held {
             Some(events) => {
                 if let Some(own) = self.pending_send_uuid.take() {
-                    self.send_gate.lock().unwrap().report_sent(own, false);
+                    let mut gate = self.send_gate.lock().unwrap();
+                    gate.report_sent(own, false);
+                    // Its text goes out inside the events' line: so does its
+                    // receipt (a caller may hold its key).
+                    gate.note_merged(events.uuid, own);
                 }
                 self.thread.apply(&ThreadEvent::Notice(HELD_EVENTS_NOTE.into()));
                 (format!("{}\n\n{text}", events.text), events.uuid)

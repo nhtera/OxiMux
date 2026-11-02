@@ -443,6 +443,13 @@ impl AgentChatView {
         });
         match last_user {
             Some((idx, text, images)) => {
+                // The same send again, under its own id: a caller holding its
+                // key sees it pending again rather than refused, and its
+                // retries keep counting under one turn.
+                let again = self.health.sent_id().and_then(|id| uuid::Uuid::parse_str(&id).ok());
+                if self.connection.is_some() && self.pending_send_uuid.is_none() {
+                    self.pending_send_uuid = again;
+                }
                 // Through the one write path, so a retry goes out tagged (its
                 // receipt settles it) and carries an owed recovery note.
                 let sent = self.connection.is_some()
@@ -457,6 +464,14 @@ impl AgentChatView {
                             false
                         }
                     };
+                if let Some(again) = again {
+                    if self.pending_send_uuid == Some(again) {
+                        // Not written: the id is not owed to the next send.
+                        self.pending_send_uuid = None;
+                    } else if sent {
+                        self.record_resend(&again.to_string(), cx);
+                    }
+                }
                 // Re-anchor the pre-turn checkpoint to the retried turn (as a
                 // fresh send would), so the "restore files" rewind affordance
                 // keeps tracking repo changes for it.

@@ -191,7 +191,13 @@ pub struct SendGate {
     /// A line written to an agent that reports no receipts, and whether its
     /// first frame (acceptance) has been seen: the owner stands in for them.
     unreported: Option<(Uuid, bool)>,
+    /// Items that went out inside another line (a send merged into held
+    /// child events), by that line's uuid: their fate is the line's.
+    merged: VecDeque<(Uuid, Uuid)>,
 }
+
+/// How many merges [`SendGate::merged_into`] remembers.
+const MERGED_KEPT: usize = 16;
 
 impl std::fmt::Debug for SendGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -230,6 +236,20 @@ impl SendGate {
         if let Some(hook) = &self.sent_hook {
             hook(uuid, ok);
         }
+    }
+
+    /// The item `own` was written inside the line sent under `line`.
+    pub fn note_merged(&mut self, line: Uuid, own: Uuid) {
+        if self.merged.len() == MERGED_KEPT {
+            self.merged.pop_front();
+        }
+        self.merged.push_back((line, own));
+    }
+
+    /// The item that went out inside the line sent under `line`, if any.
+    pub fn merged_into(&self, line: &str) -> Option<Uuid> {
+        let line = Uuid::parse_str(line).ok()?;
+        self.merged.iter().rev().find(|(l, _)| *l == line).map(|(_, own)| *own)
     }
 
     /// Whether an owner is listening. Without one, a sender writes directly.

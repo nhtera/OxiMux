@@ -62,6 +62,19 @@ fn a_failed_write_frees_its_key_but_a_settled_one_is_kept() {
 }
 
 #[test]
+fn a_refused_send_sent_again_is_pending_until_answered() {
+    let r = receipts();
+    let k = key_hash(KeyKind::Gate, "u");
+    r.settle("s", &k, ReceiptState::Rejected, "h", t0()).unwrap();
+    r.resend("s", &k, t0()).unwrap();
+    assert_eq!(r.state("s", &k).unwrap(), Some(ReceiptState::Pending));
+    r.settle("s", &k, ReceiptState::Accepted, "h", t0()).unwrap();
+    assert_eq!(r.state("s", &k).unwrap(), Some(ReceiptState::Accepted));
+    r.resend("s", &k, t0()).unwrap();
+    assert_eq!(r.state("s", &k).unwrap(), Some(ReceiptState::Accepted), "only a refusal is reopened");
+}
+
+#[test]
 fn a_new_host_marks_what_another_left_pending_unknown() {
     let r = receipts();
     let (mine, theirs) = (key_hash(KeyKind::Gate, "m"), key_hash(KeyKind::Gate, "t"));

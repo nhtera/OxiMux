@@ -114,6 +114,35 @@ async fn a_key_sends_once_and_a_repeat_reports_the_first_sends_state() {
     assert_ne!(sent[1]["uuid"], sent[0]["uuid"], "a new key is a new send");
 }
 
+/// Refused, with the host's own retry armed for it: to a caller repeating
+/// the key it is still on its way, so it is not sent again by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_send_the_host_will_retry_reads_pending() {
+    let h = host(true);
+    as_scope(&h, LocalScope::Full, |c| async move {
+        assert_eq!(call(&*c, send("k-1", "run the tests")).await, Response::SendOutcome(SendOutcomeWire::Queued));
+    })
+    .await;
+    let uuid = h.stub.sent()[0]["uuid"].as_str().unwrap().to_string();
+    let core = h.core.clone().unwrap();
+    let (line, now) = (key_hash(KeyKind::Gate, &uuid), chrono::Local::now());
+    core.lineage().receipts().settle("s1", &line, ReceiptState::Rejected, core.instance(), now).unwrap();
+    let retries = core.lineage().retries();
+    retries.arm("s1", &line, "window", "Usage limit reached", 1, core.instance(), now).unwrap();
+    let pending = Response::SendOutcome(SendOutcomeWire::Duplicate(ReceiptStateWire::Pending));
+    let rejected = Response::SendOutcome(SendOutcomeWire::Duplicate(ReceiptStateWire::Rejected));
+    as_scope(&h, LocalScope::Full, |c| async move {
+        assert_eq!(call(&*c, send("k-1", "run the tests")).await, pending);
+    })
+    .await;
+    retries.resolve("s1", oximux_agents::retry::store::Resolution::Cancelled, now).unwrap();
+    as_scope(&h, LocalScope::Full, |c| async move {
+        assert_eq!(call(&*c, send("k-1", "run the tests")).await, rejected, "nothing will send it now");
+    })
+    .await;
+    assert_eq!(h.stub.sent().len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bad_key_or_an_empty_prompt_is_refused_before_anything_is_recorded() {
     let h = host(true);
@@ -192,6 +221,37 @@ async fn a_v36_subscriber_is_never_pushed_health() {
         handle.ingest(ThreadEvent::Notice("after".into()));
         // The next frame is the event: no health frame came first.
         assert!(matches!(next_push(&*c).await, Some(Response::Event(_))));
+    })
+    .await;
+}
+
+/// No host core keeps health, so none is pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_without_a_core_pushes_no_health() {
+    let h = host(false);
+    let handle = h.registry.get("s1").unwrap();
+    as_scope(&h, LocalScope::Full, |c| async move {
+        call(&*c, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await;
+        assert!(matches!(call(&*c, Request::Subscribe { session_id: "s1".into(), after_seq: None }).await, Response::Events(_)));
+        handle.publish_health(working(oximux_agents::session_health::now_ms()));
+        handle.ingest(ThreadEvent::Notice("after".into()));
+        assert!(matches!(next_push(&*c).await, Some(Response::Event(_))));
+    })
+    .await;
+}
+
+/// A driver's first publish is pushed even when it reads as the default: a
+/// freshly opened chat still tells its subscriber what it is and which host
+/// says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_publish_like_the_default_is_still_pushed() {
+    let h = host(true);
+    let handle = h.registry.get("s1").unwrap();
+    as_scope(&h, LocalScope::Full, |c| async move {
+        call(&*c, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await;
+        assert!(matches!(call(&*c, Request::Subscribe { session_id: "s1".into(), after_seq: None }).await, Response::Events(_)));
+        handle.publish_health(HealthInputs::default());
+        assert!(matches!(next_push(&*c).await, Some(Response::SessionHealth(_))));
     })
     .await;
 }

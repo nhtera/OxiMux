@@ -77,17 +77,32 @@ pub(super) fn refused(class: RetryClass, turn_had_output: bool) -> bool {
 }
 
 impl AgentChatView {
-    /// Record proof (or, with `None`, the reservation) for the send `uuid`.
+    /// Record proof (or, with `None`, the reservation) for the send `uuid`,
+    /// and for a send that went out inside it.
     pub(super) fn record_receipt(&self, uuid: &str, state: Option<ReceiptState>, cx: &mut Context<Self>) {
-        let (session, key) = (self.remote_session_id.clone(), key_hash(KeyKind::Gate, uuid));
-        let now = chrono::Local::now();
-        enqueue(
-            cx,
-            Box::new(move |s| match state {
-                None => s.receipts.reserve(&session, &key, &s.instance, now).map(|_| ()),
-                Some(state) => s.receipts.settle(&session, &key, state, &s.instance, now),
-            }),
-        );
+        let merged = self.send_gate.lock().unwrap().merged_into(uuid);
+        for uuid in std::iter::once(uuid.to_string()).chain(merged.map(|u| u.to_string())) {
+            let (session, key) = (self.remote_session_id.clone(), key_hash(KeyKind::Gate, &uuid));
+            let now = chrono::Local::now();
+            enqueue(
+                cx,
+                Box::new(move |s| match state {
+                    None => s.receipts.reserve(&session, &key, &s.instance, now).map(|_| ()),
+                    Some(state) => s.receipts.settle(&session, &key, state, &s.instance, now),
+                }),
+            );
+        }
+    }
+
+    /// The refused send `uuid` went out again verbatim: pending until the
+    /// agent answers it.
+    pub(super) fn record_resend(&self, uuid: &str, cx: &mut Context<Self>) {
+        let merged = self.send_gate.lock().unwrap().merged_into(uuid);
+        for uuid in std::iter::once(uuid.to_string()).chain(merged.map(|u| u.to_string())) {
+            let (session, key) = (self.remote_session_id.clone(), key_hash(KeyKind::Gate, &uuid));
+            let now = chrono::Local::now();
+            enqueue(cx, Box::new(move |s| s.receipts.resend(&session, &key, now)));
+        }
     }
 
     /// The chat moved from `old` to its agent's id: move its records too, after

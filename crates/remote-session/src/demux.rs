@@ -208,6 +208,9 @@ impl DemuxPump {
                 // A v37 host pushes session health to a subscriber. Pushed,
                 // so never a reply; nothing here shows it yet.
                 Response::SessionHealth(_) => {}
+                // A desktop pushes recorded schedule runs to every session-list
+                // subscriber (v17+). Pushed, so never a reply.
+                Response::ScheduleRunsChanged(_) => {}
                 reply => {
                     if let Some(tx) = self.pending.slot.lock().unwrap().take() {
                         let _ = tx.send(Ok(reply));
@@ -300,15 +303,16 @@ mod tests {
         }
     }
 
-    /// Answers each request with a pushed health frame first, then the reply.
-    struct HealthBeforeReply {
+    /// Answers each request with a pushed frame first, then the reply.
+    struct PushBeforeReply {
         requests: AsyncMutex<mpsc::UnboundedReceiver<()>>,
         sent: mpsc::UnboundedSender<()>,
         reply_next: Mutex<bool>,
+        push: Response,
     }
 
     #[async_trait]
-    impl Transport for HealthBeforeReply {
+    impl Transport for PushBeforeReply {
         async fn send(&self, _frame: Vec<u8>) -> std::result::Result<(), TransportError> {
             let _ = self.sent.unbounded_send(());
             Ok(())
@@ -322,20 +326,32 @@ mod tests {
                 return Ok(None);
             }
             *self.reply_next.lock().unwrap() = true;
-            let frame = oximux_remote_proto::delivery::SessionHealthFrame::new("s", "h", &Default::default());
-            Ok(Some(Response::SessionHealth(frame).to_bytes().unwrap()))
+            Ok(Some(self.push.to_bytes().unwrap()))
         }
     }
 
-    /// A pushed health frame is not the reply: the call gets the frame after it.
+    /// A pushed health frame or schedule run is not the reply: the call gets
+    /// the frame after it.
     #[test]
-    fn a_health_push_never_answers_a_call() {
-        let (sent, requests) = mpsc::unbounded();
-        let transport = HealthBeforeReply { requests: AsyncMutex::new(requests), sent, reply_next: Mutex::new(false) };
-        let (handle, pump, _events, _terminals, _sessions, _shutdown) = demux(Arc::new(transport));
-        let call = async { assert_eq!(handle.call(Request::Ping).await.unwrap(), Response::Pong) };
-        let outcome = block_on(select(Box::pin(pump.run()), Box::pin(call)));
-        assert!(matches!(outcome, Either::Right(_)));
+    fn a_push_never_answers_a_call() {
+        use oximux_remote_proto::messages::{RunOutcomeWire, ScheduleRunWire};
+        let health = oximux_remote_proto::delivery::SessionHealthFrame::new("s", "h", &Default::default());
+        let run = ScheduleRunWire {
+            schedule_id: "s".into(),
+            fired_at: String::new(),
+            outcome: RunOutcomeWire::Ok,
+            session_id: None,
+            detail: None,
+        };
+        for push in [Response::SessionHealth(health), Response::ScheduleRunsChanged(run)] {
+            let (sent, requests) = mpsc::unbounded();
+            let transport =
+                PushBeforeReply { requests: AsyncMutex::new(requests), sent, reply_next: Mutex::new(false), push };
+            let (handle, pump, _events, _terminals, _sessions, _shutdown) = demux(Arc::new(transport));
+            let call = async { assert_eq!(handle.call(Request::Ping).await.unwrap(), Response::Pong) };
+            let outcome = block_on(select(Box::pin(pump.run()), Box::pin(call)));
+            assert!(matches!(outcome, Either::Right(_)));
+        }
     }
 
     /// The bug this guards: an over-cap reply used to end the pump, so a single

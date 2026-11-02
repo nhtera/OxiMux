@@ -37,7 +37,7 @@ impl Dispatcher {
         }
         // The receipts live with the host core; without one there is nothing
         // to keep the promise with (a caller falls back to `SendPrompt`).
-        let Some(core) = self.host_core.as_ref() else {
+        let Some(core) = self.host_core.as_ref().filter(|core| core.is_owner()) else {
             return Response::Error(RpcError::Unsupported);
         };
         let Some(handle) = self.registry.get(&req.session_id) else {
@@ -50,15 +50,22 @@ impl Dispatcher {
         };
         let receipts = core.lineage().receipts();
         let (session, reserved) = (req.session_id.as_str(), key_hash(KeyKind::V2, key));
-        let uuid = send_uuid(session, key);
+        let uuid = send_uuid(key);
         match receipts.reserve(session, &reserved, core.instance(), chrono::Local::now()) {
             Err(err) => {
                 tracing::warn!(%err, session, "send receipt reserve failed");
                 Response::Error(RpcError::Internal("send receipt failed".into()))
             }
             Ok(Some(state)) => {
-                let proof = receipts.state(session, &key_hash(KeyKind::Gate, &uuid.to_string())).ok().flatten();
-                Response::SendOutcome(SendOutcomeWire::Duplicate(wire(proof.unwrap_or(state))))
+                let line = key_hash(KeyKind::Gate, &uuid.to_string());
+                let mut state = receipts.state(session, &line).ok().flatten().unwrap_or(state);
+                // Refused, but the host's own retry will send it again: to the
+                // caller it is still on its way, not something to resend.
+                let retrying = || core.lineage().retries().live(session).ok().flatten().is_some_and(|r| r.turn_key == line);
+                if state == ReceiptState::Rejected && retrying() {
+                    state = ReceiptState::Pending;
+                }
+                Response::SendOutcome(SendOutcomeWire::Duplicate(wire(state)))
             }
             Ok(None) => match handle.send_prompt_tagged(&req.text, &req.images, source, Some(uuid)) {
                 Ok(()) => Response::SendOutcome(SendOutcomeWire::Queued),
@@ -73,9 +80,10 @@ impl Dispatcher {
     }
 }
 
-/// The uuid a keyed send goes out under: the same for every retry of the key.
-fn send_uuid(session: &str, key: &str) -> Uuid {
-    let digest = Sha256::digest(format!("send-v2\0{session}\0{key}").as_bytes());
+/// The uuid a keyed send goes out under: the same for every retry of the key,
+/// and unchanged when the session moves to its agent's id.
+fn send_uuid(key: &str) -> Uuid {
+    let digest = Sha256::digest(format!("send-v2\0{key}").as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     uuid::Builder::from_random_bytes(bytes).into_uuid()
@@ -95,9 +103,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_key_maps_to_one_uuid_per_session() {
-        assert_eq!(send_uuid("s", "k"), send_uuid("s", "k"));
-        assert_ne!(send_uuid("s", "k"), send_uuid("t", "k"));
-        assert_ne!(send_uuid("s", "k"), send_uuid("s", "k2"));
+    fn a_key_maps_to_one_uuid() {
+        assert_eq!(send_uuid("k"), send_uuid("k"));
+        assert_ne!(send_uuid("k"), send_uuid("k2"));
     }
 }

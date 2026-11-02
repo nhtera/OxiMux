@@ -51,31 +51,35 @@ pub async fn run_checked(
     Ok((base, human))
 }
 
-/// Send `prompt` under `key` without waiting for the turn: a v37 host sends
-/// a key at most once and answers a repeat with where the first send stands.
-/// An older host, or one that keeps no receipts, gets the plain send.
-pub async fn send_keyed(client: &Client, session: &str, prompt: &str, key: &str) -> Result<(Value, String), Failure> {
+/// Send `prompt` without waiting for the turn, under `key` when the caller
+/// has one (else a fresh one, returned): a v37 host sends a key at most once
+/// and answers a repeat with where the first send stands.
+///
+/// A host that cannot keep that promise (older, or one that keeps no
+/// receipts) gets the plain send only when the caller gave no key; a caller
+/// retrying under its key is refused instead, since a plain send could
+/// deliver the message twice.
+pub async fn send_keyed(client: &Client, session: &str, prompt: &str, key: Option<&str>) -> Result<(Value, String), Failure> {
+    let minted = key.is_none().then(|| uuid::Uuid::new_v4().to_string());
+    let key_text = key.or(minted.as_deref()).unwrap_or_default();
     if client.host_version >= SEND_V2_MIN_VERSION {
         let req = Request::SendV2(SendV2Req {
             session_id: session.into(),
             text: prompt.into(),
             images: vec![],
-            idempotency_key: key.into(),
+            idempotency_key: key_text.into(),
             corr_id: super::next_corr_id(),
         });
         match client.call(req).await? {
             Response::SendOutcome(SendOutcomeWire::Queued) => {
-                let base = json!({ "session_id": session, "accepted": true, "outcome": "queued", "idempotency_key": key });
-                return Ok((base, format!("sent to {session} (key {key})")));
+                let base = json!({ "session_id": session, "accepted": true, "outcome": "queued", "idempotency_key": key_text });
+                return Ok((base, format!("sent to {session} (key {key_text})")));
             }
             Response::SendOutcome(SendOutcomeWire::Duplicate(state)) => {
-                let state = receipt_word(state);
-                let human = format!(
-                    "not sent again: this key was already sent to {session} ({state}). Use a new key for a new message."
-                );
+                let human = duplicate_note(session, state);
                 let base = json!({
-                    "session_id": session, "accepted": true, "outcome": "duplicate", "state": state,
-                    "idempotency_key": key, "note": human,
+                    "session_id": session, "accepted": true, "outcome": "duplicate", "state": receipt_word(state),
+                    "idempotency_key": key_text, "note": human,
                 });
                 return Ok((base, human));
             }
@@ -84,9 +88,35 @@ pub async fn send_keyed(client: &Client, session: &str, prompt: &str, key: &str)
             other => return Err(unexpected_reply("SendV2", &other)),
         }
     }
+    if key.is_some() {
+        return Err(Failure::new(
+            "not-idempotent",
+            exit::ERROR,
+            format!("this host cannot hold a send to its key, so it was not sent again to {session}"),
+        )
+        .with_steps([format!(
+            "read {session}'s conversation first; send without a key only if the message is not there"
+        )]));
+    }
     let (mut base, human) = run(client, session, prompt, true, None, None, true).await?;
     base["outcome"] = json!("sent");
+    base["idempotent"] = json!(false);
     Ok((base, human))
+}
+
+/// What a repeated key means for the caller, by where the first send stands.
+fn duplicate_note(session: &str, state: ReceiptStateWire) -> String {
+    match state {
+        ReceiptStateWire::Pending => format!("not sent again: {session} has it queued or is about to start on it; do not resend"),
+        ReceiptStateWire::Accepted => format!("not sent again: {session} already started on it"),
+        ReceiptStateWire::Rejected => format!(
+            "not sent again: it was refused and nothing will retry it; send it with a new key if {session} still needs it"
+        ),
+        ReceiptStateWire::Unknown => format!(
+            "not sent again: the host restarted before it knew whether {session} got it; read its conversation, \
+             then send with a new key only if the message is not there"
+        ),
+    }
 }
 
 fn receipt_word(state: ReceiptStateWire) -> &'static str {
