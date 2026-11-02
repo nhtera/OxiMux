@@ -1194,8 +1194,13 @@ impl AgentChatView {
                     remaining_ms: remaining,
                     attempt,
                     wake_clock: chrono::DateTime::from_timestamp_millis(wake_at_ms)
-                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                        .map(|t| {
+                            let t = t.with_timezone(&chrono::Local);
+                            let same_day = t.date_naive() == chrono::Local::now().date_naive();
+                            t.format(if same_day { "%H:%M" } else { "%a %H:%M" }).to_string()
+                        })
                         .unwrap_or_default(),
+                    limited: reason == super::retry::WINDOW_REASON,
                 },
                 theme,
                 &typo,

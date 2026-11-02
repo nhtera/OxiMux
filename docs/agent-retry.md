@@ -71,8 +71,10 @@ Usage limit reached
 [ Send now ]  [ Cancel ]
 ```
 
-- The **Limited** chip counts down to the retry; hover it for the clock time.
-  The session's health reads Limited for the same span.
+- The **Limited** chip counts down to the retry; hover it for the clock time
+  (with the day, when it is not today). The session's health reads Limited for
+  the same span. An overload backoff has no reset, so its chip reads
+  **Retrying in …** instead.
 
 - **Send now** fires immediately and counts as an attempt.
 - **Cancel** drops the retry and shows the original error.

@@ -38,6 +38,24 @@ pub struct HeldMessage {
 }
 
 impl ComposerView {
+    /// Whether the draft is empty AND nothing is staged (no images, no context
+    /// chips) — the precondition for pulling a queued message back to edit so it
+    /// never clobbers work in progress.
+    pub(super) fn draft_is_empty(&self, cx: &Context<Self>) -> bool {
+        self.input.read(cx).value().trim().is_empty()
+            && self.pending_images.is_empty()
+            && self.context_chips.is_empty()
+    }
+
+    /// Seed the draft from restored text, but ONLY when the composer is empty —
+    /// never clobber text the user is already typing (mirrors the edit-queued
+    /// no-clobber guard). An empty `text` is a no-op.
+    pub fn seed_draft(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !text.trim().is_empty() && self.draft_is_empty(cx) {
+            self.set_draft_end(text, window, cx);
+        }
+    }
+
     /// Pop the oldest queued message for the parent to send, recording it in the
     /// prompt history as it goes out (it's now a sent prompt). Returns `None` when
     /// nothing is queued. Repaints so the drained chip disappears.
@@ -57,7 +75,7 @@ impl ComposerView {
     }
 
     /// Pull the most-recently parked message back into the composer to edit it
-    /// (↑ with an empty draft while messages are queued — the Claude-Desktop
+    /// (↑ with an empty draft while messages are queued — the familiar
     /// "arrow up to edit" gesture). Removes it from the queue and restores its
     /// staged attachments; re-submitting re-queues it (or sends it if the turn
     /// has since ended). Returns whether it consumed the key. Only fires with an
@@ -146,17 +164,19 @@ impl ComposerView {
         if steering {
             cx.emit(ComposerEvent::SteerNow { text: wire });
         } else {
-            cx.emit(ComposerEvent::Submit { text: wire, images });
+            cx.emit(ComposerEvent::SendParked { text: wire, images });
         }
     }
 
     /// The text of each queued message, oldest first, for persistence: the
-    /// held ones (queued before the last restart) ahead of the open queue.
+    /// held ones (queued before the last restart) ahead of the open queue. The
+    /// card marked "may already have been sent" is left out: the transcript
+    /// blob carries it, so it comes back marked.
     /// Text-only (staged images/context aren't persisted); an image-only queued
     /// message (blank text) is skipped since it can't be faithfully restored.
     pub fn queued_texts(&self) -> Vec<String> {
         let open = self.queued.iter().map(|m| m.text.clone()).filter(|t| !t.trim().is_empty());
-        self.held.iter().map(|m| m.text.clone()).chain(open).collect()
+        self.held.iter().filter(|m| !m.maybe_sent).map(|m| m.text.clone()).chain(open).collect()
     }
 
     /// Re-seed queued chips from restored text (text-only, no images/context).
@@ -178,14 +198,9 @@ impl ComposerView {
     /// Restore the messages queued when the app last quit, **held** (see
     /// [`HeldMessage`]).
     pub fn seed_held(&mut self, entries: Vec<HeldMessage>, cx: &mut Context<Self>) {
-        for entry in entries {
-            if self.held.len() >= MAX_QUEUED {
-                break;
-            }
-            if !entry.text.trim().is_empty() {
-                self.held.push(entry);
-            }
-        }
+        // No cap here: these were all accepted once, and dropping one on the
+        // way back would lose it silently.
+        self.held.extend(entries.into_iter().filter(|e| !e.text.trim().is_empty()));
         self.queue_changed(cx);
     }
 
@@ -195,7 +210,6 @@ impl ComposerView {
     pub fn hold_unconfirmed(&mut self, text: String, cx: &mut Context<Self>) {
         if !text.trim().is_empty() {
             self.held.insert(0, HeldMessage { text, maybe_sent: true });
-            self.held.truncate(MAX_QUEUED);
             self.queue_changed(cx);
         }
     }
@@ -226,12 +240,13 @@ impl ComposerView {
         let parked: Vec<QueuedMessage> = texts
             .map(|text| QueuedMessage { text, images: Vec::new(), context: Vec::new() })
             .collect();
+        // The user released them on purpose: they may take the queue past
+        // its cap rather than push out what they typed since.
         self.queued.splice(0..0, parked);
-        self.queued.truncate(MAX_QUEUED);
         self.queue_changed(cx);
         if let Some(text) = now {
             self.history.record(&text);
-            cx.emit(ComposerEvent::Submit { text, images: Vec::new() });
+            cx.emit(ComposerEvent::SendParked { text, images: Vec::new() });
         }
     }
 
@@ -263,7 +278,12 @@ impl ComposerView {
     /// The queue changed: repaint and tell the parent the counts.
     pub(super) fn queue_changed(&mut self, cx: &mut Context<Self>) {
         cx.notify();
-        cx.emit(ComposerEvent::QueueChanged { held: self.held.len() as u32, queued: self.queued.len() as u32 });
+        let unconfirmed = self.held.iter().any(|m| m.maybe_sent);
+        cx.emit(ComposerEvent::QueueChanged {
+            held: self.held.len() as u32,
+            queued: self.queued.len() as u32,
+            unconfirmed,
+        });
     }
 
     /// Parked-message chips shown above the input while a turn streams: one
@@ -428,10 +448,13 @@ impl ComposerView {
                     .flex()
                     .flex_none()
                     .gap(px(4.0))
-                    .child(
-                        button(("chat-held-send-all", 0), "Send all")
-                            .on_click(cx.listener(|this, _e, _w, cx| this.send_all_held(cx))),
-                    )
+                    // Nothing to send to while disconnected; Discard still works.
+                    .when(!self.disconnected, |row| {
+                        row.child(
+                            button(("chat-held-send-all", 0), "Send all")
+                                .on_click(cx.listener(|this, _e, _w, cx| this.send_all_held(cx))),
+                        )
+                    })
                     .child(
                         button(("chat-held-discard", 0), "Discard")
                             .on_click(cx.listener(|this, _e, _w, cx| this.discard_held(cx))),
@@ -473,10 +496,12 @@ impl ComposerView {
                                 )
                             }),
                     )
-                    .child(
-                        button(("chat-held-send", idx), "Send")
-                            .on_click(cx.listener(move |this, _e, _w, cx| this.send_held(idx, cx))),
-                    )
+                    .when(!self.disconnected, |row| {
+                        row.child(
+                            button(("chat-held-send", idx), "Send")
+                                .on_click(cx.listener(move |this, _e, _w, cx| this.send_held(idx, cx))),
+                        )
+                    })
                     .child(
                         button(("chat-held-drop", idx), "Drop")
                             .on_click(cx.listener(move |this, _e, _w, cx| this.drop_held(idx, cx))),

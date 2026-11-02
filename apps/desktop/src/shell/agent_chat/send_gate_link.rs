@@ -79,6 +79,7 @@ impl AgentChatView {
             disconnected: self.disconnected || self.unbound || self.auth.is_some() || self.connection.is_none(),
             retry_armed: self.retry.is_armed(),
             prompt_pending: self.thread.pending_permission().is_some() || self.thread.pending_question().is_some(),
+            failed: self.health.holds_queue(),
             turn_started: self.turn_has_output(),
             // Child events are steered only into an agent that reports what it
             // started on: without that, a Stop could not take them back.
@@ -266,6 +267,9 @@ impl AgentChatView {
             self.stop_turn(cx);
             return;
         }
+        // The wake may predate what holds the chat now (a turn that just
+        // failed): decide on the current holds, not the ones that woke us.
+        self.sync_gate_holds();
         if self.send_gate.lock().unwrap().ready() == Ready::Steer {
             self.steer_from_gate(cx);
             return;
@@ -365,6 +369,10 @@ impl AgentChatView {
     /// A recovery note a restart left owed goes ahead of the text, once; it is
     /// kept for the next write if this one fails.
     pub(super) fn write_prompt(&mut self, text: &str, images: &[ChatImage]) -> anyhow::Result<()> {
+        // Checked first, so a missing agent takes neither the note nor held events.
+        if self.connection.is_none() {
+            anyhow::bail!("no agent to send to");
+        }
         let note = self.recovery_note.take();
         let with_note;
         let text = match &note {
@@ -400,7 +408,7 @@ impl AgentChatView {
             }
             None => (text.to_string(), self.pending_send_uuid.take().unwrap_or_else(Uuid::new_v4)),
         };
-        let conn = self.connection.as_ref().ok_or_else(|| anyhow::anyhow!("no agent to send to"))?;
+        let conn = self.connection.as_ref().expect("checked above");
         let sent = conn.send_user_message_tagged(&line, images, &uuid.to_string());
         let mut gate = self.send_gate.lock().unwrap();
         gate.report_sent(uuid, sent.is_ok());

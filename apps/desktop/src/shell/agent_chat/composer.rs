@@ -269,12 +269,20 @@ pub enum ComposerEvent {
     SteerNow {
         text: String,
     },
+    /// A parked message (held or queued) the user sent: always a plain send,
+    /// never the staged edit a typed Submit would complete.
+    SendParked {
+        text: String,
+        images: Vec<ChatImage>,
+    },
     /// The queue's membership changed: how many restored messages are held and
     /// how many are queued to drain. The parent reports both in the session's
     /// health.
     QueueChanged {
         held: u32,
         queued: u32,
+        /// A held card is marked "may already have been sent".
+        unconfirmed: bool,
     },
     /// The user removed the recovery note the next message would carry.
     RemoveRecoveryNote,
@@ -1573,24 +1581,6 @@ impl ComposerView {
             .collect();
         self.set_draft_end(text, window, cx);
         cx.notify();
-    }
-
-    /// Whether the draft is empty AND nothing is staged (no images, no context
-    /// chips) — the precondition for pulling a queued message back to edit so it
-    /// never clobbers work in progress.
-    fn draft_is_empty(&self, cx: &Context<Self>) -> bool {
-        self.input.read(cx).value().trim().is_empty()
-            && self.pending_images.is_empty()
-            && self.context_chips.is_empty()
-    }
-
-    /// Seed the draft from restored text, but ONLY when the composer is empty —
-    /// never clobber text the user is already typing (mirrors the edit-queued
-    /// no-clobber guard). An empty `text` is a no-op.
-    pub fn seed_draft(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        if !text.trim().is_empty() && self.draft_is_empty(cx) {
-            self.set_draft_end(text, window, cx);
-        }
     }
 
     /// Whether the caret sits on the first visual line of the draft (no newline

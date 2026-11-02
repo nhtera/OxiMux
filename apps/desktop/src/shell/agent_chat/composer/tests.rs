@@ -471,8 +471,10 @@ fn capture(window: &gpui::WindowHandle<ComposerView>, cx: &mut TestAppContext) -
     cx.update(|cx| {
         let root = window.root(cx).expect("root view");
         cx.subscribe(&root, move |_, ev: &ComposerEvent, _| match ev {
-            ComposerEvent::Submit { text, .. } => sink.borrow_mut().0.push(text.clone()),
-            ComposerEvent::QueueChanged { held, queued } => sink.borrow_mut().1 = (*held, *queued),
+            ComposerEvent::Submit { text, .. } | ComposerEvent::SendParked { text, .. } => {
+                sink.borrow_mut().0.push(text.clone())
+            }
+            ComposerEvent::QueueChanged { held, queued, .. } => sink.borrow_mut().1 = (*held, *queued),
             _ => {}
         })
         .detach();
@@ -524,6 +526,37 @@ async fn held_cards_release_only_on_send(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(seen.borrow().0, vec!["b"], "only the idle Send went out at once");
     assert_eq!(seen.borrow().1, (0, 1));
+}
+
+/// A held card's Send is never a typed Submit, which a staged edit would
+/// take as its own (and rewind the conversation for).
+#[gpui::test]
+async fn a_parked_send_is_not_a_submit(cx: &mut TestAppContext) {
+    let window = test_composer(cx);
+    let submits = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = submits.clone();
+    cx.update(|cx| {
+        let root = window.root(cx).expect("root view");
+        cx.subscribe(&root, move |_, ev: &ComposerEvent, _| {
+            if matches!(ev, ComposerEvent::Submit { .. }) {
+                seen.set(seen.get() + 1);
+            }
+        })
+        .detach();
+    });
+    window
+        .update(cx, |c, window, cx| {
+            c.seed_held(held(&["a"]), cx);
+            c.send_held(0, cx);
+            c.set_state(false, true, cx);
+            c.set_draft_for_test("b", window, cx);
+            c.submit(window, cx);
+            c.set_state(false, false, cx);
+            c.send_queued_now(0, cx);
+        })
+        .expect("window update");
+    cx.run_until_parked();
+    assert_eq!(submits.get(), 0);
 }
 
 /// Send all while idle sends the oldest now and queues the rest in order.

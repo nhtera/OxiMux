@@ -30,6 +30,10 @@ use super::*;
 /// a limit that expired without them.
 const RESTORE_GRACE_MS: i64 = 5 * 60 * 1000;
 
+/// The reason a usage window gives: the one wait that is a limit resetting
+/// (an overload is a backoff), so the card's chip reads "Limited".
+pub(super) const WINDOW_REASON: &str = "Usage limit reached";
+
 /// What a retry sends when the failed turn had already started working.
 const CONTINUE_PROMPT: &str = "Please continue.";
 
@@ -87,7 +91,7 @@ impl ChatRetry {
 pub(super) fn reason_for(class: oximux_agents::retry::RetryClass) -> String {
     use oximux_agents::retry::RetryClass;
     match class {
-        RetryClass::Window { .. } => "Usage limit reached".into(),
+        RetryClass::Window { .. } => WINDOW_REASON.into(),
         RetryClass::Overload => "Provider overloaded".into(),
         // Never armed, so never rendered; kept total rather than `unreachable!`
         // so a future class cannot panic the transcript.

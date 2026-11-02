@@ -38,14 +38,22 @@ pub(super) struct Held<'a> {
     pub remaining_ms: i64,
     /// Automatic attempts already spent, zero-based.
     pub attempt: u32,
-    /// The wake time as a local clock time ("14:05"): the chip's tooltip.
+    /// The wake time as a local clock time ("14:05", with the day when it is
+    /// not today): the chip's tooltip.
     pub wake_clock: String,
+    /// A usage window is resetting (the session reads Limited), not an
+    /// overload backoff.
+    pub limited: bool,
 }
 
 /// The "Limited" chip's text: one format wherever a limited session shows its
 /// wait (the countdown, never the clock time, which is the tooltip).
-pub(super) fn limited_chip_text(remaining_ms: i64) -> String {
-    format!("Limited · resets in {}", countdown(remaining_ms))
+pub(super) fn limited_chip_text(limited: bool, remaining_ms: i64) -> String {
+    if limited {
+        format!("Limited · resets in {}", countdown(remaining_ms))
+    } else {
+        format!("Retrying in {}", countdown(remaining_ms))
+    }
 }
 
 /// Build the queued-retry card: why the turn is held, when it goes, and the two
@@ -59,7 +67,7 @@ pub(super) fn retry_card(
     send_now: impl IntoElement,
     cancel: impl IntoElement,
 ) -> AnyElement {
-    let Held { reason, remaining_ms, attempt, wake_clock } = held;
+    let Held { reason, remaining_ms, attempt, wake_clock, limited } = held;
     div()
         .flex()
         .flex_col()
@@ -89,7 +97,7 @@ pub(super) fn retry_card(
                         .bg(theme.status_warning.opacity(0.18))
                         .text_size(px(typo.t_label_xs))
                         .text_color(theme.status_warning)
-                        .child(limited_chip_text(remaining_ms))
+                        .child(limited_chip_text(limited, remaining_ms))
                         .tooltip(move |window, cx| {
                             gpui_component::tooltip::Tooltip::new(wake_clock.clone()).build(window, cx)
                         }),
@@ -125,7 +133,8 @@ mod tests {
 
     #[test]
     fn the_limited_chip_reads_as_a_countdown() {
-        assert_eq!(limited_chip_text(12 * 60_000 + 5_000), "Limited · resets in 12m");
+        assert_eq!(limited_chip_text(true, 12 * 60_000 + 5_000), "Limited · resets in 12m");
+        assert_eq!(limited_chip_text(false, 45_000), "Retrying in 45s", "an overload is no reset");
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub(super) struct HealthTrack {
     sent_unanswered: bool,
     /// The id that send went out under.
     sent_id: Option<String>,
+    /// A restored send nobody answered, still held and marked: the blob keeps
+    /// it until the user sends or drops the card.
+    pub(super) unconfirmed_held: Option<String>,
     /// The agent took the last send (receipt) and has produced nothing since.
     accepted_at: Option<i64>,
     /// How the process ended, once it has.
@@ -222,12 +225,12 @@ impl AgentChatView {
         let mid_turn = turn.mid_turn;
         // The send nothing answered before the quit may or may not have reached
         // the agent: offer it back, held and marked, never resend it unasked.
-        if turn.unanswered_send.is_some()
-            && let Some(text) = self.thread.entries.iter().rev().find_map(|e| match e {
-                ThreadEntry::User { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-        {
+        let last_user = self.thread.entries.iter().rev().find_map(|e| match e {
+            ThreadEntry::User { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        let unconfirmed = turn.unanswered_send.filter(|_| last_user.is_some());
+        if let (Some(_), Some(text)) = (&unconfirmed, last_user) {
             self.composer.update(cx, |c, cx| c.hold_unconfirmed(text, cx));
         }
         self.recovery_note = turn.recovery_note.or_else(|| {
@@ -241,6 +244,7 @@ impl AgentChatView {
             .and_then(|core| core.prior_owner())
             .is_some_and(|prior| !matches!(prior, oximux_remote_host::PriorOwner::None));
         self.health = HealthTrack::restored(mid_turn, prior_host_gone);
+        self.health.unconfirmed_held = unconfirmed;
         // A dormant chat is not bound to the host yet, so this is where its
         // restored state can be seen.
         let h = health::compute(&self.health_inputs(), now_ms(), &health::HealthConfig::default());
@@ -263,7 +267,10 @@ impl AgentChatView {
     /// The send written but not answered yet, as the blob keeps it: its id,
     /// empty when it went untagged.
     pub(super) fn unanswered_send(&self) -> Option<String> {
-        self.health.sent_unanswered.then(|| self.health.sent_id.clone().unwrap_or_default())
+        self.health
+            .sent_unanswered
+            .then(|| self.health.sent_id.clone().unwrap_or_default())
+            .or_else(|| self.health.unconfirmed_held.clone())
     }
 
     /// Whether work was running that a restart would cut short: a turn,
@@ -482,6 +489,10 @@ mod tests {
                 assert_eq!(held.len(), 2);
                 assert!(held[0].text == "ship it" && held[0].maybe_sent);
                 assert!(!held[1].maybe_sent);
+                // Saved again before the user acts: still marked next time,
+                // and not also saved as a plain queued text.
+                assert_eq!(view.unanswered_send().as_deref(), Some("u-1"));
+                assert_eq!(view.queued_texts(cx), vec!["then tests"]);
             })
             .expect("window update");
         assert!(stub.sent().is_empty(), "nothing resent");

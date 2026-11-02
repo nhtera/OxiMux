@@ -499,10 +499,23 @@
                 view.apply_batch(vec![end(true)], cx);
                 assert_eq!(users(view), 1, "nothing drained into the failed session");
                 assert!(view.health.holds_queue());
+                // Child events waiting in the gate are held too, even when the
+                // gate's own wake (not the turn end) tries to flush them.
+                view.send_gate.lock().unwrap().push(
+                    "child finished".into(),
+                    Vec::new(),
+                    oximux_agents::send_gate::SendSource::ParentEvent,
+                    oximux_agents::send_gate::DeliveryMode::Queue,
+                    None,
+                );
+                view.flush_send_gate(cx);
+                assert_eq!(users(view), 1, "the gate's wake path holds as well");
                 view.send_text("retry it".into(), Vec::new(), cx);
                 assert!(!view.health.holds_queue(), "a send clears the hold");
                 view.apply_batch(vec![end(false)], cx);
                 assert_eq!(users(view), 3, "the queued message went after the good turn");
+                view.apply_batch(vec![end(false)], cx);
+                assert_eq!(users(view), 4, "then the held child events");
             })
             .expect("window update");
     }

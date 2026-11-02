@@ -319,3 +319,17 @@ fn a_stop_from_elsewhere_wakes_the_owner_once() {
     assert!(gate.take_stop_request());
     assert!(!gate.take_stop_request());
 }
+
+#[test]
+fn a_failed_turn_holds_child_events_but_not_a_person() {
+    let mut gate = SendGate::new();
+    event(&mut gate, "child finished");
+    gate.set_holds(Holds { failed: true, ..Holds::default() });
+    let ev = gate.queued().next().unwrap().clone();
+    assert_eq!(gate.wait_of(&ev), SendWait::Busy);
+    assert!(gate.take_next_if_open().is_none(), "nothing feeds a failing session");
+    gate.push("from my phone".into(), vec![], SendSource::Remote, DeliveryMode::Queue, None);
+    assert_eq!(gate.take_next_if_open().unwrap().text, "from my phone");
+    gate.set_holds(Holds::default());
+    assert_eq!(gate.take_next_if_open().unwrap().text, "child finished", "the user's send lifted it");
+}
