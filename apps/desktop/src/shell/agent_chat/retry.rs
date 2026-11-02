@@ -456,7 +456,11 @@ impl AgentChatView {
                 // is on its way. Keyed by the turn's receipt key, so this
                 // holds after a restart too.
                 let line = uuid::Uuid::new_v4();
-                let carried = self.retry.turn_key.clone();
+                // With no retry armed (a manual Retry), the last send's key.
+                let carried = self.retry.turn_key.clone().or_else(|| {
+                    let id = self.health.sent_id()?;
+                    Some(oximux_agents::send_receipts::key_hash(oximux_agents::send_receipts::KeyKind::Gate, &id))
+                });
                 let again = (self.connection.is_some() && self.pending_send_uuid.is_none()).then_some(line);
                 if let Some(line) = again {
                     self.pending_send_uuid = Some(line);
