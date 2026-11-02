@@ -42,7 +42,15 @@ fn a_cancelled_retry_counts_from_zero_when_armed_again() {
 }
 
 #[test]
-fn resolved_rows_are_pruned_after_a_day_and_live_ones_never() {
+fn a_live_row_abandoned_for_a_week_is_pruned() {
+    let s = store();
+    s.arm("s", "t", "window", "r", 1, "h", t0()).unwrap();
+    assert_eq!(s.prune(t0() + chrono::Duration::days(6)).unwrap(), 0);
+    assert_eq!(s.prune(t0() + chrono::Duration::days(8)).unwrap(), 1);
+}
+
+#[test]
+fn resolved_rows_are_pruned_after_a_day_and_a_fresh_live_one_is_kept() {
     let s = store();
     s.arm("s", "done", "window", "r", 1, "h", t0()).unwrap();
     s.resolve("s", Resolution::Succeeded, t0()).unwrap();

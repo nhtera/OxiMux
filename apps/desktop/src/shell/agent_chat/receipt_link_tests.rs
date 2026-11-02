@@ -101,3 +101,28 @@ async fn an_accepted_send_is_not_offered_back(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// The CLI acknowledges a line before the provider answers; an overload with
+/// no output then marks the send refused, safe to resend (either write order).
+#[gpui::test]
+async fn a_refused_send_ends_rejected_after_the_clis_acknowledgement(cx: &mut TestAppContext) {
+    let (window, _rt) = chat_with_host(cx);
+    let (session, id) = window
+        .update(cx, |view, _window, cx| {
+            view.send_text("hello".into(), Vec::new(), cx);
+            let id = view.health.sent_id().expect("tagged");
+            view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: id.clone() }], cx);
+            view.thread.turn_active = false;
+            view.thread.last_turn_failure = Some((Some(529), None));
+            view.thread.last_error = Some("API Error: 529".into());
+            view.arm_retry_if_limited(cx);
+            assert!(view.retry.is_armed(), "an overload is retried");
+            (view.remote_session_id.clone(), id)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let receipts = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().receipts());
+    assert_eq!(receipts.state(&session, &key_hash(KeyKind::Gate, &id)).unwrap(), Some(ReceiptState::Rejected));
+    let live = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().retries().live(&session).unwrap());
+    assert_eq!(live.map(|l| l.attempts), Some(0), "armed, not yet fired");
+}

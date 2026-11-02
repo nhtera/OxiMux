@@ -15,6 +15,10 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 /// How long a resolved row is kept.
 pub const KEEP_HOURS: i64 = 24;
 
+/// A live row whose turn first failed this long ago was abandoned (its chat
+/// closed with a retry armed): no retry waits that long in total.
+pub const ABANDONED_DAYS: i64 = 7;
+
 /// Why a retry stopped being live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
@@ -100,6 +104,8 @@ impl RetryStore {
              reason = excluded.reason, next_wake_at_ms = excluded.next_wake_at_ms, \
              host_instance = excluded.host_instance, \
              attempts = CASE WHEN turn_retries.resolved = 'cancelled' THEN 0 ELSE turn_retries.attempts END, \
+             first_failed_at = CASE WHEN turn_retries.resolved = 'cancelled' THEN excluded.first_failed_at \
+             ELSE turn_retries.first_failed_at END, \
              resolved = NULL, resolved_at = NULL",
             params![session, turn_key, class, reason, stamp(now), wake_at_ms, instance],
         )?;
@@ -163,14 +169,16 @@ impl RetryStore {
             .optional()?)
     }
 
-    /// Drop rows resolved more than [`KEEP_HOURS`] ago. A live row is never
-    /// pruned, however old.
+    /// Drop rows resolved more than [`KEEP_HOURS`] ago, and live rows
+    /// abandoned for [`ABANDONED_DAYS`].
     pub fn prune(&self, now: DateTime<Local>) -> Result<usize> {
         let cutoff = now - chrono::Duration::hours(KEEP_HOURS);
+        let abandoned = now - chrono::Duration::days(ABANDONED_DAYS);
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
-            "DELETE FROM turn_retries WHERE resolved IS NOT NULL AND resolved_at < ?1",
-            params![stamp(cutoff)],
+            "DELETE FROM turn_retries WHERE (resolved IS NOT NULL AND resolved_at < ?1) \
+             OR (resolved IS NULL AND first_failed_at < ?2)",
+            params![stamp(cutoff), stamp(abandoned)],
         )?)
     }
 }

@@ -615,6 +615,13 @@ impl LineageStore {
         // A session's receipts and retries follow it too: a retry armed under
         // the placeholder id must still count its attempts under the real one.
         tx.execute("UPDATE OR REPLACE send_receipts SET session_id = ?2 WHERE session_id = ?1", params![old, new])?;
+        // One live retry per session: when both ids have one, the new id's
+        // wins and the old is superseded, rather than REPLACE deleting a row.
+        tx.execute(
+            "UPDATE turn_retries SET resolved = 'superseded', resolved_at = ?3 WHERE session_id = ?1 \
+             AND resolved IS NULL AND EXISTS (SELECT 1 FROM turn_retries WHERE session_id = ?2 AND resolved IS NULL)",
+            params![old, new, chrono::Local::now().with_timezone(&chrono::Utc).to_rfc3339()],
+        )?;
         tx.execute("UPDATE OR REPLACE turn_retries SET session_id = ?2 WHERE session_id = ?1", params![old, new])?;
         tx.commit().context("commit lineage rekey")?;
         Ok(())

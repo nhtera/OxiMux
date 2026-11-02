@@ -5,11 +5,14 @@
 //!
 //! The tables belong to the host core, which the app installs at boot; with no
 //! core (tests) every write here is a no-op and the chat behaves as before.
-//! Writes go to the background executor: each is one indexed row, and an
-//! out-of-order pair settles the same (a proof that beats its reservation
-//! inserts the row, and the reservation then leaves it alone).
+//! Writes go off the UI thread through one ordered queue for the whole app
+//! ([`HostWriter`]), so a chat's writes land in the order it made them: a
+//! retry is armed before it is counted as fired, and a supersede never lands
+//! after the next turn's arm.
 
-use gpui::{App, Context};
+use futures::StreamExt as _;
+use futures::channel::mpsc;
+use gpui::{App, Context, Global};
 use oximux_agents::retry::RetryClass;
 use oximux_agents::retry::store::{Resolution, RetryStore};
 use oximux_agents::send_receipts::{KeyKind, ReceiptState, Receipts, key_hash};
@@ -23,6 +26,7 @@ use super::AgentChatView;
 pub(super) struct HostStores {
     pub receipts: Receipts,
     pub retries: RetryStore,
+    pub lineage: oximux_agents::lineage::LineageStore,
     pub instance: String,
 }
 
@@ -32,9 +36,37 @@ impl HostStores {
         Some(Self {
             receipts: core.lineage().receipts(),
             retries: core.lineage().retries(),
+            lineage: core.lineage().clone(),
             instance: core.instance().to_string(),
         })
     }
+}
+
+type Job = Box<dyn FnOnce(&HostStores) -> anyhow::Result<()> + Send>;
+
+/// The app's one queue of writes to the host's tables, drained in order by a
+/// single background task.
+struct HostWriter(mpsc::UnboundedSender<(HostStores, Job)>);
+
+impl Global for HostWriter {}
+
+/// Queue `job` behind every write already queued. A no-op with no host core.
+fn enqueue(cx: &mut App, job: Job) {
+    let Some(stores) = HostStores::of(cx) else { return };
+    if !cx.has_global::<HostWriter>() {
+        let (tx, mut rx) = mpsc::unbounded::<(HostStores, Job)>();
+        cx.background_executor()
+            .spawn(async move {
+                while let Some((stores, job)) = rx.next().await {
+                    if let Err(err) = job(&stores) {
+                        tracing::warn!(%err, "host record write failed");
+                    }
+                }
+            })
+            .detach();
+        cx.set_global(HostWriter(tx));
+    }
+    let _ = cx.global::<HostWriter>().0.unbounded_send((stores, job));
 }
 
 /// Whether a failed turn's send was refused rather than taken: a failure
@@ -47,20 +79,21 @@ pub(super) fn refused(class: RetryClass, turn_had_output: bool) -> bool {
 impl AgentChatView {
     /// Record proof (or, with `None`, the reservation) for the send `uuid`.
     pub(super) fn record_receipt(&self, uuid: &str, state: Option<ReceiptState>, cx: &mut Context<Self>) {
-        let Some(stores) = HostStores::of(cx) else { return };
         let (session, key) = (self.remote_session_id.clone(), key_hash(KeyKind::Gate, uuid));
         let now = chrono::Local::now();
-        cx.background_executor()
-            .spawn(async move {
-                let done = match state {
-                    None => stores.receipts.reserve(&session, &key, &stores.instance, now).map(|_| ()),
-                    Some(state) => stores.receipts.settle(&session, &key, state, &stores.instance, now),
-                };
-                if let Err(err) = done {
-                    tracing::warn!(%err, "send receipt write failed");
-                }
-            })
-            .detach();
+        enqueue(
+            cx,
+            Box::new(move |s| match state {
+                None => s.receipts.reserve(&session, &key, &s.instance, now).map(|_| ()),
+                Some(state) => s.receipts.settle(&session, &key, state, &s.instance, now),
+            }),
+        );
+    }
+
+    /// The chat moved from `old` to its agent's id: move its records too, after
+    /// any write still queued under the old id.
+    pub(super) fn rekey_host_records(&self, old: String, new: String, cx: &mut Context<Self>) {
+        enqueue(cx, Box::new(move |s| s.lineage.rekey(&old, &new)));
     }
 
     /// Settle the host's receipts from an agent event (or a stand-in for one):
@@ -139,15 +172,8 @@ impl AgentChatView {
         cx: &mut Context<Self>,
         write: impl FnOnce(&HostStores, chrono::DateTime<chrono::Local>) -> anyhow::Result<()> + Send + 'static,
     ) {
-        let Some(stores) = HostStores::of(cx) else { return };
         let now = chrono::Local::now();
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(err) = write(&stores, now) {
-                    tracing::warn!(%err, "retry record write failed");
-                }
-            })
-            .detach();
+        enqueue(cx, Box::new(move |s| write(s, now)));
     }
 }
 

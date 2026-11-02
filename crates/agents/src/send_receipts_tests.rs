@@ -38,6 +38,18 @@ fn accepted_and_rejected_are_final_and_late_proof_settles_unknown() {
 }
 
 #[test]
+fn a_refusal_overrides_the_clis_acknowledgement_in_either_order() {
+    let r = receipts();
+    let (a, b) = (key_hash(KeyKind::Gate, "a"), key_hash(KeyKind::Gate, "b"));
+    r.settle("s", &a, ReceiptState::Accepted, "h", t0()).unwrap();
+    r.settle("s", &a, ReceiptState::Rejected, "h", t0()).unwrap();
+    r.settle("s", &b, ReceiptState::Rejected, "h", t0()).unwrap();
+    r.settle("s", &b, ReceiptState::Accepted, "h", t0()).unwrap();
+    assert_eq!(r.state("s", &a).unwrap(), Some(ReceiptState::Rejected));
+    assert_eq!(r.state("s", &b).unwrap(), Some(ReceiptState::Rejected));
+}
+
+#[test]
 fn a_new_host_marks_what_another_left_pending_unknown() {
     let r = receipts();
     let (mine, theirs) = (key_hash(KeyKind::Gate, "m"), key_hash(KeyKind::Gate, "t"));

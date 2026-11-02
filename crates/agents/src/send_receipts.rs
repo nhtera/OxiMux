@@ -95,9 +95,11 @@ impl Receipts {
         read_state(&conn, session, key_hash)
     }
 
-    /// Record proof for a send. Only a send with no proof yet (`pending`, or
-    /// `unknown` when the proof arrives late) moves; `accepted` and `rejected`
-    /// are final. A proof that beats its reservation inserts the row.
+    /// Record proof for a send. A send with no proof yet (`pending`, or
+    /// `unknown` when the proof arrives late) moves; `rejected` is final; and
+    /// `rejected` overrides `accepted`, which a CLI reports before the provider
+    /// answers (so the two settle the same in either order). A proof that beats
+    /// its reservation inserts the row.
     pub fn settle(
         &self,
         session: &str,
@@ -111,7 +113,8 @@ impl Receipts {
             "INSERT INTO send_receipts (session_id, key_hash, state, host_instance, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
              ON CONFLICT (session_id, key_hash) DO UPDATE SET state = excluded.state, \
-             updated_at = excluded.updated_at WHERE send_receipts.state IN ('pending', 'unknown')",
+             updated_at = excluded.updated_at WHERE send_receipts.state IN ('pending', 'unknown') \
+             OR (excluded.state = 'rejected' AND send_receipts.state = 'accepted')",
             params![session, key_hash, state.as_text(), instance, stamp(now)],
         )
         .context("settle send receipt")?;

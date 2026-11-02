@@ -15,12 +15,14 @@ CREATE TABLE send_receipts (
     session_id    TEXT NOT NULL,
     key_hash      TEXT NOT NULL,
     -- 'pending'  reserved, written or about to be, no proof yet;
-    -- 'accepted' the agent started on it: never resend it verbatim;
-    -- 'rejected' the provider refused the turn before producing anything
-    --            (an overload or rate-limit status and no reply or tool call
-    --            after the prompt): safe to resend verbatim. An agent CLI
-    --            acknowledges every line it reads, so its acknowledgement alone
-    --            is not acceptance by the provider;
+    -- 'accepted' the agent's CLI took it (it is in the agent's session): never
+    --            resend it verbatim. A CLI acknowledges every line it reads,
+    --            before the provider is asked, so this alone is not acceptance
+    --            by the provider;
+    -- 'rejected' the provider refused the turn before producing anything (an
+    --            overload or rate-limit status and no reply or tool call after
+    --            the prompt): safe to resend verbatim. Overrides 'accepted',
+    --            since that acknowledgement comes first;
     -- 'unknown'  written, then the host went away before any proof: the agent
     --            may or may not have it, so nothing resends it on its own.
     state         TEXT NOT NULL,
@@ -49,12 +51,14 @@ CREATE TABLE turn_retries (
     reason          TEXT NOT NULL,
     -- Automatic attempts already fired for this turn.
     attempts        INTEGER NOT NULL DEFAULT 0,
+    -- When the turn first failed (again when a cancelled retry is re-armed).
     first_failed_at TEXT NOT NULL,
     -- When the armed retry fires (unix ms, like every wake time the retry
     -- policy computes); NULL while none is armed.
     next_wake_at_ms INTEGER,
     -- NULL while live; then 'succeeded' | 'exhausted' | 'cancelled' |
-    -- 'superseded' (the user sent something new).
+    -- 'superseded' (the user sent something new). A live row a week old was
+    -- abandoned (its chat closed) and is pruned with the resolved ones.
     resolved        TEXT,
     resolved_at     TEXT,
     host_instance   TEXT NOT NULL,

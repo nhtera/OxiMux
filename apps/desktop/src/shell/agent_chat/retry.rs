@@ -37,6 +37,16 @@ const RESTORE_GRACE_MS: i64 = 5 * 60 * 1000;
 /// (an overload is a backoff), so the card's chip reads "Limited".
 pub(super) const WINDOW_REASON: &str = "Usage limit reached";
 
+/// Why no automatic retry was armed for a retryable failure: the attempts ran
+/// out, or (before any) the wait is longer than the user allows.
+fn exhausted_note(class: oximux_agents::retry::RetryClass, attempts: u32) -> &'static str {
+    match (attempts, class) {
+        (0, _) => " (the wait is longer than your automatic-retry limit)",
+        (_, oximux_agents::retry::RetryClass::Window { .. }) => " (rate limit retries exhausted)",
+        _ => " (automatic retries exhausted)",
+    }
+}
+
 /// What a retry sends when the failed turn had already started working.
 const CONTINUE_PROMPT: &str = "Please continue.";
 
@@ -152,6 +162,13 @@ impl AgentChatView {
         let seed = std::hash::Hasher::finish(&hasher);
         // The attempts count against the failed turn, durably: the host's
         // record wins over this view's when it has seen more (a restart).
+        if !class.is_retryable() {
+            // A retried turn that now fails for good: its retry is over.
+            if self.retry.turn_key.take().is_some() {
+                self.record_retry_resolved(Resolution::Cancelled, cx);
+            }
+            return;
+        }
         let turn_key = match &self.retry.turn_key {
             Some(key) => key.clone(),
             None => self.retry_turn_key(),
@@ -163,7 +180,7 @@ impl AgentChatView {
             Next::Exhausted => {
                 self.record_retry_resolved(Resolution::Exhausted, cx);
                 if let Some(err) = self.thread.last_error.as_mut() {
-                    err.push_str(" (rate limit retries exhausted)");
+                    err.push_str(exhausted_note(class, self.retry.attempt));
                 }
                 return;
             }
@@ -256,18 +273,13 @@ impl AgentChatView {
             .try_global::<AgentRetrySettings>()
             .copied()
             .unwrap_or_else(AgentRetrySettings::shipped);
-        if !settings.enabled {
-            return;
-        }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let remaining = saved.wake_at_ms - now_ms;
-        if remaining < -RESTORE_GRACE_MS {
-            return;
-        }
         // `None` is "No limit" — nothing to exceed.
-        if let Some(max) = settings.max_automatic_wait.duration()
-            && remaining > max.as_millis() as i64
-        {
+        let too_long = settings.max_automatic_wait.duration().is_some_and(|max| remaining > max.as_millis() as i64);
+        if !settings.enabled || remaining < -RESTORE_GRACE_MS || too_long {
+            // Refused: the host's record of it is over too.
+            self.record_retry_resolved(Resolution::Cancelled, cx);
             return;
         }
         // The host's record is the durable count; the blob's may be older.
