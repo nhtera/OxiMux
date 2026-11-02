@@ -5,7 +5,7 @@
 //! turn never looks like a forgotten one: it names why the turn is held, when
 //! it will go, and gives the user both overrides — send it now, or drop it.
 
-use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
+use gpui::{AnyElement, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px};
 use oximux_settings::{Density, Theme, Typography};
 
 /// Human countdown to a wake time: `45s`, `12m`, `3h 10m`.
@@ -38,6 +38,14 @@ pub(super) struct Held<'a> {
     pub remaining_ms: i64,
     /// Automatic attempts already spent, zero-based.
     pub attempt: u32,
+    /// The wake time as a local clock time ("14:05"): the chip's tooltip.
+    pub wake_clock: String,
+}
+
+/// The "Limited" chip's text: one format wherever a limited session shows its
+/// wait (the countdown, never the clock time, which is the tooltip).
+pub(super) fn limited_chip_text(remaining_ms: i64) -> String {
+    format!("Limited · resets in {}", countdown(remaining_ms))
 }
 
 /// Build the queued-retry card: why the turn is held, when it goes, and the two
@@ -51,7 +59,7 @@ pub(super) fn retry_card(
     send_now: impl IntoElement,
     cancel: impl IntoElement,
 ) -> AnyElement {
-    let Held { reason, remaining_ms, attempt } = held;
+    let Held { reason, remaining_ms, attempt, wake_clock } = held;
     div()
         .flex()
         .flex_col()
@@ -68,16 +76,32 @@ pub(super) fn retry_card(
         .py(px(10.0))
         .child(
             div()
-                .text_size(px(typo.t_label_xs))
-                .text_color(theme.fg_muted)
-                .child(format!("Attempt {} of {}", attempt + 1, oximux_agents::retry::MAX_ATTEMPTS)),
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .id("chat-retry-limited")
+                        .flex_none()
+                        .px(px(6.0))
+                        .rounded(px(density.r_xs))
+                        .bg(theme.status_warning.opacity(0.18))
+                        .text_size(px(typo.t_label_xs))
+                        .text_color(theme.status_warning)
+                        .child(limited_chip_text(remaining_ms))
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(wake_clock.clone()).build(window, cx)
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(typo.t_label_xs))
+                        .text_color(theme.fg_muted)
+                        .child(format!("Attempt {} of {}", attempt + 1, oximux_agents::retry::MAX_ATTEMPTS)),
+                ),
         )
-        .child(
-            div()
-                .text_size(px(typo.t_body_sm))
-                .text_color(theme.fg_base)
-                .child(format!("{reason} — retrying in {}", countdown(remaining_ms))),
-        )
+        .child(div().text_size(px(typo.t_body_sm)).text_color(theme.fg_base).child(reason.to_string()))
         .child(div().flex().gap(px(8.0)).child(send_now).child(cancel))
         .into_any_element()
 }
@@ -97,6 +121,11 @@ mod tests {
         assert_eq!(countdown(3_599_000), "59m");
         assert_eq!(countdown(3_600_000), "1h");
         assert_eq!(countdown(11_400_000), "3h 10m");
+    }
+
+    #[test]
+    fn the_limited_chip_reads_as_a_countdown() {
+        assert_eq!(limited_chip_text(12 * 60_000 + 5_000), "Limited · resets in 12m");
     }
 
     #[test]

@@ -52,10 +52,13 @@ random offset of up to two minutes. This is load-bearing, not a refinement.
 While a retry is armed the thread shows a card in place of the error:
 
 ```
-Attempt 1 of 4
-Usage limit reached — retrying in 3h 10m
+[Limited · resets in 3h 10m]  Attempt 1 of 4
+Usage limit reached
 [ Send now ]  [ Cancel ]
 ```
+
+- The **Limited** chip counts down to the retry; hover it for the clock time.
+  The session's health reads Limited for the same span.
 
 - **Send now** fires immediately and counts as an attempt.
 - **Cancel** drops the retry and shows the original error.

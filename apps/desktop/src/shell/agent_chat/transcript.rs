@@ -1189,7 +1189,14 @@ impl AgentChatView {
             let send_now = self.retry_send_now_button(cx);
             let cancel = self.retry_cancel_button(cx);
             col = col.child(retry_card::retry_card(
-                retry_card::Held { reason: &reason, remaining_ms: remaining, attempt },
+                retry_card::Held {
+                    reason: &reason,
+                    remaining_ms: remaining,
+                    attempt,
+                    wake_clock: chrono::DateTime::from_timestamp_millis(wake_at_ms)
+                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                        .unwrap_or_default(),
+                },
                 theme,
                 &typo,
                 density,
