@@ -28,6 +28,9 @@ const PLAN_REFUSED: &str = "Leaving plan mode needs you: this turn was started b
 /// What the transcript says when held child events go out with a message.
 const HELD_EVENTS_NOTE: &str = "Child events that arrived after the Stop went with this message.";
 
+/// What the transcript says when a recovery note went out with a message.
+const RECOVERY_NOTE_SENT: &str = "A recovery note about the restart went with this message.";
+
 /// How long after its turn ended a steered line may take to start (or be
 /// reported dropped) before the chat stops waiting for it.
 const STEER_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -85,7 +88,7 @@ impl AgentChatView {
     }
 
     /// Whether the agent has said anything since the latest prompt.
-    fn turn_has_output(&self) -> bool {
+    pub(super) fn turn_has_output(&self) -> bool {
         self.thread
             .entries
             .iter()
@@ -358,7 +361,19 @@ impl AgentChatView {
     /// Write a prompt to the agent, under the id it will report it by. Child
     /// events the gate held after a Stop go first, in the same line, under
     /// their batch's id (so their receipts settle them).
+    ///
+    /// A recovery note a restart left owed goes ahead of the text, once; it is
+    /// kept for the next write if this one fails.
     pub(super) fn write_prompt(&mut self, text: &str, images: &[ChatImage]) -> anyhow::Result<()> {
+        let note = self.recovery_note.take();
+        let with_note;
+        let text = match &note {
+            Some(note) => {
+                with_note = oximux_agents::recovery_note::attach(note, text);
+                with_note.as_str()
+            }
+            None => text,
+        };
         // Only after a Stop: events that merely waited for a busy turn go on
         // their own when it ends. The host merges events into one batch, so
         // there is normally one; any other waits for the next turn.
@@ -396,6 +411,11 @@ impl AgentChatView {
         if sent.is_ok() {
             self.health.note_sent(oximux_agents::session_health::now_ms());
             self.publish_health();
+            if note.is_some() {
+                self.thread.apply(&ThreadEvent::Notice(RECOVERY_NOTE_SENT.into()));
+            }
+        } else {
+            self.recovery_note = note;
         }
         sent
     }

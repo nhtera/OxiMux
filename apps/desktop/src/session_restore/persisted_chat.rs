@@ -182,6 +182,14 @@ pub struct PersistedChatTranscript {
     /// so a restart cut it short. `false` for older blobs.
     #[serde(default)]
     pub mid_turn: bool,
+    /// What the background tasks running at save time were doing, for the
+    /// recovery note a mid-turn restore attaches to the next message.
+    #[serde(default)]
+    pub stopped_tasks: Vec<String>,
+    /// A recovery note the chat was restored with and has not sent yet, so a
+    /// second restart before the next message does not lose it.
+    #[serde(default)]
+    pub recovery_note: Option<String>,
 }
 
 /// A retry armed at save time. Deliberately the *decision* (when, why, how many
@@ -267,6 +275,8 @@ mod tests {
             claude_fast_mode: Some(true),
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -300,6 +310,8 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -336,6 +348,8 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -410,6 +424,8 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
             choices: Default::default(),
         }
     }
@@ -460,6 +476,8 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -499,6 +517,8 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

@@ -52,6 +52,17 @@ pub(super) enum ConnectMode {
 /// One field per backend that has a posture — mirroring `ConnectSpec`'s
 /// one-launch-field-per-transport convention. Carried as a struct so adding a
 /// backend doesn't grow the arity of the construction chain it threads through.
+/// What a restart cut short in a restored chat (from its blob).
+#[derive(Debug, Clone, Default)]
+pub struct RestoredTurn {
+    /// A turn, a continuation or background work was running at save time.
+    pub mid_turn: bool,
+    /// What those background tasks were doing.
+    pub stopped_tasks: Vec<String>,
+    /// A recovery note restored earlier and not yet sent.
+    pub recovery_note: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RestoredPosture {
     /// Codex `(approval_policy, sandbox)`.
@@ -237,6 +248,8 @@ impl AgentChatView {
             // at its reset even across a quit. `None` whenever nothing is armed.
             pending_retry: self.retry.persisted(),
             mid_turn: self.mid_turn(),
+            stopped_tasks: self.running_task_descriptions(),
+            recovery_note: self.recovery_note.clone(),
             choices: PersistedChoices {
                 models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
                 modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),
@@ -256,6 +269,17 @@ impl AgentChatView {
     /// snapshot. Text-only — staged images/context aren't persisted.
     pub fn queued_texts(&self, cx: &App) -> Vec<String> {
         self.composer.read(cx).queued_texts()
+    }
+
+    /// What the running background tasks are doing, for the recovery note a
+    /// restart mid-turn owes the agent.
+    fn running_task_descriptions(&self) -> Vec<String> {
+        self.thread
+            .background_tasks
+            .iter()
+            .filter(|t| t.status == oximux_agents::thread::TaskStatus::Running)
+            .map(|t| t.description.clone())
+            .collect()
     }
 
     /// Seed a restored draft + queued messages into the composer after

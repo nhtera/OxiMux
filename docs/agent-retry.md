@@ -33,6 +33,20 @@ can cost money or hammer an account that is already refusing requests.
 A turn you stopped yourself is never retried, and neither is one whose agent
 process has died.
 
+## What a retry sends
+
+If the agent had produced nothing before the turn failed, the retry sends your
+prompt again, unchanged. If it had already started (any reply or tool call),
+sending the prompt again would make it start the work over, so the retry sends
+a new message, **"Please continue."**, which shows in the transcript. The Retry
+button on an error card follows the same rule.
+
+## The queue after a failure
+
+Messages you queued while a turn ran are not sent into a session whose last
+turn failed: their chips read "Waiting · agent failed" until you send something
+yourself (or a retry succeeds), and then they drain one per turn as usual.
+
 ## Jitter, and why it matters
 
 Every thread on one account sees the *same* reset time. Without a random spread

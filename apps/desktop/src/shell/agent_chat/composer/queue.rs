@@ -392,19 +392,7 @@ impl ComposerView {
     /// flow of the text so a narrow column wraps the text, not the buttons.
     pub(super) fn render_held(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (theme, density, typo) = (self.theme, self.density, &self.typography);
-        let button = |id: (&'static str, usize), label: &'static str| {
-            div()
-                .id(id)
-                .flex_none()
-                .px(px(8.0))
-                .py(px(2.0))
-                .rounded(px(density.r_xs))
-                .cursor_pointer()
-                .text_size(px(typo.t_body_sm))
-                .text_color(theme.fg_muted)
-                .hover(|s| s.bg(theme.bg_panel).text_color(theme.fg_base))
-                .child(SharedString::from(label))
-        };
+        let button = |id, label| super::strips::strip_button(self, id, label);
         let n = self.held.len();
         let title = format!(
             "{n} message{} queued before restart {} held (text only).",
@@ -438,18 +426,7 @@ impl ComposerView {
                             .on_click(cx.listener(|this, _e, _w, cx| this.discard_held(cx))),
                     ),
             );
-        let mut strip = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .min_w_0()
-            .gap(px(density.gap_inline * 0.5))
-            .px(px(density.pad_panel))
-            .py(px(density.gap_inline))
-            .rounded(px(density.r_card))
-            .bg(theme.bg_panel_alt)
-            .border_1()
-            .border_color(theme.border_inactive)
+        let mut strip = super::strips::strip_frame(self)
             .child(header);
         for (idx, m) in self.held.iter().enumerate() {
             let first_line = m.text.lines().next().unwrap_or_default().to_string();

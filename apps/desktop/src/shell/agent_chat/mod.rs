@@ -256,7 +256,7 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
     }
 }
 
-pub use session_persistence::RestoredPosture;
+pub use session_persistence::{RestoredPosture, RestoredTurn};
 use session_persistence::{seed_posture_feature_values, ConnectMode};
 
 /// Overlay the user's optimistic feature picks onto the backend-advertised
@@ -594,6 +594,8 @@ pub struct AgentChatView {
     pending_send_uuid: Option<uuid::Uuid>,
     /// Health facts the fold does not keep (`health_link.rs`).
     health: health_link::HealthTrack,
+    /// What a restart cut short, owed to the agent on the next message.
+    recovery_note: Option<String>,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`

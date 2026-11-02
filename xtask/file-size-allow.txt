@@ -29,8 +29,10 @@
 # The registry glue then moved to `agent_chat/remote_link.rs` too; the
 # orchestration P1 view wiring (spawn posture, credentials, the respawn gate)
 # spent part of that headroom and the row came down to what was left.
-# The composer's parked-message queue moved to `agent_chat/composer/queue.rs`
-# (3523 -> 3239) before the held restored queue (orchestration P3) spent part
-# of that room; the row is what was left.
-apps/desktop/src/shell/agent_chat/mod.rs 4040
-apps/desktop/src/shell/agent_chat/composer.rs 3256
+# Orchestration P3 made room before spending it: the composer's parked-message
+# queue moved to `agent_chat/composer/queue.rs` and its input strips to
+# `composer/strips.rs` (3523 -> 3240 after the held queue and recovery strip);
+# the view's draft/queue snapshot helpers moved to `session_persistence.rs`
+# (4070 -> 4042 after the recovery-note field). Both rows are what was left.
+apps/desktop/src/shell/agent_chat/mod.rs 4042
+apps/desktop/src/shell/agent_chat/composer.rs 3240

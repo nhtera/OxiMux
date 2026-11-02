@@ -57,6 +57,7 @@ struct PendingTranscript {
 
 mod attach_menu;
 mod queue;
+mod strips;
 pub use queue::HeldMessage;
 use queue::{MAX_QUEUED, QueuedMessage};
 
@@ -275,6 +276,8 @@ pub enum ComposerEvent {
         held: u32,
         queued: u32,
     },
+    /// The user removed the recovery note the next message would carry.
+    RemoveRecoveryNote,
     /// The user pressed Stop while a turn was streaming — interrupt it.
     Stop,
     /// The user picked a model in the bottom toolbar (a Claude alias).
@@ -535,6 +538,9 @@ pub struct ComposerView {
     /// Shown on the open queue's chips in place of "Queued" while the parent
     /// holds the queue (a failed turn).
     queue_note: Option<&'static str>,
+    /// The parent owes the agent a recovery note on the next message; shown as
+    /// a strip with [Remove].
+    recovery_note: bool,
     /// Context tokens used this turn (input + cache + output), pushed by the
     /// parent from live usage. `None` until any usage has arrived this session —
     /// the meter stays hidden so a brand-new chat doesn't flash an empty meter.
@@ -672,6 +678,7 @@ impl ComposerView {
             queued: Vec::new(),
             held: Vec::new(),
             queue_note: None,
+            recovery_note: false,
             can_steer: false,
             meter_used_tokens: None,
             meter_window: None,
@@ -2678,31 +2685,6 @@ impl ComposerView {
         row
     }
 
-    /// A muted "History i/N" strip shown above the pill while walking prompt
-    /// history — echoing a shell's recall indicator so ↑/↓ reads as browsing
-    /// sent prompts, not moving the caret. `None` when not navigating.
-    fn render_history_indicator(&self) -> Option<impl IntoElement> {
-        let (pos, total) = self.history.position()?;
-        let theme = self.theme;
-        let density = self.density;
-        let typo = &self.typography;
-        Some(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .w_full()
-                .px(px(density.pad_panel))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(typo.t_body_sm))
-                        .text_color(theme.fg_subtle)
-                        .child(SharedString::from(format!("History {pos}/{total}"))),
-                ),
-        )
-    }
-
     /// The command list shown while the palette is open: an inline panel above
     /// the pill (grows upward over the transcript) with rows grouped under
     /// "Built-in" / "Skills" headers, each row a `/name`, its description, and a
@@ -3333,6 +3315,7 @@ impl Render for ComposerView {
                     .children(self.render_mention_overlay(cx))
                     .children(self.render_usage_hint(cx))
                     .when(!self.held.is_empty(), |d| d.child(self.render_held(cx)))
+                    .when(self.recovery_note, |d| d.child(self.render_recovery_note(cx)))
                     .when(!self.queued.is_empty(), |d| d.child(self.render_queued(cx)))
                     .children(self.render_history_indicator())
                     // New Agent draft: where-this-runs + Import session sit above

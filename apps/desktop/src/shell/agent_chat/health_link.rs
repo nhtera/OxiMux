@@ -213,7 +213,15 @@ impl AgentChatView {
 
     /// A restored chat: unconfirmed until its first frame, or interrupted when
     /// it was mid-turn and this host provably replaced the one that ran it.
-    pub fn restore_health(&mut self, mid_turn: bool, cx: &mut Context<Self>) {
+    /// A restart mid-turn also owes the agent a recovery note on the next
+    /// message (kept if an earlier restore's note is still unsent).
+    pub fn restore_health(&mut self, turn: super::RestoredTurn, cx: &mut Context<Self>) {
+        let mid_turn = turn.mid_turn;
+        self.recovery_note = turn.recovery_note.or_else(|| {
+            let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            mid_turn.then(|| oximux_agents::recovery_note::build(&at, &turn.stopped_tasks))
+        });
+        self.sync_composer(cx);
         let prior_host_gone = cx
             .try_global::<crate::remote_control::RemoteControl>()
             .and_then(|rc| rc.host_core())
@@ -230,6 +238,13 @@ impl AgentChatView {
             reason = h.reason.as_deref().unwrap_or(""),
             "health (restored)"
         );
+    }
+
+    /// The user removed the recovery note (the strip's [Remove]).
+    pub(super) fn remove_recovery_note(&mut self, cx: &mut Context<Self>) {
+        self.recovery_note = None;
+        self.meta_dirty.set(true);
+        self.sync_composer(cx);
     }
 
     /// Whether work was running that a restart would cut short: a turn,
@@ -389,13 +404,44 @@ mod tests {
         let window = chat(cx, StubConnection::default());
         window
             .update(cx, |view, _window, cx| {
-                view.restore_health(true, cx);
+                view.restore_health(crate::shell::agent_chat::RestoredTurn { mid_turn: true, ..Default::default() }, cx);
                 let (status, liveness, _) = health_of(view);
                 assert_eq!(liveness, Liveness::RestoredUnconfirmed, "no lock proof in a test: no claim");
                 assert_ne!(status, HealthStatus::Failed);
                 view.health.note_event(&ThreadEvent::ProviderTurnStarted, now_ms());
                 assert_eq!(health_of(view).1, Liveness::Live);
             })
+            .expect("window update");
+    }
+
+    /// A chat restored mid-turn tells the agent on the next message, once
+    /// (F6, root); Remove drops the note.
+    #[gpui::test]
+    async fn a_mid_turn_restore_attaches_a_recovery_note_to_the_next_message(cx: &mut TestAppContext) {
+        let stub = StubConnection::default();
+        let window = chat(cx, stub.clone());
+        let turn = || crate::shell::agent_chat::RestoredTurn {
+            mid_turn: true,
+            stopped_tasks: vec!["npm test".into()],
+            recovery_note: None,
+        };
+        window
+            .update(cx, |view, _window, cx| {
+                view.restore_health(turn(), cx);
+                view.send_text("do it".into(), Vec::new(), cx);
+                view.thread.turn_active = false;
+                view.send_text("again".into(), Vec::new(), cx);
+                view.restore_health(turn(), cx);
+                view.remove_recovery_note(cx);
+            })
+            .expect("window update");
+        cx.run_until_parked();
+        let sent: Vec<String> = stub.sent().iter().map(|v| v.to_string()).collect();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("OxiMux restarted at") && sent[0].contains("npm test") && sent[0].contains("do it"));
+        assert!(!sent[1].contains("OxiMux restarted"), "once: {}", sent[1]);
+        window
+            .update(cx, |view, _window, _cx| assert!(view.recovery_note.is_none(), "Remove drops it"))
             .expect("window update");
     }
 
