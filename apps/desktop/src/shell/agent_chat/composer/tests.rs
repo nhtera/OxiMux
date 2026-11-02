@@ -117,6 +117,10 @@ impl ComposerView {
     }
 
     /// How many messages are currently parked (queued while a turn streamed).
+    pub(crate) fn held_for_test(&self) -> &[HeldMessage] {
+        &self.held
+    }
+
     pub(crate) fn queued_len_for_test(&self) -> usize {
         self.queued.len()
     }

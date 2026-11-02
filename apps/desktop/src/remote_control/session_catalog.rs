@@ -440,6 +440,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices,
         }
     }

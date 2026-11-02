@@ -361,22 +361,20 @@ impl AgentChatView {
         });
         match last_user {
             Some((idx, text, images)) => {
-                let sent = match &self.connection {
-                    Some(conn) => match conn.send_user_message_with_images(&text, &images) {
+                // Through the one write path, so a retry goes out tagged (its
+                // receipt settles it) and carries an owed recovery note.
+                let sent = self.connection.is_some()
+                    && match self.write_prompt(&text, &images) {
                         Ok(()) => {
                             self.thread.last_error = None;
                             self.thread.turn_active = true;
-                            self.health.note_sent(oximux_agents::session_health::now_ms());
-                            self.publish_health();
                             true
                         }
                         Err(e) => {
                             self.thread.last_error = Some(format!("Send failed: {e}"));
                             false
                         }
-                    },
-                    None => false,
-                };
+                    };
                 // Re-anchor the pre-turn checkpoint to the retried turn (as a
                 // fresh send would), so the "restore files" rewind affordance
                 // keeps tracking repo changes for it.

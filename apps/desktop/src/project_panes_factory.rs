@@ -250,6 +250,7 @@ fn restore_chat_turn(snap: &PersistedTabs, session_id: Option<&str>) -> crate::s
             mid_turn: t.mid_turn,
             stopped_tasks: t.stopped_tasks.clone(),
             recovery_note: t.recovery_note.clone(),
+            unanswered_send: t.unanswered_send.clone(),
         })
         .unwrap_or_default()
 }
@@ -2171,6 +2172,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         };
         let snap = PersistedTabs {
@@ -2267,6 +2269,7 @@ mod tests {
                 mid_turn: false,
                 stopped_tasks: Vec::new(),
                 recovery_note: None,
+                unanswered_send: None,
                 choices: Default::default(),
             }],
             ..PersistedTabs::default()
@@ -2319,6 +2322,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         };
         let snap =

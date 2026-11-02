@@ -61,6 +61,8 @@ pub struct RestoredTurn {
     pub stopped_tasks: Vec<String>,
     /// A recovery note restored earlier and not yet sent.
     pub recovery_note: Option<String>,
+    /// A send nothing had answered at save time (see the blob field).
+    pub unanswered_send: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -250,6 +252,7 @@ impl AgentChatView {
             mid_turn: self.mid_turn(),
             stopped_tasks: self.running_task_descriptions(),
             recovery_note: self.recovery_note.clone(),
+            unanswered_send: self.unanswered_send(),
             choices: PersistedChoices {
                 models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
                 modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),

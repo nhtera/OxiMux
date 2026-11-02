@@ -189,6 +189,17 @@ impl ComposerView {
         self.queue_changed(cx);
     }
 
+    /// The send written but never answered before the quit: held first (it
+    /// went before anything queued behind it) and marked "may already have been
+    /// sent".
+    pub fn hold_unconfirmed(&mut self, text: String, cx: &mut Context<Self>) {
+        if !text.trim().is_empty() {
+            self.held.insert(0, HeldMessage { text, maybe_sent: true });
+            self.held.truncate(MAX_QUEUED);
+            self.queue_changed(cx);
+        }
+    }
+
     /// Release held message `idx`: sent at once when idle, else moved to the
     /// front of the open queue so it goes when the turn ends.
     pub(super) fn send_held(&mut self, idx: usize, cx: &mut Context<Self>) {

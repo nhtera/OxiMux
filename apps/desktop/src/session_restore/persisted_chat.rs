@@ -190,6 +190,11 @@ pub struct PersistedChatTranscript {
     /// second restart before the next message does not lose it.
     #[serde(default)]
     pub recovery_note: Option<String>,
+    /// A send written at save time that nothing had answered yet (its id,
+    /// empty when untagged): on restore its text comes back held, marked "may
+    /// already have been sent".
+    #[serde(default)]
+    pub unanswered_send: Option<String>,
 }
 
 /// A retry armed at save time. Deliberately the *decision* (when, why, how many
@@ -277,6 +282,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -312,6 +318,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -350,6 +357,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -426,6 +434,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         }
     }
@@ -478,6 +487,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -519,6 +529,7 @@ mod tests {
             mid_turn: false,
             stopped_tasks: Vec::new(),
             recovery_note: None,
+            unanswered_send: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

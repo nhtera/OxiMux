@@ -13,7 +13,7 @@ use oximux_agents::health::{
     self, ExitProof, HealthInputs, PromptKind, Process, Restored,
 };
 use oximux_agents::session_health::now_ms;
-use oximux_agents::thread::{TaskStatus, ThreadEvent};
+use oximux_agents::thread::{TaskStatus, ThreadEntry, ThreadEvent};
 
 use super::AgentChatView;
 
@@ -24,6 +24,8 @@ pub(super) struct HealthTrack {
     last_activity_at: i64,
     /// A send went out and no frame has answered it yet.
     sent_unanswered: bool,
+    /// The id that send went out under.
+    sent_id: Option<String>,
     /// The agent took the last send (receipt) and has produced nothing since.
     accepted_at: Option<i64>,
     /// How the process ended, once it has.
@@ -73,8 +75,9 @@ impl HealthTrack {
         self.failed_turn.is_some()
     }
 
-    /// A send was written to the agent.
-    pub(super) fn note_sent(&mut self, now: i64) {
+    /// A send was written to the agent, under `id` when it was tagged.
+    pub(super) fn note_sent(&mut self, now: i64, id: Option<String>) {
+        self.sent_id = id;
         self.turns += 1;
         self.sent_unanswered = true;
         self.accepted_at = None;
@@ -217,6 +220,16 @@ impl AgentChatView {
     /// message (kept if an earlier restore's note is still unsent).
     pub fn restore_health(&mut self, turn: super::RestoredTurn, cx: &mut Context<Self>) {
         let mid_turn = turn.mid_turn;
+        // The send nothing answered before the quit may or may not have reached
+        // the agent: offer it back, held and marked, never resend it unasked.
+        if turn.unanswered_send.is_some()
+            && let Some(text) = self.thread.entries.iter().rev().find_map(|e| match e {
+                ThreadEntry::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        {
+            self.composer.update(cx, |c, cx| c.hold_unconfirmed(text, cx));
+        }
         self.recovery_note = turn.recovery_note.or_else(|| {
             let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
             mid_turn.then(|| oximux_agents::recovery_note::build(&at, &turn.stopped_tasks))
@@ -245,6 +258,12 @@ impl AgentChatView {
         self.recovery_note = None;
         self.meta_dirty.set(true);
         self.sync_composer(cx);
+    }
+
+    /// The send written but not answered yet, as the blob keeps it: its id,
+    /// empty when it went untagged.
+    pub(super) fn unanswered_send(&self) -> Option<String> {
+        self.health.sent_unanswered.then(|| self.health.sent_id.clone().unwrap_or_default())
     }
 
     /// Whether work was running that a restart would cut short: a turn,
@@ -361,7 +380,7 @@ mod tests {
                 let registry = oximux_agents::session_registry::SessionRegistry::new();
                 let handle = registry.register("s".into(), Arc::new(StubConnection::default()));
                 view.thread.push_user_message("go");
-                view.health.note_sent(now_ms());
+                view.health.note_sent(now_ms(), None);
                 for (label, step) in [("sent", 0), ("continuation", 1), ("failed", 2)] {
                     match step {
                         1 => {
@@ -423,7 +442,7 @@ mod tests {
         let turn = || crate::shell::agent_chat::RestoredTurn {
             mid_turn: true,
             stopped_tasks: vec!["npm test".into()],
-            recovery_note: None,
+            ..Default::default()
         };
         window
             .update(cx, |view, _window, cx| {
@@ -445,10 +464,33 @@ mod tests {
             .expect("window update");
     }
 
+    /// A send nothing answered before the quit comes back held first, marked
+    /// "may already have been sent"; nothing resends it.
+    #[gpui::test]
+    async fn an_unanswered_send_comes_back_held_and_marked(cx: &mut TestAppContext) {
+        let stub = StubConnection::default();
+        let window = chat(cx, stub.clone());
+        window
+            .update(cx, |view, window, cx| {
+                view.thread.push_user_message_with_images("ship it".to_string(), Vec::new());
+                view.seed_draft_and_queue(None, vec!["then tests".into()], window, cx);
+                view.restore_health(
+                    crate::shell::agent_chat::RestoredTurn { unanswered_send: Some("u-1".into()), ..Default::default() },
+                    cx,
+                );
+                let held = view.composer.read(cx).held_for_test().to_vec();
+                assert_eq!(held.len(), 2);
+                assert!(held[0].text == "ship it" && held[0].maybe_sent);
+                assert!(!held[1].maybe_sent);
+            })
+            .expect("window update");
+        assert!(stub.sent().is_empty(), "nothing resent");
+    }
+
     #[test]
     fn a_frame_answers_a_send_and_confirms_a_restore() {
         let mut t = HealthTrack::restored(true, true);
-        t.note_sent(10);
+        t.note_sent(10, None);
         assert!(t.sent_unanswered);
         t.note_event(&ThreadEvent::UserMessageAccepted { uuid: "u".into() }, 20);
         assert_eq!(t.accepted_at, Some(20), "acceptance starts the not-started clock");

@@ -409,7 +409,7 @@ impl AgentChatView {
         }
         drop(gate);
         if sent.is_ok() {
-            self.health.note_sent(oximux_agents::session_health::now_ms());
+            self.health.note_sent(oximux_agents::session_health::now_ms(), Some(uuid.to_string()));
             self.publish_health();
             if note.is_some() {
                 self.thread.apply(&ThreadEvent::Notice(RECOVERY_NOTE_SENT.into()));
