@@ -140,8 +140,9 @@ fn fixed_tools() -> Vec<Value> {
         tool(
             "oximux_send_agent",
             "Send a child a message. It queues behind the child's running turn; sending to a finished child starts it again. \
-             The answer carries an idempotency_key: if you are unsure a send went through, send again with that same key \
-             and it is never delivered twice.",
+             When the host keeps send receipts, the answer carries an idempotency_key: if you are unsure a send went \
+             through, send again with that same key and it is never delivered twice (an answer marked idempotent:false \
+             had no key to keep).",
             json!({
                 "id": { "type": "string" },
                 "text": { "type": "string" },

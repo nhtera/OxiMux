@@ -127,11 +127,11 @@ async fn a_refused_send_ends_rejected_after_the_clis_acknowledgement(cx: &mut Te
     assert_eq!(live.map(|l| l.attempts), Some(0), "armed, not yet fired");
 }
 
-/// A refused send retried verbatim goes out under its own id again, so its
-/// receipt reopens (a caller holding its key sees it pending, then taken)
-/// and the retry keeps counting under one turn.
+/// A refused send retried verbatim goes out on a fresh line (the agent has
+/// seen the first id) that its receipt follows: reopened to pending, then
+/// taken when the retry is.
 #[gpui::test]
-async fn a_verbatim_retry_resends_under_the_same_id(cx: &mut TestAppContext) {
+async fn a_verbatim_retry_carries_the_refused_sends_receipt(cx: &mut TestAppContext) {
     let (window, _rt) = chat_with_host(cx);
     let (session, id) = window
         .update(cx, |view, _window, cx| {
@@ -149,18 +149,53 @@ async fn a_verbatim_retry_resends_under_the_same_id(cx: &mut TestAppContext) {
     let key = key_hash(KeyKind::Gate, &id);
     assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Rejected));
 
-    window
+    let line = window
         .update(cx, |view, _window, cx| {
             view.retry_last_turn(cx);
-            assert_eq!(view.health.sent_id().as_deref(), Some(id.as_str()), "the same id again");
             assert_eq!(view.pending_send_uuid, None, "nothing owed to the next send");
+            view.health.sent_id().expect("tagged")
         })
         .unwrap();
+    assert_ne!(line, id, "a fresh line");
     cx.run_until_parked();
     assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Pending));
     window
-        .update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: id.clone() }], cx))
+        .update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: line.clone() }], cx))
         .unwrap();
     cx.run_until_parked();
     assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Accepted));
+}
+
+/// After a restart the view no longer knows the failed send's id, only the
+/// retry's turn key (its receipt key): that is enough for the receipt to
+/// follow the retry.
+#[gpui::test]
+async fn a_restored_retry_still_carries_the_refused_sends_receipt(cx: &mut TestAppContext) {
+    let (window, _rt) = chat_with_host(cx);
+    let session = window.update(cx, |view, _window, _cx| view.remote_session_id.clone()).unwrap();
+    let core = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().clone());
+    let (key, now) = (key_hash(KeyKind::Gate, "u-before-restart"), chrono::Local::now());
+    core.lineage().receipts().settle(&session, &key, ReceiptState::Rejected, "old-host", now).unwrap();
+    core.lineage().retries().arm(&session, &key, "window", "Usage limit reached", 1, "old-host", now).unwrap();
+    let line = window
+        .update(cx, |view, _window, cx| {
+            view.thread.push_user_message_with_images("hello".to_string(), Vec::new());
+            view.thread.turn_active = false; // the turn failed before the quit
+            let saved = PersistedRetry {
+                wake_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+                reason: "Usage limit reached".into(),
+                attempt: 0,
+            };
+            view.restore_pending_retry(saved, cx);
+            view.send_retry_now(cx);
+            view.health.sent_id().expect("tagged")
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(core.lineage().receipts().state(&session, &key).unwrap(), Some(ReceiptState::Pending));
+    window
+        .update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: line }], cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(core.lineage().receipts().state(&session, &key).unwrap(), Some(ReceiptState::Accepted));
 }

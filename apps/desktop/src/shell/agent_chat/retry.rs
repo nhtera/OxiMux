@@ -135,12 +135,19 @@ impl AgentChatView {
             self.thread.last_turn_failure.clone(),
         );
         // A send the provider refused before the agent produced anything is
-        // safe to resend verbatim; say so in its receipt.
-        if super::receipt_link::refused(class, self.turn_has_output())
-            && let Some(id) = self.health.sent_id()
-        {
+        // safe to resend verbatim; its receipt says so, written after the
+        // retry row when one is armed, so a caller repeating its key never
+        // reads "refused" for a send the host is about to retry.
+        let refused = super::receipt_link::refused(class, self.turn_has_output())
+            .then(|| self.health.sent_id())
+            .flatten();
+        self.arm_retry_for(class, cx);
+        if let Some(id) = refused {
             self.record_receipt(&id, Some(ReceiptState::Rejected), cx);
         }
+    }
+
+    fn arm_retry_for(&mut self, class: oximux_agents::retry::RetryClass, cx: &mut Context<Self>) {
         let settings = cx
             .try_global::<AgentRetrySettings>()
             .copied()
@@ -443,12 +450,19 @@ impl AgentChatView {
         });
         match last_user {
             Some((idx, text, images)) => {
-                // The same send again, under its own id: a caller holding its
-                // key sees it pending again rather than refused, and its
-                // retries keep counting under one turn.
-                let again = self.health.sent_id().and_then(|id| uuid::Uuid::parse_str(&id).ok());
-                if self.connection.is_some() && self.pending_send_uuid.is_none() {
-                    self.pending_send_uuid = again;
+                // A fresh line (the agent has seen the first one's id), which
+                // the failed send's receipt follows: a caller holding its key
+                // sees it pending again, then taken, never refused while it
+                // is on its way. Keyed by the turn's receipt key, so this
+                // holds after a restart too.
+                let line = uuid::Uuid::new_v4();
+                let carried = self.retry.turn_key.clone();
+                let again = (self.connection.is_some() && self.pending_send_uuid.is_none()).then_some(line);
+                if let Some(line) = again {
+                    self.pending_send_uuid = Some(line);
+                    if let Some(key) = carried.clone() {
+                        self.send_gate.lock().unwrap().note_carried(line, key);
+                    }
                 }
                 // Through the one write path, so a retry goes out tagged (its
                 // receipt settles it) and carries an owed recovery note.
@@ -464,12 +478,12 @@ impl AgentChatView {
                             false
                         }
                     };
-                if let Some(again) = again {
-                    if self.pending_send_uuid == Some(again) {
+                if let Some(line) = again {
+                    if self.pending_send_uuid == Some(line) {
                         // Not written: the id is not owed to the next send.
                         self.pending_send_uuid = None;
-                    } else if sent {
-                        self.record_resend(&again.to_string(), cx);
+                    } else if sent && let Some(key) = carried {
+                        self.record_resend(key, cx);
                     }
                 }
                 // Re-anchor the pre-turn checkpoint to the retried turn (as a
