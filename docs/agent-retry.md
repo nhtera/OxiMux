@@ -56,7 +56,9 @@ random offset of up to two minutes. This is load-bearing, not a refinement.
 
 ## Limits
 
-- **Four attempts** per turn, maximum. Not configurable.
+- **Four attempts** per turn, maximum. Not configurable. The count is kept by
+  the host (in its database), so quitting and reopening OxiMux mid-wait does
+  not reset it; when it runs out the error says "rate limit retries exhausted".
 - Attempts reset when you send something new, so a long conversation that hits a
   limit once an hour is never locked out.
 - Cancelling a queued retry does not count as an attempt.

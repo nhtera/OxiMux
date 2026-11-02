@@ -83,6 +83,11 @@ impl HealthTrack {
         self.failed_turn = None;
     }
 
+    /// The id of the last send, when it was tagged.
+    pub(super) fn sent_id(&self) -> Option<String> {
+        self.sent_id.clone()
+    }
+
     /// A send was written to the agent, under `id` when it was tagged.
     pub(super) fn note_sent(&mut self, now: i64, id: Option<String>) {
         self.sent_id = id;
@@ -234,14 +239,24 @@ impl AgentChatView {
             ThreadEntry::User { text, .. } => Some(text.clone()),
             _ => None,
         });
+        // A send the agent is recorded to have taken is in its session: not
+        // offered back. No record (or no id) leaves it unconfirmed.
+        let taken = |id: &String| {
+            !id.is_empty()
+                && self.receipt_state(id, cx) == Some(oximux_agents::send_receipts::ReceiptState::Accepted)
+        };
         // Cards held from an earlier restore keep their own text; only the
         // live send's text is the latest user entry.
         let live = turn
             .unanswered_send
             .zip(last_user)
             .map(|(id, text)| crate::persisted_chat::UnconfirmedSend { id, text });
-        let unconfirmed: Vec<_> =
-            turn.unconfirmed_held.into_iter().chain(live).filter(|u| !u.text.trim().is_empty()).collect();
+        let unconfirmed: Vec<_> = turn
+            .unconfirmed_held
+            .into_iter()
+            .chain(live)
+            .filter(|u| !u.text.trim().is_empty() && !taken(&u.id))
+            .collect();
         self.composer.update(cx, |c, cx| {
             // Each goes in first, so the oldest ends up on top.
             for u in unconfirmed.iter().rev() {

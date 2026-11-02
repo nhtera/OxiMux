@@ -24,6 +24,16 @@ use crate::shell::terminal_view::TerminalView;
 use super::{AgentChatView, ChatViewMode};
 
 impl AgentChatView {
+    /// The current view mode (chat vs. companion terminal).
+    pub fn view_mode(&self) -> ChatViewMode {
+        self.view_mode
+    }
+
+    /// Whether a companion terminal has already been spawned for this chat.
+    pub fn has_companion_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
     /// Mount a freshly-spawned companion terminal (the host did the async
     /// `start_session`) and switch to Terminal view. Builds the `TerminalView`
     /// from this chat's own theme/density/typography, observes it for repaint,
