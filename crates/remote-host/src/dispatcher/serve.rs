@@ -180,6 +180,9 @@ impl Dispatcher {
                                     self.forward_state_change(&peer, transport, change, with_cursor)
                                         .await
                                 }
+                                Live::Health { session_id, health } => {
+                                    self.forward_health(&peer, transport, session_id, health).await
+                                }
                             };
                             if !alive {
                                 break;
@@ -275,6 +278,13 @@ impl Dispatcher {
                 self.begin_subscribe(&peer, &session_id, after_seq.unwrap_or(0), cursors, state.peer_version);
             if let Some(stream) = stream {
                 streams.push(stream.map(Live::Session).boxed());
+                // Health rides the session's first subscribe, for a peer that
+                // can decode it and from a host that keeps it.
+                if state.peer_version >= oximux_remote_proto::proto::HEALTH_PUSH_MIN_VERSION
+                    && self.host_core.is_some()
+                {
+                    streams.push(super::health_push::health_stream(self.registry.clone(), session_id.clone()));
+                }
             }
             return self.send(transport, response).await;
         }
@@ -668,7 +678,7 @@ impl Dispatcher {
     }
 
     /// Encode + send one response frame; returns whether the transport accepted it.
-    async fn send(&self, transport: &dyn Transport, response: Response) -> bool {
+    pub(super) async fn send(&self, transport: &dyn Transport, response: Response) -> bool {
         // `Response` carries no `serde_json::Value`, so it always postcard-encodes.
         let bytes = response.to_bytes().expect("response is always encodable");
         transport.send(bytes).await.is_ok()

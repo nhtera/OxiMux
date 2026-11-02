@@ -140,9 +140,20 @@ impl SessionHandle {
             true
         });
         if modified {
-            self.health.published.store(true, Ordering::Relaxed);
+            let first = !self.health.published.swap(true, Ordering::Relaxed);
             self.rederive_health(now_ms());
+            if first {
+                // Followers wait for the first publish; tell them even when
+                // the health reads as it did before it.
+                self.health.health.send_modify(|_| {});
+            }
         }
+    }
+
+    /// Whether the session's driver has published its facts: until then its
+    /// health is a default, not something anyone observed.
+    pub fn health_published(&self) -> bool {
+        self.health.published()
     }
 
     /// Re-derive from the last published facts (a prompt was decided here).

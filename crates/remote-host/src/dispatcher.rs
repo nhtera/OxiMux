@@ -18,6 +18,7 @@ mod forge;
 mod git;
 mod handlers;
 mod handshake;
+mod health_push;
 mod heartbeats;
 mod pairing_admin;
 mod schedules;
