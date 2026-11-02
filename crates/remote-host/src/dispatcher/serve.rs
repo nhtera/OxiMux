@@ -55,6 +55,7 @@ fn session_to_build(req: &Request) -> Option<&str> {
         | Request::GetForgeItemDetail { session_id, .. }
         | Request::ListForgeChecks { session_id } => Some(session_id),
         Request::SendPrompt(r) => Some(&r.session_id),
+        Request::SendV2(r) => Some(&r.session_id),
         Request::ResolvePermission(r) => Some(&r.session_id),
         Request::AnswerQuestion(r) => Some(&r.session_id),
         _ => None,

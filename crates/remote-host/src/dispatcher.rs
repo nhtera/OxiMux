@@ -21,6 +21,7 @@ mod handshake;
 mod heartbeats;
 mod pairing_admin;
 mod schedules;
+mod send_v2;
 mod serve;
 mod sim_view;
 mod simulator;
@@ -385,6 +386,7 @@ impl Dispatcher {
                 self.fetch_transcript_page(peer, &session_id, cursor, limit)
             }
             Request::SendPrompt(r) => self.send_prompt(peer, r),
+            Request::SendV2(r) => self.send_v2(peer, r),
             Request::ResolvePermission(r) => self.resolve_permission(peer, r),
             Request::ListChildren { of, recursive } => self.list_children(peer, &of, recursive),
             Request::CancelAgent { id, cascade } => self.cancel_agent(peer, &id, cascade),

@@ -122,6 +122,17 @@ impl Receipts {
         Ok(())
     }
 
+    /// Undo a reservation whose write failed: nothing reached the agent, so
+    /// the same key may be sent again. A settled receipt is kept.
+    pub fn forget_pending(&self, session: &str, key_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM send_receipts WHERE session_id = ?1 AND key_hash = ?2 AND state = 'pending'",
+            params![session, key_hash],
+        )?;
+        Ok(())
+    }
+
     /// What is recorded for a send, if anything.
     pub fn state(&self, session: &str, key_hash: &str) -> Result<Option<ReceiptState>> {
         let conn = self.conn.lock().unwrap();
