@@ -20,11 +20,11 @@
 
 use std::collections::HashMap;
 
-use gpui::Context;
+use gpui::{App, Context, Window};
 use oximux_agents::thread::pi::posture::{self as pi_posture, PiPosture};
 use oximux_agents::thread::FeatureValue;
 
-use super::AgentChatView;
+use super::{AgentChatView, HeldMessage};
 use crate::persisted_chat::{PersistedChatTranscript, PersistedChoices};
 
 /// How a chat view comes to life. Decided once per constructor and mapped
@@ -245,6 +245,39 @@ impl AgentChatView {
             },
         }
     }
+
+    /// The unsent composer draft text, for the layout snapshot (so a typed but
+    /// unsent message survives a tab close / app quit).
+    pub fn draft_text(&self, cx: &App) -> String {
+        self.composer.read(cx).current_draft(cx)
+    }
+
+    /// The text of each queued-but-unsent message (oldest first), for the layout
+    /// snapshot. Text-only — staged images/context aren't persisted.
+    pub fn queued_texts(&self, cx: &App) -> Vec<String> {
+        self.composer.read(cx).queued_texts()
+    }
+
+    /// Seed a restored draft + queued messages into the composer after
+    /// construction. The draft seed is no-clobber-guarded; queued messages come
+    /// back HELD (a restored app must not fire billed sends without a user action).
+    pub fn seed_draft_and_queue(
+        &mut self,
+        draft: Option<String>,
+        queued: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |c, cx| {
+            if let Some(text) = draft {
+                c.seed_draft(text, window, cx);
+            }
+            if !queued.is_empty() {
+                c.seed_held(queued.into_iter().map(|text| HeldMessage { text, maybe_sent: false }).collect(), cx);
+            }
+        });
+    }
+
 }
 
 #[cfg(test)]

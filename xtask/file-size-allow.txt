@@ -32,5 +32,5 @@
 # The composer's parked-message queue moved to `agent_chat/composer/queue.rs`
 # (3523 -> 3239) before the held restored queue (orchestration P3) spent part
 # of that room; the row is what was left.
-apps/desktop/src/shell/agent_chat/mod.rs 4070
+apps/desktop/src/shell/agent_chat/mod.rs 4040
 apps/desktop/src/shell/agent_chat/composer.rs 3256

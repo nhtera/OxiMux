@@ -1313,38 +1313,6 @@ impl AgentChatView {
             .map(|b| (b.preset_id.as_str(), b.session_id.as_str()))
     }
 
-    /// The unsent composer draft text, for the layout snapshot (so a typed but
-    /// unsent message survives a tab close / app quit).
-    pub fn draft_text(&self, cx: &App) -> String {
-        self.composer.read(cx).current_draft(cx)
-    }
-
-    /// The text of each queued-but-unsent message (oldest first), for the layout
-    /// snapshot. Text-only — staged images/context aren't persisted.
-    pub fn queued_texts(&self, cx: &App) -> Vec<String> {
-        self.composer.read(cx).queued_texts()
-    }
-
-    /// Seed a restored draft + queued messages into the composer after
-    /// construction. The draft seed is no-clobber-guarded; queued messages come
-    /// back HELD (a restored app must not fire billed sends without a user action).
-    pub fn seed_draft_and_queue(
-        &mut self,
-        draft: Option<String>,
-        queued: Vec<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.composer.update(cx, |c, cx| {
-            if let Some(text) = draft {
-                c.seed_draft(text, window, cx);
-            }
-            if !queued.is_empty() {
-                c.seed_held(queued.into_iter().map(|text| HeldMessage { text, maybe_sent: false }).collect(), cx);
-            }
-        });
-    }
-
     /// The current view mode (chat vs. companion terminal).
     pub fn view_mode(&self) -> ChatViewMode {
         self.view_mode
