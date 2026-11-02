@@ -356,6 +356,16 @@ impl LineageStore {
         crate::outbox::Outbox::new(self.conn.clone())
     }
 
+    /// What became of each send, on the same database.
+    pub fn receipts(&self) -> crate::send_receipts::Receipts {
+        crate::send_receipts::Receipts::new(self.conn.clone())
+    }
+
+    /// Failed turns' automatic retries, on the same database.
+    pub fn retries(&self) -> crate::retry::store::RetryStore {
+        crate::retry::store::RetryStore::new(self.conn.clone())
+    }
+
     /// Take a slot for a child of `parent`, or refuse.
     ///
     /// In one `BEGIN IMMEDIATE` transaction: reconcile the parent's tree
@@ -602,6 +612,10 @@ impl LineageStore {
             "UPDATE OR REPLACE agent_spawn_failures SET parent_id = ?2 WHERE parent_id = ?1",
             params![old, new],
         )?;
+        // A session's receipts and retries follow it too: a retry armed under
+        // the placeholder id must still count its attempts under the real one.
+        tx.execute("UPDATE OR REPLACE send_receipts SET session_id = ?2 WHERE session_id = ?1", params![old, new])?;
+        tx.execute("UPDATE OR REPLACE turn_retries SET session_id = ?2 WHERE session_id = ?1", params![old, new])?;
         tx.commit().context("commit lineage rekey")?;
         Ok(())
     }

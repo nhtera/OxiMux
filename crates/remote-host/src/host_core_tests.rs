@@ -239,3 +239,14 @@ fn the_health_tick_reads_child_activity_and_forgives_a_sleep() {
     f.core.refresh_health(t0 + 130_000, true);
     assert!(parent.health().stalled_since.is_none(), "waking from sleep is not silence");
 }
+
+#[test]
+fn a_starting_host_marks_sends_a_previous_one_left_unsettled_unknown() {
+    use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};
+    let f = fixture(HostConfig::default());
+    let k = key_hash(KeyKind::Gate, "u-1");
+    let receipts = f.core.lineage().receipts();
+    receipts.reserve("s", &k, "a-previous-host", chrono::Local::now()).unwrap();
+    f.core.start(PriorOwner::None);
+    assert_eq!(receipts.state("s", &k).unwrap(), Some(ReceiptState::Unknown), "never resent on its own");
+}

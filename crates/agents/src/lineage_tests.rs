@@ -461,6 +461,19 @@ fn a_rekey_keeps_lineage_children_and_outbox_rows() {
 }
 
 #[test]
+fn a_rekey_carries_a_sessions_receipts_and_retry_count() {
+    use crate::send_receipts::{KeyKind, ReceiptState, key_hash};
+    let s = store();
+    let k = key_hash(KeyKind::Gate, "u-1");
+    s.receipts().reserve("agent-1", &k, "h", t0()).unwrap();
+    s.retries().arm("agent-1", &k, "window", "r", 1, "h", t0()).unwrap();
+    s.retries().fired("agent-1", &k).unwrap();
+    s.rekey("agent-1", "real-id").unwrap();
+    assert_eq!(s.receipts().state("real-id", &k).unwrap(), Some(ReceiptState::Pending));
+    assert_eq!(s.retries().attempts("real-id", &k).unwrap(), 1, "the count follows the session");
+}
+
+#[test]
 fn rekeying_a_parent_moves_its_children_and_tree() {
     let s = store();
     spawn(&s, "tmp-root", "r1", "c1");

@@ -263,6 +263,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "agent_lineage",
         sql: include_str!("../migrations/V032__agent_lineage.sql"),
     },
+    // V033: what became of each send (at most once across restarts) and the
+    // durable attempt count of a rate-limited turn's retries.
+    Migration {
+        version: 33,
+        name: "send_receipts",
+        sql: include_str!("../migrations/V033__send_receipts.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
