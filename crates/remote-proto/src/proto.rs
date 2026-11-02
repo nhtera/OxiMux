@@ -194,12 +194,20 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// agents within caps and reaches only its own subtree. A v35 host cannot
 /// decode them: see [`SPAWN_MIN_VERSION`].
 ///
+/// v37: **safe delivery and session health** ([`Request::SendV2`] and its
+/// [`Response::SendOutcome`] reply, the [`Response::SessionHealth`] push, and
+/// the `delivery` wire types): a send under a key the host has seen is never
+/// sent twice, and a subscriber is told what a session is doing and which
+/// host process says so. A v36 host cannot decode `SendV2`: see
+/// [`SEND_V2_MIN_VERSION`]; a v36 peer is never pushed a health frame: see
+/// [`HEALTH_PUSH_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -325,6 +333,16 @@ pub const OPEN_PROJECT_MIN_VERSION: u32 = 35;
 /// The oldest host that speaks agent delegation (`oximux delegate`,
 /// `oximux whoami`, the orchestration MCP tools). Read by the **client**.
 pub const SPAWN_MIN_VERSION: u32 = 36;
+
+/// The oldest host that takes [`Request::SendV2`]. Read by the **client**: an
+/// older host cannot decode it, so a client sends it the plain
+/// [`Request::SendPrompt`] instead (without the never-twice guarantee).
+pub const SEND_V2_MIN_VERSION: u32 = 37;
+
+/// The oldest peer that can decode [`Response::SessionHealth`]. A host pushes
+/// it only to a subscriber whose declared version is at least this: an older
+/// one would drop the connection on the unknown ordinal.
+pub const HEALTH_PUSH_MIN_VERSION: u32 = 37;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -992,6 +1010,11 @@ pub enum Request {
     CancelAgent { id: String, cascade: bool },
     /// Who the caller is to this host, whether it may spawn, and which agents.
     Whoami,
+
+    // ---- v37: safe delivery and session health ----
+    /// A prompt under an idempotency key. Replies [`Response::SendOutcome`]:
+    /// `Queued` for a new key, `Duplicate` (nothing sent) for a seen one.
+    SendV2(crate::delivery::SendV2Req),
 }
 
 /// Host → client.
@@ -1243,6 +1266,13 @@ pub enum Response {
     AgentsCancelled { ended: Vec<String> },
     /// Reply to [`Request::Whoami`].
     Whoami(crate::lineage::WhoamiWire),
+
+    // ---- v37: safe delivery and session health ----
+    /// Reply to [`Request::SendV2`].
+    SendOutcome(crate::delivery::SendOutcomeWire),
+    /// A session's health, **pushed** to a subscriber at or above
+    /// [`HEALTH_PUSH_MIN_VERSION`]: once on subscribe, then on every change.
+    SessionHealth(crate::delivery::SessionHealthFrame),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 36,
-        "v36 = agent delegation (SpawnAgent, ListChildren, CancelAgent, Whoami, their replies, RpcError::Spawn). v35 = opening a folder in the desktop (OpenProject, ProjectOpened). v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
+        PROTOCOL_VERSION, 37,
+        "v37 = safe delivery and session health (SendV2, SendOutcome, the SessionHealth push). v36 = agent delegation (SpawnAgent, ListChildren, CancelAgent, Whoami, their replies, RpcError::Spawn). v35 = opening a folder in the desktop (OpenProject, ProjectOpened). v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
          status bar, erase, the Net shape). v27 = the simulator verify loop (Settled/AxRefs/Wait/Assert/AsCaller, \
          SimTargetWire::Ref, their replies and errors). v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
          VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
@@ -379,6 +379,20 @@ fn early_variants_keep_their_literal_ordinals() {
     let unsupported = Response::Error(RpcError::Unsupported).to_bytes().expect("encode");
     assert_eq!(bytes[0], unsupported[0], "same Response::Error ordinal");
     assert_eq!(bytes[1], unsupported[1] + 1, "Spawn follows Unsupported");
+    // The v37 delivery verbs, appended after delegation: `SendV2` is Request
+    // ordinal 78, `SendOutcome` and `SessionHealth` Response ordinals 60, 61.
+    let send = Request::SendV2(crate::delivery::SendV2Req {
+        session_id: String::new(),
+        text: String::new(),
+        images: vec![],
+        idempotency_key: String::new(),
+        corr_id: 0,
+    });
+    assert_eq!(send.to_bytes().expect("encode")[0], 78);
+    let outcome = Response::SendOutcome(crate::delivery::SendOutcomeWire::Queued);
+    assert_eq!(outcome.to_bytes().expect("encode"), vec![60, 0]);
+    let health = crate::delivery::SessionHealthFrame::new("s", "h", &Default::default());
+    assert_eq!(Response::SessionHealth(health).to_bytes().expect("encode")[0], 61);
     // `SessionsChanged` is the 29th Response variant (index 28); pin the
     // discriminant, the `Vec` payload follows.
     let changed = Response::SessionsChanged(vec![]);
