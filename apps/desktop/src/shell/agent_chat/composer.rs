@@ -57,6 +57,7 @@ struct PendingTranscript {
 
 mod attach_menu;
 mod queue;
+pub use queue::HeldMessage;
 use queue::{MAX_QUEUED, QueuedMessage};
 
 /// One agent in the draft's agent picker: its adapter id, display name, and
@@ -266,6 +267,13 @@ pub enum ComposerEvent {
     /// reorders instead when it carries attachments.
     SteerNow {
         text: String,
+    },
+    /// The queue's membership changed: how many restored messages are held and
+    /// how many are queued to drain. The parent reports both in the session's
+    /// health.
+    QueueChanged {
+        held: u32,
+        queued: u32,
     },
     /// The user pressed Stop while a turn was streaming — interrupt it.
     Stop,
@@ -521,6 +529,12 @@ pub struct ComposerView {
     /// Messages the user lined up while a turn was streaming, oldest first. The
     /// parent drains one per completed turn via [`Self::take_next_queued`].
     queued: Vec<QueuedMessage>,
+    /// Messages queued before the last restart, held until the user sends or
+    /// drops them; never drained with [`Self::queued`].
+    held: Vec<HeldMessage>,
+    /// Shown on the open queue's chips in place of "Queued" while the parent
+    /// holds the queue (a failed turn).
+    queue_note: Option<&'static str>,
     /// Context tokens used this turn (input + cache + output), pushed by the
     /// parent from live usage. `None` until any usage has arrived this session —
     /// the meter stays hidden so a brand-new chat doesn't flash an empty meter.
@@ -656,6 +670,8 @@ impl ComposerView {
             context_chips: Vec::new(),
             history: PromptHistory::new(),
             queued: Vec::new(),
+            held: Vec::new(),
+            queue_note: None,
             can_steer: false,
             meter_used_tokens: None,
             meter_window: None,
@@ -1502,7 +1518,7 @@ impl ComposerView {
             if self.queued.len() < MAX_QUEUED {
                 self.queued.push(QueuedMessage { text, images: staged, context });
             }
-            cx.notify();
+            self.queue_changed(cx);
             return;
         }
         self.history.record(&text);
@@ -3316,6 +3332,7 @@ impl Render for ComposerView {
                     .children(self.render_slash_palette(cx))
                     .children(self.render_mention_overlay(cx))
                     .children(self.render_usage_hint(cx))
+                    .when(!self.held.is_empty(), |d| d.child(self.render_held(cx)))
                     .when(!self.queued.is_empty(), |d| d.child(self.render_queued(cx)))
                     .children(self.render_history_indicator())
                     // New Agent draft: where-this-runs + Import session sit above

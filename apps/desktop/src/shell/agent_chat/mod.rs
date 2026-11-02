@@ -519,7 +519,7 @@ impl ThinkingLevel {
     }
 }
 
-use composer::{AgentModelCount, AgentPickerRow, ComposerEvent, ComposerView, ControlVocab};
+use composer::{AgentModelCount, AgentPickerRow, ComposerEvent, ComposerView, ControlVocab, HeldMessage};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{
@@ -1326,9 +1326,8 @@ impl AgentChatView {
     }
 
     /// Seed a restored draft + queued messages into the composer after
-    /// construction. The draft seed is no-clobber-guarded; queued messages are
-    /// re-shown as chips and NEVER auto-sent (a restored app must not fire billed
-    /// sends without a user action).
+    /// construction. The draft seed is no-clobber-guarded; queued messages come
+    /// back HELD (a restored app must not fire billed sends without a user action).
     pub fn seed_draft_and_queue(
         &mut self,
         draft: Option<String>,
@@ -1341,7 +1340,7 @@ impl AgentChatView {
                 c.seed_draft(text, window, cx);
             }
             if !queued.is_empty() {
-                c.seed_queued(queued, cx);
+                c.seed_held(queued.into_iter().map(|text| HeldMessage { text, maybe_sent: false }).collect(), cx);
             }
         });
     }

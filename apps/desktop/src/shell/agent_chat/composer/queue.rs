@@ -25,6 +25,18 @@ pub(super) struct QueuedMessage {
 /// without bound. Generous — a user rarely lines up more than a few.
 pub(super) const MAX_QUEUED: usize = 20;
 
+/// A message that was queued when the app last quit. It comes back **held**:
+/// nothing sends it but the user's own Send / Send all (not a completed turn,
+/// not a new message), because a restart is exactly when nobody has reviewed
+/// what was waiting. Text only, like the queue it was saved from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldMessage {
+    pub text: String,
+    /// Its send was written but never confirmed before the quit, so the agent
+    /// may already have it.
+    pub maybe_sent: bool,
+}
+
 impl ComposerView {
     /// Pop the oldest queued message for the parent to send, recording it in the
     /// prompt history as it goes out (it's now a sent prompt). Returns `None` when
@@ -38,7 +50,7 @@ impl ComposerView {
         }
         let QueuedMessage { text, images, context } = self.queued.remove(0);
         self.history.record(&text);
-        cx.notify();
+        self.queue_changed(cx);
         let images: Vec<ChatImage> = images.into_iter().map(|p| p.chat).collect();
         let wire = prepend_context(&context, &text);
         Some((wire, images))
@@ -63,7 +75,7 @@ impl ComposerView {
         self.pending_images = images;
         self.context_chips = context;
         self.set_draft_end(text, window, cx);
-        cx.notify();
+        self.queue_changed(cx);
         true
     }
 
@@ -83,14 +95,14 @@ impl ComposerView {
         self.pending_images = images;
         self.context_chips = context;
         self.set_draft_end(text, window, cx);
-        cx.notify();
+        self.queue_changed(cx);
     }
 
     /// Cancel a parked message (its chip's ✕).
     pub(super) fn cancel_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx < self.queued.len() {
             self.queued.remove(idx);
-            cx.notify();
+            self.queue_changed(cx);
         }
     }
 
@@ -130,7 +142,7 @@ impl ComposerView {
         self.history.record(&text);
         let images: Vec<ChatImage> = images.into_iter().map(|p| p.chat).collect();
         let wire = prepend_context(&context, &text);
-        cx.notify();
+        self.queue_changed(cx);
         if steering {
             cx.emit(ComposerEvent::SteerNow { text: wire });
         } else {
@@ -138,11 +150,13 @@ impl ComposerView {
         }
     }
 
-    /// The text of each queued message, oldest first, for persistence. Text-only
-    /// (staged images/context aren't persisted); an image-only queued message
-    /// (blank text) is skipped since it can't be faithfully restored.
+    /// The text of each queued message, oldest first, for persistence: the
+    /// held ones (queued before the last restart) ahead of the open queue.
+    /// Text-only (staged images/context aren't persisted); an image-only queued
+    /// message (blank text) is skipped since it can't be faithfully restored.
     pub fn queued_texts(&self) -> Vec<String> {
-        self.queued.iter().map(|m| m.text.clone()).filter(|t| !t.trim().is_empty()).collect()
+        let open = self.queued.iter().map(|m| m.text.clone()).filter(|t| !t.trim().is_empty());
+        self.held.iter().map(|m| m.text.clone()).chain(open).collect()
     }
 
     /// Re-seed queued chips from restored text (text-only, no images/context).
@@ -158,7 +172,87 @@ impl ComposerView {
             }
             self.queued.push(QueuedMessage { text, images: Vec::new(), context: Vec::new() });
         }
+        self.queue_changed(cx);
+    }
+
+    /// Restore the messages queued when the app last quit, **held** (see
+    /// [`HeldMessage`]).
+    pub fn seed_held(&mut self, entries: Vec<HeldMessage>, cx: &mut Context<Self>) {
+        for entry in entries {
+            if self.held.len() >= MAX_QUEUED {
+                break;
+            }
+            if !entry.text.trim().is_empty() {
+                self.held.push(entry);
+            }
+        }
+        self.queue_changed(cx);
+    }
+
+    /// Release held message `idx`: sent at once when idle, else moved to the
+    /// front of the open queue so it goes when the turn ends.
+    pub(super) fn send_held(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if self.disconnected || idx >= self.held.len() {
+            return;
+        }
+        let entry = self.held.remove(idx);
+        self.release_held(vec![entry], cx);
+    }
+
+    /// Release every held message, oldest first: the first is sent when idle,
+    /// the rest go to the front of the open queue in order.
+    pub(super) fn send_all_held(&mut self, cx: &mut Context<Self>) {
+        if self.disconnected || self.held.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.held);
+        self.release_held(entries, cx);
+    }
+
+    fn release_held(&mut self, entries: Vec<HeldMessage>, cx: &mut Context<Self>) {
+        let mut texts = entries.into_iter().map(|e| e.text);
+        let now = if self.turn_active { None } else { texts.next() };
+        let parked: Vec<QueuedMessage> = texts
+            .map(|text| QueuedMessage { text, images: Vec::new(), context: Vec::new() })
+            .collect();
+        self.queued.splice(0..0, parked);
+        self.queued.truncate(MAX_QUEUED);
+        self.queue_changed(cx);
+        if let Some(text) = now {
+            self.history.record(&text);
+            cx.emit(ComposerEvent::Submit { text, images: Vec::new() });
+        }
+    }
+
+    /// Drop held message `idx` (its card's Drop).
+    pub(super) fn drop_held(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx < self.held.len() {
+            self.held.remove(idx);
+            self.queue_changed(cx);
+        }
+    }
+
+    /// Drop every held message (the strip's Discard).
+    pub(super) fn discard_held(&mut self, cx: &mut Context<Self>) {
+        if !self.held.is_empty() {
+            self.held.clear();
+            self.queue_changed(cx);
+        }
+    }
+
+    /// Why the open queue is not draining, shown on its chips instead of
+    /// "Queued" (the parent's call: a turn that failed holds the queue).
+    pub fn set_queue_note(&mut self, note: Option<&'static str>, cx: &mut Context<Self>) {
+        if self.queue_note != note {
+            self.queue_note = note;
+            cx.notify();
+        }
+    }
+
+    /// The queue changed: repaint and tell the parent the counts.
+    pub(super) fn queue_changed(&mut self, cx: &mut Context<Self>) {
         cx.notify();
+        cx.emit(ComposerEvent::QueueChanged { held: self.held.len() as u32, queued: self.queued.len() as u32 });
     }
 
     /// Parked-message chips shown above the input while a turn streams: one
@@ -208,7 +302,7 @@ impl ComposerView {
                         .flex_none()
                         .text_size(px(typo.t_body_sm))
                         .text_color(theme.fg_subtle)
-                        .child(SharedString::from("Queued")),
+                        .child(SharedString::from(self.queue_note.unwrap_or("Queued"))),
                 )
                 // Preview clips to one line — wrapped in this flex_row so a long
                 // prompt truncates instead of rendering blank (the flex-col trap).
@@ -290,5 +384,117 @@ impl ComposerView {
             col = col.child(row);
         }
         col
+    }
+
+    /// The held-queue strip: what was queued before the restart, held until the
+    /// user sends or drops it. One card per message with [Send] [Drop]; the
+    /// header carries [Send all] [Discard]. The buttons sit outside the flex
+    /// flow of the text so a narrow column wraps the text, not the buttons.
+    pub(super) fn render_held(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (theme, density, typo) = (self.theme, self.density, &self.typography);
+        let button = |id: (&'static str, usize), label: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .px(px(8.0))
+                .py(px(2.0))
+                .rounded(px(density.r_xs))
+                .cursor_pointer()
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_muted)
+                .hover(|s| s.bg(theme.bg_panel).text_color(theme.fg_base))
+                .child(SharedString::from(label))
+        };
+        let n = self.held.len();
+        let title = format!(
+            "{n} message{} queued before restart {} held (text only).",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "is" } else { "are" },
+        );
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(density.gap_inline))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(typo.t_body_sm))
+                    .text_color(theme.fg_base)
+                    .child(SharedString::from(title)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .gap(px(4.0))
+                    .child(
+                        button(("chat-held-send-all", 0), "Send all")
+                            .on_click(cx.listener(|this, _e, _w, cx| this.send_all_held(cx))),
+                    )
+                    .child(
+                        button(("chat-held-discard", 0), "Discard")
+                            .on_click(cx.listener(|this, _e, _w, cx| this.discard_held(cx))),
+                    ),
+            );
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .gap(px(density.gap_inline * 0.5))
+            .px(px(density.pad_panel))
+            .py(px(density.gap_inline))
+            .rounded(px(density.r_card))
+            .bg(theme.bg_panel_alt)
+            .border_1()
+            .border_color(theme.border_inactive)
+            .child(header);
+        for (idx, m) in self.held.iter().enumerate() {
+            let first_line = m.text.lines().next().unwrap_or_default().to_string();
+            strip = strip.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .gap(px(density.gap_inline))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(6.0))
+                            .text_size(px(typo.t_body_sm))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.fg_muted)
+                                    .child(SharedString::from(format!("▸ {first_line}"))),
+                            )
+                            .when(m.maybe_sent, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(theme.status_warning)
+                                        .child(SharedString::from("may already have been sent")),
+                                )
+                            }),
+                    )
+                    .child(
+                        button(("chat-held-send", idx), "Send")
+                            .on_click(cx.listener(move |this, _e, _w, cx| this.send_held(idx, cx))),
+                    )
+                    .child(
+                        button(("chat-held-drop", idx), "Drop")
+                            .on_click(cx.listener(move |this, _e, _w, cx| this.drop_held(idx, cx))),
+                    ),
+            );
+        }
+        strip
     }
 }

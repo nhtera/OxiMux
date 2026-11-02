@@ -37,6 +37,9 @@ pub(super) struct HealthTrack {
     /// or a turn that ends well. Only a turn's own result, not a failed fork
     /// or rewind, makes a session read failed.
     failed_turn: Option<String>,
+    /// The composer's queue: restored messages held, and messages waiting to drain.
+    pub(super) held: u32,
+    pub(super) queued: u32,
 }
 
 impl HealthTrack {
@@ -62,6 +65,12 @@ impl HealthTrack {
         if let ThreadEvent::TurnEnded { is_error, result, .. } = ev {
             self.failed_turn = is_error.then(|| result.clone().unwrap_or_else(|| "Turn failed".into()));
         }
+    }
+
+    /// The last turn failed and nothing has been sent since: the queue waits
+    /// for the user rather than draining into a failing session.
+    pub(super) fn holds_queue(&self) -> bool {
+        self.failed_turn.is_some()
     }
 
     /// A send was written to the agent.
@@ -148,8 +157,8 @@ impl AgentChatView {
             interrupted: self.interrupted,
             process,
             restored: t.restored,
-            held_restored: 0,
-            queued: 0,
+            held_restored: t.held,
+            queued: t.queued,
             last_activity_at: t.last_activity_at,
             turn_id: (t.turns > 0).then(|| format!("{incarnation}:{}", t.turns)),
             exit_seq: (t.exits > 0).then(|| format!("{incarnation}:{}", t.exits)),

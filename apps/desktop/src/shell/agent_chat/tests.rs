@@ -468,6 +468,45 @@
         assert_eq!(submits.borrow().len(), 1, "empty Enter emitted no Submit");
     }
 
+    /// A turn that fails does not release the queue into the failing session
+    /// (B4): the queued message waits until the user sends, and drains after
+    /// that turn ends well.
+    #[gpui::test]
+    async fn a_failed_turn_holds_the_queue_until_the_user_sends(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let users = |view: &AgentChatView| {
+            view.thread.entries.iter().filter(|e| matches!(e, ThreadEntry::User { .. })).count()
+        };
+        let end = |is_error| ThreadEvent::TurnEnded { result: None, usage: None, is_error, turn_diff: None };
+        window
+            .update(cx, |view, window, cx| {
+                view.send_text("first".into(), Vec::new(), cx);
+                view.composer.update(cx, |c, cx| {
+                    c.set_draft_for_test("queued", window, cx);
+                    c.submit(window, cx);
+                });
+                view.apply_batch(vec![end(true)], cx);
+                assert_eq!(users(view), 1, "nothing drained into the failed session");
+                assert!(view.health.holds_queue());
+                view.send_text("retry it".into(), Vec::new(), cx);
+                assert!(!view.health.holds_queue(), "a send clears the hold");
+                view.apply_batch(vec![end(false)], cx);
+                assert_eq!(users(view), 3, "the queued message went after the good turn");
+            })
+            .expect("window update");
+    }
+
     /// A message submitted while a turn streams is QUEUED (not sent), then
     /// released as a fresh turn when the streaming turn completes — the
     /// composer-parks + parent-drains-on-turn-end loop, end to end.
