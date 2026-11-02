@@ -205,6 +205,9 @@ impl DemuxPump {
                 Response::SessionsChanged(rows) => {
                     let _ = self.sessions.unbounded_send(rows);
                 }
+                // A v37 host pushes session health to a subscriber. Pushed,
+                // so never a reply; nothing here shows it yet.
+                Response::SessionHealth(_) => {}
                 reply => {
                     if let Some(tx) = self.pending.slot.lock().unwrap().take() {
                         let _ = tx.send(Ok(reply));
@@ -295,6 +298,44 @@ mod tests {
                 _ => Ok(Some(Response::Pong.to_bytes().unwrap())),
             }
         }
+    }
+
+    /// Answers each request with a pushed health frame first, then the reply.
+    struct HealthBeforeReply {
+        requests: AsyncMutex<mpsc::UnboundedReceiver<()>>,
+        sent: mpsc::UnboundedSender<()>,
+        reply_next: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Transport for HealthBeforeReply {
+        async fn send(&self, _frame: Vec<u8>) -> std::result::Result<(), TransportError> {
+            let _ = self.sent.unbounded_send(());
+            Ok(())
+        }
+        async fn recv(&self) -> std::result::Result<Option<Vec<u8>>, TransportError> {
+            use futures::StreamExt as _;
+            if std::mem::take(&mut *self.reply_next.lock().unwrap()) {
+                return Ok(Some(Response::Pong.to_bytes().unwrap()));
+            }
+            if self.requests.lock().await.next().await.is_none() {
+                return Ok(None);
+            }
+            *self.reply_next.lock().unwrap() = true;
+            let frame = oximux_remote_proto::delivery::SessionHealthFrame::new("s", "h", &Default::default());
+            Ok(Some(Response::SessionHealth(frame).to_bytes().unwrap()))
+        }
+    }
+
+    /// A pushed health frame is not the reply: the call gets the frame after it.
+    #[test]
+    fn a_health_push_never_answers_a_call() {
+        let (sent, requests) = mpsc::unbounded();
+        let transport = HealthBeforeReply { requests: AsyncMutex::new(requests), sent, reply_next: Mutex::new(false) };
+        let (handle, pump, _events, _terminals, _sessions, _shutdown) = demux(Arc::new(transport));
+        let call = async { assert_eq!(handle.call(Request::Ping).await.unwrap(), Response::Pong) };
+        let outcome = block_on(select(Box::pin(pump.run()), Box::pin(call)));
+        assert!(matches!(outcome, Either::Right(_)));
     }
 
     /// The bug this guards: an over-cap reply used to end the pump, so a single

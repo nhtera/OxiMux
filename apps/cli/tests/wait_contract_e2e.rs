@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::{PermissionKind, StubConnection, ThreadEvent};
-use oximux_remote_host::{AuthStore, Dispatcher, LocalScope};
+use oximux_agents::health::{HealthInputs, Process};
+use oximux_agents::lineage::LineageStore;
+use oximux_remote_host::{AuthStore, Dispatcher, HostConfig, HostCore, HostCoreDeps, LocalScope, PriorOwner};
 use oximux_remote_local::{LocalClaim, LocalControlListener, generate_token};
 
 fn bin(runtime_dir: &Path, timeout_secs: u64) -> Command {
@@ -31,10 +33,28 @@ fn outcome(out: &Output) -> (Option<i32>, Option<String>) {
 
 /// A host serving one stub session, `wait-1`, until the runtime drops.
 fn serve(rt: &tokio::runtime::Runtime, runtime_dir: &Path) -> Arc<SessionHandle> {
+    serve_on(rt, runtime_dir, false)
+}
+
+/// [`serve`], optionally with a host core: the desktop's shape, which pushes
+/// session health to a v37 subscriber.
+fn serve_on(rt: &tokio::runtime::Runtime, runtime_dir: &Path, with_core: bool) -> Arc<SessionHandle> {
     let registry = Arc::new(SessionRegistry::new());
     registry.register("wait-1".into(), Arc::new(StubConnection::default()));
     let handle = registry.get("wait-1").unwrap();
-    let dispatcher = Arc::new(Dispatcher::new(registry, Arc::new(AuthStore::new())));
+    let mut dispatcher = Dispatcher::new(registry.clone(), Arc::new(AuthStore::new()));
+    if with_core {
+        let db = oximux_storage::db::open_memory().unwrap();
+        let core = HostCore::new(HostCoreDeps {
+            rt: rt.handle().clone(),
+            lineage: LineageStore::new(db.conn()),
+            registry,
+            config: HostConfig::default(),
+        });
+        core.start(PriorOwner::None);
+        dispatcher = dispatcher.with_host_core(core);
+    }
+    let dispatcher = Arc::new(dispatcher);
     let listener = {
         let _guard = rt.enter();
         LocalControlListener::bind(runtime_dir, &generate_token()).unwrap()
@@ -157,4 +177,44 @@ fn a_prefix_matching_no_session_exits_eight() {
 
     let out = bin(dir.path(), 10).args(["wait", "nope", "--until", "done"]).output().unwrap();
     assert_eq!(outcome(&out), (Some(8), Some("target-not-found".into())));
+}
+
+/// A wait against a host that pushes health (the desktop's shape) still ends
+/// on the turn, with frames streaming throughout. A smoke check: whether a
+/// push lands inside the one mid-stream call is timing, so the routing itself
+/// is pinned by `client::tests::a_health_frame_is_a_push`.
+#[test]
+fn health_pushes_do_not_disturb_a_wait() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = serve_on(&rt, dir.path(), true);
+    prompt(&handle);
+
+    // Flip what a reader sees, so every publish is pushed.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipper = {
+        let (handle, stop) = (handle.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut turn = false;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                turn = !turn;
+                let now = oximux_agents::session_health::now_ms();
+                handle.publish_health(HealthInputs { turn_active: turn, process: Process::Live, last_activity_at: now, ..Default::default() });
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    let mut child = bin(dir.path(), 20).args(["wait", "wait-1", "--until", "idle"]).stdout(Stdio::piped()).spawn().unwrap();
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(15), "wait never returned");
+        if started.elapsed() > Duration::from_millis(800) {
+            end_turn(&handle);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flipper.join().unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(outcome(&out), (Some(0), None), "stderr-free success expected");
 }
