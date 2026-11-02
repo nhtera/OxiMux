@@ -30,4 +30,4 @@
 # orchestration P1 view wiring (spawn posture, credentials, the respawn gate)
 # spent part of that headroom and the row came down to what was left.
 apps/desktop/src/shell/agent_chat/mod.rs 4070
-apps/desktop/src/shell/agent_chat/composer.rs 3523
+apps/desktop/src/shell/agent_chat/composer.rs 3239
