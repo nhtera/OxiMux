@@ -104,17 +104,19 @@ fn turn_brackets_never_enter_the_remote_ring() {
     assert!(ring.iter().all(|(_, ev)| !ev.is_turn_bracket()));
 }
 
-/// A continuation whose closing frame never came is cleared host-side once
-/// the session has been quiet past the stall window, so the child parks.
+/// Silence never closes a continuation (a long quiet tool looks the same as
+/// a lost closing frame): past the stall window it reads stalled, still
+/// working, so the lineage does not park a child that is running.
 #[test]
-fn a_stale_continuation_stops_counting_as_working_on_the_host_tick() {
+fn a_quiet_continuation_stays_working_and_reads_stalled_on_the_host_tick() {
     let (_reg, h) = registry_with("s");
     let start = now_ms();
     h.publish_health(HealthInputs { continuations_open: 1, ..live_at(start) });
     assert!(h.status().borrow().working);
     h.refresh_health(start + 11 * MIN, ChildActivity::default());
-    assert_eq!(h.health().status, HealthStatus::Idle);
-    assert!(!h.status().borrow().working, "the lineage can park it");
+    assert_eq!(h.health().status, HealthStatus::Working);
+    assert_eq!(h.health().stalled_since, Some(start));
+    assert!(h.status().borrow().working, "the lineage must not park it");
 }
 
 /// A spawn marks a child working before its view publishes anything; the

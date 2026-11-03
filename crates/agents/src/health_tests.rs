@@ -208,16 +208,6 @@ fn edge_identities_and_counts_pass_through() {
 }
 
 #[test]
-fn a_stale_continuation_count_is_detected_only_when_idle_and_quiet() {
-    let cfg = HealthConfig::default();
-    let stale = HealthInputs { continuations_open: 1, last_activity_at: NOW - 10 * MIN, ..live() };
-    assert!(continuations_stale(&stale, NOW, &cfg));
-    assert!(!continuations_stale(&HealthInputs { turn_active: true, ..stale.clone() }, NOW, &cfg));
-    assert!(!continuations_stale(&HealthInputs { last_activity_at: NOW - MIN, ..stale.clone() }, NOW, &cfg));
-    assert!(!continuations_stale(&HealthInputs { continuations_open: 0, ..stale }, NOW, &cfg));
-}
-
-#[test]
 fn a_suspend_shows_as_wall_time_the_monotonic_clock_never_saw() {
     // Ticking every 30 s. A suspend stops the monotonic clock: the tick sees
     // 30 s pass while the wall clock moved 30 minutes.

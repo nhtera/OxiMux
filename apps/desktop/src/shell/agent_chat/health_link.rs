@@ -156,16 +156,10 @@ impl AgentChatView {
         }
     }
 
-    /// Publish the facts to the session handle (when bound). A continuation
-    /// count with no closing frame for the stall window is stale and cleared
-    /// here, where the fold lives.
+    /// Publish the facts to the session handle (when bound). Silence never
+    /// closes a continuation: only a result, a Stop or exit, or a respawn
+    /// does; a quiet one reads stalled.
     pub(super) fn publish_health(&mut self) {
-        let now = now_ms();
-        let cfg = self.remote.as_ref().map(|b| b.health_config()).unwrap_or_default();
-        if health::continuations_stale(&self.health_inputs(), now, &cfg) {
-            tracing::info!(open = self.thread.continuations_open, "health: clearing a stale continuation count");
-            self.thread.continuations_open = 0;
-        }
         if let Some(binding) = &self.remote {
             binding.publish_health(self.health_inputs());
         }
@@ -230,13 +224,10 @@ impl AgentChatView {
     }
 
     /// Whether work was running that a restart would cut short: a turn,
-    /// background tasks, or a continuation that is not stale.
+    /// background tasks, or a continuation.
     pub(super) fn mid_turn(&self) -> bool {
         let inputs = self.health_inputs();
-        let cfg = self.remote.as_ref().map(|b| b.health_config()).unwrap_or_default();
-        inputs.turn_active
-            || inputs.background_active > 0
-            || (inputs.continuations_open > 0 && !health::continuations_stale(&inputs, now_ms(), &cfg))
+        inputs.turn_active || inputs.background_active > 0 || inputs.continuations_open > 0
     }
 
     /// The error a dead process leaves, with its code when known.

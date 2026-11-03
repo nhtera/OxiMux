@@ -91,12 +91,6 @@ impl HealthCell {
             .max(self.forgiven_until.load(Ordering::Relaxed))
             .max(if children.working > 0 { children.last_activity_at } else { 0 });
         let cfg = *self.cfg.read().unwrap();
-        // A continuation whose closing frame never came would keep an idle
-        // session working forever; past the stall window with no host turn,
-        // the count is stale.
-        if health::continuations_stale(&inputs, now, &cfg) {
-            inputs.continuations_open = 0;
-        }
         let next = health::compute(&inputs, now, &cfg);
         let working = matches!(
             next.status,

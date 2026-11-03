@@ -284,14 +284,6 @@ fn classify(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> (HealthStatus, Li
     (S::Idle, live, None, false)
 }
 
-/// The safety net for the continuation count: a continuation whose closing
-/// frame never came would keep an idle session reading as working. With no
-/// host turn and no activity for the stall window, the count is stale.
-pub fn continuations_stale(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> bool {
-    let window = if cfg.stall_after_ms > 0 { cfg.stall_after_ms } else { DEFAULT_STALL_AFTER_MS };
-    i.continuations_open > 0 && !i.turn_active && now.saturating_sub(i.last_activity_at) >= window
-}
-
 /// A clock that sleeps (a laptop lid, App Nap) is not a silent agent. Given
 /// how much time passed since the last tick on a monotonic clock and on the
 /// wall clock, and the interval the caller ticks at, says whether the machine
