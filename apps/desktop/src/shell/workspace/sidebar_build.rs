@@ -91,7 +91,10 @@ impl WorkspaceRoot {
             )
         });
         let on_open_search_hit =
-            crate::workspace_root::WorkspaceRoot::build_on_open_search_hit_callback(weak.clone());
+            crate::workspace_root::WorkspaceRoot::build_on_open_search_hit_callback(
+                weak.clone(),
+                project_id.clone(),
+            );
         let on_query =
             crate::workspace_root::WorkspaceRoot::build_on_query_active_path_callback(weak);
         let worktree_settings_repo =

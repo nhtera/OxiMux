@@ -1191,13 +1191,22 @@ impl WorkspaceRoot {
         })
     }
 
-    /// Build the result-click callback handed to the Search panel. Weak
-    /// self-handle for the same reason as [`Self::build_on_open_file_callback`].
+    /// Build the result-click callback handed to `project_id`'s Search
+    /// panel. Weak self-handle for the same reason as
+    /// [`Self::build_on_open_file_callback`]. A click is dropped unless that
+    /// project is the active one: right after a switch to a project with no
+    /// cached sidebar, the previous project's sidebar stays on screen until
+    /// the new build lands, and its hits must not open in the new project.
     pub(crate) fn build_on_open_search_hit_callback(
         weak: WeakEntity<Self>,
+        project_id: String,
     ) -> crate::shell::search_panel::OnOpenSearchHit {
         Arc::new(move |path, line, col, window, cx| {
             let _ = weak.update(cx, |this, cx| {
+                if this.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
+                    tracing::debug!(target: "oximux_app::search_panel", "open-search-hit: panel's project is not active; click ignored");
+                    return;
+                }
                 this.open_search_hit_in_active_pane(path, line, col, window, cx);
             });
         })
