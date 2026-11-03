@@ -28,7 +28,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme,
-    input::{Editor, EditorState, InputState, Position, TabSize},
+    input::{Editor, EditorState, InputState, Position, RopeExt as _, TabSize},
     resizable::{h_resizable, resizable_panel},
 };
 use oximux_settings::AutosaveSettings;
@@ -407,10 +407,10 @@ pub struct EditorView {
     /// failed transiently the content isn't text yet, so the request waits
     /// here and `finish_load` applies it once the retry succeeds.
     pending_lsp: Option<PendingLspAttach>,
-    /// Cursor position requested (by [`Self::reveal_position`]) while the
-    /// buffer was still loading. `finish_load` applies it once the text lands,
-    /// so a retried read still opens at the requested line.
-    pending_cursor: Option<Position>,
+    /// Cursor range requested (by [`Self::reveal_range`]) while the buffer
+    /// was still loading. `finish_load` applies it once the text lands, so a
+    /// retried read still opens at the requested line.
+    pending_cursor: Option<(Position, Position)>,
     /// Holds the in-flight load-retry task. Dropping it cancels any pending
     /// retry (e.g., when the user triggers a fresh manual retry).
     _load_task: Option<Task<()>>,
@@ -566,23 +566,35 @@ impl EditorView {
     /// Retry) keeps the request and applies it when the text lands.
     /// Image/binary/PDF content has no text cursor, so the request is dropped.
     pub fn reveal_position(&mut self, position: Position, window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_range(position, position, window, cx);
+    }
+
+    /// Like [`Self::reveal_position`], but selects `start..end` (0-based,
+    /// UTF-16 columns), e.g. a search match. An empty range is just a cursor.
+    pub fn reveal_range(&mut self, start: Position, end: Position, window: &mut Window, cx: &mut Context<Self>) {
         match &self.content {
-            EditorContent::Text(_) => self.apply_cursor(position, window, cx),
+            EditorContent::Text(_) => self.apply_cursor(start, end, window, cx),
             EditorContent::Loading | EditorContent::LoadFailed { .. } => {
-                self.pending_cursor = Some(position);
+                self.pending_cursor = Some((start, end));
             }
             _ => {}
         }
     }
 
-    fn apply_cursor(&mut self, position: Position, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_cursor(&mut self, position: Position, end: Position, window: &mut Window, cx: &mut Context<Self>) {
         let EditorContent::Text(t) = &self.content else { return };
         let state = t.state.clone();
         if self.is_markdown && self.md_mode == MarkdownViewMode::Preview {
             self.md_mode = MarkdownViewMode::Split;
             self.find_after_mode_change(window, cx);
         }
-        state.update(cx, |s, cx| s.set_cursor_position(position, window, cx));
+        state.update(cx, |s, cx| {
+            s.set_cursor_position(position, window, cx);
+            if end != position {
+                let range = s.text().position_to_offset(&position)..s.text().position_to_offset(&end);
+                s.set_selected_range(range, cx);
+            }
+        });
         cx.notify();
     }
 
@@ -843,8 +855,8 @@ impl EditorView {
         }
         // A cursor request made while loading. Taken unconditionally: a load
         // that settled on non-text content has no cursor to place.
-        if let Some(position) = self.pending_cursor.take() {
-            self.apply_cursor(position, window, cx);
+        if let Some((start, end)) = self.pending_cursor.take() {
+            self.apply_cursor(start, end, window, cx);
         }
         cx.notify();
     }
@@ -2169,12 +2181,15 @@ mod tests {
             .update(cx, |view, win, cx| {
                 // Stand in for a first read that failed transiently.
                 view.content = EditorContent::Loading;
-                view.reveal_position(Position { line: 2, character: 3 }, win, cx);
+                let end = Position { line: 2, character: 4 };
+                view.reveal_range(Position { line: 2, character: 3 }, end, win, cx);
                 let bytes = std::fs::read(&path).expect("read");
                 let content = decide_content(&path, bytes, win, cx);
                 view.finish_load(content, win, cx);
                 let state = view.state().expect("text buffer after load");
-                assert_eq!(state.read(cx).cursor_position(), Position { line: 2, character: 3 });
+                // The range "c" on line 3 is selected; the caret sits at its end.
+                assert_eq!(state.read(cx).selected_range(), 23..24);
+                assert_eq!(state.read(cx).cursor_position(), end);
                 assert!(view.pending_cursor.is_none());
             })
             .expect("window alive");

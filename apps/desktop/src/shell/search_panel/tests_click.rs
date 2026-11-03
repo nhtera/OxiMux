@@ -13,7 +13,7 @@ use oximux_settings::{Density, Theme, Typography};
 use super::SearchPanel;
 use super::rg_runner::{SearchFileResult, SearchMatch, SearchResults};
 
-type Opened = Arc<Mutex<Vec<(PathBuf, u32, u32)>>>;
+type Opened = Arc<Mutex<Vec<(PathBuf, u32, u32, u32)>>>;
 
 fn results(root: &std::path::Path) -> SearchResults {
     let m = |line: u32, column: u32, text: &str| SearchMatch {
@@ -63,7 +63,7 @@ fn mount(cx: &mut TestAppContext) -> (gpui::Entity<SearchPanel>, &mut VisualTest
     let root_for_results = root.clone();
     panel.update(vcx, |p, cx| {
         p.rg_available = true;
-        p.set_on_open_hit(Arc::new(move |path, line, col, _, _| sink.lock().unwrap().push((path, line, col))));
+        p.set_on_open_hit(Arc::new(move |path, line, col, end, _, _| sink.lock().unwrap().push((path, line, col, end))));
         // A non-empty query routes the body to the results list.
         p.options.query = "allowlist".into();
         p.apply_result(Ok(results(&root_for_results)), cx);
@@ -82,10 +82,10 @@ fn click(vcx: &mut VisualTestContext, selector: &'static str) {
 fn clicking_a_match_opens_it_at_the_match(cx: &mut TestAppContext) {
     let (_panel, vcx, opened, root) = mount(cx);
     click(vcx, "search-match-row-0-0");
-    assert_eq!(*opened.lock().unwrap(), vec![(root.join("services/control/CLAUDE.md"), 45, 27)]);
+    assert_eq!(*opened.lock().unwrap(), vec![(root.join("services/control/CLAUDE.md"), 45, 27, 36)]);
     // Second file, first match: byte column 4 is UTF-16 column 3 after "é ".
     click(vcx, "search-match-row-1-0");
-    assert_eq!(opened.lock().unwrap()[1], (root.join("README.md"), 50, 3));
+    assert_eq!(opened.lock().unwrap()[1], (root.join("README.md"), 50, 3, 12));
 }
 
 #[gpui::test]

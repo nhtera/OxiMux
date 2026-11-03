@@ -910,13 +910,14 @@ impl WorkspaceRoot {
     }
 
     /// Open a Search-panel hit: preview-open `path` in the active project's
-    /// panes and put the cursor on the 1-based `line`/`col`. Same text-file
+    /// panes and select the match, 1-based `col..end_col` on `line`. Same text-file
     /// gate as [`Self::open_file_in_active_pane`].
     pub fn open_search_hit_in_active_pane(
         &self,
         path: std::path::PathBuf,
         line: u32,
         col: u32,
+        end_col: u32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -931,7 +932,7 @@ impl WorkspaceRoot {
             tracing::debug!(target: "oximux_app::search_panel", "open-search-hit: no active project panes");
             return;
         };
-        panes.update(cx, |p, cx| p.open_preview_editor_at(path, line, Some(col), window, cx));
+        panes.update(cx, |p, cx| p.open_preview_editor_at(path, line, Some(col), Some(end_col), window, cx));
     }
 
     /// Open `path` as a read-only diff tab in the active project's active
@@ -1201,13 +1202,13 @@ impl WorkspaceRoot {
         weak: WeakEntity<Self>,
         project_id: String,
     ) -> crate::shell::search_panel::OnOpenSearchHit {
-        Arc::new(move |path, line, col, window, cx| {
+        Arc::new(move |path, line, col, end_col, window, cx| {
             let _ = weak.update(cx, |this, cx| {
                 if this.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
                     tracing::debug!(target: "oximux_app::search_panel", "open-search-hit: panel's project is not active; click ignored");
                     return;
                 }
-                this.open_search_hit_in_active_pane(path, line, col, window, cx);
+                this.open_search_hit_in_active_pane(path, line, col, end_col, window, cx);
             });
         })
     }

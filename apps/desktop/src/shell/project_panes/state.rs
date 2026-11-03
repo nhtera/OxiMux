@@ -960,13 +960,15 @@ impl ProjectPanes {
 
     /// Single-click open of a search hit: preview-open `path` the same way
     /// [`Self::open_preview_editor_tab`] does, then move that editor's cursor
-    /// to the 1-based `line`/`col`. The open leaves the tab's group active,
+    /// to the 1-based `line`/`col`, selecting up to `select_to_col` when
+    /// given. The open leaves the tab's group active,
     /// so the cursor move targets the active group.
     pub fn open_preview_editor_at(
         &mut self,
         path: PathBuf,
         line: u32,
         col: Option<u32>,
+        select_to_col: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -976,7 +978,7 @@ impl ProjectPanes {
         let Some(group) = self.groups.get(&self.manager.active_group_id()).cloned() else {
             return;
         };
-        group.update(cx, |g, cx| g.set_editor_cursor(&path, line, col, window, cx));
+        group.update(cx, |g, cx| g.set_editor_cursor(&path, line, col, select_to_col, window, cx));
     }
 
     /// Focus the agent tab already running in `worktree_path`, if one

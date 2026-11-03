@@ -36,11 +36,12 @@ use crate::shell::search_panel::search_state::SearchOptions;
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Result-click callback: `(absolute path, 1-based line, 1-based column,
-/// window, app)`. The host opens the file in its editor at that position.
-/// The column counts UTF-16 code units, which is what the editor's
-/// `Position` takes; ripgrep's byte offset is converted before the call.
-pub type OnOpenSearchHit = Arc<dyn Fn(PathBuf, u32, u32, &mut Window, &mut gpui::App) + 'static>;
+/// Result-click callback: `(absolute path, 1-based line, 1-based start
+/// column, 1-based exclusive end column, window, app)`. The host opens the
+/// file in its editor with the match selected. Columns count UTF-16 code
+/// units, which is what the editor's `Position` takes; ripgrep's byte
+/// offsets are converted before the call.
+pub type OnOpenSearchHit = Arc<dyn Fn(PathBuf, u32, u32, u32, &mut Window, &mut gpui::App) + 'static>;
 
 /// Result of the last completed (or cancelled) search.
 #[derive(Debug, Clone)]
@@ -218,15 +219,17 @@ impl SearchPanel {
         };
         let path = file.file_path.clone();
         let col = utf16_column(&m.line_content, m.column);
+        let end_col = utf16_column(&m.line_content, m.column + m.match_length as u32);
         tracing::debug!(
             target: "oximux_app::search_panel",
             path = %path.display(),
             line = m.line,
             col,
+            end_col,
             "open search hit"
         );
         match self.on_open_hit.clone() {
-            Some(open) => open(path, m.line, col, window, cx),
+            Some(open) => open(path, m.line, col, end_col, window, cx),
             None => tracing::debug!(
                 target: "oximux_app::search_panel",
                 "open search hit: no host callback wired; click ignored"
