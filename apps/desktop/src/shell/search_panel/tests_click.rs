@@ -55,9 +55,14 @@ fn mount(cx: &mut TestAppContext) -> (gpui::Entity<SearchPanel>, &mut VisualTest
     let (panel, vcx) = cx.add_window_view(|window, cx| {
         SearchPanel::new(root.clone(), Theme::default(), Density::default(), Typography::default(), window, cx)
     });
+    // Let the rg probe settle first, then pin `rg_available`: on a machine
+    // without ripgrep (the macOS CI runner) the probe reports it missing and
+    // the panel would render the install hint instead of the result rows.
+    vcx.run_until_parked();
     let sink = opened.clone();
     let root_for_results = root.clone();
     panel.update(vcx, |p, cx| {
+        p.rg_available = true;
         p.set_on_open_hit(Arc::new(move |path, line, col, _, _| sink.lock().unwrap().push((path, line, col))));
         // A non-empty query routes the body to the results list.
         p.options.query = "allowlist".into();
