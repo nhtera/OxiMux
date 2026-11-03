@@ -909,6 +909,31 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Open a Search-panel hit: preview-open `path` in the active project's
+    /// panes and put the cursor on the 1-based `line`/`col`. Same text-file
+    /// gate as [`Self::open_file_in_active_pane`].
+    pub fn open_search_hit_in_active_pane(
+        &self,
+        path: std::path::PathBuf,
+        line: u32,
+        col: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !is_openable_text_file(&path) {
+            tracing::info!(
+                file = %path.display(),
+                "open-search-hit: refusing non-text file (binary, system metadata, or unreadable)"
+            );
+            return;
+        }
+        let Some(panes) = self.active_project_panes() else {
+            tracing::debug!(target: "oximux_app::search_panel", "open-search-hit: no active project panes");
+            return;
+        };
+        panes.update(cx, |p, cx| p.open_preview_editor_at(path, line, Some(col), window, cx));
+    }
+
     /// Open `path` as a read-only diff tab in the active project's active
     /// pane group. `staged=true` shows the staged-vs-HEAD diff; `false`
     /// shows worktree-vs-index. Idempotent — clicking the same SCM row
@@ -1162,6 +1187,18 @@ impl WorkspaceRoot {
         Arc::new(move |path, preview, window, cx| {
             let _ = weak.update(cx, |this, cx| {
                 this.open_file_in_active_pane(path, preview, window, cx);
+            });
+        })
+    }
+
+    /// Build the result-click callback handed to the Search panel. Weak
+    /// self-handle for the same reason as [`Self::build_on_open_file_callback`].
+    pub(crate) fn build_on_open_search_hit_callback(
+        weak: WeakEntity<Self>,
+    ) -> crate::shell::search_panel::OnOpenSearchHit {
+        Arc::new(move |path, line, col, window, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                this.open_search_hit_in_active_pane(path, line, col, window, cx);
             });
         })
     }

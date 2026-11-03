@@ -200,8 +200,12 @@ where
         };
         match evt {
             RgEvent::Begin { data } => {
-                let Some(abs) = data.path.text else { continue };
-                let abs = PathBuf::from(abs);
+                let Some(raw) = data.path.text else { continue };
+                // rg runs with `current_dir(cwd)` and no path argument, so it
+                // reports paths relative to `cwd`. Anchor them here: a bare
+                // relative path would later resolve against the app's own
+                // working directory and the click would open nothing.
+                let abs = cwd.join(raw);
                 let rel = abs.strip_prefix(cwd).unwrap_or(&abs).to_path_buf();
                 if let Some(prev) = current.take() {
                     results.files.push(prev);
@@ -305,6 +309,24 @@ struct Submatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn parse_stream_anchors_relative_paths_at_cwd() {
+        let ndjson = concat!(
+            r#"{"type":"begin","data":{"path":{"text":"sub/a.rs"}}}"#, "\n",
+            r#"{"type":"match","data":{"path":{"text":"sub/a.rs"},"lines":{"text":"let x = 1;\n"},"line_number":7,"submatches":[{"match":{"text":"x"},"start":4,"end":5}]}}"#, "\n",
+            r#"{"type":"end","data":{}}"#, "\n",
+        );
+        let cwd = std::path::Path::new("/repo/root");
+        let r = parse_stream(BufReader::new(ndjson.as_bytes()), cwd, 100)
+            .await
+            .expect("parse");
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.files[0].file_path, PathBuf::from("/repo/root/sub/a.rs"));
+        assert_eq!(r.files[0].relative_path, PathBuf::from("sub/a.rs"));
+        assert_eq!(r.files[0].matches[0].line, 7);
+        assert_eq!(r.files[0].matches[0].column, 5);
+    }
 
     #[test]
     fn args_include_smart_case_by_default() {

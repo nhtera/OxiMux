@@ -469,11 +469,24 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         self.open_or_activate_editor_tab(path.clone(), window, cx);
-        let Some(line) = line else {
-            return;
-        };
+        if let Some(line) = line {
+            self.set_editor_cursor(&path, line, col, window, cx);
+        }
+    }
+
+    /// Move the cursor of this group's already-open editor tab for `path` to
+    /// the 1-based `line`/`col` (`col = None` is column 1). A no-op when no
+    /// editor tab here holds `path` or its buffer has not mounted.
+    pub fn set_editor_cursor(
+        &mut self,
+        path: &std::path::Path,
+        line: u32,
+        col: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let editor = self.tabs.iter().find_map(|t| match &t.content {
-            PaneContent::Editor(v) if v.read(cx).file_path() == path.as_path() => Some(v.clone()),
+            PaneContent::Editor(v) if v.read(cx).file_path() == path => Some(v.clone()),
             _ => None,
         });
         if let Some(view) = editor

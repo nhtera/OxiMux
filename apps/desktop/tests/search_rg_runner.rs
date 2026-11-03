@@ -51,6 +51,33 @@ async fn finds_filestatus_across_files() {
     }
 }
 
+/// Regression for issue #73: rg reports paths relative to its working
+/// directory, and a relative `file_path` made every result click open
+/// nothing. Each result must carry an absolute path to a real file, with
+/// `relative_path` still relative for display.
+#[tokio::test]
+async fn result_paths_are_absolute_and_exist() {
+    if !detect_rg_available().await {
+        eprintln!("ripgrep not on PATH — skipping");
+        return;
+    }
+    let opts = SearchOptions {
+        query: "FileStatus".into(),
+        ..Default::default()
+    };
+    let root = fixture_root();
+    let r = run_ripgrep(root.clone(), opts, DEFAULT_MAX_RESULTS)
+        .await
+        .expect("rg ran ok");
+    assert!(!r.files.is_empty());
+    for f in &r.files {
+        assert!(f.file_path.is_absolute(), "not absolute: {}", f.file_path.display());
+        assert!(f.file_path.is_file(), "missing: {}", f.file_path.display());
+        assert!(f.relative_path.is_relative(), "{}", f.relative_path.display());
+        assert_eq!(root.join(&f.relative_path), f.file_path);
+    }
+}
+
 #[tokio::test]
 async fn case_sensitive_excludes_lowercase_hits() {
     if !detect_rg_available().await {

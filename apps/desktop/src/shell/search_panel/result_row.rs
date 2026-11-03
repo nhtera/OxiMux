@@ -62,6 +62,7 @@ pub(super) fn paint_file_row(
 
     div()
         .id(row_id)
+        .debug_selector(|| format!("search-file-row-{file_index}"))
         .flex()
         .flex_row()
         .items_center()
@@ -151,10 +152,10 @@ pub(super) fn paint_match_row(
     let truncated = truncate_before(&m.line_content, col0, m.match_length);
 
     let row_id = ElementId::Name(format!("sp-match-{file_index}-{match_index}").into());
-    let click_path = file.file_path.clone();
 
     div()
         .id(row_id)
+        .debug_selector(|| format!("search-match-row-{file_index}-{match_index}"))
         .flex()
         .flex_row()
         .items_center()
@@ -167,8 +168,8 @@ pub(super) fn paint_match_row(
         .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |me, _: &MouseDownEvent, _window, cx| {
-                me.open_match(&click_path, cx);
+            cx.listener(move |me, _: &MouseDownEvent, window, cx| {
+                me.open_match(file_index, match_index, window, cx);
             }),
         )
         .child(
