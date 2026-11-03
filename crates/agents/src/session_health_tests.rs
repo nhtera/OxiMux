@@ -162,6 +162,31 @@ fn an_answered_prompt_restarts_the_stall_clock() {
     assert!(h.health().stalled_since.is_none(), "answered just now");
 }
 
+/// A continuation that waited on a person past the stall window keeps
+/// counting when the answer comes through the host while the driver still
+/// shows the card: Working, not Idle, and not stalled.
+#[test]
+fn a_continuation_answered_through_the_host_keeps_working() {
+    use crate::health::PromptKind;
+    use crate::thread::PermissionDecision;
+    let (_reg, h) = registry_with("s");
+    let asked = now_ms() - 11 * MIN;
+    h.publish_health(HealthInputs {
+        continuations_open: 1,
+        prompt: Some(PromptKind::Permission),
+        prompt_request: Some("req-1".into()),
+        ..live_at(asked)
+    });
+    assert_eq!(h.health().status, HealthStatus::NeedsPermission);
+    // A host tick while the card is up changes nothing.
+    h.refresh_health(now_ms(), ChildActivity::default());
+    assert!(h.resolve_permission("req-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap());
+    assert_eq!(h.health().status, HealthStatus::Working);
+    assert!(h.health().stalled_since.is_none());
+    h.refresh_health(now_ms() + MIN, ChildActivity::default());
+    assert_eq!(h.health().status, HealthStatus::Working, "the tick does not take it for stale");
+}
+
 /// A new process numbers its requests afresh: an id answered for the old one
 /// must neither hide nor refuse the new one's prompt.
 #[test]

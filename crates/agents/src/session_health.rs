@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::watch;
 
-use crate::health::{self, HealthConfig, HealthInputs, HealthStatus, SessionHealth};
+use crate::health::{self, HealthConfig, HealthInputs, HealthStatus, Process, SessionHealth};
 use crate::session_registry::SessionHandle;
 
 /// Wall clock, Unix milliseconds.
@@ -85,6 +85,12 @@ impl HealthCell {
         if inputs.prompt_request.as_deref().is_some_and(&decided) {
             inputs.prompt = None;
         }
+        // Waiting on a person is not silence: a prompt answered (here or in
+        // the driver) restarts the stall clock, before anything reads it.
+        let waiting = |s: HealthStatus| matches!(s, HealthStatus::NeedsPermission | HealthStatus::NeedsAnswer);
+        if inputs.prompt.is_none() && matches!(inputs.process, Process::Live) && waiting(self.health.borrow().status) {
+            self.forgiven_until.fetch_max(now, Ordering::Relaxed);
+        }
         let children = *self.children.lock().unwrap();
         inputs.children_active = children.working;
         inputs.last_activity_at = inputs
@@ -92,15 +98,7 @@ impl HealthCell {
             .max(self.forgiven_until.load(Ordering::Relaxed))
             .max(if children.working > 0 { children.last_activity_at } else { 0 });
         let cfg = *self.cfg.read().unwrap();
-        let mut next = health::compute(&inputs, now, &cfg);
-        // Waiting on a person is not silence: an answer, however it came,
-        // restarts the stall clock.
-        let waiting = |s: HealthStatus| matches!(s, HealthStatus::NeedsPermission | HealthStatus::NeedsAnswer);
-        if waiting(self.health.borrow().status) && !waiting(next.status) {
-            self.forgiven_until.fetch_max(now, Ordering::Relaxed);
-            inputs.last_activity_at = inputs.last_activity_at.max(now);
-            next = health::compute(&inputs, now, &cfg);
-        }
+        let next = health::compute(&inputs, now, &cfg);
         let working = matches!(
             next.status,
             HealthStatus::Working | HealthStatus::NeedsPermission | HealthStatus::NeedsAnswer

@@ -61,6 +61,7 @@ fn select_opt(wire: &str, label: &str, description: &str) -> FeatureSelectOption
 }
 
 /// Commands the sync `AgentConnection` methods push to the worker thread.
+#[derive(Debug)]
 enum Outbound {
     Prompt(String),
     /// Kick off a ChatGPT browser sign-in (`account/login/start`) on the worker
@@ -946,7 +947,7 @@ mod tests {
                 assert_eq!(tool_use_id, "e-1");
                 assert!(is_error, "a denial reads as one");
             }
-            _ => panic!("expected a ToolResult"),
+            other => panic!("expected a ToolResult, got {other:?}"),
         }
         // An ordinary approval (codex reports its own outcome) adds nothing.
         conn.resolve_permission("not-pending", PermissionDecision::Deny { message: "no".into() }).unwrap();
@@ -983,6 +984,44 @@ printf '{"id":3,"result":{"thread":{"id":"t-1"},"model":"m"}}\n'
         };
         assert!(closed, "the stream must close once codex is gone");
         drop(conn);
+    }
+
+    /// The settle of an answered elicitation reaches the chat's stream
+    /// through the worker.
+    #[test]
+    fn an_answered_elicitation_reaches_the_event_stream() {
+        let script = r#"
+read line
+printf '{"id":1,"result":{}}\n'
+read line
+printf '{"id":2,"result":{}}\n'
+read line
+read line
+printf '{"id":3,"result":{"thread":{"id":"t-1"},"model":"m"}}\n'
+read line
+printf '{"id":4,"result":{}}\n'
+while read line; do :; done
+"#;
+        let (rpc, inbound, child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script(script))
+                .expect("spawn fake app-server");
+        // ids: 1 initialize, 2 model/list, 3 resume, 4 account/read.
+        let mut state = CodexState::default();
+        state.pending_elicitations.insert("e-1".into(), json!(7));
+        let (conn, events) = CodexAppServerConnection::start(rpc, inbound, child, state, Some("t-1"));
+        let init = events.recv_timeout(Duration::from_secs(10));
+        assert!(matches!(init, Ok(ThreadEvent::SessionInit { .. })), "handshake first, got {init:?}");
+        conn.resolve_permission("e-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let settled = loop {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(ThreadEvent::ToolResult { tool_use_id, is_error, .. }) => break Some((tool_use_id, is_error)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                _ if std::time::Instant::now() > deadline => break None,
+                _ => {}
+            }
+        };
+        assert_eq!(settled, Some(("e-1".to_string(), false)));
     }
 
     /// A thread another process is writing must NOT become a fresh thread.
