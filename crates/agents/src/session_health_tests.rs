@@ -147,6 +147,21 @@ fn a_prompt_decided_through_the_host_is_answered_at_once() {
     assert_eq!(h.health().status, HealthStatus::Working);
 }
 
+/// Waiting on a person is not silence: the answer is the last sign of life,
+/// so a long-open prompt does not read stalled as it clears.
+#[test]
+fn an_answered_prompt_restarts_the_stall_clock() {
+    use crate::health::PromptKind;
+    let (_reg, h) = registry_with("s");
+    let asked = now_ms() - 11 * MIN;
+    let waiting = HealthInputs { turn_active: true, prompt: Some(PromptKind::Permission), ..live_at(asked) };
+    h.publish_health(waiting.clone());
+    assert_eq!(h.health().status, HealthStatus::NeedsPermission);
+    h.publish_health(HealthInputs { prompt: None, ..waiting });
+    assert_eq!(h.health().status, HealthStatus::Working);
+    assert!(h.health().stalled_since.is_none(), "answered just now");
+}
+
 /// A new process numbers its requests afresh: an id answered for the old one
 /// must neither hide nor refuse the new one's prompt.
 #[test]

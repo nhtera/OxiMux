@@ -41,7 +41,8 @@ pub struct HealthCell {
     inputs: watch::Sender<HealthInputs>,
     health: watch::Sender<SessionHealth>,
     children: Mutex<ChildActivity>,
-    /// The stall clock restarts no earlier than this (the host's last wake).
+    /// The stall clock restarts no earlier than this (the host's last wake,
+    /// or the last answered prompt).
     forgiven_until: AtomicI64,
     cfg: Arc<RwLock<HealthConfig>>,
     /// Held across read-inputs → write-health → set-working, so a slower
@@ -91,7 +92,15 @@ impl HealthCell {
             .max(self.forgiven_until.load(Ordering::Relaxed))
             .max(if children.working > 0 { children.last_activity_at } else { 0 });
         let cfg = *self.cfg.read().unwrap();
-        let next = health::compute(&inputs, now, &cfg);
+        let mut next = health::compute(&inputs, now, &cfg);
+        // Waiting on a person is not silence: an answer, however it came,
+        // restarts the stall clock.
+        let waiting = |s: HealthStatus| matches!(s, HealthStatus::NeedsPermission | HealthStatus::NeedsAnswer);
+        if waiting(self.health.borrow().status) && !waiting(next.status) {
+            self.forgiven_until.fetch_max(now, Ordering::Relaxed);
+            inputs.last_activity_at = inputs.last_activity_at.max(now);
+            next = health::compute(&inputs, now, &cfg);
+        }
         let working = matches!(
             next.status,
             HealthStatus::Working | HealthStatus::NeedsPermission | HealthStatus::NeedsAnswer
