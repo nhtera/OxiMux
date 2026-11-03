@@ -475,8 +475,9 @@ impl PaneGroup {
     }
 
     /// Move the cursor of this group's already-open editor tab for `path` to
-    /// the 1-based `line`/`col` (`col = None` is column 1). A no-op when no
-    /// editor tab here holds `path` or its buffer has not mounted.
+    /// the 1-based `line`/`col` (`col = None` is column 1). A markdown preview
+    /// flips to Split so the line shows; a buffer still loading applies it
+    /// once loaded. A no-op when no editor tab here holds `path`.
     pub fn set_editor_cursor(
         &mut self,
         path: &std::path::Path,
@@ -489,14 +490,12 @@ impl PaneGroup {
             PaneContent::Editor(v) if v.read(cx).file_path() == path => Some(v.clone()),
             _ => None,
         });
-        if let Some(view) = editor
-            && let Some(state) = view.read(cx).state()
-        {
+        if let Some(view) = editor {
             let position = gpui_component::input::Position {
                 line: line.saturating_sub(1),
                 character: col.unwrap_or(1).saturating_sub(1),
             };
-            state.update(cx, |s, cx| s.set_cursor_position(position, window, cx));
+            view.update(cx, |v, cx| v.reveal_position(position, window, cx));
         }
     }
 

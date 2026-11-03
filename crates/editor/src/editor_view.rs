@@ -28,7 +28,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme,
-    input::{Editor, EditorState, InputState, TabSize},
+    input::{Editor, EditorState, InputState, Position, TabSize},
     resizable::{h_resizable, resizable_panel},
 };
 use oximux_settings::AutosaveSettings;
@@ -407,6 +407,10 @@ pub struct EditorView {
     /// failed transiently the content isn't text yet, so the request waits
     /// here and `finish_load` applies it once the retry succeeds.
     pending_lsp: Option<PendingLspAttach>,
+    /// Cursor position requested (by [`Self::reveal_position`]) while the
+    /// buffer was still loading. `finish_load` applies it once the text lands,
+    /// so a retried read still opens at the requested line.
+    pending_cursor: Option<Position>,
     /// Holds the in-flight load-retry task. Dropping it cancels any pending
     /// retry (e.g., when the user triggers a fresh manual retry).
     _load_task: Option<Task<()>>,
@@ -516,6 +520,7 @@ impl EditorView {
             _blur_sub,
             _release_sub,
             pending_lsp: None,
+            pending_cursor: None,
             _load_task,
         }
     }
@@ -553,6 +558,32 @@ impl EditorView {
             EditorContent::Text(t) => Some(t.state.clone()),
             _ => None,
         }
+    }
+
+    /// Put the cursor at the 0-based `position` and make it visible. A
+    /// markdown file in Preview switches to Split, since the rendered preview
+    /// has no cursor to show. A buffer still loading (or failed and awaiting
+    /// Retry) keeps the request and applies it when the text lands.
+    /// Image/binary/PDF content has no text cursor, so the request is dropped.
+    pub fn reveal_position(&mut self, position: Position, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.content {
+            EditorContent::Text(_) => self.apply_cursor(position, window, cx),
+            EditorContent::Loading | EditorContent::LoadFailed { .. } => {
+                self.pending_cursor = Some(position);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_cursor(&mut self, position: Position, window: &mut Window, cx: &mut Context<Self>) {
+        let EditorContent::Text(t) = &self.content else { return };
+        let state = t.state.clone();
+        if self.is_markdown && self.md_mode == MarkdownViewMode::Preview {
+            self.md_mode = MarkdownViewMode::Split;
+            self.find_after_mode_change(window, cx);
+        }
+        state.update(cx, |s, cx| s.set_cursor_position(position, window, cx));
+        cx.notify();
     }
 
     /// File path the view is showing.
@@ -790,7 +821,7 @@ impl EditorView {
     /// recompute markdown-ness, and attach any LSP server that was stashed
     /// while the file was loading. Called from the retry task once a read
     /// succeeds.
-    fn finish_load(&mut self, content: EditorContent, cx: &mut Context<Self>) {
+    fn finish_load(&mut self, content: EditorContent, window: &mut Window, cx: &mut Context<Self>) {
         self.content = content;
         // Find and the preview's renderer state belong to the old content.
         self.find = None;
@@ -809,6 +840,11 @@ impl EditorView {
             && self.is_text()
         {
             spawn_attach_lsp(self, &p.program, p.args, &p.language_id, p.workspace_root, cx);
+        }
+        // A cursor request made while loading. Taken unconditionally: a load
+        // that settled on non-text content has no cursor to place.
+        if let Some(position) = self.pending_cursor.take() {
+            self.apply_cursor(position, window, cx);
         }
         cx.notify();
     }
@@ -1132,7 +1168,7 @@ fn spawn_pdf_load(path: PathBuf, window: &mut Window, cx: &mut Context<EditorVie
                         let page =
                             pdf_preview::remembered_pdf_page(cx, &this.file_path).unwrap_or(0);
                         let content = PdfContent::new(Arc::new(doc), page, window, cx);
-                        this.finish_load(EditorContent::Pdf(content), cx)
+                        this.finish_load(EditorContent::Pdf(content), window, cx)
                     });
                     return;
                 }
@@ -1190,7 +1226,7 @@ fn schedule_load_retry_task(
                 Ok(bytes) => {
                     let _ = weak.update_in(cx, |this, window, cx| {
                         let content = decide_content(&path, bytes, window, cx);
-                        this.finish_load(content, cx);
+                        this.finish_load(content, window, cx);
                     });
                     return;
                 }
@@ -2094,6 +2130,52 @@ mod tests {
                     "the resize really did change the fit scale"
                 );
                 assert_eq!(view.pdf_page(), Some(20), "and the reader kept their page");
+            })
+            .expect("window alive");
+    }
+
+    /// Revealing a line in a markdown file that opened in Preview flips it to
+    /// Split (the preview has no cursor) and puts the source cursor there.
+    #[gpui::test]
+    async fn reveal_position_in_markdown_preview_switches_to_split(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("README.md");
+        std::fs::write(&path, "# Title\n\nfirst\nsecond allowlist\n").expect("write");
+        let window = cx.add_window(|window, cx| EditorView::new(path.clone(), window, cx));
+        cx.run_until_parked();
+        window
+            .update(cx, |view, win, cx| {
+                assert_eq!(view.md_mode, MarkdownViewMode::Preview, "markdown opens in Preview");
+                view.reveal_position(Position { line: 3, character: 7 }, win, cx);
+                assert_eq!(view.md_mode, MarkdownViewMode::Split);
+                let state = view.state().expect("text buffer");
+                assert_eq!(state.read(cx).cursor_position(), Position { line: 3, character: 7 });
+            })
+            .expect("window alive");
+    }
+
+    /// A position requested while the buffer is still loading (a transient
+    /// read failure being retried) is applied once the text lands.
+    #[gpui::test]
+    async fn reveal_position_while_loading_applies_after_load(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("main.rs");
+        std::fs::write(&path, "fn a() {}\nfn b() {}\nfn c() {}\n").expect("write");
+        let window = cx.add_window(|window, cx| EditorView::new(path.clone(), window, cx));
+        cx.run_until_parked();
+        window
+            .update(cx, |view, win, cx| {
+                // Stand in for a first read that failed transiently.
+                view.content = EditorContent::Loading;
+                view.reveal_position(Position { line: 2, character: 3 }, win, cx);
+                let bytes = std::fs::read(&path).expect("read");
+                let content = decide_content(&path, bytes, win, cx);
+                view.finish_load(content, win, cx);
+                let state = view.state().expect("text buffer after load");
+                assert_eq!(state.read(cx).cursor_position(), Position { line: 2, character: 3 });
+                assert!(view.pending_cursor.is_none());
             })
             .expect("window alive");
     }
