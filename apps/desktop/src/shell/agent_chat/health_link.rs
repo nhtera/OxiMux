@@ -78,6 +78,11 @@ impl HealthTrack {
         self.failed_turn.is_some()
     }
 
+    /// The conversation was cleared: its failed turn no longer holds anything.
+    pub(super) fn forget_failed_turn(&mut self) {
+        self.failed_turn = None;
+    }
+
     /// A send was written to the agent, under `id` when it was tagged.
     pub(super) fn note_sent(&mut self, now: i64, id: Option<String>) {
         self.sent_id = id;
@@ -243,8 +248,12 @@ impl AgentChatView {
             .and_then(|rc| rc.host_core())
             .and_then(|core| core.prior_owner())
             .is_some_and(|prior| !matches!(prior, oximux_remote_host::PriorOwner::None));
+        // The composer's counts are its own, reported by `QueueChanged`
+        // whenever that lands: keep them across the reset.
+        let (held, queued) = (self.health.held, self.health.queued);
         self.health = HealthTrack::restored(mid_turn, prior_host_gone);
         self.health.unconfirmed_held = unconfirmed;
+        (self.health.held, self.health.queued) = (held, queued);
         // A dormant chat is not bound to the host yet, so this is where its
         // restored state can be seen.
         let h = health::compute(&self.health_inputs(), now_ms(), &health::HealthConfig::default());
@@ -255,6 +264,16 @@ impl AgentChatView {
             reason = h.reason.as_deref().unwrap_or(""),
             "health (restored)"
         );
+    }
+
+    /// Blank the transcript for a fresh conversation (`/clear`). The old one's
+    /// debts end with it: a fresh session never ran the turn a restart cut
+    /// off, and its first message is not held behind the old one's failure.
+    pub(super) fn clear_conversation(&mut self) {
+        self.thread.clear();
+        self.recovery_note = None;
+        self.health.forget_failed_turn();
+        self.meta_dirty.set(true);
     }
 
     /// The user removed the recovery note (the strip's [Remove]).
@@ -468,6 +487,44 @@ mod tests {
         assert!(!sent[1].contains("OxiMux restarted"), "once: {}", sent[1]);
         window
             .update(cx, |view, _window, _cx| assert!(view.recovery_note.is_none(), "Remove drops it"))
+            .expect("window update");
+    }
+
+    /// The composer's held and queued counts survive a restore, whichever
+    /// order its `QueueChanged` and the restore land in.
+    #[gpui::test]
+    async fn a_restore_keeps_the_composer_s_counts(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                (view.health.held, view.health.queued) = (3, 1);
+                view.restore_health(crate::shell::agent_chat::RestoredTurn::default(), cx);
+                assert_eq!((view.health.held, view.health.queued), (3, 1));
+            })
+            .expect("window update");
+    }
+
+    /// `/clear` ends the old conversation's debts: no recovery note on the new
+    /// session's first message, and its failed turn holds nothing.
+    #[gpui::test]
+    async fn a_cleared_chat_drops_the_recovery_note_and_the_failed_hold(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                let turn = crate::shell::agent_chat::RestoredTurn { mid_turn: true, ..Default::default() };
+                view.restore_health(turn, cx);
+                let failed = ThreadEvent::TurnEnded {
+                    result: Some("boom".into()),
+                    usage: None,
+                    is_error: true,
+                    turn_diff: None,
+                };
+                view.health.note_event(&failed, now_ms());
+                assert!(view.recovery_note.is_some() && view.health.holds_queue());
+                view.new_chat(cx);
+                assert!(view.recovery_note.is_none(), "no note for a fresh session");
+                assert!(!view.health.holds_queue(), "the old failure holds nothing");
+            })
             .expect("window update");
     }
 

@@ -17,9 +17,8 @@
   },
   "entries": [
     {
-      "Assistant": {
-        "text": "There's an issue with the selected model (this-model-does-not-exist-xyz). It may not exist or you may not have access to it.",
-        "thinking": ""
+      "ContextCompaction": {
+        "summary": "There's an issue with the selected model (this-model-does-not-exist-xyz). It may not exist or you may not have access to it."
       }
     }
   ]

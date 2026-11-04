@@ -2052,7 +2052,7 @@ impl AgentChatView {
         if self.unbound {
             return;
         }
-        self.thread.clear();
+        self.clear_conversation();
         // Transient view state keyed to the old transcript must not survive.
         self.pending_edit = None;
         self.rewind_confirm = None;

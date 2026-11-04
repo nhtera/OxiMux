@@ -521,6 +521,29 @@ mod tests {
         .await;
     }
 
+    /// A limit refuses the prompt with an assistant line carrying the error's
+    /// text: the provider's words, not the agent's, so the prompt is resent
+    /// as it was rather than asking the agent to continue.
+    #[gpui::test]
+    async fn a_prompt_the_provider_refused_is_resent_verbatim(cx: &mut TestAppContext) {
+        use oximux_agents::thread::ThreadEvent;
+        with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            let refused = "You've hit your usage limit · resets 3pm";
+            view.send_text("build it".into(), Vec::new(), cx);
+            view.thread.apply(&ThreadEvent::AssistantText(refused.into()));
+            view.thread.apply(&ThreadEvent::TurnEnded {
+                result: Some(refused.into()),
+                usage: None,
+                is_error: true,
+                turn_diff: None,
+            });
+            assert!(!view.turn_has_output());
+            view.retry_last_turn(cx);
+            assert_eq!(users(view), vec!["build it"]);
+        })
+        .await;
+    }
+
     #[gpui::test]
     async fn a_retry_whose_reset_is_still_ahead_comes_back_armed(cx: &mut TestAppContext) {
         with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
