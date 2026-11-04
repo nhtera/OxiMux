@@ -1111,3 +1111,88 @@ assertions = [
   "a_parent_reaches_its_child_through_the_session_verbs",
   "a_parent_lists_and_cancels_its_children_but_not_a_strangers",
 ]
+
+# ---------------------------------------------------------------------------
+# session health and delivery (Phase 3)
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "agents.health-needs-a-proof"
+title = "A session's health is observed, never guessed"
+status = "stable"
+owner = "agents"
+invariant = """
+A session reads Failed or Interrupted only on an observed fact (an exit code, \
+a user Stop, the host lock proving the previous host is gone); with no process \
+to ask it is Unverifiable, never Failed. Silence marks a working session \
+stalled and never ends it: a quiet continuation stays Working, so its lineage \
+slot is not freed. A dead agent reaches its chat, and that last state reaches \
+health subscribers even though the session closes on the same tick."""
+oracle = """
+The pure derivation is asked the dormant, silent, stopped-then-exited and \
+quiet-continuation cases; a killed Codex app-server must close the event \
+stream; over the loopback, an exit published as the session unregisters must \
+arrive as a frame. Each one broke once in this phase: a time-based net closed \
+a quiet continuation (the child was parked mid-work), a Codex connection held \
+its own event sender (a dead app-server stayed Idle), and the push dropped \
+the exit frame."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only: the Linux job checks these crates without running them and the \
+Windows job tests a fixed crate list. Live-checked on the desktop host \
+2026-11-04 (kill -9 → Failed code 137 in < 1 s; Stop → Interrupted; a quiet \
+95 s command → stalled, then cleared; quit mid-turn → Interrupted on \
+relaunch). The push is bound to one handle generation, as the event stream \
+is; re-follow after a respawn is not covered."""
+test_files = [
+  "crates/agents/src/health_tests.rs",
+  "crates/agents/src/session_health_tests.rs",
+  "crates/agent-core/src/thread/stream_json_bracket_tests.rs",
+  "crates/agents/src/thread/codex/mod.rs",
+  "crates/remote-host/tests/delivery_v37.rs",
+]
+assertions = [
+  "a_dormant_chat_is_unverifiable_never_failed",
+  "ten_minutes_of_silence_while_working_is_a_stall_never_a_death",
+  "an_exit_after_a_stop_is_an_interruption",
+  "a_quiet_continuation_stays_working_and_reads_stalled_on_the_host_tick",
+  "an_answered_prompt_restarts_the_stall_clock",
+  "turn_brackets_never_enter_the_remote_ring",
+  "a_user_line_folded_into_a_continuation_ends_its_turn",
+  "a_dead_app_server_closes_the_event_stream",
+  "an_exit_published_as_the_session_closes_still_reaches_the_subscriber",
+]
+
+[[gate]]
+id = "delivery.keyed-send-at-most-once"
+title = "A keyed send is delivered at most once"
+status = "stable"
+owner = "remote-host"
+invariant = """
+A send under an idempotency key reaches the agent at most once: a repeat \
+sends nothing and answers where the first send stands, across a host \
+restart. A caller holding a key never gets a plain send from a host that \
+cannot hold it, and an older subscriber is never pushed a frame it cannot \
+decode."""
+oracle = """
+Over the loopback, the same key twice delivers once and the repeat reports \
+the first send's state; a refused send the host will retry reads pending, \
+not a fresh send. Against a host below v37, or one answering Unsupported, \
+a keyed send is refused with nothing written. A v36 subscriber's next frame \
+after a publish is the event, never health."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, as above. Live-checked 2026-11-04: a parent sent to its child \
+twice under one key; the second answered duplicate and the child answered \
+once. Receipts are kept 7 days, so a key repeated later is sent again. \
+Released-CLI against a desktop host is not in CI (the wire-skew job runs the \
+release against `serve`, which has no host core)."""
+test_files = ["crates/remote-host/tests/delivery_v37.rs", "apps/cli/src/commands/send.rs"]
+assertions = [
+  "a_key_sends_once_and_a_repeat_reports_the_first_sends_state",
+  "a_refused_send_the_host_will_retry_reads_pending",
+  "a_v36_subscriber_is_never_pushed_health",
+  "a_key_is_refused_by_a_host_that_cannot_hold_it",
+]
