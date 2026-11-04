@@ -90,6 +90,11 @@ impl WorkspaceRoot {
                 r.clone(),
             )
         });
+        let on_open_search_hit =
+            crate::workspace_root::WorkspaceRoot::build_on_open_search_hit_callback(
+                weak.clone(),
+                project_id.clone(),
+            );
         let on_query =
             crate::workspace_root::WorkspaceRoot::build_on_query_active_path_callback(weak);
         let worktree_settings_repo =
@@ -132,6 +137,7 @@ impl WorkspaceRoot {
         built.update(cx, |s, cx| {
             s.set_ports_panel(ports_panel, cx);
             s.set_simulator_panel(simulator_panel, cx);
+            s.search_panel.update(cx, |p, _| p.set_on_open_hit(on_open_search_hit));
             if let Some(tab) = replacing {
                 s.select_tab(tab, cx);
             }

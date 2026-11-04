@@ -469,21 +469,38 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         self.open_or_activate_editor_tab(path.clone(), window, cx);
-        let Some(line) = line else {
-            return;
-        };
+        if let Some(line) = line {
+            self.set_editor_cursor(&path, line, col, None, window, cx);
+        }
+    }
+
+    /// Move the cursor of this group's already-open editor tab for `path` to
+    /// the 1-based `line`/`col` (`col = None` is column 1). `select_to_col`
+    /// (1-based, exclusive, same line) also selects `col..select_to_col`.
+    /// A markdown preview flips to Split so the line shows; a buffer still
+    /// loading applies it once loaded. A no-op when no editor tab here holds
+    /// `path`.
+    pub fn set_editor_cursor(
+        &mut self,
+        path: &std::path::Path,
+        line: u32,
+        col: Option<u32>,
+        select_to_col: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let editor = self.tabs.iter().find_map(|t| match &t.content {
-            PaneContent::Editor(v) if v.read(cx).file_path() == path.as_path() => Some(v.clone()),
+            PaneContent::Editor(v) if v.read(cx).file_path() == path => Some(v.clone()),
             _ => None,
         });
-        if let Some(view) = editor
-            && let Some(state) = view.read(cx).state()
-        {
-            let position = gpui_component::input::Position {
+        if let Some(view) = editor {
+            let at = |col: u32| gpui_component::input::Position {
                 line: line.saturating_sub(1),
-                character: col.unwrap_or(1).saturating_sub(1),
+                character: col.saturating_sub(1),
             };
-            state.update(cx, |s, cx| s.set_cursor_position(position, window, cx));
+            let start = at(col.unwrap_or(1));
+            let end = select_to_col.map_or(start, at);
+            view.update(cx, |v, cx| v.reveal_range(start, end, window, cx));
         }
     }
 

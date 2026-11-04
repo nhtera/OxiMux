@@ -12,9 +12,12 @@ pub mod rows;
 pub mod search_state;
 
 mod result_row;
+#[cfg(test)]
+mod tests_click;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
@@ -32,6 +35,13 @@ use crate::shell::search_panel::rows::{SearchRow, build_search_rows};
 use crate::shell::search_panel::search_state::SearchOptions;
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Result-click callback: `(absolute path, 1-based line, 1-based start
+/// column, 1-based exclusive end column, window, app)`. The host opens the
+/// file in its editor with the match selected. Columns count UTF-16 code
+/// units, which is what the editor's `Position` takes; ripgrep's byte
+/// offsets are converted before the call.
+pub type OnOpenSearchHit = Arc<dyn Fn(PathBuf, u32, u32, u32, &mut Window, &mut gpui::App) + 'static>;
 
 /// Result of the last completed (or cancelled) search.
 #[derive(Debug, Clone)]
@@ -52,6 +62,9 @@ pub struct SearchPanel {
     latest_search_id: u64,
     debounce_task: Option<Task<()>>,
     rg_available: bool,
+    /// Set by the host after construction. `None` (tests, pre-mount) makes a
+    /// result click a logged no-op.
+    on_open_hit: Option<OnOpenSearchHit>,
 
     query_input: Entity<InputState>,
     include_input: Entity<InputState>,
@@ -119,6 +132,7 @@ impl SearchPanel {
             latest_search_id: 0,
             debounce_task: None,
             rg_available: true,
+            on_open_hit: None,
             query_input,
             include_input,
             exclude_input,
@@ -183,8 +197,44 @@ impl SearchPanel {
         cx.notify();
     }
 
-    pub(super) fn open_match(&self, file_path: &std::path::Path, cx: &gpui::App) {
-        cx.open_with_system(file_path);
+    /// Wire the host's editor-open callback for result clicks.
+    pub fn set_on_open_hit(&mut self, on_open_hit: OnOpenSearchHit) {
+        self.on_open_hit = Some(on_open_hit);
+    }
+
+    /// Open match `match_index` of file `file_index` from the last results in
+    /// the host editor, cursor on the match.
+    pub fn open_match(
+        &self,
+        file_index: usize,
+        match_index: usize,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        let Some(file) = self.last_results().and_then(|r| r.files.get(file_index)) else {
+            return;
+        };
+        let Some(m) = file.matches.get(match_index) else {
+            return;
+        };
+        let path = file.file_path.clone();
+        let col = utf16_column(&m.line_content, m.column);
+        let end_col = utf16_column(&m.line_content, m.column + m.match_length as u32);
+        tracing::debug!(
+            target: "oximux_app::search_panel",
+            path = %path.display(),
+            line = m.line,
+            col,
+            end_col,
+            "open search hit"
+        );
+        match self.on_open_hit.clone() {
+            Some(open) => open(path, m.line, col, end_col, window, cx),
+            None => tracing::debug!(
+                target: "oximux_app::search_panel",
+                "open search hit: no host callback wired; click ignored"
+            ),
+        }
     }
 
     pub(super) fn last_results(&self) -> Option<&SearchResults> {
@@ -334,6 +384,17 @@ impl SearchPanel {
     }
 }
 
+/// Convert ripgrep's 1-based byte column within `line` to the 1-based UTF-16
+/// column the editor's `Position` expects. A column past the end or inside a
+/// multi-byte character clamps to the nearest preceding character boundary.
+pub fn utf16_column(line: &str, byte_column: u32) -> u32 {
+    let mut end = (byte_column.saturating_sub(1) as usize).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].encode_utf16().count() as u32 + 1
+}
+
 #[derive(Clone, Copy)]
 enum InputField {
     Query,
@@ -454,5 +515,30 @@ impl Render for SearchPanel {
             .child(header)
             .child(body)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf16_column;
+
+    #[test]
+    fn utf16_column_matches_byte_column_on_ascii() {
+        assert_eq!(utf16_column("let allowlist = 1;", 5), 5);
+        assert_eq!(utf16_column("x", 1), 1);
+    }
+
+    #[test]
+    fn utf16_column_counts_code_units_before_multibyte_text() {
+        // "é" is 2 bytes / 1 UTF-16 unit; "😀" is 4 bytes / 2 units.
+        assert_eq!(utf16_column("é allow", 4), 3);
+        assert_eq!(utf16_column("😀 allow", 6), 4);
+    }
+
+    #[test]
+    fn utf16_column_clamps_past_end_and_inside_a_character() {
+        assert_eq!(utf16_column("ab", 99), 3);
+        // Byte 2 sits inside "é" (bytes 1..3); clamp back to its start.
+        assert_eq!(utf16_column("aé", 3), 2);
     }
 }
