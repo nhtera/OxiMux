@@ -379,7 +379,7 @@ impl HostCore {
         });
     }
 
-    /// Drop receipts and resolved retries older than a day.
+    /// Drop receipts older than a week and resolved retries older than a day.
     fn prune_stores(&self) {
         let now = chrono::Local::now();
         if let Err(err) = self.lineage.receipts().prune(now) {

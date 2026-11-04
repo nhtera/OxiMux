@@ -16,8 +16,9 @@ use chrono::{DateTime, Local};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-/// How long a receipt is kept.
-pub const KEEP_HOURS: i64 = 24;
+/// How long a receipt is kept: a week, so a chat reopened days after a quit
+/// still knows its last send was read (the transcript blob outlives a day).
+pub const KEEP_HOURS: i64 = 7 * 24;
 
 /// Where a send stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

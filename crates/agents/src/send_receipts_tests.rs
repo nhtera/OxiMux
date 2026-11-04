@@ -67,10 +67,10 @@ fn kinds_never_collide_and_keys_are_not_stored() {
 }
 
 #[test]
-fn receipts_older_than_a_day_are_pruned() {
+fn receipts_older_than_a_week_are_pruned() {
     let r = receipts();
     let k = key_hash(KeyKind::Gate, "old");
     r.reserve("s", &k, "a", t0()).unwrap();
-    assert_eq!(r.prune(t0() + chrono::Duration::hours(23)).unwrap(), 0);
-    assert_eq!(r.prune(t0() + chrono::Duration::hours(25)).unwrap(), 1);
+    assert_eq!(r.prune(t0() + chrono::Duration::hours(KEEP_HOURS - 1)).unwrap(), 0);
+    assert_eq!(r.prune(t0() + chrono::Duration::hours(KEEP_HOURS + 1)).unwrap(), 1);
 }
