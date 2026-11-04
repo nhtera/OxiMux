@@ -26,9 +26,9 @@ pub(super) struct HealthTrack {
     sent_unanswered: bool,
     /// The id that send went out under.
     sent_id: Option<String>,
-    /// A restored send nobody answered, still held and marked: the blob keeps
-    /// it until the user sends or drops the card.
-    pub(super) unconfirmed_held: Option<String>,
+    /// Restored sends nobody answered, still held and marked: the blob keeps
+    /// each (with its own text) until the user sends or drops its card.
+    pub(super) unconfirmed_held: Vec<crate::persisted_chat::UnconfirmedSend>,
     /// The agent took the last send (receipt) and has produced nothing since.
     accepted_at: Option<i64>,
     /// How the process ended, once it has.
@@ -234,10 +234,20 @@ impl AgentChatView {
             ThreadEntry::User { text, .. } => Some(text.clone()),
             _ => None,
         });
-        let unconfirmed = turn.unanswered_send.filter(|_| last_user.is_some());
-        if let (Some(_), Some(text)) = (&unconfirmed, last_user) {
-            self.composer.update(cx, |c, cx| c.hold_unconfirmed(text, cx));
-        }
+        // Cards held from an earlier restore keep their own text; only the
+        // live send's text is the latest user entry.
+        let live = turn
+            .unanswered_send
+            .zip(last_user)
+            .map(|(id, text)| crate::persisted_chat::UnconfirmedSend { id, text });
+        let unconfirmed: Vec<_> =
+            turn.unconfirmed_held.into_iter().chain(live).filter(|u| !u.text.trim().is_empty()).collect();
+        self.composer.update(cx, |c, cx| {
+            // Each goes in first, so the oldest ends up on top.
+            for u in unconfirmed.iter().rev() {
+                c.hold_unconfirmed(u.text.clone(), cx);
+            }
+        });
         self.recovery_note = turn.recovery_note.or_else(|| {
             let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
             mid_turn.then(|| oximux_agents::recovery_note::build(&at, &turn.stopped_tasks))
@@ -286,10 +296,19 @@ impl AgentChatView {
     /// The send written but not answered yet, as the blob keeps it: its id,
     /// empty when it went untagged.
     pub(super) fn unanswered_send(&self) -> Option<String> {
-        self.health
-            .sent_unanswered
-            .then(|| self.health.sent_id.clone().unwrap_or_default())
-            .or_else(|| self.health.unconfirmed_held.clone())
+        self.health.sent_unanswered.then(|| self.health.sent_id.clone().unwrap_or_default())
+    }
+
+    /// The composer's marked cards changed: keep only the unconfirmed sends
+    /// still held. Read from the composer now, not from the event: a restore
+    /// can mark a card after an earlier event was queued.
+    pub(super) fn sync_unconfirmed(&mut self, cx: &mut Context<Self>) {
+        let marked = self.composer.read(cx).unconfirmed_texts();
+        let before = self.health.unconfirmed_held.len();
+        self.health.unconfirmed_held.retain(|u| marked.contains(&u.text));
+        if self.health.unconfirmed_held.len() != before {
+            self.meta_dirty.set(true);
+        }
     }
 
     /// Whether work was running that a restart would cut short: a turn,
@@ -546,13 +565,51 @@ mod tests {
                 assert_eq!(held.len(), 2);
                 assert!(held[0].text == "ship it" && held[0].maybe_sent);
                 assert!(!held[1].maybe_sent);
-                // Saved again before the user acts: still marked next time,
-                // and not also saved as a plain queued text.
-                assert_eq!(view.unanswered_send().as_deref(), Some("u-1"));
+                // The composer's queued events land after both (the test view
+                // has no composer subscription, so run its handler by hand):
+                // the plain card's event came first and must not clear the
+                // mark. Saved again before the user acts, it is still marked
+                // next time, and not also saved as a plain queued text.
+                view.sync_unconfirmed(cx);
+                view.sync_unconfirmed(cx);
+                let marked = crate::persisted_chat::UnconfirmedSend { id: "u-1".into(), text: "ship it".into() };
+                assert_eq!(view.health.unconfirmed_held, vec![marked]);
                 assert_eq!(view.queued_texts(cx), vec!["then tests"]);
             })
             .expect("window update");
         assert!(stub.sent().is_empty(), "nothing resent");
+    }
+
+    /// A marked card keeps its own text across a later send and a second
+    /// restart, though the latest user entry is now that later message; a
+    /// dropped card is forgotten.
+    #[gpui::test]
+    async fn a_marked_card_keeps_its_text_across_a_later_send(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message_with_images("ship it".to_string(), Vec::new());
+                let turn = crate::shell::agent_chat::RestoredTurn { unanswered_send: Some("u-1".into()), ..Default::default() };
+                view.restore_health(turn, cx);
+                view.send_text("something else".into(), Vec::new(), cx);
+                view.health.note_event(&ThreadEvent::ProviderTurnStarted, now_ms());
+                // What the blob saves (`build_transcript` copies these).
+                assert_eq!(view.unanswered_send(), None, "the later send was answered");
+                let saved = view.health.unconfirmed_held.clone();
+                assert_eq!(saved.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), ["ship it"]);
+
+                let turn = crate::shell::agent_chat::RestoredTurn { unconfirmed_held: saved, ..Default::default() };
+                view.composer.update(cx, |c, cx| c.drop_all_held_for_test(cx));
+                view.restore_health(turn, cx);
+                let held = view.composer.read(cx).held_for_test().to_vec();
+                assert_eq!(held.len(), 1);
+                assert!(held[0].text == "ship it" && held[0].maybe_sent);
+                // Dropped: forgotten (the handler, run by hand as above).
+                view.composer.update(cx, |c, cx| c.drop_all_held_for_test(cx));
+                view.sync_unconfirmed(cx);
+                assert!(view.health.unconfirmed_held.is_empty(), "dropped, forgotten");
+            })
+            .expect("window update");
     }
 
     #[test]

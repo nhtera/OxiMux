@@ -281,8 +281,6 @@ pub enum ComposerEvent {
     QueueChanged {
         held: u32,
         queued: u32,
-        /// A held card is marked "may already have been sent".
-        unconfirmed: bool,
     },
     /// The user removed the recovery note the next message would carry.
     RemoveRecoveryNote,

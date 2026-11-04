@@ -73,11 +73,9 @@ impl AgentChatView {
                 ComposerEvent::SteerNow { text } => this.steer_text(text.clone(), cx),
                 ComposerEvent::SendParked { text, images } => this.send_text(text.clone(), images.clone(), cx),
                 ComposerEvent::RemoveRecoveryNote => this.remove_recovery_note(cx),
-                ComposerEvent::QueueChanged { held, queued, unconfirmed } => {
+                ComposerEvent::QueueChanged { held, queued } => {
                     (this.health.held, this.health.queued) = (*held, *queued);
-                    if !unconfirmed && this.health.unconfirmed_held.take().is_some() {
-                        this.meta_dirty.set(true);
-                    }
+                    this.sync_unconfirmed(cx);
                     this.publish_health();
                 }
                 ComposerEvent::Stop => this.stop_turn(cx),

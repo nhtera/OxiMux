@@ -121,6 +121,11 @@ impl ComposerView {
         &self.held
     }
 
+    /// The user dropped every held card.
+    pub(crate) fn drop_all_held_for_test(&mut self, cx: &mut Context<Self>) {
+        self.discard_held(cx);
+    }
+
     pub(crate) fn queued_len_for_test(&self) -> usize {
         self.queued.len()
     }

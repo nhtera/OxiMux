@@ -441,6 +441,7 @@ mod tests {
             stopped_tasks: Vec::new(),
             recovery_note: None,
             unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices,
         }
     }

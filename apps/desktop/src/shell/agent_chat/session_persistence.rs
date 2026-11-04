@@ -63,6 +63,8 @@ pub struct RestoredTurn {
     pub recovery_note: Option<String>,
     /// A send nothing had answered at save time (see the blob field).
     pub unanswered_send: Option<String>,
+    /// Restored sends still held and marked at save time.
+    pub unconfirmed_held: Vec<crate::persisted_chat::UnconfirmedSend>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -253,6 +255,7 @@ impl AgentChatView {
             stopped_tasks: self.running_task_descriptions(),
             recovery_note: self.recovery_note.clone(),
             unanswered_send: self.unanswered_send(),
+            unconfirmed_held: self.health.unconfirmed_held.clone(),
             choices: PersistedChoices {
                 models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
                 modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),

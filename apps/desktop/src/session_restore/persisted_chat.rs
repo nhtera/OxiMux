@@ -195,6 +195,18 @@ pub struct PersistedChatTranscript {
     /// already have been sent".
     #[serde(default)]
     pub unanswered_send: Option<String>,
+    /// Restored sends still held and marked "may already have been sent", each
+    /// with its own text: a later message may since be the latest user entry.
+    #[serde(default)]
+    pub unconfirmed_held: Vec<UnconfirmedSend>,
+}
+
+/// A held card marked "may already have been sent": its send's id (empty
+/// when untagged) and its text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnconfirmedSend {
+    pub id: String,
+    pub text: String,
 }
 
 /// A retry armed at save time. Deliberately the *decision* (when, why, how many
@@ -283,6 +295,7 @@ mod tests {
             stopped_tasks: Vec::new(),
             recovery_note: None,
             unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -319,6 +332,7 @@ mod tests {
             stopped_tasks: Vec::new(),
             recovery_note: None,
             unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -358,6 +372,7 @@ mod tests {
             stopped_tasks: Vec::new(),
             recovery_note: None,
             unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -435,6 +450,7 @@ mod tests {
             stopped_tasks: Vec::new(),
             recovery_note: None,
             unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         }
     }
@@ -488,6 +504,7 @@ mod tests {
             stopped_tasks: Vec::new(),
             recovery_note: None,
             unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -530,6 +547,7 @@ mod tests {
             stopped_tasks: Vec::new(),
             recovery_note: None,
             unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

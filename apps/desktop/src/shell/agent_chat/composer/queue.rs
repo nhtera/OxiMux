@@ -278,12 +278,12 @@ impl ComposerView {
     /// The queue changed: repaint and tell the parent the counts.
     pub(super) fn queue_changed(&mut self, cx: &mut Context<Self>) {
         cx.notify();
-        let unconfirmed = self.held.iter().any(|m| m.maybe_sent);
-        cx.emit(ComposerEvent::QueueChanged {
-            held: self.held.len() as u32,
-            queued: self.queued.len() as u32,
-            unconfirmed,
-        });
+        cx.emit(ComposerEvent::QueueChanged { held: self.held.len() as u32, queued: self.queued.len() as u32 });
+    }
+
+    /// The text of each held card marked "may already have been sent".
+    pub fn unconfirmed_texts(&self) -> Vec<String> {
+        self.held.iter().filter(|m| m.maybe_sent).map(|m| m.text.clone()).collect()
     }
 
     /// Parked-message chips shown above the input while a turn streams: one
