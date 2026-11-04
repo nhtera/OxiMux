@@ -3,8 +3,9 @@
 //! The key is reserved in the host's receipts (as a hash) before the prompt is
 //! written or queued; a key seen before sends nothing and answers where the
 //! first send stands. The prompt goes out under a uuid derived from the
-//! session and key, so the agent's acceptance of it is recorded (by whichever
-//! view drives the session) under that uuid: the key's row is the reservation,
+//! key alone (it survives the session moving to its agent's id), so the
+//! agent's acceptance of it is recorded (by whichever view drives the
+//! session) under that uuid: the key's row is the reservation,
 //! the uuid's row is the proof.
 
 use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};

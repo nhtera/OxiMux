@@ -195,3 +195,73 @@ pub async fn run(
         _ => Err(Failure::new("protocol", exit::ERROR, "the stream ended unexpectedly")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use oximux_remote_proto::Transport;
+
+    use super::*;
+
+    /// Records what is sent; answers from a script, then reads as closed.
+    #[derive(Default)]
+    struct Scripted {
+        sent: Mutex<Vec<Request>>,
+        replies: Mutex<VecDeque<Response>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for Scripted {
+        async fn send(&self, frame: Vec<u8>) -> Result<(), oximux_remote_proto::TransportError> {
+            self.sent.lock().unwrap().push(Request::from_bytes(&frame).unwrap());
+            Ok(())
+        }
+        async fn recv(&self) -> Result<Option<Vec<u8>>, oximux_remote_proto::TransportError> {
+            Ok(self.replies.lock().unwrap().pop_front().map(|r| r.to_bytes().unwrap()))
+        }
+    }
+
+    fn sent_kinds(t: &Scripted) -> Vec<&'static str> {
+        t.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| match r {
+                Request::SendV2(_) => "SendV2",
+                Request::GetSessionInfo { .. } => "GetSessionInfo",
+                Request::SendPrompt(_) => "SendPrompt",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    /// A caller retrying under its key never gets a plain send from a host
+    /// that cannot hold the key: it could deliver the message twice.
+    #[tokio::test]
+    async fn a_key_is_refused_by_a_host_that_cannot_hold_it() {
+        let old = Arc::new(Scripted::default());
+        let err = send_keyed(&crate::client::client_for_test(old.clone(), SEND_V2_MIN_VERSION - 1), "s", "hi", Some("k"))
+            .await
+            .expect_err("an older host cannot hold a key");
+        assert_eq!(err.code, "not-idempotent");
+        assert!(sent_kinds(&old).is_empty(), "nothing went out");
+
+        let unsupported = Arc::new(Scripted::default());
+        unsupported.replies.lock().unwrap().push_back(Response::Error(RpcError::Unsupported));
+        let err = send_keyed(&crate::client::client_for_test(unsupported.clone(), SEND_V2_MIN_VERSION), "s", "hi", Some("k"))
+            .await
+            .expect_err("a host without receipts cannot hold a key");
+        assert_eq!(err.code, "not-idempotent");
+        assert_eq!(sent_kinds(&unsupported), ["SendV2"], "only the keyed attempt went out");
+    }
+
+    /// With no key, an older host gets the plain send.
+    #[tokio::test]
+    async fn without_a_key_an_older_host_gets_the_plain_send() {
+        let old = Arc::new(Scripted::default());
+        let _ = send_keyed(&crate::client::client_for_test(old.clone(), SEND_V2_MIN_VERSION - 1), "s", "hi", None).await;
+        assert_eq!(sent_kinds(&old).first(), Some(&"GetSessionInfo"), "the plain path, never SendV2");
+    }
+}

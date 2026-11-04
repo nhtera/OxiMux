@@ -501,6 +501,12 @@ pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
     }
 }
 
+/// A client over `transport`, as if `Hello` had answered `host_version`.
+#[cfg(test)]
+pub(crate) fn client_for_test(transport: Arc<dyn Transport>, host_version: u32) -> Client {
+    Client { transport, timeout: Duration::from_secs(1), host_version, host_min_compatible: 1, target: HostTarget::Local }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

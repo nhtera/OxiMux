@@ -7,7 +7,7 @@ use std::sync::Arc;
 use futures::future::join;
 use oximux_agents::lineage::LineageStore;
 use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};
-use oximux_agents::health::{HealthInputs, Process};
+use oximux_agents::health::{ExitProof, HealthInputs, Process};
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::{StubConnection, ThreadEvent};
 use oximux_remote_host::{AuthStore, Dispatcher, HostConfig, HostCore, HostCoreDeps, LocalScope, PriorOwner};
@@ -254,4 +254,32 @@ async fn a_first_publish_like_the_default_is_still_pushed() {
         assert!(matches!(next_push(&*c).await, Some(Response::SessionHealth(_))));
     })
     .await;
+}
+
+/// A process exit is published and the session unregistered on the same
+/// tick: the subscriber still gets that last frame, whether or not it had
+/// seen one before, and the push then ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exit_published_as_the_session_closes_still_reaches_the_subscriber() {
+    for seen_before in [true, false] {
+        let h = host(true);
+        let registry = h.registry.clone();
+        as_scope(&h, LocalScope::Full, |c| async move {
+            call(&*c, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await;
+            assert!(matches!(call(&*c, Request::Subscribe { session_id: "s1".into(), after_seq: None }).await, Response::Events(_)));
+            let now = oximux_agents::session_health::now_ms();
+            if seen_before {
+                registry.get("s1").unwrap().publish_health(working(now));
+                assert!(matches!(next_push(&*c).await, Some(Response::SessionHealth(_))));
+            }
+            let exited = HealthInputs { process: Process::Exited(ExitProof::ExitCode(137)), ..working(now) };
+            registry.get("s1").unwrap().publish_health(exited);
+            drop(registry.unregister("s1"));
+            let got = next_push(&*c).await;
+            let Some(Response::SessionHealth(frame)) = got else { panic!("expected the exit frame, got {got:?}") };
+            let health = frame.health().unwrap();
+            assert_eq!((health.status.as_str(), health.exit_code), ("failed", Some(137)), "seen_before={seen_before}");
+        })
+        .await;
+    }
 }

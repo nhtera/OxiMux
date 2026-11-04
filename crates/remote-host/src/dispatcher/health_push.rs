@@ -4,11 +4,11 @@
 //! every change a person could read. Activity alone (the timestamp moving) is
 //! not a change: the events already say that.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use futures::stream::{self, BoxStream, StreamExt};
 use oximux_agents::health::{ExitProof, HealthStatus, Liveness, SessionHealth};
-use oximux_agents::session_registry::{SessionId, SessionRegistry};
+use oximux_agents::session_registry::{SessionHandle, SessionId, SessionRegistry};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::delivery::{SessionHealthFrame, SessionHealthWire};
 use oximux_remote_proto::proto::Response;
@@ -20,7 +20,9 @@ use crate::auth::Peer;
 /// Follow `session_id`'s health: wait for it to be registered (a dormant
 /// session comes to life on its next prompt), then for its driver's first
 /// publish, then forward each readable change. Ends when the session's
-/// handle or the registry goes away.
+/// handle or the registry goes away, after forwarding its last change: an
+/// exit is published and unregistered on the same tick, and that frame is
+/// the one a reader most needs.
 pub(super) fn health_stream(registry: Arc<SessionRegistry>, session_id: SessionId) -> BoxStream<'static, Live> {
     stream::once(async move {
         let mut changes = registry.subscribe_changes();
@@ -33,8 +35,9 @@ pub(super) fn health_stream(registry: Arc<SessionRegistry>, session_id: SessionI
             }
         };
         let rx = handle.subscribe_health();
-        drop(handle);
-        let follow = Follow { rx, registry, session_id, last: None, first: true };
+        // Weak: holding the handle would keep its watch open past its end.
+        let handle = Arc::downgrade(&handle);
+        let follow = Follow { rx, handle, session_id, last: None, first: true, published: false };
         stream::unfold(follow, |mut f| async move {
             loop {
                 // The current value is the first one looked at; after that,
@@ -43,8 +46,11 @@ pub(super) fn health_stream(registry: Arc<SessionRegistry>, session_id: SessionI
                     return None;
                 }
                 let now = f.rx.borrow_and_update().clone();
-                let published = f.registry.get(&f.session_id).is_some_and(|h| h.health_published());
-                if !published || f.last.as_ref().is_some_and(|l| same_to_a_reader(l, &now)) {
+                // Published stays published. A handle already gone was
+                // unregistered, so its driver had published: the change it
+                // left (its exit) is observed.
+                f.published = f.published || f.handle.upgrade().is_none_or(|h| h.health_published());
+                if !f.published || f.last.as_ref().is_some_and(|l| same_to_a_reader(l, &now)) {
                     continue;
                 }
                 f.last = Some(now.clone());
@@ -60,11 +66,13 @@ pub(super) fn health_stream(registry: Arc<SessionRegistry>, session_id: SessionI
 
 struct Follow {
     rx: tokio::sync::watch::Receiver<SessionHealth>,
-    registry: Arc<SessionRegistry>,
+    handle: Weak<SessionHandle>,
     session_id: SessionId,
     /// The last health forwarded.
     last: Option<SessionHealth>,
     first: bool,
+    /// The driver has published (seen once; it never unpublishes).
+    published: bool,
 }
 
 /// Equal but for when the session last did something.
