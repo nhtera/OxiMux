@@ -456,16 +456,26 @@ impl AgentChatView {
                 // is on its way. Keyed by the turn's receipt key, so this
                 // holds after a restart too.
                 let line = uuid::Uuid::new_v4();
-                // With no retry armed (a manual Retry), the last send's key.
-                let carried = self.retry.turn_key.clone().or_else(|| {
-                    let id = self.health.sent_id()?;
-                    Some(oximux_agents::send_receipts::key_hash(oximux_agents::send_receipts::KeyKind::Gate, &id))
-                });
+                // With no retry armed (a manual Retry), the last send's key and
+                // every key it was already carrying: a chain of refused retries
+                // keeps the first send's receipt with it.
+                let carried: Vec<String> = match self.retry.turn_key.clone() {
+                    Some(key) => vec![key],
+                    None => self
+                        .health
+                        .sent_id()
+                        .map(|id| {
+                            let own = oximux_agents::send_receipts::key_hash(oximux_agents::send_receipts::KeyKind::Gate, &id);
+                            std::iter::once(own).chain(self.send_gate.lock().unwrap().carried_by(&id)).collect()
+                        })
+                        .unwrap_or_default(),
+                };
                 let again = (self.connection.is_some() && self.pending_send_uuid.is_none()).then_some(line);
                 if let Some(line) = again {
                     self.pending_send_uuid = Some(line);
-                    if let Some(key) = carried.clone() {
-                        self.send_gate.lock().unwrap().note_carried(line, key);
+                    let mut gate = self.send_gate.lock().unwrap();
+                    for key in &carried {
+                        gate.note_carried(line, key.clone());
                     }
                 }
                 // Through the one write path, so a retry goes out tagged (its
@@ -486,8 +496,10 @@ impl AgentChatView {
                     if self.pending_send_uuid == Some(line) {
                         // Not written: the id is not owed to the next send.
                         self.pending_send_uuid = None;
-                    } else if sent && let Some(key) = carried {
-                        self.record_resend(key, cx);
+                    } else if sent {
+                        for key in carried {
+                            self.record_resend(key, cx);
+                        }
                     }
                 }
                 // Re-anchor the pre-turn checkpoint to the retried turn (as a

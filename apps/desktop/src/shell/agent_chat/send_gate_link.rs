@@ -18,7 +18,7 @@ use gpui::{AppContext as _, Context};
 use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource, Steered};
 use oximux_agents::thread::ThreadEntry;
 use oximux_agents::thread::{ChatImage, PermissionDecision, PermissionKind, ThreadEvent, ToolCallStatus, Transport};
-use oximux_agents::send_receipts::{KeyKind, key_hash};
+use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};
 use uuid::Uuid;
 
 use super::AgentChatView;
@@ -437,6 +437,11 @@ impl AgentChatView {
             }
         } else {
             self.recovery_note = note;
+            // Nothing reached the agent, and nothing will retry it on its
+            // own: a caller holding its key (or one carried with it) is told
+            // so, and may send again, rather than waiting on a pending that
+            // never ends.
+            self.record_receipt(&uuid.to_string(), Some(ReceiptState::Rejected), cx);
         }
         sent
     }
