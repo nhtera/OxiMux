@@ -4,6 +4,37 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-11-05 — v0.1.45: Agents delegate to helper agents; Search results open in the editor (#72, #74)
+
+An agent OxiMux started can now start its own helper agents, wait on them, and
+hear from them when they finish or get stuck.
+
+- **Delegation tools for agents.** Claude, Codex and ACP chats get nine
+  delegation tools over `oximux mcp --tools orchestrate` (spawn, wait, send,
+  read, cancel, list children, answer a permission, and a small shared state
+  with compare-and-set). The chat's credential is passed as a file path, never
+  in argv. Turn it off with the "Delegation tools for agents" setting.
+- **Helpers open beside their parent** as `↳` tabs, with a "Spawned by"
+  tooltip. Caps on depth, working children and lifetime budget apply, and a
+  hit cap shows a notice. Launch postures (`default`, `review`, `verify`) are
+  self-checked at start.
+- **Child events reach the parent on their own.** `finished`,
+  `needs_permission` and the like arrive as an escaped `<oximux-events>`
+  message, delivered once through a durable outbox, across tab close and
+  reopen, quit and relaunch. They wait while you are mid-send or have stopped
+  the chat; with Claude 2.1.310 or later they steer into a running turn, and a
+  Stop takes back lines that have not started. A turn started by child events
+  cannot leave plan mode.
+- **CLI:** `oximux delegate spawn|children|cancel` and `oximux whoami`.
+- **Search panel results open in the editor** (#73). Clicking a match opens the
+  file in a preview tab at the matched line with the match selected; a
+  markdown file in Preview switches to Split so the line shows. Before, a click
+  did nothing. A file header click still collapses its group.
+- **Fixes:** a chatty Codex app-server (for example with `RUST_LOG` set) no
+  longer stalls a new chat; a spawn reply names a Codex child by its settled
+  id; a Codex MCP approval answered from the CLI or a phone now closes its
+  card.
+
 ### 2026-10-24 — v0.1.44: The `oximux` CLI comes with the app; `oximux .` opens a folder (#71)
 
 - **Nothing to install.** The desktop app now ships the `oximux` command line
