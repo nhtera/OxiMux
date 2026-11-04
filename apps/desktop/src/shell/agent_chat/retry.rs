@@ -288,6 +288,13 @@ impl AgentChatView {
             self.retry.attempt = self.retry.attempt.max(attempts);
             self.retry.turn_key = Some(key);
         }
+        // Every attempt is spent (the count committed, the blob's timer did
+        // not clear before the quit): firing it would be one past the cap.
+        if self.retry.attempt >= oximux_agents::retry::MAX_ATTEMPTS {
+            self.record_retry_resolved(Resolution::Exhausted, cx);
+            self.retry.clear();
+            return;
+        }
         // The blob is the on-disk state until something changes, and a restored
         // retry is not a change — `hold_turn_until` marks the chat dirty, so
         // clear that again below to keep a restored-but-untouched chat clean.
@@ -625,6 +632,17 @@ mod tests {
             // relaunched between attempts exceed the cap without ever showing a
             // fifth attempt in any single session.
             assert_eq!(view.retry.attempt, 2, "attempts spent must survive the restart");
+        })
+        .await;
+    }
+
+    /// A blob still holding a timer whose four attempts are already spent does
+    /// not fire a fifth.
+    #[gpui::test]
+    async fn a_restored_retry_with_every_attempt_spent_is_not_armed(cx: &mut TestAppContext) {
+        with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            view.restore_pending_retry(saved(60_000, oximux_agents::retry::MAX_ATTEMPTS), cx);
+            assert!(!view.retry.is_armed(), "one past the cap");
         })
         .await;
     }

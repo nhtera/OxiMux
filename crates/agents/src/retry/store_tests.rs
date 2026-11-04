@@ -49,6 +49,16 @@ fn a_live_row_abandoned_for_a_week_is_pruned() {
     assert_eq!(s.prune(t0() + chrono::Duration::days(8)).unwrap(), 1);
 }
 
+/// A retry waiting on a reset past the abandon window is still live.
+#[test]
+fn a_live_row_waiting_on_a_far_reset_is_kept() {
+    let s = store();
+    let far = (t0() + chrono::Duration::days(9)).timestamp_millis();
+    s.arm("s", "t", "window", "r", far, "h", t0()).unwrap();
+    assert_eq!(s.prune(t0() + chrono::Duration::days(8)).unwrap(), 0);
+    assert!(s.live("s").unwrap().is_some());
+}
+
 #[test]
 fn resolved_rows_are_pruned_after_a_day_and_a_fresh_live_one_is_kept() {
     let s = store();

@@ -170,15 +170,16 @@ impl RetryStore {
     }
 
     /// Drop rows resolved more than [`KEEP_HOURS`] ago, and live rows
-    /// abandoned for [`ABANDONED_DAYS`].
+    /// abandoned for [`ABANDONED_DAYS`]: first failed that long ago and with
+    /// no wake since. A retry still waiting on a far reset is kept.
     pub fn prune(&self, now: DateTime<Local>) -> Result<usize> {
         let cutoff = now - chrono::Duration::hours(KEEP_HOURS);
         let abandoned = now - chrono::Duration::days(ABANDONED_DAYS);
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
             "DELETE FROM turn_retries WHERE (resolved IS NOT NULL AND resolved_at < ?1) \
-             OR (resolved IS NULL AND first_failed_at < ?2)",
-            params![stamp(cutoff), stamp(abandoned)],
+             OR (resolved IS NULL AND first_failed_at < ?2 AND COALESCE(next_wake_at_ms, 0) < ?3)",
+            params![stamp(cutoff), stamp(abandoned), abandoned.timestamp_millis()],
         )?)
     }
 }
