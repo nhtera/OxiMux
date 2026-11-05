@@ -75,12 +75,16 @@ pub enum SendSource {
     Agent,
     /// A batch of child events for this parent (an outbox delivery).
     ParentEvent,
+    /// A restart's recovery turn for a child it cut short. The owner writes
+    /// it only while the chat still owes the restart's note (which goes with
+    /// it) and drops it otherwise: a message written first carried the note.
+    Recovery,
 }
 
 impl SendSource {
     /// Waits while the user has the session stopped: only a person resumes it.
     pub fn held_by_stop(self) -> bool {
-        matches!(self, SendSource::ParentEvent | SendSource::Agent)
+        matches!(self, SendSource::ParentEvent | SendSource::Agent | SendSource::Recovery)
     }
 
     /// Started by someone not at this screen (a phone, an agent, child events).

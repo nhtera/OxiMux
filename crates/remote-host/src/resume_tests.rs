@@ -263,3 +263,55 @@ fn a_child_whose_parent_ended_is_not_resumed() {
     settle();
     assert!(f.catalog.opened.lock().unwrap().is_empty());
 }
+
+/// A catalog that cannot build any session.
+struct Unopenable {
+    opened: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl SessionCatalog for Unopenable {
+    fn dormant(&self) -> Vec<DormantSession> {
+        Vec::new()
+    }
+    fn transcript(&self, _: &str) -> Option<DormantTranscript> {
+        None
+    }
+    fn choices(&self, _: &str) -> Option<DormantChoices> {
+        None
+    }
+    async fn open(&self, session_id: &str) -> Result<(), String> {
+        self.opened.lock().unwrap().push(session_id.to_string());
+        Err("session files unreadable".into())
+    }
+}
+
+#[test]
+fn a_child_that_cannot_be_opened_is_sent_nothing_and_its_key_is_released() {
+    let f = fixture(3);
+    open_parent(&f, "root");
+    working_child(&f, "root", "c1", SpawnOrigin::Agent);
+    let unopenable = Arc::new(Unopenable { opened: Mutex::default() });
+    f.core.set_catalog(unopenable.clone());
+    f.core.start(previous_host());
+    wait_for("the open attempt", || !unopenable.opened.lock().unwrap().is_empty());
+    settle();
+    assert_eq!(unopenable.opened.lock().unwrap().as_slice(), ["c1"], "tried once, not retried in a loop");
+    let key = key_hash(KeyKind::V2, &continuation_id("c1", EPOCH));
+    assert_eq!(
+        f.core.lineage().receipts().state("c1", &key).unwrap(),
+        None,
+        "the pending reservation was forgotten, so a later pass may still send"
+    );
+}
+
+#[test]
+fn the_restart_epoch_is_the_start_time_else_the_pid_and_none_without_a_previous_host() {
+    let record = |pid, started_at_unix_s| HolderRecord { pid, started_at_unix_s, boot_time_unix_s: None, role: None };
+    assert_eq!(restart_epoch(&PriorOwner::None), None);
+    assert_eq!(restart_epoch(&previous_host()), Some(EPOCH));
+    let no_start = PriorOwner::Gone { record: record(4242, None), same_boot: true };
+    assert_eq!(restart_epoch(&no_start), Some(4242), "a host that recorded no start falls back to its pid");
+    let unknown = PriorOwner::Unknown { record: record(7, None) };
+    assert_eq!(restart_epoch(&unknown), Some(7));
+}

@@ -15,7 +15,9 @@
 //!
 //! A child is sent one only while its chat still owes the restart's note (a
 //! lock given up and won back cut nothing short; a message someone else sent
-//! it first carried the note already). The text is a bare continue line: the
+//! it first carried the note already). It is sent as
+//! [`SendSource::Recovery`], so a view that queued it behind a message the
+//! user wrote meanwhile drops it there. The text is a bare continue line: the
 //! view that drives the child prepends the note (what was cut short, which
 //! background tasks stopped), so the agent reads both as one message.
 //!
@@ -77,12 +79,16 @@ struct Restart {
     generation: u64,
 }
 
-/// Spawned by an agent, still parked, not working here already, and with no
-/// retry of its own armed (the retry resumes it).
+/// Spawned by an agent, still parked, its parent not ended (nobody waits on
+/// it then), not working here already, and with no retry of its own armed
+/// (the retry resumes it).
 fn qualifies(core: &HostCore, child: &str) -> bool {
     let Ok(Some(row)) = core.lineage().row(child) else { return false };
+    let parent_ended =
+        core.lineage().row(&row.parent_id).ok().flatten().is_some_and(|p| p.state == LineageState::Ended);
     row.origin == SpawnOrigin::Agent
         && row.state == LineageState::Parked
+        && !parent_ended
         && !core.working().is_working(child)
         && core.lineage().retries().live(child).ok().flatten().is_none()
 }
@@ -110,15 +116,13 @@ async fn drive(weak: Weak<HostCore>, mut waiting_parent: Vec<String>, restart: R
         if core.ownership() != Some(restart.generation) {
             return;
         }
-        // A child waits until its parent's chat is open; one whose parent
-        // ended is not owed a turn.
+        // A child waits until its parent's chat is open; one no longer owed a
+        // turn (its parent ended, say) leaves the line.
         waiting_parent.retain(|child| {
-            let Ok(Some(row)) = core.lineage().row(child) else { return false };
-            let parent_ended =
-                core.lineage().row(&row.parent_id).ok().flatten().is_some_and(|p| p.state == LineageState::Ended);
-            if parent_ended || row.state != LineageState::Parked {
+            if !qualifies(&core, child) {
                 return false;
             }
+            let Ok(Some(row)) = core.lineage().row(child) else { return false };
             if core.registry().get(&row.parent_id).is_none() {
                 return true;
             }
@@ -221,7 +225,7 @@ async fn resume_one(core: &HostCore, child: &str, restart: Restart) -> Option<St
         return None;
     }
     let uuid = send_uuid(&continuation);
-    match handle.send_prompt_tagged(CONTINUE_LINE, &[], SendSource::Agent, Some(uuid)) {
+    match handle.send_prompt_tagged(CONTINUE_LINE, &[], SendSource::Recovery, Some(uuid)) {
         Ok(()) => {
             tracing::info!(child, "recovery turn sent");
             Some(key_hash(KeyKind::Gate, &uuid.to_string()))
