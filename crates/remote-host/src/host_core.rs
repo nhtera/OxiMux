@@ -113,6 +113,9 @@ pub struct HostCore {
     /// Builds a dormant session so a recovery turn can reach it; installed
     /// by the host after the core (see [`Self::set_catalog`]).
     catalog: Mutex<Option<Arc<dyn crate::catalog::SessionCatalog>>>,
+    /// Counts the times this process won the data directory, so work begun
+    /// under one ownership stops once it is given up (even if won back).
+    owner_gen: std::sync::atomic::AtomicU64,
 }
 
 impl HostCore {
@@ -135,6 +138,7 @@ impl HostCore {
             drain: drain.clone(),
             debounce: Mutex::new(EVENT_DEBOUNCE),
             catalog: Mutex::new(None),
+            owner_gen: std::sync::atomic::AtomicU64::new(0),
         });
         core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
@@ -173,6 +177,7 @@ impl HostCore {
         }
         self.prune_stores();
         tracing::info!(?prior, "host started");
+        let generation = self.owner_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         *slot = Some(prior);
         drop(slot);
         // Our own working chats may have been parked just now; correct them.
@@ -180,7 +185,7 @@ impl HostCore {
         // Children the previous host had working were cut short: those an agent
         // spawned get a recovery turn once their parent is open.
         if let Some(epoch) = epoch {
-            crate::resume::begin(self, cut, epoch);
+            crate::resume::begin(self, cut, epoch, generation);
         }
     }
 
@@ -195,6 +200,13 @@ impl HostCore {
     /// Whether this process owns the data directory (and so writes lineage).
     pub fn is_owner(&self) -> bool {
         self.prior.lock().unwrap().is_some()
+    }
+
+    /// Which win of the data directory this process holds now, while it is
+    /// the owner: the same number only for as long as it never let go.
+    pub(crate) fn ownership(&self) -> Option<u64> {
+        let slot = self.prior.lock().unwrap();
+        slot.is_some().then(|| self.owner_gen.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Who held the data directory before this host, while it is the owner.

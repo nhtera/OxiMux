@@ -183,6 +183,7 @@ impl AgentChatView {
             interrupted: self.interrupted,
             process,
             restored: t.restored,
+            recovery_note_owed: self.recovery_note.is_some(),
             held_restored: t.held,
             queued: t.queued,
             last_activity_at: t.last_activity_at,
@@ -310,12 +311,14 @@ impl AgentChatView {
         self.thread.clear();
         self.recovery_note = None;
         self.health.forget_failed_turn();
+        self.publish_health();
         self.meta_dirty.set(true);
     }
 
     /// The user removed the recovery note (the strip's [Remove]).
     pub(super) fn remove_recovery_note(&mut self, cx: &mut Context<Self>) {
         self.recovery_note = None;
+        self.publish_health();
         self.meta_dirty.set(true);
         self.sync_composer(cx);
     }

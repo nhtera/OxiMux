@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use oximux_agents::health::{HealthInputs, Restored};
+use oximux_agents::health::HealthInputs;
 use oximux_agents::lineage::{
     LineageStore, NotifyParent, Reservation, SpawnCaps, SpawnOrigin, SpawnParent, SpawnSpec,
 };
@@ -42,7 +42,9 @@ impl SessionCatalog for Catalog {
         if self.registry.get(session_id).is_none() {
             let agent = Arc::new(StubConnection::default());
             self.agents.lock().unwrap().insert(session_id.to_string(), agent.clone());
-            self.registry.register(session_id.to_string(), agent);
+            // A restored chat cut short mid-turn owes its note from the start.
+            let handle = self.registry.register(session_id.to_string(), agent);
+            handle.publish_health(HealthInputs { recovery_note_owed: true, ..HealthInputs::default() });
         }
         Ok(())
     }
@@ -104,7 +106,7 @@ fn working_child(f: &Fixture, parent: &str, child: &str, origin: SpawnOrigin) {
 
 fn previous_host() -> PriorOwner {
     PriorOwner::Gone {
-        record: HolderRecord { pid: 4242, started_at_unix_s: Some(1_700_000_000), boot_time_unix_s: None, role: None },
+        record: HolderRecord { pid: 4242, started_at_unix_s: Some(EPOCH), boot_time_unix_s: None, role: None },
         same_boot: true,
     }
 }
@@ -126,13 +128,20 @@ fn settle() {
     std::thread::sleep(Duration::from_millis(300));
 }
 
-/// The child's recovery turn ran: it worked, then went idle.
+/// The child's agent took its recovery turn and finished it before the host
+/// ever saw it working (the driver reads the receipt, not only the flag).
 fn finish(f: &Fixture, child: &str) {
-    let handle = f.registry.get(child).unwrap();
-    handle.set_working(true);
-    settle();
-    handle.set_working(false);
+    let line = key_hash(KeyKind::Gate, &send_uuid(&continuation_id(child, EPOCH)).to_string());
+    f.core
+        .lineage()
+        .receipts()
+        .settle(child, &line, ReceiptState::Accepted, "view", chrono::Local::now())
+        .unwrap();
+    // Any registry change wakes the driver.
+    f.registry.register(format!("nudge-{child}"), Arc::new(StubConnection::default()));
 }
+
+const EPOCH: u64 = 1_700_000_000;
 
 #[test]
 fn five_children_cut_short_three_resume_and_the_rest_wait_their_turn() {
@@ -210,23 +219,47 @@ fn only_an_agent_spawned_child_without_a_retry_of_its_own_is_resumed() {
 }
 
 #[test]
-fn a_child_whose_chat_says_no_turn_was_cut_short_is_not_resumed() {
+fn a_chat_that_owes_no_note_is_not_resumed() {
+    // Its chat is open and owes nothing: local access given up and won back
+    // over this same process cut nothing short, or someone already wrote to
+    // it (and the note went with that message).
     let f = fixture(3);
     open_parent(&f, "root");
     working_child(&f, "root", "c1", SpawnOrigin::Agent);
-    // Its chat is already open and restored as idle (a Stop just before the
-    // quit parked the row a moment late).
     let agent = Arc::new(StubConnection::default());
     f.catalog.agents.lock().unwrap().insert("c1".into(), agent.clone());
-    let handle = f.registry.register("c1".into(), agent);
-    handle.publish_health(HealthInputs {
-        restored: Some(Restored { was_mid_turn: false, prior_host_gone: true }),
-        ..HealthInputs::default()
-    });
+    f.registry.register("c1".into(), agent);
     f.core.start(previous_host());
     wait_for("the open attempt", || !f.catalog.opened.lock().unwrap().is_empty());
     settle();
     assert_eq!(f.catalog.recoveries("c1"), 0);
-    let key = key_hash(KeyKind::V2, &continuation_id("c1", 1_700_000_000));
+    let key = key_hash(KeyKind::V2, &continuation_id("c1", EPOCH));
     assert_eq!(f.core.lineage().receipts().state("c1", &key).unwrap(), None, "nothing sent, nothing reserved");
+}
+
+#[test]
+fn a_host_that_gave_the_directory_up_sends_nothing_more() {
+    let f = fixture(3);
+    working_child(&f, "root", "c1", SpawnOrigin::Agent);
+    f.core.start(previous_host());
+    // Given up and won back before the recovery woke: the old one must not
+    // carry on beside whatever the new ownership decides (here nothing: the
+    // child was parked by then, not working).
+    f.core.release();
+    f.core.start(previous_host());
+    open_parent(&f, "root");
+    settle();
+    assert!(f.catalog.opened.lock().unwrap().is_empty(), "the recovery belonged to the ownership given up");
+}
+
+#[test]
+fn a_child_whose_parent_ended_is_not_resumed() {
+    let f = fixture(3);
+    working_child(&f, "root", "p", SpawnOrigin::Agent);
+    working_child(&f, "p", "c", SpawnOrigin::Agent);
+    f.core.lineage().mark_ended("p", false, chrono::Local::now()).unwrap();
+    open_parent(&f, "p");
+    f.core.start(previous_host());
+    settle();
+    assert!(f.catalog.opened.lock().unwrap().is_empty());
 }
