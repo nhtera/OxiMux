@@ -119,12 +119,13 @@ impl RetryStore {
     }
 
     /// The armed retry fired: one more attempt spent, nothing armed. Returns
-    /// the attempts now spent.
+    /// the attempts now spent. A resolved retry is left as it is: only a live
+    /// one can fire.
     pub fn fired(&self, session: &str, turn_key: &str) -> Result<u32> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE turn_retries SET attempts = attempts + 1, next_wake_at_ms = NULL \
-             WHERE session_id = ?1 AND turn_key = ?2",
+             WHERE session_id = ?1 AND turn_key = ?2 AND resolved IS NULL",
             params![session, turn_key],
         )?;
         Ok(conn
