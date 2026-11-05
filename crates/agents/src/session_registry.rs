@@ -549,6 +549,12 @@ impl SessionHandle {
                 return Ok(());
             }
         }
+        // A recovery turn is owed only with the restart's note, which the
+        // view driving the chat puts ahead of it: without that view it is
+        // not written at all.
+        if source == crate::send_gate::SendSource::Recovery {
+            anyhow::bail!("a recovery turn needs the chat's view to send it");
+        }
         // Written directly: text that only looks like a host event is text.
         let text = &*crate::envelope::neutralize_forged(text);
         // Held across the write and both records: a reply produced by this write
@@ -1591,5 +1597,22 @@ mod tests {
         gate.lock().unwrap().clear_waker();
         handle.send_prompt("direct", &[]).unwrap();
         assert_eq!(stub.sent().len(), 1);
+    }
+
+    /// A recovery turn goes only through the view that owes its note: with no
+    /// view listening it is refused, not written bare.
+    #[test]
+    fn a_recovery_turn_is_never_written_directly() {
+        use crate::send_gate::SendSource;
+        let reg = SessionRegistry::new();
+        let stub = Arc::new(crate::thread::StubConnection::default());
+        let handle = reg.register("s1".into(), stub.clone());
+        assert!(handle.send_prompt_tagged("continue", &[], SendSource::Recovery, None).is_err());
+        assert!(stub.sent().is_empty());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        gate.lock().unwrap().set_waker(|| {});
+        handle.set_gate(Some(gate.clone()));
+        handle.send_prompt_tagged("continue", &[], SendSource::Recovery, None).unwrap();
+        assert_eq!(gate.lock().unwrap().queued().count(), 1, "queued for the view");
     }
 }

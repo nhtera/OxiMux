@@ -9,6 +9,7 @@ use oximux_agents::health::HealthInputs;
 use oximux_agents::lineage::{
     LineageStore, NotifyParent, Reservation, SpawnCaps, SpawnOrigin, SpawnParent, SpawnSpec,
 };
+use oximux_agents::send_gate::SendGate;
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::connection::StubConnection;
 use oximux_agents::thread::launch_posture::SpawnPosture;
@@ -23,6 +24,9 @@ use crate::host_config::HostConfig;
 struct Catalog {
     registry: Arc<SessionRegistry>,
     agents: Mutex<HashMap<String, Arc<StubConnection>>>,
+    /// Each opened child's send gate, armed as the view that drives it arms
+    /// it: what the host queues there is what the view would write.
+    gates: Mutex<HashMap<String, Arc<Mutex<SendGate>>>>,
     opened: Mutex<Vec<String>>,
 }
 
@@ -44,6 +48,10 @@ impl SessionCatalog for Catalog {
             self.agents.lock().unwrap().insert(session_id.to_string(), agent.clone());
             // A restored chat cut short mid-turn owes its note from the start.
             let handle = self.registry.register(session_id.to_string(), agent);
+            let gate = Arc::new(Mutex::new(SendGate::new()));
+            gate.lock().unwrap().set_waker(|| {});
+            handle.set_gate(Some(gate.clone()));
+            self.gates.lock().unwrap().insert(session_id.to_string(), gate);
             handle.publish_health(HealthInputs { recovery_note_owed: true, ..HealthInputs::default() });
         }
         Ok(())
@@ -51,12 +59,16 @@ impl SessionCatalog for Catalog {
 }
 
 impl Catalog {
-    /// Recovery turns `child`'s agent was sent.
+    /// Recovery turns sent to `child`: queued for its view, or (never, for
+    /// a recovery) written to its agent directly.
     fn recoveries(&self, child: &str) -> usize {
-        let agents = self.agents.lock().unwrap();
-        agents.get(child).map_or(0, |a| {
+        let queued = self.gates.lock().unwrap().get(child).map_or(0, |g| {
+            g.lock().unwrap().queued().filter(|q| q.source == SendSource::Recovery && q.text == CONTINUE_LINE).count()
+        });
+        let written = self.agents.lock().unwrap().get(child).map_or(0, |a| {
             a.sent().iter().filter(|m| m.to_string().contains(CONTINUE_LINE)).count()
-        })
+        });
+        queued + written
     }
 
     fn total(&self) -> usize {
@@ -82,7 +94,7 @@ fn fixture(max_resumes: u32) -> Fixture {
         registry: registry.clone(),
         config: HostConfig { max_resumes, ..HostConfig::default() },
     });
-    let catalog = Arc::new(Catalog { registry: registry.clone(), agents: Mutex::default(), opened: Mutex::default() });
+    let catalog = Arc::new(Catalog { registry: registry.clone(), agents: Mutex::default(), gates: Mutex::default(), opened: Mutex::default() });
     core.set_catalog(catalog.clone());
     Fixture { core, registry, catalog, _rt: rt }
 }
@@ -314,4 +326,14 @@ fn the_restart_epoch_is_the_start_time_else_the_pid_and_none_without_a_previous_
     assert_eq!(restart_epoch(&no_start), Some(4242), "a host that recorded no start falls back to its pid");
     let unknown = PriorOwner::Unknown { record: record(7, None) };
     assert_eq!(restart_epoch(&unknown), Some(7));
+}
+
+#[test]
+fn with_recovery_turns_off_nothing_is_resumed() {
+    let f = fixture(0);
+    open_parent(&f, "root");
+    working_child(&f, "root", "c1", SpawnOrigin::Agent);
+    f.core.start(previous_host());
+    settle();
+    assert!(f.catalog.opened.lock().unwrap().is_empty(), "max_resumes 0 sends none; the note waits for the next message");
 }

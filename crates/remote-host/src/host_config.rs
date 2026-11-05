@@ -68,7 +68,8 @@ pub struct HostConfig {
     /// marked stalled (informational only). 0 turns the signal off.
     pub stall_after_s: u32,
     /// Children a restart's recovery turns may run at once (each spawns an
-    /// agent and is billed); the rest wait in line.
+    /// agent and is billed); the rest wait in line. 0 sends none: the
+    /// children stay parked and each gets the note with its next message.
     pub max_resumes: u32,
 }
 
@@ -147,7 +148,8 @@ impl HostConfig {
     }
 
     /// The config as enforced: the depth never exceeds the ceiling, every
-    /// count cap stays between 1 and its settable maximum, and the verifier
+    /// count cap stays between 1 and its settable maximum (recovery turns
+    /// between 0, off, and theirs), and the verifier
     /// keeps only command rules, whatever was stored.
     pub fn sanitized(self) -> Self {
         let clamp = |v: u32, max: u32| v.clamp(1, max);
@@ -163,7 +165,7 @@ impl HostConfig {
             verify_allow: Some(self.verify_allow.into_iter().filter(|r| is_command_rule(r)).collect::<Vec<_>>())
                 .filter(|rules| !rules.is_empty())
                 .unwrap_or_else(|| Self::default().verify_allow),
-            max_resumes: clamp(self.max_resumes, 10),
+            max_resumes: self.max_resumes.min(10),
             ..self
         }
     }

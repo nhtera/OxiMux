@@ -61,8 +61,11 @@ pub(crate) fn restart_epoch(prior: &PriorOwner) -> Option<u64> {
 /// Start recovering `cut` (the children the previous host had working), on
 /// the core's runtime, for as long as this process keeps the ownership
 /// `generation` it won. Only children an agent spawned qualify; the rest are
-/// left parked.
+/// left parked, as all are when recovery turns are off (`max_resumes` 0).
 pub(crate) fn begin(core: &Arc<HostCore>, cut: Vec<String>, epoch: u64, generation: u64) {
+    if core.config().max_resumes == 0 {
+        return;
+    }
     let candidates: Vec<String> = cut.into_iter().filter(|child| qualifies(core, child)).collect();
     if candidates.is_empty() {
         return;

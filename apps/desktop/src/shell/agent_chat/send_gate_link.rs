@@ -247,7 +247,7 @@ impl AgentChatView {
                         continue;
                     }
                     match steer {
-                        Some(s) if s.source == SendSource::Agent => {
+                        Some(s) if s.source.held_by_stop() => {
                             gate.push(s.text, Vec::new(), s.source, DeliveryMode::Queue, None);
                         }
                         Some(s) => typed.push(s.text),
