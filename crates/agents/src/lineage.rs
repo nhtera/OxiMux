@@ -723,14 +723,21 @@ impl LineageStore {
     /// Host start: the previous owner of this data dir is gone (the host lock
     /// proves it), so nothing it reserved will launch and nothing it ran is
     /// still working. `reserved` rows are deleted; `active` rows park.
-    pub fn boot_reconcile(&self, now: DateTime<Local>) -> Result<()> {
+    ///
+    /// Returns the sessions it parked: what the previous owner had working
+    /// when it went, the candidates for a recovery turn.
+    pub fn boot_reconcile(&self, now: DateTime<Local>) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM agent_lineage WHERE state = 'reserved'", [])?;
+        let cut: Vec<String> = conn
+            .prepare("SELECT session_id FROM agent_lineage WHERE state = 'active' AND session_id IS NOT NULL")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         conn.execute(
             "UPDATE agent_lineage SET state = 'parked', updated_at = ?1 WHERE state = 'active'",
             params![stamp(now)],
         )?;
-        Ok(())
+        Ok(cut)
     }
 
     /// Spawned sessions that are `active` or `parked`: the rows a host's status

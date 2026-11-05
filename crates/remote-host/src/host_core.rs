@@ -110,6 +110,9 @@ pub struct HostCore {
     watcher: ChildWatcher,
     drain: mpsc::UnboundedSender<DrainMsg>,
     debounce: Mutex<Duration>,
+    /// Builds a dormant session so a recovery turn can reach it; installed
+    /// by the host after the core (see [`Self::set_catalog`]).
+    catalog: Mutex<Option<Arc<dyn crate::catalog::SessionCatalog>>>,
 }
 
 impl HostCore {
@@ -131,6 +134,7 @@ impl HostCore {
             watcher: ChildWatcher::default(),
             drain: drain.clone(),
             debounce: Mutex::new(EVENT_DEBOUNCE),
+            catalog: Mutex::new(None),
         });
         core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
@@ -144,14 +148,16 @@ impl HostCore {
     /// ran is still working), remember who it was, and start writing. Runs on
     /// every acquisition: a lock given up and won back may have been held by
     /// another host in between. A call while already the owner is a no-op.
-    pub fn start(&self, prior: PriorOwner) {
+    pub fn start(self: &Arc<Self>, prior: PriorOwner) {
         let mut slot = self.prior.lock().unwrap();
         if slot.is_some() {
             return;
         }
-        if let Err(err) = self.lineage.boot_reconcile(chrono::Local::now()) {
+        let cut = self.lineage.boot_reconcile(chrono::Local::now()).unwrap_or_else(|err| {
             tracing::warn!(%err, "lineage boot reconcile failed");
-        }
+            Vec::new()
+        });
+        let epoch = crate::resume::restart_epoch(&prior);
         // Whatever the previous owner had in flight: claims it never wrote go
         // back to pending, lines it wrote but never saw accepted are shown as
         // unconfirmed (never resent on their own).
@@ -171,6 +177,11 @@ impl HostCore {
         drop(slot);
         // Our own working chats may have been parked just now; correct them.
         self.sync_lineage_states();
+        // Children the previous host had working were cut short: those an agent
+        // spawned get a recovery turn once their parent is open.
+        if let Some(epoch) = epoch {
+            crate::resume::begin(self, cut, epoch);
+        }
     }
 
     /// The host gave the data directory up: stop writing until it wins the
@@ -218,6 +229,16 @@ impl HostCore {
     /// How long a child event waits for others before delivery.
     pub fn event_debounce(&self) -> Duration {
         *self.debounce.lock().unwrap()
+    }
+
+    /// Install the catalog that builds dormant sessions. Without one, a
+    /// restart's recovery turns reach only sessions already live.
+    pub fn set_catalog(&self, catalog: Arc<dyn crate::catalog::SessionCatalog>) {
+        *self.catalog.lock().unwrap() = Some(catalog);
+    }
+
+    pub(crate) fn catalog(&self) -> Option<Arc<dyn crate::catalog::SessionCatalog>> {
+        self.catalog.lock().unwrap().clone()
     }
 
     /// Change [`Self::event_debounce`] (tests shorten it).

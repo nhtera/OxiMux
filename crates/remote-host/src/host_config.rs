@@ -20,6 +20,7 @@ pub mod keys {
     pub const CAP_OPEN_PER_ROOT: &str = "agents.delegation.cap.open_per_root";
     pub const VERIFY_ALLOW: &str = "agents.delegation.verify_allow";
     pub const STALL_AFTER_S: &str = "agents.health.stall_after_s";
+    pub const MAX_RESUMES: &str = "agents.recovery.max_resumes";
 }
 
 /// The commands a Claude verifier may run when nothing else is configured:
@@ -66,6 +67,9 @@ pub struct HostConfig {
     /// Seconds a working session may go without a sign of life before it is
     /// marked stalled (informational only). 0 turns the signal off.
     pub stall_after_s: u32,
+    /// Children a restart's recovery turns may run at once (each spawns an
+    /// agent and is billed); the rest wait in line.
+    pub max_resumes: u32,
 }
 
 impl Default for HostConfig {
@@ -78,6 +82,7 @@ impl Default for HostConfig {
             caps: SpawnCaps::default(),
             verify_allow: DEFAULT_VERIFY_ALLOW.iter().map(|r| r.to_string()).collect(),
             stall_after_s: (oximux_agents::health::DEFAULT_STALL_AFTER_MS / 1000) as u32,
+            max_resumes: oximux_agents::resume_governor::DEFAULT_MAX_RESUMES,
         }
     }
 }
@@ -111,6 +116,7 @@ impl HostConfig {
                 .filter(|rules| !rules.is_empty())
                 .unwrap_or(d.verify_allow),
             stall_after_s: num(keys::STALL_AFTER_S, d.stall_after_s),
+            max_resumes: num(keys::MAX_RESUMES, d.max_resumes),
         }
         .sanitized()
     }
@@ -128,6 +134,7 @@ impl HostConfig {
             (keys::CAP_OPEN_PER_ROOT, self.caps.open_per_root.to_string()),
             (keys::VERIFY_ALLOW, self.verify_allow.join("\n")),
             (keys::STALL_AFTER_S, self.stall_after_s.to_string()),
+            (keys::MAX_RESUMES, self.max_resumes.to_string()),
         ]
     }
 
@@ -156,6 +163,7 @@ impl HostConfig {
             verify_allow: Some(self.verify_allow.into_iter().filter(|r| is_command_rule(r)).collect::<Vec<_>>())
                 .filter(|rules| !rules.is_empty())
                 .unwrap_or_else(|| Self::default().verify_allow),
+            max_resumes: clamp(self.max_resumes, 10),
             ..self
         }
     }
@@ -207,6 +215,7 @@ mod tests {
             caps: SpawnCaps { depth: 2, active_per_parent: 3, ..SpawnCaps::default() },
             verify_allow: vec!["Bash(just test:*)".into(), "Bash(cargo nextest run:*)".into()],
             stall_after_s: 90,
+            max_resumes: 5,
         };
         let stored: std::collections::HashMap<&str, String> = custom.entries().into_iter().collect();
         assert_eq!(HostConfig::load(|k| stored.get(k).cloned()), custom);

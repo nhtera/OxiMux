@@ -564,6 +564,11 @@ impl RemoteControl {
 
     /// Let the host see and open sessions whose views have not been built.
     pub fn set_session_catalog(&mut self, catalog: Arc<dyn oximux_remote_host::catalog::SessionCatalog>) {
+        // The core needs it too: a restart's recovery turn may have to build a
+        // dormant child before it can reach it.
+        if let Some(core) = &self.host_core {
+            core.set_catalog(Arc::clone(&catalog));
+        }
         self.catalog = Some(catalog);
     }
 

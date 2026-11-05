@@ -22,6 +22,7 @@ pub mod host_core;
 pub mod identity;
 pub mod launcher;
 mod outbox_drainer;
+mod resume;
 pub mod projects;
 pub mod rewind;
 pub mod schedule_runner;
