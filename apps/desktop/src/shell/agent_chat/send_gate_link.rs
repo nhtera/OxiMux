@@ -28,6 +28,9 @@ const PLAN_REFUSED: &str = "Leaving plan mode needs you: this turn was started b
 /// What the transcript says when held child events go out with a message.
 const HELD_EVENTS_NOTE: &str = "Child events that arrived after the Stop went with this message.";
 
+/// What the transcript says when a recovery note went out with a message.
+const RECOVERY_NOTE_SENT: &str = "A recovery note about the restart went with this message.";
+
 /// How long after its turn ended a steered line may take to start (or be
 /// reported dropped) before the chat stops waiting for it.
 const STEER_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -76,6 +79,7 @@ impl AgentChatView {
             disconnected: self.disconnected || self.unbound || self.auth.is_some() || self.connection.is_none(),
             retry_armed: self.retry.is_armed(),
             prompt_pending: self.thread.pending_permission().is_some() || self.thread.pending_question().is_some(),
+            failed: self.health.holds_queue(),
             turn_started: self.turn_has_output(),
             // Child events are steered only into an agent that reports what it
             // started on: without that, a Stop could not take them back.
@@ -85,7 +89,7 @@ impl AgentChatView {
     }
 
     /// Whether the agent has said anything since the latest prompt.
-    fn turn_has_output(&self) -> bool {
+    pub(super) fn turn_has_output(&self) -> bool {
         self.thread
             .entries
             .iter()
@@ -263,6 +267,9 @@ impl AgentChatView {
             self.stop_turn(cx);
             return;
         }
+        // The wake may predate what holds the chat now (a turn that just
+        // failed): decide on the current holds, not the ones that woke us.
+        self.sync_gate_holds();
         if self.send_gate.lock().unwrap().ready() == Ready::Steer {
             self.steer_from_gate(cx);
             return;
@@ -358,7 +365,23 @@ impl AgentChatView {
     /// Write a prompt to the agent, under the id it will report it by. Child
     /// events the gate held after a Stop go first, in the same line, under
     /// their batch's id (so their receipts settle them).
+    ///
+    /// A recovery note a restart left owed goes ahead of the text, once; it is
+    /// kept for the next write if this one fails.
     pub(super) fn write_prompt(&mut self, text: &str, images: &[ChatImage]) -> anyhow::Result<()> {
+        // Checked first, so a missing agent takes neither the note nor held events.
+        if self.connection.is_none() {
+            anyhow::bail!("no agent to send to");
+        }
+        let note = self.recovery_note.take();
+        let with_note;
+        let text = match &note {
+            Some(note) => {
+                with_note = oximux_agents::recovery_note::attach(note, text);
+                with_note.as_str()
+            }
+            None => text,
+        };
         // Only after a Stop: events that merely waited for a busy turn go on
         // their own when it ends. The host merges events into one batch, so
         // there is normally one; any other waits for the next turn.
@@ -385,7 +408,7 @@ impl AgentChatView {
             }
             None => (text.to_string(), self.pending_send_uuid.take().unwrap_or_else(Uuid::new_v4)),
         };
-        let conn = self.connection.as_ref().ok_or_else(|| anyhow::anyhow!("no agent to send to"))?;
+        let conn = self.connection.as_ref().expect("checked above");
         let sent = conn.send_user_message_tagged(&line, images, &uuid.to_string());
         let mut gate = self.send_gate.lock().unwrap();
         gate.report_sent(uuid, sent.is_ok());
@@ -394,8 +417,13 @@ impl AgentChatView {
         }
         drop(gate);
         if sent.is_ok() {
-            self.health.note_sent(oximux_agents::session_health::now_ms());
+            self.health.note_sent(oximux_agents::session_health::now_ms(), Some(uuid.to_string()));
             self.publish_health();
+            if note.is_some() {
+                self.thread.apply(&ThreadEvent::Notice(RECOVERY_NOTE_SENT.into()));
+            }
+        } else {
+            self.recovery_note = note;
         }
         sent
     }

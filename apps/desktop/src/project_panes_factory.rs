@@ -240,12 +240,20 @@ fn restore_chat_pending_retry(
         .and_then(|t| t.pending_retry.clone())
 }
 
-/// Whether a restored chat had a turn or background work running when it was
-/// last saved (so a restart cut it short). `false` for older blobs.
-fn restore_chat_mid_turn(snap: &PersistedTabs, session_id: Option<&str>) -> bool {
+/// What a restart cut short in a restored chat: whether a turn or background
+/// work was running when it was last saved, and the recovery note it owes.
+/// Nothing for older blobs.
+fn restore_chat_turn(snap: &PersistedTabs, session_id: Option<&str>) -> crate::shell::agent_chat::RestoredTurn {
     session_id
         .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
-        .is_some_and(|t| t.mid_turn)
+        .map(|t| crate::shell::agent_chat::RestoredTurn {
+            mid_turn: t.mid_turn,
+            stopped_tasks: t.stopped_tasks.clone(),
+            recovery_note: t.recovery_note.clone(),
+            unanswered_send: t.unanswered_send.clone(),
+            unconfirmed_held: t.unconfirmed_held.clone(),
+        })
+        .unwrap_or_default()
 }
 
 /// The persisted backend posture for a restored chat, so a reopened session
@@ -478,7 +486,7 @@ pub(crate) fn build_project_panes(
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
                             let pending_retry =
                                 restore_chat_pending_retry(&snap, session_id.as_deref());
-                            let mid_turn = restore_chat_mid_turn(&snap, session_id.as_deref());
+                            let turn = restore_chat_turn(&snap, session_id.as_deref());
                             let view = group.update(cx, |g, cx| {
                                 let ix = g.open_agent_chat_tab_restored(
                                     chat_cwd, model, backend, resume_id, entries, slash_commands,
@@ -488,7 +496,7 @@ pub(crate) fn build_project_panes(
                                 g.agent_chat_view_at(ix)
                             });
                             if let Some(view) = view {
-                                view.update(cx, |v, cx| v.restore_health(mid_turn, cx));
+                                view.update(cx, |v, cx| v.restore_health(turn, cx));
                             }
                         }
                     }
@@ -671,13 +679,13 @@ fn restore_multi_group(
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
                             let pending_retry =
                                 restore_chat_pending_retry(&snap, session_id.as_deref());
-                            let mid_turn = restore_chat_mid_turn(&snap, session_id.as_deref());
+                            let turn = restore_chat_turn(&snap, session_id.as_deref());
                             if let Some(view) = p.open_agent_chat_in_group_restore(
                                 group_id, chat_cwd, model, backend, resume_id, entries, slash_commands,
                                 session_meta, thinking_level, posture, pending_retry, draft, queued,
                                 window, cx,
                             ) {
-                                view.update(cx, |v, cx| v.restore_health(mid_turn, cx));
+                                view.update(cx, |v, cx| v.restore_health(turn, cx));
                             }
                         }
                         p.place_restored_last_tab(Some(group_id), meta, cx);
@@ -2163,6 +2171,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         let snap = PersistedTabs {
@@ -2257,6 +2269,10 @@ mod tests {
                 claude_fast_mode: None,
                 pending_retry: None,
                 mid_turn: false,
+                stopped_tasks: Vec::new(),
+                recovery_note: None,
+                unanswered_send: None,
+                unconfirmed_held: Vec::new(),
                 choices: Default::default(),
             }],
             ..PersistedTabs::default()
@@ -2307,6 +2323,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         let snap =

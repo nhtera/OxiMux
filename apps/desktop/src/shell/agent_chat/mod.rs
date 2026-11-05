@@ -256,7 +256,7 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
     }
 }
 
-pub use session_persistence::RestoredPosture;
+pub use session_persistence::{RestoredPosture, RestoredTurn};
 use session_persistence::{seed_posture_feature_values, ConnectMode};
 
 /// Overlay the user's optimistic feature picks onto the backend-advertised
@@ -519,7 +519,7 @@ impl ThinkingLevel {
     }
 }
 
-use composer::{AgentModelCount, AgentPickerRow, ComposerEvent, ComposerView, ControlVocab};
+use composer::{AgentModelCount, AgentPickerRow, ComposerEvent, ComposerView, ControlVocab, HeldMessage};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{
@@ -594,6 +594,8 @@ pub struct AgentChatView {
     pending_send_uuid: Option<uuid::Uuid>,
     /// Health facts the fold does not keep (`health_link.rs`).
     health: health_link::HealthTrack,
+    /// What a restart cut short, owed to the agent on the next message.
+    recovery_note: Option<String>,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`
@@ -1311,39 +1313,6 @@ impl AgentChatView {
         self.import_bridge
             .as_ref()
             .map(|b| (b.preset_id.as_str(), b.session_id.as_str()))
-    }
-
-    /// The unsent composer draft text, for the layout snapshot (so a typed but
-    /// unsent message survives a tab close / app quit).
-    pub fn draft_text(&self, cx: &App) -> String {
-        self.composer.read(cx).current_draft(cx)
-    }
-
-    /// The text of each queued-but-unsent message (oldest first), for the layout
-    /// snapshot. Text-only — staged images/context aren't persisted.
-    pub fn queued_texts(&self, cx: &App) -> Vec<String> {
-        self.composer.read(cx).queued_texts()
-    }
-
-    /// Seed a restored draft + queued messages into the composer after
-    /// construction. The draft seed is no-clobber-guarded; queued messages are
-    /// re-shown as chips and NEVER auto-sent (a restored app must not fire billed
-    /// sends without a user action).
-    pub fn seed_draft_and_queue(
-        &mut self,
-        draft: Option<String>,
-        queued: Vec<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.composer.update(cx, |c, cx| {
-            if let Some(text) = draft {
-                c.seed_draft(text, window, cx);
-            }
-            if !queued.is_empty() {
-                c.seed_queued(queued, cx);
-            }
-        });
     }
 
     /// The current view mode (chat vs. companion terminal).
@@ -2083,7 +2052,7 @@ impl AgentChatView {
         if self.unbound {
             return;
         }
-        self.thread.clear();
+        self.clear_conversation();
         // Transient view state keyed to the old transcript must not survive.
         self.pending_edit = None;
         self.rewind_confirm = None;

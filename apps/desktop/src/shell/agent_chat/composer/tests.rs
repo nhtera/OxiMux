@@ -117,6 +117,15 @@ impl ComposerView {
     }
 
     /// How many messages are currently parked (queued while a turn streamed).
+    pub(crate) fn held_for_test(&self) -> &[HeldMessage] {
+        &self.held
+    }
+
+    /// The user dropped every held card.
+    pub(crate) fn drop_all_held_for_test(&mut self, cx: &mut Context<Self>) {
+        self.discard_held(cx);
+    }
+
     pub(crate) fn queued_len_for_test(&self) -> usize {
         self.queued.len()
     }
@@ -452,6 +461,123 @@ async fn a_picked_browser_element_reaches_the_wire_with_its_screenshot(
     assert_eq!(images.len(), 1, "the screenshot must travel with the text");
     assert_eq!(images[0].media_type, "image/png");
     assert!(!images[0].data.is_empty());
+}
+
+fn held(texts: &[&str]) -> Vec<HeldMessage> {
+    texts.iter().map(|t| HeldMessage { text: (*t).into(), maybe_sent: false }).collect()
+}
+
+/// Every Submit and the last queue counts a composer emits.
+type Seen = std::rc::Rc<std::cell::RefCell<(Vec<String>, (u32, u32))>>;
+
+fn capture(window: &gpui::WindowHandle<ComposerView>, cx: &mut TestAppContext) -> Seen {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new((Vec::new(), (0, 0))));
+    let sink = seen.clone();
+    cx.update(|cx| {
+        let root = window.root(cx).expect("root view");
+        cx.subscribe(&root, move |_, ev: &ComposerEvent, _| match ev {
+            ComposerEvent::Submit { text, .. } | ComposerEvent::SendParked { text, .. } => {
+                sink.borrow_mut().0.push(text.clone())
+            }
+            ComposerEvent::QueueChanged { held, queued, .. } => sink.borrow_mut().1 = (*held, *queued),
+            _ => {}
+        })
+        .detach();
+    });
+    seen
+}
+
+/// Messages queued before a restart come back held: no drain takes them and a
+/// new message goes past them (V4-2).
+#[gpui::test]
+async fn restored_messages_are_held_until_the_user_sends_them(cx: &mut TestAppContext) {
+    let window = test_composer(cx);
+    let seen = capture(&window, cx);
+    window
+        .update(cx, |c, window, cx| {
+            c.seed_held(held(&["one", "two", " "]), cx);
+            assert!(c.take_next_queued(cx).is_none(), "a completed turn sends nothing held");
+            c.set_draft_for_test("new", window, cx);
+            c.submit(window, cx);
+            assert_eq!(c.queued_texts(), vec!["one", "two"], "still held");
+        })
+        .expect("window update");
+    cx.run_until_parked();
+    assert_eq!(seen.borrow().0, vec!["new"], "only the new message went out");
+    assert_eq!(seen.borrow().1, (2, 0), "the blank entry is skipped");
+}
+
+/// Send releases exactly that card: at once when idle, to the front of the
+/// queue mid-turn. Drop and Discard send nothing.
+#[gpui::test]
+async fn held_cards_release_only_on_send(cx: &mut TestAppContext) {
+    let window = test_composer(cx);
+    let seen = capture(&window, cx);
+    window
+        .update(cx, |c, window, cx| {
+            c.seed_held(held(&["a", "b", "c", "d"]), cx);
+            c.send_held(1, cx);
+            c.drop_held(0, cx);
+            // Mid-turn: Send parks it ahead of what the user queued since.
+            c.set_state(false, true, cx);
+            c.set_draft_for_test("later", window, cx);
+            c.submit(window, cx);
+            c.send_held(0, cx);
+            assert_eq!(c.queued_len_for_test(), 2);
+            assert_eq!(c.take_next_queued(cx).map(|(t, _)| t).as_deref(), Some("c"));
+            c.discard_held(cx);
+        })
+        .expect("window update");
+    cx.run_until_parked();
+    assert_eq!(seen.borrow().0, vec!["b"], "only the idle Send went out at once");
+    assert_eq!(seen.borrow().1, (0, 1));
+}
+
+/// A held card's Send is never a typed Submit, which a staged edit would
+/// take as its own (and rewind the conversation for).
+#[gpui::test]
+async fn a_parked_send_is_not_a_submit(cx: &mut TestAppContext) {
+    let window = test_composer(cx);
+    let submits = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = submits.clone();
+    cx.update(|cx| {
+        let root = window.root(cx).expect("root view");
+        cx.subscribe(&root, move |_, ev: &ComposerEvent, _| {
+            if matches!(ev, ComposerEvent::Submit { .. }) {
+                seen.set(seen.get() + 1);
+            }
+        })
+        .detach();
+    });
+    window
+        .update(cx, |c, window, cx| {
+            c.seed_held(held(&["a"]), cx);
+            c.send_held(0, cx);
+            c.set_state(false, true, cx);
+            c.set_draft_for_test("b", window, cx);
+            c.submit(window, cx);
+            c.set_state(false, false, cx);
+            c.send_queued_now(0, cx);
+        })
+        .expect("window update");
+    cx.run_until_parked();
+    assert_eq!(submits.get(), 0);
+}
+
+/// Send all while idle sends the oldest now and queues the rest in order.
+#[gpui::test]
+async fn send_all_sends_the_oldest_and_queues_the_rest(cx: &mut TestAppContext) {
+    let window = test_composer(cx);
+    let seen = capture(&window, cx);
+    window
+        .update(cx, |c, _window, cx| {
+            c.seed_held(held(&["x", "y", "z"]), cx);
+            c.send_all_held(cx);
+            assert_eq!(c.queued_texts(), vec!["y", "z"]);
+        })
+        .expect("window update");
+    cx.run_until_parked();
+    assert_eq!(seen.borrow().0, vec!["x"]);
 }
 
 /// Restored queued chips (`seed_queued`) re-render without auto-sending; a

@@ -13,7 +13,7 @@ use oximux_agents::health::{
     self, ExitProof, HealthInputs, PromptKind, Process, Restored,
 };
 use oximux_agents::session_health::now_ms;
-use oximux_agents::thread::{TaskStatus, ThreadEvent};
+use oximux_agents::thread::{TaskStatus, ThreadEntry, ThreadEvent};
 
 use super::AgentChatView;
 
@@ -24,6 +24,11 @@ pub(super) struct HealthTrack {
     last_activity_at: i64,
     /// A send went out and no frame has answered it yet.
     sent_unanswered: bool,
+    /// The id that send went out under.
+    sent_id: Option<String>,
+    /// Restored sends nobody answered, still held and marked: the blob keeps
+    /// each (with its own text) until the user sends or drops its card.
+    pub(super) unconfirmed_held: Vec<crate::persisted_chat::UnconfirmedSend>,
     /// The agent took the last send (receipt) and has produced nothing since.
     accepted_at: Option<i64>,
     /// How the process ended, once it has.
@@ -37,6 +42,9 @@ pub(super) struct HealthTrack {
     /// or a turn that ends well. Only a turn's own result, not a failed fork
     /// or rewind, makes a session read failed.
     failed_turn: Option<String>,
+    /// The composer's queue: restored messages held, and messages waiting to drain.
+    pub(super) held: u32,
+    pub(super) queued: u32,
 }
 
 impl HealthTrack {
@@ -64,8 +72,20 @@ impl HealthTrack {
         }
     }
 
-    /// A send was written to the agent.
-    pub(super) fn note_sent(&mut self, now: i64) {
+    /// The last turn failed and nothing has been sent since: the queue waits
+    /// for the user rather than draining into a failing session.
+    pub(super) fn holds_queue(&self) -> bool {
+        self.failed_turn.is_some()
+    }
+
+    /// The conversation was cleared: its failed turn no longer holds anything.
+    pub(super) fn forget_failed_turn(&mut self) {
+        self.failed_turn = None;
+    }
+
+    /// A send was written to the agent, under `id` when it was tagged.
+    pub(super) fn note_sent(&mut self, now: i64, id: Option<String>) {
+        self.sent_id = id;
         self.turns += 1;
         self.sent_unanswered = true;
         self.accepted_at = None;
@@ -148,8 +168,8 @@ impl AgentChatView {
             interrupted: self.interrupted,
             process,
             restored: t.restored,
-            held_restored: 0,
-            queued: 0,
+            held_restored: t.held,
+            queued: t.queued,
             last_activity_at: t.last_activity_at,
             turn_id: (t.turns > 0).then(|| format!("{incarnation}:{}", t.turns)),
             exit_seq: (t.exits > 0).then(|| format!("{incarnation}:{}", t.exits)),
@@ -204,13 +224,46 @@ impl AgentChatView {
 
     /// A restored chat: unconfirmed until its first frame, or interrupted when
     /// it was mid-turn and this host provably replaced the one that ran it.
-    pub fn restore_health(&mut self, mid_turn: bool, cx: &mut Context<Self>) {
+    /// A restart mid-turn also owes the agent a recovery note on the next
+    /// message (kept if an earlier restore's note is still unsent).
+    pub fn restore_health(&mut self, turn: super::RestoredTurn, cx: &mut Context<Self>) {
+        let mid_turn = turn.mid_turn;
+        // The send nothing answered before the quit may or may not have reached
+        // the agent: offer it back, held and marked, never resend it unasked.
+        let last_user = self.thread.entries.iter().rev().find_map(|e| match e {
+            ThreadEntry::User { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        // Cards held from an earlier restore keep their own text; only the
+        // live send's text is the latest user entry.
+        let live = turn
+            .unanswered_send
+            .zip(last_user)
+            .map(|(id, text)| crate::persisted_chat::UnconfirmedSend { id, text });
+        let unconfirmed: Vec<_> =
+            turn.unconfirmed_held.into_iter().chain(live).filter(|u| !u.text.trim().is_empty()).collect();
+        self.composer.update(cx, |c, cx| {
+            // Each goes in first, so the oldest ends up on top.
+            for u in unconfirmed.iter().rev() {
+                c.hold_unconfirmed(u.text.clone(), cx);
+            }
+        });
+        self.recovery_note = turn.recovery_note.or_else(|| {
+            let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            mid_turn.then(|| oximux_agents::recovery_note::build(&at, &turn.stopped_tasks))
+        });
+        self.sync_composer(cx);
         let prior_host_gone = cx
             .try_global::<crate::remote_control::RemoteControl>()
             .and_then(|rc| rc.host_core())
             .and_then(|core| core.prior_owner())
             .is_some_and(|prior| !matches!(prior, oximux_remote_host::PriorOwner::None));
+        // The composer's counts are its own, reported by `QueueChanged`
+        // whenever that lands: keep them across the reset.
+        let (held, queued) = (self.health.held, self.health.queued);
         self.health = HealthTrack::restored(mid_turn, prior_host_gone);
+        self.health.unconfirmed_held = unconfirmed;
+        (self.health.held, self.health.queued) = (held, queued);
         // A dormant chat is not bound to the host yet, so this is where its
         // restored state can be seen.
         let h = health::compute(&self.health_inputs(), now_ms(), &health::HealthConfig::default());
@@ -221,6 +274,41 @@ impl AgentChatView {
             reason = h.reason.as_deref().unwrap_or(""),
             "health (restored)"
         );
+    }
+
+    /// Blank the transcript for a fresh conversation (`/clear`). The old one's
+    /// debts end with it: a fresh session never ran the turn a restart cut
+    /// off, and its first message is not held behind the old one's failure.
+    pub(super) fn clear_conversation(&mut self) {
+        self.thread.clear();
+        self.recovery_note = None;
+        self.health.forget_failed_turn();
+        self.meta_dirty.set(true);
+    }
+
+    /// The user removed the recovery note (the strip's [Remove]).
+    pub(super) fn remove_recovery_note(&mut self, cx: &mut Context<Self>) {
+        self.recovery_note = None;
+        self.meta_dirty.set(true);
+        self.sync_composer(cx);
+    }
+
+    /// The send written but not answered yet, as the blob keeps it: its id,
+    /// empty when it went untagged.
+    pub(super) fn unanswered_send(&self) -> Option<String> {
+        self.health.sent_unanswered.then(|| self.health.sent_id.clone().unwrap_or_default())
+    }
+
+    /// The composer's marked cards changed: keep only the unconfirmed sends
+    /// still held. Read from the composer now, not from the event: a restore
+    /// can mark a card after an earlier event was queued.
+    pub(super) fn sync_unconfirmed(&mut self, cx: &mut Context<Self>) {
+        let marked = self.composer.read(cx).unconfirmed_texts();
+        let before = self.health.unconfirmed_held.len();
+        self.health.unconfirmed_held.retain(|u| marked.contains(&u.text));
+        if self.health.unconfirmed_held.len() != before {
+            self.meta_dirty.set(true);
+        }
     }
 
     /// Whether work was running that a restart would cut short: a turn,
@@ -337,7 +425,7 @@ mod tests {
                 let registry = oximux_agents::session_registry::SessionRegistry::new();
                 let handle = registry.register("s".into(), Arc::new(StubConnection::default()));
                 view.thread.push_user_message("go");
-                view.health.note_sent(now_ms());
+                view.health.note_sent(now_ms(), None);
                 for (label, step) in [("sent", 0), ("continuation", 1), ("failed", 2)] {
                     match step {
                         1 => {
@@ -380,7 +468,7 @@ mod tests {
         let window = chat(cx, StubConnection::default());
         window
             .update(cx, |view, _window, cx| {
-                view.restore_health(true, cx);
+                view.restore_health(crate::shell::agent_chat::RestoredTurn { mid_turn: true, ..Default::default() }, cx);
                 let (status, liveness, _) = health_of(view);
                 assert_eq!(liveness, Liveness::RestoredUnconfirmed, "no lock proof in a test: no claim");
                 assert_ne!(status, HealthStatus::Failed);
@@ -390,10 +478,144 @@ mod tests {
             .expect("window update");
     }
 
+    /// A chat restored mid-turn tells the agent on the next message, once
+    /// (F6, root); Remove drops the note.
+    #[gpui::test]
+    async fn a_mid_turn_restore_attaches_a_recovery_note_to_the_next_message(cx: &mut TestAppContext) {
+        let stub = StubConnection::default();
+        let window = chat(cx, stub.clone());
+        let turn = || crate::shell::agent_chat::RestoredTurn {
+            mid_turn: true,
+            stopped_tasks: vec!["npm test".into()],
+            ..Default::default()
+        };
+        window
+            .update(cx, |view, _window, cx| {
+                view.restore_health(turn(), cx);
+                view.send_text("do it".into(), Vec::new(), cx);
+                view.thread.turn_active = false;
+                view.send_text("again".into(), Vec::new(), cx);
+                view.restore_health(turn(), cx);
+                view.remove_recovery_note(cx);
+            })
+            .expect("window update");
+        cx.run_until_parked();
+        let sent: Vec<String> = stub.sent().iter().map(|v| v.to_string()).collect();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("OxiMux restarted at") && sent[0].contains("npm test") && sent[0].contains("do it"));
+        assert!(!sent[1].contains("OxiMux restarted"), "once: {}", sent[1]);
+        window
+            .update(cx, |view, _window, _cx| assert!(view.recovery_note.is_none(), "Remove drops it"))
+            .expect("window update");
+    }
+
+    /// The composer's held and queued counts survive a restore, whichever
+    /// order its `QueueChanged` and the restore land in.
+    #[gpui::test]
+    async fn a_restore_keeps_the_composer_s_counts(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                (view.health.held, view.health.queued) = (3, 1);
+                view.restore_health(crate::shell::agent_chat::RestoredTurn::default(), cx);
+                assert_eq!((view.health.held, view.health.queued), (3, 1));
+            })
+            .expect("window update");
+    }
+
+    /// `/clear` ends the old conversation's debts: no recovery note on the new
+    /// session's first message, and its failed turn holds nothing.
+    #[gpui::test]
+    async fn a_cleared_chat_drops_the_recovery_note_and_the_failed_hold(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                let turn = crate::shell::agent_chat::RestoredTurn { mid_turn: true, ..Default::default() };
+                view.restore_health(turn, cx);
+                let failed = ThreadEvent::TurnEnded {
+                    result: Some("boom".into()),
+                    usage: None,
+                    is_error: true,
+                    turn_diff: None,
+                };
+                view.health.note_event(&failed, now_ms());
+                assert!(view.recovery_note.is_some() && view.health.holds_queue());
+                view.new_chat(cx);
+                assert!(view.recovery_note.is_none(), "no note for a fresh session");
+                assert!(!view.health.holds_queue(), "the old failure holds nothing");
+            })
+            .expect("window update");
+    }
+
+    /// A send nothing answered before the quit comes back held first, marked
+    /// "may already have been sent"; nothing resends it.
+    #[gpui::test]
+    async fn an_unanswered_send_comes_back_held_and_marked(cx: &mut TestAppContext) {
+        let stub = StubConnection::default();
+        let window = chat(cx, stub.clone());
+        window
+            .update(cx, |view, window, cx| {
+                view.thread.push_user_message_with_images("ship it".to_string(), Vec::new());
+                view.seed_draft_and_queue(None, vec!["then tests".into()], window, cx);
+                view.restore_health(
+                    crate::shell::agent_chat::RestoredTurn { unanswered_send: Some("u-1".into()), ..Default::default() },
+                    cx,
+                );
+                let held = view.composer.read(cx).held_for_test().to_vec();
+                assert_eq!(held.len(), 2);
+                assert!(held[0].text == "ship it" && held[0].maybe_sent);
+                assert!(!held[1].maybe_sent);
+                // The composer's queued events land after both (the test view
+                // has no composer subscription, so run its handler by hand):
+                // the plain card's event came first and must not clear the
+                // mark. Saved again before the user acts, it is still marked
+                // next time, and not also saved as a plain queued text.
+                view.sync_unconfirmed(cx);
+                view.sync_unconfirmed(cx);
+                let marked = crate::persisted_chat::UnconfirmedSend { id: "u-1".into(), text: "ship it".into() };
+                assert_eq!(view.health.unconfirmed_held, vec![marked]);
+                assert_eq!(view.queued_texts(cx), vec!["then tests"]);
+            })
+            .expect("window update");
+        assert!(stub.sent().is_empty(), "nothing resent");
+    }
+
+    /// A marked card keeps its own text across a later send and a second
+    /// restart, though the latest user entry is now that later message; a
+    /// dropped card is forgotten.
+    #[gpui::test]
+    async fn a_marked_card_keeps_its_text_across_a_later_send(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message_with_images("ship it".to_string(), Vec::new());
+                let turn = crate::shell::agent_chat::RestoredTurn { unanswered_send: Some("u-1".into()), ..Default::default() };
+                view.restore_health(turn, cx);
+                view.send_text("something else".into(), Vec::new(), cx);
+                view.health.note_event(&ThreadEvent::ProviderTurnStarted, now_ms());
+                // What the blob saves (`build_transcript` copies these).
+                assert_eq!(view.unanswered_send(), None, "the later send was answered");
+                let saved = view.health.unconfirmed_held.clone();
+                assert_eq!(saved.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), ["ship it"]);
+
+                let turn = crate::shell::agent_chat::RestoredTurn { unconfirmed_held: saved, ..Default::default() };
+                view.composer.update(cx, |c, cx| c.drop_all_held_for_test(cx));
+                view.restore_health(turn, cx);
+                let held = view.composer.read(cx).held_for_test().to_vec();
+                assert_eq!(held.len(), 1);
+                assert!(held[0].text == "ship it" && held[0].maybe_sent);
+                // Dropped: forgotten (the handler, run by hand as above).
+                view.composer.update(cx, |c, cx| c.drop_all_held_for_test(cx));
+                view.sync_unconfirmed(cx);
+                assert!(view.health.unconfirmed_held.is_empty(), "dropped, forgotten");
+            })
+            .expect("window update");
+    }
+
     #[test]
     fn a_frame_answers_a_send_and_confirms_a_restore() {
         let mut t = HealthTrack::restored(true, true);
-        t.note_sent(10);
+        t.note_sent(10, None);
         assert!(t.sent_unanswered);
         t.note_event(&ThreadEvent::UserMessageAccepted { uuid: "u".into() }, 20);
         assert_eq!(t.accepted_at, Some(20), "acceptance starts the not-started clock");

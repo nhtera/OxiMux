@@ -7,7 +7,13 @@ impl AgentChatView {
     /// Send the oldest message the composer parked while a turn streamed, if any.
     /// Driven off the natural turn-end edge in [`Self::on_event`]; since each
     /// completed turn releases exactly one, a lined-up batch drains in order.
+    ///
+    /// Never after a failed turn: the queue waits (chips read "Waiting · agent
+    /// failed") until the user sends, so a failing session is not fed the rest.
     pub(super) fn flush_next_queued(&mut self, cx: &mut Context<Self>) {
+        if self.health.holds_queue() {
+            return;
+        }
         match self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
             Some((text, images)) => self.send_text(text, images, cx),
             None => self.flush_send_gate(cx),

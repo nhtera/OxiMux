@@ -182,6 +182,31 @@ pub struct PersistedChatTranscript {
     /// so a restart cut it short. `false` for older blobs.
     #[serde(default)]
     pub mid_turn: bool,
+    /// What the background tasks running at save time were doing, for the
+    /// recovery note a mid-turn restore attaches to the next message.
+    #[serde(default)]
+    pub stopped_tasks: Vec<String>,
+    /// A recovery note the chat was restored with and has not sent yet, so a
+    /// second restart before the next message does not lose it.
+    #[serde(default)]
+    pub recovery_note: Option<String>,
+    /// A send written at save time that nothing had answered yet (its id,
+    /// empty when untagged): on restore its text comes back held, marked "may
+    /// already have been sent".
+    #[serde(default)]
+    pub unanswered_send: Option<String>,
+    /// Restored sends still held and marked "may already have been sent", each
+    /// with its own text: a later message may since be the latest user entry.
+    #[serde(default)]
+    pub unconfirmed_held: Vec<UnconfirmedSend>,
+}
+
+/// A held card marked "may already have been sent": its send's id (empty
+/// when untagged) and its text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnconfirmedSend {
+    pub id: String,
+    pub text: String,
 }
 
 /// A retry armed at save time. Deliberately the *decision* (when, why, how many
@@ -267,6 +292,10 @@ mod tests {
             claude_fast_mode: Some(true),
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -300,6 +329,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -336,6 +369,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -410,6 +447,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         }
     }
@@ -460,6 +501,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -499,6 +544,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

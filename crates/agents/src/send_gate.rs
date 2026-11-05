@@ -118,6 +118,10 @@ pub struct Holds {
     pub retry_armed: bool,
     /// A permission or question prompt waits for an answer.
     pub prompt_pending: bool,
+    /// The last turn failed and the user has not sent since: another agent's
+    /// messages and child events wait for them rather than feed a failing
+    /// session (a person's message still goes).
+    pub failed: bool,
     /// The running turn has produced something (a mid-turn line may go in).
     pub turn_started: bool,
     /// The agent takes mid-turn lines and reports them.
@@ -170,6 +174,7 @@ pub struct SendGate {
     disconnected: bool,
     retry_armed: bool,
     prompt_pending: bool,
+    failed: bool,
     stopped_by_user: bool,
     /// The CLI folds mid-turn sends and reports which it started (version
     /// gate, adapter, and the runtime self-check all passed).
@@ -285,6 +290,9 @@ impl SendGate {
         if self.retry_armed {
             return SendWait::Limited;
         }
+        if item.source.held_by_stop() && self.failed {
+            return SendWait::Busy;
+        }
         if self.turn_active {
             if item.mode == DeliveryMode::Steer && self.steer_supported && !self.turn_started {
                 return SendWait::Starting;
@@ -324,7 +332,7 @@ impl SendGate {
         if !self.open() {
             return None;
         }
-        self.queue.iter().position(|q| !q.source.held_by_stop() || !self.stopped())
+        self.queue.iter().position(|q| !q.source.held_by_stop() || !(self.stopped() || self.failed))
     }
 
     /// Put an item the owner took but could not send back at the front, as it
@@ -474,6 +482,7 @@ impl SendGate {
         self.disconnected = holds.disconnected;
         self.retry_armed = holds.retry_armed;
         self.prompt_pending = holds.prompt_pending;
+        self.failed = holds.failed;
         if self.ready() != was {
             self.wake_if_ready();
         }

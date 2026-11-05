@@ -30,6 +30,13 @@ use super::*;
 /// a limit that expired without them.
 const RESTORE_GRACE_MS: i64 = 5 * 60 * 1000;
 
+/// The reason a usage window gives: the one wait that is a limit resetting
+/// (an overload is a backoff), so the card's chip reads "Limited".
+pub(super) const WINDOW_REASON: &str = "Usage limit reached";
+
+/// What a retry sends when the failed turn had already started working.
+const CONTINUE_PROMPT: &str = "Please continue.";
+
 /// A retry the app has committed to, holding the timer that will fire it.
 ///
 /// Dropping this cancels the retry: the `Task` is aborted on drop, so Cancel,
@@ -84,7 +91,7 @@ impl ChatRetry {
 pub(super) fn reason_for(class: oximux_agents::retry::RetryClass) -> String {
     use oximux_agents::retry::RetryClass;
     match class {
-        RetryClass::Window { .. } => "Usage limit reached".into(),
+        RetryClass::Window { .. } => WINDOW_REASON.into(),
         RetryClass::Overload => "Provider overloaded".into(),
         // Never armed, so never rendered; kept total rather than `unreachable!`
         // so a future class cannot panic the transcript.
@@ -337,6 +344,16 @@ impl AgentChatView {
                 return;
             }
         }
+        // The failed turn had begun (the agent said or ran something): sending
+        // the prompt again would start the work over, so ask it to carry on.
+        // A new message, so it shows in the transcript; the attempt count
+        // survives it, since this is still the same turn's retry.
+        if self.turn_has_output() {
+            let attempt = self.retry.attempt;
+            self.send_text(CONTINUE_PROMPT.into(), Vec::new(), cx);
+            self.retry.attempt = attempt;
+            return;
+        }
         let last_user_idx = self
             .thread
             .entries
@@ -348,22 +365,20 @@ impl AgentChatView {
         });
         match last_user {
             Some((idx, text, images)) => {
-                let sent = match &self.connection {
-                    Some(conn) => match conn.send_user_message_with_images(&text, &images) {
+                // Through the one write path, so a retry goes out tagged (its
+                // receipt settles it) and carries an owed recovery note.
+                let sent = self.connection.is_some()
+                    && match self.write_prompt(&text, &images) {
                         Ok(()) => {
                             self.thread.last_error = None;
                             self.thread.turn_active = true;
-                            self.health.note_sent(oximux_agents::session_health::now_ms());
-                            self.publish_health();
                             true
                         }
                         Err(e) => {
                             self.thread.last_error = Some(format!("Send failed: {e}"));
                             false
                         }
-                    },
-                    None => false,
-                };
+                    };
                 // Re-anchor the pre-turn checkpoint to the retried turn (as a
                 // fresh send would), so the "restore files" rewind affordance
                 // keeps tracking repo changes for it.
@@ -464,6 +479,71 @@ mod tests {
 
     /// The point of persisting a retry at all: a five-hour window outlives the
     /// app session that hit it, so the held turn must come back armed.
+    fn users(view: &AgentChatView) -> Vec<String> {
+        view.thread
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A turn that failed after the agent started working is retried with
+    /// "Please continue.", never the prompt again (B5); the attempt count
+    /// carries on.
+    #[gpui::test]
+    async fn a_turn_that_had_started_is_retried_with_please_continue(cx: &mut TestAppContext) {
+        with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            view.send_text("build it".into(), Vec::new(), cx);
+            view.thread.apply(&oximux_agents::thread::ThreadEvent::AssistantText("on it".into()));
+            view.thread.turn_active = false;
+            view.retry.attempt = 2;
+            view.retry_last_turn(cx);
+            assert_eq!(users(view), vec!["build it", CONTINUE_PROMPT]);
+            assert_eq!(view.retry.attempt, 2);
+        })
+        .await;
+    }
+
+    /// A turn that failed before the agent produced anything is sent again
+    /// as it was, with no new message.
+    #[gpui::test]
+    async fn a_turn_that_never_started_is_resent_verbatim(cx: &mut TestAppContext) {
+        with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            view.send_text("build it".into(), Vec::new(), cx);
+            view.thread.turn_active = false;
+            view.retry_last_turn(cx);
+            assert_eq!(users(view), vec!["build it"]);
+            assert!(view.thread.turn_active, "the prompt went out again");
+        })
+        .await;
+    }
+
+    /// A limit refuses the prompt with an assistant line carrying the error's
+    /// text: the provider's words, not the agent's, so the prompt is resent
+    /// as it was rather than asking the agent to continue.
+    #[gpui::test]
+    async fn a_prompt_the_provider_refused_is_resent_verbatim(cx: &mut TestAppContext) {
+        use oximux_agents::thread::ThreadEvent;
+        with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            let refused = "You've hit your usage limit · resets 3pm";
+            view.send_text("build it".into(), Vec::new(), cx);
+            view.thread.apply(&ThreadEvent::AssistantText(refused.into()));
+            view.thread.apply(&ThreadEvent::TurnEnded {
+                result: Some(refused.into()),
+                usage: None,
+                is_error: true,
+                turn_diff: None,
+            });
+            assert!(!view.turn_has_output());
+            view.retry_last_turn(cx);
+            assert_eq!(users(view), vec!["build it"]);
+        })
+        .await;
+    }
+
     #[gpui::test]
     async fn a_retry_whose_reset_is_still_ahead_comes_back_armed(cx: &mut TestAppContext) {
         with_view(cx, AgentRetrySettings::shipped(), |view, cx| {

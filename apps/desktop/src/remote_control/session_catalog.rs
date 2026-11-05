@@ -438,6 +438,10 @@ mod tests {
             claude_fast_mode: None,
             pending_retry: None,
             mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
             choices,
         }
     }

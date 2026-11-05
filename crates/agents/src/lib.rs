@@ -19,6 +19,7 @@ pub mod outbox;
 pub mod osc_sideband;
 pub mod poll_helpers;
 pub mod program_status;
+pub mod recovery_note;
 pub mod registry;
 pub mod retry;
 pub mod runtime;

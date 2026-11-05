@@ -71,6 +71,13 @@ impl AgentChatView {
                     }
                 }
                 ComposerEvent::SteerNow { text } => this.steer_text(text.clone(), cx),
+                ComposerEvent::SendParked { text, images } => this.send_text(text.clone(), images.clone(), cx),
+                ComposerEvent::RemoveRecoveryNote => this.remove_recovery_note(cx),
+                ComposerEvent::QueueChanged { held, queued } => {
+                    (this.health.held, this.health.queued) = (*held, *queued);
+                    this.sync_unconfirmed(cx);
+                    this.publish_health();
+                }
                 ComposerEvent::Stop => this.stop_turn(cx),
                 ComposerEvent::ModelPicked(model) => this.change_model(model.clone(), cx),
                 ComposerEvent::PermissionModePicked(mode) => {
@@ -351,6 +358,7 @@ impl AgentChatView {
             send_gate,
             pending_send_uuid: None,
             health: Default::default(),
+            recovery_note: None,
             remote,
             backend,
             composer,
@@ -538,8 +546,13 @@ impl AgentChatView {
             .iter()
             .any(|e| matches!(e, ThreadEntry::Assistant(m) if !m.thinking.is_empty()))
             .then(|| self.thinking_level.wire().to_string());
+        // A failed turn holds the queue until the user acts (see `flush_next_queued`).
+        let queue_note = (!turn_active && self.health.holds_queue()).then_some("Waiting · agent failed");
+        let recovery_note = self.recovery_note.is_some();
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
+            c.set_queue_note(queue_note, cx);
+            c.set_recovery_note(recovery_note, cx);
             c.set_can_steer(caps.supports_steer, cx);
             c.set_usage_meter(meter_used, meter_window, meter_cost, cx);
             c.set_slash_commands(slash_commands, slash_descriptions, slash_hints, cx);

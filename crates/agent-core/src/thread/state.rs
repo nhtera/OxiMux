@@ -597,6 +597,18 @@ impl ChatThread {
                 // successful turn — so it can't survive to a later error turn.
                 let diagnostic = self.pending_diagnostic.take();
                 if *is_error {
+                    // A refused request (a usage limit, a bad model) comes as an
+                    // assistant message carrying the error's text, then this
+                    // result. That message is the provider's, not the agent's:
+                    // fold it to a notice, so nothing reads the turn as started
+                    // (a retry would ask the agent to "continue" a prompt it
+                    // never saw).
+                    if let Some(text) = result.as_deref()
+                        && let Some(last) = self.entries.last_mut()
+                        && matches!(last, ThreadEntry::Assistant(m) if m.thinking.is_empty() && m.text == text)
+                    {
+                        *last = ThreadEntry::ContextCompaction { summary: text.to_string() };
+                    }
                     let mut msg = result.clone().unwrap_or_else(|| "turn ended with error".into());
                     // The diagnostic arrived already de-duped against this text,
                     // so append it as extra detail when it adds something.
@@ -2171,6 +2183,28 @@ mod tests {
             usage: Some(TurnUsage { cost_usd: None, ..Default::default() }),
         });
         assert!((t.session_cost_usd - 0.35).abs() < 1e-9, "None cost is a no-op");
+    }
+
+    #[test]
+    fn a_refused_request_s_echo_is_a_notice_not_the_agent_speaking() {
+        let refused = "You've hit your usage limit · resets 3pm";
+        let mut t = ChatThread::new();
+        t.push_user_message("go");
+        t.apply(&ThreadEvent::AssistantText(refused.into()));
+        t.apply(&ThreadEvent::TurnEnded { result: Some(refused.into()), usage: None, is_error: true, turn_diff: None });
+        assert_eq!(t.entries.last(), Some(&ThreadEntry::ContextCompaction { summary: refused.into() }));
+        assert_eq!(t.last_error.as_deref(), Some(refused));
+
+        // The agent's own reply stays a reply: on a successful turn, and when
+        // an error ends a turn with different text.
+        t.push_user_message("again");
+        t.apply(&ThreadEvent::AssistantText("Done.".into()));
+        t.apply(&ThreadEvent::TurnEnded { result: Some("Done.".into()), usage: None, is_error: false, turn_diff: None });
+        assert!(matches!(t.entries.last(), Some(ThreadEntry::Assistant(_))));
+        t.push_user_message("more");
+        t.apply(&ThreadEvent::AssistantText("Working on it".into()));
+        t.apply(&ThreadEvent::TurnEnded { result: Some("API Error: 500".into()), usage: None, is_error: true, turn_diff: None });
+        assert!(matches!(t.entries.last(), Some(ThreadEntry::Assistant(_))));
     }
 
     #[test]

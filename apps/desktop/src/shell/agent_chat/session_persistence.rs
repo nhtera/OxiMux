@@ -20,11 +20,11 @@
 
 use std::collections::HashMap;
 
-use gpui::Context;
+use gpui::{App, Context, Window};
 use oximux_agents::thread::pi::posture::{self as pi_posture, PiPosture};
 use oximux_agents::thread::FeatureValue;
 
-use super::AgentChatView;
+use super::{AgentChatView, HeldMessage};
 use crate::persisted_chat::{PersistedChatTranscript, PersistedChoices};
 
 /// How a chat view comes to life. Decided once per constructor and mapped
@@ -52,6 +52,21 @@ pub(super) enum ConnectMode {
 /// One field per backend that has a posture — mirroring `ConnectSpec`'s
 /// one-launch-field-per-transport convention. Carried as a struct so adding a
 /// backend doesn't grow the arity of the construction chain it threads through.
+/// What a restart cut short in a restored chat (from its blob).
+#[derive(Debug, Clone, Default)]
+pub struct RestoredTurn {
+    /// A turn, a continuation or background work was running at save time.
+    pub mid_turn: bool,
+    /// What those background tasks were doing.
+    pub stopped_tasks: Vec<String>,
+    /// A recovery note restored earlier and not yet sent.
+    pub recovery_note: Option<String>,
+    /// A send nothing had answered at save time (see the blob field).
+    pub unanswered_send: Option<String>,
+    /// Restored sends still held and marked at save time.
+    pub unconfirmed_held: Vec<crate::persisted_chat::UnconfirmedSend>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RestoredPosture {
     /// Codex `(approval_policy, sandbox)`.
@@ -237,6 +252,10 @@ impl AgentChatView {
             // at its reset even across a quit. `None` whenever nothing is armed.
             pending_retry: self.retry.persisted(),
             mid_turn: self.mid_turn(),
+            stopped_tasks: self.running_task_descriptions(),
+            recovery_note: self.recovery_note.clone(),
+            unanswered_send: self.unanswered_send(),
+            unconfirmed_held: self.health.unconfirmed_held.clone(),
             choices: PersistedChoices {
                 models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
                 modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),
@@ -245,6 +264,50 @@ impl AgentChatView {
             },
         }
     }
+
+    /// The unsent composer draft text, for the layout snapshot (so a typed but
+    /// unsent message survives a tab close / app quit).
+    pub fn draft_text(&self, cx: &App) -> String {
+        self.composer.read(cx).current_draft(cx)
+    }
+
+    /// The text of each queued-but-unsent message (oldest first), for the layout
+    /// snapshot. Text-only — staged images/context aren't persisted.
+    pub fn queued_texts(&self, cx: &App) -> Vec<String> {
+        self.composer.read(cx).queued_texts()
+    }
+
+    /// What the running background tasks are doing, for the recovery note a
+    /// restart mid-turn owes the agent.
+    fn running_task_descriptions(&self) -> Vec<String> {
+        self.thread
+            .background_tasks
+            .iter()
+            .filter(|t| t.status == oximux_agents::thread::TaskStatus::Running)
+            .map(|t| t.description.clone())
+            .collect()
+    }
+
+    /// Seed a restored draft + queued messages into the composer after
+    /// construction. The draft seed is no-clobber-guarded; queued messages come
+    /// back HELD (a restored app must not fire billed sends without a user action).
+    pub fn seed_draft_and_queue(
+        &mut self,
+        draft: Option<String>,
+        queued: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |c, cx| {
+            if let Some(text) = draft {
+                c.seed_draft(text, window, cx);
+            }
+            if !queued.is_empty() {
+                c.seed_held(queued.into_iter().map(|text| HeldMessage { text, maybe_sent: false }).collect(), cx);
+            }
+        });
+    }
+
 }
 
 #[cfg(test)]
