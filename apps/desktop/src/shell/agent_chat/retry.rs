@@ -11,7 +11,10 @@
 //! disagree about exactly the edge cases that are hard to test.
 
 use gpui::Task;
+use oximux_agents::retry::driver::{Next, decide};
+use oximux_agents::retry::store::Resolution;
 use oximux_agents::retry::{RetrySettings as AgentRetryPolicy, classify_failure};
+use oximux_agents::send_receipts::ReceiptState;
 use oximux_settings::agent_retry::AgentRetrySettings;
 
 use crate::persisted_chat::PersistedRetry;
@@ -33,6 +36,16 @@ const RESTORE_GRACE_MS: i64 = 5 * 60 * 1000;
 /// The reason a usage window gives: the one wait that is a limit resetting
 /// (an overload is a backoff), so the card's chip reads "Limited".
 pub(super) const WINDOW_REASON: &str = "Usage limit reached";
+
+/// Why no automatic retry was armed for a retryable failure: the attempts ran
+/// out, or (before any) the wait is longer than the user allows.
+fn exhausted_note(class: oximux_agents::retry::RetryClass, attempts: u32) -> &'static str {
+    match (attempts, class) {
+        (0, _) => " (the wait is longer than your automatic-retry limit)",
+        (_, oximux_agents::retry::RetryClass::Window { .. }) => " (rate limit retries exhausted)",
+        _ => " (automatic retries exhausted)",
+    }
+}
 
 /// What a retry sends when the failed turn had already started working.
 const CONTINUE_PROMPT: &str = "Please continue.";
@@ -61,6 +74,9 @@ pub(super) struct ChatRetry {
     pub attempt: u32,
     /// The armed retry, if any.
     pub pending: Option<PendingRetry>,
+    /// The failed turn the attempts count against (its send's receipt key),
+    /// set at the first arm and kept across the turn's retries.
+    pub turn_key: Option<String>,
 }
 
 impl ChatRetry {
@@ -68,6 +84,7 @@ impl ChatRetry {
     /// takes over — a new send, or an explicit Cancel.
     pub fn clear(&mut self) {
         self.pending = None;
+        self.turn_key = None;
         self.attempt = 0;
     }
 
@@ -113,6 +130,17 @@ impl AgentChatView {
         if self.interrupted || self.disconnected {
             return;
         }
+        let class = classify_failure(
+            self.thread.last_rate_limit.as_ref(),
+            self.thread.last_turn_failure.clone(),
+        );
+        // A send the provider refused before the agent produced anything is
+        // safe to resend verbatim; say so in its receipt.
+        if super::receipt_link::refused(class, self.turn_has_output())
+            && let Some(id) = self.health.sent_id()
+        {
+            self.record_receipt(&id, Some(ReceiptState::Rejected), cx);
+        }
         let settings = cx
             .try_global::<AgentRetrySettings>()
             .copied()
@@ -120,10 +148,6 @@ impl AgentChatView {
         if !settings.enabled {
             return;
         }
-        let class = classify_failure(
-            self.thread.last_rate_limit.as_ref(),
-            self.thread.last_turn_failure.clone(),
-        );
         let now_ms = chrono::Utc::now().timestamp_millis();
         let policy =
             AgentRetryPolicy { max_automatic_wait: settings.max_automatic_wait.duration() };
@@ -136,11 +160,33 @@ impl AgentChatView {
         std::hash::Hash::hash(&self.remote_session_id, &mut hasher);
         std::hash::Hash::hash(&now_ms, &mut hasher);
         let seed = std::hash::Hasher::finish(&hasher);
-        let Some(wake_at_ms) =
-            oximux_agents::retry::schedule(class, self.retry.attempt, now_ms, &policy, seed)
-        else {
+        // The attempts count against the failed turn, durably: the host's
+        // record wins over this view's when it has seen more (a restart).
+        if !class.is_retryable() {
+            // A retried turn that now fails for good: its retry is over.
+            if self.retry.turn_key.take().is_some() {
+                self.record_retry_resolved(Resolution::Cancelled, cx);
+            }
             return;
+        }
+        let turn_key = match &self.retry.turn_key {
+            Some(key) => key.clone(),
+            None => self.retry_turn_key(),
         };
+        self.retry.attempt = self.retry.attempt.max(self.durable_attempts(&turn_key, cx));
+        self.retry.turn_key = Some(turn_key.clone());
+        let wake_at_ms = match decide(class, self.retry.attempt, now_ms, &policy, seed) {
+            Next::Arm { wake_at_ms, .. } => wake_at_ms,
+            Next::Exhausted => {
+                self.record_retry_resolved(Resolution::Exhausted, cx);
+                if let Some(err) = self.thread.last_error.as_mut() {
+                    err.push_str(exhausted_note(class, self.retry.attempt));
+                }
+                return;
+            }
+            Next::Never => return,
+        };
+        self.record_retry_armed(turn_key, class, reason_for(class), wake_at_ms, cx);
         // Clearing the error text is what swaps the error card for the queued
         // card: the transcript renders whichever is set.
         self.thread.last_error = None;
@@ -184,6 +230,9 @@ impl AgentChatView {
                 // the user cancels costs nothing.
                 view.retry.pending = None;
                 view.retry.attempt += 1;
+                if let Some(key) = view.retry.turn_key.clone() {
+                    view.record_retry_fired(key, cx);
+                }
                 view.mark_retry_dirty();
                 view.retry_last_turn(cx);
             });
@@ -224,21 +273,28 @@ impl AgentChatView {
             .try_global::<AgentRetrySettings>()
             .copied()
             .unwrap_or_else(AgentRetrySettings::shipped);
-        if !settings.enabled {
-            return;
-        }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let remaining = saved.wake_at_ms - now_ms;
-        if remaining < -RESTORE_GRACE_MS {
-            return;
-        }
         // `None` is "No limit" — nothing to exceed.
-        if let Some(max) = settings.max_automatic_wait.duration()
-            && remaining > max.as_millis() as i64
-        {
+        let too_long = settings.max_automatic_wait.duration().is_some_and(|max| remaining > max.as_millis() as i64);
+        if !settings.enabled || remaining < -RESTORE_GRACE_MS || too_long {
+            // Refused: the host's record of it is over too.
+            self.record_retry_resolved(Resolution::Cancelled, cx);
             return;
         }
+        // The host's record is the durable count; the blob's may be older.
         self.retry.attempt = saved.attempt;
+        if let Some((key, attempts)) = self.durable_live_retry(cx) {
+            self.retry.attempt = self.retry.attempt.max(attempts);
+            self.retry.turn_key = Some(key);
+        }
+        // Every attempt is spent (the count committed, the blob's timer did
+        // not clear before the quit): firing it would be one past the cap.
+        if self.retry.attempt >= oximux_agents::retry::MAX_ATTEMPTS {
+            self.record_retry_resolved(Resolution::Exhausted, cx);
+            self.retry.clear();
+            return;
+        }
         // The blob is the on-disk state until something changes, and a restored
         // retry is not a change — `hold_turn_until` marks the chat dirty, so
         // clear that again below to keep a restored-but-untouched chat clean.
@@ -247,12 +303,32 @@ impl AgentChatView {
         self.meta_dirty.set(was_dirty);
     }
 
+    /// The user sent something new: any retry of an earlier turn is over.
+    pub(super) fn clear_retry_for_new_send(&mut self, cx: &mut Context<Self>) {
+        if self.retry.turn_key.is_some() {
+            self.record_retry_resolved(Resolution::Superseded, cx);
+        }
+        self.retry.clear();
+    }
+
+    /// A turn ended well: a retry that got it there succeeded, and the next
+    /// failure counts from zero.
+    pub(super) fn retry_succeeded(&mut self, cx: &mut Context<Self>) {
+        if self.retry.turn_key.is_some() && !self.retry.is_armed() {
+            self.record_retry_resolved(Resolution::Succeeded, cx);
+            self.retry.clear();
+        }
+    }
+
     /// Fire an armed retry immediately (the card's "Send now").
     pub(super) fn send_retry_now(&mut self, cx: &mut Context<Self>) {
         if self.retry.pending.take().is_none() {
             return;
         }
         self.retry.attempt += 1;
+        if let Some(key) = self.retry.turn_key.clone() {
+            self.record_retry_fired(key, cx);
+        }
         self.mark_retry_dirty();
         self.retry_last_turn(cx);
     }
@@ -265,6 +341,8 @@ impl AgentChatView {
         let Some(pending) = self.retry.pending.take() else { return };
         self.thread.last_error = Some(format!("{} — retry cancelled.", pending.reason));
         self.retry.attempt = 0;
+        self.retry.turn_key = None;
+        self.record_retry_resolved(Resolution::Cancelled, cx);
         self.mark_retry_dirty();
         self.publish_health();
         cx.notify();
@@ -349,9 +427,9 @@ impl AgentChatView {
         // A new message, so it shows in the transcript; the attempt count
         // survives it, since this is still the same turn's retry.
         if self.turn_has_output() {
-            let attempt = self.retry.attempt;
+            let (attempt, key) = (self.retry.attempt, self.retry.turn_key.take());
             self.send_text(CONTINUE_PROMPT.into(), Vec::new(), cx);
-            self.retry.attempt = attempt;
+            (self.retry.attempt, self.retry.turn_key) = (attempt, key);
             return;
         }
         let last_user_idx = self
@@ -368,7 +446,7 @@ impl AgentChatView {
                 // Through the one write path, so a retry goes out tagged (its
                 // receipt settles it) and carries an owed recovery note.
                 let sent = self.connection.is_some()
-                    && match self.write_prompt(&text, &images) {
+                    && match self.write_prompt(&text, &images, cx) {
                         Ok(()) => {
                             self.thread.last_error = None;
                             self.thread.turn_active = true;
@@ -554,6 +632,17 @@ mod tests {
             // relaunched between attempts exceed the cap without ever showing a
             // fifth attempt in any single session.
             assert_eq!(view.retry.attempt, 2, "attempts spent must survive the restart");
+        })
+        .await;
+    }
+
+    /// A blob still holding a timer whose four attempts are already spent does
+    /// not fire a fifth.
+    #[gpui::test]
+    async fn a_restored_retry_with_every_attempt_spent_is_not_armed(cx: &mut TestAppContext) {
+        with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            view.restore_pending_retry(saved(60_000, oximux_agents::retry::MAX_ATTEMPTS), cx);
+            assert!(!view.retry.is_armed(), "one past the cap");
         })
         .await;
     }

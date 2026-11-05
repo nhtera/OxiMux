@@ -42,6 +42,9 @@ pub const EVENT_DEBOUNCE: Duration = Duration::from_secs(2);
 /// How often the host re-derives every session's health (the stall clock).
 pub const HEALTH_TICK: Duration = Duration::from_secs(30);
 
+/// Health ticks between prunes of the receipt and retry tables (an hour).
+const PRUNE_EVERY_TICKS: u32 = 120;
+
 /// Who held the data directory before this host won its lock.
 ///
 /// Winning the lock proves the previous holder is gone (the OS released its
@@ -155,6 +158,14 @@ impl HostCore {
         if let Err(err) = self.outbox.take_over(&self.instance) {
             tracing::warn!(%err, "outbox take-over failed");
         }
+        // Sends the previous owner wrote and never saw settled may or may not
+        // have reached their agents: never resent on their own.
+        match self.lineage.receipts().take_over(&self.instance, chrono::Local::now()) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(n, "send receipts left pending by the previous host marked unknown"),
+            Err(err) => tracing::warn!(%err, "send receipt take-over failed"),
+        }
+        self.prune_stores();
         tracing::info!(?prior, "host started");
         *slot = Some(prior);
         drop(slot);
@@ -346,6 +357,7 @@ impl HostCore {
         let weak = Arc::downgrade(self);
         self.rt.spawn(async move {
             let mut last = (std::time::Instant::now(), oximux_agents::session_health::now_ms());
+            let mut ticks: u32 = 0;
             loop {
                 tokio::time::sleep(HEALTH_TICK).await;
                 let Some(core) = weak.upgrade() else { return };
@@ -357,8 +369,25 @@ impl HostCore {
                 );
                 last = tick;
                 core.refresh_health(tick.1, woke);
+                // The day-old receipts and retries go once an hour, while this
+                // host owns the data directory.
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(PRUNE_EVERY_TICKS) && core.is_owner() {
+                    core.prune_stores();
+                }
             }
         });
+    }
+
+    /// Drop receipts older than a week and resolved retries older than a day.
+    fn prune_stores(&self) {
+        let now = chrono::Local::now();
+        if let Err(err) = self.lineage.receipts().prune(now) {
+            tracing::warn!(%err, "send receipt prune failed");
+        }
+        if let Err(err) = self.lineage.retries().prune(now) {
+            tracing::warn!(%err, "retry prune failed");
+        }
     }
 
     /// Re-derive every live session's health at `now`, folding in its working

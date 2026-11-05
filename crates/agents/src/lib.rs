@@ -25,6 +25,7 @@ pub mod retry;
 pub mod runtime;
 pub mod schedule;
 pub mod send_gate;
+pub mod send_receipts;
 pub mod session_health;
 pub mod session_registry;
 pub mod runtime_impl;

@@ -61,6 +61,7 @@ mod send_gate_link;
 mod sign_in;
 mod message_rail;
 mod pending_edit;
+mod receipt_link;
 mod retry;
 mod retry_card;
 mod plan_approval_card;
@@ -1315,16 +1316,6 @@ impl AgentChatView {
             .map(|b| (b.preset_id.as_str(), b.session_id.as_str()))
     }
 
-    /// The current view mode (chat vs. companion terminal).
-    pub fn view_mode(&self) -> ChatViewMode {
-        self.view_mode
-    }
-
-    /// Whether a companion terminal has already been spawned for this chat.
-    pub fn has_companion_terminal(&self) -> bool {
-        self.terminal.is_some()
-    }
-
     /// The companion terminal's daemon session id, so the host can reap it when
     /// the tab closes. `None` when no companion was ever spawned.
     pub fn companion_session_id(&self) -> Option<AgentSessionId> {
@@ -1917,7 +1908,7 @@ impl AgentChatView {
         // The user is driving again: drop any armed retry and reset the attempt
         // count. The cap is per turn, so a conversation that hits a limit once
         // an hour must not eventually lock itself out.
-        self.retry.clear();
+        self.clear_retry_for_new_send(cx);
         // `/clear` is a UI command (blank the transcript + free context), not
         // agent input — reset in place rather than transmitting the literal text
         // to the subprocess (matching the CLI's own TUI). `/compact` stays a
@@ -1999,7 +1990,7 @@ impl AgentChatView {
             self.spawn_title_generation(text.clone(), cx);
         }
         if self.connection.is_some() {
-            match self.write_prompt(&text, &images) {
+            match self.write_prompt(&text, &images, cx) {
                 // Tee the prompt to remote subscribers only. No backend echoes the
                 // user's own message, so without this a phone renders replies to
                 // prompts it never showed. It is NOT applied to `self.thread` —

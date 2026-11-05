@@ -55,6 +55,9 @@ impl AgentChatView {
         if let Some(rc) = cx.try_global::<RemoteControl>() {
             rc.rekey_session(&previous, &self.remote_session_id);
         }
+        // Receipt and retry writes still queued under the placeholder land
+        // after the rekey above: move them once they have.
+        self.rekey_host_records(previous, self.remote_session_id.clone(), cx);
     }
 
     /// (Re)bind this session into the remote-control registry under

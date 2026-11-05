@@ -182,6 +182,10 @@ impl AgentChatView {
             _ => stand_in = gate.unreported_accepted().map(|u| ThreadEvent::UserMessageAccepted { uuid: u.to_string() }),
         }
         drop(gate);
+        self.settle_receipts(event, cx);
+        if let Some(receipt) = &stand_in {
+            self.settle_receipts(receipt, cx);
+        }
         if let (Some(receipt), Some(binding)) = (stand_in, &self.remote) {
             binding.ingest(receipt);
         }
@@ -368,7 +372,7 @@ impl AgentChatView {
     ///
     /// A recovery note a restart left owed goes ahead of the text, once; it is
     /// kept for the next write if this one fails.
-    pub(super) fn write_prompt(&mut self, text: &str, images: &[ChatImage]) -> anyhow::Result<()> {
+    pub(super) fn write_prompt(&mut self, text: &str, images: &[ChatImage], cx: &mut Context<Self>) -> anyhow::Result<()> {
         // Checked first, so a missing agent takes neither the note nor held events.
         if self.connection.is_none() {
             anyhow::bail!("no agent to send to");
@@ -408,6 +412,7 @@ impl AgentChatView {
             }
             None => (text.to_string(), self.pending_send_uuid.take().unwrap_or_else(Uuid::new_v4)),
         };
+        self.record_receipt(&uuid.to_string(), None, cx);
         let conn = self.connection.as_ref().expect("checked above");
         let sent = conn.send_user_message_tagged(&line, images, &uuid.to_string());
         let mut gate = self.send_gate.lock().unwrap();

@@ -27,6 +27,8 @@
 //! a database, matching `schedule::recurrence`.
 
 pub mod classify;
+pub mod driver;
+pub mod store;
 
 pub use classify::{RetryClass, classify_failure};
 
