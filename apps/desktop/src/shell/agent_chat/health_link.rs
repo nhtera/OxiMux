@@ -45,6 +45,8 @@ pub(super) struct HealthTrack {
     /// The composer's queue: restored messages held, and messages waiting to drain.
     pub(super) held: u32,
     pub(super) queued: u32,
+    /// A permission or question was open at the last publish.
+    prompt_open: bool,
 }
 
 impl HealthTrack {
@@ -97,6 +99,14 @@ impl HealthTrack {
         self.last_activity_at = now;
         self.exit = None;
         self.failed_turn = None;
+    }
+
+    /// Waiting on a person is not silence: an answer, while the process
+    /// lives, is the last sign of life (the stall clock restarts there).
+    pub(super) fn note_prompt(&mut self, open: bool, now: i64) {
+        if std::mem::replace(&mut self.prompt_open, open) && !open && self.exit.is_none() {
+            self.last_activity_at = self.last_activity_at.max(now);
+        }
     }
 
     /// The process ended. Returns the proof recorded.
@@ -185,6 +195,8 @@ impl AgentChatView {
     /// closes a continuation: only a result, a Stop or exit, or a respawn
     /// does; a quiet one reads stalled.
     pub(super) fn publish_health(&mut self) {
+        let prompt_open = self.thread.pending_permission().is_some() || self.thread.pending_question().is_some();
+        self.health.note_prompt(prompt_open, now_ms());
         if let Some(binding) = &self.remote {
             binding.publish_health(self.health_inputs());
         }
@@ -638,6 +650,21 @@ mod tests {
         t.note_event(&ThreadEvent::ProviderTurnStarted, 30);
         assert!(!t.sent_unanswered && t.accepted_at.is_none() && t.restored.is_none());
         assert_eq!(t.last_activity_at, 30);
+    }
+
+    #[test]
+    fn an_answered_prompt_is_a_sign_of_life() {
+        let mut t = HealthTrack::default();
+        t.note_event(&ThreadEvent::ProviderTurnStarted, 10);
+        t.note_prompt(true, 20);
+        assert_eq!(t.last_activity_at, 10, "asking is not activity");
+        t.note_prompt(false, 900);
+        assert_eq!(t.last_activity_at, 900);
+        // A prompt that ends with the process is no sign of life.
+        t.note_prompt(true, 1000);
+        t.note_exit(false, Some(137));
+        t.note_prompt(false, 2000);
+        assert_eq!(t.last_activity_at, 900);
     }
 
     #[test]

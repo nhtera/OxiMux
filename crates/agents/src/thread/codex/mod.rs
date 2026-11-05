@@ -61,12 +61,17 @@ fn select_opt(wire: &str, label: &str, description: &str) -> FeatureSelectOption
 }
 
 /// Commands the sync `AgentConnection` methods push to the worker thread.
+#[derive(Debug)]
 enum Outbound {
     Prompt(String),
     /// Kick off a ChatGPT browser sign-in (`account/login/start`) on the worker
     /// so the calling UI thread never blocks on the RPC; the worker emits the
     /// resulting `AuthUrl` (or an `Error`) for the app to open.
     StartLogin,
+    /// An event the host decides rather than codex reports (an answered MCP
+    /// elicitation). It goes out through the worker so the worker and the
+    /// mapper stay the only senders: the stream closes when codex dies.
+    Emit(ThreadEvent),
     Shutdown,
 }
 
@@ -141,9 +146,6 @@ struct CodexState {
 
 pub struct CodexAppServerConnection {
     outbound: Sender<Outbound>,
-    /// The connection's own line into the event stream, for what the host
-    /// decides rather than codex reports (an answered MCP elicitation).
-    events: Sender<ThreadEvent>,
     rpc: RpcClient,
     state: Arc<Mutex<CodexState>>,
     child: Arc<Mutex<Child>>,
@@ -173,26 +175,40 @@ impl CodexAppServerConnection {
         mcp_servers: &[oximux_agent_core::thread::mcp_server_spec::McpServerSpec],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (rpc, inbound_rx, child) = RpcClient::spawn(cwd, env)?;
-        let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
-        let events = event_tx.clone();
-        let (out_tx, out_rx) = mpsc::channel::<Outbound>();
-        let state = Arc::new(Mutex::new(CodexState::default()));
         // Seed the current model/effort + posture so the first turn — and the
         // picker labels — reflect the tab's choice. A restored posture overrides
         // the default; a fresh session starts at on-request/workspace-write.
-        if let Ok(mut s) = state.lock() {
-            s.mcp_config = oximux_agent_core::thread::mcp_server_spec::to_codex_mcp_config(mcp_servers);
-            s.current_model = model.map(str::to_string);
-            s.current_effort = effort.map(str::to_string);
-            s.cwd = cwd.to_path_buf();
-            s.approval_policy = posture
+        let state = CodexState {
+            mcp_config: oximux_agent_core::thread::mcp_server_spec::to_codex_mcp_config(mcp_servers),
+            current_model: model.map(str::to_string),
+            current_effort: effort.map(str::to_string),
+            cwd: cwd.to_path_buf(),
+            approval_policy: posture
                 .and_then(|(a, _)| (!a.is_empty()).then(|| a.to_string()))
-                .unwrap_or_else(|| protocol::DEFAULT_APPROVAL_POLICY.to_string());
-            s.sandbox = posture
+                .unwrap_or_else(|| protocol::DEFAULT_APPROVAL_POLICY.to_string()),
+            sandbox: posture
                 .and_then(|(_, sb)| (!sb.is_empty()).then(|| sb.to_string()))
-                .unwrap_or_else(|| protocol::DEFAULT_SANDBOX.to_string());
-        }
+                .unwrap_or_else(|| protocol::DEFAULT_SANDBOX.to_string()),
+            ..Default::default()
+        };
+        Ok(Self::start(rpc, inbound_rx, child, state, resume_session_id))
+    }
 
+    /// Run the mapper and the worker over a spawned app-server. They hold the
+    /// only event senders, so the stream closes (and the chat sees the exit)
+    /// once codex is gone.
+    fn start(
+        rpc: RpcClient,
+        inbound_rx: Receiver<Inbound>,
+        child: Child,
+        state: CodexState,
+        resume_session_id: Option<&str>,
+    ) -> (Self, Receiver<ThreadEvent>) {
+        let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
+        let (out_tx, out_rx) = mpsc::channel::<Outbound>();
+        let cwd = state.cwd.clone();
+        let model = state.current_model.clone();
+        let state = Arc::new(Mutex::new(state));
         let mapper = {
             let event_tx = event_tx.clone();
             let state = state.clone();
@@ -202,16 +218,12 @@ impl CodexAppServerConnection {
         let worker = {
             let rpc = rpc.clone();
             let state = state.clone();
-            let cwd = cwd.to_path_buf();
-            let model = model.map(str::to_string);
             let resume = resume_session_id.map(str::to_string);
             thread::spawn(move || worker_loop(rpc, event_tx, state, out_rx, cwd, model, resume))
         };
-
-        Ok((
+        (
             Self {
                 outbound: out_tx,
-                events,
                 rpc,
                 state,
                 child: Arc::new(Mutex::new(child)),
@@ -219,7 +231,7 @@ impl CodexAppServerConnection {
                 _mapper: mapper,
             },
             event_rx,
-        ))
+        )
     }
 
     /// Kill + reap the codex process group — the direct child AND its sandbox
@@ -268,12 +280,12 @@ impl AgentConnection for CodexAppServerConnection {
                 // (keyed by the request id) is settled here, whoever answered:
                 // a click, a phone, or the CLI.
                 let denied = matches!(decision, PermissionDecision::Deny { .. });
-                let _ = self.events.send(ThreadEvent::ToolResult {
+                let _ = self.outbound.send(Outbound::Emit(ThreadEvent::ToolResult {
                     tool_use_id: request_id.to_string(),
                     content: if denied { "Declined".into() } else { "Allowed".into() },
                     is_error: denied,
                     structured: None,
-                });
+                }));
                 Ok(())
             }
             Some(id) => self
@@ -793,6 +805,9 @@ fn worker_loop(
                     }
                 }
             }
+            Ok(Outbound::Emit(event)) => {
+                let _ = event_tx.send(event);
+            }
             Ok(Outbound::Shutdown) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !rpc.is_alive() {
@@ -889,12 +904,10 @@ mod tests {
         let (rpc, _inbound, child) =
             transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script("read line; sleep 1"))
                 .expect("spawn fake app-server");
-        let (events, _rx) = mpsc::channel();
         let (outbound, _out_rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(CodexState { sandbox: "read-only".into(), ..Default::default() }));
         let conn = CodexAppServerConnection {
             outbound,
-            events,
             rpc,
             state: state.clone(),
             child: Arc::new(Mutex::new(child)),
@@ -917,13 +930,11 @@ mod tests {
         let (rpc, _inbound, child) =
             transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script("read line; sleep 1"))
                 .expect("spawn fake app-server");
-        let (events, rx) = mpsc::channel();
-        let (outbound, _out_rx) = mpsc::channel();
+        let (outbound, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(CodexState::default()));
         state.lock().unwrap().pending_elicitations.insert("e-1".into(), json!(7));
         let conn = CodexAppServerConnection {
             outbound,
-            events,
             rpc,
             state,
             child: Arc::new(Mutex::new(child)),
@@ -932,7 +943,7 @@ mod tests {
         };
         conn.resolve_permission("e-1", PermissionDecision::Deny { message: "no".into() }).unwrap();
         match rx.try_recv().expect("the card is settled") {
-            ThreadEvent::ToolResult { tool_use_id, is_error, .. } => {
+            Outbound::Emit(ThreadEvent::ToolResult { tool_use_id, is_error, .. }) => {
                 assert_eq!(tool_use_id, "e-1");
                 assert!(is_error, "a denial reads as one");
             }
@@ -941,6 +952,76 @@ mod tests {
         // An ordinary approval (codex reports its own outcome) adds nothing.
         conn.resolve_permission("not-pending", PermissionDecision::Deny { message: "no".into() }).unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A crashed app-server ends the event stream while the chat still holds
+    /// the connection, so the chat sees the exit: only the worker and the
+    /// mapper may own a sender.
+    #[test]
+    fn a_dead_app_server_closes_the_event_stream() {
+        // ids: 1 initialize, 2 model/list, 3 resume; then the server exits.
+        let script = r#"
+read line
+printf '{"id":1,"result":{}}\n'
+read line
+printf '{"id":2,"result":{}}\n'
+read line
+read line
+printf '{"id":3,"result":{"thread":{"id":"t-1"},"model":"m"}}\n'
+"#;
+        let (rpc, inbound, child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script(script))
+                .expect("spawn fake app-server");
+        let (conn, events) =
+            CodexAppServerConnection::start(rpc, inbound, child, CodexState::default(), Some("t-1"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let closed = loop {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+                _ if std::time::Instant::now() > deadline => break false,
+                _ => {}
+            }
+        };
+        assert!(closed, "the stream must close once codex is gone");
+        drop(conn);
+    }
+
+    /// The settle of an answered elicitation reaches the chat's stream
+    /// through the worker.
+    #[test]
+    fn an_answered_elicitation_reaches_the_event_stream() {
+        let script = r#"
+read line
+printf '{"id":1,"result":{}}\n'
+read line
+printf '{"id":2,"result":{}}\n'
+read line
+read line
+printf '{"id":3,"result":{"thread":{"id":"t-1"},"model":"m"}}\n'
+read line
+printf '{"id":4,"result":{}}\n'
+while read line; do :; done
+"#;
+        let (rpc, inbound, child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script(script))
+                .expect("spawn fake app-server");
+        // ids: 1 initialize, 2 model/list, 3 resume, 4 account/read.
+        let mut state = CodexState::default();
+        state.pending_elicitations.insert("e-1".into(), json!(7));
+        let (conn, events) = CodexAppServerConnection::start(rpc, inbound, child, state, Some("t-1"));
+        let init = events.recv_timeout(Duration::from_secs(10));
+        assert!(matches!(init, Ok(ThreadEvent::SessionInit { .. })), "handshake first, got {init:?}");
+        conn.resolve_permission("e-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let settled = loop {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(ThreadEvent::ToolResult { tool_use_id, is_error, .. }) => break Some((tool_use_id, is_error)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                _ if std::time::Instant::now() > deadline => break None,
+                _ => {}
+            }
+        };
+        assert_eq!(settled, Some(("e-1".to_string(), false)));
     }
 
     /// A thread another process is writing must NOT become a fresh thread.

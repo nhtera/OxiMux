@@ -417,6 +417,7 @@ pub fn is_push(resp: &Response) -> bool {
             | Response::TermOutput { .. }
             | Response::TermGapped { .. }
             | Response::TermExited { .. }
+            | Response::SessionHealth(_)
     )
 }
 
@@ -500,9 +501,23 @@ pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
     }
 }
 
+/// A client over `transport`, as if `Hello` had answered `host_version`.
+#[cfg(test)]
+pub(crate) fn client_for_test(transport: Arc<dyn Transport>, host_version: u32) -> Client {
+    Client { transport, timeout: Duration::from_secs(1), host_version, host_min_compatible: 1, target: HostTarget::Local }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v37 host pushes health to every subscriber; taken for a reply, it
+    /// would answer the next call and desync the connection.
+    #[test]
+    fn a_health_frame_is_a_push() {
+        let frame = oximux_remote_proto::delivery::SessionHealthFrame::new("s", "h", &Default::default());
+        assert!(is_push(&Response::SessionHealth(frame)));
+    }
 
     fn client_at(version: u32, target: HostTarget) -> Client {
         struct Dead;

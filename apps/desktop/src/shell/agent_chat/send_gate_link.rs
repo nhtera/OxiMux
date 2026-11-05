@@ -18,6 +18,7 @@ use gpui::{AppContext as _, Context};
 use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource, Steered};
 use oximux_agents::thread::ThreadEntry;
 use oximux_agents::thread::{ChatImage, PermissionDecision, PermissionKind, ThreadEvent, ToolCallStatus, Transport};
+use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};
 use uuid::Uuid;
 
 use super::AgentChatView;
@@ -405,7 +406,14 @@ impl AgentChatView {
         let (line, uuid) = match held {
             Some(events) => {
                 if let Some(own) = self.pending_send_uuid.take() {
-                    self.send_gate.lock().unwrap().report_sent(own, false);
+                    let mut gate = self.send_gate.lock().unwrap();
+                    gate.report_sent(own, false);
+                    // Its text goes out inside the events' line: so does its
+                    // receipt, and any that went with it (a caller may hold
+                    // its key).
+                    for key in std::iter::once(key_hash(KeyKind::Gate, &own.to_string())).chain(gate.carried_by(&own.to_string())) {
+                        gate.note_carried(events.uuid, key);
+                    }
                 }
                 self.thread.apply(&ThreadEvent::Notice(HELD_EVENTS_NOTE.into()));
                 (format!("{}\n\n{text}", events.text), events.uuid)
@@ -429,6 +437,11 @@ impl AgentChatView {
             }
         } else {
             self.recovery_note = note;
+            // Nothing reached the agent, and nothing will retry it on its
+            // own: a caller holding its key (or one carried with it) is told
+            // so, and may send again, rather than waiting on a pending that
+            // never ends.
+            self.record_receipt(&uuid.to_string(), Some(ReceiptState::Rejected), cx);
         }
         sent
     }

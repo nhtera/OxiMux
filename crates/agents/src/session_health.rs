@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::watch;
 
-use crate::health::{self, HealthConfig, HealthInputs, HealthStatus, SessionHealth};
+use crate::health::{self, HealthConfig, HealthInputs, HealthStatus, Process, SessionHealth};
 use crate::session_registry::SessionHandle;
 
 /// Wall clock, Unix milliseconds.
@@ -41,7 +41,8 @@ pub struct HealthCell {
     inputs: watch::Sender<HealthInputs>,
     health: watch::Sender<SessionHealth>,
     children: Mutex<ChildActivity>,
-    /// The stall clock restarts no earlier than this (the host's last wake).
+    /// The stall clock restarts no earlier than this (the host's last wake,
+    /// or the last answered prompt).
     forgiven_until: AtomicI64,
     cfg: Arc<RwLock<HealthConfig>>,
     /// Held across read-inputs → write-health → set-working, so a slower
@@ -83,6 +84,12 @@ impl HealthCell {
         // Answered here (a phone, the CLI) before the driver's card heard.
         if inputs.prompt_request.as_deref().is_some_and(&decided) {
             inputs.prompt = None;
+        }
+        // Waiting on a person is not silence: a prompt answered (here or in
+        // the driver) restarts the stall clock, before anything reads it.
+        let waiting = |s: HealthStatus| matches!(s, HealthStatus::NeedsPermission | HealthStatus::NeedsAnswer);
+        if inputs.prompt.is_none() && matches!(inputs.process, Process::Live) && waiting(self.health.borrow().status) {
+            self.forgiven_until.fetch_max(now, Ordering::Relaxed);
         }
         let children = *self.children.lock().unwrap();
         inputs.children_active = children.working;
@@ -132,6 +139,7 @@ impl SessionHandle {
     /// unanswered send counts, so a child still reacting to its background
     /// tasks keeps its slot).
     pub fn publish_health(&self, inputs: HealthInputs) {
+        let first = !self.health.published();
         let modified = self.health.inputs.send_if_modified(|current| {
             if *current == inputs {
                 return false;
@@ -139,10 +147,21 @@ impl SessionHandle {
             *current = inputs;
             true
         });
-        if modified {
-            self.health.published.store(true, Ordering::Relaxed);
+        if modified || first {
             self.rederive_health(now_ms());
         }
+        if first {
+            // Set only now, so nobody reads the default as observed; then
+            // tell followers, even when the health reads as it did before.
+            self.health.published.store(true, Ordering::Relaxed);
+            self.health.health.send_modify(|_| {});
+        }
+    }
+
+    /// Whether the session's driver has published its facts: until then its
+    /// health is a default, not something anyone observed.
+    pub fn health_published(&self) -> bool {
+        self.health.published()
     }
 
     /// Re-derive from the last published facts (a prompt was decided here).

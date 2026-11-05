@@ -135,12 +135,19 @@ impl AgentChatView {
             self.thread.last_turn_failure.clone(),
         );
         // A send the provider refused before the agent produced anything is
-        // safe to resend verbatim; say so in its receipt.
-        if super::receipt_link::refused(class, self.turn_has_output())
-            && let Some(id) = self.health.sent_id()
-        {
+        // safe to resend verbatim; its receipt says so, written after the
+        // retry row when one is armed, so a caller repeating its key never
+        // reads "refused" for a send the host is about to retry.
+        let refused = super::receipt_link::refused(class, self.turn_has_output())
+            .then(|| self.health.sent_id())
+            .flatten();
+        self.arm_retry_for(class, cx);
+        if let Some(id) = refused {
             self.record_receipt(&id, Some(ReceiptState::Rejected), cx);
         }
+    }
+
+    fn arm_retry_for(&mut self, class: oximux_agents::retry::RetryClass, cx: &mut Context<Self>) {
         let settings = cx
             .try_global::<AgentRetrySettings>()
             .copied()
@@ -443,6 +450,34 @@ impl AgentChatView {
         });
         match last_user {
             Some((idx, text, images)) => {
+                // A fresh line (the agent has seen the first one's id), which
+                // the failed send's receipt follows: a caller holding its key
+                // sees it pending again, then taken, never refused while it
+                // is on its way. Keyed by the turn's receipt key, so this
+                // holds after a restart too.
+                let line = uuid::Uuid::new_v4();
+                // With no retry armed (a manual Retry), the last send's key and
+                // every key it was already carrying: a chain of refused retries
+                // keeps the first send's receipt with it.
+                let carried: Vec<String> = match self.retry.turn_key.clone() {
+                    Some(key) => vec![key],
+                    None => self
+                        .health
+                        .sent_id()
+                        .map(|id| {
+                            let own = oximux_agents::send_receipts::key_hash(oximux_agents::send_receipts::KeyKind::Gate, &id);
+                            std::iter::once(own).chain(self.send_gate.lock().unwrap().carried_by(&id)).collect()
+                        })
+                        .unwrap_or_default(),
+                };
+                let again = (self.connection.is_some() && self.pending_send_uuid.is_none()).then_some(line);
+                if let Some(line) = again {
+                    self.pending_send_uuid = Some(line);
+                    let mut gate = self.send_gate.lock().unwrap();
+                    for key in &carried {
+                        gate.note_carried(line, key.clone());
+                    }
+                }
                 // Through the one write path, so a retry goes out tagged (its
                 // receipt settles it) and carries an owed recovery note.
                 let sent = self.connection.is_some()
@@ -457,6 +492,16 @@ impl AgentChatView {
                             false
                         }
                     };
+                if let Some(line) = again {
+                    if self.pending_send_uuid == Some(line) {
+                        // Not written: the id is not owed to the next send.
+                        self.pending_send_uuid = None;
+                    } else if sent {
+                        for key in carried {
+                            self.record_resend(key, cx);
+                        }
+                    }
+                }
                 // Re-anchor the pre-turn checkpoint to the retried turn (as a
                 // fresh send would), so the "restore files" rewind affordance
                 // keeps tracking repo changes for it.

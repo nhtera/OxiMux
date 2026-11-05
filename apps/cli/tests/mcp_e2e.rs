@@ -325,6 +325,12 @@ impl SessionLauncher for ChildLauncher {
 /// A desktop-like host with delegation on and one chat, `parent`, whose
 /// agent holds the session credential written to the returned file.
 fn serve_delegation(rt: &tokio::runtime::Runtime, dir: &Path) -> (Arc<SessionRegistry>, std::path::PathBuf) {
+    serve_delegation_on(rt, dir, true)
+}
+
+/// [`serve_delegation`], optionally with no host core: a host that keeps no
+/// send receipts, as headless serve today.
+fn serve_delegation_on(rt: &tokio::runtime::Runtime, dir: &Path, with_core: bool) -> (Arc<SessionRegistry>, std::path::PathBuf) {
     let runtime_dir = dir.join("host");
     let registry = Arc::new(SessionRegistry::new());
     let parent = registry.register("parent".into(), Arc::new(StubConnection::default()));
@@ -338,9 +344,11 @@ fn serve_delegation(rt: &tokio::runtime::Runtime, dir: &Path) -> (Arc<SessionReg
     });
     core.start(PriorOwner::None);
     let launcher = Arc::new(ChildLauncher { registry: registry.clone(), cwd: dir.to_path_buf(), launched: Default::default() });
-    let dispatcher = Arc::new(
-        Dispatcher::new(registry.clone(), Arc::new(AuthStore::new())).with_launcher(launcher).with_host_core(core),
-    );
+    let mut dispatcher = Dispatcher::new(registry.clone(), Arc::new(AuthStore::new())).with_launcher(launcher);
+    if with_core {
+        dispatcher = dispatcher.with_host_core(core);
+    }
+    let dispatcher = Arc::new(dispatcher);
     let listener = {
         let _guard = rt.enter();
         LocalControlListener::bind(&runtime_dir, &generate_token()).unwrap()
@@ -386,6 +394,20 @@ fn an_agent_delegates_over_mcp_with_its_own_credential() {
     let odd = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "x", "mode": "shout" }));
     assert!(odd["isError"] == true && text(&odd).contains("unknown mode"), "{odd}");
 
+    // A queued send carries a key; the same key again is not delivered twice.
+    let sent = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "also check nulls" }));
+    assert_eq!(sent["isError"], false, "{sent}");
+    let sent: Value = serde_json::from_str(&text(&sent)).unwrap();
+    assert_eq!(sent["outcome"], "queued", "{sent}");
+    let key = sent["idempotency_key"].as_str().expect("a minted key").to_string();
+    let again = server.call("oximux_send_agent", json!({ "id": "child-0", "text": "also check nulls", "idempotency_key": key }));
+    let again: Value = serde_json::from_str(&text(&again)).unwrap();
+    assert_eq!((again["outcome"].as_str(), again["state"].as_str()), (Some("duplicate"), Some("pending")), "{again}");
+    let delivered = registry.get("child-0").unwrap().events_since(0).into_iter().filter(
+        |(_, e)| matches!(e, ThreadEvent::UserMessage { text, .. } if text == "also check nulls"),
+    );
+    assert_eq!(delivered.count(), 1, "delivered once");
+
     // Still working: the wait gives up at its timeout and says so.
     let waited = server.call("oximux_wait_agents", json!({ "ids": ["child-0"], "timeout_ms": 1000 }));
     assert_eq!(waited["isError"], false, "{waited}");
@@ -415,4 +437,32 @@ fn the_delegation_set_needs_an_agent_credential() {
     assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("agent session credential"));
     assert!(out.stdout.is_empty());
+}
+
+/// A host that keeps no receipts: a new message still goes (marked not
+/// idempotent), but a retry under its key is refused rather than delivered
+/// a second time.
+#[test]
+fn a_keyed_retry_is_refused_where_the_key_cannot_be_kept() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, credential) = serve_delegation_on(&rt, dir.path(), false);
+    let runtime_dir = dir.path().join("host");
+    let mut server = Server::with_args(
+        &runtime_dir,
+        &["mcp", "--tools", "orchestrate", "--credential-file", credential.to_str().unwrap(), "--default-agent", "claude-code"],
+    );
+    server.request("initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }));
+
+    let sent = server.call("oximux_send_agent", json!({ "id": "parent", "text": "note to self" }));
+    assert_eq!(sent["isError"], false, "{sent}");
+    let sent: Value = serde_json::from_str(&text(&sent)).unwrap();
+    assert_eq!((sent["outcome"].as_str(), sent["idempotent"].as_bool()), (Some("sent"), Some(false)), "{sent}");
+
+    let again = server.call("oximux_send_agent", json!({ "id": "parent", "text": "note to self", "idempotency_key": "k-1" }));
+    assert!(again["isError"] == true && text(&again).contains("cannot hold a send to its key"), "{again}");
+    let delivered = registry.get("parent").unwrap().events_since(0).into_iter().filter(
+        |(_, e)| matches!(e, ThreadEvent::UserMessage { text, .. } if text == "note to self"),
+    );
+    assert_eq!(delivered.count(), 1);
 }

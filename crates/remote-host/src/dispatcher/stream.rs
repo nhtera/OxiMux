@@ -67,6 +67,10 @@ pub(super) enum Live {
     /// cursor-bearing ordinal to the cursor-less watcher would drop its whole
     /// connection, since it has no decoder for it.
     StateChange { change: oximux_remote_proto::messages::StateChangeWire, with_cursor: bool },
+    /// A subscribed session's health changed (v37 peers only, opened with the
+    /// session's first subscribe). Forwarded as [`Response::SessionHealth`]
+    /// behind the same per-frame read recheck as its events.
+    Health { session_id: SessionId, health: oximux_agents::health::SessionHealth },
 }
 
 /// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.

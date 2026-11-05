@@ -77,17 +77,27 @@ pub(super) fn refused(class: RetryClass, turn_had_output: bool) -> bool {
 }
 
 impl AgentChatView {
-    /// Record proof (or, with `None`, the reservation) for the send `uuid`.
+    /// Record proof (or, with `None`, the reservation) for the send `uuid`,
+    /// and for every receipt that went out with it.
     pub(super) fn record_receipt(&self, uuid: &str, state: Option<ReceiptState>, cx: &mut Context<Self>) {
-        let (session, key) = (self.remote_session_id.clone(), key_hash(KeyKind::Gate, uuid));
-        let now = chrono::Local::now();
-        enqueue(
-            cx,
-            Box::new(move |s| match state {
-                None => s.receipts.reserve(&session, &key, &s.instance, now).map(|_| ()),
-                Some(state) => s.receipts.settle(&session, &key, state, &s.instance, now),
-            }),
-        );
+        let carried = self.send_gate.lock().unwrap().carried_by(uuid);
+        for key in std::iter::once(key_hash(KeyKind::Gate, uuid)).chain(carried) {
+            let (session, now) = (self.remote_session_id.clone(), chrono::Local::now());
+            enqueue(
+                cx,
+                Box::new(move |s| match state {
+                    None => s.receipts.reserve(&session, &key, &s.instance, now).map(|_| ()),
+                    Some(state) => s.receipts.settle(&session, &key, state, &s.instance, now),
+                }),
+            );
+        }
+    }
+
+    /// The refused send whose receipt key is `key` went out again: pending
+    /// until the agent answers it.
+    pub(super) fn record_resend(&self, key: String, cx: &mut Context<Self>) {
+        let (session, now) = (self.remote_session_id.clone(), chrono::Local::now());
+        enqueue(cx, Box::new(move |s| s.receipts.resend(&session, &key, now)));
     }
 
     /// The chat moved from `old` to its agent's id: move its records too, after

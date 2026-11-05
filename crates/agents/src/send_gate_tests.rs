@@ -333,3 +333,18 @@ fn a_failed_turn_holds_child_events_but_not_a_person() {
     gate.set_holds(Holds::default());
     assert_eq!(gate.take_next_if_open().unwrap().text, "child finished", "the user's send lifted it");
 }
+
+#[test]
+fn receipts_carried_by_a_line_settle_with_it() {
+    let mut gate = SendGate::new();
+    let (line, other) = (Uuid::new_v4(), Uuid::new_v4());
+    gate.note_carried(line, "k-own".into());
+    gate.note_carried(line, "k-retried".into());
+    assert_eq!(gate.carried_by(&line.to_string()), vec!["k-own".to_string(), "k-retried".to_string()]);
+    assert!(gate.carried_by(&other.to_string()).is_empty());
+    assert!(gate.carried_by("not a uuid").is_empty());
+    for _ in 0..16 {
+        gate.note_carried(Uuid::new_v4(), "k".into());
+    }
+    assert!(gate.carried_by(&line.to_string()).is_empty(), "only the last few lines are remembered");
+}

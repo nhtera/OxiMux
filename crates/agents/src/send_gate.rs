@@ -191,7 +191,13 @@ pub struct SendGate {
     /// A line written to an agent that reports no receipts, and whether its
     /// first frame (acceptance) has been seen: the owner stands in for them.
     unreported: Option<(Uuid, bool)>,
+    /// Receipts that follow another line, by that line's uuid: a send merged
+    /// into held child events, or a refused send its retry writes again.
+    carried: VecDeque<(Uuid, Vec<String>)>,
 }
+
+/// How many lines [`SendGate::carried_by`] remembers.
+const CARRIED_KEPT: usize = 16;
 
 impl std::fmt::Debug for SendGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -230,6 +236,25 @@ impl SendGate {
         if let Some(hook) = &self.sent_hook {
             hook(uuid, ok);
         }
+    }
+
+    /// The receipt `key` (a receipt key hash) went out with the line written
+    /// under `line`, so it settles with it.
+    pub fn note_carried(&mut self, line: Uuid, key: String) {
+        if let Some((_, keys)) = self.carried.iter_mut().find(|(l, _)| *l == line) {
+            keys.push(key);
+            return;
+        }
+        if self.carried.len() == CARRIED_KEPT {
+            self.carried.pop_front();
+        }
+        self.carried.push_back((line, vec![key]));
+    }
+
+    /// The receipt keys that settle with the line written under `line`.
+    pub fn carried_by(&self, line: &str) -> Vec<String> {
+        let Ok(line) = Uuid::parse_str(line) else { return Vec::new() };
+        self.carried.iter().find(|(l, _)| *l == line).map(|(_, keys)| keys.clone()).unwrap_or_default()
     }
 
     /// Whether an owner is listening. Without one, a sender writes directly.

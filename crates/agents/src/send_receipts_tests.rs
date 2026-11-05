@@ -50,6 +50,31 @@ fn a_refusal_overrides_the_clis_acknowledgement_in_either_order() {
 }
 
 #[test]
+fn a_failed_write_frees_its_key_but_a_settled_one_is_kept() {
+    let r = receipts();
+    let (k, done) = (key_hash(KeyKind::V2, "k"), key_hash(KeyKind::V2, "done"));
+    r.reserve("s", &k, "h", t0()).unwrap();
+    r.forget_pending("s", &k).unwrap();
+    assert_eq!(r.reserve("s", &k, "h", t0()).unwrap(), None, "the key is free again");
+    r.settle("s", &done, ReceiptState::Accepted, "h", t0()).unwrap();
+    r.forget_pending("s", &done).unwrap();
+    assert_eq!(r.state("s", &done).unwrap(), Some(ReceiptState::Accepted));
+}
+
+#[test]
+fn a_refused_send_sent_again_is_pending_until_answered() {
+    let r = receipts();
+    let k = key_hash(KeyKind::Gate, "u");
+    r.settle("s", &k, ReceiptState::Rejected, "h", t0()).unwrap();
+    r.resend("s", &k, t0()).unwrap();
+    assert_eq!(r.state("s", &k).unwrap(), Some(ReceiptState::Pending));
+    r.settle("s", &k, ReceiptState::Accepted, "h", t0()).unwrap();
+    assert_eq!(r.state("s", &k).unwrap(), Some(ReceiptState::Accepted));
+    r.resend("s", &k, t0()).unwrap();
+    assert_eq!(r.state("s", &k).unwrap(), Some(ReceiptState::Accepted), "only a refusal is reopened");
+}
+
+#[test]
 fn a_new_host_marks_what_another_left_pending_unknown() {
     let r = receipts();
     let (mine, theirs) = (key_hash(KeyKind::Gate, "m"), key_hash(KeyKind::Gate, "t"));

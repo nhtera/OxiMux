@@ -14,6 +14,13 @@ use crate::remote_control::RemoteControl;
 
 /// A chat whose app has a host core on an in-memory database.
 fn chat_with_host(cx: &mut TestAppContext) -> (gpui::WindowHandle<AgentChatView>, tokio::runtime::Runtime) {
+    chat_with_host_on(cx, StubConnection::default())
+}
+
+fn chat_with_host_on(
+    cx: &mut TestAppContext,
+    stub: StubConnection,
+) -> (gpui::WindowHandle<AgentChatView>, tokio::runtime::Runtime) {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
     let db = oximux_storage::db::open_memory().unwrap();
     let lineage = oximux_agents::lineage::LineageStore::new(db.conn());
@@ -27,7 +34,7 @@ fn chat_with_host(cx: &mut TestAppContext) -> (gpui::WindowHandle<AgentChatView>
     });
     let window = cx.add_window(|window, cx| {
         AgentChatView::with_connection_for_test(
-            Arc::new(StubConnection::default()),
+            Arc::new(stub),
             Theme::default(),
             Density::default(),
             Typography::default(),
@@ -125,4 +132,130 @@ async fn a_refused_send_ends_rejected_after_the_clis_acknowledgement(cx: &mut Te
     assert_eq!(receipts.state(&session, &key_hash(KeyKind::Gate, &id)).unwrap(), Some(ReceiptState::Rejected));
     let live = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().retries().live(&session).unwrap());
     assert_eq!(live.map(|l| l.attempts), Some(0), "armed, not yet fired");
+}
+
+/// A refused send retried verbatim goes out on a fresh line (the agent has
+/// seen the first id) that its receipt follows: reopened to pending, then
+/// taken when the retry is.
+#[gpui::test]
+async fn a_verbatim_retry_carries_the_refused_sends_receipt(cx: &mut TestAppContext) {
+    let (window, _rt) = chat_with_host(cx);
+    let (session, id) = window
+        .update(cx, |view, _window, cx| {
+            view.send_text("hello".into(), Vec::new(), cx);
+            let id = view.health.sent_id().expect("tagged");
+            view.thread.turn_active = false;
+            view.thread.last_turn_failure = Some((Some(529), None));
+            view.thread.last_error = Some("API Error: 529".into());
+            view.arm_retry_if_limited(cx);
+            (view.remote_session_id.clone(), id)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let receipts = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().receipts());
+    let key = key_hash(KeyKind::Gate, &id);
+    assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Rejected));
+
+    let line = window
+        .update(cx, |view, _window, cx| {
+            view.retry_last_turn(cx);
+            assert_eq!(view.pending_send_uuid, None, "nothing owed to the next send");
+            view.health.sent_id().expect("tagged")
+        })
+        .unwrap();
+    assert_ne!(line, id, "a fresh line");
+    cx.run_until_parked();
+    assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Pending));
+    window
+        .update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: line.clone() }], cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Accepted));
+}
+
+/// After a restart the view no longer knows the failed send's id, only the
+/// retry's turn key (its receipt key): that is enough for the receipt to
+/// follow the retry.
+#[gpui::test]
+async fn a_restored_retry_still_carries_the_refused_sends_receipt(cx: &mut TestAppContext) {
+    let (window, _rt) = chat_with_host(cx);
+    let session = window.update(cx, |view, _window, _cx| view.remote_session_id.clone()).unwrap();
+    let core = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().clone());
+    let (key, now) = (key_hash(KeyKind::Gate, "u-before-restart"), chrono::Local::now());
+    core.lineage().receipts().settle(&session, &key, ReceiptState::Rejected, "old-host", now).unwrap();
+    core.lineage().retries().arm(&session, &key, "window", "Usage limit reached", 1, "old-host", now).unwrap();
+    let line = window
+        .update(cx, |view, _window, cx| {
+            view.thread.push_user_message_with_images("hello".to_string(), Vec::new());
+            view.thread.turn_active = false; // the turn failed before the quit
+            let saved = PersistedRetry {
+                wake_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+                reason: "Usage limit reached".into(),
+                attempt: 0,
+            };
+            view.restore_pending_retry(saved, cx);
+            view.send_retry_now(cx);
+            view.health.sent_id().expect("tagged")
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(core.lineage().receipts().state(&session, &key).unwrap(), Some(ReceiptState::Pending));
+    window
+        .update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: line }], cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(core.lineage().receipts().state(&session, &key).unwrap(), Some(ReceiptState::Accepted));
+}
+
+/// A gate item (a phone's or an agent's send) whose write fails reached
+/// nothing, and nothing retries it: its receipt reads rejected, so a caller
+/// repeating its key is told to send again rather than to wait.
+#[gpui::test]
+async fn a_send_whose_write_fails_reads_rejected(cx: &mut TestAppContext) {
+    let stub = StubConnection::default();
+    stub.fail_sends(true);
+    let (window, _rt) = chat_with_host_on(cx, stub);
+    let line = uuid::Uuid::new_v4();
+    let session = window
+        .update(cx, |view, _window, cx| {
+            view.pending_send_uuid = Some(line);
+            view.send_text("hello".into(), Vec::new(), cx);
+            view.remote_session_id.clone()
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let receipts = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().receipts());
+    let key = key_hash(KeyKind::Gate, &line.to_string());
+    assert_eq!(receipts.state(&session, &key).unwrap(), Some(ReceiptState::Rejected));
+}
+
+/// Manual retries, none armed: A refused, its retry B refused, then C taken.
+/// A's receipt rides the whole chain and ends taken, so a caller repeating
+/// A's key is never told to send it again.
+#[gpui::test]
+async fn a_chain_of_manual_retries_keeps_the_first_sends_receipt(cx: &mut TestAppContext) {
+    let (window, _rt) = chat_with_host(cx);
+    let (session, first) = window
+        .update(cx, |view, _window, cx| {
+            view.send_text("hello".into(), Vec::new(), cx);
+            (view.remote_session_id.clone(), view.health.sent_id().expect("tagged"))
+        })
+        .unwrap();
+    let mut refused = first.clone();
+    for _ in 0..2 {
+        refused = window
+            .update(cx, |view, _window, cx| {
+                view.record_receipt(&refused, Some(ReceiptState::Rejected), cx);
+                view.thread.turn_active = false;
+                view.retry_last_turn(cx);
+                view.health.sent_id().expect("tagged")
+            })
+            .unwrap();
+    }
+    window
+        .update(cx, |view, _window, cx| view.apply_batch(vec![ThreadEvent::UserMessageAccepted { uuid: refused.clone() }], cx))
+        .unwrap();
+    cx.run_until_parked();
+    let receipts = cx.update(|cx| cx.global::<RemoteControl>().host_core().unwrap().lineage().receipts());
+    assert_eq!(receipts.state(&session, &key_hash(KeyKind::Gate, &first)).unwrap(), Some(ReceiptState::Accepted));
 }

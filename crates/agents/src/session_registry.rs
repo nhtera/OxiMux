@@ -523,6 +523,19 @@ impl SessionHandle {
     /// [`Self::send_prompt`] for a sender other than a phone (another agent's
     /// `send_agent`), which a Stop holds.
     pub fn send_prompt_from(&self, text: &str, images: &[ChatImage], source: crate::send_gate::SendSource) -> Result<()> {
+        self.send_prompt_tagged(text, images, source, None)
+    }
+
+    /// [`Self::send_prompt_from`] under the caller's `uuid`: the gate item,
+    /// or the line written directly, carries it, so the agent's acceptance is
+    /// reported (and recorded) by that id.
+    pub fn send_prompt_tagged(
+        &self,
+        text: &str,
+        images: &[ChatImage],
+        source: crate::send_gate::SendSource,
+        uuid: Option<uuid::Uuid>,
+    ) -> Result<()> {
         if text.trim().is_empty() && images.is_empty() {
             anyhow::bail!("an empty prompt");
         }
@@ -532,7 +545,7 @@ impl SessionHandle {
         if let Some(gate) = self.gate() {
             let mut gate = gate.lock().unwrap();
             if gate.has_waker() {
-                gate.push(text.to_string(), images.to_vec(), source, crate::send_gate::DeliveryMode::Queue, None);
+                gate.push(text.to_string(), images.to_vec(), source, crate::send_gate::DeliveryMode::Queue, uuid);
                 return Ok(());
             }
         }
@@ -541,7 +554,10 @@ impl SessionHandle {
         // Held across the write and both records: a reply produced by this write
         // cannot be folded until the user's bubble has been. See `prompt_order`.
         let _order = self.prompt_order.lock().unwrap();
-        self.conn().send_user_message_with_images(text, images)?;
+        match uuid {
+            Some(uuid) => self.conn().send_user_message_tagged(text, images, &uuid.to_string())?,
+            None => self.conn().send_user_message_with_images(text, images)?,
+        }
         // No backend echoes the user's own message back, so without this the
         // remote transcript would show replies to prompts it never displayed.
         // Ingested only after the send succeeds — a failed send must not leave a
