@@ -39,7 +39,8 @@ concurrency:
 jobs:
   check:
     name: check + clippy + test
-    runs-on: macos-14
+    # macos-14 was removed on 2026-11-02 (jobs on it now fail at once).
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -58,8 +59,9 @@ jobs:
       # keeps the fingerprint and the files it points at in step.
       #
       # The key is versioned separately from Cargo.lock so a fix like this one
-      # can invalidate entries saved under the old layout; bump `v2` whenever
-      # what is cached changes, not when dependencies do.
+      # can invalidate entries saved under the old layout; bump the version
+      # whenever what is cached changes, not when dependencies do. (v3: the
+      # move to macos-15, whose build output must not mix with the old image's.)
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -68,9 +70,9 @@ jobs:
             ~/.cargo/git
             ~/Library/Caches/sherpa-rs
             target
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v3-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v2-
+            ${{ runner.os }}-cargo-v3-
 
       # Insurance against the same failure returning by another route: any cache
       # that comes back with the build-script output but without the libraries
