@@ -250,10 +250,13 @@ pub fn render_event(event: &ThreadEvent) -> Option<String> {
         // Typed detail for the `TurnEnded` right behind it, which prints the
         // message a person reads.
         | ThreadEvent::TurnFailed { .. }
-        // Receipts about the host's own sends (never on the wire either).
+        // Receipts about the host's own sends and provider turn brackets
+        // (never on the wire either).
         | ThreadEvent::UserMessageAccepted { .. }
         | ThreadEvent::UserMessagesDelivered { .. }
         | ThreadEvent::UserMessageDropped { .. }
+        | ThreadEvent::ProviderTurnStarted
+        | ThreadEvent::ContinuationEnded
         | ThreadEvent::TitleUpdated { .. } => None,
     }
 }

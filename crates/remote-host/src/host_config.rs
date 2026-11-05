@@ -19,6 +19,7 @@ pub mod keys {
     pub const CAP_ACTIVE_PER_ROOT: &str = "agents.delegation.cap.active_per_root";
     pub const CAP_OPEN_PER_ROOT: &str = "agents.delegation.cap.open_per_root";
     pub const VERIFY_ALLOW: &str = "agents.delegation.verify_allow";
+    pub const STALL_AFTER_S: &str = "agents.health.stall_after_s";
 }
 
 /// The commands a Claude verifier may run when nothing else is configured:
@@ -62,6 +63,9 @@ pub struct HostConfig {
     /// `Bash(<command>)` rules survive sanitizing: an edit tool, an MCP tool
     /// or a bare `Bash(*)` would widen the posture past "builds and tests".
     pub verify_allow: Vec<String>,
+    /// Seconds a working session may go without a sign of life before it is
+    /// marked stalled (informational only). 0 turns the signal off.
+    pub stall_after_s: u32,
 }
 
 impl Default for HostConfig {
@@ -73,6 +77,7 @@ impl Default for HostConfig {
             steer_events: true,
             caps: SpawnCaps::default(),
             verify_allow: DEFAULT_VERIFY_ALLOW.iter().map(|r| r.to_string()).collect(),
+            stall_after_s: (oximux_agents::health::DEFAULT_STALL_AFTER_MS / 1000) as u32,
         }
     }
 }
@@ -105,6 +110,7 @@ impl HostConfig {
                 .map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect::<Vec<_>>())
                 .filter(|rules| !rules.is_empty())
                 .unwrap_or(d.verify_allow),
+            stall_after_s: num(keys::STALL_AFTER_S, d.stall_after_s),
         }
         .sanitized()
     }
@@ -121,7 +127,16 @@ impl HostConfig {
             (keys::CAP_ACTIVE_PER_ROOT, self.caps.active_per_root.to_string()),
             (keys::CAP_OPEN_PER_ROOT, self.caps.open_per_root.to_string()),
             (keys::VERIFY_ALLOW, self.verify_allow.join("\n")),
+            (keys::STALL_AFTER_S, self.stall_after_s.to_string()),
         ]
+    }
+
+    /// The health thresholds this config sets.
+    pub fn health(&self) -> oximux_agents::health::HealthConfig {
+        oximux_agents::health::HealthConfig {
+            stall_after_ms: i64::from(self.stall_after_s) * 1000,
+            ..Default::default()
+        }
     }
 
     /// The config as enforced: the depth never exceeds the ceiling, every
@@ -191,6 +206,7 @@ mod tests {
             steer_events: false,
             caps: SpawnCaps { depth: 2, active_per_parent: 3, ..SpawnCaps::default() },
             verify_allow: vec!["Bash(just test:*)".into(), "Bash(cargo nextest run:*)".into()],
+            stall_after_s: 90,
         };
         let stored: std::collections::HashMap<&str, String> = custom.entries().into_iter().collect();
         assert_eq!(HostConfig::load(|k| stored.get(k).cloned()), custom);

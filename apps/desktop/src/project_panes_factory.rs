@@ -240,6 +240,14 @@ fn restore_chat_pending_retry(
         .and_then(|t| t.pending_retry.clone())
 }
 
+/// Whether a restored chat had a turn or background work running when it was
+/// last saved (so a restart cut it short). `false` for older blobs.
+fn restore_chat_mid_turn(snap: &PersistedTabs, session_id: Option<&str>) -> bool {
+    session_id
+        .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
+        .is_some_and(|t| t.mid_turn)
+}
+
 /// The persisted backend posture for a restored chat, so a reopened session
 /// resumes under the same choice rather than a default. Empty when the blob
 /// predates the fields, the session isn't found, or the backend has no posture.
@@ -470,13 +478,18 @@ pub(crate) fn build_project_panes(
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
                             let pending_retry =
                                 restore_chat_pending_retry(&snap, session_id.as_deref());
-                            group.update(cx, |g, cx| {
-                                g.open_agent_chat_tab_restored(
+                            let mid_turn = restore_chat_mid_turn(&snap, session_id.as_deref());
+                            let view = group.update(cx, |g, cx| {
+                                let ix = g.open_agent_chat_tab_restored(
                                     chat_cwd, model, backend, resume_id, entries, slash_commands,
                                     session_meta, thinking_level, posture, pending_retry, draft,
                                     queued, window, cx,
                                 );
+                                g.agent_chat_view_at(ix)
                             });
+                            if let Some(view) = view {
+                                view.update(cx, |v, cx| v.restore_health(mid_turn, cx));
+                            }
                         }
                     }
                     p.place_restored_last_tab(None, meta, cx);
@@ -658,11 +671,14 @@ fn restore_multi_group(
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
                             let pending_retry =
                                 restore_chat_pending_retry(&snap, session_id.as_deref());
-                            p.open_agent_chat_in_group_restore(
+                            let mid_turn = restore_chat_mid_turn(&snap, session_id.as_deref());
+                            if let Some(view) = p.open_agent_chat_in_group_restore(
                                 group_id, chat_cwd, model, backend, resume_id, entries, slash_commands,
                                 session_meta, thinking_level, posture, pending_retry, draft, queued,
                                 window, cx,
-                            );
+                            ) {
+                                view.update(cx, |v, cx| v.restore_health(mid_turn, cx));
+                            }
                         }
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
@@ -2146,6 +2162,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         };
         let snap = PersistedTabs {
@@ -2239,6 +2256,7 @@ mod tests {
                 omp_posture: None,
                 claude_fast_mode: None,
                 pending_retry: None,
+                mid_turn: false,
                 choices: Default::default(),
             }],
             ..PersistedTabs::default()
@@ -2288,6 +2306,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         };
         let snap =

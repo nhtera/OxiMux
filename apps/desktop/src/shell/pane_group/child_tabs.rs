@@ -49,6 +49,14 @@ impl PaneGroup {
         self.chat_session_id_at(ix, cx)
     }
 
+    /// The chat view at tab `ix`, if that tab is a chat.
+    pub fn agent_chat_view_at(&self, ix: usize) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+        match &self.tabs.get(ix)?.content {
+            PaneContent::AgentChat(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
     /// Every chat view in this group.
     pub fn agent_chat_views(&self) -> Vec<Entity<crate::shell::agent_chat::AgentChatView>> {
         self.tabs

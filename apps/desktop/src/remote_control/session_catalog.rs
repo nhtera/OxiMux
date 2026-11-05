@@ -437,6 +437,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices,
         }
     }

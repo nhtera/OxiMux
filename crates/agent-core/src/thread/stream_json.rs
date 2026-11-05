@@ -198,7 +198,7 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
                 mcp_servers: mcp_servers(v),
                 agents: str_list_field(v, "agents"),
             },
-        }],
+        }, ThreadEvent::ProviderTurnStarted],
         Some("post_turn_summary") => vec![ThreadEvent::TurnSummary {
             detail: str_field(v, "status_detail"),
             category: str_field(v, "status_category"),
@@ -261,7 +261,7 @@ fn decode_task_updated(v: &Value) -> Vec<ThreadEvent> {
     match status {
         Some(s) if is_terminal_status(s) => vec![ThreadEvent::BackgroundTaskFinished {
             task_id: str_field(v, "task_id"),
-            failed: s != "completed",
+            failed: !is_clean_end(s),
             ended_at_ms: patch.and_then(|p| p.get("end_time")).and_then(Value::as_u64),
             summary: None,
             output_file: None,
@@ -276,7 +276,7 @@ fn decode_task_notification(v: &Value) -> Vec<ThreadEvent> {
     match v.get("status").and_then(Value::as_str) {
         Some(s) if is_terminal_status(s) => vec![ThreadEvent::BackgroundTaskFinished {
             task_id: str_field(v, "task_id"),
-            failed: s != "completed",
+            failed: !is_clean_end(s),
             ended_at_ms: None,
             summary: v.get("summary").and_then(Value::as_str).map(str::to_string),
             output_file: v.get("output_file").and_then(Value::as_str).map(str::to_string),
@@ -286,8 +286,16 @@ fn decode_task_notification(v: &Value) -> Vec<ThreadEvent> {
 }
 
 /// Whether a task status string is terminal (completion or a failure/cancel).
+/// `stopped` is what an interrupt leaves (CLI 2.1.310); missing it left every
+/// task a Stop ended "running" for good.
 fn is_terminal_status(s: &str) -> bool {
-    matches!(s, "completed" | "failed" | "cancelled" | "canceled") || s.starts_with("error")
+    matches!(s, "completed" | "failed" | "cancelled" | "canceled" | "stopped" | "killed")
+        || s.starts_with("error")
+}
+
+/// A task that ended as asked: it completed, or the user stopped it.
+fn is_clean_end(s: &str) -> bool {
+    matches!(s, "completed" | "stopped")
 }
 
 fn decode_stream_event(v: &Value) -> Vec<ThreadEvent> {
@@ -552,11 +560,21 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
     // marked `origin.kind == "task-notification"`. Those are NOT the user's turn
     // ending: honoring them would flip `turn_active` mid-flight and overwrite the
     // real turn's usage footer with a continuation's tiny total. Only the
-    // origin-less `result` (the user's own turn) ends the turn.
-    if v.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str)
-        == Some("task-notification")
-    {
-        return Vec::new();
+    // origin-less `result` (the user's own turn) ends the turn; a continuation's
+    // closes the continuation the health fold is counting.
+    //
+    // Except when a user line arrived while the continuation ran: the CLI folds
+    // it into that continuation, and the one result that follows is marked as
+    // the continuation's yet carries the line in `user_message_uuids`. It ends
+    // both, or the user's turn would never end.
+    let continuation = v.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str)
+        == Some("task-notification");
+    let carries_user_line = v
+        .get("user_message_uuids")
+        .and_then(Value::as_array)
+        .is_some_and(|uuids| !uuids.is_empty());
+    if continuation && !carries_user_line {
+        return vec![ThreadEvent::ContinuationEnded];
     }
     // Real error subtypes are `error_max_turns`, `error_during_execution`, …
     let is_error = v
@@ -571,6 +589,9 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
     // state machine. A populated `result` (e.g. a bad-model 404) is the fallback.
     let result = decode_errors(v).or_else(|| v.get("result").and_then(Value::as_str).map(str::to_string));
     let mut out = Vec::new();
+    if continuation {
+        out.push(ThreadEvent::ContinuationEnded);
+    }
     // A stale `--resume` (session gone) needs recovery, not just a message: emit
     // an additive event so the fold clears the dead session id and the next send
     // starts fresh instead of looping the same error. The attempted id is the
@@ -758,7 +779,7 @@ mod tests {
             session_id: "sid-1".into(), model: "claude-sonnet-5".into(),
             permission_mode: "default".into(),
             slash_commands: vec!["compact".into(), "research".into(), "codex:rescue".into()],
-            meta: SessionMeta::default() }]);
+            meta: SessionMeta::default() }, ThreadEvent::ProviderTurnStarted]);
     }
 
     #[test]
@@ -773,7 +794,7 @@ mod tests {
                            {"status":"nameless — skipped"}],
             "agents":["code-reviewer","planner"]}).to_string();
         match &decode_line(&l)[..] {
-            [ThreadEvent::SessionInit { meta, .. }] => {
+            [ThreadEvent::SessionInit { meta, .. }, ThreadEvent::ProviderTurnStarted] => {
                 assert_eq!(meta.cwd.as_deref(), Some("/repo"));
                 // Non-string entries are skipped, not fatal.
                 assert_eq!(meta.tools, vec!["Bash".to_string(), "Read".to_string()]);
@@ -797,7 +818,7 @@ mod tests {
         assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
             session_id: "s".into(), model: "m".into(),
             permission_mode: "default".into(), slash_commands: vec![],
-            meta: SessionMeta::default() }]);
+            meta: SessionMeta::default() }, ThreadEvent::ProviderTurnStarted]);
     }
 
     #[test]
@@ -1473,95 +1494,21 @@ mod tests {
             "type":"result","subtype":"success","origin":{"kind":"task-notification"},
             "usage":{"output_tokens":30}
         }).to_string();
-        assert!(decode_line(&cont).is_empty(), "task-notification result must not end the turn");
+        assert_eq!(
+            decode_line(&cont),
+            vec![ThreadEvent::ContinuationEnded],
+            "a task-notification result closes a continuation, never the turn"
+        );
         // An origin-less result still ends the turn.
         let real = json!({"type":"result","subtype":"success","usage":{"output_tokens":381}}).to_string();
         assert!(matches!(decode_line(&real).as_slice(), [ThreadEvent::TurnEnded { .. }]));
-    }
-
-    /// End-to-end against the captured spike fixture (one turn spawning a
-    /// subagent + a background bash): the subagent's own tool calls stay out of
-    /// the main stream, and exactly one — the primary — `TurnEnded` is emitted
-    /// with the real turn's usage (not a continuation's tiny total).
-    #[test]
-    fn spike_fixture_keeps_main_stream_clean() {
-        let fixture = include_str!("testdata/stream_json_subagent.jsonl");
-        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
-
-        let tool_names: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                ThreadEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
-        // Only the parent's two tool calls survive as real cards; the subagent's
-        // Read/Bash calls (`parent_tool_use_id`-tagged) route to the log, not a card.
-        assert_eq!(tool_names, ["Agent", "Bash"], "subagent tool calls leaked: {tool_names:?}");
-
-        // The subagent's child tool calls surface as SubagentAction lines addressed
-        // to the spawning Agent card's id — folded, they populate that card's log
-        // while the root transcript stays free of child bubbles.
-        use crate::thread::state::ChatThread;
-        let mut thread = ChatThread::new();
-        for ev in &events {
-            thread.apply(ev);
-        }
-        let agent_card = thread.entries.iter().find_map(|e| match e {
-            crate::thread::ThreadEntry::ToolCall(tc) if tc.name == "Agent" => Some(tc),
-            _ => None,
-        }).expect("Agent card exists");
-        assert!(!agent_card.subagent_log.is_empty(), "subagent log populated from child actions");
-        assert!(
-            agent_card.subagent_log.iter().any(|l| l.starts_with("Read ") || l.starts_with("Bash ")),
-            "child tool actions logged: {:?}", agent_card.subagent_log,
-        );
-
-        let turn_ends: Vec<&TurnUsage> = events
-            .iter()
-            .filter_map(|e| match e {
-                ThreadEvent::TurnEnded { usage: Some(u), .. } => Some(u),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(turn_ends.len(), 1, "exactly one turn-end (not the task-notification continuations)");
-        assert_eq!(turn_ends[0].output_tokens, 381, "usage footer must be the primary turn's, not a continuation's");
-    }
-
-    /// The fixture's `system/task_*` events decode into one subagent + one
-    /// background-bash task, each with a start and a terminal finish.
-    #[test]
-    fn spike_fixture_emits_background_task_events() {
-        use super::super::background_task::BackgroundTaskKind;
-        let fixture = include_str!("testdata/stream_json_subagent.jsonl");
-        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
-
-        let started: Vec<&ThreadEvent> = events
-            .iter()
-            .filter(|e| matches!(e, ThreadEvent::BackgroundTaskStarted { .. }))
-            .collect();
-        assert_eq!(started.len(), 2, "one subagent + one background bash started");
-        let kinds: Vec<&BackgroundTaskKind> = started
-            .iter()
-            .filter_map(|e| match e {
-                ThreadEvent::BackgroundTaskStarted { kind, .. } => Some(kind),
-                _ => None,
-            })
-            .collect();
-        assert!(kinds.iter().any(|k| matches!(k, BackgroundTaskKind::BackgroundBash)));
-        assert!(kinds.iter().any(|k| matches!(
-            k,
-            BackgroundTaskKind::Subagent { subagent_type } if subagent_type == "general-purpose"
-        )));
-
-        let finished = events
-            .iter()
-            .filter(|e| matches!(e, ThreadEvent::BackgroundTaskFinished { .. }))
-            .count();
-        assert!(finished >= 2, "both tasks reach a terminal finish, got {finished}");
     }
 }
 
 #[cfg(test)]
 #[path = "stream_json_receipt_tests.rs"]
 mod receipt_tests;
+
+#[cfg(test)]
+#[path = "stream_json_bracket_tests.rs"]
+mod bracket_tests;

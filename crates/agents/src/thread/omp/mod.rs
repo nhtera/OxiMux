@@ -648,6 +648,10 @@ impl AgentConnection for OmpRpcConnection {
         Ok(())
     }
 
+    fn exit_code(&self) -> Option<i32> {
+        super::connection::reap_exit_code(&self.child)
+    }
+
     fn shutdown(&self) {
         // Closing stdin resolves any pending approval as deny (verified live)
         // before the SIGTERM lands — teardown can't allow anything.

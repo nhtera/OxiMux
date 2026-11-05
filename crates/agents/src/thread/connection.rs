@@ -250,6 +250,14 @@ pub trait AgentConnection: Send + Sync {
     /// Terminate the session and its process.
     fn shutdown(&self);
 
+    /// How the agent's process ended, once it has, without blocking: its exit
+    /// code (`128 + signal` for one a signal ended). `None` while it runs, or
+    /// for a backend that cannot tell. Read after the output closes, so a dead
+    /// process can be reported with its code rather than as a guess.
+    fn exit_code(&self) -> Option<i32> {
+        None
+    }
+
     /// Interrupt the in-flight turn. Every backend does this over its own
     /// protocol — Claude `{subtype:"interrupt"}`, Codex `turn/interrupt`, pi
     /// `Abort`, ACP `session/cancel` — so none of them depends on a signal, and
@@ -584,6 +592,52 @@ pub struct StubConnection {
     /// Whether it reports receipts for tagged lines, as Claude does. False by
     /// default, like the trait.
     receipts: bool,
+    /// The exit code `exit_code` reports, set by a test playing a dead process.
+    exit: Arc<Mutex<Option<i32>>>,
+}
+
+/// Read `child`'s exit code without blocking (`128 + signal` when a signal
+/// ended it, the shell's convention). `None` while it still runs.
+///
+/// On Unix this does **not** reap: the exited child stays a zombie, so its pid
+/// (and for a group leader, its process-group id) cannot be reused before the
+/// adapter's own shutdown reaps it. Reaping here would let a later group kill
+/// by that id land on whatever process took the number in the meantime.
+pub(crate) fn reap_exit_code(child: &Mutex<std::process::Child>) -> Option<i32> {
+    let mut child = match child.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    #[cfg(unix)]
+    {
+        let _ = &mut child;
+        peek_exit_code(child.id())
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().ok()??.code()
+    }
+}
+
+/// `waitid(.., WNOWAIT)`: how `pid` ended, leaving it unreaped.
+#[cfg(unix)]
+fn peek_exit_code(pid: u32) -> Option<i32> {
+    // SAFETY: `info` is a plain C struct the call fills; zeroed is a valid
+    // initial value, and `si_pid == 0` after a WNOHANG call means "still
+    // running", which is checked before any other field is read.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        if libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) != 0 || info.si_pid() == 0 {
+            return None;
+        }
+        let status = info.si_status();
+        match info.si_code {
+            libc::CLD_EXITED => Some(status),
+            libc::CLD_KILLED | libc::CLD_DUMPED => Some(128 + status),
+            _ => None,
+        }
+    }
 }
 
 impl StubConnection {
@@ -592,6 +646,11 @@ impl StubConnection {
     pub fn new() -> (Self, Receiver<ThreadEvent>, Sender<ThreadEvent>) {
         let (tx, rx) = mpsc::channel();
         (Self::default(), rx, tx)
+    }
+
+    /// Play a process that exited with `code` (read by `exit_code`).
+    pub fn set_exit_code(&self, code: Option<i32>) {
+        *self.exit.lock().unwrap() = code;
     }
 
     /// Make the stub advertise `caps` (e.g. a rewind-capable Claude-like backend
@@ -636,6 +695,9 @@ impl StubConnection {
 }
 
 impl AgentConnection for StubConnection {
+    fn exit_code(&self) -> Option<i32> {
+        *self.exit.lock().unwrap()
+    }
     fn send_user_message(&self, text: &str) -> Result<()> {
         self.record(user_message_json(text));
         Ok(())

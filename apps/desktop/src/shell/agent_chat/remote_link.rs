@@ -167,13 +167,6 @@ impl AgentChatView {
             // Git RPCs resolve their repository from this.
             cwd: Some(self.cwd.clone()),
         });
-        // Every event batch passes through here, so the first batch of a turn
-        // and its `TurnEnded` both reach the host's lineage subscriber.
-        binding.set_working(
-            self.thread.turn_active
-                || self.thread.pending_permission().is_some()
-                || self.thread.pending_question().is_some(),
-        );
     }
 
     /// The model this tab is actually running under.

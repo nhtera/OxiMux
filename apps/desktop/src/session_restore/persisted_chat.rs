@@ -178,6 +178,10 @@ pub struct PersistedChatTranscript {
     /// restore with nothing armed, which is the pre-existing behaviour.
     #[serde(default)]
     pub pending_retry: Option<PersistedRetry>,
+    /// A turn, a continuation or background work was running at save time,
+    /// so a restart cut it short. `false` for older blobs.
+    #[serde(default)]
+    pub mid_turn: bool,
 }
 
 /// A retry armed at save time. Deliberately the *decision* (when, why, how many
@@ -262,6 +266,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: Some(true),
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -294,6 +299,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -329,6 +335,7 @@ mod tests {
             omp_posture: Some(OmpPosture::AlwaysAsk),
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -402,6 +409,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         }
     }
@@ -451,6 +459,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -489,6 +498,7 @@ mod tests {
             omp_posture: None,
             claude_fast_mode: None,
             pending_retry: None,
+            mid_turn: false,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

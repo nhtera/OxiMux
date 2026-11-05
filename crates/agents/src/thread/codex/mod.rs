@@ -498,6 +498,10 @@ impl AgentConnection for CodexAppServerConnection {
         }
     }
 
+    fn exit_code(&self) -> Option<i32> {
+        super::connection::reap_exit_code(&self.child)
+    }
+
     fn shutdown(&self) {
         let _ = self.outbound.send(Outbound::Shutdown);
         self.reap();

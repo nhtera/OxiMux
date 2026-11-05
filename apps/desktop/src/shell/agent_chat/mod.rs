@@ -52,6 +52,11 @@ mod remote_link;
 mod posture_snapshot;
 mod respawn_gate;
 mod drain;
+mod health_link;
+mod lifecycle;
+mod overlays;
+#[cfg(test)]
+mod test_support;
 mod send_gate_link;
 mod sign_in;
 mod message_rail;
@@ -587,6 +592,8 @@ pub struct AgentChatView {
     send_gate: Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>,
     /// The id the next write goes out under (a gate item's), else a fresh one.
     pending_send_uuid: Option<uuid::Uuid>,
+    /// Health facts the fold does not keep (`health_link.rs`).
+    health: health_link::HealthTrack,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
     /// remote control is disabled (the common case → zero per-event cost). `Some`
     /// only while a connection is bound and remote is enabled; each `ThreadEvent`
@@ -2116,6 +2123,7 @@ impl AgentChatView {
         self.interrupt_turn(cx);
         self.interrupted = true;
         self.thread.interrupt();
+        self.publish_health();
         self.sync_composer(cx);
         cx.notify();
     }
@@ -2550,224 +2558,6 @@ impl AgentChatView {
         .detach();
     }
 
-    /// Test-only constructor: inject a connection (a `StubConnection`) instead
-    /// of spawning a real subprocess, and skip the background drain so a
-    /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
-    #[cfg(test)]
-    pub(crate) fn with_connection_for_test(
-        connection: Arc<dyn AgentConnection>,
-        theme: Theme,
-        density: Density,
-        typography: Typography,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let composer = cx.new(|cx| {
-            ComposerView::new(
-                theme,
-                density,
-                typography.clone(),
-                ChatBackend::stream_json().provider_display_name(),
-                window,
-                cx,
-            )
-        });
-        // Mirror `new`: seed the palette's command metadata from the backend, so
-        // a test exercises the same path the real constructor takes.
-        push_slash_catalog(Some(connection.as_ref()), &composer, std::path::Path::new(""), cx);
-        // No thread yet in this constructor, so the placeholder is correct: a
-        // test view has never run and so has no agent session id to key on.
-        let remote_session_id = remote_session_id_for(None);
-        let remote = cx
-            .try_global::<RemoteControl>()
-            .and_then(|rc| rc.bind(&remote_session_id, connection.clone()));
-
-        let focus = cx.focus_handle();
-        Self {
-            thread: ChatThread::new(),
-            connection: Some(connection),
-            remote_session_id,
-            spawn_posture: Default::default(),
-            posture_refused: None,
-            send_gate: Self::new_send_gate(),
-            pending_send_uuid: None,
-            pending_respawn: false,
-            remote,
-            backend: ChatBackend::stream_json(),
-            composer,
-            session_detail_open: false,
-            last_notify: std::time::Instant::now(),
-            flush_scheduled: false,
-            probed_catalogs: HashMap::new(),
-            // The injected StubConnection is the whole point: no subprocess.
-            probe_catalogs_live: false,
-            focus_handle: focus.clone(),
-            scroll: transcript::ScrollState::new(),
-            markdown: markdown_state::Markdown::new(cx.entity_id(), focus),
-            stick_to_bottom: true,
-            // Kick the follow so a restored transcript (which loads at
-            // construction, not via `on_event`) is pinned to the true bottom
-            // once its async markdown layout settles.
-            follow_frames: FOLLOW_FRAMES,
-            last_max_offset: 0.0,
-            theme,
-            density,
-            typography,
-            screen_control: ScreenControl::new(&PathBuf::new()),
-            screen_prompts: HashMap::new(),
-            cwd: PathBuf::new(),
-            model: None,
-            permission_mode: None,
-            effort: None,
-            feature_values: HashMap::new(),
-            disconnected: false,
-            interrupted: false,
-            retry: retry::ChatRetry::default(),
-            dormant: false,
-            publish_throttle: publish_throttle::PublishThrottle::new(),
-            last_saved_revision: std::cell::Cell::new(u64::MAX),
-            meta_dirty: std::cell::Cell::new(false),
-            // The test injects a live connection, so this chat is already bound.
-            unbound: false,
-            unbound_agent_id: None,
-            view_mode: ChatViewMode::Chat,
-            terminal: None,
-            companion_session: None,
-            chat_advanced_since_companion: false,
-            companion_spawn_pending: false,
-            _terminal_observer: None,
-            expanded_thinking: HashSet::new(),
-            collapsed_thinking: HashSet::new(),
-            thinking_level: ThinkingLevel::default(),
-            expanded_tool_calls: HashSet::new(),
-            expanded_tool_runs: HashSet::new(),
-            image_cache: ImageCache::new(),
-            preview: None,
-            forge_picker: None,
-            forge_picker_gen: 0,
-            _forge_task: None,
-            open_tool_sheet: None,
-            sheet_copied: false,
-            _sheet_copy_task: None,
-            _drain_task: None,
-            drain_gen: 0,
-            _remote_prompt_task: None,
-            _remote_choice_task: None,
-            remote_choice_tx: None,
-            _subscriptions: Vec::new(),
-            question_cards: HashMap::new(),
-            question_card_subs: HashMap::new(),
-            embedded_terminals: HashMap::new(),
-            embedded_terminal_subs: HashMap::new(),
-            env_inputs: Vec::new(),
-            env_input_subs: Vec::new(),
-            auth: None,
-            checkpoint_engine: None,
-            pre_turn_checkpoint: None,
-            rewind_confirm: None,
-            rewinding: false,
-            rewind_then_send: None,
-            pending_edit: None,
-            pane_group: None,
-            remote_tab_title: None,
-            show_background_tasks: false,
-            flash_entry: None,
-            flash_frames: 0,
-            drop_hint: None,
-            recently_copied: None,
-            _copied_clear_task: None,
-            rows: RefCell::new(Vec::new()),
-            find_bar: None,
-            rail_hover: false,
-            menu_hover: false,
-            title_generated: false,
-            title_task: None,
-            is_git_project: false,
-            worktree_draft_enabled: false,
-            worktree_slug_input: None,
-            _worktree_slug_sub: None,
-            worktree_create_state: roster::WorktreeCreateState::default(),
-            pending_worktree_send: None,
-            worktree_branch_label: None,
-            import_bridge: None,
-        }
-    }
-
-    /// Test-only: whether an agent connection is live behind this view. Lets a
-    /// test assert the chat is usable, rather than inferring it from a method
-    /// that would consume the connection to look.
-    #[cfg(test)]
-    pub(super) fn has_connection_for_test(&self) -> bool {
-        self.connection.is_some()
-    }
-
-    /// Test-only: put this view into the unbound *New Agent* draft state (no
-    /// connection, Claude picked) so a `#[gpui::test]` can drive `change_agent` /
-    /// `change_model` on a draft without spawning a subprocess.
-    #[cfg(test)]
-    fn make_unbound_for_test(&mut self) {
-        self.connection = None;
-        self.unbound = true;
-        self.unbound_agent_id = Some("claude-code".to_string());
-        self.backend = ChatBackend::stream_json();
-        self.model = Some("opus".to_string());
-    }
-
-    /// Test-only: the inverse of [`Self::make_unbound_for_test`] — mark the draft
-    /// as bound the way a successful first send does, without spawning anything.
-    /// The stub connection the test harness injects stands in for the real one.
-    #[cfg(test)]
-    fn make_bound_for_test(&mut self) {
-        self.unbound = false;
-        self.unbound_agent_id = None;
-    }
-
-    /// Test-only: override `is_git_project` — the real constructor derives it
-    /// from a `.git` stat on `cwd`, which a `#[gpui::test]`'s throwaway path
-    /// never has, so tests that need the worktree-toggle to render set it here.
-    #[cfg(test)]
-    fn set_git_project_for_test(&mut self, is_git: bool) {
-        self.is_git_project = is_git;
-    }
-
-    #[cfg(test)]
-    fn worktree_draft_enabled_for_test(&self) -> bool {
-        self.worktree_draft_enabled
-    }
-
-    #[cfg(test)]
-    fn worktree_create_state_for_test(&self) -> &roster::WorktreeCreateState {
-        &self.worktree_create_state
-    }
-
-    #[cfg(test)]
-    fn backend_transport_for_test(&self) -> Transport {
-        self.backend.transport
-    }
-
-    #[cfg(test)]
-    fn model_for_test(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-
-    #[cfg(test)]
-    fn unbound_agent_id_for_test(&self) -> Option<&str> {
-        self.unbound_agent_id.as_deref()
-    }
-
-    /// Test-only: whether a subprocess connection exists at all — distinct from
-    /// [`Self::is_bound_for_test`], which also requires the view to *know* it's
-    /// bound. The gap between the two is exactly the bug `/clear` used to cause.
-    #[cfg(test)]
-    fn connection_is_live_for_test(&self) -> bool {
-        self.connection.is_some()
-    }
-
-    #[cfg(test)]
-    fn is_bound_for_test(&self) -> bool {
-        !self.unbound && self.connection.is_some()
-    }
-
     /// The sender for this tab's choice relay, starting the relay on first use.
     ///
     /// One relay per view for its whole life, rather than one per binding: a
@@ -2846,6 +2636,7 @@ impl AgentChatView {
             if let Some(binding) = &self.remote {
                 binding.ingest(ev.clone());
             }
+            self.health.note_event(&ev, oximux_agents::session_health::now_ms());
             let refuse_plan = self.before_apply(&ev, cx);
             self.apply_event(ev, cx);
             self.after_apply(refuse_plan);
@@ -2861,6 +2652,7 @@ impl AgentChatView {
         // lands in the same batch). Done here, at the one place every event passes
         // through, rather than at each site that can change them.
         self.publish_remote_meta();
+        self.publish_health();
         if all_delta {
             self.notify_throttled(cx);
         } else {
@@ -3092,65 +2884,6 @@ impl AgentChatView {
         }
     }
 
-    /// Send the oldest message the composer parked while a turn streamed, if any.
-    /// Driven off the natural turn-end edge in [`Self::on_event`]; since each
-    /// completed turn releases exactly one, a lined-up batch drains in order.
-    fn flush_next_queued(&mut self, cx: &mut Context<Self>) {
-        match self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
-            Some((text, images)) => self.send_text(text, images, cx),
-            None => self.flush_send_gate(cx),
-        }
-    }
-
-    /// The event channel closed — the agent process exited or its stdout was
-    /// closed. Fail closed: if a permission was still pending, reject it (the
-    /// tool never ran, since the process is gone). Best-effort deny in case
-    /// stdin is briefly still writable, then mark the tool `Rejected` so the UI
-    /// never shows a dangling approval prompt.
-    fn on_disconnect(&mut self, cx: &mut Context<Self>) {
-        // The live process is gone: drop the remote binding so the phone's session
-        // list reflects only live sessions (a resume respawns + re-binds).
-        self.unbind_remote();
-        self.revoke_spawn_credential(cx);
-        let pending = self
-            .thread
-            .pending_permission()
-            .map(|(tool_id, req)| (tool_id.to_string(), req.request_id.clone()));
-        if let Some((tool_id, request_id)) = pending {
-            if let Some(conn) = &self.connection {
-                let _ = conn.resolve_permission(
-                    &request_id,
-                    PermissionDecision::Deny { message: "agent disconnected".into() },
-                );
-            }
-            self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
-        }
-        // Fail-close a pending AskUserQuestion too: the process is gone, so it can
-        // never be answered — reject it and drop its card rather than stranding an
-        // unanswerable prompt.
-        if let Some(tool_id) = self.thread.pending_question().map(|(id, _)| id.to_string()) {
-            self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
-            self.question_cards.remove(&tool_id);
-            self.question_card_subs.remove(&tool_id);
-        }
-        self.thread.turn_active = false;
-        if self.interrupted {
-            // Intentional Stop: the child exited exactly as asked. Stay
-            // resumable-idle (the next send respawns via `--resume`) instead of
-            // marking the tab unavailable.
-            self.thread.last_error = None;
-            self.sync_composer(cx);
-            cx.notify();
-            return;
-        }
-        self.disconnected = true;
-        if self.thread.last_error.is_none() {
-            self.thread.last_error = Some("Agent process exited.".into());
-        }
-        self.sync_composer(cx);
-        cx.notify();
-    }
-
     /// Whether entry `idx`'s thinking block renders expanded, resolving the
     /// chat-wide level against the user's per-entry expand/collapse overrides.
     /// In `Auto`, the streaming thought (last entry, turn active, no text yet)
@@ -3374,6 +3107,7 @@ impl AgentChatView {
             }
         };
         self.thread.set_tool_status(&tool_id, status);
+        self.publish_health();
         cx.notify();
     }
 
@@ -3598,6 +3332,7 @@ impl AgentChatView {
         self.thread.set_tool_status(&tool_id, ToolCallStatus::InProgress);
         self.question_cards.remove(&tool_id);
         self.question_card_subs.remove(&tool_id);
+        self.publish_health();
         cx.notify();
     }
 
@@ -3876,200 +3611,6 @@ impl AgentChatView {
             );
         }
         Some(thumbs.into_any_element())
-    }
-
-    /// Open the full-size lightbox on one message's image.
-    fn open_image_preview(&mut self, entry_idx: usize, img_idx: usize, cx: &mut Context<Self>) {
-        self.preview = Some((entry_idx, img_idx));
-        cx.notify();
-    }
-
-    /// Dismiss the lightbox (backdrop click or the ✕).
-    fn close_image_preview(&mut self, cx: &mut Context<Self>) {
-        if self.preview.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Open the fullscreen payload sheet on a tool call. The image lightbox and
-    /// the sheet are mutually exclusive overlays — opening one closes the other.
-    /// Focus moves to the view root so Escape dispatches from here (the overlay
-    /// handlers' context) instead of being eaten by the composer input's IME —
-    /// the same "focus the dialog on open" rule the find bar follows.
-    fn open_tool_sheet(&mut self, tool_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview = None;
-        self.sheet_copied = false;
-        self.open_tool_sheet = Some(tool_id);
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    /// Dismiss the tool sheet (backdrop click, the ✕, or Escape) and return focus
-    /// to the composer so typing resumes immediately (mirrors the find bar).
-    fn close_tool_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open_tool_sheet.take().is_some() {
-            self.sheet_copied = false;
-            self.composer.read(cx).focus_handle(cx).focus(window, cx);
-            cx.notify();
-        }
-    }
-
-    /// Flash the sheet's Copy control to "Copied ✓" for a beat.
-    fn flash_sheet_copied(&mut self, cx: &mut Context<Self>) {
-        self.sheet_copied = true;
-        cx.notify();
-        self._sheet_copy_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(1400))
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.sheet_copied {
-                    view.sheet_copied = false;
-                    cx.notify();
-                }
-            });
-        }));
-    }
-
-    /// The live tool call backing the open sheet, looked up by id across the
-    /// thread's tool calls each render (so a still-running tool grows in place).
-    /// `None` if no sheet is open or the id is gone (e.g. after a rewind).
-    fn open_sheet_tool_call(&self) -> Option<&ToolCall> {
-        let id = self.open_tool_sheet.as_deref()?;
-        self.thread.entries.iter().find_map(|e| match e {
-            ThreadEntry::ToolCall(tc) if tc.id == id => Some(tc),
-            _ => None,
-        })
-    }
-
-    /// The fullscreen tool-payload sheet, rendered over everything when
-    /// [`Self::open_tool_sheet`] names a still-present tool call.
-    fn render_tool_sheet(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let tc = self.open_sheet_tool_call()?;
-        Some(tool_sheet::render_tool_sheet(
-            tc,
-            self.sheet_copied,
-            self.theme,
-            self.density,
-            &self.typography,
-            cx,
-        ))
-    }
-
-    /// Step within the CURRENT message's image group, wrapping at the ends.
-    fn step_image_preview(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if let Some((entry, img)) = self.preview {
-            let n = self.entry_images(entry).len();
-            if n == 0 {
-                return;
-            }
-            let next = (img as isize + delta).rem_euclid(n as isize) as usize;
-            self.preview = Some((entry, next));
-            cx.notify();
-        }
-    }
-
-    /// The full-size image lightbox: a dimmed backdrop (click to dismiss) with
-    /// the current image fit (aspect-preserved), a ‹ N of M › pager across the
-    /// SAME message's images, and a ✕ — Claude-Desktop-style. Rendered over
-    /// everything when [`Self::preview`] is set.
-    fn render_image_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (entry, img_idx) = self.preview?;
-        let group = self.entry_images(entry);
-        let i = img_idx.min(group.len().saturating_sub(1));
-        let image = group.get(i)?.clone();
-        let n = group.len();
-        let theme = self.theme;
-        let typo = &self.typography;
-
-        // A circular control glyph used for the ✕ and the ‹ › arrows.
-        let control = |id: &'static str, glyph: &'static str| {
-            div()
-                .id(id)
-                .size(px(30.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .bg(theme.bg_panel)
-                .border_1()
-                .border_color(theme.border_input)
-                .text_color(theme.fg_muted)
-                .cursor_pointer()
-                .hover(|s| s.text_color(theme.fg_base))
-                .child(SharedString::from(glyph))
-        };
-
-        // The image box is sized RELATIVE TO THE BACKDROP (a definite full-window
-        // box), NOT a shrink-wrapped column — otherwise `relative(..)` resolves
-        // against an auto-sized parent and collapses to zero (blank image). It's
-        // a direct child of the backdrop for that reason. Clicking the image
-        // itself is swallowed so only the dark margin (or ✕) dismisses.
-        let image_box = div()
-            .w(relative(0.86))
-            .h(relative(0.78))
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-            .child(
-                img(ImageSource::Image(image))
-                    .size_full()
-                    .object_fit(ObjectFit::Contain),
-            );
-
-        let pager = (n > 1).then(|| {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(16.0))
-                // Clicks on the pager (label / gaps) shouldn't close either.
-                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-                .child(control("chat-image-prev", "‹").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _e, _w, cx| this.step_image_preview(-1, cx)),
-                ))
-                .child(
-                    div()
-                        .text_size(px(typo.t_body_sm))
-                        .text_color(theme.fg_muted)
-                        .child(SharedString::from(format!("{} of {}", i + 1, n))),
-                )
-                .child(control("chat-image-next", "›").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _e, _w, cx| this.step_image_preview(1, cx)),
-                ))
-        });
-
-        Some(
-            div()
-                .id("chat-image-preview")
-                .absolute()
-                .inset_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(12.0))
-                .bg(gpui::black().opacity(0.82))
-                // A click on the bare (dark) backdrop closes the lightbox.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _e, _w, cx| this.close_image_preview(cx)),
-                )
-                .child(image_box)
-                .children(pager)
-                // ✕ sits on the backdrop, so clicking it bubbles to the close
-                // handler.
-                .child(
-                    control("chat-image-preview-close", "✕")
-                        .absolute()
-                        .top(px(16.0))
-                        .right(px(16.0)),
-                )
-                .into_any_element(),
-        )
     }
 
     /// The Background Tasks toggle chip + inline drawer, shown once the current

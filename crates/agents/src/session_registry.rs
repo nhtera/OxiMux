@@ -221,6 +221,9 @@ pub struct SessionHandle {
     /// operator-edited approval can be recorded as such.
     pending: Mutex<HashMap<String, PendingPermission>>,
     status_tx: watch::Sender<SessionStatus>,
+    /// The session's health: the driver's published facts and what they mean
+    /// (`session_health.rs`).
+    pub(crate) health: crate::session_health::HealthCell,
     /// Display metadata published by the desktop view (title/model).
     meta: Mutex<SessionMeta>,
     /// The latest folded-transcript snapshot the desktop view published, served to a
@@ -295,6 +298,11 @@ impl SessionHandle {
         // ring remote clients read (an older client could not decode it).
         if event.is_receipt() {
             let _ = self.receipts.send(event);
+            return self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        }
+        // Turn brackets feed the host's health through the driver's fold; the
+        // ring stays in the vocabulary remote clients decode.
+        if event.is_turn_bracket() {
             return self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
         }
         // Track outstanding permission requests for the coarse status snapshot —
@@ -447,7 +455,15 @@ impl SessionHandle {
                 let _ = tx.unbounded_send(event);
             }
         }
+        if self.health.published() {
+            self.rederive_health(crate::session_health::now_ms());
+        }
         Ok(true)
+    }
+
+    /// Whether `request_id` was decided through this handle.
+    pub(crate) fn decided_contains(&self, request_id: &str) -> bool {
+        self.decided.lock().unwrap().contains(request_id)
     }
 
     /// Put a line in this session's transcript that no backend will echo: the
@@ -491,6 +507,9 @@ impl SessionHandle {
         }
         self.pending.lock().unwrap().remove(request_id);
         self.update_status(None);
+        if self.health.published() {
+            self.rederive_health(crate::session_health::now_ms());
+        }
         Ok(true)
     }
 
@@ -623,7 +642,18 @@ impl SessionHandle {
     /// such frame as an already-seen duplicate and silently drops it, with no gap
     /// to trigger a resync. Swapping keeps the stream monotonic instead.
     pub fn swap_connection(&self, conn: Arc<dyn AgentConnection>) {
-        *self.conn.lock().unwrap() = conn;
+        let mut current = self.conn.lock().unwrap();
+        if Arc::ptr_eq(&current, &conn) {
+            return; // the same process re-bound (access switched back on)
+        }
+        *current = conn;
+        drop(current);
+        // A new process numbers its requests afresh (Codex reuses JSON-RPC
+        // ids from 1): an id decided for the old one must not read as decided,
+        // or refuse an answer, for the new one's prompt.
+        self.decided.lock().unwrap().clear();
+        self.pending.lock().unwrap().clear();
+        self.update_status(None);
     }
 
     /// The models this session's backend offers, for a remote picker.
@@ -845,12 +875,14 @@ pub struct SessionRegistry {
     /// list-visible state changes. A session-list subscriber awaits this and
     /// re-snapshots, so the phone is pushed the list rather than polling it.
     changed: watch::Sender<u64>,
+    /// The health thresholds every session derives with (the host config).
+    health_cfg: Arc<std::sync::RwLock<crate::health::HealthConfig>>,
 }
 
 impl Default for SessionRegistry {
     fn default() -> Self {
         let (changed, _) = watch::channel(0);
-        Self { sessions: Mutex::new(HashMap::new()), changed }
+        Self { sessions: Mutex::new(HashMap::new()), changed, health_cfg: Default::default() }
     }
 }
 
@@ -907,6 +939,7 @@ impl SessionRegistry {
             decided: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             status_tx,
+            health: crate::session_health::HealthCell::new(self.health_cfg.clone()),
             meta: Mutex::new(SessionMeta::default()),
             transcript: Mutex::new(None),
             remote_prompt_tx: Mutex::new(None),
@@ -936,6 +969,17 @@ impl SessionRegistry {
     /// Look up a live session handle.
     pub fn get(&self, id: &str) -> Option<Arc<SessionHandle>> {
         self.sessions.lock().unwrap().get(id).cloned()
+    }
+
+    /// Every live session, for a periodic look across them.
+    pub fn handles(&self) -> Vec<(SessionId, Arc<SessionHandle>)> {
+        self.sessions.lock().unwrap().iter().map(|(id, h)| (id.clone(), h.clone())).collect()
+    }
+
+    /// Set the health thresholds; every session derives with them from its
+    /// next look.
+    pub fn set_health_config(&self, cfg: crate::health::HealthConfig) {
+        *self.health_cfg.write().unwrap() = cfg;
     }
 
     /// Number of live sessions.

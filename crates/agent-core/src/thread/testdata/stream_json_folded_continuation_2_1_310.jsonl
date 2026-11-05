@@ -1,0 +1,14 @@
+{"type": "command_lifecycle", "command_uuid": "04653c02-ce8d-408e-94b5-711dfa0b6346", "state": "queued", "session_id": "sid-fold"}
+{"type": "command_lifecycle", "command_uuid": "04653c02-ce8d-408e-94b5-711dfa0b6346", "state": "started", "session_id": "sid-fold"}
+{"type": "system", "subtype": "init", "session_id": "sid-fold", "model": "claude-haiku-5-5", "claude_code_version": "2.1.310", "permissionMode": "default"}
+{"type": "system", "subtype": "task_started", "task_id": "bf532o979", "session_id": "sid-fold", "task_type": "local_bash", "tool_use_id": "toolu_014pDT6PGttHWgfE2zBVhA6h"}
+{"type": "system", "subtype": "task_notification", "task_id": "bf532o979", "session_id": "sid-fold", "status": "completed", "tool_use_id": "toolu_014pDT6PGttHWgfE2zBVhA6h"}
+{"type": "result", "subtype": "success", "is_error": false, "num_turns": 2, "session_id": "sid-fold", "usage": {"output_tokens": 412}, "user_message_uuids": ["04653c02-ce8d-408e-94b5-711dfa0b6346"], "result": "started"}
+{"type": "command_lifecycle", "command_uuid": "04653c02-ce8d-408e-94b5-711dfa0b6346", "state": "completed", "session_id": "sid-fold"}
+{"type": "system", "subtype": "init", "session_id": "sid-fold", "model": "claude-haiku-5-5", "claude_code_version": "2.1.310", "permissionMode": "default"}
+{"type": "system", "subtype": "task_started", "task_id": "bz7o9p1hx", "session_id": "sid-fold", "task_type": "local_bash", "tool_use_id": "toolu_01UkGSJF8iLywLTGhaAcd1CP"}
+{"type": "command_lifecycle", "command_uuid": "971639b3-5047-4f86-923a-df583a1236fe", "state": "queued", "session_id": "sid-fold"}
+{"type": "system", "subtype": "task_notification", "task_id": "bz7o9p1hx", "session_id": "sid-fold", "status": "completed", "tool_use_id": "toolu_01UkGSJF8iLywLTGhaAcd1CP"}
+{"type": "command_lifecycle", "command_uuid": "971639b3-5047-4f86-923a-df583a1236fe", "state": "started", "session_id": "sid-fold"}
+{"type": "command_lifecycle", "command_uuid": "971639b3-5047-4f86-923a-df583a1236fe", "state": "completed", "session_id": "sid-fold"}
+{"type": "result", "subtype": "success", "is_error": false, "num_turns": 2, "session_id": "sid-fold", "usage": {"output_tokens": 400}, "origin": {"kind": "task-notification"}, "user_message_uuids": ["971639b3-5047-4f86-923a-df583a1236fe"], "result": "PINEAPPLE"}

@@ -350,6 +350,7 @@ impl AgentChatView {
             pending_respawn: false,
             send_gate,
             pending_send_uuid: None,
+            health: Default::default(),
             remote,
             backend,
             composer,

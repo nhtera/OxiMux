@@ -39,6 +39,9 @@ use crate::outbox_drainer::{self, DrainMsg};
 /// so children that finish together reach their parent as one message.
 pub const EVENT_DEBOUNCE: Duration = Duration::from_secs(2);
 
+/// How often the host re-derives every session's health (the stall clock).
+pub const HEALTH_TICK: Duration = Duration::from_secs(30);
+
 /// Who held the data directory before this host won its lock.
 ///
 /// Winning the lock proves the previous holder is gone (the OS released its
@@ -126,7 +129,9 @@ impl HostCore {
             drain: drain.clone(),
             debounce: Mutex::new(EVENT_DEBOUNCE),
         });
+        core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
+        core.spawn_health_ticker();
         core.rt.spawn(outbox_drainer::run(Arc::downgrade(&core), drain, drain_rx));
         core
     }
@@ -257,7 +262,9 @@ impl HostCore {
     /// Apply new settings. Sanitized on the way in, so a stored depth above the
     /// ceiling never takes effect.
     pub fn set_config(&self, config: HostConfig) {
-        self.config.send_replace(config.sanitized());
+        let config = config.sanitized();
+        self.registry.set_health_config(config.health());
+        self.config.send_replace(config);
     }
 
     /// Answers "is this session working?" for reservation-time reconcile, from
@@ -328,6 +335,50 @@ impl HostCore {
             if let Err(err) = result {
                 tracing::warn!(%err, session, "lineage sync: write failed");
             }
+        }
+    }
+
+    /// The one stall clock for every session: a quiet working session turns
+    /// stalled with time alone, which no event would ever report. A tick that
+    /// comes far later than its interval means the machine slept, and that
+    /// silence is forgiven rather than read as a burst of stalls.
+    fn spawn_health_ticker(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.rt.spawn(async move {
+            let mut last = (std::time::Instant::now(), oximux_agents::session_health::now_ms());
+            loop {
+                tokio::time::sleep(HEALTH_TICK).await;
+                let Some(core) = weak.upgrade() else { return };
+                let tick = (std::time::Instant::now(), oximux_agents::session_health::now_ms());
+                let woke = oximux_agents::health::slept(
+                    tick.0.duration_since(last.0).as_millis() as i64,
+                    tick.1 - last.1,
+                    HEALTH_TICK.as_millis() as i64,
+                );
+                last = tick;
+                core.refresh_health(tick.1, woke);
+            }
+        });
+    }
+
+    /// Re-derive every live session's health at `now`, folding in its working
+    /// children. `woke`: the clock just slept, so silence so far is forgiven.
+    pub fn refresh_health(&self, now: i64, woke: bool) {
+        let handles = self.registry.handles();
+        for (id, handle) in &handles {
+            if woke {
+                handle.forgive_until(now);
+            }
+            let children: Vec<_> = self
+                .lineage
+                .children(id, false)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|row| row.session_id)
+                .filter_map(|child| self.registry.get(&child))
+                .collect();
+            let activity = oximux_agents::session_health::child_activity(children.iter().map(|c| c.as_ref()));
+            handle.refresh_health(now, activity);
         }
     }
 

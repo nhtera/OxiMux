@@ -80,6 +80,13 @@ pub struct ChatThread {
     /// Whether a turn is currently in flight (between a user send and
     /// `TurnEnded`). Drives the composer's send/stop affordance.
     pub turn_active: bool,
+    /// Continuation turns the provider is running on its own: a Claude parent
+    /// wakes once per finished background task after its user turn ended, and
+    /// nothing in `turn_active` covers that work. Counted from
+    /// [`ThreadEvent::ProviderTurnStarted`] while no host turn runs, down on
+    /// [`ThreadEvent::ContinuationEnded`], floored at 0 (the two can arrive out
+    /// of order). Cleared when the process goes away or is stopped.
+    pub continuations_open: u32,
     /// Whether the backend is compacting context right now (Claude
     /// `system/status status="compacting"`). Set on `CompactionStarted`, cleared
     /// when the `CompactBoundary` divider lands or the turn ends without one — so
@@ -552,11 +559,24 @@ impl ChatThread {
             ThreadEvent::RateLimitUpdated(info) => {
                 self.last_rate_limit = Some(info.clone());
             }
+            ThreadEvent::ProviderTurnStarted => {
+                if !self.turn_active {
+                    self.continuations_open += 1;
+                }
+            }
+            ThreadEvent::ContinuationEnded => {
+                self.continuations_open = self.continuations_open.saturating_sub(1);
+            }
             // Receipts about the host's own sends: nothing to show.
             ThreadEvent::UserMessageAccepted { .. }
             | ThreadEvent::UserMessagesDelivered { .. }
             | ThreadEvent::UserMessageDropped { .. } => {}
             ThreadEvent::TurnEnded { is_error, result, usage, turn_diff } => {
+                // With no host turn running, a result ends a turn the
+                // provider started itself: close it, whatever its origin says.
+                if !self.turn_active {
+                    self.continuations_open = self.continuations_open.saturating_sub(1);
+                }
                 self.turn_active = false;
                 // Clear a dangling compaction spinner if the turn ended without a
                 // boundary event (e.g. a compaction that failed or was aborted).
@@ -768,6 +788,7 @@ impl ChatThread {
     pub fn interrupt(&mut self) {
         self.touch();
         self.turn_active = false;
+        self.continuations_open = 0;
         // A tool whose arguments were still streaming (`content_block_start` opened
         // the card, the finalized `tool_use` block never arrived) would otherwise
         // show "streaming…" forever after the turn is killed. Stop tracking it and

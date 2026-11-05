@@ -183,6 +183,7 @@ impl AgentChatView {
         });
         self.retry.pending = Some(PendingRetry { wake_at_ms, reason, _task: task });
         self.mark_retry_dirty();
+        self.publish_health();
         cx.notify();
     }
 
@@ -258,6 +259,7 @@ impl AgentChatView {
         self.thread.last_error = Some(format!("{} — retry cancelled.", pending.reason));
         self.retry.attempt = 0;
         self.mark_retry_dirty();
+        self.publish_health();
         cx.notify();
     }
 
@@ -351,6 +353,8 @@ impl AgentChatView {
                         Ok(()) => {
                             self.thread.last_error = None;
                             self.thread.turn_active = true;
+                            self.health.note_sent(oximux_agents::session_health::now_ms());
+                            self.publish_health();
                             true
                         }
                         Err(e) => {

@@ -202,6 +202,22 @@ impl RemoteBinding {
         self.handle.set_working(working);
     }
 
+    /// Publish the session's health facts; the handle derives its health and
+    /// working flag from them.
+    pub fn publish_health(&self, inputs: oximux_agents::health::HealthInputs) {
+        self.handle.publish_health(inputs);
+    }
+
+    /// The health thresholds the host derives with.
+    pub fn health_config(&self) -> oximux_agents::health::HealthConfig {
+        self.handle.health_config()
+    }
+
+    /// The registered run's id (new on every registration), for edge ids.
+    pub fn incarnation(&self) -> String {
+        self.handle.incarnation().to_string()
+    }
+
     /// Publish the folded transcript so a remote client opening this session sees
     /// its full history — including one restored from disk after a restart, which
     /// never entered the event ring. `entries_json` is the folded `Vec<ThreadEntry>`
