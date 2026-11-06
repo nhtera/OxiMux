@@ -87,6 +87,9 @@ impl AgentChatView {
                 // empty. Meta too, so the row is labelled from the first list.
                 self.publish_remote_meta();
                 self.publish_remote_transcript();
+                // And its health, so the host sees what the chat knows from the
+                // start (a restored chat owing a recovery note, before any frame).
+                self.publish_health();
                 // Re-arm the remote-prompt echo relay against the new binding.
                 let (tx, rx) = futures::channel::mpsc::unbounded();
                 let (event_tx, event_rx) = futures::channel::mpsc::unbounded();

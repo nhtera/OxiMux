@@ -330,7 +330,7 @@ fn boot_reconcile_deletes_reservations_and_parks_active_rows() {
     let s = store();
     spawn(&s, "root", "r1", "c1");
     let _ = s.reserve(&parent("root"), &spec("r2"), caps(), &all_working, t0()).unwrap();
-    s.boot_reconcile(t0()).unwrap();
+    assert_eq!(s.boot_reconcile(t0()).unwrap(), ["c1"], "the parked ones are named");
     assert_eq!(s.row("c1").unwrap().unwrap().state, LineageState::Parked);
     assert!(s.find_by_request("root", "r2").unwrap().is_none(), "the reservation is gone");
 }
@@ -343,7 +343,7 @@ fn quitting_never_ends_rows() {
         spawn(&s, "root", &format!("r{i}"), &format!("c{i}"));
         s.park(&format!("c{i}"), settled()).unwrap();
     }
-    s.boot_reconcile(secs(100)).unwrap();
+    assert!(s.boot_reconcile(secs(100)).unwrap().is_empty(), "nothing was working");
     assert!(s.children("root", false).unwrap().iter().all(|r| r.state == LineageState::Parked));
 }
 

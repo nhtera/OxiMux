@@ -69,3 +69,12 @@ fn resolved_rows_are_pruned_after_a_day_and_a_fresh_live_one_is_kept() {
     assert_eq!(s.prune(later).unwrap(), 1);
     assert!(s.live("s").unwrap().is_some());
 }
+
+#[test]
+fn a_resolved_retry_cannot_fire() {
+    let s = store();
+    s.arm("s", "t", "window", "r", 1, "h", t0()).unwrap();
+    assert_eq!(s.fired("s", "t").unwrap(), 1);
+    assert!(s.resolve("s", Resolution::Exhausted, t0()).unwrap());
+    assert_eq!(s.fired("s", "t").unwrap(), 1, "the count stays where the retry ended");
+}

@@ -22,7 +22,7 @@ mod health_push;
 mod heartbeats;
 mod pairing_admin;
 mod schedules;
-mod send_v2;
+pub(crate) mod send_v2;
 mod serve;
 mod sim_view;
 mod simulator;

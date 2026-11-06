@@ -138,6 +138,9 @@ pub struct HealthInputs {
     pub process: Process,
     /// Set from a restart until the first frame on the new connection.
     pub restored: Option<Restored>,
+    /// A restart cut a turn short and the agent has not been told yet: the
+    /// note goes with the next message. Frames do not clear it; that send does.
+    pub recovery_note_owed: bool,
     /// Messages restored from before a restart, held for the user.
     pub held_restored: u32,
     /// Messages queued behind the running turn.

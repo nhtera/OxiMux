@@ -83,7 +83,7 @@ impl Dispatcher {
 
 /// The uuid a keyed send goes out under: the same for every retry of the key,
 /// and unchanged when the session moves to its agent's id.
-fn send_uuid(key: &str) -> Uuid {
+pub(crate) fn send_uuid(key: &str) -> Uuid {
     let digest = Sha256::digest(format!("send-v2\0{key}").as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);

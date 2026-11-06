@@ -247,7 +247,7 @@ impl AgentChatView {
                         continue;
                     }
                     match steer {
-                        Some(s) if s.source == SendSource::Agent => {
+                        Some(s) if s.source.held_by_stop() => {
                             gate.push(s.text, Vec::new(), s.source, DeliveryMode::Queue, None);
                         }
                         Some(s) => typed.push(s.text),
@@ -272,6 +272,7 @@ impl AgentChatView {
             self.stop_turn(cx);
             return;
         }
+        self.drop_stale_recoveries(cx);
         // The wake may predate what holds the chat now (a turn that just
         // failed): decide on the current holds, not the ones that woke us.
         self.sync_gate_holds();
@@ -305,6 +306,25 @@ impl AgentChatView {
             self.screen_control.end_remote_turn();
             self.send_gate.lock().unwrap().requeue_front(kept);
             self.sync_gate_holds();
+        }
+    }
+
+    /// A restart's recovery turn is owed only with the restart's note: once
+    /// the note went out (with a message written meanwhile) or was cleared, a
+    /// recovery still queued would be a second, unasked turn. It is dropped,
+    /// and its receipt reads rejected so the host stops waiting on it.
+    fn drop_stale_recoveries(&self, cx: &mut Context<Self>) {
+        if self.recovery_note.is_some() {
+            return;
+        }
+        let stale: Vec<(u64, Uuid)> = {
+            let gate = self.send_gate.lock().unwrap();
+            gate.queued().filter(|q| q.source == SendSource::Recovery).map(|q| (q.id, q.uuid)).collect()
+        };
+        for (id, uuid) in stale {
+            self.send_gate.lock().unwrap().remove(id);
+            tracing::info!(session = %self.remote_session_id, "a recovery turn the chat no longer owes was dropped");
+            self.record_receipt(&uuid.to_string(), Some(ReceiptState::Rejected), cx);
         }
     }
 

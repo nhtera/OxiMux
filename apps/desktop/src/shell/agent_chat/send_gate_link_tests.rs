@@ -387,3 +387,43 @@ async fn a_dropped_steer_is_queued_again(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// A restart's recovery turn goes out with the note the chat owes; queued
+/// behind a message the user wrote meanwhile (which took the note), it is
+/// dropped instead of becoming a second, unasked turn.
+#[gpui::test]
+async fn a_recovery_turn_goes_only_with_the_note_it_is_owed(cx: &mut TestAppContext) {
+    let (window, stub) = bound_chat(cx);
+    let recovery = |view: &mut AgentChatView| {
+        view.send_gate.lock().unwrap().push("Continue.".into(), vec![], SendSource::Recovery, DeliveryMode::Queue, None);
+    };
+    window
+        .update(cx, |view, _window, _cx| {
+            view.recovery_note = Some("NOTE".into());
+            recovery(view);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let lines = user_lines(&stub);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["message"]["content"], "NOTE\n\nContinue.");
+
+    window
+        .update(cx, |view, _window, cx| {
+            end_turn(view, cx);
+            // The user writes first: the note goes with that message.
+            view.recovery_note = Some("NOTE".into());
+            view.send_text("mine".into(), vec![], cx);
+            recovery(view);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window.update(cx, |view, _window, cx| end_turn(view, cx)).unwrap();
+    cx.run_until_parked();
+    let lines = user_lines(&stub);
+    assert_eq!(lines.len(), 2, "the stale recovery was dropped: {lines:?}");
+    assert_eq!(lines[1]["message"]["content"], "NOTE\n\nmine");
+    window
+        .update(cx, |view, _window, _cx| assert!(view.send_gate.lock().unwrap().is_empty()))
+        .unwrap();
+}

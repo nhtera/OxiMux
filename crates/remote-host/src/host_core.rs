@@ -110,6 +110,12 @@ pub struct HostCore {
     watcher: ChildWatcher,
     drain: mpsc::UnboundedSender<DrainMsg>,
     debounce: Mutex<Duration>,
+    /// Builds a dormant session so a recovery turn can reach it; installed
+    /// by the host after the core (see [`Self::set_catalog`]).
+    catalog: Mutex<Option<Arc<dyn crate::catalog::SessionCatalog>>>,
+    /// Counts the times this process won the data directory, so work begun
+    /// under one ownership stops once it is given up (even if won back).
+    owner_gen: std::sync::atomic::AtomicU64,
 }
 
 impl HostCore {
@@ -131,6 +137,8 @@ impl HostCore {
             watcher: ChildWatcher::default(),
             drain: drain.clone(),
             debounce: Mutex::new(EVENT_DEBOUNCE),
+            catalog: Mutex::new(None),
+            owner_gen: std::sync::atomic::AtomicU64::new(0),
         });
         core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
@@ -144,14 +152,16 @@ impl HostCore {
     /// ran is still working), remember who it was, and start writing. Runs on
     /// every acquisition: a lock given up and won back may have been held by
     /// another host in between. A call while already the owner is a no-op.
-    pub fn start(&self, prior: PriorOwner) {
+    pub fn start(self: &Arc<Self>, prior: PriorOwner) {
         let mut slot = self.prior.lock().unwrap();
         if slot.is_some() {
             return;
         }
-        if let Err(err) = self.lineage.boot_reconcile(chrono::Local::now()) {
+        let cut = self.lineage.boot_reconcile(chrono::Local::now()).unwrap_or_else(|err| {
             tracing::warn!(%err, "lineage boot reconcile failed");
-        }
+            Vec::new()
+        });
+        let epoch = crate::resume::restart_epoch(&prior);
         // Whatever the previous owner had in flight: claims it never wrote go
         // back to pending, lines it wrote but never saw accepted are shown as
         // unconfirmed (never resent on their own).
@@ -167,10 +177,16 @@ impl HostCore {
         }
         self.prune_stores();
         tracing::info!(?prior, "host started");
+        let generation = self.owner_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         *slot = Some(prior);
         drop(slot);
         // Our own working chats may have been parked just now; correct them.
         self.sync_lineage_states();
+        // Children the previous host had working were cut short: those an agent
+        // spawned get a recovery turn once their parent is open.
+        if let Some(epoch) = epoch {
+            crate::resume::begin(self, cut, epoch, generation);
+        }
     }
 
     /// The host gave the data directory up: stop writing until it wins the
@@ -184,6 +200,13 @@ impl HostCore {
     /// Whether this process owns the data directory (and so writes lineage).
     pub fn is_owner(&self) -> bool {
         self.prior.lock().unwrap().is_some()
+    }
+
+    /// Which win of the data directory this process holds now, while it is
+    /// the owner: the same number only for as long as it never let go.
+    pub(crate) fn ownership(&self) -> Option<u64> {
+        let slot = self.prior.lock().unwrap();
+        slot.is_some().then(|| self.owner_gen.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Who held the data directory before this host, while it is the owner.
@@ -218,6 +241,16 @@ impl HostCore {
     /// How long a child event waits for others before delivery.
     pub fn event_debounce(&self) -> Duration {
         *self.debounce.lock().unwrap()
+    }
+
+    /// Install the catalog that builds dormant sessions. Without one, a
+    /// restart's recovery turns reach only sessions already live.
+    pub fn set_catalog(&self, catalog: Arc<dyn crate::catalog::SessionCatalog>) {
+        *self.catalog.lock().unwrap() = Some(catalog);
+    }
+
+    pub(crate) fn catalog(&self) -> Option<Arc<dyn crate::catalog::SessionCatalog>> {
+        self.catalog.lock().unwrap().clone()
     }
 
     /// Change [`Self::event_debounce`] (tests shorten it).
