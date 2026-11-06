@@ -232,8 +232,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("order");
         let script = r#"
+echo ready >> "$LOG"
 while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  id=${line#*\"request_id\":\"}; id=${id%%\"*}
   case "$line" in
     *cancel_async_message*) echo dequeue >> "$LOG"
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"cancelled":true}}}\n' "$id" ;;
@@ -245,8 +246,15 @@ done
         let mut cmd = crate::thread::sh_fixture::sh_script(script);
         cmd.env("LOG", &log);
         let (conn, _rx) = super::super::claude_stream_json::ClaudeStreamJsonConnection::spawn_command(cmd).unwrap();
+        // The stand-in is running before the Stop: a shell's start-up (slow on
+        // a Windows runner) must not eat the reply window being tested.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !std::fs::read_to_string(&log).is_ok_and(|s| s.starts_with("ready")) {
+            assert!(Instant::now() < deadline, "the stand-in never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let taken = conn.stop_turn(&["u-1".to_string()]).unwrap();
         assert_eq!(taken, ["u-1"]);
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), "dequeue\ninterrupt\n");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "ready\ndequeue\ninterrupt\n");
     }
 }

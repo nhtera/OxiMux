@@ -61,9 +61,8 @@ env:
 jobs:
   release-macos:
     name: macOS arm64 DMG
-    # macos-15: macos-14 is deprecated (removed 2026-11-02), and it has no
-    # Xcode 26 for the simulator-helper smoke test. The CLI matrix below still
-    # uses macos-14 and needs the same move before then.
+    # macos-15: macos-14 was removed on 2026-11-02, and it has no Xcode 26
+    # for the simulator-helper smoke test.
     runs-on: macos-15
     # Cold-cache release build of the whole workspace plus notarization wait;
     # generous on purpose — a timeout here wastes a full expensive build.
@@ -555,9 +554,9 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-unknown-linux-gnu
             # Deliberately not ubuntu-latest: a glibc build runs only on the
             # glibc it was linked against or newer, so the OLDEST supported
