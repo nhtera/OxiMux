@@ -580,9 +580,10 @@ impl SessionHandle {
         };
         // A respawn seen before the write means the person is answering a
         // request the agent no longer has: say so rather than writing into a
-        // process that is on its way out.
+        // process that is on its way out. Nothing to roll back — the handover
+        // has already cleared this gate, and anything under this id now
+        // belongs to the successor.
         if self.conn_generation.load(Ordering::SeqCst) != generation {
-            self.decided.lock().unwrap().remove(request_id);
             anyhow::bail!(
                 "the agent restarted while request {request_id} was being answered; \
                  open the agent to see where it stands"
@@ -590,11 +591,18 @@ impl SessionHandle {
         }
         if let Err(err) = conn.resolve_permission(request_id, decision) {
             // Undo the gate so the request isn't permanently locked as "decided"
-            // by a transient transport failure.
-            self.decided.lock().unwrap().remove(request_id);
+            // by a transient transport failure — but only while the gate is
+            // still ours. A respawn during the write hands the id to a new
+            // process, whose own gate this must not open.
+            self.settle(generation, |this| {
+                this.decided.lock().unwrap().remove(request_id);
+            });
             return Err(err);
         }
-        let asked = self.pending.lock().unwrap().remove(request_id);
+        let mut asked = None;
+        self.settle(generation, |this| {
+            asked = this.pending.lock().unwrap().remove(request_id);
+        });
         // Resolving is not itself an ingest — it must NOT advance `last_seq` (deriving
         // it from `next_seq` here can read a counter already bumped by a concurrent
         // ingest whose event isn't in the backlog yet, publishing a resume cursor
@@ -624,6 +632,26 @@ impl SessionHandle {
             self.rederive_health(crate::session_health::now_ms());
         }
         Ok(true)
+    }
+
+    /// Run `f` only while `generation` is still the registered process, under
+    /// the lock the handover takes — and say whether it ran.
+    ///
+    /// Settling a decision means touching state keyed by request id, and a
+    /// respawn may have handed that id to a new process while the transport
+    /// call was in flight. Removing a proposal or opening a decision gate then
+    /// removes the *successor's*: its request would lose its proposal, or
+    /// become answerable twice. Holding the handover's own lock is what makes
+    /// the check and the write one step, since the handover clears this state
+    /// under it; when the generation has moved, the handover has already
+    /// cleared everything of ours and there is nothing to settle.
+    fn settle(&self, generation: u64, f: impl FnOnce(&Self)) -> bool {
+        let _handover = self.conn.lock().unwrap();
+        if self.conn_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        f(self);
+        true
     }
 
     /// Whether `request_id` was decided through this handle.
@@ -1503,6 +1531,102 @@ mod tests {
         handle.swap_connection(Arc::new(RecordingConn::default()));
         assert_eq!(handle.pending_permission("req-1"), None);
         assert!(handle.outstanding_permissions().is_empty());
+    }
+
+    /// A connection that, from inside its own `resolve_permission`, respawns
+    /// the session *and* lets the successor ask something under the same
+    /// request id — so the replacement request exists before the old
+    /// transport call returns and the cleanup runs.
+    struct SuccessorArrivesMidAnswer {
+        reg: Mutex<Option<std::sync::Weak<SessionRegistry>>>,
+        handle: Mutex<Option<std::sync::Weak<SessionHandle>>>,
+        fail: bool,
+        /// Also answer the successor's request, so its decision gate is taken
+        /// before this call's cleanup runs.
+        answer_successor: bool,
+    }
+
+    impl AgentConnection for SuccessorArrivesMidAnswer {
+        fn send_user_message(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        fn resolve_permission(&self, _request_id: &str, _decision: PermissionDecision) -> Result<()> {
+            let handle = self.handle.lock().unwrap().clone().and_then(|h| h.upgrade());
+            let reg = self.reg.lock().unwrap().clone().and_then(|r| r.upgrade());
+            if let (Some(handle), Some(reg)) = (handle, reg) {
+                handle.swap_connection(Arc::new(RecordingConn::default()));
+                reg.ingest(
+                    "s1",
+                    permission_request("req-1", "Bash", serde_json::json!({"command": "rm -rf /"})),
+                );
+                if self.answer_successor {
+                    // And someone answers the successor's request, taking its
+                    // decision gate — all before this call returns and runs
+                    // its own cleanup.
+                    let digest = handle.pending_permission("req-1").unwrap().args_digest;
+                    let allow = PermissionDecision::allow(serde_json::Value::Null)
+                        .with_args_digest(Some(digest));
+                    assert!(handle.resolve_permission("req-1", allow).unwrap(), "successor answered");
+                }
+            }
+            if self.fail {
+                anyhow::bail!("transport down");
+            }
+            Ok(())
+        }
+        fn shutdown(&self) {}
+    }
+
+    fn successor_mid_answer(
+        fail: bool,
+        answer_successor: bool,
+    ) -> (Arc<SessionRegistry>, Arc<SessionHandle>) {
+        let reg = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(SuccessorArrivesMidAnswer {
+            reg: Mutex::new(Some(Arc::downgrade(&reg))),
+            handle: Mutex::new(None),
+            fail,
+            answer_successor,
+        });
+        let handle = reg.register("s1".into(), conn.clone());
+        *conn.handle.lock().unwrap() = Some(Arc::downgrade(&handle));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        (reg, handle)
+    }
+
+    #[test]
+    fn settling_an_answer_never_takes_a_successors_request_with_it() {
+        let (_reg, handle) = successor_mid_answer(false, false);
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+        assert!(handle.resolve_permission("req-1", allow().with_args_digest(Some(digest))).unwrap());
+
+        // The successor asked for something far more dangerous under the same
+        // id while the answer was in flight. Its proposal must still be there
+        // for the person to see and decide on.
+        let still_pending = handle.pending_permission("req-1").expect("the successor's proposal");
+        assert_eq!(
+            still_pending.input,
+            serde_json::json!({"command": "rm -rf /"}),
+            "the old answer's cleanup removed the successor's request"
+        );
+    }
+
+    #[test]
+    fn a_failed_answer_never_opens_a_successors_decision_gate() {
+        // The successor's request is both raised and answered while the old
+        // call is still in flight; then that call fails and rolls back.
+        let (_reg, handle) = successor_mid_answer(true, true);
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+        handle
+            .resolve_permission("req-1", allow().with_args_digest(Some(digest)))
+            .expect_err("the transport failed");
+
+        // The rollback must not have opened the gate the successor's decider
+        // took, or that request could be answered a second time.
+        assert!(
+            !handle.resolve_permission("req-1", allow()).unwrap(),
+            "the successor's answer still stands: its gate was not rolled back"
+        );
     }
 
     #[test]
