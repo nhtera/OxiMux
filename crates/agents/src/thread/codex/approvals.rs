@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn decision_translation() {
-        assert_eq!(to_codex_decision(&PermissionDecision::Allow { updated_input: json!({}) }), "accept");
+        assert_eq!(to_codex_decision(&PermissionDecision::allow(json!({}))), "accept");
         assert_eq!(to_codex_decision(&PermissionDecision::Deny { message: "no".into() }), "decline");
     }
 
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn elicitation_reply_uses_action_shape() {
         assert_eq!(
-            to_codex_elicitation(&PermissionDecision::Allow { updated_input: json!({}) }),
+            to_codex_elicitation(&PermissionDecision::allow(json!({}))),
             json!({ "action": "accept", "content": {} })
         );
         assert_eq!(

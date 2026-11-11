@@ -115,6 +115,16 @@ pub struct RemotePrompt {
     pub images: Vec<ChatImage>,
 }
 
+/// An undecided question, kept so a surface other than the chat card can see
+/// what is being asked. The question text lives here because answering keys
+/// the payload by it, and the fold that holds the card is out of reach.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingQuestionView {
+    pub request_id: String,
+    pub tool_use_id: Option<String>,
+    pub questions: Vec<crate::thread::AskQuestion>,
+}
+
 /// What a pending permission asked for, kept until it is decided so the
 /// decision can be compared against the proposal — an approval whose
 /// `updated_input` differs is an operator edit worth recording in the
@@ -129,15 +139,61 @@ struct PendingPermission {
     kind: crate::thread::PermissionKind,
     /// The input the agent proposed.
     input: serde_json::Value,
+    /// Arrival order, so a list of several reads oldest first (a `HashMap` has
+    /// none, and "the oldest one" is what a surface jumps to).
+    seq: u64,
+}
+
+impl PendingPermission {
+    fn view(&self, request_id: &str) -> PendingPermissionView {
+        PendingPermissionView {
+            request_id: request_id.to_string(),
+            tool_name: self.tool_name.clone(),
+            kind: self.kind,
+            input: self.input.clone(),
+            args_digest: args_digest(&self.input),
+        }
+    }
+}
+
+/// What a pending question asked, with its arrival order.
+#[derive(Clone, Debug)]
+struct PendingQuestion {
+    request_id: String,
+    tool_use_id: Option<String>,
+    questions: Vec<crate::thread::AskQuestion>,
+    seq: u64,
+}
+
+/// An opaque digest of a tool call's arguments.
+///
+/// Taken over the serialized value the host holds, never over anything a
+/// client formatted: key order and number formatting differ between Rust and
+/// a phone's JavaScript, so a client-computed hash of what it displayed could
+/// never be compared against this. Hex of SHA-256, which is as opaque as it
+/// needs to be — a client cannot work out what arguments would produce a
+/// chosen digest.
+pub fn args_digest(input: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(input).unwrap_or_default();
+    format!("{:x}", Sha256::digest(&bytes))
 }
 
 /// An undecided permission request, as a decider must see it before choosing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingPermissionView {
+    /// The request this answers — what a decision is keyed by, so a surface
+    /// that lists several can answer the right one.
+    pub request_id: String,
     pub tool_name: String,
     pub kind: crate::thread::PermissionKind,
     /// The input the agent proposed.
     pub input: serde_json::Value,
+    /// An opaque digest of `input`, minted here. A surface that shows these
+    /// arguments echoes it back with its decision, and
+    /// [`SessionHandle::resolve_permission`] refuses an approval that does not
+    /// match — so approving what was on screen cannot approve something else.
+    pub args_digest: String,
 }
 
 /// Which picker a [`RemoteChoice`] carries.
@@ -220,6 +276,13 @@ pub struct SessionHandle {
     /// join key and proposal a later decision is compared against, so an
     /// operator-edited approval can be recorded as such.
     pending: Mutex<HashMap<String, PendingPermission>>,
+    /// Questions awaiting an answer, keyed by request-id. Kept apart from
+    /// `pending`: a question is answered with selections, and counting one as
+    /// an outstanding permission would offer Allow/Reject for it.
+    questions: Mutex<HashMap<String, PendingQuestion>>,
+    /// Arrival counter for both maps, so "the oldest undecided one" is a fact
+    /// rather than whatever a `HashMap` iterates first.
+    prompt_seq: AtomicU64,
     status_tx: watch::Sender<SessionStatus>,
     /// The session's health: the driver's published facts and what they mean
     /// (`session_health.rs`).
@@ -317,6 +380,20 @@ impl SessionHandle {
                     tool_name: tool_name.clone(),
                     kind: *kind,
                     input: input.clone(),
+                    seq: self.prompt_seq.fetch_add(1, Ordering::SeqCst),
+                },
+            );
+        }
+        // And the questions, so a surface away from the chat card knows what
+        // is being asked and does not offer Allow/Reject for it.
+        if let ThreadEvent::QuestionAsked { request_id, tool_use_id, questions } = &event {
+            self.questions.lock().unwrap().insert(
+                request_id.clone(),
+                PendingQuestion {
+                    request_id: request_id.clone(),
+                    tool_use_id: tool_use_id.clone(),
+                    questions: questions.clone(),
+                    seq: self.prompt_seq.fetch_add(1, Ordering::SeqCst),
                 },
             );
         }
@@ -394,10 +471,29 @@ impl SessionHandle {
 
     /// The undecided request `request_id`, if it is still pending.
     pub fn pending_permission(&self, request_id: &str) -> Option<PendingPermissionView> {
-        self.pending.lock().unwrap().get(request_id).map(|p| PendingPermissionView {
-            tool_name: p.tool_name.clone(),
-            kind: p.kind,
-            input: p.input.clone(),
+        self.pending.lock().unwrap().get(request_id).map(|p| p.view(request_id))
+    }
+
+    /// Every undecided permission request, oldest first, as a decider must see
+    /// them. A surface offers inline Allow/Reject only when there is exactly
+    /// one: with several, which one a single pair of buttons answers is a
+    /// guess, and the chat card is where they are told apart.
+    pub fn outstanding_permissions(&self) -> Vec<PendingPermissionView> {
+        let pending = self.pending.lock().unwrap();
+        let mut out: Vec<_> = pending.iter().map(|(id, p)| (p.seq, p.view(id))).collect();
+        drop(pending);
+        out.sort_by_key(|(seq, _)| *seq);
+        out.into_iter().map(|(_, view)| view).collect()
+    }
+
+    /// The undecided question, if one is waiting. A question is answered with
+    /// selections or free text, never with Allow/Reject, so the surfaces have
+    /// to tell it from a permission.
+    pub fn pending_question(&self) -> Option<PendingQuestionView> {
+        self.questions.lock().unwrap().values().min_by_key(|q| q.seq).map(|q| PendingQuestionView {
+            request_id: q.request_id.clone(),
+            tool_use_id: q.tool_use_id.clone(),
+            questions: q.questions.clone(),
         })
     }
 
@@ -405,11 +501,26 @@ impl SessionHandle {
     /// caller that actually fired the transport, `Ok(false)` for any later/racing
     /// caller whose decision was already made. On transport error the gate is rolled
     /// back so a genuine retry can proceed.
+    ///
+    /// An approval that carries an `args_digest` is checked against the
+    /// arguments still pending here and refused if they differ: a surface that
+    /// showed a person one tool call cannot approve a different one. A decision
+    /// with no digest is accepted as before, so the chat card — which reads the
+    /// request out of the same process — and older clients keep working.
     pub fn resolve_permission(
         &self,
         request_id: &str,
         decision: PermissionDecision,
     ) -> Result<bool> {
+        if let Some(echoed) = decision.args_digest()
+            && let Some(pending) = self.pending.lock().unwrap().get(request_id)
+            && args_digest(&pending.input) != echoed
+        {
+            anyhow::bail!(
+                "the arguments of request {request_id} changed since they were shown; \
+                 open the agent and decide there"
+            );
+        }
         let newly_decided = self.decided.lock().unwrap().insert(request_id.to_string());
         if !newly_decided {
             return Ok(false);
@@ -417,7 +528,7 @@ impl SessionHandle {
         // Read before the decision is moved into the transport: an approval's
         // `updated_input` is compared against the proposal below.
         let approved = match &decision {
-            PermissionDecision::Allow { updated_input }
+            PermissionDecision::Allow { updated_input, .. }
             | PermissionDecision::AllowWithSuggestion { updated_input, .. } => {
                 Some(updated_input.clone())
             }
@@ -506,6 +617,7 @@ impl SessionHandle {
             return Err(err);
         }
         self.pending.lock().unwrap().remove(request_id);
+        self.questions.lock().unwrap().remove(request_id);
         self.update_status(None);
         if self.health.published() {
             self.rederive_health(crate::session_health::now_ms());
@@ -675,6 +787,7 @@ impl SessionHandle {
         // or refuse an answer, for the new one's prompt.
         self.decided.lock().unwrap().clear();
         self.pending.lock().unwrap().clear();
+        self.questions.lock().unwrap().clear();
         self.update_status(None);
     }
 
@@ -960,6 +1073,8 @@ impl SessionRegistry {
             gate: Mutex::new(None),
             decided: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
+            questions: Mutex::new(HashMap::new()),
+            prompt_seq: AtomicU64::new(0),
             status_tx,
             health: crate::session_health::HealthCell::new(self.health_cfg.clone()),
             meta: Mutex::new(SessionMeta::default()),
@@ -996,6 +1111,11 @@ impl SessionRegistry {
     /// Every live session, for a periodic look across them.
     pub fn handles(&self) -> Vec<(SessionId, Arc<SessionHandle>)> {
         self.sessions.lock().unwrap().iter().map(|(id, h)| (id.clone(), h.clone())).collect()
+    }
+
+    /// Every live session's id, when the handles themselves are not needed.
+    pub fn ids(&self) -> Vec<SessionId> {
+        self.sessions.lock().unwrap().keys().cloned().collect()
     }
 
     /// Set the health thresholds; every session derives with them from its
@@ -1073,6 +1193,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingConn {
         resolves: AtomicUsize,
+        answers: AtomicUsize,
         prompts: Mutex<Vec<String>>,
         fail_resolve: bool,
     }
@@ -1089,11 +1210,148 @@ mod tests {
             }
             Ok(())
         }
+        fn answer_question(
+            &self,
+            _request_id: &str,
+            _questions: &[crate::thread::AskQuestion],
+            _answers: &crate::thread::QuestionAnswers,
+        ) -> Result<()> {
+            self.answers.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
         fn shutdown(&self) {}
     }
 
     fn allow() -> PermissionDecision {
-        PermissionDecision::Allow { updated_input: serde_json::Value::Null }
+        PermissionDecision::allow(serde_json::Value::Null)
+    }
+
+    // ─── what a decider away from the chat card sees ──────────────────────────
+
+    fn permission_request(id: &str, tool: &str, input: serde_json::Value) -> ThreadEvent {
+        ThreadEvent::PermissionRequested {
+            request_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            tool_name: tool.into(),
+            input,
+            description: String::new(),
+            suggestions: vec![],
+            kind: crate::thread::PermissionKind::Tool,
+        }
+    }
+
+    #[test]
+    fn outstanding_permissions_lists_every_request_oldest_first() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        for id in ["req-1", "req-2", "req-3"] {
+            reg.ingest("s1", permission_request(id, "Read", serde_json::json!({"path": id})));
+        }
+
+        let ids: Vec<_> =
+            handle.outstanding_permissions().into_iter().map(|p| p.request_id).collect();
+        assert_eq!(ids, vec!["req-1", "req-2", "req-3"], "arrival order, not hash order");
+
+        // Answering one takes it off the list.
+        handle.resolve_permission("req-2", allow()).unwrap();
+        let ids: Vec<_> =
+            handle.outstanding_permissions().into_iter().map(|p| p.request_id).collect();
+        assert_eq!(ids, vec!["req-1", "req-3"]);
+    }
+
+    #[test]
+    fn a_requests_digest_is_stable_and_follows_its_arguments() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Bash", serde_json::json!({"command": "ls"})));
+        let first = handle.pending_permission("req-1").unwrap().args_digest;
+        assert_eq!(first, handle.pending_permission("req-1").unwrap().args_digest, "stable");
+        assert!(!first.is_empty());
+
+        // A different request with different arguments digests differently.
+        reg.ingest("s1", permission_request("req-2", "Bash", serde_json::json!({"command": "rm -rf /"})));
+        assert_ne!(handle.pending_permission("req-2").unwrap().args_digest, first);
+    }
+
+    #[test]
+    fn an_approval_whose_digest_does_not_match_is_refused() {
+        let reg = SessionRegistry::new();
+        let conn = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), conn.clone());
+        reg.ingest("s1", permission_request("req-1", "Bash", serde_json::json!({"command": "ls"})));
+
+        let stale = allow().with_args_digest(Some("not-the-one".into()));
+        let err = handle.resolve_permission("req-1", stale).expect_err("refused");
+        assert!(err.to_string().contains("changed since they were shown"), "saw {err}");
+        assert_eq!(conn.resolves.load(Ordering::SeqCst), 0, "nothing reached the agent");
+        // And the request is still answerable, so the chat card still works.
+        assert!(handle.pending_permission("req-1").is_some());
+        assert!(handle.resolve_permission("req-1", allow()).unwrap());
+    }
+
+    #[test]
+    fn the_digest_the_host_minted_is_accepted() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+        assert!(handle.resolve_permission("req-1", allow().with_args_digest(Some(digest))).unwrap());
+    }
+
+    #[test]
+    fn a_decision_with_no_digest_is_accepted_as_before() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        assert_eq!(allow().args_digest(), None, "an in-process caller mints none");
+        assert!(handle.resolve_permission("req-1", allow()).unwrap(), "legacy clients keep working");
+    }
+
+    #[test]
+    fn a_deny_is_never_refused_over_its_arguments() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Bash", serde_json::json!({"command": "ls"})));
+        // Denying is safe whatever the arguments turned out to be.
+        let deny = PermissionDecision::deny("no").with_args_digest(Some("stale".into()));
+        assert_eq!(deny.args_digest(), None, "a Deny carries none to check");
+        assert!(handle.resolve_permission("req-1", deny).unwrap());
+    }
+
+    #[test]
+    fn a_pending_question_is_not_an_outstanding_permission() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest(
+            "s1",
+            ThreadEvent::QuestionAsked {
+                request_id: "q-1".into(),
+                tool_use_id: Some("toolu_q1".into()),
+                questions: vec![],
+            },
+        );
+        assert!(handle.outstanding_permissions().is_empty(), "no Allow/Reject for a question");
+        let q = handle.pending_question().expect("the question is visible");
+        assert_eq!(q.request_id, "q-1");
+        assert_eq!(q.tool_use_id.as_deref(), Some("toolu_q1"));
+
+        handle.answer_question("q-1", &[], &Default::default()).unwrap();
+        assert_eq!(handle.pending_question(), None, "answered");
+    }
+
+    #[test]
+    fn a_respawn_drops_the_old_processs_question() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest(
+            "s1",
+            ThreadEvent::QuestionAsked { request_id: "1".into(), tool_use_id: None, questions: vec![] },
+        );
+        assert!(handle.pending_question().is_some());
+        // Codex numbers requests from 1 again: the old process's prompt must
+        // not read as the new one's.
+        handle.swap_connection(Arc::new(RecordingConn::default()));
+        assert_eq!(handle.pending_question(), None);
     }
 
     /// A remote subscriber learns the user's own prompt ONLY from the synthetic
@@ -1226,7 +1484,7 @@ mod tests {
         reg.resolve_permission(
             "s1",
             "req-1",
-            PermissionDecision::Allow { updated_input: serde_json::json!({"command": "ls x"}) },
+            PermissionDecision::allow(serde_json::json!({"command": "ls x"})),
         )
         .unwrap();
 
@@ -1249,7 +1507,7 @@ mod tests {
         reg.resolve_permission(
             "s1",
             "req-2",
-            PermissionDecision::Allow { updated_input: serde_json::json!({"command": "rm -rf x"}) },
+            PermissionDecision::allow(serde_json::json!({"command": "rm -rf x"})),
         )
         .unwrap();
         assert!(handle.events_since(seq_before).is_empty(), "an unedited allow records nothing");

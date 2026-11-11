@@ -377,21 +377,139 @@ pub struct PermissionSuggestion {
 }
 
 /// The user's answer to a `PermissionRequest`, sent back to the agent.
+///
+/// An approval carries an optional `args_digest`: the host mints one per
+/// pending request over the arguments it actually holds, and a surface that
+/// shows those arguments echoes it back. The host refuses an approval whose
+/// digest does not match, so a request whose arguments changed between being
+/// shown and being approved cannot be approved by mistake. It is
+/// `#[serde(default)]` and lives on the variants themselves — `decision_json`
+/// is parsed straight as this enum, so a wrapper object would break hosts that
+/// predate it, while an unknown field is simply ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PermissionDecision {
     /// Allow this one call. `updated_input` echoes (optionally edits) the
     /// tool input — REQUIRED by the CLI, an allow without it is malformed.
-    Allow { updated_input: Value },
+    Allow {
+        updated_input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args_digest: Option<String>,
+    },
     /// Allow and apply a suggestion (e.g. acceptEdits for the session).
-    AllowWithSuggestion { updated_input: Value, suggestion: PermissionSuggestion },
+    AllowWithSuggestion {
+        updated_input: Value,
+        suggestion: PermissionSuggestion,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args_digest: Option<String>,
+    },
     /// Deny this call; `message` is shown to the model.
     Deny { message: String },
+}
+
+impl PermissionDecision {
+    /// Allow the call with `updated_input` and no digest: a caller inside the
+    /// host's own process, which holds the request itself.
+    pub fn allow(updated_input: Value) -> Self {
+        Self::Allow { updated_input, args_digest: None }
+    }
+
+    /// Allow the call and apply `suggestion`, with no digest.
+    pub fn allow_with_suggestion(updated_input: Value, suggestion: PermissionSuggestion) -> Self {
+        Self::AllowWithSuggestion { updated_input, suggestion, args_digest: None }
+    }
+
+    /// Deny the call with `message`.
+    pub fn deny(message: impl Into<String>) -> Self {
+        Self::Deny { message: message.into() }
+    }
+
+    /// The digest the decider echoed back, if any.
+    pub fn args_digest(&self) -> Option<&str> {
+        match self {
+            Self::Allow { args_digest, .. } | Self::AllowWithSuggestion { args_digest, .. } => {
+                args_digest.as_deref()
+            }
+            Self::Deny { .. } => None,
+        }
+    }
+
+    /// The same decision carrying `digest`, for a surface that showed the
+    /// arguments the host holds. A Deny is unchanged: denying is safe whatever
+    /// the arguments were.
+    pub fn with_args_digest(mut self, digest: Option<String>) -> Self {
+        match &mut self {
+            Self::Allow { args_digest, .. } | Self::AllowWithSuggestion { args_digest, .. } => {
+                *args_digest = digest;
+            }
+            Self::Deny { .. } => {}
+        }
+        self
+    }
+
+    /// Whether this is an approval (either kind).
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Self::Allow { .. } | Self::AllowWithSuggestion { .. })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The digest field is additive on purpose: a host that predates it parses
+    /// `decision_json` straight as this enum, so the JSON a newer client sends
+    /// must still read as a plain allow there, and the JSON an older client
+    /// sends must still read here.
+    #[test]
+    fn the_digest_field_is_additive_in_both_directions() {
+        // Old JSON, new code: no digest, and it parses.
+        let old = r#"{"Allow":{"updated_input":{"a":1}}}"#;
+        let parsed: PermissionDecision = serde_json::from_str(old).expect("old allow parses");
+        assert_eq!(parsed, PermissionDecision::allow(json!({"a": 1})));
+        assert_eq!(parsed.args_digest(), None);
+
+        let old_suggestion = r#"{"AllowWithSuggestion":{"updated_input":{},"suggestion":{"kind":"setMode","label":"l","raw":{}}}}"#;
+        let parsed: PermissionDecision =
+            serde_json::from_str(old_suggestion).expect("old suggestion allow parses");
+        assert!(parsed.is_allow());
+        assert_eq!(parsed.args_digest(), None);
+
+        // New code with no digest writes exactly the old JSON, so an old host
+        // sees no new field at all.
+        assert_eq!(
+            serde_json::to_string(&PermissionDecision::allow(json!({"a": 1}))).unwrap(),
+            old,
+            "skip_serializing_if keeps the old shape byte-for-byte"
+        );
+
+        // New JSON round-trips, and the field an old host would ignore is the
+        // only difference.
+        let with = PermissionDecision::allow(json!({"a": 1})).with_args_digest(Some("abc".into()));
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains("\"args_digest\":\"abc\""), "saw {text}");
+        assert_eq!(serde_json::from_str::<PermissionDecision>(&text).unwrap(), with);
+    }
+
+    /// There is no `deny_unknown_fields` on this enum, so an old host ignores
+    /// the digest rather than failing the whole decision. Pinned, because
+    /// adding one later would silently break every newer client.
+    #[test]
+    fn an_unknown_field_in_a_decision_is_ignored_not_an_error() {
+        let future = r#"{"Deny":{"message":"no","some_future_field":7}}"#;
+        assert_eq!(
+            serde_json::from_str::<PermissionDecision>(future).expect("unknown fields are ignored"),
+            PermissionDecision::deny("no")
+        );
+    }
+
+    #[test]
+    fn a_deny_carries_no_digest_however_it_is_built() {
+        let deny = PermissionDecision::deny("no").with_args_digest(Some("abc".into()));
+        assert_eq!(deny, PermissionDecision::deny("no"));
+        assert_eq!(deny.args_digest(), None);
+        assert!(!deny.is_allow());
+    }
 
     #[test]
     fn parse_partial_json_complete_value_passes_through() {

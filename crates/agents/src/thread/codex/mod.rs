@@ -1011,7 +1011,7 @@ while read line; do :; done
         let (conn, events) = CodexAppServerConnection::start(rpc, inbound, child, state, Some("t-1"));
         let init = events.recv_timeout(Duration::from_secs(10));
         assert!(matches!(init, Ok(ThreadEvent::SessionInit { .. })), "handshake first, got {init:?}");
-        conn.resolve_permission("e-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap();
+        conn.resolve_permission("e-1", PermissionDecision::allow(serde_json::Value::Null)).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let settled = loop {
             match events.recv_timeout(Duration::from_millis(100)) {

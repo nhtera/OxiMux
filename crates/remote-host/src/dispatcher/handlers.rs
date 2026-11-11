@@ -688,7 +688,7 @@ fn parent_may_decide(pending: Option<&PendingPermissionView>, decision: &Permiss
     match decision {
         PermissionDecision::Deny { .. } => true,
         PermissionDecision::AllowWithSuggestion { .. } => false,
-        PermissionDecision::Allow { updated_input } => {
+        PermissionDecision::Allow { updated_input, .. } => {
             pending.kind == PermissionKind::Tool
                 && is_read_only_tool(&pending.tool_name)
                 && *updated_input == pending.input
@@ -713,7 +713,14 @@ mod parent_permit_tests {
     use serde_json::json;
 
     fn pending(tool: &str, kind: PermissionKind) -> PendingPermissionView {
-        PendingPermissionView { tool_name: tool.into(), kind, input: json!({"url": "https://example.com"}) }
+        let input = json!({"url": "https://example.com"});
+        PendingPermissionView {
+            request_id: "req-1".into(),
+            tool_name: tool.into(),
+            kind,
+            args_digest: oximux_agents::session_registry::args_digest(&input),
+            input,
+        }
     }
 
     #[test]
@@ -725,8 +732,8 @@ mod parent_permit_tests {
 
     #[test]
     fn a_parent_allows_only_unchanged_input_for_safe_tools() {
-        let same = PermissionDecision::Allow { updated_input: json!({"url": "https://example.com"}) };
-        let edited = PermissionDecision::Allow { updated_input: json!({"url": "https://evil.example"}) };
+        let same = PermissionDecision::allow(json!({"url": "https://example.com"}));
+        let edited = PermissionDecision::allow(json!({"url": "https://evil.example"}));
         assert!(parent_may_decide(Some(&pending("WebFetch", PermissionKind::Tool)), &same));
         assert!(!parent_may_decide(Some(&pending("WebFetch", PermissionKind::Tool)), &edited));
         for tool in [

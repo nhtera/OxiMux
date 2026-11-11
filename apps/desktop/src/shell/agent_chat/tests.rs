@@ -1053,7 +1053,7 @@
                 view.resolve_permission(
                     "t1".into(),
                     "r1".into(),
-                    PermissionDecision::Allow { updated_input: json!({"file_path": "a.txt"}) },
+                    PermissionDecision::allow(json!({"file_path": "a.txt"})),
                     cx,
                 );
                 view.resolve_permission(
@@ -1192,7 +1192,7 @@
                 view.resolve_permission(
                     "t1".into(),
                     "r1".into(),
-                    PermissionDecision::Allow { updated_input: json!({}) },
+                    PermissionDecision::allow(json!({})),
                     cx,
                 );
                 // Stray second answer: deny — must be ignored (already decided).

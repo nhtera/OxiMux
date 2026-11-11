@@ -311,7 +311,7 @@ fn approval_row(
                 this.resolve_permission(
                     tool_id.clone(),
                     request_id.clone(),
-                    PermissionDecision::Allow { updated_input: input.clone() },
+                    PermissionDecision::allow(input.clone()),
                     cx,
                 )
             }),
@@ -373,10 +373,10 @@ fn approval_row(
                     this.resolve_permission(
                         tool_id.clone(),
                         request_id.clone(),
-                        PermissionDecision::AllowWithSuggestion {
-                            updated_input: input.clone(),
-                            suggestion: suggestion.clone(),
-                        },
+                        PermissionDecision::allow_with_suggestion(
+                            input.clone(),
+                            suggestion.clone(),
+                        ),
                         cx,
                     )
                 }),

@@ -478,10 +478,10 @@ pub fn user_message_json_tagged(text: &str, images: &[ChatImage], uuid: &str) ->
 /// - **deny** carries a `message` shown to the model.
 pub fn control_response_json(request_id: &str, decision: &PermissionDecision) -> Value {
     let response = match decision {
-        PermissionDecision::Allow { updated_input } => {
+        PermissionDecision::Allow { updated_input, .. } => {
             json!({"behavior": "allow", "updatedInput": updated_input})
         }
-        PermissionDecision::AllowWithSuggestion { updated_input, suggestion } => {
+        PermissionDecision::AllowWithSuggestion { updated_input, suggestion, .. } => {
             json!({"behavior": "allow", "updatedInput": updated_input,
                    "updatedPermissions": [suggestion.raw]})
         }
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn allow_response_carries_updated_input() {
-        let d = PermissionDecision::Allow { updated_input: json!({"file_path": "a"}) };
+        let d = PermissionDecision::allow(json!({"file_path": "a"}));
         let v = control_response_json("rid-1", &d);
         assert_eq!(v["type"], "control_response");
         assert_eq!(v["response"]["subtype"], "success");
@@ -945,12 +945,12 @@ mod tests {
         // "Allow always": allow this call AND apply the suggestion verbatim
         // under updatedPermissions, so the CLI stops re-prompting.
         let raw = json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"});
-        let d = PermissionDecision::AllowWithSuggestion {
-            updated_input: json!({"file_path": "a"}),
-            suggestion: PermissionSuggestion {
+        let d = PermissionDecision::allow_with_suggestion(
+            json!({"file_path": "a"}),
+            PermissionSuggestion {
                 kind: "setMode".into(), label: "Always (acceptEdits)".into(), raw: raw.clone(),
             },
-        };
+        );
         let r = control_response_json("r", &d);
         let inner = &r["response"]["response"];
         assert_eq!(inner["behavior"], "allow");
@@ -959,7 +959,7 @@ mod tests {
 
         // A plain allow must NOT carry updatedPermissions (else every allow
         // would stick as always-allow).
-        let plain = control_response_json("r", &PermissionDecision::Allow { updated_input: json!({}) });
+        let plain = control_response_json("r", &PermissionDecision::allow(json!({})));
         assert!(plain["response"]["response"].get("updatedPermissions").is_none());
     }
 
@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(tool_id, "toolu_1");
         conn.resolve_permission(
             &req.request_id.clone(),
-            PermissionDecision::Allow { updated_input: json!({"file_path": "notes.txt"}) },
+            PermissionDecision::allow(json!({"file_path": "notes.txt"})),
         ).unwrap();
 
         // stub recorded: [user message, control_response allow]
