@@ -275,7 +275,15 @@ pub struct SessionHandle {
     gate: Mutex<Option<Arc<Mutex<crate::send_gate::SendGate>>>>,
     /// Request-ids that have been decided. Insertion is the atomic gate: the
     /// caller whose `insert` returns `true` is the one that fires the transport.
-    decided: Mutex<HashSet<String>>,
+    /// Requests already decided, keyed by **(process generation, request id)**.
+    ///
+    /// Scoped by generation rather than cleared on handover, because a request
+    /// id means nothing across processes: a provider that numbers its requests
+    /// from 1 again gives the successor the same id, and a gate claimed for the
+    /// old process's request would then refuse the successor's for good. Any
+    /// entry a decision leaves behind belongs to a generation no decider will
+    /// consult again, so it can neither block nor be opened by anyone else.
+    decided: Mutex<HashSet<(u64, String)>>,
     /// Requests currently awaiting a decision (drives `awaiting_permission`),
     /// keyed by request-id. The value keeps what the agent ASKED for — the
     /// join key and proposal a later decision is compared against, so an
@@ -565,7 +573,7 @@ impl SessionHandle {
                 ),
             }
         }
-        let newly_decided = self.decided.lock().unwrap().insert(request_id.to_string());
+        let newly_decided = self.claim_gate(generation, request_id);
         if !newly_decided {
             return Ok(false);
         }
@@ -580,29 +588,35 @@ impl SessionHandle {
         };
         // A respawn seen before the write means the person is answering a
         // request the agent no longer has: say so rather than writing into a
-        // process that is on its way out. Nothing to roll back — the handover
-        // has already cleared this gate, and anything under this id now
-        // belongs to the successor.
+        // process that is on its way out. The gate goes back, and because it
+        // is scoped to this generation that is safe whichever side of the
+        // handover the claim landed on.
         if self.conn_generation.load(Ordering::SeqCst) != generation {
+            self.release_gate(generation, request_id);
             anyhow::bail!(
                 "the agent restarted while request {request_id} was being answered; \
                  open the agent to see where it stands"
             );
         }
         if let Err(err) = conn.resolve_permission(request_id, decision) {
-            // Undo the gate so the request isn't permanently locked as "decided"
-            // by a transient transport failure — but only while the gate is
-            // still ours. A respawn during the write hands the id to a new
-            // process, whose own gate this must not open.
-            self.settle(generation, |this| {
-                this.decided.lock().unwrap().remove(request_id);
-            });
+            // Undo the gate so the request isn't permanently locked as
+            // "decided" by a transient transport failure. Scoped to this
+            // generation, so a respawn during the write cannot make this open
+            // the successor's gate.
+            self.release_gate(generation, request_id);
             return Err(err);
         }
-        let mut asked = None;
-        self.settle(generation, |this| {
-            asked = this.pending.lock().unwrap().remove(request_id);
-        });
+        // Take the proposal only while it is still the one this decision
+        // answered. A respawn during the write hands the id to a new process,
+        // and removing its proposal would leave a person with no sign of a
+        // request the agent is waiting on.
+        let asked = {
+            let mut pending = self.pending.lock().unwrap();
+            match pending.get(request_id) {
+                Some(p) if p.generation == generation => pending.remove(request_id),
+                _ => None,
+            }
+        };
         // Resolving is not itself an ingest — it must NOT advance `last_seq` (deriving
         // it from `next_seq` here can read a counter already bumped by a concurrent
         // ingest whose event isn't in the backlog yet, publishing a resume cursor
@@ -634,29 +648,22 @@ impl SessionHandle {
         Ok(true)
     }
 
-    /// Run `f` only while `generation` is still the registered process, under
-    /// the lock the handover takes — and say whether it ran.
-    ///
-    /// Settling a decision means touching state keyed by request id, and a
-    /// respawn may have handed that id to a new process while the transport
-    /// call was in flight. Removing a proposal or opening a decision gate then
-    /// removes the *successor's*: its request would lose its proposal, or
-    /// become answerable twice. Holding the handover's own lock is what makes
-    /// the check and the write one step, since the handover clears this state
-    /// under it; when the generation has moved, the handover has already
-    /// cleared everything of ours and there is nothing to settle.
-    fn settle(&self, generation: u64, f: impl FnOnce(&Self)) -> bool {
-        let _handover = self.conn.lock().unwrap();
-        if self.conn_generation.load(Ordering::SeqCst) != generation {
-            return false;
-        }
-        f(self);
-        true
+    /// Claim the right to decide `request_id` on the process `generation`
+    /// names. `false` means someone already has it.
+    fn claim_gate(&self, generation: u64, request_id: &str) -> bool {
+        self.decided.lock().unwrap().insert((generation, request_id.to_string()))
     }
 
-    /// Whether `request_id` was decided through this handle.
+    /// Give the claim back, so a genuine retry can proceed.
+    fn release_gate(&self, generation: u64, request_id: &str) {
+        self.decided.lock().unwrap().remove(&(generation, request_id.to_string()));
+    }
+
+    /// Whether `request_id` was decided through this handle, on the process
+    /// running now.
     pub(crate) fn decided_contains(&self, request_id: &str) -> bool {
-        self.decided.lock().unwrap().contains(request_id)
+        let generation = self.conn_generation.load(Ordering::SeqCst);
+        self.decided.lock().unwrap().contains(&(generation, request_id.to_string()))
     }
 
     /// Put a line in this session's transcript that no backend will echo: the
@@ -688,14 +695,15 @@ impl SessionHandle {
         questions: &[AskQuestion],
         answers: &QuestionAnswers,
     ) -> Result<bool> {
-        let newly_decided = self.decided.lock().unwrap().insert(request_id.to_string());
+        let generation = self.conn_generation.load(Ordering::SeqCst);
+        let newly_decided = self.claim_gate(generation, request_id);
         if !newly_decided {
             return Ok(false);
         }
         if let Err(err) = self.conn().answer_question(request_id, questions, answers) {
             // Roll the gate back so a transient transport failure doesn't lock the
             // question as answered forever.
-            self.decided.lock().unwrap().remove(request_id);
+            self.release_gate(generation, request_id);
             return Err(err);
         }
         self.pending.lock().unwrap().remove(request_id);
@@ -870,11 +878,17 @@ impl SessionHandle {
         // process reusing the request id would then answer.
         //
         // A new process numbers its requests afresh (Codex reuses JSON-RPC
-        // ids from 1): an id decided for the old one must not read as decided,
-        // or refuse an answer, for the new one's prompt.
+        // ids from 1), so none of the old process's requests mean anything
+        // here any more. The decision gate is not cleared but *scoped* by
+        // generation: a decision already in flight may still claim or release
+        // its own entry after this point, and clearing would race that —
+        // leaving a claim no decider will ever consult, or taking one a
+        // successor needs. Dropping the old generation's entries is housekeeping
+        // for a long-lived session, not correctness.
         self.conn_generation.fetch_add(1, Ordering::SeqCst);
         *current = conn;
-        self.decided.lock().unwrap().clear();
+        let settled = self.conn_generation.load(Ordering::SeqCst);
+        self.decided.lock().unwrap().retain(|(generation, _)| *generation >= settled);
         self.pending.lock().unwrap().clear();
         self.questions.lock().unwrap().clear();
         drop(current);
@@ -1627,6 +1641,52 @@ mod tests {
             !handle.resolve_permission("req-1", allow()).unwrap(),
             "the successor's answer still stands: its gate was not rolled back"
         );
+    }
+
+    /// A claim left behind by the old process must never refuse the
+    /// successor's request under the same id.
+    ///
+    /// The claim can outlive the handover whichever way the two interleave: a
+    /// decision that validated before the swap can claim after it, and a
+    /// decision in flight can release after it. That is why the gate is scoped
+    /// by generation rather than cleared — a claim nobody will consult again is
+    /// harmless, where a cleared one is a race.
+    #[test]
+    fn a_gate_claimed_under_the_old_process_never_refuses_the_successors_request() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        // Decided on the old process: the claim is taken.
+        assert!(handle.resolve_permission("req-1", allow()).unwrap());
+        assert!(!handle.resolve_permission("req-1", allow()).unwrap(), "claimed");
+
+        // The agent respawns and its first request is "req-1" again.
+        let successor = Arc::new(RecordingConn::default());
+        handle.swap_connection(successor.clone());
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "b"})));
+
+        assert!(
+            handle.resolve_permission("req-1", allow()).unwrap(),
+            "the successor's request is answerable: the old claim is not its claim"
+        );
+        assert_eq!(successor.resolves.load(Ordering::SeqCst), 1, "and it reached the successor");
+        assert!(
+            !handle.resolve_permission("req-1", allow()).unwrap(),
+            "exactly once: its own claim now holds"
+        );
+    }
+
+    #[test]
+    fn a_decided_request_reads_as_decided_only_on_the_process_that_decided_it() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        assert!(handle.resolve_permission("req-1", allow()).unwrap());
+        assert!(handle.decided_contains("req-1"), "decided here");
+        // The health fold asks this to know whether a prompt has been
+        // answered; a successor's identically numbered prompt has not been.
+        handle.swap_connection(Arc::new(RecordingConn::default()));
+        assert!(!handle.decided_contains("req-1"), "not on the process running now");
     }
 
     #[test]
