@@ -429,12 +429,20 @@ fn a_failure_is_identified_by_the_exit_or_the_turn_that_failed() {
     let exited = SessionHealth {
         exit_seq: Some("inc:3".into()),
         turn_id: Some("inc:9".into()),
+        // What a death actually looks like: the exit markers come with it.
+        exited_unexpectedly: true,
+        liveness: Liveness::Exited(ExitProof::ExitCode(137)),
         ..health(HealthStatus::Failed)
     };
     let a = of("s1", &exited, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(edge_of("s1", &a, Some(&exited), None).id, "inc:3", "the exit, when there was one");
 
-    let turn_failed = SessionHealth { exit_seq: None, ..exited };
+    let turn_failed = SessionHealth {
+        exit_seq: None,
+        exited_unexpectedly: false,
+        liveness: Liveness::Live,
+        ..exited
+    };
     let a = of("s1", &turn_failed, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(edge_of("s1", &a, Some(&turn_failed), None).id, "inc:9", "else the turn");
 }
@@ -517,4 +525,44 @@ fn two_external_items_tied_on_kind_and_time_are_picked_by_their_key() {
     };
     assert_eq!(pick(&one), pick(&other), "a HashMap's order must not pick the reason");
     assert_eq!(pick(&one).as_deref(), Some("a says so"));
+}
+
+#[test]
+fn a_failed_turn_on_a_live_process_is_not_identified_by_an_old_exit() {
+    // The exit count survives a reconnect, so a session that died once and
+    // came back still carries `inc:1`. A later failed turn that reused that
+    // identity would be swallowed by a subscriber that remembers what it has
+    // already alerted on.
+    let reconnected = SessionHealth {
+        exit_seq: Some("inc:1".into()),
+        turn_id: Some("inc:7".into()),
+        exited_unexpectedly: false,
+        liveness: Liveness::Live,
+        ..health(HealthStatus::Failed)
+    };
+    let a = of("s1", &reconnected, &fresh(), &[], &new_edges()).expect("raised");
+    assert_eq!(
+        edge_of("s1", &a, Some(&reconnected), None).id,
+        "inc:7",
+        "the turn that failed, not the exit it survived"
+    );
+
+    // When the exit *is* the failure, the exit identifies it.
+    let died = SessionHealth {
+        exited_unexpectedly: true,
+        liveness: Liveness::Exited(ExitProof::ExitCode(137)),
+        ..reconnected
+    };
+    let a = of("s1", &died, &fresh(), &[], &new_edges()).expect("raised");
+    assert_eq!(edge_of("s1", &a, Some(&died), None).id, "inc:1");
+}
+
+#[test]
+fn a_chats_target_and_its_prefs_key_are_one_string() {
+    // The host reads prefs by the target; a rekey moves the prefs key. If the
+    // two were spelled apart, a rekeyed chat would lose what it had seen.
+    assert_eq!(crate::session_prefs::chat_key("s1"), "chat:s1");
+    assert_eq!(crate::session_prefs::chat_id("chat:s1"), Some("s1"));
+    assert_eq!(crate::session_prefs::chat_id("plan:7"), None, "a run root is not a chat");
+    assert_eq!(crate::session_prefs::chat_id(&crate::session_prefs::chat_key("plan:7")), Some("plan:7"));
 }

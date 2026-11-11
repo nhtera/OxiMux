@@ -61,9 +61,6 @@ const CHANGE_BUFFER: usize = 256;
 /// is forgotten simply reads as new.
 const ONSET_MEMORY: usize = 64;
 
-/// The prefix a chat session's target carries.
-const CHAT: &str = "chat:";
-
 /// A target's attention became something else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionChanged {
@@ -131,10 +128,10 @@ impl EdgeOnset for Onset<'_> {
     }
 }
 
-/// The target a chat session's attention is keyed by.
-pub fn chat_target(session: &str) -> String {
-    format!("{CHAT}{session}")
-}
+/// The target a chat session's attention is keyed by. The same spelling as
+/// its preference key, because they are the same thing: the key a rekey moves
+/// has to be the key the host reads.
+pub use oximux_agents::session_prefs::chat_key as chat_target;
 
 impl HostCore {
     /// Follow attention changes in this process.
@@ -347,7 +344,7 @@ impl HostCore {
 
     /// The live session a target names, if it names one.
     fn session_of(&self, target: &str) -> Option<Arc<SessionHandle>> {
-        self.registry().get(target.strip_prefix(CHAT)?)
+        self.registry().get(oximux_agents::session_prefs::chat_id(target)?)
     }
 
     /// What the person has already seen of `target`. An unreadable row reads

@@ -78,7 +78,16 @@ pub struct SessionPrefs {
 /// are named `team:<run>` / `plan:<run>`, so the prefix is what keeps a chat
 /// whose provider named it `plan:7` out of a run's row.
 pub fn chat_key(session_id: &str) -> String {
-    format!("chat:{session_id}")
+    format!("{CHAT}{session_id}")
+}
+
+/// The one spelling of a chat's prefix, so minting a key and reading one back
+/// cannot drift apart.
+const CHAT: &str = "chat:";
+
+/// The session id a chat's key names, or `None` when the key is not a chat's.
+pub fn chat_id(key: &str) -> Option<&str> {
+    key.strip_prefix(CHAT)
 }
 
 /// The prefs key of a terminal (cockpit) agent, by its `agent_sessions.id`.

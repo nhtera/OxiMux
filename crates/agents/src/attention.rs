@@ -22,7 +22,7 @@
 //!   as [`ExternalAttention`] from whoever knows about them, and are ranked
 //!   against the session's own state rather than rendered somewhere else.
 
-use crate::health::{HealthStatus, SessionHealth};
+use crate::health::{HealthStatus, Liveness, SessionHealth};
 use crate::session_prefs::SessionPrefs;
 
 /// What a session wants from a person, in priority order. Lower [`priority`]
@@ -170,10 +170,17 @@ pub fn edge_of(
             AttentionKind::NeedsPermission | AttentionKind::NeedsInput => prompt_request
                 .map(|id| format!("req:{id}"))
                 .unwrap_or_else(|| format!("prompt:{}", attention.since)),
-            // A process exit is identified by the exit, a failed turn by the
-            // turn: a retry that fails again is a new edge.
+            // A failure that is a process exit is identified by that exit; a
+            // failed turn by the turn, so a retry that fails again is a new
+            // edge. The exit count is only the right identity while the exit
+            // is what failed: it survives a reconnect, so a later failed turn
+            // would otherwise reuse the last exit's identity and be swallowed
+            // by a subscriber that remembers what it has alerted on.
             AttentionKind::Failed => health
-                .and_then(|h| h.exit_seq.clone().or_else(|| h.turn_id.clone()))
+                .and_then(|h| {
+                    let exited = h.exited_unexpectedly || matches!(h.liveness, Liveness::Exited(_));
+                    exited.then(|| h.exit_seq.clone()).flatten().or_else(|| h.turn_id.clone())
+                })
                 .unwrap_or_else(|| format!("failed:{}", attention.since)),
             // The episode the silence was measured from: it re-arms only
             // after new activity and then new silence.
