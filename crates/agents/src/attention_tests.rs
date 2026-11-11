@@ -35,21 +35,19 @@ fn viewed(ago: i64) -> SessionPrefs {
     SessionPrefs { last_viewed_at: Some(NOW - ago), ..Default::default() }
 }
 
-/// Every alert reads as brand new: the host has published none of them yet.
-fn new_edges() -> Unrecorded {
-    Unrecorded
+/// Nothing has been seen: every alert reads as new.
+fn new_edges() -> NothingSeen {
+    NothingSeen
 }
 
-/// Every alert was raised `ago` ms before [`NOW`], as if the host had
-/// published it then.
-fn raised_at(ago: i64) -> impl EdgeOnset {
-    move |_: &AttentionEdge| Some(NOW - ago)
+/// The person's look came after every alert here: all of them are seen.
+fn seen_all() -> impl SeenEdges {
+    |_: &AttentionEdge, _: i64| true
 }
 
-/// Only the edge whose id is `id` was raised, `ago` ms before [`NOW`]; any
-/// other edge is one the host has never published, so it is new.
-fn raised_only(id: &str, ago: i64) -> impl EdgeOnset + '_ {
-    move |edge: &AttentionEdge| (edge.id == id).then_some(NOW - ago)
+/// Only the alert with this id was there when the person looked.
+fn seen_only(id: &str) -> impl SeenEdges + '_ {
+    move |edge: &AttentionEdge, _: i64| edge.id == id
 }
 
 fn kind_of(h: &SessionHealth, p: &SessionPrefs) -> Option<AttentionKind> {
@@ -57,8 +55,8 @@ fn kind_of(h: &SessionHealth, p: &SessionPrefs) -> Option<AttentionKind> {
 }
 
 /// What the session wants, given when its alerts were raised.
-fn kind_with_onset(h: &SessionHealth, p: &SessionPrefs, onset: &dyn EdgeOnset) -> Option<AttentionKind> {
-    of("s1", h, p, &[], onset).map(|a| a.kind)
+fn kind_with_onset(h: &SessionHealth, p: &SessionPrefs, seen: &dyn SeenEdges) -> Option<AttentionKind> {
+    of("s1", h, p, &[], seen).map(|a| a.kind)
 }
 
 // ─── the status table ────────────────────────────────────────────────────────
@@ -146,7 +144,7 @@ fn a_failure_leaves_needs_you_once_it_has_been_seen() {
     assert_eq!(raised.reason.as_deref(), Some("agent process exited (code 137)"));
     // Viewing the tab (or Dismiss, which writes the same stamp) clears it, as
     // long as the look came after the alert arose.
-    assert_eq!(kind_with_onset(&h, &viewed(0), &raised_at(MIN)), None);
+    assert_eq!(kind_with_onset(&h, &viewed(0), &seen_all()), None);
 }
 
 #[test]
@@ -161,7 +159,7 @@ fn a_new_failure_after_a_dismiss_is_raised_again() {
         ..health(HealthStatus::Failed)
     };
     assert_eq!(
-        kind_with_onset(&h, &p, &raised_at(9 * MIN)),
+        kind_with_onset(&h, &p, &new_edges()),
         Some(AttentionKind::Failed),
         "raised after the dismiss"
     );
@@ -171,7 +169,7 @@ fn a_new_failure_after_a_dismiss_is_raised_again() {
 fn a_dismiss_at_the_very_moment_the_alert_arose_counts_as_seen() {
     let h = health(HealthStatus::Failed);
     let p = SessionPrefs { last_viewed_at: Some(NOW - MIN), ..Default::default() };
-    assert_eq!(kind_with_onset(&h, &p, &raised_at(MIN)), None, "viewed >= raised");
+    assert_eq!(kind_with_onset(&h, &p, &seen_all()), None, "the look covered it");
 }
 
 /// The bug this whole onset notion exists to stop. A person looks at a quiet
@@ -184,12 +182,12 @@ fn a_stall_declared_after_the_person_looked_is_still_raised() {
     // saw the stall 2 minutes ago.
     let h = stalled(12 * MIN);
     assert_eq!(
-        kind_with_onset(&h, &viewed(5 * MIN), &raised_at(2 * MIN)),
+        kind_with_onset(&h, &viewed(5 * MIN), &new_edges()),
         Some(AttentionKind::Stalled),
         "the look came before the stall existed"
     );
     // A look after it was declared does clear it.
-    assert_eq!(kind_with_onset(&h, &viewed(MIN), &raised_at(2 * MIN)), None);
+    assert_eq!(kind_with_onset(&h, &viewed(MIN), &seen_all()), None);
 }
 
 /// The same hole for a process that dies after a look: its `last_activity_at`
@@ -204,7 +202,7 @@ fn a_death_after_the_person_looked_is_still_raised() {
         ..health(HealthStatus::Failed)
     };
     assert_eq!(
-        kind_with_onset(&h, &viewed(5 * MIN), &raised_at(MIN)),
+        kind_with_onset(&h, &viewed(5 * MIN), &new_edges()),
         Some(AttentionKind::Failed),
         "it died after they looked away"
     );
@@ -248,7 +246,7 @@ fn a_stall_episode_dismissed_stays_gone_until_new_silence() {
     let p = SessionPrefs { last_viewed_at: Some(NOW), ..Default::default() };
     let h = SessionHealth { stalled_since: Some(episode), last_activity_at: episode, ..health(HealthStatus::Working) };
     let this_episode = format!("stall:{episode}");
-    let onset = raised_only(&this_episode, MIN);
+    let onset = seen_only(&this_episode);
     assert_eq!(kind_with_onset(&h, &p, &onset), None, "this episode has been seen");
     // Output resumed, then it went quiet again: a new episode is a new edge,
     // which the host has not recorded, so it is new by definition.
@@ -340,16 +338,16 @@ fn kind_of_with(
 fn an_external_failure_that_has_been_seen_stops_counting() {
     let items = [external("ci", AttentionKind::Failed, 5 * MIN)];
     assert!(of_external("plan:run-1", &fresh(), &items, &new_edges()).is_some());
-    assert_eq!(of_external("plan:run-1", &viewed(0), &items, &raised_at(MIN)), None, "viewed after it was raised");
+    assert_eq!(of_external("plan:run-1", &viewed(0), &items, &seen_all()), None, "viewed after it was raised");
     // A later trip of the same breaker is a new edge.
     let again = [external("ci", AttentionKind::Failed, 0)];
-    assert!(of_external("plan:run-1", &viewed(MIN), &again, &raised_at(0)).is_some());
+    assert!(of_external("plan:run-1", &viewed(MIN), &again, &new_edges()).is_some());
 }
 
 #[test]
 fn an_external_prompt_is_never_dismissed_by_a_look() {
     let items = [external("cockpit:7", AttentionKind::NeedsPermission, 5 * MIN)];
-    assert!(of_external("plan:run-1", &viewed(0), &items, &raised_at(MIN)).is_some(), "it still has to be answered");
+    assert!(of_external("plan:run-1", &viewed(0), &items, &seen_all()).is_some(), "it still has to be answered");
 }
 
 #[test]
@@ -502,7 +500,7 @@ fn a_rate_limit_raised_externally_is_not_read_by_looking() {
     // Unlike a finish, seeing a rate limit does not deal with it.
     let items = [external("provider", AttentionKind::Limited, 5 * MIN)];
     assert!(
-        of_external("plan:run-1", &viewed(0), &items, &raised_at(MIN)).is_some(),
+        of_external("plan:run-1", &viewed(0), &items, &seen_all()).is_some(),
         "still limited"
     );
 }

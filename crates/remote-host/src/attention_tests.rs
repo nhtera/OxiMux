@@ -16,13 +16,18 @@ use crate::host_core::{HostCore, HostCoreDeps, PriorOwner};
 struct Fixture {
     core: Arc<HostCore>,
     registry: Arc<SessionRegistry>,
+    db: Arc<oximux_storage::db::Db>,
     _rt: tokio::runtime::Runtime,
 }
 
 fn fixture() -> Fixture {
+    fixture_on(Arc::new(oximux_storage::db::open_memory().unwrap()))
+}
+
+/// A host on an existing database — a restart, for the prefs that outlive one.
+fn fixture_on(db: Arc<oximux_storage::db::Db>) -> Fixture {
     let rt =
         tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-    let db = oximux_storage::db::open_memory().unwrap();
     let registry = Arc::new(SessionRegistry::new());
     let core = HostCore::new(HostCoreDeps {
         rt: rt.handle().clone(),
@@ -31,7 +36,7 @@ fn fixture() -> Fixture {
         config: HostConfig::default(),
     });
     core.start(PriorOwner::None);
-    Fixture { core, registry, _rt: rt }
+    Fixture { core, registry, db, _rt: rt }
 }
 
 fn register(f: &Fixture, id: &str) -> Arc<SessionHandle> {
@@ -698,13 +703,79 @@ fn viewing_a_failure_the_host_never_evaluated_still_clears_it() {
         None,
         "the failure had arrived before the view, so the view dealt with it"
     );
-    // The arrival is recorded at the moment of the view, not after it: the two
-    // are one event, so no ordering of the writes can leave the alert looking
-    // newer than the view that covered it.
-    let viewed = f.core.prefs_of(&chat_target("s1")).last_viewed_at.expect("viewed");
+    // The failure was observed before the look was placed, so the look covers
+    // it — an order, not two timestamps that might tie.
+    assert!(f.core.prefs_of(&chat_target("s1")).last_viewed_at.is_some(), "the look was stored");
     let state = f.core.attention().state.lock().unwrap();
-    let raised = state
+    let observed = state
         .onset_for_test(&chat_target("s1"), AttentionKind::Failed, "inc:1")
         .expect("its arrival was recorded");
-    assert!(raised <= viewed, "raised {raised} must not be later than the view {viewed}");
+    let looked = state.viewed_position_for_test(&chat_target("s1")).expect("the look was placed");
+    assert!(observed <= looked, "observed at {observed}, looked at {looked}");
+}
+
+#[test]
+fn a_failure_that_arrives_just_after_a_look_stays_visible_however_often_it_is_read() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    // A look, then a failure, then two reads — all of which can land inside
+    // one millisecond. A timestamp cannot order the look and the failure, so
+    // the second read used to decide the person had already seen it and the
+    // failure vanished until something else changed.
+    f.core.mark_viewed(&chat_target("s1"));
+    h.publish_health(HealthInputs {
+        process: Process::Live,
+        last_turn_failure: Some("turn failed".into()),
+        last_activity_at: now(),
+        turn_id: Some("inc:1".into()),
+        ..Default::default()
+    });
+
+    for read in 1..=5 {
+        assert_eq!(
+            f.core.attention_of(&chat_target("s1")).map(|a| a.kind),
+            Some(AttentionKind::Failed),
+            "read {read}: it arrived after the look, so no number of reads makes it seen"
+        );
+    }
+    assert_eq!(f.core.needs_you().len(), 1, "and it still needs a person");
+
+    // Looking again does deal with it.
+    f.core.mark_viewed(&chat_target("s1"));
+    assert_eq!(f.core.attention_of(&chat_target("s1")), None);
+}
+
+#[test]
+fn a_look_from_before_a_restart_still_covers_what_it_covered() {
+    // After a restart the host has observed no looks, so the only record is
+    // the stored timestamp. An alert the person had dealt with must stay dealt
+    // with rather than coming back with the badge.
+    let f = fixture();
+    let h = register(&f, "s1");
+    h.publish_health(HealthInputs {
+        process: Process::Live,
+        last_turn_failure: Some("turn failed".into()),
+        last_activity_at: now() - 60_000,
+        turn_id: Some("inc:1".into()),
+        ..Default::default()
+    });
+    f.core.mark_viewed(&chat_target("s1"));
+    assert_eq!(f.core.attention_of(&chat_target("s1")), None, "dealt with");
+
+    // A fresh host on the same database: the prefs survive, the observation
+    // order does not.
+    let restarted = fixture_on(f.db.clone());
+    let h2 = restarted.registry.register("s1".into(), Arc::new(StubConnection::default()));
+    h2.publish_health(HealthInputs {
+        process: Process::Live,
+        last_turn_failure: Some("turn failed".into()),
+        last_activity_at: now() - 60_000,
+        turn_id: Some("inc:1".into()),
+        ..Default::default()
+    });
+    assert_eq!(
+        restarted.core.attention_of(&chat_target("s1")),
+        None,
+        "the look it was dealt with by is still on record"
+    );
 }

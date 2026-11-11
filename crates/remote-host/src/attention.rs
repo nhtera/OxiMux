@@ -43,9 +43,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use oximux_agents::attention::{
-    self, Attention, AttentionEdge, AttentionKind, AttentionSource, EdgeOnset, ExternalAttention,
+    self, Attention, AttentionEdge, AttentionKind, AttentionSource, ExternalAttention, SeenEdges,
 };
-use oximux_agents::session_health::now_ms;
 use oximux_agents::session_prefs::{SessionPrefs, SessionPrefsRepo};
 use oximux_agents::session_registry::{SessionHandle, SessionId};
 use tokio::sync::broadcast;
@@ -100,26 +99,48 @@ pub struct AttentionState {
     /// Keyed by kind *and* id, because an id alone is not an alert: a finished
     /// turn and a later failure of that same turn share the turn's id, and a
     /// viewed finish must not hide the failure that followed it.
-    onset: HashMap<String, Vec<(EdgeKey, i64)>>,
+    ///
+    /// The value is this process's observation counter, not a clock. Two
+    /// things can happen within one millisecond — a look, then a failure — and
+    /// a timestamp cannot order them, so a failure arising just after a look
+    /// read as covered by it. A counter cannot tie.
+    onset: HashMap<String, Vec<(EdgeKey, u64)>>,
+    /// Where each target's last look sits in that same order, for the looks
+    /// this process has seen.
+    viewed_at: HashMap<String, u64>,
+    /// Hands out the positions above.
+    observed: u64,
 }
 
 impl AttentionState {
-    /// When `edge` was first seen on its target.
-    fn raised_at(&self, edge: &AttentionEdge) -> Option<i64> {
+    /// Where `edge` sits in the observation order, if it has been seen.
+    fn observed_at(&self, edge: &AttentionEdge) -> Option<u64> {
         let seen = self.onset.get(&edge.target)?;
         let key: EdgeKey = (edge.kind, edge.id.clone());
         seen.iter().find(|(k, _)| *k == key).map(|(_, at)| *at)
     }
 
-    /// When an alert of `kind` with `id` was recorded as arriving, for tests
-    /// that pin the view-and-arrival invariant.
+    /// Where an alert of `kind` with `id` sits, for tests that pin the
+    /// view-and-arrival ordering.
     #[cfg(test)]
-    fn onset_for_test(&self, target: &str, kind: AttentionKind, id: &str) -> Option<i64> {
-        self.raised_at(&AttentionEdge { target: target.to_string(), kind, id: id.to_string() })
+    fn onset_for_test(&self, target: &str, kind: AttentionKind, id: &str) -> Option<u64> {
+        self.observed_at(&AttentionEdge { target: target.to_string(), kind, id: id.to_string() })
     }
 
-    /// Remember that `edge` was seen at `now`, if it is not already known.
-    fn record(&mut self, edge: &AttentionEdge, now: i64) {
+    /// Where a target's last look sits, for tests.
+    #[cfg(test)]
+    fn viewed_position_for_test(&self, target: &str) -> Option<u64> {
+        self.viewed_at.get(target).copied()
+    }
+
+    /// The next position in the observation order.
+    fn tick(&mut self) -> u64 {
+        self.observed += 1;
+        self.observed
+    }
+
+    /// Remember that `edge` was observed at `at`, if it is not already known.
+    fn record(&mut self, edge: &AttentionEdge, at: u64) {
         let seen = self.onset.entry(edge.target.clone()).or_default();
         let key: EdgeKey = (edge.kind, edge.id.clone());
         if seen.iter().any(|(k, _)| *k == key) {
@@ -128,7 +149,28 @@ impl AttentionState {
         if seen.len() >= ONSET_MEMORY {
             seen.remove(0);
         }
-        seen.push((key, now));
+        seen.push((key, at));
+    }
+
+    /// Whether `edge` was observed no later than its target's last look.
+    ///
+    /// Within one run this is an exact order, which is the point: a look and an
+    /// alert can fall in the same millisecond and a clock cannot separate them.
+    ///
+    /// Across a restart the order is gone — only the stored look survives — so
+    /// the alert's own `since` is compared against it instead. That is weaker,
+    /// and knowingly so: a stall or a death whose `since` predates the last
+    /// look reads as covered, where within a run it would not. The alternative
+    /// is a restart replaying every old failure into the badge, which is the
+    /// behaviour the stored look exists to prevent.
+    fn covered_by_a_look(&self, edge: &AttentionEdge, since: i64, prefs: &SessionPrefs) -> bool {
+        match (self.observed_at(edge), self.viewed_at.get(&edge.target)) {
+            (Some(observed), Some(looked)) => observed <= *looked,
+            // No look seen in this run: the stored one is all there is.
+            (_, None) => prefs.last_viewed_at.is_some_and(|viewed| viewed >= since),
+            // Never observed, and there *was* a look this run: it came after.
+            (None, Some(_)) => false,
+        }
     }
 }
 
@@ -136,12 +178,12 @@ impl AttentionState {
 /// since a finished turn and a later failure of it share the turn's id.
 type EdgeKey = (AttentionKind, String);
 
-/// [`AttentionState`] read as the evaluator's edge history.
-struct Onset<'a>(&'a AttentionState);
+/// [`AttentionState`] read as the evaluator's record of what has been seen.
+struct Seen<'a>(&'a AttentionState, &'a SessionPrefs);
 
-impl EdgeOnset for Onset<'_> {
-    fn raised_at(&self, edge: &AttentionEdge) -> Option<i64> {
-        self.0.raised_at(edge)
+impl SeenEdges for Seen<'_> {
+    fn is_seen(&self, edge: &AttentionEdge, since: i64) -> bool {
+        self.0.covered_by_a_look(edge, since, self.1)
     }
 }
 
@@ -215,19 +257,18 @@ impl HostCore {
     /// What one target wants from a person, computed now.
     pub fn attention_of(&self, target: &str) -> Option<Attention> {
         let mut state = self.attention().state.lock().unwrap();
-        self.current(target, &mut state, now_ms()).0
+        self.current(target, &mut state).0
     }
 
     /// Every target that needs a person, worst first. This is the number the
     /// chip, the nav badge and the hotkey cycle all read, so they cannot
     /// disagree.
     pub fn needs_you(&self) -> Vec<(String, Attention)> {
-        let now = now_ms();
         let mut state = self.attention().state.lock().unwrap();
         let mut out: Vec<(String, Attention)> = targets(&state, self.registry().ids())
             .into_iter()
             .filter_map(|target| {
-                let a = self.current(&target, &mut state, now).0?;
+                let a = self.current(&target, &mut state).0?;
                 a.kind.is_needs_you().then_some((target, a))
             })
             .collect();
@@ -263,7 +304,13 @@ impl HostCore {
         let at = chrono::Local::now();
         {
             let mut state = self.attention().state.lock().unwrap();
-            let _ = self.current(target, &mut state, at.timestamp_millis());
+            // Everything raised up to here is observed first, and the look is
+            // placed after it. An alert that arrives later gets a higher
+            // position, so it cannot read as covered by this look however
+            // close in time the two are.
+            let _ = self.current(target, &mut state);
+            let looked = state.tick();
+            state.viewed_at.insert(target.to_string(), looked);
         }
         if let Err(err) = self.attention().prefs.mark_viewed(target, at) {
             tracing::warn!(%err, target, "could not record that a session was viewed");
@@ -289,7 +336,6 @@ impl HostCore {
     /// nothing is published: the events already say that, and a surface that
     /// re-alerted on it would alert constantly.
     pub fn reevaluate(&self, target: &str) {
-        let now = now_ms();
         // Derive, record and broadcast as one step. Apart, a derivation that
         // read the world before another thread's `mark_viewed` could be
         // installed after that thread had already retired the alert, and a
@@ -299,7 +345,7 @@ impl HostCore {
         // apart, a health update in between could pair an alert with an
         // identity from another moment — a prompt edge minted for a prompt
         // that had just been answered.
-        let (attention, edge) = self.current(target, &mut state, now);
+        let (attention, edge) = self.current(target, &mut state);
         let previous = state.last.get(target).cloned();
         let change = match (&attention, &edge, previous) {
             // The same edge with the same line: nothing to hear about.
@@ -344,7 +390,6 @@ impl HostCore {
         &self,
         target: &str,
         state: &mut AttentionState,
-        now: i64,
     ) -> (Option<Attention>, Option<AttentionEdge>) {
         let external = external_for(state, target);
         let prefs = self.prefs_of(target);
@@ -362,10 +407,10 @@ impl HostCore {
         // brand-new alert against this very moment, and a view taken in the
         // same millisecond would swallow it.
         let attention = match health {
-            Some(health) => attention::of(target, health, &prefs, &external, &Onset(state)),
+            Some(health) => attention::of(target, health, &prefs, &external, &Seen(state, &prefs)),
             // No session of its own (a terminal agent, a run root): its alerts
             // are the ones its producer raised.
-            None => attention::of_external(target, &prefs, &external, &Onset(state)),
+            None => attention::of_external(target, &prefs, &external, &Seen(state, &prefs)),
         };
         // Then every alert this target could raise is recorded, not only the
         // one that won. An alert sitting beneath a worse one has arrived as
@@ -374,7 +419,8 @@ impl HostCore {
         // reading as new after the view, and stuck in "needs you".
         for candidate in self.candidates(target, health, &external) {
             let edge = attention::edge_of(target, &candidate, health, request.as_deref());
-            state.record(&edge, now);
+            let at = state.tick();
+            state.record(&edge, at);
         }
         let edge = attention
             .as_ref()
@@ -403,7 +449,7 @@ impl HostCore {
         if let Some(health) = health
             // With default prefs nothing reads as seen, so this is the
             // session's own alert as it stands.
-            && let Some(own) = attention::of(target, health, &unseen, &[], &attention::Unrecorded)
+            && let Some(own) = attention::of(target, health, &unseen, &[], &attention::NothingSeen)
         {
             out.push(own);
         }
