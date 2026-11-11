@@ -653,3 +653,35 @@ fn a_prompt_after_a_respawn_is_a_new_alert_even_with_the_same_request_id() {
         "a consumer that alerts once per edge has to announce the new prompt"
     );
 }
+
+#[test]
+fn viewing_a_failure_the_host_never_evaluated_still_clears_it() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    // No surface is listening, so no follower ever looked at this session.
+    h.publish_health(HealthInputs {
+        process: Process::Live,
+        last_turn_failure: Some("turn failed".into()),
+        last_activity_at: now() - 60_000,
+        turn_id: Some("inc:1".into()),
+        ..Default::default()
+    });
+
+    // The person opens it. The view has to cover a failure that was already
+    // there, even though the host is seeing it for the first time now.
+    f.core.mark_viewed(&chat_target("s1"));
+    assert_eq!(
+        f.core.attention_of(&chat_target("s1")),
+        None,
+        "the failure had arrived before the view, so the view dealt with it"
+    );
+    // The arrival is recorded at the moment of the view, not after it: the two
+    // are one event, so no ordering of the writes can leave the alert looking
+    // newer than the view that covered it.
+    let viewed = f.core.prefs_of(&chat_target("s1")).last_viewed_at.expect("viewed");
+    let state = f.core.attention().state.lock().unwrap();
+    let raised = state
+        .onset_for_test(&chat_target("s1"), AttentionKind::Failed, "inc:1")
+        .expect("its arrival was recorded");
+    assert!(raised <= viewed, "raised {raised} must not be later than the view {viewed}");
+}

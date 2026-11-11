@@ -79,7 +79,21 @@ impl HealthCell {
         decided: impl Fn(&str) -> bool,
         set_working: impl FnOnce(bool),
     ) -> Option<SessionHealth> {
-        let _derive = self.derive.lock().unwrap();
+        let derive = self.derive.lock().unwrap();
+        self.recompute_under(derive, now, decided, set_working)
+    }
+
+    /// [`Self::recompute`] for a caller that already holds the lock, so a
+    /// publish can write the facts and derive from them without anyone reading
+    /// in between.
+    fn recompute_under(
+        &self,
+        derive: std::sync::MutexGuard<'_, ()>,
+        now: i64,
+        decided: impl Fn(&str) -> bool,
+        set_working: impl FnOnce(bool),
+    ) -> Option<SessionHealth> {
+        let _derive = derive;
         let mut inputs = self.inputs.borrow().clone();
         // Answered here (a phone, the CLI) before the driver's card heard.
         if inputs.prompt_request.as_deref().is_some_and(&decided) {
@@ -147,6 +161,12 @@ impl SessionHandle {
     /// tasks keeps its slot).
     pub fn publish_health(&self, inputs: HealthInputs) {
         let first = !self.health.published();
+        // The facts and the health derived from them move in one step, under
+        // the lock every derivation holds. A reader that saw the new facts
+        // beside the old health would pair a prompt id with a health that no
+        // longer has that prompt, and raise an alert for something already
+        // answered.
+        let derive = self.health.derive.lock().unwrap();
         let modified = self.health.inputs.send_if_modified(|current| {
             if *current == inputs {
                 return false;
@@ -154,9 +174,20 @@ impl SessionHandle {
             *current = inputs;
             true
         });
-        if modified || first {
-            self.rederive_health(now_ms());
-        }
+        let changed = if modified || first {
+            self.health.recompute_under(
+                derive,
+                now_ms(),
+                |id| self.is_decided(id),
+                |working| {
+                    self.set_working(working);
+                },
+            )
+        } else {
+            drop(derive);
+            None
+        };
+        self.log_change(changed);
         if first {
             // Set only now, so nobody reads the default as observed; then
             // tell followers, even when the health reads as it did before.

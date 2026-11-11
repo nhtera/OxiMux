@@ -111,6 +111,13 @@ impl AttentionState {
         seen.iter().find(|(k, _)| *k == key).map(|(_, at)| *at)
     }
 
+    /// When an alert of `kind` with `id` was recorded as arriving, for tests
+    /// that pin the view-and-arrival invariant.
+    #[cfg(test)]
+    fn onset_for_test(&self, target: &str, kind: AttentionKind, id: &str) -> Option<i64> {
+        self.raised_at(&AttentionEdge { target: target.to_string(), kind, id: id.to_string() })
+    }
+
     /// Remember that `edge` was seen at `now`, if it is not already known.
     fn record(&mut self, edge: &AttentionEdge, now: i64) {
         let seen = self.onset.entry(edge.target.clone()).or_default();
@@ -208,7 +215,7 @@ impl HostCore {
     /// What one target wants from a person, computed now.
     pub fn attention_of(&self, target: &str) -> Option<Attention> {
         let mut state = self.attention().state.lock().unwrap();
-        self.current(target, &mut state, now_ms())
+        self.current(target, &mut state, now_ms()).0
     }
 
     /// Every target that needs a person, worst first. This is the number the
@@ -220,7 +227,7 @@ impl HostCore {
         let mut out: Vec<(String, Attention)> = targets(&state, self.registry().ids())
             .into_iter()
             .filter_map(|target| {
-                let a = self.current(&target, &mut state, now)?;
+                let a = self.current(&target, &mut state, now).0?;
                 a.kind.is_needs_you().then_some((target, a))
             })
             .collect();
@@ -247,7 +254,18 @@ impl HostCore {
     /// Writing the stamp is what clears a Failed or Stalled row, so this is
     /// the one call behind both "viewed" and "Dismiss".
     pub fn mark_viewed(&self, target: &str) {
-        if let Err(err) = self.attention().prefs.mark_viewed(target, chrono::Local::now()) {
+        // The view and what it covers are **one moment**, so which of the two
+        // writes happens first cannot matter. Everything the target is asking
+        // for is recorded as having arrived at `at`, and the view is stamped
+        // `at`, so a view covers what was already there — including an alert
+        // the host has never evaluated, which a session that failed with no
+        // surface listening would otherwise keep for good.
+        let at = chrono::Local::now();
+        {
+            let mut state = self.attention().state.lock().unwrap();
+            let _ = self.current(target, &mut state, at.timestamp_millis());
+        }
+        if let Err(err) = self.attention().prefs.mark_viewed(target, at) {
             tracing::warn!(%err, target, "could not record that a session was viewed");
             return;
         }
@@ -277,8 +295,11 @@ impl HostCore {
         // installed after that thread had already retired the alert, and a
         // retirement could be broadcast before the raise it retires.
         let mut state = self.attention().state.lock().unwrap();
-        let attention = self.current(target, &mut state, now);
-        let edge = attention.as_ref().map(|a| self.edge_of(target, a));
+        // One read of the session for the attention *and* its edge: taken
+        // apart, a health update in between could pair an alert with an
+        // identity from another moment — a prompt edge minted for a prompt
+        // that had just been answered.
+        let (attention, edge) = self.current(target, &mut state, now);
         let previous = state.last.get(target).cloned();
         let change = match (&attention, &edge, previous) {
             // The same edge with the same line: nothing to hear about.
@@ -324,7 +345,7 @@ impl HostCore {
         target: &str,
         state: &mut AttentionState,
         now: i64,
-    ) -> Option<Attention> {
+    ) -> (Option<Attention>, Option<AttentionEdge>) {
         let external = external_for(state, target);
         let prefs = self.prefs_of(target);
         // One coherent read of the session, so the prompt id and the health it
@@ -357,7 +378,10 @@ impl HostCore {
             let edge = attention::edge_of(target, &candidate, health, request.as_deref());
             state.record(&edge, now);
         }
-        attention
+        let edge = attention
+            .as_ref()
+            .map(|a| attention::edge_of(target, a, health, request.as_deref()));
+        (attention, edge)
     }
 
     /// Every alert `target` could raise right now, ignoring what the person
@@ -390,21 +414,6 @@ impl HostCore {
 
     /// `target`'s alert identity, with the pending request id the session
     /// handle holds (health alone does not carry it).
-    fn edge_of(&self, target: &str, attention: &Attention) -> AttentionEdge {
-        match self.session_of(target) {
-            Some(handle) => {
-                // One read, so the prompt id cannot belong to a different
-                // moment than the health it is read with: the driver publishes
-                // its facts before the health derived from them, and a reader
-                // that caught the gap would mint an edge for a prompt that had
-                // just been answered.
-                let (health, inputs) = handle.health_snapshot();
-                attention::edge_of(target, attention, Some(&health), self.prompt_edge(&handle, &inputs).as_deref())
-            }
-            None => attention::edge_of(target, attention, None, None),
-        }
-    }
-
     /// The pending prompt's edge identity: the provider's request id qualified
     /// by the process that asked.
     ///

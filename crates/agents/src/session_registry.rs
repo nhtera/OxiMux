@@ -313,12 +313,16 @@ pub struct SessionHandle {
     /// Bumped by every [`Self::swap_connection`]. A decision checked against
     /// one process must not be dispatched to the next.
     conn_generation: AtomicU64,
-    /// Runs between a decision's validation and its gate claim, so a test can
-    /// land a respawn in exactly that window. There is no other way in: the
-    /// window is inside one function call, and the orderings it produces are
-    /// the ones this handle's generation scoping exists for.
+    /// Runs **once**, between a decision's validation and its gate claim, so a
+    /// test can land a respawn in exactly that window. There is no other way
+    /// in: the window is inside one function call, and the orderings it
+    /// produces are the ones this handle's generation scoping exists for.
+    ///
+    /// Taken out of the mutex before it is called, and taken rather than
+    /// borrowed: a hook that answers a request re-enters this function, and
+    /// holding the lock across the call deadlocked on it.
     #[cfg(test)]
-    before_gate_claim: Mutex<Option<Box<dyn Fn() + Send>>>,
+    before_gate_claim: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     status_tx: watch::Sender<SessionStatus>,
     /// The session's health: the driver's published facts and what they mean
     /// (`session_health.rs`).
@@ -603,8 +607,15 @@ impl SessionHandle {
             }
         }
         #[cfg(test)]
-        if let Some(hook) = self.before_gate_claim.lock().unwrap().as_ref() {
-            hook();
+        {
+            // Taken in a statement of its own, so the guard is gone before
+            // the hook runs: a hook that answers a request re-enters this
+            // function, and a guard still alive in an `if let` scrutinee
+            // deadlocked on it.
+            let hook = self.before_gate_claim.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let newly_decided = self.claim_gate(generation, request_id);
         if !newly_decided {
@@ -681,9 +692,9 @@ impl SessionHandle {
         Ok(true)
     }
 
-    /// Install the test seam described on `before_gate_claim`.
+    /// Install the one-shot test seam described on `before_gate_claim`.
     #[cfg(test)]
-    fn on_before_gate_claim(&self, f: impl Fn() + Send + 'static) {
+    fn on_before_gate_claim(&self, f: impl FnOnce() + Send + 'static) {
         *self.before_gate_claim.lock().unwrap() = Some(Box::new(f));
     }
 
@@ -1774,12 +1785,8 @@ mod tests {
         let successor = Arc::new(RecordingConn::default());
         {
             let (h, r, next) = (handle.clone(), reg.clone(), successor.clone());
-            let once = Mutex::new(true);
             handle.on_before_gate_claim(move || {
-                if !std::mem::replace(&mut *once.lock().unwrap(), false) {
-                    return;
-                }
-                h.swap_connection(next.clone());
+                h.swap_connection(next);
                 r.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "b"})));
             });
         }
@@ -1802,6 +1809,47 @@ mod tests {
         );
         assert_eq!(successor.resolves.load(Ordering::SeqCst), 1);
         assert!(!handle.resolve_permission("req-1", allow()).unwrap(), "and only once");
+    }
+
+    /// The same window, with the successor **answered before the old decision
+    /// returns** — so the old claim and the successor's overlap, and the old
+    /// decision's rollback runs while the successor's answer stands.
+    #[test]
+    fn a_stale_claim_and_the_successors_answer_overlap_without_disturbing_each_other() {
+        let reg = Arc::new(SessionRegistry::new());
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+
+        let successor = Arc::new(RecordingConn::default());
+        let answered_in_window = Arc::new(AtomicUsize::new(0));
+        {
+            let (h, r, next) = (handle.clone(), reg.clone(), successor.clone());
+            let counted = answered_in_window.clone();
+            handle.on_before_gate_claim(move || {
+                h.swap_connection(next);
+                r.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "b"})));
+                // Answered here, inside the old decision's window: its claim
+                // is about to be made under a generation that is gone, and its
+                // rollback will run after this answer already stands.
+                let its_digest = h.pending_permission("req-1").unwrap().args_digest;
+                let allow = PermissionDecision::allow(serde_json::Value::Null)
+                    .with_args_digest(Some(its_digest));
+                assert!(h.resolve_permission("req-1", allow).unwrap(), "the successor is answered");
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        handle
+            .resolve_permission("req-1", allow().with_args_digest(Some(digest)))
+            .expect_err("the process it was for is gone");
+
+        assert_eq!(answered_in_window.load(Ordering::SeqCst), 1, "the overlap happened");
+        assert_eq!(successor.resolves.load(Ordering::SeqCst), 1, "the successor was answered once");
+        assert!(
+            !handle.resolve_permission("req-1", allow()).unwrap(),
+            "and stays answered: the old decision's rollback did not reopen its gate"
+        );
     }
 
     #[test]
@@ -1851,6 +1899,82 @@ mod tests {
         assert_eq!(first.answers.load(Ordering::SeqCst), 0, "not to the process that is gone");
         assert_eq!(successor.answers.load(Ordering::SeqCst), 1, "to the one asking now");
         assert_eq!(handle.pending_question(), None, "and it settled the question it answered");
+    }
+
+    /// A connection that respawns the session, and lets the successor ask a
+    /// question under the same id, from inside its own `answer_question` — so
+    /// the swap lands between the generation being captured and the answer
+    /// being written.
+    struct SwapsWhileAnsweringAQuestion {
+        reg: Mutex<Option<std::sync::Weak<SessionRegistry>>>,
+        handle: Mutex<Option<std::sync::Weak<SessionHandle>>>,
+        answers: AtomicUsize,
+        successor: Mutex<Option<Arc<RecordingConn>>>,
+    }
+
+    impl AgentConnection for SwapsWhileAnsweringAQuestion {
+        fn send_user_message(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        fn resolve_permission(&self, _request_id: &str, _decision: PermissionDecision) -> Result<()> {
+            Ok(())
+        }
+        fn answer_question(
+            &self,
+            _request_id: &str,
+            _questions: &[crate::thread::AskQuestion],
+            _answers: &crate::thread::QuestionAnswers,
+        ) -> Result<()> {
+            self.answers.fetch_add(1, Ordering::SeqCst);
+            let handle = self.handle.lock().unwrap().clone().and_then(|h| h.upgrade());
+            let reg = self.reg.lock().unwrap().clone().and_then(|r| r.upgrade());
+            if let (Some(handle), Some(reg)) = (handle, reg) {
+                let next = Arc::new(RecordingConn::default());
+                *self.successor.lock().unwrap() = Some(next.clone());
+                handle.swap_connection(next);
+                reg.ingest(
+                    "s1",
+                    ThreadEvent::QuestionAsked {
+                        request_id: "q-1".into(),
+                        tool_use_id: Some("successor".into()),
+                        questions: vec![],
+                    },
+                );
+            }
+            Ok(())
+        }
+        fn shutdown(&self) {}
+    }
+
+    #[test]
+    fn a_respawn_during_a_question_answer_leaves_the_successors_question_alone() {
+        let reg = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(SwapsWhileAnsweringAQuestion {
+            reg: Mutex::new(Some(Arc::downgrade(&reg))),
+            handle: Mutex::new(None),
+            answers: AtomicUsize::new(0),
+            successor: Mutex::new(None),
+        });
+        let handle = reg.register("s1".into(), conn.clone());
+        *conn.handle.lock().unwrap() = Some(Arc::downgrade(&handle));
+        reg.ingest(
+            "s1",
+            ThreadEvent::QuestionAsked { request_id: "q-1".into(), tool_use_id: None, questions: vec![] },
+        );
+
+        assert!(handle.answer_question("q-1", &[], &Default::default()).unwrap());
+        assert_eq!(conn.answers.load(Ordering::SeqCst), 1, "answered by the process that asked");
+        let successor = conn.successor.lock().unwrap().clone().expect("respawned");
+        assert_eq!(successor.answers.load(Ordering::SeqCst), 0, "never by its replacement");
+
+        // The successor asked its own question under the same id while the old
+        // answer was in flight. It must still be there for the person.
+        let waiting = handle.pending_question().expect("the successor's question");
+        assert_eq!(
+            waiting.tool_use_id.as_deref(),
+            Some("successor"),
+            "the old answer's cleanup took the successor's question with it"
+        );
     }
 
     #[test]
