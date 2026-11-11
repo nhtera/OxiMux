@@ -218,3 +218,28 @@ fn a_late_write_of_any_kind_cannot_let_a_stale_view_clear_an_unread_mark() {
         );
     }
 }
+
+#[test]
+fn a_rekey_keeps_the_later_clock_rather_than_taking_the_current_one() {
+    // `mark_viewed` judges an unread mark by `updated_at`, so a rekey that
+    // stamped the current time would rewind it whenever the system clock had
+    // stepped back, and let a stale view clear a mark made after it.
+    let db = oximux_storage::db::open_memory().expect("open in-memory db");
+    let r = SessionPrefsRepo::new(db.conn());
+    r.mark_viewed(&chat_key("old"), t(10)).unwrap();
+    r.mark_unread(&chat_key("new"), t(40)).unwrap();
+
+    rekey(&db, "old", "new");
+
+    let moved = r.get(&chat_key("new")).unwrap();
+    assert!(moved.unread_override, "the mark survived the rekey");
+    // A view from before the mark must still not spend it, however long ago
+    // the rekey happened to run.
+    r.mark_viewed(&chat_key("new"), t(20)).unwrap();
+    assert!(
+        r.get(&chat_key("new")).unwrap().unread_override,
+        "the rekey kept the clock the mark is judged by"
+    );
+    r.mark_viewed(&chat_key("new"), t(50)).unwrap();
+    assert!(!r.get(&chat_key("new")).unwrap().unread_override, "a later view does spend it");
+}

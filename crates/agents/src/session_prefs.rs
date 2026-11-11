@@ -251,7 +251,9 @@ impl SessionPrefsRepo {
 /// dropped: the later view wins, so nothing already seen is un-seen; an unread
 /// mark on either side survives, because swallowing an alert is worse than
 /// showing one twice; and the mode and fold state come from the old id, the
-/// row whose tab the person has actually been using.
+/// row whose tab the person has actually been using. `updated_at` is the later
+/// of the two rather than the current clock, because it is what
+/// [`SessionPrefsRepo::mark_viewed`] judges an unread mark against.
 pub(crate) fn rekey_in(tx: &rusqlite::Transaction<'_>, old: &str, new: &str) -> Result<()> {
     if old == new {
         return Ok(());
@@ -267,17 +269,27 @@ pub(crate) fn rekey_in(tx: &rusqlite::Transaction<'_>, old: &str, new: &str) -> 
             unread_override: from.unread_override || into.unread_override,
             notify_mode: from.notify_mode,
             collapsed: from.collapsed,
+            // The later of the two, never the current clock: this is what
+            // `mark_viewed` judges an unread mark against, so stamping "now"
+            // would rewind it whenever the system clock had stepped back and
+            // let a stale view clear a mark made after it.
+            updated_at: from.updated_at.max(into.updated_at),
         },
     };
     tx.execute(
-        "INSERT INTO agent_session_prefs              (session_key, last_viewed_at, unread_override, notify_mode, collapsed, updated_at)          VALUES (?1, ?2, ?3, ?4, ?5, ?6)          ON CONFLICT(session_key) DO UPDATE SET              last_viewed_at = ?2, unread_override = ?3, notify_mode = ?4, collapsed = ?5, updated_at = ?6",
+        "INSERT INTO agent_session_prefs \
+             (session_key, last_viewed_at, unread_override, notify_mode, collapsed, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(session_key) DO UPDATE SET \
+             last_viewed_at = ?2, unread_override = ?3, notify_mode = ?4, collapsed = ?5, \
+             updated_at = ?6",
         params![
             new,
             merged.last_viewed_at,
             i64::from(merged.unread_override),
             merged.notify_mode,
             i64::from(merged.collapsed),
-            stamp(chrono::Local::now()),
+            merged.updated_at,
         ],
     )
     .context("rekey session prefs")?;
@@ -291,11 +303,13 @@ struct Row {
     unread_override: bool,
     notify_mode: String,
     collapsed: bool,
+    updated_at: String,
 }
 
 fn row_in(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<Option<Row>> {
     tx.query_row(
-        "SELECT last_viewed_at, unread_override, notify_mode, collapsed          FROM agent_session_prefs WHERE session_key = ?1",
+        "SELECT last_viewed_at, unread_override, notify_mode, collapsed, updated_at \
+         FROM agent_session_prefs WHERE session_key = ?1",
         params![key],
         |r| {
             Ok(Row {
@@ -303,6 +317,7 @@ fn row_in(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<Option<Row>> {
                 unread_override: r.get::<_, i64>(1)? != 0,
                 notify_mode: r.get(2)?,
                 collapsed: r.get::<_, i64>(3)? != 0,
+                updated_at: r.get(4)?,
             })
         },
     )

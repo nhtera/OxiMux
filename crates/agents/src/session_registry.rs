@@ -142,6 +142,11 @@ struct PendingPermission {
     /// Arrival order, so a list of several reads oldest first (a `HashMap` has
     /// none, and "the oldest one" is what a surface jumps to).
     seq: u64,
+    /// Which process asked ([`SessionHandle::conn_generation`] when it did).
+    /// A proposal recorded under one process can only be answered under that
+    /// process, so a successor that reuses the request id — with the same
+    /// arguments, even — cannot have the old request's approval applied to it.
+    generation: u64,
 }
 
 impl PendingPermission {
@@ -384,6 +389,7 @@ impl SessionHandle {
                     kind: *kind,
                     input: input.clone(),
                     seq: self.prompt_seq.fetch_add(1, Ordering::SeqCst),
+                    generation: self.conn_generation.load(Ordering::SeqCst),
                 },
             );
         }
@@ -540,7 +546,15 @@ impl SessionHandle {
         // digest exists to stop, so it is refused rather than trusted.
         if let Some(echoed) = decision.args_digest() {
             match self.pending.lock().unwrap().get(request_id) {
-                Some(pending) if args_digest(&pending.input) == echoed => {}
+                Some(pending)
+                    if pending.generation == generation && args_digest(&pending.input) == echoed => {}
+                // A proposal from a process that has since been replaced. The
+                // id may name a different request now, so matching arguments
+                // do not make it the same request.
+                Some(pending) if pending.generation != generation => anyhow::bail!(
+                    "request {request_id} belongs to an agent process that has been replaced; \
+                     open the agent to see where it stands"
+                ),
                 Some(_) => anyhow::bail!(
                     "the arguments of request {request_id} changed since they were shown; \
                      open the agent and decide there"
@@ -820,18 +834,22 @@ impl SessionHandle {
         if Arc::ptr_eq(&current, &conn) {
             return; // the same process re-bound (access switched back on)
         }
-        // Bumped under the same lock the connection is replaced under, so a
-        // reader that takes both together can never pair one process's
-        // connection with another's generation.
-        self.conn_generation.fetch_add(1, Ordering::SeqCst);
-        *current = conn;
-        drop(current);
+        // The whole handover happens without releasing the lock: the
+        // generation, the connection, and the old process's outstanding
+        // requests move together. Clearing the requests after releasing it
+        // left a window where a decision could capture the *new* connection
+        // and still validate against the *old* process's proposal, which a new
+        // process reusing the request id would then answer.
+        //
         // A new process numbers its requests afresh (Codex reuses JSON-RPC
         // ids from 1): an id decided for the old one must not read as decided,
         // or refuse an answer, for the new one's prompt.
+        self.conn_generation.fetch_add(1, Ordering::SeqCst);
+        *current = conn;
         self.decided.lock().unwrap().clear();
         self.pending.lock().unwrap().clear();
         self.questions.lock().unwrap().clear();
+        drop(current);
         self.update_status(None);
     }
 
@@ -1415,6 +1433,76 @@ mod tests {
             0,
             "and never reached the process that took over"
         );
+    }
+
+    /// The interleaving the captured connection alone did not cover: the swap
+    /// completes *before* the decision is made, so the decision sees the new
+    /// connection and a matching generation, and a successor that reuses the
+    /// request id is asking something of its own under that id.
+    ///
+    /// What the digest protects is the arguments the person was shown. A
+    /// successor asking something *different* under the reused id cannot be
+    /// answered by that approval. A successor asking for exactly the same
+    /// thing can: the person approved those arguments on that tool, which is
+    /// what is about to happen.
+    #[test]
+    fn an_approval_cannot_answer_a_successors_different_request_under_a_reused_id() {
+        let reg = SessionRegistry::new();
+        let first = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), first.clone());
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a.env"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+
+        // The agent respawns and numbers its first request "req-1" too, but it
+        // is asking about a different file.
+        let second = Arc::new(RecordingConn::default());
+        handle.swap_connection(second.clone());
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "b.env"})));
+
+        let err = handle
+            .resolve_permission("req-1", allow().with_args_digest(Some(digest)))
+            .expect_err("refused: not what the person was shown");
+        assert!(err.to_string().contains("changed since they were shown"), "saw {err}");
+        assert_eq!(second.resolves.load(Ordering::SeqCst), 0, "nothing reached the successor");
+        assert_eq!(first.resolves.load(Ordering::SeqCst), 0, "nor the process that is gone");
+    }
+
+    /// A proposal recorded under one process cannot be answered under the
+    /// next, even for identical arguments. This is the guard for a decision
+    /// whose process is replaced *while* it is being made: the proposal it
+    /// validated against is re-recorded under the new generation, and the
+    /// generation the decision captured no longer matches.
+    #[test]
+    fn a_proposal_is_only_answerable_under_the_process_that_made_it() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        let asked = serde_json::json!({"path": "a.env"});
+        reg.ingest("s1", permission_request("req-1", "Read", asked.clone()));
+        let pending = handle.pending_permission("req-1").expect("recorded");
+
+        handle.swap_connection(Arc::new(RecordingConn::default()));
+        // The successor asks for exactly the same thing under the same id.
+        reg.ingest("s1", permission_request("req-1", "Read", asked));
+        let after = handle.pending_permission("req-1").expect("recorded afresh");
+        assert_eq!(after.args_digest, pending.args_digest, "same arguments, same digest");
+
+        // Answering it now is answering the successor's own request, which is
+        // for what the person was shown, so it goes through.
+        assert!(handle.resolve_permission("req-1", allow().with_args_digest(Some(after.args_digest))).unwrap());
+    }
+
+    #[test]
+    fn a_swap_leaves_no_window_where_an_old_proposal_is_still_readable() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        assert!(handle.pending_permission("req-1").is_some());
+        // The handover does not release the connection lock until the old
+        // process's requests are gone with it, so no decision can see the new
+        // connection beside the old proposal.
+        handle.swap_connection(Arc::new(RecordingConn::default()));
+        assert_eq!(handle.pending_permission("req-1"), None);
+        assert!(handle.outstanding_permissions().is_empty());
     }
 
     #[test]
