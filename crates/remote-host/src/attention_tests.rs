@@ -999,3 +999,59 @@ fn a_published_alert_and_its_edge_always_describe_the_same_moment() {
     writer.join().unwrap();
     assert!(seen > 100, "the probe has to actually see changes: {seen}");
 }
+
+#[test]
+fn a_view_that_could_not_be_stored_is_not_remembered_in_memory_either() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    h.publish_health(HealthInputs {
+        process: Process::Live,
+        last_turn_failure: Some("turn failed".into()),
+        last_activity_at: 1_000,
+        turn_id: Some("inc:1".into()),
+        ..Default::default()
+    });
+    assert!(f.core.attention_of(&chat_target("s1")).is_some(), "needs a person");
+
+    // The prefs table is gone, so the look cannot be stored.
+    f.db.conn().lock().unwrap().execute_batch("DROP TABLE agent_session_prefs").unwrap();
+    f.core.mark_viewed(&chat_target("s1"));
+
+    assert!(
+        f.core.attention_of(&chat_target("s1")).is_some(),
+        "a look that was not stored must not hide the failure: it would come back \
+         after a restart, and nothing on disk would say it had been seen"
+    );
+}
+
+/// The successor's prompt must be its own alert even when the old one was
+/// never cleared — and today it is not, so this test is written to the
+/// behaviour that is wanted and ignored until the defect behind it is fixed.
+///
+/// `prompt_request` comes from the view's fold, and a respawn clears the
+/// handle's maps but not the fold (`agent_chat/health_link.rs:169`;
+/// `agent_chat/mod.rs:2132`). So the dead process's request stays reported,
+/// the successor's identically numbered one never becomes the reported prompt,
+/// and nothing in the published facts tells the two apart. Fixing it is a
+/// choice between the fold dropping a dead process's pending card on respawn
+/// and the host suppressing a prompt whose publishing generation is behind the
+/// current connection; either way, un-ignore this.
+#[test]
+#[ignore = "a respawn leaves the fold's pending permission: see the doc comment"]
+fn a_stale_prompt_never_hides_the_successors_request() {
+    let f = fixture();
+    let mut rx = f.core.subscribe_attention();
+    let h = register(&f, "s1");
+    let waiting = HealthInputs { last_activity_at: 1_000, ..needs_permission() };
+    h.publish_health(waiting.clone());
+    let old_prompt = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
+
+    // The agent respawns. Nothing clears the prompt, and the successor asks
+    // under the very same request id.
+    h.swap_connection(Arc::new(StubConnection::default()));
+    h.publish_health(HealthInputs { last_activity_at: 2_000, ..waiting });
+
+    let change = next_change_for(&mut rx, &chat_target("s1"));
+    let now_asking = change.edge.expect("the successor's prompt is an alert of its own");
+    assert_ne!(now_asking, old_prompt, "a consumer has to announce the successor's request");
+}

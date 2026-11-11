@@ -309,12 +309,18 @@ impl HostCore {
             // position, so it cannot read as covered by this look however
             // close in time the two are.
             let _ = self.current(target, &mut state);
+            // The stored look and the in-memory one are the same look, so they
+            // are written together: a database failure that left the in-memory
+            // one behind would hide an alert now and let it return after a
+            // restart, since nothing on disk would say it had been seen.
+            // Written while the lock is held, so no evaluation can fall
+            // between the two.
+            if let Err(err) = self.attention().prefs.mark_viewed(target, at) {
+                tracing::warn!(%err, target, "could not record that a session was viewed");
+                return;
+            }
             let looked = state.tick();
             state.viewed_at.insert(target.to_string(), looked);
-        }
-        if let Err(err) = self.attention().prefs.mark_viewed(target, at) {
-            tracing::warn!(%err, target, "could not record that a session was viewed");
-            return;
         }
         self.reevaluate(target);
     }
