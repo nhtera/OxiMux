@@ -22,8 +22,14 @@ CREATE TABLE agent_session_prefs (
     -- Dismiss writes it too, so there is no second "dismissed_at" to reconcile.
     last_viewed_at  TEXT,
     -- "Mark as unread": the person wants it to keep standing out even though
-    -- they have viewed it. Cleared by the next send to the session.
+    -- they have viewed it. Cleared by the next view or send that happens after
+    -- the mark was made.
     unread_override INTEGER NOT NULL DEFAULT 0,
+    -- When that mark was made, RFC-3339. Its own column rather than reusing
+    -- `updated_at`: a view only spends a mark it is later than, and judging
+    -- that by the row's last write would let any unrelated write — a fold
+    -- state, a notification mode — decide whether the mark survives.
+    unread_marked_at TEXT,
     -- 'default' | 'all' | 'needs_you' | 'muted'. The notification mode this
     -- session's alerts obey; the Settings rows that drive it come later.
     notify_mode     TEXT NOT NULL DEFAULT 'default',

@@ -156,7 +156,7 @@ impl PendingPermission {
             tool_name: self.tool_name.clone(),
             kind: self.kind,
             input: self.input.clone(),
-            args_digest: args_digest(&self.input),
+            args_digest: args_digest(&self.tool_name, self.kind, &self.input),
         }
     }
 }
@@ -168,20 +168,34 @@ struct PendingQuestion {
     tool_use_id: Option<String>,
     questions: Vec<crate::thread::AskQuestion>,
     seq: u64,
+    /// Which process asked, as for a permission proposal.
+    generation: u64,
 }
 
-/// An opaque digest of a tool call's arguments.
+/// An opaque digest of what a permission request is asking for: the tool, the
+/// kind of request, and the arguments.
 ///
-/// Taken over the serialized value the host holds, never over anything a
-/// client formatted: key order and number formatting differ between Rust and
-/// a phone's JavaScript, so a client-computed hash of what it displayed could
+/// The tool is in it because the arguments alone do not say what will happen.
+/// Two tools can be handed identical JSON — a read and a write of one path —
+/// and an approval minted for one must not be accepted for the other, which a
+/// process reusing a request id could otherwise arrange.
+///
+/// Taken over the values the host holds, never over anything a client
+/// formatted: key order and number formatting differ between Rust and a
+/// phone's JavaScript, so a client-computed hash of what it displayed could
 /// never be compared against this. Hex of SHA-256, which is as opaque as it
-/// needs to be — a client cannot work out what arguments would produce a
-/// chosen digest.
-pub fn args_digest(input: &serde_json::Value) -> String {
+/// needs to be — a client cannot work out what request would produce a chosen
+/// digest.
+pub fn args_digest(tool_name: &str, kind: crate::thread::PermissionKind, input: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(input).unwrap_or_default();
-    format!("{:x}", Sha256::digest(&bytes))
+    let mut hash = Sha256::new();
+    // Length-prefixed, so no pair of fields can be re-cut into another pair
+    // that hashes the same.
+    for part in [tool_name.as_bytes(), format!("{kind:?}").as_bytes(), &serde_json::to_vec(input).unwrap_or_default()] {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    format!("{:x}", hash.finalize())
 }
 
 /// An undecided permission request, as a decider must see it before choosing.
@@ -299,6 +313,12 @@ pub struct SessionHandle {
     /// Bumped by every [`Self::swap_connection`]. A decision checked against
     /// one process must not be dispatched to the next.
     conn_generation: AtomicU64,
+    /// Runs between a decision's validation and its gate claim, so a test can
+    /// land a respawn in exactly that window. There is no other way in: the
+    /// window is inside one function call, and the orderings it produces are
+    /// the ones this handle's generation scoping exists for.
+    #[cfg(test)]
+    before_gate_claim: Mutex<Option<Box<dyn Fn() + Send>>>,
     status_tx: watch::Sender<SessionStatus>,
     /// The session's health: the driver's published facts and what they mean
     /// (`session_health.rs`).
@@ -417,6 +437,7 @@ impl SessionHandle {
                     tool_use_id: tool_use_id.clone(),
                     questions: questions.clone(),
                     seq: self.prompt_seq.fetch_add(1, Ordering::SeqCst),
+                    generation: self.conn_generation.load(Ordering::SeqCst),
                 },
             );
         }
@@ -442,6 +463,13 @@ impl SessionHandle {
 
         self.update_status(Some(seq));
         seq
+    }
+
+    /// How many times this session's connection has been replaced. Part of a
+    /// prompt's alert identity, because a provider that numbers its requests
+    /// from 1 again gives the successor's prompt the id the last one had.
+    pub fn conn_generation(&self) -> u64 {
+        self.conn_generation.load(Ordering::SeqCst)
     }
 
     /// See the `incarnation` field.
@@ -555,7 +583,8 @@ impl SessionHandle {
         if let Some(echoed) = decision.args_digest() {
             match self.pending.lock().unwrap().get(request_id) {
                 Some(pending)
-                    if pending.generation == generation && args_digest(&pending.input) == echoed => {}
+                    if pending.generation == generation
+                        && args_digest(&pending.tool_name, pending.kind, &pending.input) == echoed => {}
                 // A proposal from a process that has since been replaced. The
                 // id may name a different request now, so matching arguments
                 // do not make it the same request.
@@ -572,6 +601,10 @@ impl SessionHandle {
                      open the agent to see where it stands"
                 ),
             }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.before_gate_claim.lock().unwrap().as_ref() {
+            hook();
         }
         let newly_decided = self.claim_gate(generation, request_id);
         if !newly_decided {
@@ -648,6 +681,12 @@ impl SessionHandle {
         Ok(true)
     }
 
+    /// Install the test seam described on `before_gate_claim`.
+    #[cfg(test)]
+    fn on_before_gate_claim(&self, f: impl Fn() + Send + 'static) {
+        *self.before_gate_claim.lock().unwrap() = Some(Box::new(f));
+    }
+
     /// Claim the right to decide `request_id` on the process `generation`
     /// names. `false` means someone already has it.
     fn claim_gate(&self, generation: u64, request_id: &str) -> bool {
@@ -695,19 +734,47 @@ impl SessionHandle {
         questions: &[AskQuestion],
         answers: &QuestionAnswers,
     ) -> Result<bool> {
-        let generation = self.conn_generation.load(Ordering::SeqCst);
+        // The process this answer belongs to, taken together and used for the
+        // dispatch, exactly as a permission decision does: a respawn in
+        // between must not send these answers to whatever the new process
+        // numbered the same.
+        let (generation, conn) = {
+            let current = self.conn.lock().unwrap();
+            (self.conn_generation.load(Ordering::SeqCst), current.clone())
+        };
         let newly_decided = self.claim_gate(generation, request_id);
         if !newly_decided {
             return Ok(false);
         }
-        if let Err(err) = self.conn().answer_question(request_id, questions, answers) {
+        if self.conn_generation.load(Ordering::SeqCst) != generation {
+            self.release_gate(generation, request_id);
+            anyhow::bail!(
+                "the agent restarted while question {request_id} was being answered; \
+                 open the agent to see where it stands"
+            );
+        }
+        if let Err(err) = conn.answer_question(request_id, questions, answers) {
             // Roll the gate back so a transient transport failure doesn't lock the
             // question as answered forever.
             self.release_gate(generation, request_id);
             return Err(err);
         }
-        self.pending.lock().unwrap().remove(request_id);
-        self.questions.lock().unwrap().remove(request_id);
+        // Each settled only while it is still the one this answer was for: a
+        // respawn during the write hands the id to a new process, and taking
+        // its question would leave a person with no sign of a prompt the agent
+        // is waiting on.
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.get(request_id).is_some_and(|p| p.generation == generation) {
+                pending.remove(request_id);
+            }
+        }
+        {
+            let mut questions = self.questions.lock().unwrap();
+            if questions.get(request_id).is_some_and(|q| q.generation == generation) {
+                questions.remove(request_id);
+            }
+        }
         self.update_status(None);
         if self.health.published() {
             self.rederive_health(crate::session_health::now_ms());
@@ -1180,6 +1247,8 @@ impl SessionRegistry {
             questions: Mutex::new(HashMap::new()),
             prompt_seq: AtomicU64::new(0),
             conn_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            before_gate_claim: Mutex::new(None),
             status_tx,
             health: crate::session_health::HealthCell::new(self.health_cfg.clone()),
             meta: Mutex::new(SessionMeta::default()),
@@ -1687,6 +1756,101 @@ mod tests {
         // answered; a successor's identically numbered prompt has not been.
         handle.swap_connection(Arc::new(RecordingConn::default()));
         assert!(!handle.decided_contains("req-1"), "not on the process running now");
+    }
+
+    /// The interleaving asked for twice in review: the respawn lands *between*
+    /// a decision's validation and its gate claim, so the claim is made under
+    /// a generation that is already gone.
+    #[test]
+    fn a_claim_made_after_the_respawn_neither_dispatches_nor_blocks_the_successor() {
+        let reg = Arc::new(SessionRegistry::new());
+        let first = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), first.clone());
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+
+        // The agent respawns in the window, and its successor asks something
+        // of its own under the same id.
+        let successor = Arc::new(RecordingConn::default());
+        {
+            let (h, r, next) = (handle.clone(), reg.clone(), successor.clone());
+            let once = Mutex::new(true);
+            handle.on_before_gate_claim(move || {
+                if !std::mem::replace(&mut *once.lock().unwrap(), false) {
+                    return;
+                }
+                h.swap_connection(next.clone());
+                r.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "b"})));
+            });
+        }
+
+        let err = handle
+            .resolve_permission("req-1", allow().with_args_digest(Some(digest)))
+            .expect_err("the process it was for is gone");
+        assert!(err.to_string().contains("restarted"), "saw {err}");
+        assert_eq!(first.resolves.load(Ordering::SeqCst), 0, "nothing was dispatched");
+        assert_eq!(successor.resolves.load(Ordering::SeqCst), 0, "least of all to the successor");
+
+        // And the claim it left behind does not block the successor's request,
+        // which is answerable exactly once.
+        let now_asking = handle.pending_permission("req-1").expect("the successor's proposal");
+        assert!(
+            handle
+                .resolve_permission("req-1", allow().with_args_digest(Some(now_asking.args_digest)))
+                .unwrap(),
+            "the successor's own request is answerable"
+        );
+        assert_eq!(successor.resolves.load(Ordering::SeqCst), 1);
+        assert!(!handle.resolve_permission("req-1", allow()).unwrap(), "and only once");
+    }
+
+    #[test]
+    fn an_approval_is_bound_to_the_tool_it_was_shown_for() {
+        let reg = SessionRegistry::new();
+        let conn = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), conn.clone());
+        // Two tools, one set of arguments: reading a path and writing it take
+        // the same JSON and do very different things.
+        let path = serde_json::json!({"path": "deploy.key"});
+        reg.ingest("s1", permission_request("req-1", "Read", path.clone()));
+        let for_read = handle.pending_permission("req-1").unwrap().args_digest;
+        handle.resolve_permission("req-1", allow()).unwrap();
+
+        reg.ingest("s1", permission_request("req-2", "Write", path));
+        let for_write = handle.pending_permission("req-2").unwrap().args_digest;
+        assert_ne!(for_read, for_write, "the tool is part of what was approved");
+
+        let err = handle
+            .resolve_permission("req-2", allow().with_args_digest(Some(for_read)))
+            .expect_err("an approval minted for the read must not permit the write");
+        assert!(err.to_string().contains("changed since they were shown"), "saw {err}");
+        assert_eq!(conn.resolves.load(Ordering::SeqCst), 1, "only the read was answered");
+    }
+
+    #[test]
+    fn answering_a_question_goes_to_the_process_that_asked_it() {
+        let reg = Arc::new(SessionRegistry::new());
+        let first = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), first.clone());
+        reg.ingest(
+            "s1",
+            ThreadEvent::QuestionAsked { request_id: "q-1".into(), tool_use_id: None, questions: vec![] },
+        );
+
+        // The agent respawns and its successor asks a question under the same
+        // id. The old answer must not be sent to it, and must not take its
+        // question away.
+        let successor = Arc::new(RecordingConn::default());
+        handle.swap_connection(successor.clone());
+        reg.ingest(
+            "s1",
+            ThreadEvent::QuestionAsked { request_id: "q-1".into(), tool_use_id: Some("t".into()), questions: vec![] },
+        );
+
+        assert!(handle.answer_question("q-1", &[], &Default::default()).unwrap());
+        assert_eq!(first.answers.load(Ordering::SeqCst), 0, "not to the process that is gone");
+        assert_eq!(successor.answers.load(Ordering::SeqCst), 1, "to the one asking now");
+        assert_eq!(handle.pending_question(), None, "and it settled the question it answered");
     }
 
     #[test]

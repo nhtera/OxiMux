@@ -126,6 +126,13 @@ impl HealthCell {
     pub(crate) fn published(&self) -> bool {
         self.published.load(Ordering::Relaxed)
     }
+
+    /// The derived health and the inputs it was derived from, under the lock
+    /// that every derivation holds.
+    fn coherent(&self) -> (SessionHealth, HealthInputs) {
+        let _derive = self.derive.lock().unwrap();
+        (self.health.borrow().clone(), self.inputs.borrow().clone())
+    }
 }
 
 impl SessionHandle {
@@ -195,6 +202,18 @@ impl SessionHandle {
     /// Follow the session's health.
     pub fn subscribe_health(&self) -> watch::Receiver<SessionHealth> {
         self.health.health.subscribe()
+    }
+
+    /// The driver's facts and the health derived from them, read as one.
+    ///
+    /// `publish_health` writes the facts and then derives the health from
+    /// them, so the two watches move one after the other. A reader that caught
+    /// the gap would pair a prompt id with a health that no longer has that
+    /// prompt — or the reverse — and mint an alert for something already
+    /// answered. Taken under the same lock the derivation holds, so there is
+    /// no gap to catch.
+    pub fn health_snapshot(&self) -> (SessionHealth, HealthInputs) {
+        self.health.coherent()
     }
 
     /// Follow the driver's raw facts.

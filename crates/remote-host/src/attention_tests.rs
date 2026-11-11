@@ -284,7 +284,10 @@ fn a_health_change_publishes_one_change_with_its_edge() {
     let change = next_change_for(&mut rx, &chat_target("s1"));
     let edge = change.edge.expect("an edge to alert on");
     assert_eq!(edge.kind, AttentionKind::NeedsPermission);
-    assert_eq!(edge.id, "req:req-1", "the request being answered");
+    assert_eq!(
+        edge.id, "req:0:req-1",
+        "the request being answered, qualified by the process that asked"
+    );
     assert_eq!(change.retired, None, "nothing was showing before");
 }
 
@@ -570,4 +573,83 @@ fn a_new_request_with_the_same_health_is_still_a_new_edge() {
     let second = change.edge.expect("raised");
     assert_ne!(second, first, "a different request is a different alert");
     assert_eq!(change.retired, Some(first));
+}
+
+#[test]
+fn a_viewed_finish_never_hides_a_failure_of_the_same_turn() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    let turn = HealthInputs {
+        process: Process::Live,
+        last_activity_at: now() - 60_000,
+        turn_id: Some("inc:1".into()),
+        ..Default::default()
+    };
+    // The turn finished and nobody had read it.
+    h.publish_health(turn.clone());
+    assert_eq!(
+        f.core.attention_of(&chat_target("s1")).map(|a| a.kind),
+        Some(AttentionKind::FinishedUnread)
+    );
+    // The person reads it.
+    f.core.mark_viewed(&chat_target("s1"));
+    assert_eq!(f.core.attention_of(&chat_target("s1")), None);
+
+    // Then that same turn is reported failed. It carries the turn's id, so an
+    // alert history keyed by id alone would hand it the finish's onset and
+    // call it seen.
+    h.publish_health(HealthInputs { last_turn_failure: Some("turn failed".into()), ..turn });
+    assert_eq!(
+        f.core.attention_of(&chat_target("s1")).map(|a| a.kind),
+        Some(AttentionKind::Failed),
+        "reading the finish is not reading the failure"
+    );
+}
+
+#[test]
+fn a_view_covers_an_alert_that_was_sitting_beneath_a_worse_one() {
+    let f = fixture();
+    // The failure is current; the stall arrives underneath it and is never
+    // the winner, so it would never be recorded as having arrived.
+    f.core.publish_external(external("ci", "plan:run-1", AttentionKind::Failed));
+    f.core.publish_external(external("slow", "plan:run-1", AttentionKind::Stalled));
+    assert_eq!(f.core.attention_of("plan:run-1").unwrap().kind, AttentionKind::Failed);
+
+    // One view deals with what was on the row at the time — both of them.
+    f.core.mark_viewed("plan:run-1");
+    f.core.clear_external("ci");
+    assert_eq!(
+        f.core.attention_of("plan:run-1"),
+        None,
+        "the stall had arrived before the view too, so it was seen as well"
+    );
+}
+
+#[test]
+fn a_prompt_after_a_respawn_is_a_new_alert_even_with_the_same_request_id() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    h.publish_health(needs_permission());
+    let first = f.core.attention_of(&chat_target("s1")).expect("raised");
+    let edge_before = oximux_agents::attention::edge_of(
+        &chat_target("s1"),
+        &first,
+        Some(&h.health()),
+        Some(&format!("{}:req-1", h.conn_generation())),
+    );
+
+    // The agent respawns and numbers its first request "req-1" again.
+    h.swap_connection(Arc::new(StubConnection::default()));
+    h.publish_health(needs_permission());
+    let after = f.core.attention_of(&chat_target("s1")).expect("raised");
+    let edge_after = oximux_agents::attention::edge_of(
+        &chat_target("s1"),
+        &after,
+        Some(&h.health()),
+        Some(&format!("{}:req-1", h.conn_generation())),
+    );
+    assert_ne!(
+        edge_before, edge_after,
+        "a consumer that alerts once per edge has to announce the new prompt"
+    );
 }

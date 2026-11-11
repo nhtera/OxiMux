@@ -74,6 +74,9 @@ pub struct SessionPrefs {
     pub last_viewed_at: Option<i64>,
     /// "Mark as unread": keep standing out although it has been viewed.
     pub unread_override: bool,
+    /// When that mark was made, in Unix milliseconds. A view spends the mark
+    /// only if it happened after this.
+    pub unread_marked_at: Option<i64>,
     pub notify_mode: NotifyMode,
     /// The session's subtree is folded shut in the rail (read by the subagent
     /// tree phase; stored here because V034 is immutable once merged).
@@ -118,7 +121,7 @@ impl SessionPrefsRepo {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT last_viewed_at, unread_override, notify_mode, collapsed \
+                "SELECT last_viewed_at, unread_override, notify_mode, collapsed, unread_marked_at \
                  FROM agent_session_prefs WHERE session_key = ?1",
                 params![session_key],
                 |r| {
@@ -127,6 +130,7 @@ impl SessionPrefsRepo {
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -134,9 +138,10 @@ impl SessionPrefsRepo {
             .context("read session prefs")?;
         Ok(match row {
             None => SessionPrefs::default(),
-            Some((viewed, unread, mode, collapsed)) => SessionPrefs {
+            Some((viewed, unread, mode, collapsed, marked)) => SessionPrefs {
                 last_viewed_at: viewed.as_deref().and_then(parse_ms),
                 unread_override: unread != 0,
+                unread_marked_at: marked.as_deref().and_then(parse_ms),
                 notify_mode: NotifyMode::from_text(&mode),
                 collapsed: collapsed != 0,
             },
@@ -149,7 +154,8 @@ impl SessionPrefsRepo {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT session_key, last_viewed_at, unread_override, notify_mode, collapsed \
+                "SELECT session_key, last_viewed_at, unread_override, notify_mode, collapsed, \
+                        unread_marked_at \
                  FROM agent_session_prefs",
             )
             .context("prepare session prefs scan")?;
@@ -162,6 +168,7 @@ impl SessionPrefsRepo {
                         unread_override: r.get::<_, i64>(2)? != 0,
                         notify_mode: NotifyMode::from_text(&r.get::<_, String>(3)?),
                         collapsed: r.get::<_, i64>(4)? != 0,
+                        unread_marked_at: r.get::<_, Option<String>>(5)?.as_deref().and_then(parse_ms),
                     },
                 ))
             })
@@ -179,9 +186,10 @@ impl SessionPrefsRepo {
     ///
     /// Nothing here moves backwards. `last_viewed_at` only ever advances, so a
     /// stale call — a tick that raced a newer view — cannot un-see something;
-    /// and a view older than the row's last write does not clear an unread
-    /// mark made after it, which would silently undo what the person asked
-    /// for.
+    /// and a view earlier than the unread mark does not clear it, which would
+    /// silently undo what the person asked for. That comparison is against the
+    /// mark's own time, so an unrelated write — a fold state, a notification
+    /// mode — cannot decide whether the mark survives.
     pub fn mark_viewed(&self, session_key: &str, now: DateTime<Local>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -189,7 +197,9 @@ impl SessionPrefsRepo {
              VALUES (?1, ?2, 0, ?2) \
              ON CONFLICT(session_key) DO UPDATE SET \
                  last_viewed_at = MAX(COALESCE(last_viewed_at, ?2), ?2), \
-                 unread_override = CASE WHEN ?2 >= updated_at THEN 0 ELSE unread_override END, \
+                 unread_override = CASE \
+                     WHEN unread_marked_at IS NULL OR ?2 >= unread_marked_at THEN 0 \
+                     ELSE unread_override END, \
                  updated_at = MAX(updated_at, ?2)",
             params![session_key, stamp(now)],
         )
@@ -197,9 +207,22 @@ impl SessionPrefsRepo {
         Ok(())
     }
 
-    /// "Mark as unread": the person wants it to keep standing out.
+    /// "Mark as unread": the person wants it to keep standing out. The time is
+    /// recorded, because only a view later than this spends the mark.
     pub fn mark_unread(&self, session_key: &str, now: DateTime<Local>) -> Result<()> {
-        self.set_flag(session_key, "unread_override", true, now)
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_session_prefs \
+                 (session_key, unread_override, unread_marked_at, updated_at) \
+             VALUES (?1, 1, ?2, ?2) \
+             ON CONFLICT(session_key) DO UPDATE SET \
+                 unread_override = 1, \
+                 unread_marked_at = MAX(COALESCE(unread_marked_at, ?2), ?2), \
+                 updated_at = MAX(updated_at, ?2)",
+            params![session_key, stamp(now)],
+        )
+        .context("mark session unread")?;
+        Ok(())
     }
 
     pub fn set_notify_mode(&self, session_key: &str, mode: NotifyMode, now: DateTime<Local>) -> Result<()> {
@@ -269,20 +292,26 @@ pub(crate) fn rekey_in(tx: &rusqlite::Transaction<'_>, old: &str, new: &str) -> 
             unread_override: from.unread_override || into.unread_override,
             notify_mode: from.notify_mode,
             collapsed: from.collapsed,
-            // The later of the two, never the current clock: this is what
-            // `mark_viewed` judges an unread mark against, so stamping "now"
-            // would rewind it whenever the system clock had stepped back and
-            // let a stale view clear a mark made after it.
+            // The later of the two, never the current clock: stamping "now"
+            // would rewind the row's clock whenever the system clock had
+            // stepped back.
             updated_at: from.updated_at.max(into.updated_at),
+            // And the later mark, so a view earlier than either still does not
+            // spend it.
+            unread_marked_at: [from.unread_marked_at, into.unread_marked_at]
+                .into_iter()
+                .flatten()
+                .max(),
         },
     };
     tx.execute(
         "INSERT INTO agent_session_prefs \
-             (session_key, last_viewed_at, unread_override, notify_mode, collapsed, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             (session_key, last_viewed_at, unread_override, notify_mode, collapsed, updated_at, \
+              unread_marked_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
          ON CONFLICT(session_key) DO UPDATE SET \
              last_viewed_at = ?2, unread_override = ?3, notify_mode = ?4, collapsed = ?5, \
-             updated_at = ?6",
+             updated_at = ?6, unread_marked_at = ?7",
         params![
             new,
             merged.last_viewed_at,
@@ -290,6 +319,7 @@ pub(crate) fn rekey_in(tx: &rusqlite::Transaction<'_>, old: &str, new: &str) -> 
             merged.notify_mode,
             i64::from(merged.collapsed),
             merged.updated_at,
+            merged.unread_marked_at,
         ],
     )
     .context("rekey session prefs")?;
@@ -301,6 +331,7 @@ pub(crate) fn rekey_in(tx: &rusqlite::Transaction<'_>, old: &str, new: &str) -> 
 struct Row {
     last_viewed_at: Option<String>,
     unread_override: bool,
+    unread_marked_at: Option<String>,
     notify_mode: String,
     collapsed: bool,
     updated_at: String,
@@ -308,7 +339,8 @@ struct Row {
 
 fn row_in(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<Option<Row>> {
     tx.query_row(
-        "SELECT last_viewed_at, unread_override, notify_mode, collapsed, updated_at \
+        "SELECT last_viewed_at, unread_override, notify_mode, collapsed, updated_at, \
+                unread_marked_at \
          FROM agent_session_prefs WHERE session_key = ?1",
         params![key],
         |r| {
@@ -318,6 +350,7 @@ fn row_in(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<Option<Row>> {
                 notify_mode: r.get(2)?,
                 collapsed: r.get::<_, i64>(3)? != 0,
                 updated_at: r.get(4)?,
+                unread_marked_at: r.get(5)?,
             })
         },
     )

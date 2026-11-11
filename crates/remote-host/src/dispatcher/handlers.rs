@@ -718,7 +718,7 @@ mod parent_permit_tests {
             request_id: "req-1".into(),
             tool_name: tool.into(),
             kind,
-            args_digest: oximux_agents::session_registry::args_digest(&input),
+            args_digest: oximux_agents::session_registry::args_digest(tool, kind, &input),
             input,
         }
     }

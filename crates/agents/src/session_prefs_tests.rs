@@ -200,11 +200,14 @@ fn a_view_that_arrives_late_does_not_undo_a_newer_unread_mark() {
 }
 
 #[test]
-fn a_late_write_of_any_kind_cannot_let_a_stale_view_clear_an_unread_mark() {
-    // `mark_viewed` decides by `updated_at`, so every writer has to keep it
-    // moving forward: a delayed collapse or mode change that moved it back
-    // would make an older view look recent enough to spend the mark.
+fn a_view_is_judged_against_the_mark_itself_not_against_other_writes() {
+    // A view spends a mark only if it came after it. Judging that by the row's
+    // last write let any unrelated write decide the outcome, in both
+    // directions: a late write could rewind the clock, and a write *after* the
+    // mark could keep a later view from spending it.
     for late in ["collapsed", "notify_mode"] {
+        // The view (10) is older than the mark (11): the mark survives,
+        // however the other writes fall.
         let r = repo();
         r.mark_unread("chat:s1", t(11)).unwrap();
         match late {
@@ -214,9 +217,34 @@ fn a_late_write_of_any_kind_cannot_let_a_stale_view_clear_an_unread_mark() {
         r.mark_viewed("chat:s1", t(10)).unwrap();
         assert!(
             r.get("chat:s1").unwrap().unread_override,
-            "a late {late} write must not rewind the clock the mark is judged by"
+            "a view before the mark must not spend it ({late} write at 9)"
+        );
+
+        // The view (10) is newer than the mark (9): it spends it, even though
+        // an unrelated write landed in between.
+        let r = repo();
+        r.mark_unread("chat:s1", t(9)).unwrap();
+        match late {
+            "collapsed" => r.set_collapsed("chat:s1", true, t(11)).unwrap(),
+            _ => r.set_notify_mode("chat:s1", NotifyMode::Muted, t(11)).unwrap(),
+        }
+        r.mark_viewed("chat:s1", t(10)).unwrap();
+        assert!(
+            !r.get("chat:s1").unwrap().unread_override,
+            "a view after the mark must spend it, whatever else was written ({late} at 11)"
         );
     }
+}
+
+#[test]
+fn the_time_of_an_unread_mark_is_recorded_and_only_moves_forward() {
+    let r = repo();
+    r.mark_unread("chat:s1", t(20)).unwrap();
+    assert_eq!(r.get("chat:s1").unwrap().unread_marked_at, Some(ms(t(20))));
+    // A stale duplicate of the mark cannot move it back and let an older view
+    // spend it.
+    r.mark_unread("chat:s1", t(10)).unwrap();
+    assert_eq!(r.get("chat:s1").unwrap().unread_marked_at, Some(ms(t(20))));
 }
 
 #[test]
@@ -233,6 +261,7 @@ fn a_rekey_keeps_the_later_clock_rather_than_taking_the_current_one() {
 
     let moved = r.get(&chat_key("new")).unwrap();
     assert!(moved.unread_override, "the mark survived the rekey");
+    assert_eq!(moved.unread_marked_at, Some(ms(t(40))), "and so did its time");
     // A view from before the mark must still not spend it, however long ago
     // the rekey happened to run.
     r.mark_viewed(&chat_key("new"), t(20)).unwrap();

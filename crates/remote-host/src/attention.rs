@@ -43,7 +43,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use oximux_agents::attention::{
-    self, Attention, AttentionEdge, EdgeOnset, ExternalAttention,
+    self, Attention, AttentionEdge, AttentionKind, AttentionSource, EdgeOnset, ExternalAttention,
 };
 use oximux_agents::session_health::now_ms;
 use oximux_agents::session_prefs::{SessionPrefs, SessionPrefsRepo};
@@ -96,28 +96,38 @@ pub struct AttentionState {
     /// is measured from, and a process dies after its last output. Kept per
     /// edge rather than per target so an alert outranked by a worse one and
     /// then uncovered again is still judged by when it actually arrived.
-    onset: HashMap<String, Vec<(String, i64)>>,
+    ///
+    /// Keyed by kind *and* id, because an id alone is not an alert: a finished
+    /// turn and a later failure of that same turn share the turn's id, and a
+    /// viewed finish must not hide the failure that followed it.
+    onset: HashMap<String, Vec<(EdgeKey, i64)>>,
 }
 
 impl AttentionState {
     /// When `edge` was first seen on its target.
     fn raised_at(&self, edge: &AttentionEdge) -> Option<i64> {
         let seen = self.onset.get(&edge.target)?;
-        seen.iter().find(|(id, _)| *id == edge.id).map(|(_, at)| *at)
+        let key: EdgeKey = (edge.kind, edge.id.clone());
+        seen.iter().find(|(k, _)| *k == key).map(|(_, at)| *at)
     }
 
     /// Remember that `edge` was seen at `now`, if it is not already known.
     fn record(&mut self, edge: &AttentionEdge, now: i64) {
         let seen = self.onset.entry(edge.target.clone()).or_default();
-        if seen.iter().any(|(id, _)| *id == edge.id) {
+        let key: EdgeKey = (edge.kind, edge.id.clone());
+        if seen.iter().any(|(k, _)| *k == key) {
             return;
         }
         if seen.len() >= ONSET_MEMORY {
             seen.remove(0);
         }
-        seen.push((edge.id.clone(), now));
+        seen.push((key, now));
     }
 }
+
+/// What identifies an edge within one target: an id alone is not an alert,
+/// since a finished turn and a later failure of it share the turn's id.
+type EdgeKey = (AttentionKind, String);
 
 /// [`AttentionState`] read as the evaluator's edge history.
 struct Onset<'a>(&'a AttentionState);
@@ -317,16 +327,65 @@ impl HostCore {
     ) -> Option<Attention> {
         let external = external_for(state, target);
         let prefs = self.prefs_of(target);
-        let attention = match self.session_of(target) {
-            Some(handle) => {
-                attention::of(target, &handle.health(), &prefs, &external, &Onset(state))
-            }
+        // One coherent read of the session, so the prompt id and the health it
+        // is judged against are the same moment.
+        let session = self.session_of(target).map(|handle| handle.health_snapshot());
+        // The qualified form, matching what `edge_of` mints, so a recorded
+        // onset and the edge it is looked up by cannot disagree.
+        let request = match (self.session_of(target), session.as_ref()) {
+            (Some(handle), Some((_, inputs))) => self.prompt_edge(&handle, inputs),
+            _ => None,
+        };
+
+        let health = session.as_ref().map(|(h, _)| h);
+        // Evaluated against the onsets as they stood *before* this call, so an
+        // alert is never born already seen: recording first would compare a
+        // brand-new alert against this very moment, and a view taken in the
+        // same millisecond would swallow it.
+        let attention = match health {
+            Some(health) => attention::of(target, health, &prefs, &external, &Onset(state)),
             // No session of its own (a terminal agent, a run root): its alerts
             // are the ones its producer raised.
             None => attention::of_external(target, &prefs, &external, &Onset(state)),
-        }?;
-        state.record(&self.edge_of(target, &attention), now);
-        Some(attention)
+        };
+        // Then every alert this target could raise is recorded, not only the
+        // one that won. An alert sitting beneath a worse one has arrived as
+        // surely as the worse one has, and a view covers what had arrived when
+        // it was taken; recording only the winner left the one underneath
+        // reading as new after the view, and stuck in "needs you".
+        for candidate in self.candidates(target, health, &external) {
+            let edge = attention::edge_of(target, &candidate, health, request.as_deref());
+            state.record(&edge, now);
+        }
+        attention
+    }
+
+    /// Every alert `target` could raise right now, ignoring what the person
+    /// has seen — the session's own state and each external item.
+    fn candidates(
+        &self,
+        target: &str,
+        health: Option<&oximux_agents::health::SessionHealth>,
+        external: &[ExternalAttention],
+    ) -> Vec<Attention> {
+        let unseen = SessionPrefs::default();
+        let mut out: Vec<Attention> = external
+            .iter()
+            .map(|item| Attention {
+                kind: item.kind,
+                since: item.since,
+                reason: Some(item.reason.clone()),
+                source: AttentionSource::External(item.key.clone()),
+            })
+            .collect();
+        if let Some(health) = health
+            // With default prefs nothing reads as seen, so this is the
+            // session's own alert as it stands.
+            && let Some(own) = attention::of(target, health, &unseen, &[], &attention::Unrecorded)
+        {
+            out.push(own);
+        }
+        out
     }
 
     /// `target`'s alert identity, with the pending request id the session
@@ -334,12 +393,33 @@ impl HostCore {
     fn edge_of(&self, target: &str, attention: &Attention) -> AttentionEdge {
         match self.session_of(target) {
             Some(handle) => {
-                let health = handle.health();
-                let request = handle.health_inputs().prompt_request;
-                attention::edge_of(target, attention, Some(&health), request.as_deref())
+                // One read, so the prompt id cannot belong to a different
+                // moment than the health it is read with: the driver publishes
+                // its facts before the health derived from them, and a reader
+                // that caught the gap would mint an edge for a prompt that had
+                // just been answered.
+                let (health, inputs) = handle.health_snapshot();
+                attention::edge_of(target, attention, Some(&health), self.prompt_edge(&handle, &inputs).as_deref())
             }
             None => attention::edge_of(target, attention, None, None),
         }
+    }
+
+    /// The pending prompt's edge identity: the provider's request id qualified
+    /// by the process that asked.
+    ///
+    /// A provider that numbers its requests from 1 again after a respawn gives
+    /// the successor's prompt the same id as the one before it. Unqualified,
+    /// the two would be one edge, and a consumer that alerts once per edge
+    /// would never announce the new prompt. The raw id still decides the
+    /// prompt itself — this qualification is for telling alerts apart.
+    fn prompt_edge(
+        &self,
+        handle: &SessionHandle,
+        inputs: &oximux_agents::health::HealthInputs,
+    ) -> Option<String> {
+        let request = inputs.prompt_request.as_deref()?;
+        Some(format!("{}:{request}", handle.conn_generation()))
     }
 
     /// The live session a target names, if it names one.
