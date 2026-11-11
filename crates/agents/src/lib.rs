@@ -8,6 +8,7 @@
 pub mod agent_process;
 pub mod agent_title;
 pub mod cli;
+pub mod attention;
 pub mod command_envelope;
 pub mod commit_message;
 pub mod commit_message_heuristic;
@@ -28,6 +29,7 @@ pub mod schedule;
 pub mod send_gate;
 pub mod send_receipts;
 pub mod session_health;
+pub mod session_prefs;
 pub mod session_registry;
 pub mod runtime_impl;
 pub mod session_log;

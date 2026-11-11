@@ -270,6 +270,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "send_receipts",
         sql: include_str!("../migrations/V033__send_receipts.sql"),
     },
+    // V034: what a person has already seen of a session (so a restart does not
+    // replay old alerts) and how loudly it may speak.
+    Migration {
+        version: 34,
+        name: "agent_session_prefs",
+        sql: include_str!("../migrations/V034__agent_session_prefs.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
