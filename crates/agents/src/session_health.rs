@@ -62,14 +62,18 @@ pub struct HealthCell {
     /// session alone: a spawn marks a child working before its view exists,
     /// and default inputs must not undo that.
     published: std::sync::atomic::AtomicBool,
-    /// Which process the published facts came from (the handle's connection
-    /// generation when they were published).
+    /// Which process raised the pending prompt (the handle's connection
+    /// generation when that prompt was first published).
     ///
     /// Read with the facts rather than from the handle, because the two must
     /// agree: a respawn bumps the generation without clearing a prompt the old
     /// process had published, so a generation read a moment later would brand
     /// that prompt with the successor's number — and the successor's own first
     /// prompt, numbered the same by its provider, would then be the same alert.
+    ///
+    /// Moved only by a change of prompt. Anything looser re-attributes a
+    /// prompt the old process still owns: a republish of identical facts did
+    /// it, and so did an unrelated field changing.
     published_generation: AtomicI64,
 }
 
@@ -191,6 +195,16 @@ impl SessionHandle {
         // answered.
         let derive = self.health.derive.lock().unwrap();
         let generation = self.conn_generation() as i64;
+        // The number belongs to **the prompt**, so it moves when the prompt
+        // does and at no other time.
+        //
+        // Tying it to the facts as a whole was wrong twice over: a republish
+        // of identical facts re-attributed them, and then any unrelated change
+        // — an activity timestamp — re-attributed a prompt that was still the
+        // old process's. Either way its pending prompt took the successor's
+        // number, and the successor's own identically numbered request became
+        // the very same alert, which nothing would announce.
+        let new_prompt = self.health.inputs.borrow().prompt_request != inputs.prompt_request;
         let modified = self.health.inputs.send_if_modified(|current| {
             if *current == inputs {
                 return false;
@@ -198,13 +212,7 @@ impl SessionHandle {
             *current = inputs;
             true
         });
-        // Stamped only when the facts actually changed. A republish of the
-        // *same* facts — a rebind re-announcing what the chat already knows —
-        // must not re-attribute them: they are still the old process's, and
-        // moving the stamp would give its pending prompt the successor's
-        // number, at which point the successor's own first prompt is the very
-        // same alert and nothing announces it.
-        if modified {
+        if new_prompt {
             self.health.published_generation.store(generation, Ordering::Relaxed);
         }
         let changed = if modified || first {

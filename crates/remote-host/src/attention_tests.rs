@@ -648,32 +648,14 @@ fn a_prompt_keeps_the_number_of_the_process_that_published_it() {
         "the facts still belong to the process that published them"
     );
 
-    // Once the successor publishes, its prompt carries its own number.
-    h.publish_health(HealthInputs { last_activity_at: now() + 1, ..needs_permission() });
-    assert_ne!(h.health_snapshot().generation, before, "a new publish, a new process");
-}
+    // Activity alone does not move it either: the prompt is still the one the
+    // old process raised.
+    h.publish_health(HealthInputs { last_activity_at: 9_999, ..needs_permission() });
+    assert_eq!(h.health_snapshot().generation, before, "activity is not a new prompt");
 
-#[test]
-fn a_prompt_after_a_respawn_is_a_new_alert_even_with_the_same_request_id() {
-    let f = fixture();
-    // Read the edges the host *publishes*, which is what a consumer dedupes
-    // on — rebuilding them in the test would only prove the test agrees with
-    // itself.
-    let mut rx = f.core.subscribe_attention();
-    let h = register(&f, "s1");
-    h.publish_health(needs_permission());
-    let before = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
-
-    // The agent respawns and numbers its first request "req-1" again.
-    h.swap_connection(Arc::new(StubConnection::default()));
-    h.publish_health(HealthInputs { last_activity_at: now() + 1, ..needs_permission() });
-    let change = next_change_for(&mut rx, &chat_target("s1"));
-    let after = change.edge.expect("raised");
-    assert_ne!(
-        after, before,
-        "a consumer that alerts once per edge has to announce the new prompt"
-    );
-    assert_eq!(change.retired, Some(before), "and the one before it is retired");
+    // Once the successor raises a prompt of its own, that one is its.
+    h.publish_health(HealthInputs { prompt_request: Some("its-own".into()), ..needs_permission() });
+    assert_ne!(h.health_snapshot().generation, before, "a new prompt, a new process");
 }
 
 #[test]
@@ -789,28 +771,72 @@ fn a_look_from_before_a_restart_still_covers_what_it_covered() {
 }
 
 #[test]
-fn republishing_the_same_facts_does_not_re_attribute_them() {
+fn only_a_change_of_prompt_moves_the_number_it_is_attributed_to() {
     let f = fixture();
     let h = register(&f, "s1");
-    h.publish_health(needs_permission());
-    let published_by = h.health_snapshot().generation;
+    // Fixed, so "the same facts" really are the same: `needs_permission()`
+    // reads the clock, and two calls can differ by a millisecond.
+    let waiting = HealthInputs { last_activity_at: 1_000, ..needs_permission() };
+    h.publish_health(waiting.clone());
+    let raised_by = h.health_snapshot().generation;
 
-    // The agent respawns and something re-announces what the chat already
-    // knows — a rebind does exactly this. The facts are unchanged, so they are
-    // still the old process's and must keep its number; otherwise the
-    // successor's own first prompt, numbered the same by its provider, is the
-    // very same alert and nothing announces it.
     h.swap_connection(Arc::new(StubConnection::default()));
-    h.publish_health(needs_permission());
+
+    // A rebind re-announcing what the chat already knows.
+    h.publish_health(waiting.clone());
     assert_eq!(
         h.health_snapshot().generation,
-        published_by,
-        "a republish of the same facts is not a new publication"
+        raised_by,
+        "a republish of the same facts is not a new prompt"
     );
 
-    // Facts that genuinely change do carry the new process's number.
-    h.publish_health(HealthInputs { prompt_request: Some("req-2".into()), ..needs_permission() });
-    assert_ne!(h.health_snapshot().generation, published_by);
+    // And an unrelated field moving — the session did something — is not a new
+    // prompt either. The prompt is still the one the old process raised.
+    h.publish_health(HealthInputs { last_activity_at: 2_000, ..waiting.clone() });
+    assert_eq!(
+        h.health_snapshot().generation,
+        raised_by,
+        "activity is not a prompt: the old process still owns this one"
+    );
+
+    // A different prompt is attributed to whoever is asking now.
+    h.publish_health(HealthInputs { prompt_request: Some("req-2".into()), ..waiting });
+    assert_ne!(h.health_snapshot().generation, raised_by);
+}
+
+#[test]
+fn a_successor_reusing_a_retained_prompts_request_id_still_gets_its_own_alert() {
+    // The sequence the host has to survive, read off the stream a consumer
+    // actually dedupes on: a prompt is raised, the agent respawns while that
+    // prompt is still in the published facts, the session keeps reporting
+    // activity, and then the successor asks under the very same request id.
+    let f = fixture();
+    let mut rx = f.core.subscribe_attention();
+    let h = register(&f, "s1");
+    let waiting = HealthInputs { last_activity_at: 1_000, ..needs_permission() };
+    h.publish_health(waiting.clone());
+    let old_prompt = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
+
+    h.swap_connection(Arc::new(StubConnection::default()));
+    // Activity while the old prompt is retained must not re-attribute it, and
+    // must not announce anything: it is the same alert.
+    h.publish_health(HealthInputs { last_activity_at: 2_000, ..waiting.clone() });
+    assert!(
+        matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+        "a retained prompt is not a new alert"
+    );
+
+    // The successor clears it and asks its own, numbered the same.
+    h.publish_health(HealthInputs { prompt: None, prompt_request: None, last_activity_at: 3_000, ..waiting.clone() });
+    next_change_for(&mut rx, &chat_target("s1"));
+    h.publish_health(HealthInputs { last_activity_at: 4_000, ..waiting });
+
+    let change = next_change_for(&mut rx, &chat_target("s1"));
+    let new_prompt = change.edge.expect("raised");
+    assert_ne!(
+        new_prompt, old_prompt,
+        "the successor's prompt carries its own number, so a consumer announces it"
+    );
 }
 
 #[test]
