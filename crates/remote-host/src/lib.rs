@@ -13,6 +13,7 @@
 //! migration, and the enablement UI are later slices; this crate is the network-
 //! free core they build on.
 
+pub mod attention;
 pub mod auth;
 pub mod catalog;
 mod child_watcher;
