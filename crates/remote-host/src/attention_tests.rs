@@ -626,6 +626,29 @@ fn a_view_covers_an_alert_that_was_sitting_beneath_a_worse_one() {
 }
 
 #[test]
+fn a_prompt_keeps_the_number_of_the_process_that_published_it() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    h.publish_health(needs_permission());
+    let before = h.health_snapshot().generation;
+
+    // The agent respawns. The old process's prompt is still in the published
+    // facts — nothing clears it — so a generation read *now* rather than at
+    // publish time would brand that prompt with the successor's number, and
+    // the successor's own `req-1` would then be the very same alert.
+    h.swap_connection(Arc::new(StubConnection::default()));
+    assert_eq!(
+        h.health_snapshot().generation,
+        before,
+        "the facts still belong to the process that published them"
+    );
+
+    // Once the successor publishes, its prompt carries its own number.
+    h.publish_health(HealthInputs { last_activity_at: now() + 1, ..needs_permission() });
+    assert_ne!(h.health_snapshot().generation, before, "a new publish, a new process");
+}
+
+#[test]
 fn a_prompt_after_a_respawn_is_a_new_alert_even_with_the_same_request_id() {
     let f = fixture();
     let h = register(&f, "s1");
@@ -635,18 +658,18 @@ fn a_prompt_after_a_respawn_is_a_new_alert_even_with_the_same_request_id() {
         &chat_target("s1"),
         &first,
         Some(&h.health()),
-        Some(&format!("{}:req-1", h.conn_generation())),
+        Some(&format!("{}:req-1", h.health_snapshot().generation)),
     );
 
     // The agent respawns and numbers its first request "req-1" again.
     h.swap_connection(Arc::new(StubConnection::default()));
-    h.publish_health(needs_permission());
+    h.publish_health(HealthInputs { last_activity_at: now() + 1, ..needs_permission() });
     let after = f.core.attention_of(&chat_target("s1")).expect("raised");
     let edge_after = oximux_agents::attention::edge_of(
         &chat_target("s1"),
         &after,
         Some(&h.health()),
-        Some(&format!("{}:req-1", h.conn_generation())),
+        Some(&format!("{}:req-1", h.health_snapshot().generation)),
     );
     assert_ne!(
         edge_before, edge_after,

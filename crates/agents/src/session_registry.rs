@@ -578,17 +578,33 @@ impl SessionHandle {
             let current = self.conn.lock().unwrap();
             (self.conn_generation.load(Ordering::SeqCst), current.clone())
         };
+        // Already answered on this process: say so instead of checking
+        // anything. A decision whose acknowledgement was lost is retried, and
+        // by then its proposal is gone — refusing it as "no longer waiting"
+        // would turn a harmless replay into an error for the caller.
+        if self.gate_held(generation, request_id) {
+            return Ok(false);
+        }
         // A digest-bearing approval is checked against the proposal this
-        // handle still holds. No proposal means nothing to check: the request
-        // was decided, or a respawn cleared the map and the id may now belong
-        // to a different request on a new process (Codex numbers them from 1
-        // again). Letting it through unchecked would be the one case the
-        // digest exists to stop, so it is refused rather than trusted.
+        // handle still holds. No proposal means nothing to check: a respawn
+        // cleared the map and the id may now belong to a different request on
+        // a new process (Codex numbers them from 1 again). Letting it through
+        // unchecked would be the one case the digest exists to stop, so it is
+        // refused rather than trusted.
+        //
+        // `answering` is the exact proposal checked. An adapter can replace an
+        // undecided request under the same id — an ACP tool call re-raised, say
+        // — and that replacement is a different request even though nothing
+        // about the process changed, so it is re-checked before the dispatch.
+        let mut answering = None;
         if let Some(echoed) = decision.args_digest() {
             match self.pending.lock().unwrap().get(request_id) {
                 Some(pending)
                     if pending.generation == generation
-                        && args_digest(&pending.tool_name, pending.kind, &pending.input) == echoed => {}
+                        && args_digest(&pending.tool_name, pending.kind, &pending.input) == echoed =>
+                {
+                    answering = Some(pending.seq);
+                }
                 // A proposal from a process that has since been replaced. The
                 // id may name a different request now, so matching arguments
                 // do not make it the same request.
@@ -640,6 +656,18 @@ impl SessionHandle {
             anyhow::bail!(
                 "the agent restarted while request {request_id} was being answered; \
                  open the agent to see where it stands"
+            );
+        }
+        // And the request itself must still be the one that was checked: an
+        // adapter that re-raised it under the same id is asking something
+        // else, which this approval was not given for.
+        if let Some(checked) = answering
+            && self.pending.lock().unwrap().get(request_id).is_none_or(|p| p.seq != checked)
+        {
+            self.release_gate(generation, request_id);
+            anyhow::bail!(
+                "request {request_id} was replaced while it was being answered; \
+                 open the agent and decide there"
             );
         }
         if let Err(err) = conn.resolve_permission(request_id, decision) {
@@ -702,6 +730,11 @@ impl SessionHandle {
     /// names. `false` means someone already has it.
     fn claim_gate(&self, generation: u64, request_id: &str) -> bool {
         self.decided.lock().unwrap().insert((generation, request_id.to_string()))
+    }
+
+    /// Whether the claim for `request_id` on `generation` is already taken.
+    fn gate_held(&self, generation: u64, request_id: &str) -> bool {
+        self.decided.lock().unwrap().contains(&(generation, request_id.to_string()))
     }
 
     /// Give the claim back, so a genuine retry can proceed.
@@ -1974,6 +2007,57 @@ mod tests {
             waiting.tool_use_id.as_deref(),
             Some("successor"),
             "the old answer's cleanup took the successor's question with it"
+        );
+    }
+
+    #[test]
+    fn retrying_an_answered_approval_is_a_no_op_rather_than_an_error() {
+        let reg = SessionRegistry::new();
+        let conn = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), conn.clone());
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+        let decision = || allow().with_args_digest(Some(digest.clone()));
+
+        assert!(handle.resolve_permission("req-1", decision()).unwrap());
+        // A caller whose acknowledgement was lost retries the same decision.
+        // Its proposal is gone by now, and refusing it as "no longer waiting"
+        // would turn a harmless replay into an error.
+        assert!(
+            !handle.resolve_permission("req-1", decision()).unwrap(),
+            "a replay reads as already answered"
+        );
+        assert_eq!(conn.resolves.load(Ordering::SeqCst), 1, "and is not answered twice");
+    }
+
+    #[test]
+    fn a_request_replaced_while_it_was_being_answered_is_refused() {
+        let reg = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), conn.clone());
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+
+        // The adapter re-raises the same tool-call id with something else
+        // between the check and the dispatch. Nothing about the process
+        // changed, so the generation cannot tell.
+        {
+            let r = reg.clone();
+            handle.on_before_gate_claim(move || {
+                r.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "b"})));
+            });
+        }
+        let err = handle
+            .resolve_permission("req-1", allow().with_args_digest(Some(digest)))
+            .expect_err("this approval was not given for the replacement");
+        assert!(err.to_string().contains("replaced while it was being answered"), "saw {err}");
+        assert_eq!(conn.resolves.load(Ordering::SeqCst), 0, "nothing was dispatched");
+        // And the replacement is still answerable on its own terms.
+        let now_asking = handle.pending_permission("req-1").expect("the replacement");
+        assert!(
+            handle
+                .resolve_permission("req-1", allow().with_args_digest(Some(now_asking.args_digest)))
+                .unwrap()
         );
     }
 

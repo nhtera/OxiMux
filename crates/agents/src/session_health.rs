@@ -27,6 +27,15 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// One consistent read of a session's state.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub health: SessionHealth,
+    pub inputs: HealthInputs,
+    /// The connection generation the inputs were published by.
+    pub generation: i64,
+}
+
 /// What the host knows about a session's children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChildActivity {
@@ -53,6 +62,15 @@ pub struct HealthCell {
     /// session alone: a spawn marks a child working before its view exists,
     /// and default inputs must not undo that.
     published: std::sync::atomic::AtomicBool,
+    /// Which process the published facts came from (the handle's connection
+    /// generation when they were published).
+    ///
+    /// Read with the facts rather than from the handle, because the two must
+    /// agree: a respawn bumps the generation without clearing a prompt the old
+    /// process had published, so a generation read a moment later would brand
+    /// that prompt with the successor's number — and the successor's own first
+    /// prompt, numbered the same by its provider, would then be the same alert.
+    published_generation: AtomicI64,
 }
 
 impl HealthCell {
@@ -64,6 +82,7 @@ impl HealthCell {
             health: watch::channel(first).0,
             children: Mutex::new(ChildActivity::default()),
             forgiven_until: AtomicI64::new(0),
+            published_generation: AtomicI64::new(0),
             cfg,
             derive: Mutex::new(()),
             published: std::sync::atomic::AtomicBool::new(false),
@@ -141,11 +160,15 @@ impl HealthCell {
         self.published.load(Ordering::Relaxed)
     }
 
-    /// The derived health and the inputs it was derived from, under the lock
-    /// that every derivation holds.
-    fn coherent(&self) -> (SessionHealth, HealthInputs) {
+    /// The derived health, the inputs it was derived from, and the process
+    /// those inputs were published by — under the lock every derivation holds.
+    fn coherent(&self) -> Snapshot {
         let _derive = self.derive.lock().unwrap();
-        (self.health.borrow().clone(), self.inputs.borrow().clone())
+        Snapshot {
+            health: self.health.borrow().clone(),
+            inputs: self.inputs.borrow().clone(),
+            generation: self.published_generation.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -167,6 +190,11 @@ impl SessionHandle {
         // longer has that prompt, and raise an alert for something already
         // answered.
         let derive = self.health.derive.lock().unwrap();
+        // Stamped with the facts: whichever process published them is the one
+        // their pending prompt belongs to.
+        self.health
+            .published_generation
+            .store(self.conn_generation() as i64, Ordering::Relaxed);
         let modified = self.health.inputs.send_if_modified(|current| {
             if *current == inputs {
                 return false;
@@ -243,7 +271,7 @@ impl SessionHandle {
     /// prompt — or the reverse — and mint an alert for something already
     /// answered. Taken under the same lock the derivation holds, so there is
     /// no gap to catch.
-    pub fn health_snapshot(&self) -> (SessionHealth, HealthInputs) {
+    pub fn health_snapshot(&self) -> Snapshot {
         self.health.coherent()
     }
 

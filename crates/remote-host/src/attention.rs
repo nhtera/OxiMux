@@ -348,17 +348,15 @@ impl HostCore {
     ) -> (Option<Attention>, Option<AttentionEdge>) {
         let external = external_for(state, target);
         let prefs = self.prefs_of(target);
-        // One coherent read of the session, so the prompt id and the health it
-        // is judged against are the same moment.
+        // **One** read of the session: one handle lookup, and the health, the
+        // prompt id and the process that published them taken together. Two
+        // lookups let a respawn land in between and brand the old process's
+        // prompt with the successor's number — at which point the successor's
+        // own first prompt, numbered the same by its provider, is the same
+        // alert and is never announced.
         let session = self.session_of(target).map(|handle| handle.health_snapshot());
-        // The qualified form, matching what `edge_of` mints, so a recorded
-        // onset and the edge it is looked up by cannot disagree.
-        let request = match (self.session_of(target), session.as_ref()) {
-            (Some(handle), Some((_, inputs))) => self.prompt_edge(&handle, inputs),
-            _ => None,
-        };
-
-        let health = session.as_ref().map(|(h, _)| h);
+        let request = session.as_ref().and_then(prompt_edge);
+        let health = session.as_ref().map(|s| &s.health);
         // Evaluated against the onsets as they stood *before* this call, so an
         // alert is never born already seen: recording first would compare a
         // brand-new alert against this very moment, and a view taken in the
@@ -410,25 +408,6 @@ impl HostCore {
             out.push(own);
         }
         out
-    }
-
-    /// `target`'s alert identity, with the pending request id the session
-    /// handle holds (health alone does not carry it).
-    /// The pending prompt's edge identity: the provider's request id qualified
-    /// by the process that asked.
-    ///
-    /// A provider that numbers its requests from 1 again after a respawn gives
-    /// the successor's prompt the same id as the one before it. Unqualified,
-    /// the two would be one edge, and a consumer that alerts once per edge
-    /// would never announce the new prompt. The raw id still decides the
-    /// prompt itself — this qualification is for telling alerts apart.
-    fn prompt_edge(
-        &self,
-        handle: &SessionHandle,
-        inputs: &oximux_agents::health::HealthInputs,
-    ) -> Option<String> {
-        let request = inputs.prompt_request.as_deref()?;
-        Some(format!("{}:{request}", handle.conn_generation()))
     }
 
     /// The live session a target names, if it names one.
@@ -539,6 +518,23 @@ async fn follow(
         core.attention().followed.lock().unwrap().remove(&key);
         core.reevaluate(&target);
     }
+}
+
+/// The pending prompt's edge identity: the provider's request id qualified by
+/// the process that published it.
+///
+/// A provider that numbers its requests from 1 again after a respawn gives the
+/// successor's prompt the same id as the one before it. Unqualified, the two
+/// would be one edge, and a consumer that alerts once per edge would never
+/// announce the new prompt. The raw id still decides the prompt itself — this
+/// qualification is for telling alerts apart.
+///
+/// Taken from the snapshot rather than from the handle, so the number is the
+/// one the facts were published under and not whatever is current a moment
+/// later.
+fn prompt_edge(session: &oximux_agents::session_health::Snapshot) -> Option<String> {
+    let request = session.inputs.prompt_request.as_deref()?;
+    Some(format!("{}:{request}", session.generation))
 }
 
 /// Every external alert raised for `target`, worst first.

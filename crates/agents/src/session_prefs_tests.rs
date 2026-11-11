@@ -272,3 +272,21 @@ fn a_rekey_keeps_the_later_clock_rather_than_taking_the_current_one() {
     r.mark_viewed(&chat_key("new"), t(50)).unwrap();
     assert!(!r.get(&chat_key("new")).unwrap().unread_override, "a later view does spend it");
 }
+
+#[test]
+fn an_unread_mark_that_arrives_after_a_later_view_does_not_take_hold() {
+    let r = repo();
+    // The person asks for it to stand out at 10, then looks at it at 20. The
+    // mark reaches the store last.
+    r.mark_viewed("chat:s1", t(20)).unwrap();
+    r.mark_unread("chat:s1", t(10)).unwrap();
+    let p = r.get("chat:s1").unwrap();
+    assert!(
+        !p.unread_override,
+        "the look came after the mark, so the look is the later word"
+    );
+    assert_eq!(p.last_viewed_at, Some(ms(t(20))));
+    // A mark made after that view does take hold.
+    r.mark_unread("chat:s1", t(30)).unwrap();
+    assert!(r.get("chat:s1").unwrap().unread_override);
+}

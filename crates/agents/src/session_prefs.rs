@@ -209,6 +209,11 @@ impl SessionPrefsRepo {
 
     /// "Mark as unread": the person wants it to keep standing out. The time is
     /// recorded, because only a view later than this spends the mark.
+    ///
+    /// A mark that arrives late — stamped before a view that has already been
+    /// recorded — does not take hold. The person looked after asking for this,
+    /// so the look is the later word; setting the flag anyway would leave the
+    /// session unread until they looked a second time.
     pub fn mark_unread(&self, session_key: &str, now: DateTime<Local>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -216,7 +221,9 @@ impl SessionPrefsRepo {
                  (session_key, unread_override, unread_marked_at, updated_at) \
              VALUES (?1, 1, ?2, ?2) \
              ON CONFLICT(session_key) DO UPDATE SET \
-                 unread_override = 1, \
+                 unread_override = CASE \
+                     WHEN last_viewed_at IS NULL OR ?2 >= last_viewed_at THEN 1 \
+                     ELSE unread_override END, \
                  unread_marked_at = MAX(COALESCE(unread_marked_at, ?2), ?2), \
                  updated_at = MAX(updated_at, ?2)",
             params![session_key, stamp(now)],
