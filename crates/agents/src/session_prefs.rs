@@ -59,6 +59,12 @@ impl NotifyMode {
 
 /// One session's prefs. A session with no row reads as the default, so nothing
 /// has to be written before a session can be looked at.
+///
+/// **`updated_at` is monotonic across every writer.** It is not bookkeeping:
+/// [`SessionPrefsRepo::mark_viewed`] decides whether a view is recent enough
+/// to spend an unread mark by comparing against it, so a write that moved it
+/// backwards — a delayed `set_collapsed`, say — would let a stale view clear a
+/// mark the person made after it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionPrefs {
     /// When the person last had this session in front of them, in Unix
@@ -200,7 +206,7 @@ impl SessionPrefsRepo {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO agent_session_prefs (session_key, notify_mode, updated_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(session_key) DO UPDATE SET notify_mode = ?2, updated_at = ?3",
+             ON CONFLICT(session_key) DO UPDATE SET notify_mode = ?2, updated_at = MAX(updated_at, ?3)",
             params![session_key, mode.as_text(), stamp(now)],
         )
         .context("set session notify mode")?;
@@ -215,7 +221,7 @@ impl SessionPrefsRepo {
         // `column` is one of this module's own literals, never caller input.
         let sql = format!(
             "INSERT INTO agent_session_prefs (session_key, {column}, updated_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(session_key) DO UPDATE SET {column} = ?2, updated_at = ?3"
+             ON CONFLICT(session_key) DO UPDATE SET {column} = ?2, updated_at = MAX(updated_at, ?3)"
         );
         let conn = self.conn.lock().unwrap();
         conn.execute(&sql, params![session_key, i64::from(value), stamp(now)])

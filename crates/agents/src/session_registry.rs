@@ -521,6 +521,17 @@ impl SessionHandle {
         request_id: &str,
         decision: PermissionDecision,
     ) -> Result<bool> {
+        // The process this decision belongs to, taken before anything is
+        // checked and used for the dispatch itself. `swap_connection` bumps
+        // the generation while holding the same lock, so these two are one
+        // process: the proposal checked below, and the connection the answer
+        // is written to, cannot end up belonging to different processes. The
+        // answer goes to the process that asked even if a respawn lands
+        // mid-call, rather than to whatever the new process numbered the same.
+        let (generation, conn) = {
+            let current = self.conn.lock().unwrap();
+            (self.conn_generation.load(Ordering::SeqCst), current.clone())
+        };
         // A digest-bearing approval is checked against the proposal this
         // handle still holds. No proposal means nothing to check: the request
         // was decided, or a respawn cleared the map and the id may now belong
@@ -540,11 +551,6 @@ impl SessionHandle {
                 ),
             }
         }
-        // The process this decision was checked against must still be the one
-        // it is dispatched to. A respawn in between would send an answer meant
-        // for the old process's request to whatever the new one numbered the
-        // same.
-        let generation = self.conn_generation.load(Ordering::SeqCst);
         let newly_decided = self.decided.lock().unwrap().insert(request_id.to_string());
         if !newly_decided {
             return Ok(false);
@@ -558,6 +564,9 @@ impl SessionHandle {
             }
             PermissionDecision::Deny { .. } => None,
         };
+        // A respawn seen before the write means the person is answering a
+        // request the agent no longer has: say so rather than writing into a
+        // process that is on its way out.
         if self.conn_generation.load(Ordering::SeqCst) != generation {
             self.decided.lock().unwrap().remove(request_id);
             anyhow::bail!(
@@ -565,7 +574,7 @@ impl SessionHandle {
                  open the agent to see where it stands"
             );
         }
-        if let Err(err) = self.conn().resolve_permission(request_id, decision) {
+        if let Err(err) = conn.resolve_permission(request_id, decision) {
             // Undo the gate so the request isn't permanently locked as "decided"
             // by a transient transport failure.
             self.decided.lock().unwrap().remove(request_id);
@@ -811,12 +820,15 @@ impl SessionHandle {
         if Arc::ptr_eq(&current, &conn) {
             return; // the same process re-bound (access switched back on)
         }
+        // Bumped under the same lock the connection is replaced under, so a
+        // reader that takes both together can never pair one process's
+        // connection with another's generation.
+        self.conn_generation.fetch_add(1, Ordering::SeqCst);
         *current = conn;
         drop(current);
         // A new process numbers its requests afresh (Codex reuses JSON-RPC
         // ids from 1): an id decided for the old one must not read as decided,
         // or refuse an answer, for the new one's prompt.
-        self.conn_generation.fetch_add(1, Ordering::SeqCst);
         self.decided.lock().unwrap().clear();
         self.pending.lock().unwrap().clear();
         self.questions.lock().unwrap().clear();
@@ -1349,6 +1361,60 @@ mod tests {
         let deny = PermissionDecision::deny("no").with_args_digest(Some("stale".into()));
         assert_eq!(deny.args_digest(), None, "a Deny carries none to check");
         assert!(handle.resolve_permission("req-1", deny).unwrap());
+    }
+
+    /// A connection that respawns the session from inside its own
+    /// `resolve_permission`, so the swap lands exactly in the window between
+    /// the decision being checked and the answer being written.
+    struct SwapsWhileAnswering {
+        handle: Mutex<Option<std::sync::Weak<SessionHandle>>>,
+        answered: AtomicUsize,
+        replacement: Mutex<Option<Arc<RecordingConn>>>,
+    }
+
+    impl AgentConnection for SwapsWhileAnswering {
+        fn send_user_message(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        fn resolve_permission(&self, _request_id: &str, _decision: PermissionDecision) -> Result<()> {
+            self.answered.fetch_add(1, Ordering::SeqCst);
+            // The agent restarts mid-answer. The write is already aimed at
+            // this process, so it cannot be redirected to the new one.
+            let handle = self.handle.lock().unwrap().clone();
+            if let Some(handle) = handle.and_then(|h| h.upgrade()) {
+                let next = Arc::new(RecordingConn::default());
+                *self.replacement.lock().unwrap() = Some(next.clone());
+                handle.swap_connection(next);
+            }
+            Ok(())
+        }
+        fn shutdown(&self) {}
+    }
+
+    #[test]
+    fn a_respawn_during_the_write_cannot_redirect_the_answer() {
+        let reg = SessionRegistry::new();
+        let conn = Arc::new(SwapsWhileAnswering {
+            handle: Mutex::new(None),
+            answered: AtomicUsize::new(0),
+            replacement: Mutex::new(None),
+        });
+        let handle = reg.register("s1".into(), conn.clone());
+        *conn.handle.lock().unwrap() = Some(Arc::downgrade(&handle));
+        reg.ingest("s1", permission_request("req-1", "Read", serde_json::json!({"path": "a"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+
+        assert!(
+            handle.resolve_permission("req-1", allow().with_args_digest(Some(digest))).unwrap(),
+            "the answer went through to the process that asked"
+        );
+        assert_eq!(conn.answered.load(Ordering::SeqCst), 1, "answered once, by the asker");
+        let replacement = conn.replacement.lock().unwrap().clone().expect("respawned");
+        assert_eq!(
+            replacement.resolves.load(Ordering::SeqCst),
+            0,
+            "and never reached the process that took over"
+        );
     }
 
     #[test]

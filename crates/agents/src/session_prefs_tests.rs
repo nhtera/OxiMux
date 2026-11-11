@@ -198,3 +198,23 @@ fn a_view_that_arrives_late_does_not_undo_a_newer_unread_mark() {
     r.mark_viewed("chat:s1", t(12)).unwrap();
     assert!(!r.get("chat:s1").unwrap().unread_override);
 }
+
+#[test]
+fn a_late_write_of_any_kind_cannot_let_a_stale_view_clear_an_unread_mark() {
+    // `mark_viewed` decides by `updated_at`, so every writer has to keep it
+    // moving forward: a delayed collapse or mode change that moved it back
+    // would make an older view look recent enough to spend the mark.
+    for late in ["collapsed", "notify_mode"] {
+        let r = repo();
+        r.mark_unread("chat:s1", t(11)).unwrap();
+        match late {
+            "collapsed" => r.set_collapsed("chat:s1", true, t(9)).unwrap(),
+            _ => r.set_notify_mode("chat:s1", NotifyMode::Muted, t(9)).unwrap(),
+        }
+        r.mark_viewed("chat:s1", t(10)).unwrap();
+        assert!(
+            r.get("chat:s1").unwrap().unread_override,
+            "a late {late} write must not rewind the clock the mark is judged by"
+        );
+    }
+}
