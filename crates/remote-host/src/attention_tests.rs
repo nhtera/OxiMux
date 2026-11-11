@@ -656,30 +656,24 @@ fn a_prompt_keeps_the_number_of_the_process_that_published_it() {
 #[test]
 fn a_prompt_after_a_respawn_is_a_new_alert_even_with_the_same_request_id() {
     let f = fixture();
+    // Read the edges the host *publishes*, which is what a consumer dedupes
+    // on — rebuilding them in the test would only prove the test agrees with
+    // itself.
+    let mut rx = f.core.subscribe_attention();
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    let first = f.core.attention_of(&chat_target("s1")).expect("raised");
-    let edge_before = oximux_agents::attention::edge_of(
-        &chat_target("s1"),
-        &first,
-        Some(&h.health()),
-        Some(&format!("{}:req-1", h.health_snapshot().generation)),
-    );
+    let before = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
 
     // The agent respawns and numbers its first request "req-1" again.
     h.swap_connection(Arc::new(StubConnection::default()));
     h.publish_health(HealthInputs { last_activity_at: now() + 1, ..needs_permission() });
-    let after = f.core.attention_of(&chat_target("s1")).expect("raised");
-    let edge_after = oximux_agents::attention::edge_of(
-        &chat_target("s1"),
-        &after,
-        Some(&h.health()),
-        Some(&format!("{}:req-1", h.health_snapshot().generation)),
-    );
+    let change = next_change_for(&mut rx, &chat_target("s1"));
+    let after = change.edge.expect("raised");
     assert_ne!(
-        edge_before, edge_after,
+        after, before,
         "a consumer that alerts once per edge has to announce the new prompt"
     );
+    assert_eq!(change.retired, Some(before), "and the one before it is retired");
 }
 
 #[test]
@@ -739,6 +733,20 @@ fn a_failure_that_arrives_just_after_a_look_stays_visible_however_often_it_is_re
         );
     }
     assert_eq!(f.core.needs_you().len(), 1, "and it still needs a person");
+
+    // And the reason it holds, rather than just that it holds: the decision is
+    // an order, so it cannot depend on how close in time the two were. The
+    // failure sits after the look in the observation order, and no clock takes
+    // part in the comparison.
+    {
+        let state = f.core.attention().state.lock().unwrap();
+        let looked =
+            state.viewed_position_for_test(&chat_target("s1")).expect("the look was placed");
+        let failed = state
+            .onset_for_test(&chat_target("s1"), AttentionKind::Failed, "inc:1")
+            .expect("the failure was observed");
+        assert!(failed > looked, "failure at {failed} must sit after the look at {looked}");
+    }
 
     // Looking again does deal with it.
     f.core.mark_viewed(&chat_target("s1"));
@@ -803,4 +811,95 @@ fn republishing_the_same_facts_does_not_re_attribute_them() {
     // Facts that genuinely change do carry the new process's number.
     h.publish_health(HealthInputs { prompt_request: Some("req-2".into()), ..needs_permission() });
     assert_ne!(h.health_snapshot().generation, published_by);
+}
+
+#[test]
+fn a_snapshot_never_shows_facts_from_one_moment_beside_health_from_another() {
+    // The derivation gap is held shut by a lock, so there is no seam to drive
+    // one interleaving through on demand. What a test can do is hammer both
+    // sides and check the invariant the lock exists for: a snapshot is one
+    // moment, so a pending prompt in its facts and a waiting status in its
+    // health always agree.
+    //
+    // Four writers and 400k reads is what it took to make this discriminate:
+    // with the write moved back outside the lock it fails, and at a tenth of
+    // this pressure it did not. Lower the numbers and it stops testing
+    // anything.
+    let f = fixture();
+    let h = register(&f, "s1");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let writers: Vec<_> = (0..4).map(|_| {
+        let (h, stop) = (h.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut n = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                // Alternate between waiting on a person and working, which is
+                // the transition that pairs a prompt with a status.
+                let inputs = if n % 2 == 0 {
+                    HealthInputs { last_activity_at: now() + n, ..needs_permission() }
+                } else {
+                    HealthInputs {
+                        process: Process::Live,
+                        turn_active: true,
+                        last_activity_at: now() + n,
+                        ..Default::default()
+                    }
+                };
+                h.publish_health(inputs);
+            }
+        })
+    }).collect();
+
+    for _ in 0..400_000 {
+        let snapshot = h.health_snapshot();
+        let waiting = matches!(
+            snapshot.health.status,
+            oximux_agents::health::HealthStatus::NeedsPermission
+                | oximux_agents::health::HealthStatus::NeedsAnswer
+        );
+        assert_eq!(
+            snapshot.inputs.prompt.is_some(),
+            waiting,
+            "a prompt in the facts and a waiting status must be the same moment: \
+             {:?} beside {:?}",
+            snapshot.inputs.prompt,
+            snapshot.health.status
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for writer in writers {
+        writer.join().unwrap();
+    }
+}
+
+#[test]
+fn a_session_re_registered_under_one_id_is_read_from_its_own_handle() {
+    let f = fixture();
+    let mut rx = f.core.subscribe_attention();
+    let first = register(&f, "s1");
+    first.publish_health(needs_permission());
+    let before = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
+
+    // Unregistered and registered again under the same id. The new handle has
+    // its own facts; nothing of the old one may colour what the host reads,
+    // even while a view still holds the old handle alive.
+    f.registry.unregister("s1");
+    next_change_for(&mut rx, &chat_target("s1"));
+    let second = register(&f, "s1");
+    second.publish_health(HealthInputs {
+        prompt_request: Some("its-own".into()),
+        last_activity_at: now() + 1,
+        ..needs_permission()
+    });
+
+    let change = next_change_for(&mut rx, &chat_target("s1"));
+    let after = change.edge.expect("raised");
+    assert_ne!(after, before, "the new handle's prompt is its own alert");
+    assert!(
+        after.id.ends_with(":its-own"),
+        "read from the handle that is registered now, not the one a view still holds: {after:?}"
+    );
+    drop(first);
 }
