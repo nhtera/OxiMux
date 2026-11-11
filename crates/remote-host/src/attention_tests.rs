@@ -929,3 +929,73 @@ fn a_session_re_registered_under_one_id_is_read_from_its_own_handle() {
     );
     drop(first);
 }
+
+#[test]
+fn a_published_alert_and_its_edge_always_describe_the_same_moment() {
+    // The interleaving once possible here — a health update between deriving
+    // the attention and building its edge — cannot happen any more: both come
+    // from one owned snapshot. There is no seam to drive, so what a test can
+    // do is hammer the publisher and check the invariant that replaced it, on
+    // the stream a consumer actually reads: an alert and the edge published
+    // with it always agree.
+    let f = fixture();
+    let mut rx = f.core.subscribe_attention();
+    let h = register(&f, "s1");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let writer = {
+        let (h, stop) = (h.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut n = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                // Alternate the prompt and the failure, so both the kind and
+                // the identity move under the reader.
+                let inputs = if n % 2 == 0 {
+                    HealthInputs {
+                        prompt_request: Some(format!("req-{n}")),
+                        last_activity_at: 1_000 + n,
+                        ..needs_permission()
+                    }
+                } else {
+                    HealthInputs {
+                        process: Process::Live,
+                        last_turn_failure: Some("turn failed".into()),
+                        last_activity_at: 1_000 + n,
+                        turn_id: Some(format!("inc:{n}")),
+                        ..Default::default()
+                    }
+                };
+                h.publish_health(inputs);
+            }
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = 0;
+    while Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(change) => {
+                seen += 1;
+                match (&change.attention, &change.edge) {
+                    (Some(a), Some(e)) => {
+                        assert_eq!(a.kind, e.kind, "an alert and its edge must be one moment");
+                        // A prompt's identity is a request; a failure's is a
+                        // turn or an exit. Crossed, they came from two reads.
+                        if a.kind == AttentionKind::NeedsPermission {
+                            assert!(e.id.starts_with("req:"), "prompt edge, not {e:?}");
+                        }
+                    }
+                    (None, None) => {}
+                    other => panic!("an alert without its edge, or the reverse: {other:?}"),
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => std::thread::yield_now(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(err) => panic!("{err}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(seen > 100, "the probe has to actually see changes: {seen}");
+}
