@@ -35,8 +35,30 @@ fn viewed(ago: i64) -> SessionPrefs {
     SessionPrefs { last_viewed_at: Some(NOW - ago), ..Default::default() }
 }
 
+/// Every alert reads as brand new: the host has published none of them yet.
+fn new_edges() -> Unrecorded {
+    Unrecorded
+}
+
+/// Every alert was raised `ago` ms before [`NOW`], as if the host had
+/// published it then.
+fn raised_at(ago: i64) -> impl EdgeOnset {
+    move |_: &AttentionEdge| Some(NOW - ago)
+}
+
+/// Only the edge whose id is `id` was raised, `ago` ms before [`NOW`]; any
+/// other edge is one the host has never published, so it is new.
+fn raised_only(id: &str, ago: i64) -> impl EdgeOnset + '_ {
+    move |edge: &AttentionEdge| (edge.id == id).then_some(NOW - ago)
+}
+
 fn kind_of(h: &SessionHealth, p: &SessionPrefs) -> Option<AttentionKind> {
-    of(h, p, &[]).map(|a| a.kind)
+    of("s1", h, p, &[], &new_edges()).map(|a| a.kind)
+}
+
+/// What the session wants, given when its alerts were raised.
+fn kind_with_onset(h: &SessionHealth, p: &SessionPrefs, onset: &dyn EdgeOnset) -> Option<AttentionKind> {
+    of("s1", h, p, &[], onset).map(|a| a.kind)
 }
 
 // ─── the status table ────────────────────────────────────────────────────────
@@ -118,29 +140,74 @@ fn a_failure_leaves_needs_you_once_it_has_been_seen() {
         liveness: Liveness::Exited(ExitProof::ExitCode(137)),
         ..health(HealthStatus::Failed)
     };
-    let raised = of(&h, &fresh(), &[]).expect("raised");
+    let raised = of("s1", &h, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(raised.kind, AttentionKind::Failed);
     assert_eq!(raised.since, h.last_activity_at, "since is when it last did anything");
     assert_eq!(raised.reason.as_deref(), Some("agent process exited (code 137)"));
-    // Viewing the tab (or Dismiss, which writes the same stamp) clears it.
-    assert_eq!(kind_of(&h, &viewed(0)), None);
+    // Viewing the tab (or Dismiss, which writes the same stamp) clears it, as
+    // long as the look came after the alert arose.
+    assert_eq!(kind_with_onset(&h, &viewed(0), &raised_at(MIN)), None);
 }
 
 #[test]
 fn a_new_failure_after_a_dismiss_is_raised_again() {
     let dismissed_at = NOW - 10 * MIN;
     let p = SessionPrefs { last_viewed_at: Some(dismissed_at), ..Default::default() };
-    // The retry ran and failed: the session did something after the dismiss.
-    let h = SessionHealth { last_activity_at: dismissed_at + MIN, ..health(HealthStatus::Failed) };
-    assert_eq!(kind_of(&h, &p), Some(AttentionKind::Failed), "a newer edge is not seen");
+    // The retry ran and failed again, so the host saw a new edge after the
+    // dismiss: a different turn id makes it a different alert.
+    let h = SessionHealth {
+        turn_id: Some("inc:2".into()),
+        last_activity_at: dismissed_at + MIN,
+        ..health(HealthStatus::Failed)
+    };
+    assert_eq!(
+        kind_with_onset(&h, &p, &raised_at(9 * MIN)),
+        Some(AttentionKind::Failed),
+        "raised after the dismiss"
+    );
 }
 
 #[test]
-fn a_dismiss_at_the_very_moment_of_the_failure_counts_as_seen() {
-    let at = NOW - MIN;
-    let h = SessionHealth { last_activity_at: at, ..health(HealthStatus::Failed) };
-    let p = SessionPrefs { last_viewed_at: Some(at), ..Default::default() };
-    assert_eq!(kind_of(&h, &p), None, "viewed >= since");
+fn a_dismiss_at_the_very_moment_the_alert_arose_counts_as_seen() {
+    let h = health(HealthStatus::Failed);
+    let p = SessionPrefs { last_viewed_at: Some(NOW - MIN), ..Default::default() };
+    assert_eq!(kind_with_onset(&h, &p, &raised_at(MIN)), None, "viewed >= raised");
+}
+
+/// The bug this whole onset notion exists to stop. A person looks at a quiet
+/// working session partway through its silence; the stall is declared later.
+/// Comparing their look against `last_activity_at` — when the silence began —
+/// would swallow it, and the agent would sit stalled with nothing saying so.
+#[test]
+fn a_stall_declared_after_the_person_looked_is_still_raised() {
+    // Silence began 12 minutes ago; they looked 5 minutes ago; the host first
+    // saw the stall 2 minutes ago.
+    let h = stalled(12 * MIN);
+    assert_eq!(
+        kind_with_onset(&h, &viewed(5 * MIN), &raised_at(2 * MIN)),
+        Some(AttentionKind::Stalled),
+        "the look came before the stall existed"
+    );
+    // A look after it was declared does clear it.
+    assert_eq!(kind_with_onset(&h, &viewed(MIN), &raised_at(2 * MIN)), None);
+}
+
+/// The same hole for a process that dies after a look: its `last_activity_at`
+/// is the output before it died, which can predate the view.
+#[test]
+fn a_death_after_the_person_looked_is_still_raised() {
+    let h = SessionHealth {
+        last_activity_at: NOW - 10 * MIN,
+        exited_unexpectedly: true,
+        liveness: Liveness::Exited(ExitProof::ExitCode(1)),
+        exit_seq: Some("inc:1".into()),
+        ..health(HealthStatus::Failed)
+    };
+    assert_eq!(
+        kind_with_onset(&h, &viewed(5 * MIN), &raised_at(MIN)),
+        Some(AttentionKind::Failed),
+        "it died after they looked away"
+    );
 }
 
 // ─── the stall lifecycle ─────────────────────────────────────────────────────
@@ -156,7 +223,7 @@ fn stalled(since_ago: i64) -> SessionHealth {
 #[test]
 fn a_quiet_working_session_stalls_and_says_since_when() {
     let h = stalled(12 * MIN);
-    let a = of(&h, &fresh(), &[]).expect("raised");
+    let a = of("s1", &h, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(a.kind, AttentionKind::Stalled);
     assert_eq!(a.since, NOW - 12 * MIN, "the episode the silence was measured from");
 }
@@ -180,10 +247,13 @@ fn a_stall_episode_dismissed_stays_gone_until_new_silence() {
     let episode = NOW - 12 * MIN;
     let p = SessionPrefs { last_viewed_at: Some(NOW), ..Default::default() };
     let h = SessionHealth { stalled_since: Some(episode), last_activity_at: episode, ..health(HealthStatus::Working) };
-    assert_eq!(kind_of(&h, &p), None, "this episode has been seen");
-    // Output resumed, then it went quiet again: a new episode, a new alert.
+    let this_episode = format!("stall:{episode}");
+    let onset = raised_only(&this_episode, MIN);
+    assert_eq!(kind_with_onset(&h, &p, &onset), None, "this episode has been seen");
+    // Output resumed, then it went quiet again: a new episode is a new edge,
+    // which the host has not recorded, so it is new by definition.
     let next = SessionHealth { stalled_since: Some(NOW + MIN), last_activity_at: NOW + MIN, ..h };
-    assert_eq!(kind_of(&next, &p), Some(AttentionKind::Stalled));
+    assert_eq!(kind_with_onset(&next, &p, &onset), Some(AttentionKind::Stalled));
 }
 
 // ─── prompts are not dismissible ─────────────────────────────────────────────
@@ -219,7 +289,7 @@ fn external(key: &str, kind: AttentionKind, since_ago: i64) -> ExternalAttention
 #[test]
 fn a_target_with_no_health_is_judged_by_its_external_items_alone() {
     let items = [external("cockpit:7", AttentionKind::NeedsPermission, MIN)];
-    let a = of_external(&fresh(), &items).expect("raised");
+    let a = of_external("plan:run-1", &fresh(), &items, &new_edges()).expect("raised");
     assert_eq!(a.kind, AttentionKind::NeedsPermission);
     assert_eq!(a.reason.as_deref(), Some("cockpit:7 says so"));
 }
@@ -231,7 +301,7 @@ fn the_worst_external_item_wins_and_ties_go_to_the_older_one() {
         external("a", AttentionKind::Failed, MIN),
         external("c", AttentionKind::Failed, 9 * MIN),
     ];
-    let a = of_external(&fresh(), &items).expect("raised");
+    let a = of_external("plan:run-1", &fresh(), &items, &new_edges()).expect("raised");
     assert_eq!(a.kind, AttentionKind::Failed);
     assert_eq!(a.since, NOW - 9 * MIN, "the one waiting longest");
 }
@@ -241,13 +311,13 @@ fn an_external_item_outranks_a_calmer_session_and_loses_a_tie_to_it() {
     // A ticket breaker tripped on a run whose own session is merely idle.
     let idle = SessionHealth { turn_id: None, ..health(HealthStatus::Idle) };
     let breaker = [external("plan:run-1:T-3:breaker", AttentionKind::Failed, MIN)];
-    let a = of(&idle, &fresh(), &breaker).expect("raised");
+    let a = of("plan:run-1", &idle, &fresh(), &breaker, &new_edges()).expect("raised");
     assert_eq!(a.kind, AttentionKind::Failed);
     assert_eq!(a.reason.as_deref(), Some("plan:run-1:T-3:breaker says so"));
 
     // Same kind on both sides: the session's own health is the local truth.
     let failed = SessionHealth { reason: Some("turn failed".into()), ..health(HealthStatus::Failed) };
-    let a = of(&failed, &fresh(), &breaker).expect("raised");
+    let a = of("plan:run-1", &failed, &fresh(), &breaker, &new_edges()).expect("raised");
     assert_eq!(a.reason.as_deref(), Some("turn failed"), "health wins the tie");
 }
 
@@ -263,30 +333,30 @@ fn kind_of_with(
     p: &SessionPrefs,
     items: &[ExternalAttention],
 ) -> Option<AttentionKind> {
-    of(h, p, items).map(|a| a.kind)
+    of("s1", h, p, items, &new_edges()).map(|a| a.kind)
 }
 
 #[test]
 fn an_external_failure_that_has_been_seen_stops_counting() {
     let items = [external("ci", AttentionKind::Failed, 5 * MIN)];
-    assert!(of_external(&fresh(), &items).is_some());
-    assert_eq!(of_external(&viewed(0), &items), None, "viewed after it was raised");
+    assert!(of_external("plan:run-1", &fresh(), &items, &new_edges()).is_some());
+    assert_eq!(of_external("plan:run-1", &viewed(0), &items, &raised_at(MIN)), None, "viewed after it was raised");
     // A later trip of the same breaker is a new edge.
     let again = [external("ci", AttentionKind::Failed, 0)];
-    assert!(of_external(&viewed(MIN), &again).is_some());
+    assert!(of_external("plan:run-1", &viewed(MIN), &again, &raised_at(0)).is_some());
 }
 
 #[test]
 fn an_external_prompt_is_never_dismissed_by_a_look() {
     let items = [external("cockpit:7", AttentionKind::NeedsPermission, 5 * MIN)];
-    assert!(of_external(&viewed(0), &items).is_some(), "it still has to be answered");
+    assert!(of_external("plan:run-1", &viewed(0), &items, &raised_at(MIN)).is_some(), "it still has to be answered");
 }
 
 #[test]
 fn nothing_raised_is_nothing_wanted() {
-    assert_eq!(of_external(&fresh(), &[]), None);
+    assert_eq!(of_external("plan:run-1", &fresh(), &[], &new_edges()), None);
     let working = health(HealthStatus::Working);
-    assert_eq!(of(&working, &fresh(), &[]), None);
+    assert_eq!(of("s1", &working, &fresh(), &[], &new_edges()), None);
 }
 
 // ─── unread, on its own ──────────────────────────────────────────────────────
@@ -332,11 +402,11 @@ fn a_mode_is_not_attention() {
 #[test]
 fn one_prompt_is_one_edge_however_often_health_is_re_derived() {
     let h = health(HealthStatus::NeedsPermission);
-    let a = of(&h, &fresh(), &[]).expect("raised");
+    let a = of("s1", &h, &fresh(), &[], &new_edges()).expect("raised");
     let first = edge_of("s1", &a, Some(&h), Some("req-1"));
     // The same request, a second snapshot a minute later: the same edge.
     let later = SessionHealth { last_activity_at: NOW + MIN, ..h.clone() };
-    let again = of(&later, &fresh(), &[]).expect("raised");
+    let again = of("s1", &later, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(edge_of("s1", &again, Some(&later), Some("req-1")), first, "no second banner");
     // A different request is a different edge, so it alerts at once.
     assert_ne!(edge_of("s1", &again, Some(&later), Some("req-2")), first);
@@ -345,12 +415,12 @@ fn one_prompt_is_one_edge_however_often_health_is_re_derived() {
 #[test]
 fn a_prompt_with_no_provider_id_falls_back_to_when_it_arrived() {
     let h = health(HealthStatus::NeedsAnswer);
-    let a = of(&h, &fresh(), &[]).expect("raised");
+    let a = of("s1", &h, &fresh(), &[], &new_edges()).expect("raised");
     let edge = edge_of("s1", &a, Some(&h), None);
     assert_eq!(edge.id, format!("prompt:{}", NOW - MIN));
     // A later prompt is later activity, so it is a new edge.
     let next = SessionHealth { last_activity_at: NOW, ..h };
-    let a2 = of(&next, &fresh(), &[]).expect("raised");
+    let a2 = of("s1", &next, &fresh(), &[], &new_edges()).expect("raised");
     assert_ne!(edge_of("s1", &a2, Some(&next), None), edge);
 }
 
@@ -361,22 +431,22 @@ fn a_failure_is_identified_by_the_exit_or_the_turn_that_failed() {
         turn_id: Some("inc:9".into()),
         ..health(HealthStatus::Failed)
     };
-    let a = of(&exited, &fresh(), &[]).expect("raised");
+    let a = of("s1", &exited, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(edge_of("s1", &a, Some(&exited), None).id, "inc:3", "the exit, when there was one");
 
     let turn_failed = SessionHealth { exit_seq: None, ..exited };
-    let a = of(&turn_failed, &fresh(), &[]).expect("raised");
+    let a = of("s1", &turn_failed, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(edge_of("s1", &a, Some(&turn_failed), None).id, "inc:9", "else the turn");
 }
 
 #[test]
 fn a_stall_edge_is_its_episode_and_an_external_edge_is_its_key_and_time() {
     let h = stalled(12 * MIN);
-    let a = of(&h, &fresh(), &[]).expect("raised");
+    let a = of("s1", &h, &fresh(), &[], &new_edges()).expect("raised");
     assert_eq!(edge_of("s1", &a, Some(&h), None).id, format!("stall:{}", NOW - 12 * MIN));
 
     let items = [external("plan:r:T-3:breaker", AttentionKind::Failed, MIN)];
-    let a = of_external(&fresh(), &items).expect("raised");
+    let a = of_external("plan:run-1", &fresh(), &items, &new_edges()).expect("raised");
     let edge = edge_of("plan:r", &a, None, None);
     assert_eq!(edge.id, format!("plan:r:T-3:breaker@{}", NOW - MIN));
     assert_eq!(edge.target, "plan:r");
@@ -387,11 +457,64 @@ fn a_stall_edge_is_its_episode_and_an_external_edge_is_its_key_and_time() {
 #[test]
 fn an_edge_carries_the_kind_so_two_alerts_on_one_session_never_merge() {
     let h = health(HealthStatus::NeedsPermission);
-    let perm = of(&h, &fresh(), &[]).expect("raised");
+    let perm = of("s1", &h, &fresh(), &[], &new_edges()).expect("raised");
     let perm_edge = edge_of("s1", &perm, Some(&h), Some("x"));
-    let ext = of_external(&fresh(), &[external("ci", AttentionKind::Failed, MIN)]).expect("raised");
+    let ext =
+        of_external("s1", &fresh(), &[external("ci", AttentionKind::Failed, MIN)], &new_edges())
+            .expect("raised");
     let ci_edge = edge_of("s1", &ext, Some(&h), Some("x"));
     assert_ne!(perm_edge, ci_edge);
     assert_eq!(perm_edge.kind, AttentionKind::NeedsPermission);
     assert_eq!(ci_edge.kind, AttentionKind::Failed);
+}
+
+#[test]
+fn an_external_unread_finish_is_read_by_looking_at_its_target() {
+    // A producer can raise an unread finish, and nothing but a look reads it:
+    // its producer has no idea whether the person opened the tab.
+    let items = [external("run", AttentionKind::FinishedUnread, 5 * MIN)];
+    assert!(of_external("plan:run-1", &fresh(), &items, &new_edges()).is_some());
+    assert_eq!(
+        of_external("plan:run-1", &viewed(0), &items, &new_edges()),
+        None,
+        "looked at it after it finished"
+    );
+    assert_eq!(
+        of_external("plan:run-1", &viewed(9 * MIN), &items, &new_edges()).map(|a| a.kind),
+        Some(AttentionKind::FinishedUnread),
+        "it finished after they looked"
+    );
+    // Marking it unread brings it back.
+    let marked = SessionPrefs { unread_override: true, ..viewed(0) };
+    assert!(of_external("plan:run-1", &marked, &items, &new_edges()).is_some());
+}
+
+#[test]
+fn a_rate_limit_raised_externally_is_not_read_by_looking() {
+    // Unlike a finish, seeing a rate limit does not deal with it.
+    let items = [external("provider", AttentionKind::Limited, 5 * MIN)];
+    assert!(
+        of_external("plan:run-1", &viewed(0), &items, &raised_at(MIN)).is_some(),
+        "still limited"
+    );
+}
+
+#[test]
+fn two_external_items_tied_on_kind_and_time_are_picked_by_their_key() {
+    let at = NOW - MIN;
+    let item = |key: &str| ExternalAttention {
+        key: key.into(),
+        target: "plan:run-1".into(),
+        kind: AttentionKind::Failed,
+        reason: format!("{key} says so"),
+        since: at,
+    };
+    // Whichever order the producer map iterated, the answer is the same.
+    let one = [item("b"), item("a")];
+    let other = [item("a"), item("b")];
+    let pick = |items: &[ExternalAttention]| {
+        of_external("plan:run-1", &fresh(), items, &new_edges()).unwrap().reason
+    };
+    assert_eq!(pick(&one), pick(&other), "a HashMap's order must not pick the reason");
+    assert_eq!(pick(&one).as_deref(), Some("a says so"));
 }

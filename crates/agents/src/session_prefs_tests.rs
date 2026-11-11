@@ -183,3 +183,18 @@ fn prefs_can_be_forgotten_with_the_session() {
     r.forget("chat:s1").unwrap();
     assert_eq!(r.get("chat:s1").unwrap(), SessionPrefs::default());
 }
+
+#[test]
+fn a_view_that_arrives_late_does_not_undo_a_newer_unread_mark() {
+    let r = repo();
+    r.mark_viewed("chat:s1", t(9)).unwrap();
+    r.mark_unread("chat:s1", t(11)).unwrap();
+    // A view computed at minute 10 reaches the store after the mark at 11.
+    r.mark_viewed("chat:s1", t(10)).unwrap();
+    let p = r.get("chat:s1").unwrap();
+    assert!(p.unread_override, "the person asked for it after that view was taken");
+    assert_eq!(p.last_viewed_at, Some(ms(t(10))), "the view itself still counts");
+    // A view genuinely after the mark does spend it.
+    r.mark_viewed("chat:s1", t(12)).unwrap();
+    assert!(!r.get("chat:s1").unwrap().unread_override);
+}

@@ -283,6 +283,9 @@ pub struct SessionHandle {
     /// Arrival counter for both maps, so "the oldest undecided one" is a fact
     /// rather than whatever a `HashMap` iterates first.
     prompt_seq: AtomicU64,
+    /// Bumped by every [`Self::swap_connection`]. A decision checked against
+    /// one process must not be dispatched to the next.
+    conn_generation: AtomicU64,
     status_tx: watch::Sender<SessionStatus>,
     /// The session's health: the driver's published facts and what they mean
     /// (`session_health.rs`).
@@ -383,6 +386,12 @@ impl SessionHandle {
                     seq: self.prompt_seq.fetch_add(1, Ordering::SeqCst),
                 },
             );
+        }
+        // A turn that ended without an answer settles its questions: the
+        // request is gone with the turn, and offering it would be offering a
+        // prompt nothing can answer.
+        if matches!(&event, ThreadEvent::TurnEnded { .. }) {
+            self.questions.lock().unwrap().clear();
         }
         // And the questions, so a surface away from the chat card knows what
         // is being asked and does not offer Allow/Reject for it.
@@ -512,15 +521,30 @@ impl SessionHandle {
         request_id: &str,
         decision: PermissionDecision,
     ) -> Result<bool> {
-        if let Some(echoed) = decision.args_digest()
-            && let Some(pending) = self.pending.lock().unwrap().get(request_id)
-            && args_digest(&pending.input) != echoed
-        {
-            anyhow::bail!(
-                "the arguments of request {request_id} changed since they were shown; \
-                 open the agent and decide there"
-            );
+        // A digest-bearing approval is checked against the proposal this
+        // handle still holds. No proposal means nothing to check: the request
+        // was decided, or a respawn cleared the map and the id may now belong
+        // to a different request on a new process (Codex numbers them from 1
+        // again). Letting it through unchecked would be the one case the
+        // digest exists to stop, so it is refused rather than trusted.
+        if let Some(echoed) = decision.args_digest() {
+            match self.pending.lock().unwrap().get(request_id) {
+                Some(pending) if args_digest(&pending.input) == echoed => {}
+                Some(_) => anyhow::bail!(
+                    "the arguments of request {request_id} changed since they were shown; \
+                     open the agent and decide there"
+                ),
+                None => anyhow::bail!(
+                    "request {request_id} is no longer waiting on an answer; \
+                     open the agent to see where it stands"
+                ),
+            }
         }
+        // The process this decision was checked against must still be the one
+        // it is dispatched to. A respawn in between would send an answer meant
+        // for the old process's request to whatever the new one numbered the
+        // same.
+        let generation = self.conn_generation.load(Ordering::SeqCst);
         let newly_decided = self.decided.lock().unwrap().insert(request_id.to_string());
         if !newly_decided {
             return Ok(false);
@@ -534,6 +558,13 @@ impl SessionHandle {
             }
             PermissionDecision::Deny { .. } => None,
         };
+        if self.conn_generation.load(Ordering::SeqCst) != generation {
+            self.decided.lock().unwrap().remove(request_id);
+            anyhow::bail!(
+                "the agent restarted while request {request_id} was being answered; \
+                 open the agent to see where it stands"
+            );
+        }
         if let Err(err) = self.conn().resolve_permission(request_id, decision) {
             // Undo the gate so the request isn't permanently locked as "decided"
             // by a transient transport failure.
@@ -785,6 +816,7 @@ impl SessionHandle {
         // A new process numbers its requests afresh (Codex reuses JSON-RPC
         // ids from 1): an id decided for the old one must not read as decided,
         // or refuse an answer, for the new one's prompt.
+        self.conn_generation.fetch_add(1, Ordering::SeqCst);
         self.decided.lock().unwrap().clear();
         self.pending.lock().unwrap().clear();
         self.questions.lock().unwrap().clear();
@@ -1075,6 +1107,7 @@ impl SessionRegistry {
             pending: Mutex::new(HashMap::new()),
             questions: Mutex::new(HashMap::new()),
             prompt_seq: AtomicU64::new(0),
+            conn_generation: AtomicU64::new(0),
             status_tx,
             health: crate::session_health::HealthCell::new(self.health_cfg.clone()),
             meta: Mutex::new(SessionMeta::default()),
@@ -1316,6 +1349,44 @@ mod tests {
         let deny = PermissionDecision::deny("no").with_args_digest(Some("stale".into()));
         assert_eq!(deny.args_digest(), None, "a Deny carries none to check");
         assert!(handle.resolve_permission("req-1", deny).unwrap());
+    }
+
+    #[test]
+    fn a_digest_bearing_approval_needs_a_proposal_to_check_against() {
+        let reg = SessionRegistry::new();
+        let conn = Arc::new(RecordingConn::default());
+        let handle = reg.register("s1".into(), conn.clone());
+        reg.ingest("s1", permission_request("req-1", "Bash", serde_json::json!({"command": "ls"})));
+        let digest = handle.pending_permission("req-1").unwrap().args_digest;
+
+        // The process respawned: the map is cleared, and the new process may
+        // already have numbered a different request "req-1".
+        handle.swap_connection(Arc::new(RecordingConn::default()));
+        let err = handle
+            .resolve_permission("req-1", allow().with_args_digest(Some(digest)))
+            .expect_err("refused rather than answered unchecked");
+        assert!(err.to_string().contains("no longer waiting"), "saw {err}");
+        assert_eq!(conn.resolves.load(Ordering::SeqCst), 0, "nothing reached either process");
+    }
+
+    #[test]
+    fn a_turn_that_ends_without_an_answer_settles_its_question() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        reg.ingest(
+            "s1",
+            ThreadEvent::QuestionAsked { request_id: "q-1".into(), tool_use_id: None, questions: vec![] },
+        );
+        assert!(handle.pending_question().is_some());
+        reg.ingest(
+            "s1",
+            ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
+        );
+        assert_eq!(
+            handle.pending_question(),
+            None,
+            "the request went with the turn; offering it would offer an unanswerable prompt"
+        );
     }
 
     #[test]

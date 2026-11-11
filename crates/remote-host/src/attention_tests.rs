@@ -9,7 +9,7 @@ use oximux_agents::lineage::LineageStore;
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::connection::StubConnection;
 
-use super::AttentionChanged;
+use super::{AttentionChanged, chat_target};
 use crate::host_config::HostConfig;
 use crate::host_core::{HostCore, HostCoreDeps, PriorOwner};
 
@@ -98,10 +98,10 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
 fn a_session_waiting_on_a_person_needs_you_and_a_quiet_one_does_not() {
     let f = fixture();
     let h = register(&f, "s1");
-    assert_eq!(f.core.attention_of("s1"), None, "a session with no published health wants nothing");
+    assert_eq!(f.core.attention_of(&chat_target("s1")), None, "a session with no published health wants nothing");
 
     h.publish_health(needs_permission());
-    let a = f.core.attention_of("s1").expect("raised");
+    let a = f.core.attention_of(&chat_target("s1")).expect("raised");
     assert_eq!(a.kind, AttentionKind::NeedsPermission);
     assert_eq!(a.source, AttentionSource::Health);
     assert_eq!(f.core.needs_you().len(), 1);
@@ -109,7 +109,7 @@ fn a_session_waiting_on_a_person_needs_you_and_a_quiet_one_does_not() {
     // Answered: it drops out of needs-you. What is left is the turn nobody
     // has read yet, which is shown but needs nobody.
     h.publish_health(HealthInputs { prompt: None, ..needs_permission() });
-    assert_eq!(f.core.attention_of("s1").unwrap().kind, AttentionKind::FinishedUnread);
+    assert_eq!(f.core.attention_of(&chat_target("s1")).unwrap().kind, AttentionKind::FinishedUnread);
     assert!(f.core.needs_you().is_empty(), "nothing waits on a person");
 }
 
@@ -128,7 +128,11 @@ fn needs_you_is_ordered_worst_first() {
     b.publish_health(needs_permission());
 
     let order: Vec<_> = f.core.needs_you().into_iter().map(|(t, _)| t).collect();
-    assert_eq!(order, vec!["b-permission", "a-failed"], "a prompt outranks a failure");
+    assert_eq!(
+        order,
+        vec![chat_target("b-permission"), chat_target("a-failed")],
+        "a prompt outranks a failure"
+    );
 }
 
 #[test]
@@ -142,7 +146,7 @@ fn an_informational_state_is_shown_but_not_counted() {
         turn_id: Some("inc:1".into()),
         ..Default::default()
     });
-    assert_eq!(f.core.attention_of("s1").unwrap().kind, AttentionKind::FinishedUnread);
+    assert_eq!(f.core.attention_of(&chat_target("s1")).unwrap().kind, AttentionKind::FinishedUnread);
     assert!(f.core.needs_you().is_empty(), "a finished turn needs nobody");
 }
 
@@ -161,11 +165,11 @@ fn viewing_a_failed_session_takes_it_out_of_needs_you_and_it_stays_out() {
     });
     assert_eq!(f.core.needs_you().len(), 1);
 
-    f.core.mark_viewed("s1");
+    f.core.mark_viewed(&chat_target("s1"));
     assert!(f.core.needs_you().is_empty(), "a failure that has been looked at is not an alert");
     // And it is persisted, so a re-read says the same.
-    assert!(f.core.prefs_of("s1").last_viewed_at.is_some());
-    assert_eq!(f.core.attention_of("s1"), None);
+    assert!(f.core.prefs_of(&chat_target("s1")).last_viewed_at.is_some());
+    assert_eq!(f.core.attention_of(&chat_target("s1")), None);
 }
 
 #[test]
@@ -178,19 +182,45 @@ fn marking_a_session_unread_brings_back_a_finish_that_was_read() {
         turn_id: Some("inc:1".into()),
         ..Default::default()
     });
-    f.core.mark_viewed("s1");
-    assert_eq!(f.core.attention_of("s1"), None);
-    f.core.mark_unread("s1");
-    assert_eq!(f.core.attention_of("s1").unwrap().kind, AttentionKind::FinishedUnread);
+    f.core.mark_viewed(&chat_target("s1"));
+    assert_eq!(f.core.attention_of(&chat_target("s1")), None);
+    f.core.mark_unread(&chat_target("s1"));
+    assert_eq!(f.core.attention_of(&chat_target("s1")).unwrap().kind, AttentionKind::FinishedUnread);
 }
 
 #[test]
-fn a_prefs_key_keeps_a_chat_apart_from_a_run_root() {
+fn a_chat_and_a_run_root_that_share_a_name_are_different_targets() {
     let f = fixture();
-    assert_eq!(f.core.prefs_key("s1"), "chat:s1");
-    assert_eq!(f.core.prefs_key("plan:run-1"), "plan:run-1");
-    assert_eq!(f.core.prefs_key("team:run-1"), "team:run-1");
-    assert_eq!(f.core.prefs_key("cockpit:7"), "cockpit:7");
+    // A provider free to name its own session could call one `plan:7`. The
+    // namespace is what keeps it off the run `plan:7`'s row and out of its
+    // preference record.
+    let h = register(&f, "plan:7");
+    h.publish_health(needs_permission());
+    f.core.publish_external(external("breaker", "plan:7", AttentionKind::Failed));
+
+    assert_eq!(
+        f.core.attention_of(&chat_target("plan:7")).unwrap().kind,
+        AttentionKind::NeedsPermission,
+        "the chat's own prompt"
+    );
+    assert_eq!(
+        f.core.attention_of("plan:7").unwrap().kind,
+        AttentionKind::Failed,
+        "and the run's breaker, separately"
+    );
+    assert_eq!(f.core.needs_you().len(), 2, "two things need a person, not one");
+
+    // Viewing one does not mark the other seen.
+    f.core.mark_viewed("plan:7");
+    assert!(f.core.prefs_of(&chat_target("plan:7")).last_viewed_at.is_none());
+}
+
+#[test]
+fn a_target_with_no_session_is_judged_without_one() {
+    let f = fixture();
+    f.core.publish_external(external("ci", "plan:run-1", AttentionKind::Failed));
+    assert!(f.core.attention_of("plan:run-1").is_some());
+    assert_eq!(f.core.attention_of(&chat_target("plan:run-1")), None, "no such chat");
 }
 
 // ─── alerts no session's health can know about ───────────────────────────────
@@ -233,13 +263,13 @@ fn an_external_alert_on_a_session_is_ranked_against_its_own_health() {
     let f = fixture();
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    f.core.publish_external(external("ci", "s1", AttentionKind::Failed));
+    f.core.publish_external(external("ci", &chat_target("s1"), AttentionKind::Failed));
     // The session's own prompt is the more urgent of the two.
-    assert_eq!(f.core.attention_of("s1").unwrap().kind, AttentionKind::NeedsPermission);
-    assert_eq!(f.core.external_for("s1").len(), 1, "and the CI alert is still there to render");
+    assert_eq!(f.core.attention_of(&chat_target("s1")).unwrap().kind, AttentionKind::NeedsPermission);
+    assert_eq!(f.core.external_for(&chat_target("s1")).len(), 1, "and the CI alert is still there to render");
 
     h.publish_health(HealthInputs { prompt: None, ..needs_permission() });
-    assert_eq!(f.core.attention_of("s1").unwrap().kind, AttentionKind::Failed, "now CI's turn");
+    assert_eq!(f.core.attention_of(&chat_target("s1")).unwrap().kind, AttentionKind::Failed, "now CI's turn");
 }
 
 // ─── the stream ──────────────────────────────────────────────────────────────
@@ -251,7 +281,7 @@ fn a_health_change_publishes_one_change_with_its_edge() {
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
 
-    let change = next_change_for(&mut rx, "s1");
+    let change = next_change_for(&mut rx, &chat_target("s1"));
     let edge = change.edge.expect("an edge to alert on");
     assert_eq!(edge.kind, AttentionKind::NeedsPermission);
     assert_eq!(edge.id, "req:req-1", "the request being answered");
@@ -264,11 +294,11 @@ fn the_same_alert_re_derived_is_never_published_twice() {
     let mut rx = f.core.subscribe_attention();
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    next_change_for(&mut rx, "s1");
+    next_change_for(&mut rx, &chat_target("s1"));
 
     // The host re-derives (the stall tick, a reconnect): the same request, so
     // the same edge, so nothing a surface has to hear about.
-    f.core.reevaluate("s1");
+    f.core.reevaluate(&chat_target("s1"));
     f.core.refresh_health(now(), false);
     assert!(
         matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
@@ -282,10 +312,10 @@ fn answering_a_prompt_retires_its_edge() {
     let mut rx = f.core.subscribe_attention();
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    let raised = next_change_for(&mut rx, "s1").edge.expect("raised");
+    let raised = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
 
     h.publish_health(HealthInputs { prompt: None, ..needs_permission() });
-    let change = next_change_for(&mut rx, "s1");
+    let change = next_change_for(&mut rx, &chat_target("s1"));
     assert!(
         !change.attention.as_ref().unwrap().kind.is_needs_you(),
         "it no longer waits on a person"
@@ -299,14 +329,14 @@ fn a_second_different_prompt_replaces_the_first_edge() {
     let mut rx = f.core.subscribe_attention();
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    let first = next_change_for(&mut rx, "s1").edge.expect("raised");
+    let first = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
 
     h.publish_health(HealthInputs {
         prompt_request: Some("req-2".into()),
         last_activity_at: now() + 1,
         ..needs_permission()
     });
-    let change = next_change_for(&mut rx, "s1");
+    let change = next_change_for(&mut rx, &chat_target("s1"));
     let second = change.edge.expect("raised");
     assert_ne!(second, first, "a different request is a different alert");
     assert_eq!(change.retired, Some(first), "the first is retired as the second posts");
@@ -318,11 +348,11 @@ fn a_session_ending_retires_what_it_wanted() {
     let mut rx = f.core.subscribe_attention();
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    let raised = next_change_for(&mut rx, "s1").edge.expect("raised");
+    let raised = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
 
     drop(h);
     f.registry.unregister("s1");
-    let change = next_change_for(&mut rx, "s1");
+    let change = next_change_for(&mut rx, &chat_target("s1"));
     assert_eq!(change.attention, None);
     assert_eq!(change.retired, Some(raised));
 }
@@ -335,10 +365,10 @@ fn a_session_unregistered_while_a_view_still_holds_it_retires_too() {
     // its health watch never closes and its follower never wakes.
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    let raised = next_change_for(&mut rx, "s1").edge.expect("raised");
+    let raised = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
 
     f.registry.unregister("s1");
-    let change = next_change_for(&mut rx, "s1");
+    let change = next_change_for(&mut rx, &chat_target("s1"));
     assert_eq!(change.attention, None, "a session the host no longer has wants nothing");
     assert_eq!(change.retired, Some(raised));
     drop(h);
@@ -356,7 +386,9 @@ fn a_session_that_wants_nothing_publishes_nothing() {
         last_activity_at: now(),
         ..Default::default()
     });
-    wait_until("the follower to have looked", || f.core.attention_targets().contains(&"s1".to_string()));
+    wait_until("the follower to have looked", || {
+        f.core.attention_targets().contains(&chat_target("s1"))
+    });
     assert!(
         matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
         "a busy agent is not an alert"
@@ -375,10 +407,10 @@ fn viewing_a_session_retires_its_alert_on_the_stream() {
         turn_id: Some("inc:1".into()),
         ..Default::default()
     });
-    let raised = next_change_for(&mut rx, "s1").edge.expect("raised");
+    let raised = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
 
-    f.core.mark_viewed("s1");
-    let change = next_change_for(&mut rx, "s1");
+    f.core.mark_viewed(&chat_target("s1"));
+    let change = next_change_for(&mut rx, &chat_target("s1"));
     assert_eq!(change.attention, None);
     assert_eq!(change.retired, Some(raised));
 }
@@ -396,14 +428,14 @@ fn a_changed_line_on_the_same_alert_updates_it_without_retiring_it() {
         ..Default::default()
     };
     h.publish_health(failing.clone());
-    let raised = next_change_for(&mut rx, "s1").edge.expect("raised");
+    let raised = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
 
     // The same failed turn, reported with a fuller reason.
     h.publish_health(HealthInputs {
         last_turn_failure: Some("turn failed: rate limit retries exhausted".into()),
         ..failing
     });
-    let change = next_change_for(&mut rx, "s1");
+    let change = next_change_for(&mut rx, &chat_target("s1"));
     assert_eq!(change.edge.as_ref(), Some(&raised), "still the same failure");
     assert_eq!(
         change.retired, None,
@@ -418,7 +450,7 @@ fn activity_alone_publishes_nothing() {
     let mut rx = f.core.subscribe_attention();
     let h = register(&f, "s1");
     h.publish_health(needs_permission());
-    next_change_for(&mut rx, "s1");
+    next_change_for(&mut rx, &chat_target("s1"));
 
     // The session keeps working on the same prompt: the timestamp moves and
     // nothing a person reads changes.
@@ -428,4 +460,114 @@ fn activity_alone_publishes_nothing() {
         matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
         "the events already say it is alive"
     );
+}
+
+// ─── when an alert arose, which is what a view is measured against ───────────
+
+#[test]
+fn a_failure_that_arose_after_the_person_looked_is_not_already_seen() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    // They look at a healthy session.
+    f.core.mark_viewed(&chat_target("s1"));
+    // Its last output predates that look, and only now does the turn fail.
+    h.publish_health(HealthInputs {
+        process: Process::Live,
+        last_turn_failure: Some("turn failed".into()),
+        last_activity_at: now() - 60_000,
+        turn_id: Some("inc:1".into()),
+        ..Default::default()
+    });
+    assert_eq!(
+        f.core.attention_of(&chat_target("s1")).map(|a| a.kind),
+        Some(AttentionKind::Failed),
+        "the look came before the failure existed"
+    );
+    // Looking again, now that it has failed, does clear it.
+    f.core.mark_viewed(&chat_target("s1"));
+    assert_eq!(f.core.attention_of(&chat_target("s1")), None);
+}
+
+#[test]
+fn an_alert_uncovered_again_is_still_judged_by_when_it_arrived() {
+    let f = fixture();
+    // A stall-level alert arrives first, then a worse one covers it.
+    f.core.publish_external(external("slow", "plan:run-1", AttentionKind::Stalled));
+    assert_eq!(f.core.attention_of("plan:run-1").unwrap().kind, AttentionKind::Stalled);
+    f.core.publish_external(external("ci", "plan:run-1", AttentionKind::Failed));
+    assert_eq!(f.core.attention_of("plan:run-1").unwrap().kind, AttentionKind::Failed);
+
+    // The person deals with what they can see, then the worse one clears.
+    f.core.mark_viewed("plan:run-1");
+    f.core.clear_external("ci");
+    assert_eq!(
+        f.core.attention_of("plan:run-1"),
+        None,
+        "the stall was raised before that look too, so it has been seen"
+    );
+}
+
+// ─── external alerts that move or are replaced ──────────────────────────────
+
+#[test]
+fn moving_an_external_key_to_another_target_retires_it_on_the_old_one() {
+    let f = fixture();
+    let mut rx = f.core.subscribe_attention();
+    f.core.publish_external(external("ci", "plan:run-1", AttentionKind::Failed));
+    let raised = next_change_for(&mut rx, "plan:run-1").edge.expect("raised");
+
+    // The producer re-attributes its alert to a role under the run.
+    f.core.publish_external(external("ci", "team:run-1", AttentionKind::Failed));
+    assert!(f.core.attention_of("team:run-1").is_some(), "raised on the new target");
+    let left = next_change_for(&mut rx, "plan:run-1");
+    assert_eq!(left.attention, None, "and the target it left wants nothing");
+    assert_eq!(left.retired, Some(raised));
+}
+
+// ─── followers ───────────────────────────────────────────────────────────────
+
+#[test]
+fn a_session_registered_again_under_one_id_is_followed_afresh() {
+    let f = fixture();
+    let mut rx = f.core.subscribe_attention();
+    // A view keeps the first handle alive, so its watches never close.
+    let first = register(&f, "s1");
+    first.publish_health(needs_permission());
+    next_change_for(&mut rx, &chat_target("s1"));
+
+    // The session comes back under the same id on a new handle.
+    f.registry.unregister("s1");
+    next_change_for(&mut rx, &chat_target("s1"));
+    let second = register(&f, "s1");
+    wait_until("the new handle to be followed", || {
+        f.core.attention().followed.lock().unwrap().len() >= 2
+    });
+
+    second.publish_health(needs_permission());
+    let change = next_change_for(&mut rx, &chat_target("s1"));
+    assert!(
+        change.attention.is_some(),
+        "the new handle's prompt reaches the stream, not only the old handle's"
+    );
+    drop(first);
+}
+
+#[test]
+fn a_new_request_with_the_same_health_is_still_a_new_edge() {
+    let f = fixture();
+    let mut rx = f.core.subscribe_attention();
+    let h = register(&f, "s1");
+    let at = now();
+    let waiting = HealthInputs { last_activity_at: at, ..needs_permission() };
+    h.publish_health(waiting.clone());
+    let first = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
+
+    // One request answered and the next arriving leave the status and the
+    // activity stamp alike: only the request id differs, and that lives in the
+    // inputs rather than in the derived health.
+    h.publish_health(HealthInputs { prompt_request: Some("req-2".into()), ..waiting });
+    let change = next_change_for(&mut rx, &chat_target("s1"));
+    let second = change.edge.expect("raised");
+    assert_ne!(second, first, "a different request is a different alert");
+    assert_eq!(change.retired, Some(first));
 }

@@ -162,19 +162,20 @@ impl SessionPrefsRepo {
     /// alerts): every edge older than `now` has been seen, and the explicit
     /// unread mark is spent.
     ///
-    /// `last_viewed_at` only ever moves forward, so a stale call (a tick that
-    /// raced a newer view) cannot un-see something.
+    /// Nothing here moves backwards. `last_viewed_at` only ever advances, so a
+    /// stale call — a tick that raced a newer view — cannot un-see something;
+    /// and a view older than the row's last write does not clear an unread
+    /// mark made after it, which would silently undo what the person asked
+    /// for.
     pub fn mark_viewed(&self, session_key: &str, now: DateTime<Local>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO agent_session_prefs (session_key, last_viewed_at, unread_override, updated_at) \
              VALUES (?1, ?2, 0, ?2) \
              ON CONFLICT(session_key) DO UPDATE SET \
-                 last_viewed_at = CASE \
-                     WHEN last_viewed_at IS NULL OR last_viewed_at < ?2 THEN ?2 \
-                     ELSE last_viewed_at END, \
-                 unread_override = 0, \
-                 updated_at = ?2",
+                 last_viewed_at = MAX(COALESCE(last_viewed_at, ?2), ?2), \
+                 unread_override = CASE WHEN ?2 >= updated_at THEN 0 ELSE unread_override END, \
+                 updated_at = MAX(updated_at, ?2)",
             params![session_key, stamp(now)],
         )
         .context("mark session viewed")?;

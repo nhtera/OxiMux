@@ -163,7 +163,7 @@ pub fn edge_of(
     let id = match &attention.source {
         // The producer's key plus when it raised it: re-publishing the same
         // trip (a boot replay, a re-scan) is the same edge.
-        AttentionSource::External(key) => format!("{key}@{}", attention.since),
+        AttentionSource::External(key) => external_edge_id(key, attention.since),
         AttentionSource::Health => match attention.kind {
             // The request being answered, so one prompt alerts once however
             // many times the session's health is re-derived.
@@ -208,6 +208,12 @@ pub struct ExternalAttention {
     pub since: i64,
 }
 
+/// One external item's edge id, spelled in one place so the evaluator's
+/// "already seen" check and [`edge_of`] cannot disagree.
+fn external_edge_id(key: &str, since: i64) -> String {
+    format!("{key}@{since}")
+}
+
 /// Whether anyone still has unread work in this session: it did something
 /// after they last looked, or they marked it unread on purpose.
 pub fn is_unread(health: &SessionHealth, prefs: &SessionPrefs) -> bool {
@@ -218,22 +224,59 @@ pub fn is_unread(health: &SessionHealth, prefs: &SessionPrefs) -> bool {
         }
 }
 
+/// When each alert this target could raise was first observed, so the
+/// evaluator can tell an alert the person has already dealt with from one
+/// raised since they last looked.
+///
+/// The onset cannot be read off the health. `last_activity_at` is when the
+/// session last did something, which for a stall is when the *silence* began —
+/// minutes before the stall was declared. Comparing a view against that would
+/// suppress a stall that arose after the person looked, which is the one thing
+/// this phase exists to prevent. So the host, which has the clock and sees
+/// every edge as it appears, says when each one arrived; an edge it has not
+/// recorded yet is brand new and therefore unseen.
+pub trait EdgeOnset {
+    /// When `edge` was first observed, in Unix milliseconds, or `None` when it
+    /// has not been seen before.
+    fn raised_at(&self, edge: &AttentionEdge) -> Option<i64>;
+}
+
+/// No history: every alert reads as brand new. What a caller with no edge
+/// history of its own uses — a remote client, which has no prefs either.
+pub struct Unrecorded;
+
+impl EdgeOnset for Unrecorded {
+    fn raised_at(&self, _edge: &AttentionEdge) -> Option<i64> {
+        None
+    }
+}
+
+impl<F: Fn(&AttentionEdge) -> Option<i64>> EdgeOnset for F {
+    fn raised_at(&self, edge: &AttentionEdge) -> Option<i64> {
+        self(edge)
+    }
+}
+
 /// What this session wants from a person: the worse of its own health and the
 /// external items raised against it, or `None` when it wants nothing.
 ///
 /// `external` is the items whose `target` is this session (or run root); the
-/// caller filters, because it holds the registry.
+/// caller filters, because it holds the registry. `onset` says when each alert
+/// first appeared, so a dismissible one the person has already looked at can
+/// be left out; pass [`Unrecorded`] to keep every alert.
 ///
 /// A tie between the session's own state and an external item goes to the
 /// session: its health is the more local truth, and the external item is still
 /// there to render on the row.
 pub fn of(
+    target: &str,
     health: &SessionHealth,
     prefs: &SessionPrefs,
     external: &[ExternalAttention],
+    onset: &dyn EdgeOnset,
 ) -> Option<Attention> {
-    let own = from_health(health, prefs);
-    let outside = of_external(prefs, external);
+    let own = from_health(target, health, prefs, onset);
+    let outside = of_external(target, prefs, external, onset);
     match (own, outside) {
         (Some(a), Some(b)) if b.kind.priority() < a.kind.priority() => Some(b),
         (Some(a), _) => Some(a),
@@ -243,11 +286,19 @@ pub fn of(
 
 /// The worst unseen external item for a target that has no health of its own
 /// (a terminal agent, a run root).
-pub fn of_external(prefs: &SessionPrefs, external: &[ExternalAttention]) -> Option<Attention> {
+pub fn of_external(
+    target: &str,
+    prefs: &SessionPrefs,
+    external: &[ExternalAttention],
+    onset: &dyn EdgeOnset,
+) -> Option<Attention> {
     external
         .iter()
-        .filter(|item| !is_seen(item.kind, item.since, prefs))
-        .min_by_key(|item| (item.kind.priority(), item.since))
+        .filter(|item| !seen_external(target, item, prefs, onset))
+        // The producer key breaks a tie: two items of one kind raised in the
+        // same millisecond arrive in whatever order a `HashMap` iterated, and
+        // picking by that would show a different reason on each pass.
+        .min_by_key(|item| (item.kind.priority(), item.since, &item.key))
         .map(|item| Attention {
             kind: item.kind,
             since: item.since,
@@ -256,8 +307,37 @@ pub fn of_external(prefs: &SessionPrefs, external: &[ExternalAttention]) -> Opti
         })
 }
 
+/// Whether the person has dealt with one external item.
+///
+/// An unread finish counts here although it is not dismissible: a producer can
+/// raise one, and looking at the target is what reads it. Nothing else
+/// informational can be cleared by a look — a rate limit is still a rate limit
+/// once you have seen it.
+fn seen_external(
+    target: &str,
+    item: &ExternalAttention,
+    prefs: &SessionPrefs,
+    onset: &dyn EdgeOnset,
+) -> bool {
+    if item.kind == AttentionKind::FinishedUnread {
+        return !prefs.unread_override
+            && prefs.last_viewed_at.is_some_and(|viewed| viewed >= item.since);
+    }
+    let edge = AttentionEdge {
+        target: target.to_string(),
+        kind: item.kind,
+        id: external_edge_id(&item.key, item.since),
+    };
+    is_seen(item.kind, &edge, prefs, onset)
+}
+
 /// The session's own state, read as attention.
-fn from_health(health: &SessionHealth, prefs: &SessionPrefs) -> Option<Attention> {
+fn from_health(
+    target: &str,
+    health: &SessionHealth,
+    prefs: &SessionPrefs,
+    onset: &dyn EdgeOnset,
+) -> Option<Attention> {
     let kind = match health.status {
         HealthStatus::NeedsPermission => AttentionKind::NeedsPermission,
         HealthStatus::NeedsAnswer => AttentionKind::NeedsInput,
@@ -275,12 +355,14 @@ fn from_health(health: &SessionHealth, prefs: &SessionPrefs) -> Option<Attention
                 return None;
             }
             let since = health.stalled_since?;
-            return (!is_seen(AttentionKind::Stalled, since, prefs)).then(|| Attention {
+            let stalled = Attention {
                 kind: AttentionKind::Stalled,
                 since,
                 reason: health.reason.clone().or_else(|| Some("no output".into())),
                 source: AttentionSource::Health,
-            });
+            };
+            let edge = edge_of(target, &stalled, Some(health), None);
+            return (!is_seen(AttentionKind::Stalled, &edge, prefs, onset)).then_some(stalled);
         }
         // Idle and nothing pending: the only thing left is a turn nobody read.
         // `turn_id` is what says a turn ever ran, so a session that has never
@@ -294,27 +376,42 @@ fn from_health(health: &SessionHealth, prefs: &SessionPrefs) -> Option<Attention
             });
         }
     };
-    let since = health.last_activity_at;
-    (!is_seen(kind, since, prefs))
-        .then(|| Attention { kind, since, reason: health.reason.clone(), source: AttentionSource::Health })
+    let raised = Attention {
+        kind,
+        since: health.last_activity_at,
+        reason: health.reason.clone(),
+        source: AttentionSource::Health,
+    };
+    // The edge is built without a request id: only the dismissible kinds are
+    // filtered here, and neither a failure nor a stall has one.
+    let edge = edge_of(target, &raised, Some(health), None);
+    (!is_seen(kind, &edge, prefs, onset)).then_some(raised)
 }
 
-/// Whether the person has already dealt with an alert of this kind raised at
-/// `since`.
+/// Whether the person has already dealt with this exact alert.
 ///
 /// Only the dismissible kinds can be "seen": viewing a session does not answer
-/// its permission prompt, and pretending it did would hide a stopped agent. A
-/// newer edge of the same kind (a fresh failure after a dismiss, a new stall
-/// episode after output resumed) is past `last_viewed_at` again and so is not
-/// seen.
-fn is_seen(kind: AttentionKind, since: i64, prefs: &SessionPrefs) -> bool {
-    if !kind.is_dismissible() {
+/// its permission prompt, and pretending it did would hide a stopped agent.
+///
+/// The comparison is against when the alert *arose*, not when the session last
+/// did something. A person who looks at a quiet working session five minutes
+/// into its silence has not seen the stall declared five minutes later, and a
+/// process that dies after a look has not been seen either — both would be
+/// swallowed by comparing against `last_activity_at`. An edge with no recorded
+/// onset has never been published, so it is new by definition.
+fn is_seen(
+    kind: AttentionKind,
+    edge: &AttentionEdge,
+    prefs: &SessionPrefs,
+    onset: &dyn EdgeOnset,
+) -> bool {
+    if !kind.is_dismissible() || prefs.unread_override {
         return false;
     }
-    if prefs.unread_override {
+    let (Some(viewed), Some(raised)) = (prefs.last_viewed_at, onset.raised_at(edge)) else {
         return false;
-    }
-    prefs.last_viewed_at.is_some_and(|viewed| viewed >= since)
+    };
+    viewed >= raised
 }
 
 #[cfg(test)]

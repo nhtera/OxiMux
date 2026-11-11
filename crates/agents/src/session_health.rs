@@ -197,6 +197,17 @@ impl SessionHandle {
         self.health.health.subscribe()
     }
 
+    /// Follow the driver's raw facts.
+    ///
+    /// Needed beside [`Self::subscribe_health`] because two things a person
+    /// has to act on can derive the same health: one permission request
+    /// answered and the next arriving in the same millisecond leave the status
+    /// and the activity stamp alike, so the health watch stays quiet while the
+    /// request id — which is what tells the two prompts apart — has changed.
+    pub fn subscribe_health_inputs(&self) -> watch::Receiver<HealthInputs> {
+        self.health.inputs.subscribe()
+    }
+
     /// The host's periodic look: fold in the children's activity and re-derive
     /// at `now` (a quiet session crosses the stall threshold here).
     pub fn refresh_health(&self, now: i64, children: ChildActivity) -> Option<SessionHealth> {
