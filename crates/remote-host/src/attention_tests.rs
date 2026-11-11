@@ -779,3 +779,28 @@ fn a_look_from_before_a_restart_still_covers_what_it_covered() {
         "the look it was dealt with by is still on record"
     );
 }
+
+#[test]
+fn republishing_the_same_facts_does_not_re_attribute_them() {
+    let f = fixture();
+    let h = register(&f, "s1");
+    h.publish_health(needs_permission());
+    let published_by = h.health_snapshot().generation;
+
+    // The agent respawns and something re-announces what the chat already
+    // knows — a rebind does exactly this. The facts are unchanged, so they are
+    // still the old process's and must keep its number; otherwise the
+    // successor's own first prompt, numbered the same by its provider, is the
+    // very same alert and nothing announces it.
+    h.swap_connection(Arc::new(StubConnection::default()));
+    h.publish_health(needs_permission());
+    assert_eq!(
+        h.health_snapshot().generation,
+        published_by,
+        "a republish of the same facts is not a new publication"
+    );
+
+    // Facts that genuinely change do carry the new process's number.
+    h.publish_health(HealthInputs { prompt_request: Some("req-2".into()), ..needs_permission() });
+    assert_ne!(h.health_snapshot().generation, published_by);
+}

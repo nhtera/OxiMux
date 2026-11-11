@@ -190,11 +190,7 @@ impl SessionHandle {
         // longer has that prompt, and raise an alert for something already
         // answered.
         let derive = self.health.derive.lock().unwrap();
-        // Stamped with the facts: whichever process published them is the one
-        // their pending prompt belongs to.
-        self.health
-            .published_generation
-            .store(self.conn_generation() as i64, Ordering::Relaxed);
+        let generation = self.conn_generation() as i64;
         let modified = self.health.inputs.send_if_modified(|current| {
             if *current == inputs {
                 return false;
@@ -202,6 +198,15 @@ impl SessionHandle {
             *current = inputs;
             true
         });
+        // Stamped only when the facts actually changed. A republish of the
+        // *same* facts — a rebind re-announcing what the chat already knows —
+        // must not re-attribute them: they are still the old process's, and
+        // moving the stamp would give its pending prompt the successor's
+        // number, at which point the successor's own first prompt is the very
+        // same alert and nothing announces it.
+        if modified {
+            self.health.published_generation.store(generation, Ordering::Relaxed);
+        }
         let changed = if modified || first {
             self.health.recompute_under(
                 derive,
