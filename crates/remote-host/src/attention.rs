@@ -63,8 +63,13 @@ impl HostCore {
     /// Follow attention changes in this process. The current state is not
     /// replayed: a new subscriber reads [`HostCore::needs_you`] (or
     /// [`HostCore::attention_of`]) first and then follows this.
-    pub fn subscribe_attention(&self) -> broadcast::Receiver<AttentionChanged> {
-        self.attention().tx.subscribe()
+    pub fn subscribe_attention(self: &Arc<Self>) -> broadcast::Receiver<AttentionChanged> {
+        let rx = self.attention().tx.subscribe();
+        // Sessions already live when the first surface subscribes need their
+        // followers now; the watcher loop only wakes when the registry
+        // changes.
+        self.follow_live_sessions();
+        rx
     }
 
     /// Raise or update an alert no session's health can know about: a terminal
@@ -263,6 +268,13 @@ impl HostCore {
     /// changes. One task per session, which ends with the session: a session's
     /// health watch is the only signal that says when a person is needed, and
     /// the 30-second stall tick is far too coarse for a banner.
+    ///
+    /// Only while something is listening. The snapshot calls compute on
+    /// demand, so the followers exist purely to feed the stream: with no
+    /// subscriber they would read the database on every health change for
+    /// nobody. That also keeps a host built in a test — where nothing
+    /// subscribes — from doing work on a runtime thread behind the test's back
+    /// ([[gpui-test-scheduler-forbids-foreign-thread-wakes]]).
     pub(crate) fn spawn_attention_watchers(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let mut changes = self.registry().subscribe_changes();
@@ -271,20 +283,7 @@ impl HostCore {
             loop {
                 {
                     let Some(core) = weak.upgrade() else { return };
-                    let live: std::collections::HashSet<SessionId> =
-                        core.registry().ids().into_iter().collect();
-                    for id in &live {
-                        if !core.attention().followed.lock().unwrap().insert(id.clone()) {
-                            continue;
-                        }
-                        let Some(handle) = core.registry().get(id) else {
-                            core.attention().followed.lock().unwrap().remove(id);
-                            continue;
-                        };
-                        let rx = handle.subscribe_health();
-                        // Weak, so following a session never keeps it alive.
-                        core.runtime().spawn(follow(Arc::downgrade(&core), id.clone(), rx));
-                    }
+                    let live = core.follow_live_sessions();
                     // A session that left the registry wants nothing, whether
                     // or not its health watch has closed: a view still holding
                     // its handle keeps that watch open, and its follower would
@@ -299,6 +298,29 @@ impl HostCore {
                 }
             }
         });
+    }
+
+    /// Start a follower for every live session that has none, and answer with
+    /// the live set. A no-op while nothing subscribes to the stream.
+    fn follow_live_sessions(self: &Arc<Self>) -> std::collections::HashSet<SessionId> {
+        let live: std::collections::HashSet<SessionId> =
+            self.registry().ids().into_iter().collect();
+        if self.attention().tx.receiver_count() == 0 {
+            return live;
+        }
+        for id in &live {
+            if !self.attention().followed.lock().unwrap().insert(id.clone()) {
+                continue;
+            }
+            let Some(handle) = self.registry().get(id) else {
+                self.attention().followed.lock().unwrap().remove(id);
+                continue;
+            };
+            let rx = handle.subscribe_health();
+            // Weak, so following a session never keeps it alive.
+            self.runtime().spawn(follow(Arc::downgrade(self), id.clone(), rx));
+        }
+        live
     }
 }
 
