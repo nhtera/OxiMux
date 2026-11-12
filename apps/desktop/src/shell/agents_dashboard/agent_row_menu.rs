@@ -20,21 +20,23 @@
 
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    Styled, WeakEntity, Window, div, px,
+    SharedString, Styled, WeakEntity, Window, div, px,
 };
+use oximux_ui::MenuRow;
 use oximux_agents::attention::Attention;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::rail_agent_row::RailAgentTarget;
 use crate::workspace_root::WorkspaceRoot;
 
-/// Height of one menu row, matching the workspace row menu so the two read as
-/// the same control.
-const ITEM_H: f32 = 26.0;
-const PADDING_X: f32 = 8.0;
 /// Pushes the card clear of the pointer so the first item is not already
-/// hovered when it appears.
+/// hovered when it appears. Scaled with the rest of the interface, since it is
+/// measured against a row height that scales.
 const ANCHOR_Y_OFFSET: f32 = 4.0;
+/// Width of the card. The longest label is "Mark as unread"; fixed so the
+/// menu does not resize between a row that offers Dismiss and one that does
+/// not, and so the clamp below knows the width before layout.
+const MENU_WIDTH: f32 = 176.0;
 
 /// What a row's menu can offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +147,7 @@ impl AgentRowMenu {
 }
 
 impl Render for AgentRowMenu {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(
             &mut self.theme,
             &mut self.density,
@@ -169,38 +171,53 @@ impl Render for AgentRowMenu {
             .rounded(px(density.r_card))
             .shadow_lg();
 
+        // The shared row, not a seventh hand-rolled one: `MenuRow` exists
+        // because six menus had drifted into four signatures for the same
+        // painted control, and it is what agrees on the height, the padding
+        // and the type size — all of which scale with interface zoom.
         for (ix, &action) in state.actions.iter().enumerate() {
+            let menu = cx.entity();
             card = card.child(
-                div()
-                    .id(("agent-row-menu-item", ix))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(ITEM_H))
-                    .px(px(PADDING_X))
-                    .rounded(px(density.r_xs))
-                    .cursor_pointer()
-                    .whitespace_nowrap()
-                    .hover(move |s| s.bg(theme.hover_overlay))
-                    .text_size(px(typography.t_body_md))
-                    .text_color(theme.fg_base)
-                    .child(action.label())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                            this.dispatch(action, cx);
-                        }),
-                    ),
+                MenuRow::new(
+                    SharedString::from(format!("agent-row-menu-{ix}")),
+                    action.label(),
+                    theme,
+                    density,
+                    typography.clone(),
+                )
+                .build(move |_, _window, cx| {
+                    menu.update(cx, |menu, cx| menu.dispatch(action, cx));
+                }),
             );
         }
 
-        // A full-screen catcher behind the card closes it on any outside
-        // click, the same way the workspace row menu dismisses.
+        // Keep the card inside the window. Two rows is a short menu, but the
+        // second one is Dismiss — the whole point of the menu — and a
+        // right-click near the bottom edge would put it where it cannot be
+        // clicked. The height is computed rather than measured, the way the
+        // terminal's context menu does it: the row count is known here and
+        // the metrics scale together.
+        let rows = state.actions.len() as f32;
+        let height = 2.0 * density.pad_overlay + rows * density.h_overlay_item;
+        let viewport = window.viewport_size();
+        let (vp_w, vp_h) = (f32::from(viewport.width), f32::from(viewport.height));
+        // Not enough room below: anchor the card's bottom at the pointer, and
+        // never let it run off the top either.
+        let top = if state.y + height > vp_h { (state.y - height).max(0.0) } else { state.y };
+        let left =
+            if state.x + MENU_WIDTH > vp_w { (state.x - MENU_WIDTH).max(0.0) } else { state.x };
+
+        // A full-window catcher behind the card closes it on any outside
+        // click, the same way the workspace row menu dismisses. It *occludes*:
+        // without that, a click passes through to the row underneath, which
+        // would run that row's own click — and a row click records a look, so
+        // choosing "Mark as unread" would be undone by the very click that
+        // chose it.
         div()
             .absolute()
-            .left_0()
-            .top_0()
+            .inset_0()
             .size_full()
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close(cx)),
@@ -209,7 +226,18 @@ impl Render for AgentRowMenu {
                 MouseButton::Right,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close(cx)),
             )
-            .child(div().absolute().left(px(state.x)).top(px(state.y)).child(card))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(MENU_WIDTH))
+                    // A click on the card is the card's, not the backdrop's:
+                    // without this it would also close the menu, and the
+                    // close would race the action.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(card),
+            )
             .into_any_element()
     }
 }
