@@ -295,6 +295,35 @@ impl HostCore {
         self.current(target, &mut state).0
     }
 
+    /// The attention of a cockpit (terminal) agent, from the status the caller
+    /// is already holding.
+    ///
+    /// Terminal agents have no [`SessionHealth`], so their state arrives as a
+    /// parsed `AgentStatus`. It is mapped by
+    /// [`attention::external_of_agent_status`] — the one mapping, shared with
+    /// the producer — and then ranked against whatever else was published
+    /// against the same row, so a CI alert or a plan breaker on that row still
+    /// competes with it.
+    pub fn attention_of_agent_status(
+        &self,
+        target: &str,
+        status: &oximux_core::AgentStatus,
+        completed_turn: bool,
+        since: i64,
+    ) -> Option<Attention> {
+        // Key and target are the same string for a cockpit item: the producer
+        // owns one alert per row, so the row's key *is* its identity.
+        let item = attention::external_of_agent_status(
+            target.to_string(),
+            target.to_string(),
+            status,
+            completed_turn,
+            since,
+        );
+        let mut state = self.attention().state.lock().unwrap();
+        self.current_with(target, item, &mut state).0
+    }
+
     /// Every target that needs a person, worst first. This is the number the
     /// chip, the nav badge and the hotkey cycle all read, so they cannot
     /// disagree.
@@ -432,7 +461,37 @@ impl HostCore {
         target: &str,
         state: &mut AttentionState,
     ) -> (Option<Attention>, Option<AttentionEdge>) {
-        let external = external_for(state, target);
+        self.current_with(target, None, state)
+    }
+
+    /// As [`HostCore::current`], with one external item supplied by the caller
+    /// rather than read from the registry.
+    ///
+    /// A cockpit row's state is a PTY-parsed `AgentStatus` the caller already
+    /// holds. Evaluating only what the producer has published would read
+    /// "Working" for a blocked agent until the first publication landed, and
+    /// evaluating it anywhere else would be a second evaluator. So it comes in
+    /// here, through the same ranking, the same prefs, the same looks and the
+    /// same onset recording as everything else.
+    fn current_with(
+        &self,
+        target: &str,
+        from_status: Option<ExternalAttention>,
+        state: &mut AttentionState,
+    ) -> (Option<Attention>, Option<AttentionEdge>) {
+        let mut external = external_for(state, target);
+        if let Some(item) = from_status {
+            // The producer publishes this same item under this same key. If it
+            // has already landed, the caller's is the fresher of the two, not a
+            // second alert.
+            external.retain(|published| published.key != item.key);
+            external.push(item);
+            // `external_for` returns them worst-first and the evaluator relies
+            // on that order for its tie-break.
+            external.sort_by(|a, b| {
+                (a.kind.priority(), a.since, &a.key).cmp(&(b.kind.priority(), b.since, &b.key))
+            });
+        }
         let prefs = self.prefs_of(target);
         // **One** read of the session: one handle lookup, and the health, the
         // prompt id and the process that published them taken together. Two

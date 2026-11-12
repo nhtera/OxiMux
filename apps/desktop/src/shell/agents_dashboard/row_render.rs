@@ -19,7 +19,7 @@ use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px, svg};
 use oximux_core::AgentStatus;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::agents_dashboard::model::{AgentRow, attention_rank};
+use crate::shell::agents_dashboard::model::AgentRow;
 use crate::shell::agents_dashboard::sections::SectionKind;
 use crate::shell::left_rail::workspace_agent_rows::{agent_state_indicator, agent_state_label};
 use crate::ui::overlay::FloatingSurface;
@@ -82,8 +82,10 @@ pub fn render_agent_row(
     typography: &Typography,
 ) -> Div {
     let status = row.status.clone().unwrap_or(AgentStatus::Idle);
-    // Tier 0 = the user is being asked something (approval / input).
-    let is_attention = attention_rank(row.status.as_ref(), row.is_live) == 0;
+    // The evaluator's answer, not a status guess: a failure that has been
+    // viewed no longer wears the accent, and a stall now does.
+    let is_attention =
+        row.attention.as_ref().is_some_and(|attention| attention.kind.is_needs_you());
 
     // ── leading column: state glyph + adapter icon, sat on the title line ──
     let lead = div()

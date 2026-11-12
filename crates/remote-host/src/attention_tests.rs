@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use oximux_agents::attention::{AttentionEdge, AttentionKind, AttentionSource, ExternalAttention};
 use oximux_agents::health::{HealthInputs, Process, PromptKind};
+use oximux_core::AgentStatus;
 use oximux_agents::lineage::LineageStore;
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::connection::StubConnection;
@@ -1235,5 +1236,58 @@ fn an_unwinding_probe_still_stops_its_writers() {
         stop.load(Ordering::Relaxed),
         "the writer was left publishing after the probe failed, which buries the real failure \
          in whatever runs next"
+    );
+}
+
+// ─── a cockpit row's status, through the host ────────────────────────────────
+
+#[test]
+fn a_cockpit_rows_status_is_ranked_against_what_was_published_on_it() {
+    // The row builder holds the parsed status before the producer has
+    // published anything, so the status alone has to answer. Whatever else was
+    // raised on that row still competes with it rather than being replaced.
+    let f = fixture();
+    let target = "cockpit:7";
+    let waiting = AgentStatus::NeedsApproval("rm -rf build/".into());
+
+    let alone =
+        f.core.attention_of_agent_status(target, &waiting, false, now()).expect("raised");
+    assert_eq!(alone.kind, AttentionKind::NeedsPermission, "the status alone answers");
+    assert_eq!(alone.reason.as_deref(), Some("rm -rf build/"), "the row says what it would run");
+
+    f.core.publish_external(external("ci:7", target, AttentionKind::Failed));
+    let ranked =
+        f.core.attention_of_agent_status(target, &waiting, false, now()).expect("raised");
+    assert_eq!(ranked.kind, AttentionKind::NeedsPermission, "a permission outranks a failure");
+
+    let quiet = f.core
+        .attention_of_agent_status(target, &AgentStatus::Idle, false, now())
+        .expect("the published alert outlives a quiet status");
+    assert_eq!(quiet.kind, AttentionKind::Failed, "CI's alert is still on the row");
+}
+
+#[test]
+fn the_producers_item_and_the_rows_status_are_one_alert_not_two() {
+    // Both callers publish under the row's own key. Once the producer's item
+    // has landed, the caller's status is the fresher of the two and replaces
+    // it; counted as a second item, a stale worse alert would outrank the
+    // truth the caller is holding.
+    let f = fixture();
+    let target = "cockpit:7";
+    f.core.publish_external(ExternalAttention {
+        key: target.into(),
+        target: target.into(),
+        kind: AttentionKind::NeedsPermission,
+        reason: "a prompt that has since been answered".into(),
+        since: now() - 10_000,
+    });
+
+    let fresh = f.core
+        .attention_of_agent_status(target, &AgentStatus::WaitingForInput, false, now())
+        .expect("raised");
+    assert_eq!(
+        fresh.kind,
+        AttentionKind::NeedsInput,
+        "the status replaces the item under its own key instead of being outranked by it"
     );
 }

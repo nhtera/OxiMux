@@ -343,9 +343,33 @@ pub fn external_of_agent_status(
     key: String,
     target: String,
     status: &AgentStatus,
+    completed_turn: bool,
     since: i64,
 ) -> Option<ExternalAttention> {
-    let (kind, reason) = match status {
+    let (kind, reason) = kind_of_agent_status(status, completed_turn)?;
+    Some(ExternalAttention { key, target, kind, reason, since })
+}
+
+/// What a cockpit agent's parsed status raises, with the line to show for it.
+///
+/// Split out of [`external_of_agent_status`] for the callers that want the
+/// question "does this status need a person?" without an item to rank: the nav
+/// badge counts statuses, not alerts. One `match`, so the badge cannot drift
+/// from the row the way it did when it kept its own list.
+///
+/// `completed_turn` is the cockpit's "finished a turn" signal — a parked agent
+/// that has replied. The status alone cannot say it: the agent is `Idle`
+/// either way, and an agent that has never run a turn is not unread work. It
+/// is the counterpart of the `turn_id.is_some()` that [`of`] requires of a
+/// session's health for the same reason.
+pub fn kind_of_agent_status(
+    status: &AgentStatus,
+    completed_turn: bool,
+) -> Option<(AttentionKind, String)> {
+    if completed_turn && matches!(status, AgentStatus::Idle) {
+        return Some((AttentionKind::FinishedUnread, "Finished".to_string()));
+    }
+    let pair = match status {
         // The captured prompt is the only thing that says *what* is being
         // approved, so it is the reason verbatim.
         AgentStatus::NeedsApproval(what) => (AttentionKind::NeedsPermission, what.clone()),
@@ -368,7 +392,7 @@ pub fn external_of_agent_status(
         AgentStatus::Interrupted => return None,
         AgentStatus::Running | AgentStatus::Idle => return None,
     };
-    Some(ExternalAttention { key, target, kind, reason, since })
+    Some(pair)
 }
 
 /// Whether the person has dealt with one external item.

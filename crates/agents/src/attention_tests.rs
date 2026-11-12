@@ -568,7 +568,7 @@ fn a_chats_target_and_its_prefs_key_are_one_string() {
 // ─── a cockpit agent's status, through the one evaluator ─────────────────────
 
 fn cockpit(status: AgentStatus) -> Option<ExternalAttention> {
-    external_of_agent_status("cockpit:7".into(), "cockpit:7".into(), &status, NOW - MIN)
+    external_of_agent_status("cockpit:7".into(), "cockpit:7".into(), &status, false, NOW - MIN)
 }
 
 #[test]
@@ -627,7 +627,7 @@ fn a_cockpit_failure_is_cleared_by_a_look_and_a_later_one_is_raised_again() {
     let item = cockpit(AgentStatus::Failed("boom".into())).expect("raised");
     let unseen = SessionPrefs::default();
     assert!(
-        of_external("cockpit:7", &unseen, &[item.clone()], &NothingSeen).is_some(),
+        of_external("cockpit:7", &unseen, std::slice::from_ref(&item), &NothingSeen).is_some(),
         "nobody has looked yet"
     );
 
@@ -643,11 +643,43 @@ fn a_cockpit_failure_is_cleared_by_a_look_and_a_later_one_is_raised_again() {
         "cockpit:7".into(),
         "cockpit:7".into(),
         &AgentStatus::Failed("boom again".into()),
+        false,
         NOW + MIN,
     )
     .expect("raised");
     assert!(
         of_external("cockpit:7", &looked, &[later], &seen_after_the_look).is_some(),
         "a failure after the look is a new edge and is raised again"
+    );
+}
+
+#[test]
+fn a_parked_cockpit_agent_that_has_replied_is_unread_work() {
+    // The status is `Idle` whether the agent has run a turn or never has, so
+    // the status alone cannot tell unread work from an agent that has done
+    // nothing. `completed_turn` is what separates them, the same way `of`
+    // requires a `turn_id` of a session's health.
+    let replied = external_of_agent_status(
+        "cockpit:7".into(),
+        "cockpit:7".into(),
+        &AgentStatus::Idle,
+        true,
+        NOW - MIN,
+    );
+    assert_eq!(
+        replied.map(|item| item.kind),
+        Some(AttentionKind::FinishedUnread),
+        "a parked agent with a reply is a finish nobody has read"
+    );
+    assert!(
+        external_of_agent_status(
+            "cockpit:7".into(),
+            "cockpit:7".into(),
+            &AgentStatus::Idle,
+            false,
+            NOW - MIN,
+        )
+        .is_none(),
+        "an agent that never ran a turn is not unread work"
     );
 }

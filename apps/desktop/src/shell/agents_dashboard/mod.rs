@@ -9,6 +9,7 @@
 
 pub mod filter;
 pub mod model;
+pub mod row_attention;
 pub mod row_builder;
 pub mod row_render;
 pub mod sections;
@@ -26,6 +27,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agents_dashboard::filter::{StatusFilter, apply_filter};
 use crate::shell::agents_dashboard::model::AgentRow;
+use crate::shell::agents_dashboard::row_attention::resolver as attention_resolver;
 use crate::shell::agents_dashboard::row_builder::build_agent_rows;
 use crate::shell::agents_dashboard::row_render::{render_agent_row, render_section_header};
 use crate::shell::agents_dashboard::sections::{DashboardItem, group_into_sections};
@@ -55,10 +57,15 @@ pub fn render_agents_dashboard(
     theme: Theme,
     density: Density,
     typography: &Typography,
+    host: Option<std::sync::Arc<oximux_remote_host::HostCore>>,
 ) -> AnyElement {
     // Build + sort once, narrow by the filter, then group into status sections.
+    // Attention is resolved per row here, before the `uniform_list` closure,
+    // so the host is asked once per row per frame and never inside the
+    // virtualization layer.
+    let attention_of = attention_resolver(host);
     let all_rows: Vec<AgentRow> =
-        build_agent_rows(workspace_agents, projects, workspaces_by_project, now);
+        build_agent_rows(workspace_agents, projects, workspaces_by_project, now, &attention_of);
     let had_any = !all_rows.is_empty();
     let rows = apply_filter(all_rows, filter_text, status_filter);
 

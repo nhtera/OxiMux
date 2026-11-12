@@ -172,6 +172,7 @@ mod tests {
             primary: primary.map(str::to_string),
             secondary: None,
             completed_turn: false,
+            attention: None,
         }
     }
 

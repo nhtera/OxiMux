@@ -4,6 +4,7 @@
 //! severity-ordered, empty sections dropped. The render layer (mod.rs) walks
 //! the items and paints a header or a card per entry.
 
+use oximux_agents::attention::AttentionKind;
 use oximux_core::AgentStatus;
 
 use crate::shell::agents_dashboard::model::AgentRow;
@@ -11,22 +12,27 @@ use crate::shell::agents_dashboard::model::AgentRow;
 /// A status section, in severity order (top of the list first).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SectionKind {
-    /// Blocked on the user — approval or input required.
+    /// Someone has to act: a permission, a question, a failure, a stall —
+    /// [`AttentionKind::is_needs_you`] and nothing else.
     Attention,
-    /// Actively running.
+    /// Finished a turn that nobody has read yet.
+    FinishedUnread,
+    /// Actively running. A rate-limited session lives here too: it retries
+    /// itself, so it reads as working with the limit as its reason.
     Working,
-    /// Finished a turn / clean exit.
+    /// Finished and already looked at.
     Done,
     /// Ready, never run a turn.
     Idle,
-    /// Interrupted / failed / non-zero exit.
+    /// Interrupted, or a failure that has been dealt with.
     Ended,
 }
 
 impl SectionKind {
     /// Severity order — drives both the bucket index and the render order.
-    pub const ORDER: [SectionKind; 5] = [
+    pub const ORDER: [SectionKind; 6] = [
         SectionKind::Attention,
+        SectionKind::FinishedUnread,
         SectionKind::Working,
         SectionKind::Done,
         SectionKind::Idle,
@@ -34,20 +40,26 @@ impl SectionKind {
     ];
 
     /// Position in [`SectionKind::ORDER`] (the bucket index).
-    fn index(self) -> usize {
+    ///
+    /// Public because it is also the row sort key: `sort_agent_rows` orders by
+    /// it, so the sorted list and the sections it is cut into cannot disagree
+    /// about which row is more urgent.
+    pub fn index(self) -> usize {
         match self {
             SectionKind::Attention => 0,
-            SectionKind::Working => 1,
-            SectionKind::Done => 2,
-            SectionKind::Idle => 3,
-            SectionKind::Ended => 4,
+            SectionKind::FinishedUnread => 1,
+            SectionKind::Working => 2,
+            SectionKind::Done => 3,
+            SectionKind::Idle => 4,
+            SectionKind::Ended => 5,
         }
     }
 
     /// Small-caps header label.
     pub fn label(self) -> &'static str {
         match self {
-            SectionKind::Attention => "NEEDS ATTENTION",
+            SectionKind::Attention => "NEEDS YOU",
+            SectionKind::FinishedUnread => "FINISHED · UNREAD",
             SectionKind::Working => "WORKING",
             SectionKind::Done => "DONE",
             SectionKind::Idle => "IDLE",
@@ -56,22 +68,48 @@ impl SectionKind {
     }
 }
 
-/// Which section a row belongs to. A finished-turn row (idle + reply) is "done"
-/// even though its raw status is Idle, matching the card's emerald check.
+/// Which section a row belongs to.
+///
+/// The top two sections are the evaluator's answer, not this function's: a row
+/// is in NEEDS YOU because [`AttentionKind::is_needs_you`] said so, and in
+/// FINISHED · UNREAD because the evaluator weighed the finish against what the
+/// person has already looked at. Below that there is no attention left to
+/// read, so the row's own lifecycle sections it — a finished-turn row
+/// (idle + reply) is "done" even though its raw status is Idle, matching the
+/// card's check.
+///
+/// That split is the point. A failure sits in NEEDS YOU until it is viewed or
+/// dismissed and then falls to ENDED, and a stall returns to WORKING, without
+/// either section having to know the dismissal rules.
 pub fn section_of(row: &AgentRow) -> SectionKind {
+    if let Some(attention) = &row.attention {
+        if attention.kind.is_needs_you() {
+            return SectionKind::Attention;
+        }
+        if attention.kind == AttentionKind::FinishedUnread {
+            return SectionKind::FinishedUnread;
+        }
+        // `Limited` is informational and retries itself, so it falls through
+        // to the status and reads as working.
+    }
     if row.completed_turn {
         return SectionKind::Done;
     }
     match row.status.as_ref() {
-        Some(AgentStatus::NeedsApproval(_)) | Some(AgentStatus::WaitingForInput) => {
-            SectionKind::Attention
-        }
         Some(AgentStatus::Running) => SectionKind::Working,
         Some(AgentStatus::Done { code: Some(0) }) => SectionKind::Done,
         Some(AgentStatus::Idle) | None => SectionKind::Idle,
         Some(AgentStatus::Done { .. })
         | Some(AgentStatus::Failed(_))
         | Some(AgentStatus::Interrupted) => SectionKind::Ended,
+        // A blocked status with no attention of its own. Unreachable for a row
+        // the evaluator has seen, because a prompt is not dismissible and so
+        // never reads as dealt with; it happens only for a row built without
+        // an evaluator. Showing a blocked agent as "working" would be a lie,
+        // and this is the one reading that never tells it.
+        Some(AgentStatus::NeedsApproval(_)) | Some(AgentStatus::WaitingForInput) => {
+            SectionKind::Attention
+        }
     }
 }
 
@@ -87,7 +125,8 @@ pub enum DashboardItem {
 /// followed by its rows for each non-empty section. Rows keep their incoming
 /// (recency) order within a section.
 pub fn group_into_sections(rows: Vec<AgentRow>) -> Vec<DashboardItem> {
-    let mut buckets: [Vec<AgentRow>; 5] = std::array::from_fn(|_| Vec::new());
+    let mut buckets: [Vec<AgentRow>; SectionKind::ORDER.len()] =
+        std::array::from_fn(|_| Vec::new());
     for row in rows {
         buckets[section_of(&row).index()].push(row);
     }
@@ -134,7 +173,31 @@ mod tests {
         }
     }
 
+    /// A row's attention the way the app resolves a cockpit row's: the one
+    /// mapping, the one evaluator, nobody having looked at anything. These
+    /// tests are about which section the evaluator's answer lands in, so a
+    /// stub would make every one of them vacuous.
+    fn unseen_attention(
+        status: &AgentStatus,
+        completed_turn: bool,
+    ) -> Option<oximux_agents::attention::Attention> {
+        let item = oximux_agents::attention::external_of_agent_status(
+            "t".into(),
+            "t".into(),
+            status,
+            completed_turn,
+            0,
+        )?;
+        oximux_agents::attention::of_external(
+            "t",
+            &oximux_agents::session_prefs::SessionPrefs::default(),
+            &[item],
+            &oximux_agents::attention::NothingSeen,
+        )
+    }
+
     fn row(id: &str, status: AgentStatus, completed_turn: bool) -> AgentRow {
+        let attention = unseen_attention(&status, completed_turn);
         AgentRow {
             project_name: "P".into(),
             workspace: workspace(),
@@ -149,7 +212,14 @@ mod tests {
             primary: None,
             secondary: None,
             completed_turn,
+            attention,
         }
+    }
+
+    /// The same row with nobody's attention on it: a failure that has been
+    /// viewed, or a row built before the evaluator saw it.
+    fn row_without_attention(id: &str, status: AgentStatus, completed_turn: bool) -> AgentRow {
+        AgentRow { attention: None, ..row(id, status, completed_turn) }
     }
 
     #[test]
@@ -167,29 +237,92 @@ mod tests {
             SectionKind::Working
         );
         assert_eq!(
-            section_of(&row("d", AgentStatus::Done { code: Some(0) }, false)),
-            SectionKind::Done
-        );
-        assert_eq!(
             section_of(&row("e", AgentStatus::Idle, false)),
             SectionKind::Idle
         );
         assert_eq!(
-            section_of(&row("f", AgentStatus::Failed("x".into()), false)),
-            SectionKind::Ended
-        );
-        assert_eq!(
             section_of(&row("g", AgentStatus::Interrupted, false)),
-            SectionKind::Ended
+            SectionKind::Ended,
+            "a cancel asks nobody anything and stays where it was"
         );
     }
 
     #[test]
-    fn idle_with_reply_is_done() {
-        // A finished-turn row reads as Done even though its raw status is Idle.
+    fn a_failure_needs_you_until_it_has_been_dealt_with() {
+        // The move this phase is for: a failure used to be filed under ENDED,
+        // where nobody looked. It is an alert while it is unanswered now, and
+        // falls to ENDED only once the evaluator says it has been seen.
+        assert_eq!(
+            section_of(&row("f", AgentStatus::Failed("boom".into()), false)),
+            SectionKind::Attention
+        );
+        assert_eq!(
+            section_of(&row_without_attention("f", AgentStatus::Failed("boom".into()), false)),
+            SectionKind::Ended,
+            "viewed or dismissed, it leaves NEEDS YOU without its status changing"
+        );
+    }
+
+    #[test]
+    fn an_unread_finish_has_its_own_section_and_a_read_one_is_done() {
+        assert_eq!(
+            section_of(&row("d", AgentStatus::Done { code: Some(0) }, false)),
+            SectionKind::FinishedUnread,
+            "a clean finish nobody has read"
+        );
+        assert_eq!(
+            section_of(&row_without_attention("d", AgentStatus::Done { code: Some(0) }, false)),
+            SectionKind::Done,
+            "read, so it drops to the read-finished bucket"
+        );
+    }
+
+    #[test]
+    fn a_non_zero_exit_needs_you_rather_than_reading_as_finished() {
+        assert_eq!(
+            section_of(&row("x", AgentStatus::Done { code: Some(137) }, false)),
+            SectionKind::Attention
+        );
+    }
+
+    #[test]
+    fn a_blocked_row_the_evaluator_never_saw_is_never_shown_as_working() {
+        // Unreachable for a row the evaluator has seen, since a prompt is not
+        // dismissible. It is the fallback for a row built without one, and the
+        // reading that does not hide a request from the person it waits on.
+        assert_eq!(
+            section_of(&row_without_attention("a", AgentStatus::NeedsApproval("x".into()), false)),
+            SectionKind::Attention
+        );
+    }
+
+    #[test]
+    fn the_sections_are_in_the_order_the_phase_fixed() {
+        let labels: Vec<&str> = SectionKind::ORDER.iter().map(|k| k.label()).collect();
+        assert_eq!(
+            labels,
+            vec!["NEEDS YOU", "FINISHED · UNREAD", "WORKING", "DONE", "IDLE", "ENDED"]
+        );
+        // The sort key and the bucket index are one number, so a sorted list
+        // cannot come out shuffled inside its own headers.
+        for (want, kind) in SectionKind::ORDER.iter().enumerate() {
+            assert_eq!(kind.index(), want, "{} is out of place", kind.label());
+        }
+    }
+
+    #[test]
+    fn idle_with_reply_is_an_unread_finish_until_somebody_reads_it() {
+        // It used to land in DONE the moment the turn ended, beside
+        // finishes from last week. A reply nobody has read is what this
+        // phase added a section for, and DONE is the read-finished bucket.
         assert_eq!(
             section_of(&row("a", AgentStatus::Idle, true)),
-            SectionKind::Done
+            SectionKind::FinishedUnread
+        );
+        assert_eq!(
+            section_of(&row_without_attention("a", AgentStatus::Idle, true)),
+            SectionKind::Done,
+            "read, so it drops to DONE"
         );
     }
 
@@ -198,18 +331,19 @@ mod tests {
         let rows = vec![
             row("done1", AgentStatus::Done { code: Some(0) }, false),
             row("run1", AgentStatus::Running, false),
-            row("done2", AgentStatus::Idle, true), // finished turn → done
+            row("done2", AgentStatus::Idle, true), // replied, unread
             row("wait1", AgentStatus::WaitingForInput, false),
         ];
         let items = group_into_sections(rows);
-        // Order: Attention header, run? no — Attention(1), Working(1), Done(2).
+        // The clean exit and the idle-with-reply row are both unread
+        // finishes now, so they share a section instead of DONE.
         let mut headers = items.iter().filter_map(|i| match i {
             DashboardItem::Header { kind, count } => Some((*kind, *count)),
             DashboardItem::Row(_) => None,
         });
         assert_eq!(headers.next(), Some((SectionKind::Attention, 1)));
+        assert_eq!(headers.next(), Some((SectionKind::FinishedUnread, 2)));
         assert_eq!(headers.next(), Some((SectionKind::Working, 1)));
-        assert_eq!(headers.next(), Some((SectionKind::Done, 2)));
         assert_eq!(headers.next(), None);
     }
 
