@@ -1093,6 +1093,55 @@ fn a_replacements_first_prompt_is_not_the_departed_handles_prompt() {
 }
 
 #[test]
+fn a_replacements_prompt_reaches_the_stream_with_no_retirement_in_between() {
+    // The sibling test above pins the edge *identities*, which is where the
+    // defect lived. This pins the consequence a person actually feels: the
+    // change reaches the stream, so a surface has something to show. Nothing
+    // retires the departed handle's alert first, which is the order that made
+    // the new prompt vanish.
+    let f = fixture();
+    let target = chat_target("s1");
+    let mut rx = f.core.subscribe_attention();
+    let first = register(&f, "s1");
+    first.publish_health(needs_permission());
+    f.core.reevaluate(&target);
+    let departed = next_change_for(&mut rx, &target).edge.expect("the first handle's prompt");
+
+    f.registry.unregister("s1");
+    let second = register(&f, "s1");
+    second.publish_health(HealthInputs { last_activity_at: now() + 1, ..needs_permission() });
+    f.core.reevaluate(&target);
+
+    // A retirement may arrive first, published by the watcher noticing the
+    // removal; what must arrive is a prompt that is not the departed one. With
+    // the edges colliding, no such change is ever published and this times out.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the replacement's prompt never reached the stream, so nothing would show it"
+        );
+        match rx.try_recv() {
+            Ok(change) if change.target != target => continue,
+            Ok(change) => match change.edge {
+                Some(edge)
+                    if edge.kind == AttentionKind::NeedsPermission && edge != departed =>
+                {
+                    break;
+                }
+                _ => continue,
+            },
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(err) => panic!("{err}"),
+        }
+    }
+    drop(first);
+}
+
+#[test]
 fn a_look_dismisses_the_showing_alert_however_crowded_the_history() {
     // One more live alert on this target than the onset memory holds. Every
     // insertion used to evict the oldest entry whether or not it was still
