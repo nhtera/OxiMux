@@ -65,26 +65,6 @@ static BURST: Mutex<Option<BurstGate>> = Mutex::new(None);
 /// reset to 0 (badge cleared) when the window regains focus.
 static ATTENTION_BADGE: AtomicU64 = AtomicU64::new(0);
 
-/// Tab ids with an outstanding `coalesce_until_focus` banner. A second
-/// attention edge for a tab already in this set is suppressed until the window
-/// regains focus (`clear_attention` empties it) — the chat "one outstanding per
-/// tab" policy. Only chat requests populate it; ambient/bell/test never do.
-static OUTSTANDING: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
-
-/// For a `coalesce_until_focus` request: `true` (and records the tab) on the
-/// first edge for a tab since the last focus, `false` while one is already
-/// outstanding. Non-coalescing requests always return `true`.
-fn coalesce_allows(req: &NotificationRequest) -> bool {
-    if !req.coalesce_until_focus {
-        return true;
-    }
-    let mut slot = match OUTSTANDING.lock() {
-        Ok(s) => s,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    slot.get_or_insert_with(std::collections::HashSet::new).insert(req.tab_id.0)
-}
-
 /// Set the dock-tile badge to `count` (`0` clears it). A UIKit/AppKit call, so
 /// it must run on the main thread — `MainThreadMarker::new()` returns `None`
 /// off-main and the update is skipped (a badge is cosmetic; never risk a
@@ -92,7 +72,7 @@ fn coalesce_allows(req: &NotificationRequest) -> bool {
 /// path sets it.
 ///
 /// The badge is inherently app-global — macOS gives the process a single dock
-/// tile, so `ATTENTION_BADGE` / `OUTSTANDING` are process-wide, and any
+/// tile, so `ATTENTION_BADGE` is process-wide, and any
 /// window regaining focus clears them (`clear_attention`). With multiple
 /// windows open this can zero the badge while a *different* unfocused window
 /// still has un-viewed attention; the already-delivered banners persist in
@@ -185,6 +165,13 @@ fn parse_click_identifier(identifier: &str) -> Option<ClickTarget> {
     }
     if let Some(rest) = identifier.strip_prefix("bell:") {
         return parse_id(rest).map(ClickTarget::TerminalSession);
+    }
+    // The bridge's two, which carry no sequence: the handle is the rest.
+    if let Some(rest) = identifier.strip_prefix("session:") {
+        return rest.parse().ok().map(ClickTarget::NeedsYou);
+    }
+    if let Some(rest) = identifier.strip_prefix("root:") {
+        return rest.parse().ok().map(ClickTarget::NeedsYouRoot);
     }
     None
 }
@@ -311,6 +298,12 @@ impl MacNotifier {
     /// so bell banners — whose `tab_id` carries a raw terminal session id —
     /// never collide with agent tab ids.
     fn mint_identifier(req: &NotificationRequest) -> String {
+        // A caller-owned key IS the identifier, with no sequence: posting
+        // under it again replaces the delivered banner in one call, which is
+        // how one session's successive alerts stay one banner.
+        if let Some(key) = &req.replace_key {
+            return key.clone();
+        }
         let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
         match req.source {
             NotificationSource::Test => format!("test:{seq}"),
@@ -323,6 +316,9 @@ impl MacNotifier {
     /// and a terminal session that happen to share a numeric id never
     /// evict each other's banner.
     fn replace_key(req: &NotificationRequest) -> String {
+        if let Some(key) = &req.replace_key {
+            return key.clone();
+        }
         match req.source {
             NotificationSource::Test => "test".to_string(),
             NotificationSource::TerminalBell => format!("bell:{}", req.tab_id.0),
@@ -337,15 +333,24 @@ impl Notifier for MacNotifier {
             return;
         }
         if !self.settings.should_fire(&req) {
+            // A *replacement* the gates decline leaves whatever is on screen
+            // saying something that is no longer true: answer the permission
+            // of two children and the update is a quiet `Stalled` post, which
+            // a default-off toggle drops — and the old "needs approval, 2
+            // agents" banner stays. So a declined replacement retires instead.
+            // Nothing is lost: the gate's own reasons for declining (the
+            // person is looking at the pane, or does not want this kind) are
+            // all reasons the stale banner should go too.
+            if let Some(key) = &req.replace_key {
+                self.retire(key);
+            }
             return;
         }
-        // One outstanding banner per tab until refocus (chat policy) — checked
-        // before the burst gate so a suppressed repeat doesn't consume the
-        // workspace's burst slot.
-        if !coalesce_allows(&req) {
-            return;
-        }
-        if req.source != NotificationSource::Test && !burst_allows(&req.workspace_key) {
+        // The burst window is the bell's. Agent-state traffic comes from the
+        // bridge, which dedupes by edge identity — exact where a 5-second
+        // window is a guess, and a guess that swallowed the second of two
+        // genuine alerts in one worktree.
+        if req.source == NotificationSource::TerminalBell && !burst_allows(&req.workspace_key) {
             return;
         }
 
@@ -369,7 +374,10 @@ impl Notifier for MacNotifier {
         };
 
         let center = UNUserNotificationCenter::currentNotificationCenter();
-        if let Some(stale_id) = stale {
+        // Only a *different* previous identifier needs removing. Posting under
+        // the one already delivered replaces it in place, and removing it
+        // first would make the banner flicker out and back in.
+        if let Some(stale_id) = stale.filter(|previous| *previous != identifier) {
             let ids = NSArray::from_retained_slice(&[NSString::from_str(&stale_id)]);
             center.removeDeliveredNotificationsWithIdentifiers(&ids);
         }
@@ -377,7 +385,9 @@ impl Notifier for MacNotifier {
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str(&title));
         content.setBody(&NSString::from_str(&message));
-        if self.settings.sound_enabled() {
+        // `quiet` is for an update to a banner the person has already heard:
+        // a root's child count changing is the same alert saying more.
+        if self.settings.sound_enabled() && !req.quiet {
             content.setSound(Some(&UNNotificationSound::defaultSound()));
         }
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
@@ -406,12 +416,28 @@ impl Notifier for MacNotifier {
     fn clear_attention(&self) {
         ATTENTION_BADGE.store(0, Ordering::Relaxed);
         set_dock_badge(0);
-        // Reopen the per-tab attention gate so the next edge after refocus fires.
-        if let Ok(mut slot) = OUTSTANDING.lock()
-            && let Some(set) = slot.as_mut()
-        {
-            set.clear();
+    }
+
+    fn retire(&self, replace_key: &str) {
+        if UNAVAILABLE.load(Ordering::Relaxed) {
+            return;
         }
+        // Only what this process posted under that key, and only once: the
+        // identifier is dropped so a later retire of the same key is a no-op
+        // rather than a call into the notification centre.
+        let delivered = {
+            let mut last = match self.last_posted.lock() {
+                Ok(l) => l,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            last.remove(replace_key)
+        };
+        let Some(identifier) = delivered else {
+            return;
+        };
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let ids = NSArray::from_retained_slice(&[NSString::from_str(&identifier)]);
+        center.removeDeliveredNotificationsWithIdentifiers(&ids);
     }
 
     fn availability(&self) -> NotifierAvailability {
@@ -439,36 +465,26 @@ mod tests {
             body: String::new(),
             window_active: false,
             pane_visible: false,
-            coalesce_until_focus: true,
+            replace_key: None,
+            quiet: false,
         }
     }
 
     #[test]
-    fn coalesce_allows_one_per_tab_until_cleared() {
-        // Reset shared state (other tests may have touched it).
-        if let Ok(mut s) = OUTSTANDING.lock() {
-            *s = None;
-        }
-        // First edge for a tab fires; a second is suppressed.
-        assert!(coalesce_allows(&chat_req(1)));
-        assert!(!coalesce_allows(&chat_req(1)));
-        // A different tab is independent.
-        assert!(coalesce_allows(&chat_req(2)));
-        // A non-coalescing request always passes.
-        let mut bell = chat_req(1);
-        bell.coalesce_until_focus = false;
-        assert!(coalesce_allows(&bell));
-        // Clearing the set reopens the gate.
-        if let Ok(mut s) = OUTSTANDING.lock()
-            && let Some(set) = s.as_mut()
-        {
-            set.clear();
-        }
-        assert!(coalesce_allows(&chat_req(1)));
-        // Clean up so ordering with other tests doesn't leak.
-        if let Ok(mut s) = OUTSTANDING.lock() {
-            *s = None;
-        }
+    fn a_caller_owned_key_is_the_identifier_and_replaces_in_place() {
+        // The bridge's banners must replace rather than stack, which is what
+        // a stable identifier buys: the same string posted twice is one
+        // banner. The bell and test paths keep their sequence, so theirs
+        // never replace.
+        let mut owned = chat_req(1);
+        owned.replace_key = Some("session:7".to_string());
+        assert_eq!(MacNotifier::mint_identifier(&owned), "session:7");
+        assert_eq!(MacNotifier::mint_identifier(&owned), "session:7", "stable across posts");
+        assert_eq!(MacNotifier::replace_key(&owned), "session:7");
+
+        let minted = MacNotifier::mint_identifier(&chat_req(1));
+        assert!(minted.starts_with("agent:1:"), "{minted}");
+        assert_ne!(minted, MacNotifier::mint_identifier(&chat_req(1)), "a sequence each time");
     }
 
     #[test]
@@ -481,6 +497,13 @@ mod tests {
             parse_click_identifier("bell:9:3"),
             Some(ClickTarget::TerminalSession(9))
         );
+        assert_eq!(
+            parse_click_identifier("session:7"),
+            Some(ClickTarget::NeedsYou(7)),
+            "the bridge's identifiers carry no sequence: the rest is the handle"
+        );
+        assert_eq!(parse_click_identifier("root:12"), Some(ClickTarget::NeedsYouRoot(12)));
+        assert_eq!(parse_click_identifier("session:"), None);
         assert_eq!(parse_click_identifier("test:7"), None);
         assert_eq!(parse_click_identifier("agent:notanum:7"), None);
         assert_eq!(parse_click_identifier("agent:42"), None);

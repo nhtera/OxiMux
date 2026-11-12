@@ -185,7 +185,8 @@ fn send_test_notification(
                 body: "Notifications are working.".to_string(),
                 window_active: false,
                 pane_visible: false,
-                coalesce_until_focus: false,
+                replace_key: None,
+                quiet: false,
             });
             toast(cx, ToastKind::Success, "Test notification posted");
         }

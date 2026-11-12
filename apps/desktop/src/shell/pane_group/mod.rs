@@ -6,6 +6,7 @@
 //! focused one. Each group is independent: opening a file in one group
 //! does NOT affect any other group's tab list.
 
+pub mod attention;
 pub mod file_drag;
 pub mod layout_presets;
 pub mod render;

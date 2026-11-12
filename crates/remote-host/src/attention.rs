@@ -430,6 +430,16 @@ impl HostCore {
         self.current_with(target, None, None, &mut state).0
     }
 
+    /// What one target wants, with the edge that identifies it.
+    ///
+    /// The edge is what a notifier dedupes on, so a surface that announces
+    /// things needs both halves from one read: taken apart, a health update
+    /// in between could pair an alert with an identity from another moment.
+    pub fn attention_with_edge(&self, target: &str) -> (Option<Attention>, Option<AttentionEdge>) {
+        let mut state = self.attention().state.lock().unwrap();
+        self.current(target, &mut state)
+    }
+
     /// As [`HostCore::attention_of`], against a reading of the preferences the
     /// caller already has in hand.
     ///

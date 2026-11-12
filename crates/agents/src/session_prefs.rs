@@ -107,6 +107,13 @@ pub fn cockpit_key(db_id: &str) -> String {
 /// The one spelling of a cockpit row's prefix, like [`CHAT`].
 const COCKPIT: &str = "cockpit:";
 
+/// The row id a cockpit key names, or `None` when the key is not a cockpit
+/// row's. The mirror of [`cockpit_key`], for the surfaces that are handed a
+/// target and have to find the row it came from.
+pub fn cockpit_id(key: &str) -> Option<&str> {
+    key.strip_prefix(COCKPIT)
+}
+
 /// The prefs table, backed by the app's SQLite database. Cloning shares the
 /// connection.
 #[derive(Clone)]

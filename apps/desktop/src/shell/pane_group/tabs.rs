@@ -1221,9 +1221,6 @@ impl PaneGroup {
                     cx,
                 );
             }
-            crate::shell::agent_chat::AgentChatEvent::AttentionNeeded { kind, body } => {
-                self.notify_chat_attention(view, *kind, body.clone());
-            }
             crate::shell::agent_chat::AgentChatEvent::TaskSummaryReady { cwd, summary } => {
                 // Route up to `WorkspaceRoot`, which owns the `WorkspaceRepo`
                 // and can map `cwd` to a row — the same seam the worktree
@@ -1278,46 +1275,6 @@ impl PaneGroup {
                 self.open_script_terminal_tab(cwd.clone(), title, &script, window, cx);
             }
         }
-    }
-
-    /// Dispatch a chat-attention banner (turn finished / errored / needs
-    /// approval / question / auth) for the chat tab backing `view`, through the
-    /// shared notification pipeline. Mirrors `notify_terminal`: the view
-    /// classified the edge; this end contributes the context the view can't see —
-    /// the tab label, the workspace burst key, whether the tab is the visible one,
-    /// and the live window-active flag. The notifier applies the master/source
-    /// gates, visible-pane suppression, the focus gate, and the dock badge.
-    fn notify_chat_attention(
-        &self,
-        view: &Entity<crate::shell::agent_chat::AgentChatView>,
-        kind: crate::notifier::NotificationKind,
-        body: String,
-    ) {
-        let Some(idx) = self.tabs.iter().position(|t| {
-            matches!(&t.content, PaneContent::AgentChat(v) if v.entity_id() == view.entity_id())
-        }) else {
-            return;
-        };
-        let tab = &self.tabs[idx];
-        let label = tab.custom_title.clone().unwrap_or_else(|| tab.label.clone());
-        // Visible = this chat is the group's active tab. Combined with the
-        // window-active flag, the notifier stays silent while the user is looking
-        // at this very chat.
-        let pane_visible = idx == self.active;
-        self.notifier.notify(crate::notifier::NotificationRequest {
-            source: crate::notifier::NotificationSource::AgentState,
-            kind,
-            // A stable per-view id (survives tab reorder/rename) in TabId space.
-            tab_id: TabId(view.entity_id().as_u64()),
-            workspace_key: self.cwd.to_string_lossy().into_owned(),
-            label: label.to_string(),
-            body,
-            window_active: self.window_active.load(Ordering::Relaxed),
-            pane_visible,
-            // Chat policy: one outstanding attention banner per tab until the
-            // window regains focus (cleared by `clear_attention`).
-            coalesce_until_focus: true,
-        });
     }
 
     /// Toggle the agent-chat tab at insertion-order `ix` between chat and its
@@ -2464,11 +2421,8 @@ impl PaneGroup {
         };
         let status_task = spawn_status_task(
             status_rx.clone(),
-            self.notifier.clone(),
-            self.window_active.clone(),
             TabId::from(session_id),
             label.clone(),
-            worktree_path.to_string_lossy().into_owned(),
             view.downgrade(),
             cx,
         );
@@ -2938,6 +2892,11 @@ impl PaneGroup {
         window.defer(cx, move |window, app| {
             group.update(app, |g, cx| g.focus_active(window, cx));
         });
+        // Outside the `changed` check on purpose: re-selecting the tab that is
+        // already active is how a person comes back to a chat that finished
+        // while they were elsewhere, and how a banner click lands on an
+        // already-active tab. Both are reading it.
+        self.note_read(idx, cx);
         if changed {
             cx.notify();
         }

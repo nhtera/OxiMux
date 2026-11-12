@@ -21,6 +21,7 @@
 //! kept on `weak_root` is dispatch upward via callbacks (e.g.
 //! `open_row_menu`), which fire on user events after render completes.
 
+pub mod badge;
 pub mod dashboard_status_menu;
 pub mod locate_anchor;
 pub mod nav_section;
@@ -61,7 +62,7 @@ use crate::left_rail_layout;
 
 use crate::actions::{OpenAddProjectDialog, OpenProjectPicker, OpenWorkspaceCreate};
 use crate::shell::agent_presentation::AmbientAgent;
-use crate::shell::agents_dashboard::model::{status_needs_you, workspace_sort_tier};
+use crate::shell::agents_dashboard::model::workspace_sort_tier;
 use crate::shell::agents_dashboard::filter::StatusFilter;
 use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::locate_anchor::{LocateAnchor, new_anchor, reveal_offset};
@@ -306,6 +307,9 @@ pub struct LeftRail {
     /// zeroed when the page is opened. Lives here (not on the dashboard
     /// view) because the rail entity survives project switches.
     agents_unread: u32,
+    /// The targets that needed someone at the last pass, so the badge counts
+    /// a session once rather than on every refresh.
+    agents_needing_you: std::collections::HashSet<String>,
     /// Per-project held Smart-sort order during the settle window (item:
     /// Smart rows don't reshuffle under the cursor right after a status
     /// change). Keyed by project id. Not persisted.
@@ -386,6 +390,7 @@ impl LeftRail {
             locate_glow_seq: 0,
             locate_anchor: new_anchor(),
             agents_unread: 0,
+            agents_needing_you: std::collections::HashSet::new(),
             smart_settle: HashMap::new(),
             settle_timer_armed: false,
             settle_override_cache: HashMap::new(),
@@ -1026,21 +1031,23 @@ impl LeftRail {
         focused_agent: Option<RailAgentTarget>,
         cx: &mut Context<Self>,
     ) {
-        // Unread accounting BEFORE the snapshot swap: any workspace whose
-        // status TRANSITIONED into an attention/terminal state while the
-        // Agents page is closed bumps the nav badge. Comparing against the
-        // previous snapshot (not absolute states) means a long-finished
-        // session doesn't re-count on every refresh.
+        // Unread accounting: every target that has newly started needing
+        // someone since the last pass bumps the nav badge, while the Agents
+        // page is closed. The host's answer, so a chat session counts like a
+        // tracked agent — the status map this used to read holds neither chat
+        // sessions nor more than one agent per workspace.
+        let needing = badge::targets_needing_you(cx);
+        let was_unread = self.agents_unread;
         if self.active_nav != Some(NavItem::Agents) {
-            for (ws_id, status) in &latest_status {
-                let was = self.latest_status.get(ws_id).cloned().flatten();
-                if status.as_ref() != was.as_ref()
-                    && status.as_ref().is_some_and(status_needs_you)
-                {
-                    self.agents_unread = self.agents_unread.saturating_add(1);
-                }
-            }
+            let fresh = badge::newly_needing(&self.agents_needing_you, &needing);
+            self.agents_unread = self.agents_unread.saturating_add(fresh);
         }
+        self.agents_needing_you = needing;
+        // The badge is a render input like any other, and not one of the
+        // compared fields below: a chat going stalled changes the count
+        // without changing any status the rail displays, and the new number
+        // would sit unpainted until something else happened to repaint.
+        let badge_changed = self.agents_unread != was_unread;
         // Dirty-check: `WorkspaceRoot::render` pushes this snapshot down every
         // frame (and re-renders on every pane-output tick while an agent
         // streams), so notifying unconditionally rebuilds the whole rail
@@ -1053,7 +1060,8 @@ impl LeftRail {
         // surfaces via `latest_status`/`agent_sideband`/`ambient_status`, which
         // ARE compared (ambient rows also carry their prompt in `persisted_title`,
         // compared by `agents_display_equal`).
-        let changed = self.projects != projects
+        let changed = badge_changed
+            || self.projects != projects
             || self.active_project_id != active_project_id
             || self.active_workspace_id != active_workspace_id
             || self.workspaces_by_project != workspaces_by_project
