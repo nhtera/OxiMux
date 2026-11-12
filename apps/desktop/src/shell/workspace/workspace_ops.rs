@@ -1642,6 +1642,9 @@ impl WorkspaceRoot {
                 FocusedRailAgent::AmbientTerminal { pty_id } => {
                     Some(RailAgentTarget::AmbientTerminal { pty_id })
                 }
+                FocusedRailAgent::Chat { session_id } => {
+                    Some(RailAgentTarget::Chat { session_id })
+                }
             });
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(

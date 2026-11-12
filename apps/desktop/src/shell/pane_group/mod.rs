@@ -537,6 +537,11 @@ fn terminal_view_cwd(
 pub enum FocusedRailAgent {
     Session(AgentSessionId),
     AmbientTerminal { pty_id: String },
+    /// A chat tab, by the registry id its row carries. Owed since chat rows
+    /// joined the rail: without it a focused chat lit no row, and anything
+    /// aimed at "the session you are looking at" — `MarkUnread` — found
+    /// nothing when that session was a chat.
+    Chat { session_id: String },
 }
 
 /// One hand-launched (ambient) agent detected in a plain terminal, keyed by the

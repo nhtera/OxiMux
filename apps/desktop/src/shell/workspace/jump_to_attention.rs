@@ -151,6 +151,25 @@ mod tests {
     }
 
     #[test]
+    fn a_session_read_through_the_chord_leaves_the_cycle() {
+        // The reason the walk is honest: opening a session records the look,
+        // so a failure read this way leaves `needs_you` — and the next press
+        // moves on instead of coming back to the same row. The host's own
+        // tests cover the clearing; this pins the shape the walk relies on,
+        // which is that the list it reads is the list after the look.
+        let before = needing(&["chat:a", "chat:b"]);
+        assert_eq!(next_target(&before, None).as_deref(), Some("chat:a"));
+
+        // `chat:a` was read and is gone from the host's answer.
+        let after = needing(&["chat:b"]);
+        assert_eq!(
+            next_target(&after, Some("chat:a")).as_deref(),
+            Some("chat:b"),
+            "the one just read is not revisited"
+        );
+    }
+
+    #[test]
     fn nothing_asking_goes_nowhere() {
         assert_eq!(next_target(&[], None), None);
         assert_eq!(next_target(&[], Some("chat:a")), None);

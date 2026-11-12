@@ -111,6 +111,20 @@ impl WorkspaceRoot {
         };
         if !focused {
             self.show_agents_page(cx);
+            return;
+        }
+        // Opening it is reading it — the same rule as a row click, and on the
+        // same condition: only when something was actually put in front of the
+        // person. Without this, ⌘⇧U took you to a failed terminal to read it
+        // and left it in `needs_you`, so the count never moved and the next
+        // press came back to the same row. The chat path records this again on
+        // tab activation; `mark_viewed` only ever moves the stamp forward, so
+        // the second call is a no-op rather than a conflict.
+        if let Some(host) = cx
+            .try_global::<crate::remote_control::RemoteControl>()
+            .and_then(|rc| rc.host_core())
+        {
+            host.mark_viewed(target);
         }
     }
 
@@ -186,12 +200,16 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
-    /// Open the Agents page, for a banner whose session has no tab to focus.
+    /// Show the Agents page on what needs someone.
+    ///
+    /// The destination for a banner whose session has no tab to focus, and for
+    /// `ShowNeedsYou` itself. Opens the rail if it is collapsed: selecting a
+    /// nav item in a hidden rail changes nothing a person can see, which is
+    /// the one thing this must not do.
     pub(crate) fn show_agents_page(&mut self, cx: &mut Context<Self>) {
+        self.left_rail_open = true;
         let rail = self.left_rail.clone();
-        rail.update(cx, |rail, cx| {
-            rail.select_nav(crate::shell::left_rail::nav_section::NavItem::Agents, cx);
-        });
+        rail.update(cx, |rail, cx| rail.show_needs_you(cx));
         cx.notify();
     }
 

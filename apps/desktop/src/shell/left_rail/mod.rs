@@ -1205,6 +1205,25 @@ impl LeftRail {
         cx.notify();
     }
 
+    /// Show the Agents page on the sessions that need someone.
+    ///
+    /// Not `select_nav`, which *toggles*: this is a "show" and must not close
+    /// the page when it happens to be open already. It also clears the text
+    /// filter and narrows the status filter to NEEDS YOU, because a stale
+    /// filter — a text query from an hour ago, or `Working` — would leave the
+    /// page open on none of the rows the person came to see.
+    pub(crate) fn show_needs_you(&mut self, cx: &mut Context<Self>) {
+        self.active_nav = Some(NavItem::Agents);
+        // The text filter's own state is cleared too, not just the string the
+        // list reads: leaving the box showing a stale query over an unfiltered
+        // list is worse than either.
+        self.dashboard_filter.clear();
+        self.dashboard_filter_input = None;
+        self._dashboard_filter_sub = None;
+        self.dashboard_status_filter = StatusFilter::Attention;
+        cx.notify();
+    }
+
     /// Version of `select_nav` that carries `&mut Window`, required when
     /// opening a pane-hosted page (RT-1). Dispatches up through `weak_root` to
     /// open the singleton tab in the active project's pane group; everything

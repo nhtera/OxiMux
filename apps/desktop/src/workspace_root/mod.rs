@@ -299,7 +299,7 @@ pub struct WorkspaceRoot {
     /// Cached registry of built-in adapters; resolves `AgentAdapter` at spawn.
     pub(crate) adapter_registry: Arc<AdapterRegistry>,
     /// Left rail visibility flag (Cmd+B).
-    left_rail_open: bool,
+    pub(crate) left_rail_open: bool,
     /// Bubbles ProjectPanes change notifications up so the workspace rerenders.
     pub(crate) _project_panes_observer: Option<Subscription>,
     /// Pauses + kicks StatusPoller on window blur/focus.

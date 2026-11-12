@@ -485,6 +485,17 @@ impl PaneGroup {
             PaneGroupTabKind::Agent { session_id, .. } => {
                 Some(FocusedRailAgent::Session(*session_id))
             }
+            // The REMOTE id, which is what the row and the registry use; the
+            // agent's own id is the same string once it has minted one, but a
+            // chat that has not finished a turn has none.
+            PaneGroupTabKind::AgentChat { .. } => {
+                let PaneContent::AgentChat(view) = &tab.content else {
+                    return None;
+                };
+                Some(FocusedRailAgent::Chat {
+                    session_id: view.read(cx).remote_session_id().to_string(),
+                })
+            }
             PaneGroupTabKind::Terminal => {
                 let PaneContent::Terminal(tree) = &tab.content else {
                     return None;
