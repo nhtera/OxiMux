@@ -202,12 +202,18 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// [`SEND_V2_MIN_VERSION`]; a v36 peer is never pushed a health frame: see
 /// [`HEALTH_PUSH_MIN_VERSION`].
 ///
+/// v38: **a restart retires its prompts** (`ThreadEvent::PromptsRetired`): a
+/// permission or question the departed process raised is marked cut off in
+/// every fold, so an already-open subscriber stops offering buttons nothing
+/// can answer. A v37 peer's decoder does not know the event and is sent the
+/// prose instead: see [`PROMPTS_RETIRED_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 37;
+pub const PROTOCOL_VERSION: u32 = 38;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -219,6 +225,16 @@ pub const PROTOCOL_VERSION: u32 = 37;
 /// everywhere, and it still says in prose what the edit was about. Peers at or
 /// above this version get the structured event.
 pub const PERMISSION_EDITED_MIN_VERSION: u32 = 20;
+
+/// The oldest peer whose event decoder knows `ThreadEvent::PromptsRetired`.
+///
+/// Gated and downgraded exactly like [`PERMISSION_EDITED_MIN_VERSION`], and
+/// for the same reason: the shared fold refuses an unknown variant, and a
+/// refused frame kills the subscription. An older peer gets the same sentence
+/// as prose — it loses the automatic cancellation, so its card stays until it
+/// reopens the session, but it is told the request was cut off and nothing was
+/// approved, which is the part that matters.
+pub const PROMPTS_RETIRED_MIN_VERSION: u32 = 38;
 
 /// The oldest peer that can decode [`Response::StateChanged`]. Like
 /// [`SCHEDULE_PUSH_MIN_VERSION`], this exists because a push reaches a peer

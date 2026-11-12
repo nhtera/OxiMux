@@ -21,39 +21,32 @@ impl AgentChatView {
     }
 
     /// The event channel closed — the agent process exited or its stdout was
-    /// closed. Fail closed: if a permission was still pending, reject it (the
-    /// tool never ran, since the process is gone). Best-effort deny in case
-    /// stdin is briefly still writable, then mark the tool `Rejected` so the UI
-    /// never shows a dangling approval prompt.
+    /// closed. Fail closed: every prompt it was waiting on is retired (the
+    /// tools never ran, since the process is gone), with a best-effort deny
+    /// first in case stdin is briefly still writable.
     pub(super) fn on_disconnect(&mut self, cx: &mut Context<Self>) {
         // Record how the process ended while the session is still bound, so the
         // host sees the exit before the session leaves its list.
         self.record_exit(cx);
+        if let Some((_, req)) = self.thread.pending_permission()
+            && let Some(conn) = &self.connection
+        {
+            let request_id = req.request_id.clone();
+            let _ = conn.resolve_permission(
+                &request_id,
+                PermissionDecision::Deny { message: "agent disconnected".into() },
+            );
+        }
+        // Every one of them, not just the first: a process can exit with
+        // several outstanding, and one left `WaitingForConfirmation` both
+        // strands an unanswerable card and makes `defer_respawn_mid_turn` hold
+        // a respawn this dead chat can never run. Before the unbind, so a
+        // subscriber still on the stream is told.
+        self.retire_pending_prompts();
         // The live process is gone: drop the remote binding so the phone's session
         // list reflects only live sessions (a resume respawns + re-binds).
         self.unbind_remote();
         self.revoke_spawn_credential(cx);
-        let pending = self
-            .thread
-            .pending_permission()
-            .map(|(tool_id, req)| (tool_id.to_string(), req.request_id.clone()));
-        if let Some((tool_id, request_id)) = pending {
-            if let Some(conn) = &self.connection {
-                let _ = conn.resolve_permission(
-                    &request_id,
-                    PermissionDecision::Deny { message: "agent disconnected".into() },
-                );
-            }
-            self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
-        }
-        // Fail-close a pending AskUserQuestion too: the process is gone, so it can
-        // never be answered — reject it and drop its card rather than stranding an
-        // unanswerable prompt.
-        if let Some(tool_id) = self.thread.pending_question().map(|(id, _)| id.to_string()) {
-            self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
-            self.question_cards.remove(&tool_id);
-            self.question_card_subs.remove(&tool_id);
-        }
         self.thread.turn_active = false;
         if self.interrupted {
             // Intentional Stop: the child exited exactly as asked. Stay

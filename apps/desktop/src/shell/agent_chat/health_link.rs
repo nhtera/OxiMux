@@ -442,9 +442,9 @@ mod tests {
                 assert_eq!(inputs.prompt_request.as_deref(), Some("rid"), "waiting on a person");
                 assert_eq!(health_of(view).0, HealthStatus::NeedsPermission);
 
-                // What a respawn does to the fold. Nothing can route an answer
-                // to the process that asked any more.
-                assert_eq!(view.thread.interrupt_pending_prompts(), 1);
+                // The shipping path itself, not a stand-in for it: nothing can
+                // route an answer to the process that asked any more.
+                view.retire_pending_prompts();
 
                 let inputs = view.health_inputs();
                 assert_eq!(inputs.prompt_request, None, "no request to offer");

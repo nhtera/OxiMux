@@ -595,6 +595,42 @@ pub enum ThreadEvent {
     /// background task and is done reacting to it (a `result` marked
     /// `origin.kind == "task-notification"`). Host bookkeeping.
     ContinuationEnded,
+    /// The prompts these tool calls were waiting on are dead, because the
+    /// process that raised them is gone (a respawn reaped it, or it exited).
+    ///
+    /// A permission or a question is answered by routing a decision back to
+    /// the process that asked, by request id, so once that process has gone
+    /// nothing can carry an answer there — the request is dead whatever the
+    /// card still says. The fold marks each named call `Canceled` and adds a
+    /// notice saying so; a call that is not waiting is left alone.
+    ///
+    /// Like [`Self::Rewound`], this exists *because* a remote subscriber can
+    /// never observe it otherwise: the desktop retires these prompts in its
+    /// own thread directly, and without the event an already-open phone keeps
+    /// rendering answer buttons for a process that no longer exists.
+    ///
+    /// Carries the ids rather than meaning "retire whatever you are waiting
+    /// on", so a subscriber whose fold holds a prompt this host already
+    /// settled does not lose it to someone else's restart.
+    PromptsRetired { tool_use_ids: Vec<String> },
+}
+
+/// What a transcript says when `n` prompts were cut off by a restart.
+///
+/// One definition, because two places say it: the fold, which writes it into
+/// the transcript when it applies [`ThreadEvent::PromptsRetired`], and the
+/// host's wire downgrade, which sends exactly this prose to a peer whose
+/// decoder predates the event. They must not drift.
+pub fn retired_prompts_notice(n: usize) -> String {
+    match n {
+        1 => "The agent restarted. The request it was waiting on was cut off; \
+              nothing was approved."
+            .to_string(),
+        n => format!(
+            "The agent restarted. The {n} requests it was waiting on were cut off; \
+             nothing was approved."
+        ),
+    }
 }
 
 impl ThreadEvent {

@@ -164,4 +164,50 @@ mod tests {
             .expect("window update");
         super::super::respawn_gate::tests::RESPAWN_IN_PLACE.with(|f| f.set(false));
     }
+
+    /// The drain retires with the process, not with the successful start of its
+    /// replacement. A respawn that fails to spawn never reaches `start_drain`,
+    /// so the generation used to stay put and the dead child's already-decoded
+    /// events kept being folded — re-raising the very prompt the respawn had
+    /// just retired, with no process left to answer it.
+    #[gpui::test]
+    async fn the_dead_processs_queued_events_cannot_raise_a_prompt_again(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                let generation = view.drain_gen;
+                // Only the teardown half of a respawn runs here: what a spawn
+                // failure leaves behind, with no new connection and no new drain.
+                view.end_the_old_process();
+
+                let queued = vec![ThreadEvent::PermissionRequested {
+                    request_id: "rid-late".into(),
+                    tool_use_id: Some("toolu_late".into()),
+                    tool_name: "Bash".into(),
+                    input: serde_json::json!({"command": "rm -rf /"}),
+                    description: String::new(),
+                    suggestions: vec![],
+                    kind: oximux_agents::thread::PermissionKind::Tool,
+                }];
+                assert!(!view.drain_batch(generation, queued, cx), "the dead process's drain stops");
+                assert!(
+                    view.thread.pending_prompt_ids().is_empty(),
+                    "and nothing it still held can ask the person again"
+                );
+                view.drain_closed(generation, cx);
+                assert!(!view.disconnected, "a retired drain's exit is not this chat's");
+            })
+            .expect("window update");
+    }
 }

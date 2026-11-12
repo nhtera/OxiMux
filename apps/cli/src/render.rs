@@ -219,6 +219,12 @@ pub fn render_event(event: &ThreadEvent) -> Option<String> {
         ThreadEvent::Diagnostic(text) => Some(format!("! {}", one_line(text))),
         ThreadEvent::Error(text) => Some(format!("✗ {}", one_line(text))),
         ThreadEvent::Rewound { ordinal } => Some(format!("— rewound to turn {ordinal} —")),
+        // The same sentence the desktop writes into its transcript: a reader
+        // watching this session has to learn the prompt it saw is dead.
+        ThreadEvent::PromptsRetired { tool_use_ids } => Some(format!(
+            "· {}",
+            one_line(&oximux_agent_core::thread::retired_prompts_notice(tool_use_ids.len()))
+        )),
         // Only a refusal is worth a line. `allowed` and `allowed_warning`
         // readings arrive every time a percentage ticks over, and printing them
         // would bury the transcript in meter noise.
