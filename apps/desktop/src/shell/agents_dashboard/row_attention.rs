@@ -36,21 +36,27 @@ pub fn attention_target(db_id: &str, target: &RailAgentTarget) -> String {
     }
 }
 
-/// What the row says about when its current state began: its end time, else
-/// its launch time, else nothing.
+/// When this row's state ended, if it has ended.
 ///
-/// Seeds the moment the host stamps a cockpit row's alert with the first time
-/// it sees it. It matters across a restart and only then: `status_onset` is in
-/// memory, so after one every alert is new, and stamping an old finish or an
-/// old failure with the clock dates it after the stored look — the finish
-/// comes back unread, the dismissed failure comes back to NEEDS YOU. A DB
-/// row's `ended_at` survives the restart; an ambient row has neither
-/// timestamp and gets the clock, which is all a row re-detected after a
-/// restart could offer anyway.
+/// Seeds the moment the host stamps a cockpit row's alert with, the first time
+/// it sees that alert. It exists for the restart and for nothing else:
+/// `status_onset` is in memory, so after one every alert is new, and stamping
+/// an old finish or an old failure with the clock dates it after the stored
+/// look — the finish comes back unread, the dismissed failure comes back to
+/// NEEDS YOU. `ended_at` survives the restart and is the moment that alert
+/// really arose.
+///
+/// **A launch time is not a seed.** It is the one other timestamp a row
+/// carries, and seeding with it was wrong in a way that showed every day: a
+/// row launched an hour ago finishes a turn *now*, and dated an hour ago that
+/// finish sits before any look the person has taken since — so it reads as
+/// already read and never reaches FINISHED · UNREAD. A live row gets the
+/// clock, which is right: its alert did arise in this run, and the host
+/// remembers it for the rest of it.
 ///
 /// Both readers call this, so the seed cannot differ between them.
-pub fn row_began(rail: &RailAgentRow) -> Option<i64> {
-    rail.ended_at.as_deref().or(rail.started_at.as_deref()).and_then(rfc3339_ms)
+pub fn row_ended(rail: &RailAgentRow) -> Option<i64> {
+    rail.ended_at.as_deref().and_then(rfc3339_ms)
 }
 
 /// What `rail` wants from a person, or `None` when it wants nothing.
@@ -76,7 +82,7 @@ pub fn attention_of_row(
         &target,
         &rail.effective_status(),
         is_completed_turn(rail),
-        row_began(rail),
+        row_ended(rail),
         prefs,
     )
 }
@@ -146,23 +152,25 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_moment_is_when_it_ended_else_when_it_started() {
-        // What the host stamps a first-seen alert with, and the only thing
-        // about it that survives a restart.
+    fn only_a_row_that_has_ended_seeds_its_alerts_moment() {
+        // The seed exists for the restart: `ended_at` is both a moment that
+        // survives one and the moment the alert arose.
         let ended = rfc3339_ms("2026-06-23T10:00:00Z").expect("a parseable fixture");
-        let started = rfc3339_ms("2026-06-23T09:00:00Z").expect("a parseable fixture");
         assert_eq!(
-            row_began(&rail_row(Some("2026-06-23T09:00:00Z"), Some("2026-06-23T10:00:00Z"))),
+            row_ended(&rail_row(Some("2026-06-23T09:00:00Z"), Some("2026-06-23T10:00:00Z"))),
             Some(ended),
             "a row that has ended arose when it ended"
         );
+        // The one that bit: a live row's launch is not when its next alert
+        // arose. Dated at launch, a turn that finishes now sits before every
+        // look taken since and is read before anyone sees it.
         assert_eq!(
-            row_began(&rail_row(Some("2026-06-23T09:00:00Z"), None)),
-            Some(started),
-            "a live row has only its launch"
+            row_ended(&rail_row(Some("2026-06-23T09:00:00Z"), None)),
+            None,
+            "a live row has only its launch, which is not a seed"
         );
         assert_eq!(
-            row_began(&rail_row(None, None)),
+            row_ended(&rail_row(None, None)),
             None,
             "an ambient row has neither, and the host falls back to the clock"
         );

@@ -101,7 +101,7 @@ pub fn publish_cockpit_attention(
                 &key,
                 &row.effective_status(),
                 is_completed_turn(row),
-                crate::shell::agents_dashboard::row_attention::row_began(row),
+                crate::shell::agents_dashboard::row_attention::row_ended(row),
             ) {
                 Some(item) => host.publish_external(item),
                 // Nothing to raise, so whatever the key holds ends here.

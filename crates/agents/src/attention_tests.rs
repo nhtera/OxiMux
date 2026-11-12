@@ -683,3 +683,23 @@ fn a_parked_cockpit_agent_that_has_replied_is_unread_work() {
         "an agent that never ran a turn is not unread work"
     );
 }
+
+#[test]
+fn a_finish_in_the_same_millisecond_as_a_look_is_not_swallowed_by_it() {
+    // The tie the stored timestamp cannot break. A look and a turn finishing
+    // inside one millisecond are indistinguishable by clock, and read as
+    // "already read" is a reply nobody is ever shown — so the watcher's order
+    // decides, and a stored look only reads a finish that is strictly older.
+    let items = [external("run", AttentionKind::FinishedUnread, 0)];
+    let tie = SessionPrefs { last_viewed_at: Some(NOW), ..Default::default() };
+    assert_eq!(
+        of_external("plan:run-1", &tie, &items, &new_edges()).map(|a| a.kind),
+        Some(AttentionKind::FinishedUnread),
+        "the look cannot be shown to have come after it"
+    );
+    assert_eq!(
+        of_external("plan:run-1", &tie, &items, &seen_all()),
+        None,
+        "a watcher that saw the look land after it reads it"
+    );
+}

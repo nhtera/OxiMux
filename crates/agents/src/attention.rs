@@ -407,21 +407,34 @@ pub fn kind_of_agent_status(
 /// raise one, and looking at the target is what reads it. Nothing else
 /// informational can be cleared by a look — a rate limit is still a rate limit
 /// once you have seen it.
+///
+/// A finish is read when **either** source says so: the watcher, which orders
+/// the look and the alert by observation, or a stored look that is strictly
+/// later than the finish.
+///
+/// It used to be the stored look alone, compared with `>=`. That cannot order
+/// a look and a finish falling in the same millisecond, and the tie went to
+/// "read" — a reply nobody is ever shown. The watcher settles those exactly.
+/// The stored look stays as the second source because a caller that watches
+/// nothing has only that: a phone asking what needs a person must not be told
+/// about a turn its owner read on the desktop. Strictly later, so the
+/// millisecond the two share is the watcher's to answer.
 fn seen_external(
     target: &str,
     item: &ExternalAttention,
     prefs: &SessionPrefs,
     seen: &dyn SeenEdges,
 ) -> bool {
-    if item.kind == AttentionKind::FinishedUnread {
-        return !prefs.unread_override
-            && prefs.last_viewed_at.is_some_and(|viewed| viewed >= item.since);
-    }
     let edge = AttentionEdge {
         target: target.to_string(),
         kind: item.kind,
         id: external_edge_id(&item.key, item.since),
     };
+    if item.kind == AttentionKind::FinishedUnread {
+        return !prefs.unread_override
+            && (seen.is_seen(&edge, item.since)
+                || prefs.last_viewed_at.is_some_and(|viewed| viewed > item.since));
+    }
     is_seen(item.kind, &edge, item.since, prefs, seen)
 }
 

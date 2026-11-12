@@ -1461,3 +1461,41 @@ fn a_restart_does_not_bring_back_a_finish_that_was_read() {
         "this is what taking the moment from the row prevents"
     );
 }
+
+#[test]
+fn a_turn_that_finishes_after_a_look_is_unread_however_long_the_row_has_been_live() {
+    // A finish is read when the stored look is at or after the moment the
+    // finish arose — a timestamp comparison, not the observation order the
+    // dismissible kinds use. So the moment a finish is stamped with decides
+    // whether anyone is ever shown it.
+    //
+    // The person opens the row and types a prompt: a look, recorded now. The
+    // turn finishes after that, and the row has been live since it launched,
+    // so it has no end time to seed with. Seeded with its *launch* instead,
+    // this finish was dated before the look and read before anyone saw it —
+    // every turn of a row the person had ever opened.
+    let f = fixture();
+    let target = "cockpit:7";
+    f.core.mark_viewed(target);
+
+    let finish = f
+        .core
+        .cockpit_item(target, target, &AgentStatus::Idle, true, None)
+        .expect("a finished turn nobody has read");
+    f.core.publish_external(finish);
+    assert_eq!(
+        f.core
+            .attention_of_agent_status(target, &AgentStatus::Idle, true, None)
+            .map(|a| a.kind),
+        Some(AttentionKind::FinishedUnread),
+        "the turn finished after the look, so its reply is unread"
+    );
+
+    // And reading it again does end it, which is the other half of the rule.
+    f.core.mark_viewed(target);
+    assert_eq!(
+        f.core.attention_of_agent_status(target, &AgentStatus::Idle, true, None),
+        None,
+        "a look after the finish reads it"
+    );
+}
