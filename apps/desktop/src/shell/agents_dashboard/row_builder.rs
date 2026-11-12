@@ -112,7 +112,7 @@ mod tests {
             "t".into(),
             &rail.effective_status(),
             is_completed_turn(rail),
-            0,
+            |_, _| 0,
         )?;
         oximux_agents::attention::of_external(
             "t",

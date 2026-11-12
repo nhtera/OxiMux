@@ -16,6 +16,10 @@ pub enum StatusFilter {
     #[default]
     All,
     Attention,
+    /// Finished a turn nobody has read. Its own choice, because `Done` is now
+    /// only the finishes that *have* been read: without it the newest work on
+    /// the page would be reachable from `All` alone.
+    FinishedUnread,
     Working,
     Done,
     Idle,
@@ -25,9 +29,10 @@ pub enum StatusFilter {
 impl StatusFilter {
     /// Every bucket, in menu order (`All` first) — the dropdown's row list and
     /// the source of `next`'s cycle.
-    pub const ALL: [StatusFilter; 6] = [
+    pub const ALL: [StatusFilter; 7] = [
         StatusFilter::All,
         StatusFilter::Attention,
+        StatusFilter::FinishedUnread,
         StatusFilter::Working,
         StatusFilter::Done,
         StatusFilter::Idle,
@@ -45,6 +50,7 @@ impl StatusFilter {
         match self {
             StatusFilter::All => "All",
             StatusFilter::Attention => "Needs attention",
+            StatusFilter::FinishedUnread => "Finished · unread",
             StatusFilter::Working => "Working",
             StatusFilter::Done => "Done",
             StatusFilter::Idle => "Idle",
@@ -57,6 +63,7 @@ impl StatusFilter {
         match self {
             StatusFilter::All => None,
             StatusFilter::Attention => Some(SectionKind::Attention),
+            StatusFilter::FinishedUnread => Some(SectionKind::FinishedUnread),
             StatusFilter::Working => Some(SectionKind::Working),
             StatusFilter::Done => Some(SectionKind::Done),
             StatusFilter::Idle => Some(SectionKind::Idle),
@@ -180,6 +187,20 @@ mod tests {
     fn status_cycle_wraps() {
         assert_eq!(StatusFilter::All.next(), StatusFilter::Attention);
         assert_eq!(StatusFilter::Ended.next(), StatusFilter::All);
+    }
+
+    #[test]
+    fn every_section_can_be_filtered_to() {
+        // A section with no choice is a section the person can only reach by
+        // going back to `All` — and the one the new work lands in was exactly
+        // that until this choice existed.
+        for kind in SectionKind::ORDER {
+            assert!(
+                StatusFilter::ALL.iter().any(|f| f.section() == Some(kind)),
+                "{} has no filter choice",
+                kind.label()
+            );
+        }
     }
 
     #[test]

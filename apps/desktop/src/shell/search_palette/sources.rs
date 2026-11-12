@@ -182,13 +182,15 @@ fn tab_needs_you(
             crate::shell::agents_dashboard::model::status_needs_you(&status_rx.borrow().status)
         }
         // A chat session: the host holds its health, so it is the authority.
-        // The session id is on the view, not on the tab kind.
-        (PaneGroupTabKind::AgentChat { .. }, PaneContent::AgentChat(view)) => view
-            .read(cx)
-            .session_id()
-            .zip(host)
-            .and_then(|(id, host)| {
-                host.attention_of(&oximux_agents::session_prefs::chat_key(id))
+        // The id is on the view, not on the tab kind — and it is the REMOTE
+        // id, the key the session is registered and published under. The
+        // agent's own id is the same string once it has minted one, but a chat
+        // that has not finished a turn has none, and that is exactly a chat
+        // that is working right now and may be asking for something.
+        (PaneGroupTabKind::AgentChat { .. }, PaneContent::AgentChat(view)) => host
+            .and_then(|host| {
+                let key = oximux_agents::session_prefs::chat_key(view.read(cx).remote_session_id());
+                host.attention_of(&key)
             })
             .is_some_and(|attention| attention.kind.is_needs_you()),
         _ => false,

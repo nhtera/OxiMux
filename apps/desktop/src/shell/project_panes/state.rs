@@ -126,6 +126,13 @@ impl ProjectPanes {
         self.groups.values().any(|g| g.read(cx).has_agent_chat_for_session(session_id, cx))
     }
 
+    /// Whether any group holds the registry chat session `remote_session_id` —
+    /// the id a rail row carries, and the one
+    /// [`ProjectPanes::focus_agent_chat_session`] activates by.
+    pub fn has_agent_chat_for_remote_id(&self, remote_session_id: &str, cx: &App) -> bool {
+        self.groups.values().any(|g| g.read(cx).has_agent_chat_for_remote_id(remote_session_id, cx))
+    }
+
     /// Every group in this project, in no particular order.
     pub fn group_entities(&self) -> Vec<Entity<PaneGroup>> {
         self.groups.values().cloned().collect()

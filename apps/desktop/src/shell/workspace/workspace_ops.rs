@@ -1621,6 +1621,7 @@ impl WorkspaceRoot {
             crate::shell::workspace::cockpit_attention::publish_cockpit_attention(
                 &host,
                 &workspace_agents,
+                &mut self.cockpit_attention_raised,
             );
         }
         // The agent whose tab is the active pane keeps its disclosure row lit.

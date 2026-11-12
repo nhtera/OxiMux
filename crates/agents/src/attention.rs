@@ -329,24 +329,30 @@ pub fn of_external(
 /// the priority order and the "has it been dealt with?" lifecycle in exactly
 /// one place, rather than giving the cockpit a second evaluator to drift from.
 ///
-/// **Two callers, by design.** The desktop's row builder calls it so a row is
-/// in the right section the instant it is built, and the cockpit producer
-/// calls it to publish the same item into the host's registry so the notifier,
-/// the badge and a phone see what the row sees. A row that waited for the
-/// producer to publish would show a blocked agent as "Working" until the first
-/// publication landed.
+/// **Two readers, one item.** The desktop's row builder asks for it so a row
+/// is in the right section the instant it is built, and the cockpit producer
+/// publishes it into the host's registry so the notifier, the badge and a
+/// phone see what the row sees. A row that waited for the producer to publish
+/// would show a blocked agent as "Working" until the first publication landed.
 ///
-/// `since` is the session's own activity timestamp, never the clock: with
-/// `key` it is the item's edge identity, so two callers passing different
-/// moments would raise two edges for one alert.
+/// `since` is asked for the *alert*, not for the row, and that is the whole
+/// point of taking it as a function. With `key` it is the item's edge
+/// identity, so it must change when the alert changes and at no other time: a
+/// value taken from the row — a launch time fixed at insert, or the clock —
+/// either never changes while the row lives (so a second request is the first
+/// request and raises nothing) or changes on every refresh (so one alert is a
+/// new alert each time, read as unread again and announced again). In OxiMux
+/// the host answers it, because both readers above ask the same owner and so
+/// cannot disagree.
 pub fn external_of_agent_status(
     key: String,
     target: String,
     status: &AgentStatus,
     completed_turn: bool,
-    since: i64,
+    since: impl FnOnce(AttentionKind, &str) -> i64,
 ) -> Option<ExternalAttention> {
     let (kind, reason) = kind_of_agent_status(status, completed_turn)?;
+    let since = since(kind, &reason);
     Some(ExternalAttention { key, target, kind, reason, since })
 }
 

@@ -611,6 +611,14 @@ pub struct WorkspaceRoot {
     pub(crate) rail_agents_cache: crate::shell::left_rail::WorkspaceAgentList,
     /// Marks `rail_agents_cache` stale (session/live-agent change).
     pub(crate) rail_agents_dirty: bool,
+    /// The cockpit attention keys this window has raised with the host.
+    ///
+    /// A terminal agent's alert is published by the pass that walks these rows
+    /// (`cockpit_attention`), and only that pass can end it. This is what it
+    /// remembers so a row that has gone — a blocked terminal the person closed
+    /// — has its alert retired rather than standing for the rest of the run.
+    /// Per window, because another window's terminals are not in this pass.
+    pub(crate) cockpit_attention_raised: std::collections::HashSet<String>,
     /// `true` while the window is active. The periodic diff refresh only runs
     /// when focused so an inactive window does not churn `git` in the
     /// background (mirrors the SCM status poller's pause-on-blur behavior).
@@ -1570,6 +1578,7 @@ impl WorkspaceRoot {
             rail_dirty: false,
             rail_refresh_inflight: false,
             rail_agents_cache: HashMap::new(),
+            cockpit_attention_raised: std::collections::HashSet::new(),
             rail_agents_dirty: true,
             diff_refresh_focused: true,
             diff_refresh_in_flight: false,

@@ -70,6 +70,26 @@ pub(crate) fn render_section_header(
         )
 }
 
+/// The card's second line: the live tool step or reply, else what the row is
+/// asking for, else its state label.
+///
+/// The evaluator's answer comes before the status label because the two can
+/// disagree and the status is the weaker word. A chat row's display status is
+/// `Idle` whenever it is not working, so a failed chat — and a chat with no
+/// tab open to read a status from at all — said "Idle" underneath a NEEDS YOU
+/// header. The live line still wins: it is the newest thing the agent did,
+/// and for a blocked tracked agent it is the request itself.
+///
+/// The indicator glyph still reads the status alone. It is shared with the
+/// rail and takes an `AgentStatus`; PR D replaces both with the attention's
+/// own verb and tone rather than mapping backwards from one to the other.
+fn state_line(row: &AgentRow, status: &AgentStatus) -> String {
+    row.secondary
+        .clone()
+        .or_else(|| row.attention.as_ref().and_then(|a| a.reason.clone()))
+        .unwrap_or_else(|| agent_state_label(status).to_string())
+}
+
 /// Size of the adapter brand glyph beside the state indicator.
 const ICON_GLYPH_SIZE: f32 = 14.0;
 
@@ -142,11 +162,7 @@ pub fn render_agent_row(
                 .child(row.age_label.clone()),
         );
 
-    // ── line 2: the live tool step / reply, else the state label ──
-    let secondary = row
-        .secondary
-        .clone()
-        .unwrap_or_else(|| agent_state_label(&status).to_string());
+    let secondary = state_line(row, &status);
     let line2 = (!secondary.is_empty()).then(|| {
         div()
             .w_full()
@@ -227,5 +243,80 @@ pub fn render_agent_row(
         )
     } else {
         root.hover(|s| s.bg(theme.hover_overlay))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::agents_dashboard::model::AgentRow;
+    use crate::shell::left_rail::RailAgentTarget;
+    use oximux_agents::attention::{Attention, AttentionKind, AttentionSource};
+
+    fn row(secondary: Option<&str>, attention: Option<Attention>) -> AgentRow {
+        AgentRow {
+            project_name: "oximux".into(),
+            workspace: oximux_core::Workspace {
+                id: "ws".into(),
+                project_id: "p".into(),
+                branch_minted: false,
+                name: "ws".into(),
+                slug: "ws".into(),
+                branch: "main".into(),
+                worktree_path: "/tmp/ws".into(),
+                status: "active".into(),
+                created_at: "2026-06-01T00:00:00Z".into(),
+                archived_at: None,
+                linked_issue: None,
+                tint: None,
+                sort_order: 0.0,
+                pinned: false,
+                comment: String::new(),
+                phase: String::new(),
+            },
+            db_id: "s1".into(),
+            target: RailAgentTarget::Chat { session_id: "s1".into() },
+            age_label: "now".into(),
+            status: Some(AgentStatus::Idle),
+            is_live: true,
+            icon_path: "icons/sparkles.svg",
+            last_active_at: None,
+            label: "Chat".into(),
+            primary: Some("Fix the parser".into()),
+            secondary: secondary.map(str::to_string),
+            completed_turn: false,
+            attention,
+        }
+    }
+
+    fn attention(kind: AttentionKind, reason: &str) -> Attention {
+        Attention {
+            kind,
+            since: 0,
+            reason: Some(reason.to_string()),
+            source: AttentionSource::External("chat:s1".into()),
+        }
+    }
+
+    #[test]
+    fn a_blocked_row_says_what_it_wants_rather_than_its_status() {
+        // A chat's display status is `Idle` whenever it is not working, so the
+        // status label read "Idle" on a card sitting under NEEDS YOU.
+        let blocked = row(None, Some(attention(AttentionKind::Failed, "spawn failed: no binary")));
+        assert_eq!(state_line(&blocked, &AgentStatus::Idle), "spawn failed: no binary");
+    }
+
+    #[test]
+    fn the_live_line_still_wins_because_it_is_the_newest_thing_that_happened() {
+        let working = row(
+            Some("Edit: parser.rs"),
+            Some(attention(AttentionKind::NeedsPermission, "rm -rf build/")),
+        );
+        assert_eq!(state_line(&working, &AgentStatus::Running), "Edit: parser.rs");
+    }
+
+    #[test]
+    fn a_row_with_nothing_to_say_falls_back_to_its_state_label() {
+        assert_eq!(state_line(&row(None, None), &AgentStatus::Running), "Working");
     }
 }

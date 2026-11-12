@@ -167,7 +167,7 @@ impl WorkspaceRoot {
         let owner = self.project_panes_by_project.iter().find_map(|(pid, panes)| {
             panes
                 .read(cx)
-                .has_agent_chat_for_session(session_id, cx)
+                .has_agent_chat_for_remote_id(session_id, cx)
                 .then(|| pid.clone())
         });
         let Some(project_id) = owner else {

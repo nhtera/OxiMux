@@ -8,41 +8,57 @@
 
 use std::sync::Arc;
 
+use gpui::App;
 use oximux_agents::attention::Attention;
 use oximux_agents::session_prefs::{chat_key, cockpit_key};
 use oximux_remote_host::HostCore;
+use oximux_remote_host::attention::PrefsSnapshot;
 
 use crate::shell::left_rail::rail_agent_row::{RailAgentRow, RailAgentTarget};
 use crate::shell::left_rail::workspace_agent_rows::is_completed_turn;
-use crate::shell::search_palette::recency::{now_ms, rfc3339_ms};
+
+/// The key a row's attention and preferences live under.
+///
+/// One spelling, read by the resolver below, by the producer that publishes a
+/// cockpit row's alert, and by the click that records a look — a row whose
+/// look was stored under a different key than its alert would never clear.
+pub fn attention_target(db_id: &str, target: &RailAgentTarget) -> String {
+    match target {
+        // A chat session is in the registry under its own id.
+        RailAgentTarget::Chat { session_id } => chat_key(session_id),
+        // Everything else is a cockpit row, keyed by the row's own id: an
+        // `agent_sessions.id` for a tracked agent, `ambient:<pty>` for an
+        // agent found inside a plain terminal.
+        RailAgentTarget::AgentSession { .. } | RailAgentTarget::AmbientTerminal { .. } => {
+            cockpit_key(db_id)
+        }
+    }
+}
 
 /// What `rail` wants from a person, or `None` when it wants nothing.
 ///
 /// A cockpit or ambient terminal agent has no `SessionHealth` at all — OxiMux
 /// parses its PTY into an `AgentStatus` — so its status goes through the host's
-/// status entry, which maps it to the same vocabulary every other surface uses
-/// and ranks it against anything else published against that row.
-pub fn attention_of_row(host: &HostCore, rail: &RailAgentRow) -> Option<Attention> {
+/// status entry, which maps it to the same vocabulary every other surface uses,
+/// stamps it with the moment that alert arose, and ranks it against anything
+/// else published against that row.
+pub fn attention_of_row(
+    host: &HostCore,
+    rail: &RailAgentRow,
+    prefs: &PrefsSnapshot,
+) -> Option<Attention> {
+    let target = attention_target(&rail.db_id, &rail.target);
     // A chat session is in the registry and publishes its own health, so the
     // host already knows everything about it — including the prefs and the
     // looks that decide whether a failure has been dealt with.
-    if let RailAgentTarget::Chat { session_id } = &rail.target {
-        return host.attention_of(&chat_key(session_id));
+    if matches!(rail.target, RailAgentTarget::Chat { .. }) {
+        return host.attention_of_in(&target, prefs);
     }
-    // The row's own last activity, never the clock: with the key it is the
-    // alert's edge identity, and the producer publishes the same moment, so a
-    // clock here would make one alert look like two.
-    let since = rail
-        .ended_at
-        .as_deref()
-        .or(rail.started_at.as_deref())
-        .and_then(rfc3339_ms)
-        .unwrap_or_else(now_ms);
-    host.attention_of_agent_status(
-        &cockpit_key(&rail.db_id),
+    host.attention_of_agent_status_in(
+        &target,
         &rail.effective_status(),
         is_completed_turn(rail),
-        since,
+        prefs,
     )
 }
 
@@ -51,6 +67,58 @@ pub fn attention_of_row(host: &HostCore, rail: &RailAgentRow) -> Option<Attentio
 /// Resolves nothing when there is no host — a window rendered before the host
 /// has started. Rows then carry no attention and are sectioned by their own
 /// lifecycle, which is the reading that shows no alerts rather than wrong ones.
+///
+/// The preferences are read **once per pass**, here, rather than per row: the
+/// dashboard asks about every row it builds, and a point query each put one
+/// SQLite read per row on the render path.
 pub fn resolver(host: Option<Arc<HostCore>>) -> impl Fn(&RailAgentRow) -> Option<Attention> {
-    move |rail| host.as_deref().and_then(|host| attention_of_row(host, rail))
+    let prefs = host.as_deref().map(|host| host.prefs_snapshot());
+    move |rail| match (host.as_deref(), prefs.as_ref()) {
+        (Some(host), Some(prefs)) => attention_of_row(host, rail, prefs),
+        _ => None,
+    }
+}
+
+/// Record that the person is now looking at the row they just clicked.
+///
+/// This is the one thing that ends an alert nobody has to answer: a failure
+/// stands in NEEDS YOU until it is viewed or dismissed, and a finished turn
+/// stays unread until it is read. Opening the row *is* reading it — the click
+/// focuses its tab — so a row the person has opened stops asking for them.
+///
+/// Silent when there is no host: there is then no attention to clear either.
+pub fn mark_row_viewed(db_id: &str, target: &RailAgentTarget, cx: &App) {
+    let Some(host) = cx
+        .try_global::<crate::remote_control::RemoteControl>()
+        .and_then(|rc| rc.host_core())
+    else {
+        return;
+    };
+    host.mark_viewed(&attention_target(db_id, target));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_kind_of_row_is_keyed_the_way_its_alert_is_published() {
+        assert_eq!(
+            attention_target("7", &RailAgentTarget::AgentSession { db_id: "7".into() }),
+            "cockpit:7"
+        );
+        assert_eq!(
+            attention_target(
+                "ambient:pty-3",
+                &RailAgentTarget::AmbientTerminal { pty_id: "pty-3".into() }
+            ),
+            "cockpit:ambient:pty-3",
+            "an ambient row's key is its row id, which already carries the pty"
+        );
+        assert_eq!(
+            attention_target("s1", &RailAgentTarget::Chat { session_id: "s1".into() }),
+            "chat:s1",
+            "a chat's key is the registry id its health is published under"
+        );
+    }
 }

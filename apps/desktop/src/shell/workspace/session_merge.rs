@@ -413,7 +413,14 @@ fn sort_and_cap_rows(rows: &mut Vec<RailAgentRow>) {
             .cmp(&a.is_live)
             .then_with(|| b.started_at.cmp(&a.started_at))
     });
-    rows.truncate(HISTORY_CAP);
+    // The cap bounds HISTORY; the live set bounds itself. A live row dropped
+    // to make room is a row the person cannot reach at all — and the rows with
+    // no `started_at` sort last among the live ones, which is every chat
+    // session and every ambient terminal, so a worktree busy with tracked
+    // agents hid exactly the rows that had nowhere else to appear. A chat
+    // waiting on an approval was one of them.
+    let live = rows.iter().filter(|r| r.is_live).count();
+    rows.truncate(HISTORY_CAP.max(live));
 }
 
 #[cfg(test)]
@@ -590,6 +597,70 @@ mod tests {
         append_chat_agent_rows(&by_project(vec![ws(WS)]), &[chat("s1", "/tmp")], &mut lists);
         let rows = lists.get(WS).expect("grouped");
         assert_eq!(rows.len(), 2, "one tracked row and one chat row, side by side");
+    }
+
+    #[test]
+    fn a_busy_workspace_still_shows_its_chats() {
+        // `sort_and_cap_rows` used to truncate the whole list, live rows
+        // included, and a chat row has no `started_at` so it sorts after every
+        // live tracked agent. A worktree running HISTORY_CAP agents therefore
+        // dropped every chat — including one waiting on an approval, which has
+        // no other row anywhere to appear on.
+        let mut lists: WorkspaceAgentList = HashMap::new();
+        let live: Vec<RailAgentRow> = (0..HISTORY_CAP)
+            .map(|i| RailAgentRow {
+                db_id: format!("tracked-{i}"),
+                target: RailAgentTarget::AgentSession { db_id: format!("tracked-{i}") },
+                workspace_key: WS.into(),
+                adapter_id: "claude-code".into(),
+                label: "Claude Code".into(),
+                is_live: true,
+                status_rx: None,
+                db_status: AgentStatus::Running,
+                started_at: Some(NOW.into()),
+                ended_at: None,
+                age_label: "now".into(),
+                persisted_title: None,
+                persisted_message: None,
+                ambient_detail: None,
+            })
+            .collect();
+        lists.insert(WS.to_string(), live);
+        let waiting = ChatRow { awaiting_permission: true, ..chat("s1", "/tmp") };
+        append_chat_agent_rows(&by_project(vec![ws(WS)]), &[waiting], &mut lists);
+
+        let rows = lists.get(WS).expect("grouped");
+        assert_eq!(rows.len(), HISTORY_CAP + 1, "the cap bounds history, not what is live");
+        assert!(
+            rows.iter().any(|r| matches!(&r.target, RailAgentTarget::Chat { session_id } if session_id == "s1")),
+            "the chat waiting on a person is still in the list"
+        );
+    }
+
+    #[test]
+    fn history_is_still_capped_once_the_live_rows_are_in() {
+        // The other half of the rule: a long tail of finished sessions is cut
+        // down, so one worktree's history cannot fill the rail.
+        let mut rows: Vec<RailAgentRow> = (0..HISTORY_CAP + 7)
+            .map(|i| RailAgentRow {
+                db_id: format!("done-{i}"),
+                target: RailAgentTarget::AgentSession { db_id: format!("done-{i}") },
+                workspace_key: WS.into(),
+                adapter_id: "claude-code".into(),
+                label: "Claude Code".into(),
+                is_live: false,
+                status_rx: None,
+                db_status: AgentStatus::Done { code: Some(0) },
+                started_at: Some(NOW.into()),
+                ended_at: Some(NOW.into()),
+                age_label: "now".into(),
+                persisted_title: None,
+                persisted_message: None,
+                ambient_detail: None,
+            })
+            .collect();
+        sort_and_cap_rows(&mut rows);
+        assert_eq!(rows.len(), HISTORY_CAP);
     }
 
     #[test]

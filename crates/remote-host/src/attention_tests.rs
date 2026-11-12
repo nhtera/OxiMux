@@ -1251,17 +1251,17 @@ fn a_cockpit_rows_status_is_ranked_against_what_was_published_on_it() {
     let waiting = AgentStatus::NeedsApproval("rm -rf build/".into());
 
     let alone =
-        f.core.attention_of_agent_status(target, &waiting, false, now()).expect("raised");
+        f.core.attention_of_agent_status(target, &waiting, false).expect("raised");
     assert_eq!(alone.kind, AttentionKind::NeedsPermission, "the status alone answers");
     assert_eq!(alone.reason.as_deref(), Some("rm -rf build/"), "the row says what it would run");
 
     f.core.publish_external(external("ci:7", target, AttentionKind::Failed));
     let ranked =
-        f.core.attention_of_agent_status(target, &waiting, false, now()).expect("raised");
+        f.core.attention_of_agent_status(target, &waiting, false).expect("raised");
     assert_eq!(ranked.kind, AttentionKind::NeedsPermission, "a permission outranks a failure");
 
     let quiet = f.core
-        .attention_of_agent_status(target, &AgentStatus::Idle, false, now())
+        .attention_of_agent_status(target, &AgentStatus::Idle, false)
         .expect("the published alert outlives a quiet status");
     assert_eq!(quiet.kind, AttentionKind::Failed, "CI's alert is still on the row");
 }
@@ -1283,11 +1283,123 @@ fn the_producers_item_and_the_rows_status_are_one_alert_not_two() {
     });
 
     let fresh = f.core
-        .attention_of_agent_status(target, &AgentStatus::WaitingForInput, false, now())
+        .attention_of_agent_status(target, &AgentStatus::WaitingForInput, false)
         .expect("raised");
     assert_eq!(
         fresh.kind,
         AttentionKind::NeedsInput,
         "the status replaces the item under its own key instead of being outranked by it"
+    );
+}
+
+#[test]
+fn a_quiet_status_ends_the_item_published_under_the_rows_own_key() {
+    // The producer publishes a permission and the agent then answers it: the
+    // row's own status is the newer word, so the item it published has to go
+    // with it. Kept, `needs_you` went on naming a request the terminal had
+    // already finished with, and nothing but a publication could end it.
+    let f = fixture();
+    let target = "cockpit:7";
+    f.core.publish_external(ExternalAttention {
+        key: target.into(),
+        target: target.into(),
+        kind: AttentionKind::NeedsPermission,
+        reason: "rm -rf build/".into(),
+        since: now() - 10_000,
+    });
+
+    assert_eq!(
+        f.core.attention_of_agent_status(target, &AgentStatus::Running, false),
+        None,
+        "the request ended with the status that raised it"
+    );
+
+    // Another producer's alert on the same row is not the status's to end.
+    f.core.publish_external(external("ci:7", target, AttentionKind::Failed));
+    assert_eq!(
+        f.core
+            .attention_of_agent_status(target, &AgentStatus::Running, false)
+            .map(|a| a.kind),
+        Some(AttentionKind::Failed),
+        "only the row's own key is the status's to speak for"
+    );
+}
+
+#[test]
+fn one_unchanged_alert_keeps_the_moment_it_first_appeared() {
+    // The edge identity of an external alert is its key *and* its `since`, so
+    // a fresh moment is a fresh alert: a viewed alert read as unread again and
+    // the notifier announced it a second time. An ambient row has no timestamp
+    // of its own at all, so every refresh used the clock and churned.
+    let f = fixture();
+    let target = "cockpit:ambient:pty-3";
+    let blocked = AgentStatus::NeedsApproval("rm -rf build/".into());
+
+    let first = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
+    let again = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
+    assert_eq!(first, again, "the same alert, asked about twice");
+
+    // The row resolver asks the same owner, so it cannot disagree with what
+    // the producer published.
+    f.core.publish_external(first.clone());
+    let resolved = f.core.attention_of_agent_status(target, &blocked, false).expect("raised");
+    assert_eq!(resolved.since, first.since, "the row shows the alert that was published");
+
+    // A different request is a different alert and gets its own moment.
+    let other = AgentStatus::NeedsApproval("git push --force".into());
+    let next = f.core.cockpit_item(target, target, &other, false).expect("raised");
+    assert_ne!(next.since, first.since, "a second request is not the first one");
+}
+
+#[test]
+fn a_failure_after_a_look_is_raised_again_even_with_the_very_same_words() {
+    // A failure, a look that deals with it, then the agent fails again the
+    // same way. The second failure arose after the look and still needs a
+    // person — which holds only because ending an alert leaves its moment
+    // behind as a floor, so the one that follows cannot be stamped with it and
+    // read as the edge the look already covered.
+    let f = fixture();
+    let target = "cockpit:7";
+    let failed = AgentStatus::Failed("boom".into());
+    f.core
+        .publish_external(f.core.cockpit_item(target, target, &failed, false).expect("raised"));
+    f.core.mark_viewed(target);
+    assert_eq!(
+        f.core.attention_of_agent_status(target, &failed, false),
+        None,
+        "the look deals with the failure that was already there"
+    );
+
+    // Restarted, ran, failed again — the same words, the same key.
+    f.core.clear_external(target);
+    let again = f.core.cockpit_item(target, target, &failed, false).expect("raised");
+    f.core.publish_external(again);
+    assert_eq!(
+        f.core.attention_of_agent_status(target, &failed, false).map(|a| a.kind),
+        Some(AttentionKind::Failed),
+        "a second failure is not the first one, however alike they read"
+    );
+}
+
+#[test]
+fn a_cleared_rows_key_can_be_reused_without_inheriting_its_moment() {
+    // `agent_sessions` ids are not reused, but an ambient row's key is its
+    // PTY's, and a pty id can come back. A key that handed the new row the old
+    // row's moment would hand it an alert stamped before a look taken minutes
+    // ago, and the new row would never ask for anyone.
+    let f = fixture();
+    let target = "cockpit:ambient:pty-3";
+    let blocked = AgentStatus::NeedsApproval("rm -rf build/".into());
+    let first = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
+    f.core.publish_external(first.clone());
+
+    // The producer's sweep: the terminal is gone, so its alert is cleared.
+    f.core.clear_external(target);
+    assert_eq!(f.core.attention_of(target), None, "the row is gone and so is its alert");
+
+    let reused = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
+    assert!(
+        reused.since > first.since,
+        "a new row's alert is a new alert, not the cleared row's"
     );
 }

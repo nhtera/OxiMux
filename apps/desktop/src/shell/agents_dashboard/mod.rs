@@ -224,6 +224,9 @@ fn build_dashboard_row(
     let row_id: gpui::SharedString = format!("agent-row-{}", row.db_id).into();
     let is_focused = focused_agent == Some(&row.target);
     let target = row.target.clone();
+    // Carried for the look the click records: the row's key needs its id as
+    // well as its kind.
+    let row_db_id = row.db_id.clone();
     // The row's resolved workspace row id: a `workspaces.id`, or
     // `primary:<project_id>` for the repo-root row. Either way it names a rail
     // row, which is what the reveal needs.
@@ -236,6 +239,12 @@ fn build_dashboard_row(
     card.on_mouse_down(
         MouseButton::Left,
         move |_ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+            // Opening the row is reading it: this is what drops a dealt-with
+            // failure out of NEEDS YOU and an unread finish into DONE.
+            // Recorded before the focus, so a row that has no tab to focus —
+            // a history row, a session another agent spawned — still counts as
+            // read, which is the only way the person can clear it.
+            crate::shell::agents_dashboard::row_attention::mark_row_viewed(&row_db_id, &target, cx);
             let _ = weak_root.update(cx, |root, cx| {
                 match &target {
                     RailAgentTarget::AgentSession { db_id } => {

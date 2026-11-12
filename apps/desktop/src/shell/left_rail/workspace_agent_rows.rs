@@ -589,9 +589,16 @@ fn render_agent_sub_row(
         });
     if row.is_focusable() {
         let target = row.target.clone();
+        let row_db_id = row.db_id.clone();
         base.cursor_pointer()
             .hover(|s| s.bg(theme.hover_overlay))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                // Opening the row is reading it — the same look the dashboard
+                // card records, since either one puts the row in front of the
+                // person.
+                crate::shell::agents_dashboard::row_attention::mark_row_viewed(
+                    &row_db_id, &target, cx,
+                );
                 let _ = weak_root.update(cx, |root, cx| match &target {
                     RailAgentTarget::AgentSession { db_id } => {
                         root.focus_agent_by_db_id(db_id, window, cx);

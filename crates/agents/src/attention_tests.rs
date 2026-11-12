@@ -568,7 +568,7 @@ fn a_chats_target_and_its_prefs_key_are_one_string() {
 // ─── a cockpit agent's status, through the one evaluator ─────────────────────
 
 fn cockpit(status: AgentStatus) -> Option<ExternalAttention> {
-    external_of_agent_status("cockpit:7".into(), "cockpit:7".into(), &status, false, NOW - MIN)
+    external_of_agent_status("cockpit:7".into(), "cockpit:7".into(), &status, false, |_, _| NOW - MIN)
 }
 
 #[test]
@@ -644,7 +644,7 @@ fn a_cockpit_failure_is_cleared_by_a_look_and_a_later_one_is_raised_again() {
         "cockpit:7".into(),
         &AgentStatus::Failed("boom again".into()),
         false,
-        NOW + MIN,
+        |_, _| NOW + MIN,
     )
     .expect("raised");
     assert!(
@@ -664,7 +664,7 @@ fn a_parked_cockpit_agent_that_has_replied_is_unread_work() {
         "cockpit:7".into(),
         &AgentStatus::Idle,
         true,
-        NOW - MIN,
+        |_, _| NOW - MIN,
     );
     assert_eq!(
         replied.map(|item| item.kind),
@@ -677,7 +677,7 @@ fn a_parked_cockpit_agent_that_has_replied_is_unread_work() {
             "cockpit:7".into(),
             &AgentStatus::Idle,
             false,
-            NOW - MIN,
+            |_, _| NOW - MIN,
         )
         .is_none(),
         "an agent that never ran a turn is not unread work"

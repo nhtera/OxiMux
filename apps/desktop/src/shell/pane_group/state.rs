@@ -402,6 +402,19 @@ impl PaneGroup {
         })
     }
 
+    /// Whether any chat tab here is the registry session `remote_session_id`.
+    ///
+    /// Keyed on the REMOTE id, the one
+    /// [`PaneGroup::chat_tab_index_by_remote_id`] activates by and the one a
+    /// rail row carries, because the row comes from the registry. The two ids
+    /// are the same string once the agent has minted its own — the remote id
+    /// is derived from it — but a chat that has not finished a turn yet has
+    /// only the counter, and asking by the agent id would answer "no owner"
+    /// for a chat that is sitting right there, asking for a permission.
+    pub fn has_agent_chat_for_remote_id(&self, remote_session_id: &str, cx: &gpui::App) -> bool {
+        self.chat_tab_index_by_remote_id(remote_session_id, cx).is_some()
+    }
+
     /// The active tab's agent session id, if the active tab is an agent.
     /// Used by "send to active agent" actions to route directly to the
     /// agent in the focused tab — the most common layout has terminal +

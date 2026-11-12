@@ -313,7 +313,7 @@ mod tests {
             "t".into(),
             status?,
             false,
-            0,
+            |_, _| 0,
         )?;
         oximux_agents::attention::of_external(
             "t",
