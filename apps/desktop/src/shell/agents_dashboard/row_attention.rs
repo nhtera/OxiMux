@@ -9,10 +9,10 @@
 use std::sync::Arc;
 
 use oximux_agents::attention::Attention;
-use oximux_agents::session_prefs::cockpit_key;
+use oximux_agents::session_prefs::{chat_key, cockpit_key};
 use oximux_remote_host::HostCore;
 
-use crate::shell::left_rail::rail_agent_row::RailAgentRow;
+use crate::shell::left_rail::rail_agent_row::{RailAgentRow, RailAgentTarget};
 use crate::shell::left_rail::workspace_agent_rows::is_completed_turn;
 use crate::shell::search_palette::recency::{now_ms, rfc3339_ms};
 
@@ -23,6 +23,12 @@ use crate::shell::search_palette::recency::{now_ms, rfc3339_ms};
 /// status entry, which maps it to the same vocabulary every other surface uses
 /// and ranks it against anything else published against that row.
 pub fn attention_of_row(host: &HostCore, rail: &RailAgentRow) -> Option<Attention> {
+    // A chat session is in the registry and publishes its own health, so the
+    // host already knows everything about it — including the prefs and the
+    // looks that decide whether a failure has been dealt with.
+    if let RailAgentTarget::Chat { session_id } = &rail.target {
+        return host.attention_of(&chat_key(session_id));
+    }
     // The row's own last activity, never the clock: with the key it is the
     // alert's edge identity, and the producer publishes the same moment, so a
     // clock here would make one alert look like two.

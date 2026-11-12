@@ -152,6 +152,50 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
+    /// Focus the chat session a rail row names.
+    ///
+    /// A session spawned by another agent has no tab of its own, so this is a
+    /// no-op for it — the same no-op a history row has always been. The row
+    /// still renders, which is the point of sourcing rows from the registry
+    /// rather than from the open tabs.
+    pub(crate) fn focus_chat_by_session_id(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = self.project_panes_by_project.iter().find_map(|(pid, panes)| {
+            panes
+                .read(cx)
+                .has_agent_chat_for_session(session_id, cx)
+                .then(|| pid.clone())
+        });
+        let Some(project_id) = owner else {
+            return;
+        };
+        if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
+            match self
+                .app_state
+                .recent_projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            {
+                Some(project) => self.set_active_project(project, window, cx),
+                None => return,
+            }
+        }
+        if let Some(panes) = self.active_project_panes() {
+            panes.update(cx, |p, cx| {
+                p.focus_agent_chat_session(session_id, window, cx);
+            });
+            // Same deferral as the agent path: a synchronous focus inside the
+            // rail-row mouse-down is clobbered by GPUI's post-click dispatch.
+            crate::shell::workspace::workspace_ops::defer_focus_active(window, cx, panes);
+        }
+        cx.notify();
+    }
+
     /// Focus a hand-launched (ambient) agent the user clicked in the rail. The
     /// row is keyed by the terminal's PTY id (its per-pane identity) rather than
     /// a DB session id, because no tracked `agent_sessions` row exists for an

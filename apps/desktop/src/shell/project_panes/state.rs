@@ -1052,6 +1052,32 @@ impl ProjectPanes {
         true
     }
 
+    /// Activate the chat tab bound to `session_id` (its group becomes active,
+    /// then the tab within it). The chat counterpart of
+    /// [`ProjectPanes::focus_agent_session`], keyed by the registry id a rail
+    /// row carries. Returns `false` when no group holds it.
+    pub fn focus_agent_chat_session(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .chat_tab_index_by_remote_id(session_id, cx)
+                .map(|idx| (*id, idx))
+        });
+        let Some((id, idx)) = existing else {
+            return false;
+        };
+        self.set_active_group(id, window, cx);
+        if let Some(group) = self.groups.get(&id).cloned() {
+            group.update(cx, |g, cx| g.set_active(idx, window, cx));
+        }
+        true
+    }
+
     /// Whether any group hosts the terminal PTY `pty_id` (the per-pane identity
     /// an ambient agent rail row is keyed by).
     pub fn has_terminal_pty(&self, pty_id: &str, cx: &gpui::App) -> bool {

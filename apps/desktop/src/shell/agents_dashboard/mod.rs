@@ -244,6 +244,9 @@ fn build_dashboard_row(
                     RailAgentTarget::AmbientTerminal { pty_id } => {
                         root.focus_ambient_agent_terminal(pty_id, window, cx);
                     }
+                    RailAgentTarget::Chat { session_id } => {
+                        root.focus_chat_by_session_id(session_id, window, cx);
+                    }
                 }
                 // Both calls above no-op for a history row — it has no live
                 // session to focus — which used to make the whole card a dead

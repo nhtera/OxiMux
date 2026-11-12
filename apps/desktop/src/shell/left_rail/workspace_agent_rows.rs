@@ -599,6 +599,9 @@ fn render_agent_sub_row(
                     RailAgentTarget::AmbientTerminal { pty_id } => {
                         root.focus_ambient_agent_terminal(pty_id, window, cx);
                     }
+                    RailAgentTarget::Chat { session_id } => {
+                        root.focus_chat_by_session_id(session_id, window, cx);
+                    }
                 });
             })
     } else {
