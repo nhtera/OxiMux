@@ -852,8 +852,25 @@ reading it.
   ease-out to transparent). It's a transient locator, not a state — the steady
   focus marker stays the tab strip's bottom border. Single-group layouts don't
   flash (no ambiguity). Reuses `focus_ring`; no new token.
-- **No drop shadows** on dark UI. They look muddy. Use a 1px border in `border_active`
-  instead.
+- **No drop shadows** on dark UI *in the layout*. They look muddy. Use a 1px
+  border in `border_active` instead. This is about panels, rows, headers and
+  chrome that sit **in** the layout — anything that has a place in the
+  composition does not need to pretend to hover above it.
+- **Floating surfaces are the exception, and they take `shadow_lg`.** A surface
+  that floats **over** content — a context menu, a picker, a palette, a modal,
+  a popover, a drag image — has no place in the layout by definition, and a 1px
+  border is not enough to detach it from whatever it happens to be covering: a
+  menu over a dense list reads as part of the list. Every such surface in the
+  cockpit carries `shadow_lg`, which is the rule rather than a drift.
+  - The **top inner-highlight** is not an alternative to this; the two do
+    different jobs. The highlight (`edge_highlight`, applied by
+    `floating_chrome`) is *internal* elevation — it works at any size, never
+    muddies, and is what makes a surface read as raised rather than flat. The
+    shadow is *separation*, and only a surface with content beneath it needs
+    it. Read the "reads as elevation without a shadow" note on `edge_highlight`
+    as what the highlight buys on its own, not as a ban on pairing them.
+  - It does **not** extend to a row, a card or a section inside a surface. One
+    shadow per floating surface, on the surface itself.
 - **No gradients** outside of the focus ring.
 
 ## Anti-patterns
