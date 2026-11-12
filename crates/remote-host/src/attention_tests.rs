@@ -1,9 +1,10 @@
 //! The host's attention owner: one answer, published as changes.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oximux_agents::attention::{AttentionKind, AttentionSource, ExternalAttention};
+use oximux_agents::attention::{AttentionEdge, AttentionKind, AttentionSource, ExternalAttention};
 use oximux_agents::health::{HealthInputs, Process, PromptKind};
 use oximux_agents::lineage::LineageStore;
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
@@ -41,6 +42,29 @@ fn fixture_on(db: Arc<oximux_storage::db::Db>) -> Fixture {
 
 fn register(f: &Fixture, id: &str) -> Arc<SessionHandle> {
     f.registry.register(id.to_string(), Arc::new(StubConnection::default()))
+}
+
+/// Writer threads that stop when this goes out of scope, however it goes.
+///
+/// The probes below assert inside their read loops. A failing assertion
+/// unwinds past any shutdown written after it, and dropping a `JoinHandle`
+/// only *detaches* the thread — so the writers kept their `stop` flag false
+/// and went on publishing for the rest of the test process, burying the real
+/// failure in whatever ran next. Stopping them in `Drop` runs on both paths.
+struct Writers {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Writers {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            // On the unwinding path a panic is already in flight; a writer's
+            // own panic must not abort the process on top of it.
+            let _ = handle.join();
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -290,8 +314,9 @@ fn a_health_change_publishes_one_change_with_its_edge() {
     let edge = change.edge.expect("an edge to alert on");
     assert_eq!(edge.kind, AttentionKind::NeedsPermission);
     assert_eq!(
-        edge.id, "req:0:req-1",
-        "the request being answered, qualified by the process that asked"
+        edge.id,
+        format!("req:{}:0:req-1", h.incarnation()),
+        "the request being answered, qualified by the handle and the process that asked"
     );
     assert_eq!(change.retired, None, "nothing was showing before");
 }
@@ -877,6 +902,8 @@ fn a_snapshot_never_shows_facts_from_one_moment_beside_health_from_another() {
             }
         })
     }).collect();
+    // Held for the rest of the test: the assertions below unwind on failure.
+    let _writers = Writers { stop: stop.clone(), handles: writers };
 
     for _ in 0..400_000 {
         let snapshot = h.health_snapshot();
@@ -893,10 +920,6 @@ fn a_snapshot_never_shows_facts_from_one_moment_beside_health_from_another() {
             snapshot.inputs.prompt,
             snapshot.health.status
         );
-    }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    for writer in writers {
-        writer.join().unwrap();
     }
 }
 
@@ -971,6 +994,7 @@ fn a_published_alert_and_its_edge_always_describe_the_same_moment() {
         })
     };
 
+    let _writers = Writers { stop: stop.clone(), handles: vec![writer] };
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut seen = 0;
     while Instant::now() < deadline {
@@ -995,8 +1019,6 @@ fn a_published_alert_and_its_edge_always_describe_the_same_moment() {
             Err(err) => panic!("{err}"),
         }
     }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    writer.join().unwrap();
     assert!(seen > 100, "the probe has to actually see changes: {seen}");
 }
 
@@ -1024,3 +1046,145 @@ fn a_view_that_could_not_be_stored_is_not_remembered_in_memory_either() {
     );
 }
 
+
+// ─── review round 17 ─────────────────────────────────────────────────────────
+
+/// The edge a target would raise right now, read the way `reevaluate` reads it.
+///
+/// Taken directly rather than off the stream, so these tests do not depend on
+/// a follower task waking.
+fn edge_now(f: &Fixture, target: &str) -> Option<AttentionEdge> {
+    let mut state = f.core.attention().state.lock().unwrap();
+    f.core.current(target, &mut state).1
+}
+
+#[test]
+fn a_replacements_first_prompt_is_not_the_departed_handles_prompt() {
+    // `SessionRegistry::register_with_caps` starts a replacement handle's
+    // generation at zero again, so qualifying a prompt by the generation alone
+    // gave both handles' first request one edge. Nothing here waits for the
+    // removal to be reconciled, which is the order that made the new prompt
+    // vanish: the edge read as unchanged, `reevaluate` had nothing to say, and
+    // nobody was ever shown a request that was waiting on them.
+    let f = fixture();
+    let target = chat_target("s1");
+    let first = register(&f, "s1");
+    first.publish_health(needs_permission());
+    let departed = edge_now(&f, &target).expect("the first handle's prompt");
+
+    f.registry.unregister("s1");
+    let second = register(&f, "s1");
+    // The same request id the departed handle was waiting on, and the same
+    // generation, because the replacement counts from zero too.
+    second.publish_health(HealthInputs { last_activity_at: now() + 1, ..needs_permission() });
+
+    let replacement = edge_now(&f, &target).expect("the replacement's prompt");
+    assert_eq!(replacement.kind, AttentionKind::NeedsPermission);
+    assert_ne!(
+        replacement, departed,
+        "a replacement handle's prompt is its own alert, not the departed handle's"
+    );
+    assert!(
+        replacement.id.ends_with(":0:req-1"),
+        "the request and the generation are still part of it: {replacement:?}"
+    );
+    // A view holding the old handle is the case that keeps this reachable.
+    drop(first);
+}
+
+#[test]
+fn a_look_dismisses_the_showing_alert_however_crowded_the_history() {
+    // One more live alert on this target than the onset memory holds. Every
+    // insertion used to evict the oldest entry whether or not it was still
+    // live, so a live edge was re-recorded on the next pass *after* the look
+    // meant to cover it: it read as unseen again and the row never cleared.
+    let f = fixture();
+    let target = "cockpit:c1";
+    for n in 0..=super::ONSET_MEMORY {
+        f.core.publish_external(external(&format!("k{n}"), target, AttentionKind::Failed));
+    }
+    assert!(
+        f.core.needs_you().iter().any(|(t, _)| t == target),
+        "the crowd of failures needs a person before the look"
+    );
+
+    f.core.mark_viewed(target);
+
+    assert!(
+        !f.core.needs_you().iter().any(|(t, _)| t == target),
+        "a look covers what had arrived when it was taken, however many had arrived"
+    );
+}
+
+#[test]
+fn a_session_gone_before_the_watcher_ever_saw_it_is_still_reconciled() {
+    // A session can register, publish through its follower and unregister
+    // between two of the watcher's passes, so it never enters `known`. A
+    // difference against `known` alone left its published edge with nothing to
+    // retire it, and a view still holding the handle keeps its watches open,
+    // so its own follower never wakes to do it either.
+    let f = fixture();
+    let target = chat_target("s1");
+    let handle = register(&f, "s1");
+    handle.publish_health(needs_permission());
+    f.core.reevaluate(&target);
+    assert!(
+        f.core.attention().state.lock().unwrap().last.contains_key(&target),
+        "there has to be a published alert for there to be anything to retire"
+    );
+
+    f.registry.unregister("s1");
+    // The watcher's own view of this pass: it never sampled the session, so
+    // `known` is empty, and it is not live now either.
+    let stale = f.core.chats_to_retire(&HashSet::new(), &HashSet::new());
+    assert!(
+        stale.contains(&target),
+        "a target published but never sampled is still gone and wants nothing: {stale:?}"
+    );
+    drop(handle);
+}
+
+#[test]
+fn a_follower_knows_when_nothing_is_listening() {
+    // The guard a follower reads before re-evaluating. Its own loop used to
+    // take the attention lock and read the preferences database on every
+    // health change although the stream had no subscriber left.
+    let f = fixture();
+    assert!(!f.core.feeding_subscribers(), "nothing has subscribed yet");
+    let rx = f.core.subscribe_attention();
+    assert!(f.core.feeding_subscribers(), "a subscriber is listening");
+    drop(rx);
+    assert!(!f.core.feeding_subscribers(), "the last subscriber left");
+}
+
+#[test]
+fn an_unwinding_probe_still_stops_its_writers() {
+    // What the `Writers` guard is for. The probes above assert inside their
+    // read loops, and a failing assertion unwinds past anything written after
+    // it; dropping a `JoinHandle` only detaches the thread. This panics on
+    // purpose and checks the writer was stopped on the way out. The panic
+    // message it prints is expected output, not a failure.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    let held = stop.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _writers = Writers { stop: held, handles: vec![handle] };
+        panic!("an assertion failed mid-probe");
+    }));
+
+    assert!(outcome.is_err(), "the probe has to have unwound for this to prove anything");
+    assert!(
+        stop.load(Ordering::Relaxed),
+        "the writer was left publishing after the probe failed, which buries the real failure \
+         in whatever runs next"
+    );
+}

@@ -139,15 +139,50 @@ impl AttentionState {
         self.observed
     }
 
+    /// Remember when each of `edges` was observed, then forget history down to
+    /// the cap.
+    ///
+    /// `edges` is every alert the target could raise *right now*, and none of
+    /// them is ever forgotten. That is the whole point of capping here rather
+    /// than per edge: a live edge dropped to make room would be re-recorded on
+    /// the next pass at a position *after* the look that was meant to cover
+    /// it, so it would read as unseen again and no number of looks could
+    /// dismiss it. Reachable whenever one target has more live alerts than
+    /// [`ONSET_MEMORY`] — the previous code evicted the oldest entry on every
+    /// insertion, live or not, so the row stayed in "needs you" for good.
+    ///
+    /// So the cap bounds *history*, and the live set bounds itself: the list
+    /// may sit above [`ONSET_MEMORY`] while that many alerts are genuinely
+    /// outstanding, and falls back to it as they clear.
+    fn record_all(&mut self, target: &str, edges: &[AttentionEdge]) {
+        for edge in edges {
+            let at = self.tick();
+            self.record(edge, at);
+        }
+        let live: HashSet<EdgeKey> = edges.iter().map(|e| (e.kind, e.id.clone())).collect();
+        let Some(seen) = self.onset.get_mut(target) else { return };
+        let mut excess = seen.len().saturating_sub(ONSET_MEMORY);
+        if excess == 0 {
+            return;
+        }
+        // In order, so the oldest no-longer-live edges go first.
+        seen.retain(|(key, _)| {
+            if excess > 0 && !live.contains(key) {
+                excess -= 1;
+                return false;
+            }
+            true
+        });
+    }
+
     /// Remember that `edge` was observed at `at`, if it is not already known.
+    /// An edge already known keeps the position it had: that is when it
+    /// arrived, and re-deriving it is not a new arrival.
     fn record(&mut self, edge: &AttentionEdge, at: u64) {
         let seen = self.onset.entry(edge.target.clone()).or_default();
         let key: EdgeKey = (edge.kind, edge.id.clone());
         if seen.iter().any(|(k, _)| *k == key) {
             return;
-        }
-        if seen.len() >= ONSET_MEMORY {
-            seen.remove(0);
         }
         seen.push((key, at));
     }
@@ -405,9 +440,14 @@ impl HostCore {
         // prompt with the successor's number — at which point the successor's
         // own first prompt, numbered the same by its provider, is the same
         // alert and is never announced.
-        let session = self.session_of(target).map(|handle| handle.health_snapshot());
-        let request = session.as_ref().and_then(prompt_edge);
-        let health = session.as_ref().map(|s| &s.health);
+        // The incarnation comes from the same lookup as the snapshot. It is
+        // fixed for the life of a handle, so unlike the generation it cannot
+        // be made stale by reading it here.
+        let session = self
+            .session_of(target)
+            .map(|handle| (handle.incarnation().to_string(), handle.health_snapshot()));
+        let request = session.as_ref().and_then(|(born, s)| prompt_edge(s, born));
+        let health = session.as_ref().map(|(_, s)| &s.health);
         // Evaluated against the onsets as they stood *before* this call, so an
         // alert is never born already seen: recording first would compare a
         // brand-new alert against this very moment, and a view taken in the
@@ -423,11 +463,12 @@ impl HostCore {
         // surely as the worse one has, and a view covers what had arrived when
         // it was taken; recording only the winner left the one underneath
         // reading as new after the view, and stuck in "needs you".
-        for candidate in self.candidates(target, health, &external) {
-            let edge = attention::edge_of(target, &candidate, health, request.as_deref());
-            let at = state.tick();
-            state.record(&edge, at);
-        }
+        let raised: Vec<AttentionEdge> = self
+            .candidates(target, health, &external)
+            .iter()
+            .map(|candidate| attention::edge_of(target, candidate, health, request.as_deref()))
+            .collect();
+        state.record_all(target, &raised);
         let edge = attention
             .as_ref()
             .map(|a| attention::edge_of(target, a, health, request.as_deref()));
@@ -501,8 +542,8 @@ impl HostCore {
                     // or not its watches have closed: a view still holding its
                     // handle keeps them open, and its follower would never
                     // wake to retire the alert.
-                    for target in known.difference(&live) {
-                        core.reevaluate(target);
+                    for target in core.chats_to_retire(&known, &live) {
+                        core.reevaluate(&target);
                     }
                     known = live;
                 }
@@ -513,6 +554,50 @@ impl HostCore {
         });
     }
 
+    /// Whether anything is listening to the attention stream.
+    ///
+    /// The followers exist only to feed it, so with no subscriber their work
+    /// is unobservable and they skip it.
+    pub(crate) fn feeding_subscribers(&self) -> bool {
+        self.attention().tx.receiver_count() > 0
+    }
+
+    /// The chat targets to re-evaluate because they are no longer registered.
+    ///
+    /// Two sources, because the watcher's own view is incomplete. A session can
+    /// register, publish an alert through its follower and unregister between
+    /// two of the watcher's passes: it was never in `known`, so a difference
+    /// against `known` alone would never reconcile it, and a view still
+    /// holding its handle keeps its watches open, so its follower never wakes
+    /// to retire the alert either. Whatever was published is in `last`, so
+    /// that is the second place to look.
+    ///
+    /// Chats only: an external producer's target has no handle in the
+    /// registry, so `live` says nothing about whether it is gone.
+    pub(crate) fn chats_to_retire(
+        &self,
+        known: &HashSet<String>,
+        live: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = known.difference(live).cloned().collect();
+        {
+            // Dropped before the caller re-evaluates: `reevaluate` takes this
+            // same lock, and it is not reentrant.
+            let state = self.attention().state.lock().unwrap();
+            for target in state.last.keys() {
+                if oximux_agents::session_prefs::chat_id(target).is_some()
+                    && !live.contains(target)
+                    && !known.contains(target)
+                {
+                    out.push(target.clone());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Start a follower for every live session that has none. A no-op while
     /// nothing subscribes to the stream.
     ///
@@ -521,7 +606,7 @@ impl HostCore {
     /// holds the old handle; keyed by id alone, the new handle would be taken
     /// for one already followed and its changes would never reach the stream.
     fn follow_live_sessions(self: &Arc<Self>) {
-        if self.attention().tx.receiver_count() == 0 {
+        if !self.feeding_subscribers() {
             return;
         }
         for id in self.registry().ids() {
@@ -556,7 +641,14 @@ async fn follow(
     loop {
         {
             let Some(core) = core.upgrade() else { return };
-            core.reevaluate(&target);
+            // Nothing is listening. The guard in `follow_live_sessions` only
+            // stops followers being *started*; one already running would go on
+            // taking the attention lock and reading the preferences database
+            // on every health change for nobody. The snapshot readers derive
+            // on demand, so skipping this is unobservable.
+            if core.feeding_subscribers() {
+                core.reevaluate(&target);
+            }
         }
         let ended = tokio::select! {
             changed = health.changed() => changed.is_err(),
@@ -573,7 +665,7 @@ async fn follow(
 }
 
 /// The pending prompt's edge identity: the provider's request id qualified by
-/// the process that published it.
+/// the handle that published it *and* the process within that handle.
 ///
 /// A provider that numbers its requests from 1 again after a respawn gives the
 /// successor's prompt the same id as the one before it. Unqualified, the two
@@ -581,12 +673,24 @@ async fn follow(
 /// announce the new prompt. The raw id still decides the prompt itself — this
 /// qualification is for telling alerts apart.
 ///
+/// **The generation alone is not enough.** `register_with_caps` starts a
+/// replacement handle's generation at zero again, so a session unregistered
+/// and registered under the same id gives its first prompt the same
+/// `0:<request>` as the departed handle's first prompt. If the replacement
+/// arrives before the watcher has reconciled the removal, that is the *same*
+/// edge, and [`HostCore::reevaluate`]'s "nothing to hear about" arm drops the
+/// new prompt — a person is never shown a request that is waiting on them.
+/// The incarnation is unique per handle, so it separates the two.
+///
 /// Taken from the snapshot rather than from the handle, so the number is the
 /// one the facts were published under and not whatever is current a moment
 /// later.
-fn prompt_edge(session: &oximux_agents::session_health::Snapshot) -> Option<String> {
+fn prompt_edge(
+    session: &oximux_agents::session_health::Snapshot,
+    incarnation: &str,
+) -> Option<String> {
     let request = session.inputs.prompt_request.as_deref()?;
-    Some(format!("{}:{request}", session.generation))
+    Some(format!("{incarnation}:{}:{request}", session.generation))
 }
 
 /// Every external alert raised for `target`, worst first.
