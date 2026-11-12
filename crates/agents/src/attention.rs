@@ -22,6 +22,7 @@
 //!   as [`ExternalAttention`] from whoever knows about them, and are ranked
 //!   against the session's own state rather than rendered somewhere else.
 
+use oximux_core::AgentStatus;
 use crate::health::{HealthStatus, Liveness, SessionHealth};
 use crate::session_prefs::SessionPrefs;
 
@@ -317,6 +318,57 @@ pub fn of_external(
             reason: Some(item.reason.clone()),
             source: AttentionSource::External(item.key.clone()),
         })
+}
+
+/// The external item a cockpit (terminal) agent's parsed status raises, or
+/// `None` when it raises nothing.
+///
+/// A cockpit agent has no [`SessionHealth`]: OxiMux reads its PTY and parses
+/// an [`AgentStatus`], so it cannot go through [`of`]. It goes through
+/// [`of_external`] instead, as the item this returns — which keeps the kinds,
+/// the priority order and the "has it been dealt with?" lifecycle in exactly
+/// one place, rather than giving the cockpit a second evaluator to drift from.
+///
+/// **Two callers, by design.** The desktop's row builder calls it so a row is
+/// in the right section the instant it is built, and the cockpit producer
+/// calls it to publish the same item into the host's registry so the notifier,
+/// the badge and a phone see what the row sees. A row that waited for the
+/// producer to publish would show a blocked agent as "Working" until the first
+/// publication landed.
+///
+/// `since` is the session's own activity timestamp, never the clock: with
+/// `key` it is the item's edge identity, so two callers passing different
+/// moments would raise two edges for one alert.
+pub fn external_of_agent_status(
+    key: String,
+    target: String,
+    status: &AgentStatus,
+    since: i64,
+) -> Option<ExternalAttention> {
+    let (kind, reason) = match status {
+        // The captured prompt is the only thing that says *what* is being
+        // approved, so it is the reason verbatim.
+        AgentStatus::NeedsApproval(what) => (AttentionKind::NeedsPermission, what.clone()),
+        AgentStatus::WaitingForInput => {
+            (AttentionKind::NeedsInput, "Waiting for your reply".to_string())
+        }
+        AgentStatus::Failed(why) => (AttentionKind::Failed, why.clone()),
+        AgentStatus::Done { code: Some(0) } => {
+            (AttentionKind::FinishedUnread, "Finished".to_string())
+        }
+        AgentStatus::Done { code: Some(code) } => {
+            (AttentionKind::Failed, format!("Agent process exited (code {code})"))
+        }
+        // Killed by a signal: no code, and not a clean finish.
+        AgentStatus::Done { code: None } => {
+            (AttentionKind::Failed, "Agent process was killed".to_string())
+        }
+        // A user cancel, or a session that was alive at shutdown. Nobody is
+        // being asked anything, and it must not resurface on every boot.
+        AgentStatus::Interrupted => return None,
+        AgentStatus::Running | AgentStatus::Idle => return None,
+    };
+    Some(ExternalAttention { key, target, kind, reason, since })
 }
 
 /// Whether the person has dealt with one external item.
