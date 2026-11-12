@@ -83,13 +83,25 @@ impl WorkspaceRoot {
         else {
             return;
         };
-        // The session may have no tab at all — a child another agent spawned,
-        // or a row whose tab has since closed. The Agents page is then the
-        // answer rather than nothing: it is where that row is, and it is
-        // where the person can deal with it.
-        let focused = if let Some(session) = oximux_agents::session_prefs::chat_id(&target) {
+        self.navigate_to_attention_target(&target, window, cx);
+    }
+
+    /// Open the session a namespaced target names.
+    ///
+    /// Shared by a banner's click and by ⌘⇧U, so the two cannot disagree about
+    /// where a given target lives. The session may have no tab at all — a
+    /// child another agent spawned, or a row whose tab has since closed. The
+    /// Agents page is then the answer rather than nothing: it is where that
+    /// row is, and where the person can deal with it.
+    pub(crate) fn navigate_to_attention_target(
+        &mut self,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focused = if let Some(session) = oximux_agents::session_prefs::chat_id(target) {
             self.focus_chat_by_session_id(session, window, cx)
-        } else if let Some(db_id) = oximux_agents::session_prefs::cockpit_id(&target) {
+        } else if let Some(db_id) = oximux_agents::session_prefs::cockpit_id(target) {
             match db_id.strip_prefix("ambient:") {
                 Some(pty_id) => self.focus_ambient_agent_terminal(pty_id, window, cx),
                 None => self.focus_agent_by_db_id(db_id, window, cx),
@@ -100,6 +112,27 @@ impl WorkspaceRoot {
         if !focused {
             self.show_agents_page(cx);
         }
+    }
+
+    /// The attention target of the row the rail has focused, if any.
+    ///
+    /// What "this session" means for `MarkUnread`: the one the person is
+    /// looking at. The rail already tracks it, so this reads that rather than
+    /// keeping a selection of its own to drift.
+    pub(crate) fn focused_attention_target(&self, cx: &gpui::App) -> Option<String> {
+        let focused = self.left_rail.read(cx).focused_agent_target()?;
+        let db_id = match &focused {
+            crate::shell::left_rail::rail_agent_row::RailAgentTarget::AgentSession { db_id } => {
+                db_id.clone()
+            }
+            crate::shell::left_rail::rail_agent_row::RailAgentTarget::AmbientTerminal {
+                pty_id,
+            } => format!("ambient:{pty_id}"),
+            crate::shell::left_rail::rail_agent_row::RailAgentTarget::Chat { session_id } => {
+                session_id.clone()
+            }
+        };
+        Some(crate::shell::agents_dashboard::row_attention::attention_target(&db_id, &focused))
     }
 
     /// Open a dashboard row's context menu at the pointer.
@@ -154,7 +187,7 @@ impl WorkspaceRoot {
     }
 
     /// Open the Agents page, for a banner whose session has no tab to focus.
-    fn show_agents_page(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn show_agents_page(&mut self, cx: &mut Context<Self>) {
         let rail = self.left_rail.clone();
         rail.update(cx, |rail, cx| {
             rail.select_nav(crate::shell::left_rail::nav_section::NavItem::Agents, cx);

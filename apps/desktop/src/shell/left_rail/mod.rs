@@ -306,10 +306,9 @@ pub struct LeftRail {
     /// Agents page was NOT open. Shown as a badge on the Agents nav row;
     /// zeroed when the page is opened. Lives here (not on the dashboard
     /// view) because the rail entity survives project switches.
+    /// How many sessions need a person, as of the last pass. A count, not a
+    /// tally — see `badge`.
     agents_unread: u32,
-    /// The targets that needed someone at the last pass, so the badge counts
-    /// a session once rather than on every refresh.
-    agents_needing_you: std::collections::HashSet<String>,
     /// Per-project held Smart-sort order during the settle window (item:
     /// Smart rows don't reshuffle under the cursor right after a status
     /// change). Keyed by project id. Not persisted.
@@ -390,7 +389,6 @@ impl LeftRail {
             locate_glow_seq: 0,
             locate_anchor: new_anchor(),
             agents_unread: 0,
-            agents_needing_you: std::collections::HashSet::new(),
             smart_settle: HashMap::new(),
             settle_timer_armed: false,
             settle_override_cache: HashMap::new(),
@@ -993,6 +991,12 @@ impl LeftRail {
     }
 
     /// Current rail width — read by `WorkspaceRoot` for pane reflow.
+    /// The agent row the rail has focused, if any — what "this session"
+    /// means for an action aimed at what the person is looking at.
+    pub(crate) fn focused_agent_target(&self) -> Option<RailAgentTarget> {
+        self.focused_agent.clone()
+    }
+
     pub(crate) fn width(&self) -> Pixels {
         self.width
     }
@@ -1036,13 +1040,13 @@ impl LeftRail {
         // page is closed. The host's answer, so a chat session counts like a
         // tracked agent — the status map this used to read holds neither chat
         // sessions nor more than one agent per workspace.
-        let needing = badge::targets_needing_you(cx);
+        // How many sessions are asking for someone, from the host — the same
+        // number the status-bar chip shows and the same number the list has
+        // rows for. A count rather than a tally of transitions: dealing with a
+        // session takes it out, which is what "dealt with" should mean, and it
+        // needs no resetting when the page opens.
         let was_unread = self.agents_unread;
-        if self.active_nav != Some(NavItem::Agents) {
-            let fresh = badge::newly_needing(&self.agents_needing_you, &needing);
-            self.agents_unread = self.agents_unread.saturating_add(fresh);
-        }
-        self.agents_needing_you = needing;
+        self.agents_unread = badge::needs_you_now(cx).len() as u32;
         // The badge is a render input like any other, and not one of the
         // compared fields below: a chat going stalled changes the count
         // without changing any status the rail displays, and the new number
@@ -1198,9 +1202,6 @@ impl LeftRail {
         } else {
             Some(item)
         };
-        if self.active_nav == Some(NavItem::Agents) {
-            self.agents_unread = 0;
-        }
         cx.notify();
     }
 

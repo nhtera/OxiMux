@@ -28,6 +28,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::Icon;
+use oximux_agents::attention::AttentionKind;
 use oximux_agents::session_log::usage::ProviderUsage;
 use oximux_core::GitState;
 use oximux_git::PollState;
@@ -35,6 +36,7 @@ use oximux_settings::{Density, Theme, Typography, UsageDetail};
 
 use super::awake_card;
 use crate::agent_awake::AwakeStatus;
+use crate::shell::agents_dashboard::attention_look::tone_color;
 use crate::shell::source_control::primary_action::PrimaryAction;
 use crate::shell::usage_meter;
 
@@ -96,6 +98,31 @@ pub fn agent_label(count: usize) -> String {
     }
 }
 
+/// The `● N needs you` chip: how many sessions are asking, and the worst
+/// thing any of them wants.
+///
+/// Absent when nothing is asking — a chip reading "0 needs you" would be the
+/// one metric in the strip that is loudest when there is nothing to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeedsYou {
+    pub count: usize,
+    /// Colours the dot and the text. The worst kind among them, by the
+    /// evaluator's own ranking, so this and the list's top row agree.
+    pub kind: AttentionKind,
+}
+
+/// `"1 needs you"` / `"N need you"`.
+///
+/// The verb agrees with the count, which is the whole reason this is a
+/// function: "1 need you" is the kind of thing that makes an app feel
+/// unfinished, and the strip is read at a glance.
+pub fn needs_you_label(count: usize) -> String {
+    match count {
+        1 => "1 needs you".to_string(),
+        n => format!("{n} need you"),
+    }
+}
+
 /// `"1 pane"` / `"N panes"`. Plural-aware.
 pub fn pane_label(count: usize) -> String {
     match count {
@@ -149,6 +176,9 @@ pub fn view<F, G, H, P, T, A>(
     pane_count: usize,
     tty_count: usize,
     agent_count: usize,
+    // How many of those agents are waiting on a person, and the worst thing
+    // any of them wants. `None` when nothing is asking, which hides the chip.
+    needs_you: Option<NeedsYou>,
     // Listening ports attributed to this window's terminals. Hidden at zero —
     // see `ports_segment_visible`.
     port_count: usize,
@@ -485,6 +515,37 @@ where
                         .text_color(metric_color(agent_count, 1, theme))
                         .child(agent_label(agent_count)),
                 )
+                // Beside the agent count, because it is a reading of the same
+                // population: how many of those agents are waiting on you.
+                .children(needs_you.map(|needs_you| {
+                    let color = tone_color(needs_you.kind.tone(), theme);
+                    let hover_bg = theme.hover_overlay;
+                    div()
+                        .id("status-bar-needs-you")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(density.gap_inline))
+                        .h(px(16.))
+                        .px(px(4.))
+                        .rounded(px(density.r_chip))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .text_size(px(typography.t_body_sm))
+                        .text_color(color)
+                        .child(div().size(px(6.)).rounded_full().bg(color))
+                        .child(needs_you_label(needs_you.count))
+                        // Dispatched rather than handed in as another closure:
+                        // `ShowNeedsYou` is the one entry point for "show me
+                        // the inbox", shared with the palette, so the chip
+                        // needs no handler of its own.
+                        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::actions::ShowNeedsYou),
+                                cx,
+                            );
+                        })
+                }))
                 .child(separator(theme, typography))
                 .child(
                     div()
@@ -523,6 +584,8 @@ mod tests {
 
     #[test]
     fn agent_label_zero() {
+        assert_eq!(needs_you_label(1), "1 needs you");
+        assert_eq!(needs_you_label(3), "3 need you", "the verb agrees with the count");
         assert_eq!(agent_label(0), "0 agents");
     }
 

@@ -614,6 +614,10 @@ pub struct WorkspaceRoot {
     pub(crate) rail_agents_cache: crate::shell::left_rail::WorkspaceAgentList,
     /// Marks `rail_agents_cache` stale (session/live-agent change).
     pub(crate) rail_agents_dirty: bool,
+    /// The target ⌘⇧U last sent the person to, so the next press takes the
+    /// one after it. A session rather than an index — see
+    /// `jump_to_attention`.
+    pub(crate) last_attention_jump: Option<String>,
     /// The cockpit attention keys this window has raised with the host.
     ///
     /// A terminal agent's alert is published by the pass that walks these rows
@@ -1605,6 +1609,7 @@ impl WorkspaceRoot {
             rail_dirty: false,
             rail_refresh_inflight: false,
             rail_agents_cache: HashMap::new(),
+            last_attention_jump: None,
             cockpit_attention_raised: std::collections::HashSet::new(),
             rail_agents_dirty: true,
             diff_refresh_focused: true,

@@ -84,6 +84,18 @@ impl Render for WorkspaceRoot {
             })
             .unwrap_or(0);
 
+        // How many sessions are waiting on a person, and the worst thing any
+        // of them wants. The host's answer, so the chip, the rail badge and
+        // the list are three readings of one number — which is the whole
+        // point of this phase. `None` hides the chip: a metric reading
+        // "0 need you" would be loudest when there is nothing to say.
+        let needs_you = {
+            let needing = crate::shell::left_rail::badge::needs_you_now(cx);
+            crate::shell::left_rail::badge::worst_kind(&needing).map(|kind| {
+                crate::shell::chrome::status_bar::NeedsYou { count: needing.len(), kind }
+            })
+        };
+
         // True TTY count = terminal + agent tabs across every group.
         let tty_count = active_panes
             .as_ref()
@@ -760,6 +772,15 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.remember_palette_terminal(window, cx);
                 this.palette.update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::JumpToNextAttention, window, cx| {
+                this.jump_to_next_attention(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ShowNeedsYou, _window, cx| {
+                this.show_needs_you(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::MarkUnread, _window, cx| {
+                this.mark_focused_unread(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSessionHistory, window, cx| {
                 if this.confirm_pending(cx) {
@@ -1942,6 +1963,7 @@ impl Render for WorkspaceRoot {
                     pane_count,
                     tty_count,
                     agent_count,
+                    needs_you,
                     port_count,
                     git_state.as_ref(),
                     primary,
