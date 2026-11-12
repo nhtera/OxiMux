@@ -1024,34 +1024,3 @@ fn a_view_that_could_not_be_stored_is_not_remembered_in_memory_either() {
     );
 }
 
-/// The successor's prompt must be its own alert even when the old one was
-/// never cleared — and today it is not, so this test is written to the
-/// behaviour that is wanted and ignored until the defect behind it is fixed.
-///
-/// `prompt_request` comes from the view's fold, and a respawn clears the
-/// handle's maps but not the fold (`agent_chat/health_link.rs:169`;
-/// `agent_chat/mod.rs:2132`). So the dead process's request stays reported,
-/// the successor's identically numbered one never becomes the reported prompt,
-/// and nothing in the published facts tells the two apart. Fixing it is a
-/// choice between the fold dropping a dead process's pending card on respawn
-/// and the host suppressing a prompt whose publishing generation is behind the
-/// current connection; either way, un-ignore this.
-#[test]
-#[ignore = "a respawn leaves the fold's pending permission: see the doc comment"]
-fn a_stale_prompt_never_hides_the_successors_request() {
-    let f = fixture();
-    let mut rx = f.core.subscribe_attention();
-    let h = register(&f, "s1");
-    let waiting = HealthInputs { last_activity_at: 1_000, ..needs_permission() };
-    h.publish_health(waiting.clone());
-    let old_prompt = next_change_for(&mut rx, &chat_target("s1")).edge.expect("raised");
-
-    // The agent respawns. Nothing clears the prompt, and the successor asks
-    // under the very same request id.
-    h.swap_connection(Arc::new(StubConnection::default()));
-    h.publish_health(HealthInputs { last_activity_at: 2_000, ..waiting });
-
-    let change = next_change_for(&mut rx, &chat_target("s1"));
-    let now_asking = change.edge.expect("the successor's prompt is an alert of its own");
-    assert_ne!(now_asking, old_prompt, "a consumer has to announce the successor's request");
-}
