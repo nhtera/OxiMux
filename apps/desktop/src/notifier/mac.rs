@@ -333,6 +333,17 @@ impl Notifier for MacNotifier {
             return;
         }
         if !self.settings.should_fire(&req) {
+            // A *replacement* the gates decline leaves whatever is on screen
+            // saying something that is no longer true: answer the permission
+            // of two children and the update is a quiet `Stalled` post, which
+            // a default-off toggle drops — and the old "needs approval, 2
+            // agents" banner stays. So a declined replacement retires instead.
+            // Nothing is lost: the gate's own reasons for declining (the
+            // person is looking at the pane, or does not want this kind) are
+            // all reasons the stale banner should go too.
+            if let Some(key) = &req.replace_key {
+                self.retire(key);
+            }
             return;
         }
         // The burst window is the bell's. Agent-state traffic comes from the

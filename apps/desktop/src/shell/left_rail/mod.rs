@@ -1037,11 +1037,17 @@ impl LeftRail {
         // tracked agent — the status map this used to read holds neither chat
         // sessions nor more than one agent per workspace.
         let needing = badge::targets_needing_you(cx);
+        let was_unread = self.agents_unread;
         if self.active_nav != Some(NavItem::Agents) {
             let fresh = badge::newly_needing(&self.agents_needing_you, &needing);
             self.agents_unread = self.agents_unread.saturating_add(fresh);
         }
         self.agents_needing_you = needing;
+        // The badge is a render input like any other, and not one of the
+        // compared fields below: a chat going stalled changes the count
+        // without changing any status the rail displays, and the new number
+        // would sit unpainted until something else happened to repaint.
+        let badge_changed = self.agents_unread != was_unread;
         // Dirty-check: `WorkspaceRoot::render` pushes this snapshot down every
         // frame (and re-renders on every pane-output tick while an agent
         // streams), so notifying unconditionally rebuilds the whole rail
@@ -1054,7 +1060,8 @@ impl LeftRail {
         // surfaces via `latest_status`/`agent_sideband`/`ambient_status`, which
         // ARE compared (ambient rows also carry their prompt in `persisted_title`,
         // compared by `agents_display_equal`).
-        let changed = self.projects != projects
+        let changed = badge_changed
+            || self.projects != projects
             || self.active_project_id != active_project_id
             || self.active_workspace_id != active_workspace_id
             || self.workspaces_by_project != workspaces_by_project

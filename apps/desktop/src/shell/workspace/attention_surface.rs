@@ -36,13 +36,21 @@ impl WorkspaceRoot {
         if chat.is_none() && agent.is_none() {
             return None;
         }
-        let found = self.project_panes_by_project.values().find_map(|panes| {
+        // Every project is searched for the *label* — a session's tab can be
+        // in a project that is not on screen, and the banner should still say
+        // what it is called. Visibility is another matter: a group's active
+        // tab in a project the person is not looking at is not visible, and
+        // reporting it as such suppressed the banner entirely (a visible pane
+        // in an active window never banners, whatever the focus preference).
+        let active = self.active_project.as_ref().map(|project| project.id.clone());
+        let found = self.project_panes_by_project.iter().find_map(|(project_id, panes)| {
             let panes = panes.read(cx);
-            let context = panes
+            let (label, active_tab) = panes
                 .group_entities()
                 .into_iter()
                 .find_map(|group| group.read(cx).attention_context(chat, agent, cx))?;
-            Some((context, panes.window_active()))
+            let on_screen = active.as_deref() == Some(project_id.as_str());
+            Some(((label, active_tab && on_screen), panes.window_active()))
         });
         let ((label, pane_visible), window_active) = found?;
         Some(crate::notifier::attention_bridge::TargetContext {
@@ -75,19 +83,32 @@ impl WorkspaceRoot {
         else {
             return;
         };
-        // A banner can outlive the row it was about: the person may click one
-        // from Notification Center long after. Focusing nothing is the right
-        // answer then — popping a window with no destination is worse.
-        if let Some(session) = oximux_agents::session_prefs::chat_id(&target) {
-            self.focus_chat_by_session_id(session, window, cx);
-            return;
-        }
-        if let Some(db_id) = oximux_agents::session_prefs::cockpit_id(&target) {
+        // The session may have no tab at all — a child another agent spawned,
+        // or a row whose tab has since closed. The Agents page is then the
+        // answer rather than nothing: it is where that row is, and it is
+        // where the person can deal with it.
+        let focused = if let Some(session) = oximux_agents::session_prefs::chat_id(&target) {
+            self.focus_chat_by_session_id(session, window, cx)
+        } else if let Some(db_id) = oximux_agents::session_prefs::cockpit_id(&target) {
             match db_id.strip_prefix("ambient:") {
                 Some(pty_id) => self.focus_ambient_agent_terminal(pty_id, window, cx),
                 None => self.focus_agent_by_db_id(db_id, window, cx),
-            };
+            }
+        } else {
+            false
+        };
+        if !focused {
+            self.show_agents_page(cx);
         }
+    }
+
+    /// Open the Agents page, for a banner whose session has no tab to focus.
+    fn show_agents_page(&mut self, cx: &mut Context<Self>) {
+        let rail = self.left_rail.clone();
+        rail.update(cx, |rail, cx| {
+            rail.select_nav(crate::shell::left_rail::nav_section::NavItem::Agents, cx);
+        });
+        cx.notify();
     }
 
     /// End the cockpit alerts this window raised, because it is going away.

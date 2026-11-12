@@ -2892,8 +2892,12 @@ impl PaneGroup {
         window.defer(cx, move |window, app| {
             group.update(app, |g, cx| g.focus_active(window, cx));
         });
+        // Outside the `changed` check on purpose: re-selecting the tab that is
+        // already active is how a person comes back to a chat that finished
+        // while they were elsewhere, and how a banner click lands on an
+        // already-active tab. Both are reading it.
+        self.note_read(idx, cx);
         if changed {
-            self.note_read(idx, cx);
             cx.notify();
         }
     }

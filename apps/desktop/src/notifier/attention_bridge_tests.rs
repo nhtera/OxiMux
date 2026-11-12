@@ -348,3 +348,52 @@ fn nothing_wanted_by_a_target_that_never_banners_says_nothing() {
         "but a child that was never waiting does not touch its root's count"
     );
 }
+
+#[test]
+fn what_the_bridge_is_holding_is_what_a_re_read_has_to_revisit() {
+    // After falling behind, the changes that were dropped are gone. Reading
+    // only what needs someone *now* misses the opposite case — an answer or a
+    // retirement — because such a target is absent from that list, and its
+    // banner would stand for the rest of the run.
+    let mut state = BridgeState::new();
+    state.on_change(&raise("chat:s1", AttentionKind::NeedsPermission, "req:a", "rm?"));
+    state.on_change(&raise_child("team:r1", "chat:c1", AttentionKind::NeedsPermission, "req:1"));
+
+    let tracked = state.tracked();
+    assert!(tracked.contains(&"chat:s1".to_string()), "a session with a banner up");
+    assert!(
+        tracked.contains(&"chat:c1".to_string()),
+        "and a child counted under a root, whose answer has to reach the root's count"
+    );
+}
+
+#[test]
+fn handles_do_not_start_over_after_a_restart() {
+    // macOS keeps delivered banners across a restart. A handle counted from
+    // zero would be minted again next run, and an old `session:7` would open
+    // whichever session happened to be seventh this time.
+    let mut first = BridgeState::new();
+    let posts = first.on_change(&raise("chat:s1", AttentionKind::Failed, "turn:1", "boom"));
+    let BridgeAction::Post(post) = &posts[0] else {
+        panic!("expected a post, got {posts:?}");
+    };
+
+    // A fresh process, raising for the same session: its handle must not be
+    // the one the delivered banner is still carrying.
+    let mut next = BridgeState::new();
+    let again = next.on_change(&raise("chat:s1", AttentionKind::Failed, "turn:1", "boom"));
+    let BridgeAction::Post(fresh) = &again[0] else {
+        panic!("expected a post, got {again:?}");
+    };
+    assert_ne!(
+        handle(&fresh.replace_key),
+        handle(&post.replace_key),
+        "two runs minting the same handle means an old banner opens whatever \
+         holds that number now"
+    );
+    assert_eq!(
+        next.target_of(handle(&post.replace_key)),
+        None,
+        "and the old handle resolves to nothing, so a stale click opens nothing"
+    );
+}

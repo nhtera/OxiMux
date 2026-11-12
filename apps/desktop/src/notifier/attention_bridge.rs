@@ -118,7 +118,29 @@ pub struct BridgeState {
 
 impl BridgeState {
     pub fn new() -> Self {
-        Self::default()
+        // Handles start somewhere unpredictable rather than at zero. macOS
+        // keeps delivered banners across a restart, so a handle counted from
+        // zero would be minted again next run and an old `session:7` would
+        // resolve to whichever session happened to be seventh this time — a
+        // click opening the wrong conversation. From a random base a stale
+        // handle resolves to nothing, and a click that opens nothing is what
+        // the router already does for a banner whose row has gone.
+        //
+        // Not the clock: two bases drawn in the same millisecond would be the
+        // same base, and this run's handles have to be this run's.
+        Self { next_handle: random_base(), ..Self::default() }
+    }
+
+    /// Every target the bridge has announced something for. What a re-read
+    /// has to revisit, because these are the ones that may have something on
+    /// screen to take back.
+    ///
+    /// The children counted under a root are in here too, and by
+    /// construction: the raise that counts a child is the same one that
+    /// records its edge, so one map answers for both rather than two that
+    /// could drift.
+    pub fn tracked(&self) -> Vec<String> {
+        self.announced.keys().cloned().collect()
     }
 
     /// Record everything already needing a person as announced, announcing
@@ -319,6 +341,14 @@ impl BridgeState {
     }
 }
 
+/// A starting point for this run's handles, with room above it to count.
+///
+/// Shifted down so incrementing can never wrap, and so the numbers in a
+/// banner identifier stay short enough to read in a log.
+fn random_base() -> u64 {
+    (uuid::Uuid::new_v4().as_u64_pair().0 >> 24) + 1
+}
+
 /// The body for a root's banner. Singular is worth the branch: "1 agents
 /// under api need you" is the kind of thing that makes an app feel unfinished.
 fn waiting_body(waiting: usize) -> String {
@@ -491,9 +521,20 @@ impl AttentionBridge {
         self.state.lock().unwrap().seed(outstanding);
     }
 
-    /// Re-read every target and feed it through as a change.
+    /// Re-read the world after falling behind.
+    ///
+    /// Not just what needs someone now: a change the channel dropped could
+    /// have been an answer or a retirement, and such a target is *absent*
+    /// from `needs_you` — so visiting only that list would leave its banner
+    /// standing for the rest of the run. Everything the bridge is holding
+    /// something for is revisited too, which is exactly the set with
+    /// something on screen to take back.
     fn resync(&self, cx: &mut gpui::App) {
-        for (target, _) in self.host.needs_you() {
+        let mut targets: Vec<String> = self.host.attention_targets();
+        targets.extend(self.state.lock().unwrap().tracked());
+        targets.sort();
+        targets.dedup();
+        for target in targets {
             self.reconsider(&target, cx);
         }
     }
