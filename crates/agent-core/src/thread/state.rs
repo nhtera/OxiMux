@@ -966,6 +966,38 @@ impl ChatThread {
         })
     }
 
+    /// Retire every prompt the agent was waiting on, because the process that
+    /// asked is gone. Returns how many there were.
+    ///
+    /// A permission or a question is answered by routing a decision back to
+    /// the process that raised it, by request id. Once that process has been
+    /// replaced, nothing can carry an answer there: the request is dead
+    /// whatever the card still says. Leaving it `WaitingForConfirmation` tells
+    /// the person an agent is blocked on them, offers buttons that now fail,
+    /// and keeps the derived health reporting `NeedsPermission` with a request
+    /// id no one can act on.
+    ///
+    /// They become `Canceled` rather than being removed: the request really
+    /// was made, and a transcript that quietly loses it is a worse record than
+    /// one that shows it was cut off.
+    pub fn interrupt_pending_prompts(&mut self) -> usize {
+        let mut cut = 0;
+        for entry in &mut self.entries {
+            let ThreadEntry::ToolCall(tc) = entry else { continue };
+            if matches!(
+                tc.status,
+                ToolCallStatus::WaitingForConfirmation(_) | ToolCallStatus::AwaitingAnswer(_)
+            ) {
+                tc.status = ToolCallStatus::Canceled;
+                cut += 1;
+            }
+        }
+        if cut > 0 {
+            self.touch();
+        }
+        cut
+    }
+
     fn tool_call_mut(&mut self, id: &str) -> Option<&mut ToolCall> {
         self.entries.iter_mut().rev().find_map(|e| match e {
             ThreadEntry::ToolCall(tc) if tc.id == id => Some(tc),
@@ -1245,6 +1277,65 @@ mod tests {
     /// An edited approval annotates the card with what was ALLOWED while
     /// `input` keeps what the agent asked for — both survive in the entry, so
     /// a transcript reader can tell the call was narrowed. Status is left to
+    /// A decision is routed back to the process that asked, by request id, so
+    /// once that process is replaced nothing can carry an answer there. The
+    /// prompts have to stop claiming the agent is waiting.
+    #[test]
+    fn a_respawn_retires_every_prompt_the_dead_process_was_waiting_on() {
+        let mut t = ChatThread::new();
+        t.push_user_message("tidy up");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_rm".into(), name: "Bash".into(), input: json!({"command": "rm -rf build"}) });
+        t.apply(&ThreadEvent::PermissionRequested {
+            request_id: "rid".into(), tool_use_id: Some("toolu_rm".into()),
+            tool_name: "Bash".into(), input: json!({"command": "rm -rf build"}),
+            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+        let ask = json!({"questions":[{"question":"Which first?","header":"Order",
+            "options":[{"label":"Tests","description":""},{"label":"Docs","description":""}],
+            "multiSelect":false}]});
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_ask".into(), name: "AskUserQuestion".into(), input: ask.clone() });
+        t.apply(&ThreadEvent::QuestionAsked {
+            request_id: "qid".into(), tool_use_id: Some("toolu_ask".into()),
+            questions: crate::thread::question::parse_questions(&ask) });
+        assert!(t.pending_permission().is_some());
+        assert!(t.pending_question().is_some());
+
+        assert_eq!(t.interrupt_pending_prompts(), 2, "both were waiting");
+
+        assert!(t.pending_permission().is_none(), "nothing is waiting on a person any more");
+        assert!(t.pending_question().is_none());
+        // Cut off, not erased: the request really was made, and a transcript
+        // that loses it is a worse record than one that shows what happened.
+        for (entry, id) in [(&t.entries[1], "toolu_rm"), (&t.entries[2], "toolu_ask")] {
+            match entry {
+                ThreadEntry::ToolCall(tc) => {
+                    assert_eq!(tc.id, id);
+                    assert_eq!(tc.status, ToolCallStatus::Canceled, "{id}");
+                }
+                other => panic!("expected the tool call, got {other:?}"),
+            }
+        }
+        assert_eq!(t.interrupt_pending_prompts(), 0, "nothing left to retire");
+    }
+
+    #[test]
+    fn a_respawn_leaves_a_settled_tool_call_alone() {
+        let mut t = ChatThread::new();
+        t.push_user_message("read it");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_read".into(), name: "Read".into(), input: json!({"path": "a"}) });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "toolu_read".into(), content: "contents".into(),
+            is_error: false, structured: None });
+
+        assert_eq!(t.interrupt_pending_prompts(), 0, "a finished call was not waiting on anyone");
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Completed),
+            other => panic!("expected the tool call, got {other:?}"),
+        }
+    }
+
     /// the backend's own follow-ups, exactly as for an unedited approval.
     #[test]
     fn an_edited_approval_annotates_the_card_without_touching_status() {

@@ -35,5 +35,5 @@
 # the view's draft/queue snapshot helpers moved to `session_persistence.rs`
 # (4070 -> 4035 after the recovery-note field and the receipt link, with the
 # companion accessors moved to `companion_sync.rs`). Both rows are what was left.
-apps/desktop/src/shell/agent_chat/mod.rs 4035
+apps/desktop/src/shell/agent_chat/mod.rs 4033
 apps/desktop/src/shell/agent_chat/composer.rs 3232

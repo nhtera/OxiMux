@@ -409,6 +409,56 @@ mod tests {
             .expect("window update");
     }
 
+    /// A respawn ends the prompts the dead process was waiting on, so the
+    /// health stops claiming an agent is blocked on a person.
+    ///
+    /// This is the layer that matters: `prompt_request` is read from the
+    /// view's fold, so the host can only be truthful if the driver retires
+    /// what the departed process asked. Driving the respawn itself needs a
+    /// real process, so this exercises the step the respawn performs.
+    #[gpui::test]
+    async fn retiring_a_dead_processs_prompts_stops_the_health_asking_for_a_person(
+        cx: &mut TestAppContext,
+    ) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("tidy up");
+                view.thread.apply(&ThreadEvent::ToolCallStarted {
+                    id: "toolu_rm".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "rm -rf build"}),
+                });
+                view.thread.apply(&ThreadEvent::PermissionRequested {
+                    request_id: "rid".into(),
+                    tool_use_id: Some("toolu_rm".into()),
+                    tool_name: "Bash".into(),
+                    input: serde_json::json!({"command": "rm -rf build"}),
+                    description: String::new(),
+                    suggestions: vec![],
+                    kind: oximux_agents::thread::PermissionKind::Tool,
+                });
+                let inputs = view.health_inputs();
+                assert_eq!(inputs.prompt_request.as_deref(), Some("rid"), "waiting on a person");
+                assert_eq!(health_of(view).0, HealthStatus::NeedsPermission);
+
+                // What a respawn does to the fold. Nothing can route an answer
+                // to the process that asked any more.
+                assert_eq!(view.thread.interrupt_pending_prompts(), 1);
+
+                let inputs = view.health_inputs();
+                assert_eq!(inputs.prompt_request, None, "no request to offer");
+                assert_eq!(inputs.prompt, None);
+                assert_ne!(
+                    health_of(view).0,
+                    HealthStatus::NeedsPermission,
+                    "the rail must stop offering a request nobody can answer"
+                );
+                let _ = cx;
+            })
+            .expect("window update");
+    }
+
     /// A process that exits after the user's Stop was asked to.
     #[gpui::test]
     async fn an_exit_after_stop_reads_interrupted(cx: &mut TestAppContext) {

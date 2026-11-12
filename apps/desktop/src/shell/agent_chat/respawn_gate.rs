@@ -14,6 +14,49 @@ use gpui::Context;
 use super::AgentChatView;
 
 impl AgentChatView {
+    /// Reap the process being replaced and retire everything it was waiting
+    /// on.
+    ///
+    /// `Child`'s Drop neither kills nor waits, and a Stop now interrupts the
+    /// turn over the protocol rather than signalling the process, so after one
+    /// the child is still *alive* and this is what ends it; it also harvests a
+    /// child that died on its own.
+    ///
+    /// Then the prompts. A permission or a question is answered by routing a
+    /// decision back to the process that raised it, by request id, so once
+    /// that process is gone nothing can carry an answer there — the request is
+    /// dead whatever the card still says. Left alone it tells the person an
+    /// agent is blocked on them, offers buttons that now fail, and keeps the
+    /// derived health reporting `NeedsPermission` with a request id nobody can
+    /// act on, which puts the session in the rail's "needs you" for good.
+    ///
+    /// Done before the new connection rather than after a successful one, so
+    /// it covers a respawn that fails (the session ends up dead and the
+    /// request is just as unanswerable) and a dormant restore, whose first
+    /// connect comes through here with the pre-quit card still in the fold.
+    pub(super) fn end_the_old_process(&mut self) {
+        if let Some(old) = self.connection.take() {
+            old.shutdown();
+        }
+        let cut_off = self.thread.interrupt_pending_prompts();
+        if cut_off == 0 {
+            return;
+        }
+        self.thread.apply(&oximux_agents::thread::ThreadEvent::Notice(match cut_off {
+            1 => "The agent restarted. The request it was waiting on was cut off; \
+                  nothing was approved."
+                .to_string(),
+            n => format!(
+                "The agent restarted. The {n} requests it was waiting on were cut off; \
+                 nothing was approved."
+            ),
+        }));
+        // The host derives this session's state from the fold, so it has to
+        // hear that the prompt is gone — otherwise the rail keeps offering a
+        // request nobody can answer.
+        self.publish_health();
+    }
+
     /// Whether a respawn asked for now has to wait for the turn to end. When it
     /// does, it is recorded and runs from [`Self::run_pending_respawn`].
     pub(super) fn defer_respawn_mid_turn(&mut self) -> bool {
