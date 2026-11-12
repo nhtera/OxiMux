@@ -7,6 +7,8 @@
 //! All data must be fully assembled BEFORE the `uniform_list` closure to avoid
 //! per-frame work inside the virtualization layer.
 
+pub mod agent_row_menu;
+pub mod attention_look;
 pub mod filter;
 pub mod model;
 pub mod row_attention;
@@ -232,11 +234,37 @@ fn build_dashboard_row(
     // row, which is what the reveal needs.
     let workspace_key = row.workspace.id.clone();
 
+    // The menu needs what the row is asking for, to decide whether Dismiss
+    // belongs in it.
+    let attention = row.attention.clone();
+    let menu_target = row.target.clone();
+    let menu_db_id = row.db_id.clone();
+    let weak_for_menu = weak_root.clone();
+
     let mut card = render_agent_row(&row, theme, density, typography).id(row_id);
     if is_focused {
         card = card.bg(theme.hover_overlay);
     }
     card.on_mouse_down(
+        MouseButton::Right,
+        move |ev: &MouseDownEvent, _window: &mut Window, cx: &mut App| {
+            // Dismiss lives here and nowhere else: a row with nothing to open
+            // cannot be cleared by clicking it, so without this menu a failed
+            // history row would ask forever.
+            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            let _ = weak_for_menu.update(cx, |root, cx| {
+                root.open_agent_row_menu(
+                    menu_db_id.clone(),
+                    menu_target.clone(),
+                    attention.as_ref(),
+                    x,
+                    y,
+                    cx,
+                );
+            });
+        },
+    )
+    .on_mouse_down(
         MouseButton::Left,
         move |_ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
             let _ = weak_root.update(cx, |root, cx| {

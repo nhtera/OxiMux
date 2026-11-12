@@ -37,6 +37,7 @@ impl Render for WorkspaceRoot {
             || self.stash_context_menu.read(cx).is_open()
             || self.terminal_context_menu.read(cx).is_open()
             || self.row_menu.read(cx).is_open()
+            || self.agent_row_menu.read(cx).is_open()
             || self.project_menu.read(cx).is_open()
             || self.dashboard_status_menu.read(cx).is_open()
             || self.options_menu.read(cx).is_open()
@@ -1802,6 +1803,7 @@ impl Render for WorkspaceRoot {
                     || this.terminal_context_menu.read(cx).is_open()
                     || this.adapter_picker.read(cx).is_open()
                     || this.row_menu.read(cx).is_open()
+                    || this.agent_row_menu.read(cx).is_open()
                     || this.project_menu.read(cx).is_open()
                     || this.session_history.read(cx).is_open()
                     || this.status_popover_open.is_some();
@@ -1818,6 +1820,7 @@ impl Render for WorkspaceRoot {
                 this.terminal_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.row_menu.update(cx, |m, cx| m.close(cx));
+                this.agent_row_menu.update(cx, |m, cx| m.close(cx));
                 this.project_menu.update(cx, |m, cx| m.close(cx));
                 // The session-history picker is counted in `any_open` above (so
                 // Escape is consumed rather than leaking to the terminal even
@@ -2214,6 +2217,7 @@ impl Render for WorkspaceRoot {
             .child(self.workspace_dialog.clone())
             // Per-row action popover (sidebar Rename / Archive / Delete).
             .child(self.row_menu.clone())
+            .child(self.agent_row_menu.clone())
             // Per-project-header action popover (Reveal / Copy / Remove).
             .child(self.project_menu.clone())
             // Agents-page status-filter dropdown.

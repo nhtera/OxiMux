@@ -1209,6 +1209,7 @@ impl WorkspaceRoot {
             || self.settings_modal.read(cx).is_open()
             || self.workspace_dialog.read(cx).is_open()
             || self.row_menu.read(cx).is_open()
+            || self.agent_row_menu.read(cx).is_open()
             || self.project_menu.read(cx).is_open()
             || self.dashboard_status_menu.read(cx).is_open()
             || self.options_menu.read(cx).is_open()
@@ -1227,6 +1228,7 @@ impl WorkspaceRoot {
         self.settings_modal.update(cx, |m, cx| m.close(cx));
         self.workspace_dialog.update(cx, |d, cx| d.close(cx));
         self.row_menu.update(cx, |m, cx| m.close(cx));
+        self.agent_row_menu.update(cx, |m, cx| m.close(cx));
         self.project_menu.update(cx, |m, cx| m.close(cx));
         self.dashboard_status_menu.update(cx, |m, cx| m.close(cx));
         self.options_menu.update(cx, |m, cx| m.close(cx));

@@ -813,6 +813,33 @@ shows over modals). Events route via the free `shell::toast::toast(cx, kind, tex
 to the active window's layer (`ToastBus` global, refreshed on window activation),
 or `WorkspaceRoot::push_toast` when the call site already holds the root.
 
+## Agent rows that need a person
+
+An agent row is the one place a status hue appears on a *list row* rather than
+on a banner or an indicator. It is deliberate, and narrow: the row is an inbox
+entry, and the whole point of the inbox is that you can tell at a glance which
+entry is the one to open.
+
+- **A 2px left accent bar, in the kind's own tone**, on the same contract as a
+  toast's: the bar *is* the accent, text stays `fg_base`, one per row.
+  `status_warn` for a permission or a question, `status_error` for a failure,
+  `status_muted` for a stall — nothing has gone wrong there, it has gone quiet.
+- **A finished turn wears no bar.** Unread work is a thing to collect, not a
+  thing to be alarmed by, and a bar on every completed agent would stripe the
+  whole list. Its emerald check carries it instead.
+- **A row that wants nothing wears no bar**, however it ended. A failure that
+  has been viewed or dismissed is not asking any more, so it loses its accent
+  along with its place in NEEDS YOU.
+- **The tone is not the row's to choose.** It comes from
+  `AttentionKind::tone()` in `oximux_agents`, the same answer the status-bar
+  chip and the notifier read, so a row and a banner can never disagree about
+  how bad a thing is. The desktop only maps a tone to a token
+  (`agents_dashboard/attention_look.rs`).
+
+This is an exception to "the brand IS the absence of accent": it buys the one
+thing the absence of accent cannot, which is a list you can triage without
+reading it.
+
 ## Composition rules
 
 - **One accent per surface.** A row uses `status_warn` *or* `status_info`, not both.
