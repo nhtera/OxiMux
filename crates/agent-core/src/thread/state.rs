@@ -965,6 +965,24 @@ impl ChatThread {
         })
     }
 
+    /// Every permission request awaiting a decision, oldest first.
+    ///
+    /// A process can block on more than one at a time, so a path that answers
+    /// "the" pending permission answers only the oldest and leaves the child
+    /// waiting on the rest.
+    pub fn pending_permissions(&self) -> Vec<(&str, &PermissionRequest)> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::ToolCall(tc) => match &tc.status {
+                    ToolCallStatus::WaitingForConfirmation(req) => Some((tc.id.as_str(), req)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The pending AskUserQuestion (if any) awaiting the user's answers.
     pub fn pending_question(&self) -> Option<(&str, &QuestionRequest)> {
         self.entries.iter().find_map(|e| match e {
@@ -1359,6 +1377,28 @@ mod tests {
             tool_use_ids: vec!["toolu_rm".into(), "toolu_ask".into()],
         });
         assert_eq!(t.entries.len(), settled, "a replayed retirement is a no-op");
+    }
+
+    /// The sentence has to survive someone's urge to say more than is known.
+    /// Both claims it once made were false in a reachable case: "the agent
+    /// restarted" when a process had simply exited, and "nothing was approved"
+    /// when a decision from another device had already reached the agent
+    /// without moving this fold.
+    #[test]
+    fn the_retirement_notice_claims_neither_a_restart_nor_an_approval() {
+        for n in [1, 2, 7] {
+            let text = crate::thread::retired_prompts_notice(n);
+            assert!(
+                !text.contains("restart"),
+                "a process that exited and was not replaced did not restart: {text}"
+            );
+            assert!(
+                !text.contains("approv"),
+                "a prompt answered from another device leaves this fold waiting, \
+                 so the approval state is not ours to state: {text}"
+            );
+            assert!(text.contains("cut off"), "it still says what happened: {text}");
+        }
     }
 
     /// The event names the prompts the departed process raised, so a fold
