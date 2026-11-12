@@ -30,6 +30,19 @@ pub fn needs_you_now(cx: &gpui::App) -> Vec<(String, Attention)> {
         .unwrap_or_default()
 }
 
+/// Whether the rail has to repaint because *which* sessions are asking has
+/// changed — not merely how many.
+///
+/// One session being dealt with as another starts asking leaves the count
+/// identical. Comparing only the count would leave the dashboard showing the
+/// row that has gone until some unrelated input happened to repaint it.
+pub fn membership_changed(
+    previous: &std::collections::HashSet<String>,
+    current: &std::collections::HashSet<String>,
+) -> bool {
+    previous != current
+}
+
 /// The worst kind among `needs_you`, which is what colours the chip.
 ///
 /// `None` for an empty list, where there is nothing to colour. The order is
@@ -75,6 +88,19 @@ mod tests {
             Some(AttentionKind::Failed),
             "a failure outranks a stall"
         );
+    }
+
+    #[test]
+    fn a_swap_with_no_change_in_count_still_repaints() {
+        // The case a count cannot see: one session answered in the same pass
+        // another starts asking. Two rows changed and the number did not.
+        let before: std::collections::HashSet<String> =
+            ["chat:a".to_string(), "cockpit:7".to_string()].into_iter().collect();
+        let after: std::collections::HashSet<String> =
+            ["cockpit:7".to_string(), "chat:b".to_string()].into_iter().collect();
+        assert_eq!(before.len(), after.len(), "the premise: the count is unchanged");
+        assert!(membership_changed(&before, &after));
+        assert!(!membership_changed(&before, &before.clone()), "and an unchanged set is quiet");
     }
 
     #[test]

@@ -309,6 +309,9 @@ pub struct LeftRail {
     /// How many sessions need a person, as of the last pass. A count, not a
     /// tally — see `badge`.
     agents_unread: u32,
+    /// *Which* sessions those were, so a repaint happens when the membership
+    /// changes and not only when the number does. Never displayed.
+    agents_needing_you: std::collections::HashSet<String>,
     /// Per-project held Smart-sort order during the settle window (item:
     /// Smart rows don't reshuffle under the cursor right after a status
     /// change). Keyed by project id. Not persisted.
@@ -389,6 +392,7 @@ impl LeftRail {
             locate_glow_seq: 0,
             locate_anchor: new_anchor(),
             agents_unread: 0,
+            agents_needing_you: std::collections::HashSet::new(),
             smart_settle: HashMap::new(),
             settle_timer_armed: false,
             settle_override_cache: HashMap::new(),
@@ -1045,13 +1049,21 @@ impl LeftRail {
         // rows for. A count rather than a tally of transitions: dealing with a
         // session takes it out, which is what "dealt with" should mean, and it
         // needs no resetting when the page opens.
-        let was_unread = self.agents_unread;
-        self.agents_unread = badge::needs_you_now(cx).len() as u32;
-        // The badge is a render input like any other, and not one of the
-        // compared fields below: a chat going stalled changes the count
-        // without changing any status the rail displays, and the new number
-        // would sit unpainted until something else happened to repaint.
-        let badge_changed = self.agents_unread != was_unread;
+        let needing: std::collections::HashSet<String> =
+            badge::needs_you_now(cx).into_iter().map(|(target, _)| target).collect();
+        self.agents_unread = needing.len() as u32;
+        // Attention is a render input like any other, and none of the compared
+        // fields below carries it: a chat going stalled changes what the rows
+        // say without changing any status the rail displays.
+        //
+        // The *set*, not just the count: one session being dealt with as
+        // another starts asking leaves the number identical, and comparing
+        // only the number would leave the dashboard showing the row that has
+        // gone until some unrelated input happened to repaint. The badge
+        // itself is still the count — this is how the change is noticed, not
+        // what is displayed.
+        let badge_changed = badge::membership_changed(&self.agents_needing_you, &needing);
+        self.agents_needing_you = needing;
         // Dirty-check: `WorkspaceRoot::render` pushes this snapshot down every
         // frame (and re-renders on every pane-output tick while an agent
         // streams), so notifying unconditionally rebuilds the whole rail
