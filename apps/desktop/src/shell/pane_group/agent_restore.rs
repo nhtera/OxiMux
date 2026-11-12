@@ -57,8 +57,6 @@ impl PaneGroup {
         }) else {
             return false;
         };
-        let notifier = self.notifier.clone();
-        let window_active = self.window_active.clone();
         let tab = &mut self.tabs[idx];
         let PaneContent::Terminal(tree) = &tab.content else {
             return false;
@@ -79,30 +77,21 @@ impl PaneGroup {
             v.prefill_grid(marker(kind));
             v.arm_restore_notice(kind.label());
         });
-        let PaneGroupTabKind::Agent {
-            session_id,
-            status_rx,
-            worktree_path,
-            ..
-        } = &mut tab.kind
+        let PaneGroupTabKind::Agent { session_id, status_rx, .. } = &mut tab.kind
         else {
             return false;
         };
         *session_id = new;
         *status_rx = new_status_rx.clone();
-        let workspace_key = worktree_path.to_string_lossy().into_owned();
         let label = tab.label.clone();
         let weak_view = view.downgrade();
         // The restore path hands the same proxy stream back (see
-        // `restore_agent_tab`); respawning the watcher re-keys its toasts and
-        // banners to the fresh session's tab id.
+        // `restore_agent_tab`); respawning the watcher re-keys its ring and
+        // toasts to the fresh session's tab id.
         tab._status_task = Some(spawn_status_task(
             new_status_rx,
-            notifier,
-            window_active,
             TabId::from(new),
             label,
-            workspace_key,
             weak_view,
             cx,
         ));

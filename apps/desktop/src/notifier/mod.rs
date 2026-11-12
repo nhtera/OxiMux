@@ -1,11 +1,20 @@
 //! Agent notification dispatch — platform-agnostic surface.
 //!
 //! The badge alone covers the in-app case; this module covers the
-//! out-of-app case: a desktop notification fires when an agent transitions
-//! into a notify-worthy state (`NeedsApproval`, `WaitingForInput`, `Done`,
-//! `Failed`) — by default only while the OxiMux window is not the active
-//! one. Clicking the notification brings the window forward and switches
-//! the workspace tab to the originating agent.
+//! out-of-app case: a desktop notification fires when a session starts
+//! needing a person — by default only while the OxiMux window is not the
+//! active one. Clicking the notification brings the window forward and
+//! switches to the session it came from.
+//!
+//! **One owner.** Every agent-state banner comes from
+//! [`attention_bridge::AttentionBridge`], which subscribes to the host's
+//! attention stream. There used to be two independent paths — a per-tab
+//! status watcher for cockpit agents and a view event for chats — and with a
+//! third answer arriving from the host they would have fired next to each
+//! other. The bridge owns the dedupe, so what dedupes and what decides are
+//! the same thing. The bell, the terminal's own notifications and the
+//! settings test button are separate sources and still call `notify`
+//! directly.
 //!
 //! Layout:
 //!   - `Notifier` trait — synchronous surface so a `MockNotifier` in tests
@@ -16,9 +25,9 @@
 //!   - `TabId` — opaque newtype routing a stable agent-session handle from
 //!     the badge subscription through the notifier and back into the GPUI
 //!     workspace-tab activation path.
-//!   - `SuppressMap` — per-(tab, kind) dedupe so an adapter that re-emits
-//!     its prompt on every output chunk produces one notification.
-//!   - `notification_kind_for_transition` — pure edge detector; tested.
+//!   - `BurstGate` — per-workspace burst collapse, for the bell source only.
+//!     Agent-state traffic is deduped by edge identity in the bridge, which
+//!     is exact where a time window is a guess.
 //!
 //! Platform impls live in sibling modules: `mac` (active on
 //! `target_os = "macos"`) and `null` (no-op fallback).
@@ -27,17 +36,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use oximux_core::{AgentSessionId, AgentStatus};
+use oximux_agents::attention::AttentionKind;
+use oximux_core::AgentSessionId;
 
+pub mod attention_bridge;
 pub mod null;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
-
-/// Minimum interval between two notifications for the same (tab, kind).
-/// An adapter that re-prints its prompt on every output chunk (or one that
-/// races the status detector) must not be allowed to spam.
-pub const SUPPRESS_WINDOW: Duration = Duration::from_secs(30);
 
 /// Burst-collapse window: a second notification for the same workspace
 /// (any tab, any kind) within this span is dropped, so two agents
@@ -60,7 +66,7 @@ pub enum NotificationSource {
 
 /// One notification dispatch, bundled so the `Notifier` trait surface
 /// stays stable as gating inputs grow.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NotificationRequest {
     pub source: NotificationSource,
     pub kind: NotificationKind,
@@ -78,12 +84,21 @@ pub struct NotificationRequest {
     /// group. A visible pane in a frontmost window never banners — the
     /// user is already looking at it.
     pub pane_visible: bool,
-    /// When true, at most ONE banner fires for this `tab_id` until the window
-    /// regains focus (`Notifier::clear_attention`) — "one outstanding attention
-    /// per tab", the chat-thread policy. Distinct from the per-source 30s
-    /// `SuppressMap` the ambient status path uses; false there, so a long-running
-    /// agent's periodic re-prompts still surface. Default false.
-    pub coalesce_until_focus: bool,
+    /// The identifier to post under, when the caller owns one.
+    ///
+    /// A stable string, so posting again *replaces* the delivered banner in
+    /// place instead of stacking a second one: `session:<handle>` for a
+    /// session's own alert and `root:<handle>` for a root's coalesced child
+    /// count. It is also what [`Notifier::retire`] takes, so whoever posted a
+    /// banner can take it back when the thing it was about is over.
+    ///
+    /// `None` keeps the per-source identifier the bell and test paths mint,
+    /// which carries a sequence number and so never replaces.
+    pub replace_key: Option<String>,
+    /// Post without a sound. For an update to a banner the person has already
+    /// heard: a root's child count going from 2 to 3 is the same alert saying
+    /// more, and a count going down is not news at all.
+    pub quiet: bool,
 }
 
 /// Per-workspace burst collapse (see [`BURST_WINDOW`]). Owned by the
@@ -146,6 +161,15 @@ pub enum ClickTarget {
     /// `bell:{session}:{seq}` — the raw terminal session id whose pane
     /// rang the bell.
     TerminalSession(u64),
+    /// `session:{handle}` — the session one of the bridge's banners was
+    /// about. The handle is minted by the bridge, which holds the mapping
+    /// back to the namespaced target; a `u64` keeps this type `Copy`, and it
+    /// is re-sent to every window on a click.
+    NeedsYou(u64),
+    /// `root:{handle}` — a root whose children need someone. Clicking it
+    /// goes to the oldest child still waiting, the same place the
+    /// jump-to-next hotkey would.
+    NeedsYouRoot(u64),
 }
 
 /// Which agent lifecycle edge a notification represents. Drives the banner
@@ -160,6 +184,11 @@ pub enum NotificationKind {
     Done,
     /// Agent exited with an error.
     Failed,
+    /// Nothing from the agent for long enough that it looks stuck.
+    Stalled,
+    /// Held by a rate limit. Informational: it retries itself, so this is
+    /// news about *why* nothing is happening, not a request to act.
+    Limited,
     /// Terminal bell (BEL) from a pane the user can't see. Only dispatched
     /// when the bell setting is `Notify`, so it has no per-kind toggle of
     /// its own — the source gate + that setting are the opt-ins.
@@ -171,15 +200,20 @@ pub enum NotificationKind {
 }
 
 impl NotificationKind {
-    /// The notify-worthy kind for a status, or `None` for transient states
-    /// (`Idle`, `Running`, `Interrupted`).
-    pub fn from_status(status: &AgentStatus) -> Option<Self> {
-        match status {
-            AgentStatus::NeedsApproval(_) => Some(Self::NeedsApproval),
-            AgentStatus::WaitingForInput => Some(Self::WaitingForInput),
-            AgentStatus::Done { .. } => Some(Self::Done),
-            AgentStatus::Failed(_) => Some(Self::Failed),
-            _ => None,
+    /// The banner kind for one attention kind.
+    ///
+    /// The only mapping from attention to a banner, and the replacement for
+    /// the status-based one this module used to own: a status cannot say
+    /// whether anyone has dealt with the thing it describes, so deciding from
+    /// it meant re-announcing a failure the person had already dismissed.
+    pub fn from_attention(kind: AttentionKind) -> Self {
+        match kind {
+            AttentionKind::NeedsPermission => Self::NeedsApproval,
+            AttentionKind::NeedsInput => Self::WaitingForInput,
+            AttentionKind::Failed => Self::Failed,
+            AttentionKind::Stalled => Self::Stalled,
+            AttentionKind::Limited => Self::Limited,
+            AttentionKind::FinishedUnread => Self::Done,
         }
     }
 
@@ -190,6 +224,8 @@ impl NotificationKind {
             Self::WaitingForInput => format!("Agent waiting for input — {agent_label}"),
             Self::Done => format!("Agent finished — {agent_label}"),
             Self::Failed => format!("Agent failed — {agent_label}"),
+            Self::Stalled => format!("Agent may be stuck — {agent_label}"),
+            Self::Limited => format!("Agent is rate-limited — {agent_label}"),
             Self::Bell => format!("Terminal bell — {agent_label}"),
             // Fixed: a program may not choose the banner title, or it could
             // pose as an agent or the system. Its own title goes in the body.
@@ -213,6 +249,13 @@ pub struct AgentNotifySettings {
     pub waiting_input: AtomicBool,
     pub done: AtomicBool,
     pub failed: AtomicBool,
+    /// Off by default: the stall threshold is a measurement this phase has
+    /// not taken yet, and a banner for "nothing happened" is the easiest
+    /// one to cry wolf with.
+    pub stalled: AtomicBool,
+    /// Off by default: a rate limit retries itself, so it is news rather
+    /// than a request to act.
+    pub limited: AtomicBool,
     pub sound: AtomicBool,
     /// When true (default), only notify while the window is unfocused.
     pub only_when_unfocused: AtomicBool,
@@ -229,6 +272,8 @@ pub struct NotifyPrefValues {
     pub waiting_input: bool,
     pub done: bool,
     pub failed: bool,
+    pub stalled: bool,
+    pub limited: bool,
     pub sound: bool,
     pub only_when_unfocused: bool,
 }
@@ -246,6 +291,8 @@ impl Default for NotifyPrefValues {
             waiting_input: false,
             done: true,
             failed: true,
+            stalled: false,
+            limited: false,
             sound: false,
             only_when_unfocused: true,
         }
@@ -262,6 +309,8 @@ impl AgentNotifySettings {
             waiting_input: AtomicBool::new(v.waiting_input),
             done: AtomicBool::new(v.done),
             failed: AtomicBool::new(v.failed),
+            stalled: AtomicBool::new(v.stalled),
+            limited: AtomicBool::new(v.limited),
             sound: AtomicBool::new(v.sound),
             only_when_unfocused: AtomicBool::new(v.only_when_unfocused),
         }
@@ -289,6 +338,8 @@ impl AgentNotifySettings {
             waiting_input: read(keys::WAITING_INPUT, d.waiting_input),
             done: read(keys::DONE, d.done),
             failed: read(keys::FAILED, d.failed),
+            stalled: read(keys::STALLED, d.stalled),
+            limited: read(keys::LIMITED, d.limited),
             sound: read(keys::SOUND, d.sound),
             only_when_unfocused: read(keys::ONLY_WHEN_UNFOCUSED, d.only_when_unfocused),
         })
@@ -327,6 +378,8 @@ impl AgentNotifySettings {
             NotificationKind::WaitingForInput => &self.waiting_input,
             NotificationKind::Done => &self.done,
             NotificationKind::Failed => &self.failed,
+            NotificationKind::Stalled => &self.stalled,
+            NotificationKind::Limited => &self.limited,
             // Bell carries no per-kind toggle: the per-pane `Notify` bell
             // setting and the source gate above are the opt-ins.
             NotificationKind::Bell | NotificationKind::TerminalNotify => return true,
@@ -393,6 +446,8 @@ pub mod keys {
     pub const WAITING_INPUT: &str = "notify.waiting_input";
     pub const DONE: &str = "notify.done";
     pub const FAILED: &str = "notify.failed";
+    pub const STALLED: &str = "notify.stalled";
+    pub const LIMITED: &str = "notify.limited";
     pub const SOUND: &str = "notify.sound";
     pub const ONLY_WHEN_UNFOCUSED: &str = "notify.only_when_unfocused";
 }
@@ -431,63 +486,17 @@ pub trait Notifier: Send + Sync {
     /// focus — the user is back, so the accumulated count clears. Default no-op
     /// (the null notifier / mocks have no dock tile).
     fn clear_attention(&self) {}
-}
 
-/// The notification kind to fire for a `(prev → new)` status edge, or `None`
-/// when `new` is not notify-worthy or is the same kind as `prev` (a no-edge
-/// repeat — e.g. `NeedsApproval → NeedsApproval` even if the payload differs).
-pub fn notification_kind_for_transition(
-    prev: &AgentStatus,
-    new: &AgentStatus,
-) -> Option<NotificationKind> {
-    let kind = NotificationKind::from_status(new)?;
-    if NotificationKind::from_status(prev) == Some(kind) {
-        return None;
-    }
-    Some(kind)
-}
-
-/// Per-(tab, kind) rate limiter for notification dispatch. The status
-/// watcher consults this before calling [`Notifier::notify`]. Owned by the
-/// per-tab `_status_task` closure — not shared across tabs.
-pub struct SuppressMap {
-    last_fired: HashMap<(TabId, NotificationKind), Instant>,
-    window: Duration,
-}
-
-impl SuppressMap {
-    pub fn new() -> Self {
-        Self {
-            last_fired: HashMap::new(),
-            window: SUPPRESS_WINDOW,
-        }
-    }
-
-    /// Returns true if a notification for `(tab_id, kind)` may fire at `now`.
-    /// On a positive return the map records `now` so subsequent calls within
-    /// `window` return false. Pass `Instant::now()` in production and a
-    /// synthetic Instant in tests.
-    pub fn should_fire(&mut self, tab_id: TabId, kind: NotificationKind, now: Instant) -> bool {
-        match self.last_fired.get(&(tab_id, kind)) {
-            Some(prev) if now.duration_since(*prev) < self.window => false,
-            _ => {
-                self.last_fired.insert((tab_id, kind), now);
-                true
-            }
-        }
-    }
-
-    /// Forget the last-fired timestamp for `(tab_id, kind)`. Called when an
-    /// agent leaves that state so the next entry can fire immediately rather
-    /// than waiting out the rate-limit window.
-    pub fn forget(&mut self, tab_id: TabId, kind: NotificationKind) {
-        self.last_fired.remove(&(tab_id, kind));
-    }
-}
-
-impl Default for SuppressMap {
-    fn default() -> Self {
-        Self::new()
+    /// Take back the banner posted under `replace_key`, if it is still
+    /// delivered.
+    ///
+    /// What makes a banner honest: a permission answered on a phone, a
+    /// failure dismissed in the rail, a root whose last child was dealt with
+    /// — the thing the banner was about is over, and a notification the
+    /// person finds later should not still be asking. Default no-op, so the
+    /// null notifier and mocks stay one-liners.
+    fn retire(&self, replace_key: &str) {
+        let _ = replace_key;
     }
 }
 
@@ -534,75 +543,25 @@ mod tests {
         assert!(gate.should_fire(&terminal_burst_key("/wt", true), now + Duration::from_millis(30)));
     }
 
-    fn na(reason: &str) -> AgentStatus {
-        AgentStatus::NeedsApproval(reason.into())
-    }
-
     #[test]
-    fn fires_on_idle_to_needs_approval() {
-        assert_eq!(
-            notification_kind_for_transition(&AgentStatus::Idle, &na("write?")),
-            Some(NotificationKind::NeedsApproval)
-        );
+    fn every_attention_kind_has_a_banner_kind() {
+        use oximux_agents::attention::AttentionKind;
+        // The mapping is total on purpose: a kind with no banner would be an
+        // alert the rail shows and the notifier silently drops.
+        let pairs = [
+            (AttentionKind::NeedsPermission, NotificationKind::NeedsApproval),
+            (AttentionKind::NeedsInput, NotificationKind::WaitingForInput),
+            (AttentionKind::Failed, NotificationKind::Failed),
+            (AttentionKind::Stalled, NotificationKind::Stalled),
+            (AttentionKind::Limited, NotificationKind::Limited),
+            (AttentionKind::FinishedUnread, NotificationKind::Done),
+        ];
+        for (attention, banner) in pairs {
+            assert_eq!(NotificationKind::from_attention(attention), banner);
+        }
     }
 
-    #[test]
-    fn fires_on_running_to_done_and_failed() {
-        assert_eq!(
-            notification_kind_for_transition(
-                &AgentStatus::Running,
-                &AgentStatus::Done { code: Some(0) }
-            ),
-            Some(NotificationKind::Done)
-        );
-        assert_eq!(
-            notification_kind_for_transition(
-                &AgentStatus::Running,
-                &AgentStatus::Failed("boom".into())
-            ),
-            Some(NotificationKind::Failed)
-        );
-    }
 
-    #[test]
-    fn fires_on_running_to_waiting_for_input() {
-        assert_eq!(
-            notification_kind_for_transition(&AgentStatus::Running, &AgentStatus::WaitingForInput),
-            Some(NotificationKind::WaitingForInput)
-        );
-    }
-
-    #[test]
-    fn does_not_fire_when_already_in_needs_approval() {
-        // Adapter re-emits the same prompt; payload may even change. The
-        // dedupe-by-kind guard prevents a second notification.
-        assert_eq!(
-            notification_kind_for_transition(&na("first?"), &na("second?")),
-            None
-        );
-    }
-
-    #[test]
-    fn does_not_fire_for_transient_states() {
-        assert_eq!(
-            notification_kind_for_transition(&AgentStatus::Idle, &AgentStatus::Running),
-            None
-        );
-    }
-
-    #[test]
-    fn fires_again_after_leaving_and_re_entering() {
-        assert_eq!(
-            notification_kind_for_transition(&na("a"), &AgentStatus::Running),
-            None
-        );
-        assert_eq!(
-            notification_kind_for_transition(&AgentStatus::Running, &na("b")),
-            Some(NotificationKind::NeedsApproval)
-        );
-    }
-
-    /// Request fixture: agent-state source, given kind + focus/visibility.
     fn req(kind: NotificationKind, window_active: bool, pane_visible: bool) -> NotificationRequest {
         NotificationRequest {
             source: NotificationSource::AgentState,
@@ -613,7 +572,8 @@ mod tests {
             body: String::new(),
             window_active,
             pane_visible,
-            coalesce_until_focus: false,
+            replace_key: None,
+            quiet: false,
         }
     }
 
@@ -738,56 +698,5 @@ mod tests {
         assert!(g.should_fire("/wt/b", t0 + Duration::from_secs(2)));
         // Same workspace after the window elapses — fires again.
         assert!(g.should_fire("/wt/a", t0 + Duration::from_secs(6)));
-    }
-
-    #[test]
-    fn suppress_map_fires_first_call() {
-        let mut sm = SuppressMap::new();
-        assert!(sm.should_fire(TabId(7), NotificationKind::NeedsApproval, Instant::now()));
-    }
-
-    #[test]
-    fn suppress_map_blocks_within_window() {
-        let mut sm = SuppressMap::new();
-        let t0 = Instant::now();
-        assert!(sm.should_fire(TabId(7), NotificationKind::NeedsApproval, t0));
-        let t1 = t0 + Duration::from_secs(10);
-        assert!(!sm.should_fire(TabId(7), NotificationKind::NeedsApproval, t1));
-    }
-
-    #[test]
-    fn suppress_map_independent_per_kind() {
-        let mut sm = SuppressMap::new();
-        let t0 = Instant::now();
-        assert!(sm.should_fire(TabId(7), NotificationKind::WaitingForInput, t0));
-        // Same tab + instant, different kind — must fire independently so a
-        // waiting-input banner never masks a later approval banner.
-        assert!(sm.should_fire(TabId(7), NotificationKind::NeedsApproval, t0));
-    }
-
-    #[test]
-    fn suppress_map_fires_after_window_elapses() {
-        let mut sm = SuppressMap::new();
-        let t0 = Instant::now();
-        assert!(sm.should_fire(TabId(7), NotificationKind::Done, t0));
-        let t2 = t0 + Duration::from_secs(31);
-        assert!(sm.should_fire(TabId(7), NotificationKind::Done, t2));
-    }
-
-    #[test]
-    fn suppress_map_forget_reopens_fire_window() {
-        let mut sm = SuppressMap::new();
-        let t0 = Instant::now();
-        assert!(sm.should_fire(TabId(7), NotificationKind::NeedsApproval, t0));
-        let t1 = t0 + Duration::from_secs(10);
-        assert!(!sm.should_fire(TabId(7), NotificationKind::NeedsApproval, t1));
-        sm.forget(TabId(7), NotificationKind::NeedsApproval);
-        assert!(sm.should_fire(TabId(7), NotificationKind::NeedsApproval, t1));
-    }
-
-    #[test]
-    fn tab_id_from_session_id_roundtrips() {
-        let sid = AgentSessionId::new(42);
-        assert_eq!(TabId::from(sid), TabId(42));
     }
 }

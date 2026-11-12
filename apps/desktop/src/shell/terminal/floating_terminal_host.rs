@@ -192,7 +192,8 @@ impl WorkspaceRoot {
                         body: body.clone(),
                         window_active: window.is_window_active(),
                         pane_visible: *pane_visible,
-                        coalesce_until_focus: false,
+                        replace_key: None,
+                        quiet: false,
                     });
                 }
             },

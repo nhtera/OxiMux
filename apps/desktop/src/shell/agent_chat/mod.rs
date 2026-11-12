@@ -12,7 +12,6 @@
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
 mod apply_patch;
-mod attention;
 mod auth_card;
 mod background_tasks_panel;
 mod bubble;
@@ -417,18 +416,6 @@ pub enum AgentChatEvent {
     /// are: a `window.dispatch_action` from a render closure does not reach the
     /// host's action handlers. `key` makes each turn its own tab.
     ReviewTurnDiffRequested { key: String, diff: String },
-    /// A live chat turn reached a state the user should be told about while they
-    /// may be looking elsewhere — the turn finished / errored, or it paused on a
-    /// permission / question / auth prompt. The host (which owns the notifier +
-    /// the window-active / visible-tab context) decides whether to raise a
-    /// desktop notification + dock badge, applying the shared notification gates.
-    /// Emitted only for LIVE events (a restored transcript seeds entries directly,
-    /// never through the event path), so it never fires during restore replay.
-    AttentionNeeded {
-        kind: crate::notifier::NotificationKind,
-        /// Short context for the banner body (tool name, error head); may be empty.
-        body: String,
-    },
 }
 
 /// Which surface an agent-chat tab is showing: its structured chat, or a
@@ -528,7 +515,6 @@ use tool_grouping::{
     GroupedTool,
 };
 use crate::remote_control::{RemoteBinding, RemoteControl, remote_session_id_for};
-use attention::attention_for_event;
 use computer_use::ScreenControl;
 pub use computer_use::clear_stale_screen_control_grants;
 use screen_consent::ScreenPrompt;
@@ -2794,14 +2780,11 @@ impl AgentChatView {
         if self.interrupted {
             self.thread.last_error = None;
         }
-        // Raise an attention signal for a live turn edge the user should hear
-        // about while looking elsewhere. The host applies the focus/visibility/
-        // per-kind gates — this only classifies the edge. Gated on `was_active`
-        // for the finished/errored kinds so a stray no-turn result can't banner,
-        // and suppressed for an intentional Stop (an interrupt isn't a failure).
-        if let Some((kind, body)) = attention_for_event(&ev, was_active, self.interrupted) {
-            cx.emit(AgentChatEvent::AttentionNeeded { kind, body });
-        }
+        // No banner is raised from here any more. A view can see that a turn
+        // ended; it cannot see whether the person has dealt with it, which is
+        // what decides whether to interrupt them. The session's health reaches
+        // the host, the host decides, and the attention bridge posts — one
+        // owner instead of this path racing the cockpit's.
         // Following (and the actual `scroll_to_bottom`) is owned by `render` via
         // `stick_to_bottom`, so newly-arrived content — streamed text, a tall
         // tool card, an Allow/Reject row — stays glued as it settles. Arm a short

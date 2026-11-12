@@ -845,7 +845,8 @@ impl PaneGroup {
             window_active: self.window_active.load(Ordering::Relaxed),
             pane_visible,
             // A bell is a one-shot event, not a sticky state — no until-focus coalescing.
-            coalesce_until_focus: false,
+            replace_key: None,
+            quiet: false,
         });
     }
 

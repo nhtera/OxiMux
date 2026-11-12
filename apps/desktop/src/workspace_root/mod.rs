@@ -834,6 +834,12 @@ impl WorkspaceRoot {
             Arc::new(crate::notifier::null::NullNotifier)
         };
 
+        // The one agent-state notifier owner, started by whichever window
+        // gets here first (the call is a no-op after that). It outlives this
+        // window: clicks are broadcast to every registered window, so a
+        // banner stays clickable while any of them is open.
+        crate::notifier::attention_bridge::AttentionBridge::start(notifier.clone(), cx);
+
         // ProjectPanes entities live in a per-project HashMap, lazily built on
         // the first `set_active_project` call. Boot renders the welcome view
         // until the project-restore path (or user open) supplies one.
@@ -1438,6 +1444,14 @@ impl WorkspaceRoot {
                                 window,
                                 cx,
                             );
+                        }
+                        // One of the bridge's banners. The identifier carries
+                        // a handle rather than the session's key, so the
+                        // bridge resolves it — and for a root's banner it
+                        // resolves to the child that has waited longest.
+                        needs_you @ (crate::notifier::ClickTarget::NeedsYou(_)
+                        | crate::notifier::ClickTarget::NeedsYouRoot(_)) => {
+                            root.navigate_to_attention(needs_you, window, cx);
                         }
                     })
                     .is_err()
