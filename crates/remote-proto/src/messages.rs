@@ -402,7 +402,9 @@ impl HostEvent {
 
     /// Build a frame for a specific peer, downgrading any event that peer's
     /// decoder predates (see
-    /// [`PERMISSION_EDITED_MIN_VERSION`](crate::proto::PERMISSION_EDITED_MIN_VERSION)).
+    /// [`PERMISSION_EDITED_MIN_VERSION`](crate::proto::PERMISSION_EDITED_MIN_VERSION)
+    /// and
+    /// [`PROMPTS_RETIRED_MIN_VERSION`](crate::proto::PROMPTS_RETIRED_MIN_VERSION)).
     /// The one constructor every host-side frame builder should use — building
     /// with [`Self::new`] sends a vocabulary the peer never declared it speaks,
     /// and the downgrade keeps the seq occupied so a resync cannot loop on it.
@@ -413,6 +415,16 @@ impl HostEvent {
         status: SessionStatusWire,
         peer_version: u32,
     ) -> Result<Self, WireError> {
+        // The prose carries the same sentence the fold would have written, so an
+        // older phone still learns the request was cut off and nothing approved.
+        if peer_version < crate::proto::PROMPTS_RETIRED_MIN_VERSION
+            && let ThreadEvent::PromptsRetired { tool_use_ids } = event
+        {
+            let notice = ThreadEvent::Notice(oximux_agent_core::thread::retired_prompts_notice(
+                tool_use_ids.len(),
+            ));
+            return Self::new(session_id, seq, &notice, status);
+        }
         if peer_version < crate::proto::PERMISSION_EDITED_MIN_VERSION
             && let ThreadEvent::PermissionEdited { request_id, .. } = event
         {
@@ -1083,5 +1095,45 @@ mod tests {
         let plain = ThreadEvent::AssistantText("hi".into());
         let frame = HostEvent::new_for_peer("s1", 9, &plain, status(), 1).unwrap();
         assert_eq!(frame.event().unwrap(), plain);
+    }
+
+    /// A retirement reaches a peer that predates the event as the fold's own
+    /// sentence, in the same seq. Such a peer cannot cancel the card itself,
+    /// so the prose is all it gets — and it must be the same prose, which is
+    /// why the wording has one definition.
+    #[test]
+    fn an_old_peer_is_told_in_prose_that_the_prompts_were_cut_off() {
+        let retired =
+            ThreadEvent::PromptsRetired { tool_use_ids: vec!["toolu_a".into(), "toolu_b".into()] };
+        let frame = HostEvent::new_for_peer(
+            "s1",
+            12,
+            &retired,
+            status(),
+            crate::proto::PROMPTS_RETIRED_MIN_VERSION - 1,
+        )
+        .unwrap();
+        assert_eq!(frame.seq, 12, "the seq stays occupied");
+        match frame.event().expect("decodable by any build") {
+            ThreadEvent::Notice(text) => assert_eq!(
+                text,
+                oximux_agent_core::thread::retired_prompts_notice(2),
+                "the one wording, for both counts of prompts"
+            ),
+            other => panic!("expected the downgrade Notice, got {other:?}"),
+        }
+
+        let frame = HostEvent::new_for_peer(
+            "s1",
+            12,
+            &retired,
+            status(),
+            crate::proto::PROMPTS_RETIRED_MIN_VERSION,
+        )
+        .unwrap();
+        assert!(
+            matches!(frame.event().unwrap(), ThreadEvent::PromptsRetired { .. }),
+            "a peer at the floor cancels the cards itself"
+        );
     }
 }

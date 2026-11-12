@@ -733,6 +733,16 @@ impl ChatThread {
                     self.entries.push(ThreadEntry::ContextCompaction { summary: text.clone() });
                 }
             }
+            // The process that raised these prompts is gone, so nothing can
+            // carry an answer to them. Retire the ones still waiting and say
+            // so in the transcript — through the `Notice` arm, so the divider
+            // and its collapse rule stay defined in one place.
+            ThreadEvent::PromptsRetired { tool_use_ids } => {
+                let cut = self.retire_prompts(tool_use_ids);
+                if cut > 0 {
+                    self.apply(&ThreadEvent::Notice(crate::thread::retired_prompts_notice(cut)));
+                }
+            }
             ThreadEvent::SessionResumeStale { attempted_id } => {
                 if self.session_id.as_deref() == Some(attempted_id.as_str()) {
                     self.session_id = None;
@@ -955,6 +965,24 @@ impl ChatThread {
         })
     }
 
+    /// Every permission request awaiting a decision, oldest first.
+    ///
+    /// A process can block on more than one at a time, so a path that answers
+    /// "the" pending permission answers only the oldest and leaves the child
+    /// waiting on the rest.
+    pub fn pending_permissions(&self) -> Vec<(&str, &PermissionRequest)> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::ToolCall(tc) => match &tc.status {
+                    ToolCallStatus::WaitingForConfirmation(req) => Some((tc.id.as_str(), req)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The pending AskUserQuestion (if any) awaiting the user's answers.
     pub fn pending_question(&self) -> Option<(&str, &QuestionRequest)> {
         self.entries.iter().find_map(|e| match e {
@@ -964,6 +992,52 @@ impl ChatThread {
             },
             _ => None,
         })
+    }
+
+    /// Every tool call currently waiting on a person: a permission to approve
+    /// or a question to answer.
+    ///
+    /// The input to [`ThreadEvent::PromptsRetired`], which is how a process's
+    /// departure is told to this fold and to every remote one.
+    pub fn pending_prompt_ids(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::ToolCall(tc)
+                    if matches!(
+                        tc.status,
+                        ToolCallStatus::WaitingForConfirmation(_) | ToolCallStatus::AwaitingAnswer(_)
+                    ) =>
+                {
+                    Some(tc.id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Mark each named prompt `Canceled`, skipping any that is not waiting.
+    /// Returns how many were actually retired.
+    ///
+    /// They become `Canceled` rather than being removed: the request really
+    /// was made, and a transcript that quietly loses it is a worse record than
+    /// one that shows it was cut off.
+    fn retire_prompts(&mut self, tool_use_ids: &[String]) -> usize {
+        let mut cut = 0;
+        for entry in &mut self.entries {
+            let ThreadEntry::ToolCall(tc) = entry else { continue };
+            if !tool_use_ids.iter().any(|id| id == &tc.id) {
+                continue;
+            }
+            if matches!(
+                tc.status,
+                ToolCallStatus::WaitingForConfirmation(_) | ToolCallStatus::AwaitingAnswer(_)
+            ) {
+                tc.status = ToolCallStatus::Canceled;
+                cut += 1;
+            }
+        }
+        cut
     }
 
     fn tool_call_mut(&mut self, id: &str) -> Option<&mut ToolCall> {
@@ -1240,6 +1314,138 @@ mod tests {
         // deny → rejected, no longer pending
         t.set_tool_status("toolu_9", ToolCallStatus::Rejected);
         assert!(t.pending_permission().is_none());
+    }
+
+    /// A decision is routed back to the process that asked, by request id, so
+    /// once that process is replaced nothing can carry an answer there. The
+    /// prompts have to stop claiming the agent is waiting — and the transcript
+    /// has to say they were cut off, since the event is also what a remote
+    /// subscriber folds.
+    #[test]
+    fn a_respawn_retires_every_prompt_the_dead_process_was_waiting_on() {
+        let mut t = ChatThread::new();
+        t.push_user_message("tidy up");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_rm".into(), name: "Bash".into(), input: json!({"command": "rm -rf build"}) });
+        t.apply(&ThreadEvent::PermissionRequested {
+            request_id: "rid".into(), tool_use_id: Some("toolu_rm".into()),
+            tool_name: "Bash".into(), input: json!({"command": "rm -rf build"}),
+            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+        let ask = json!({"questions":[{"question":"Which first?","header":"Order",
+            "options":[{"label":"Tests","description":""},{"label":"Docs","description":""}],
+            "multiSelect":false}]});
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_ask".into(), name: "AskUserQuestion".into(), input: ask.clone() });
+        t.apply(&ThreadEvent::QuestionAsked {
+            request_id: "qid".into(), tool_use_id: Some("toolu_ask".into()),
+            questions: crate::thread::question::parse_questions(&ask) });
+        assert!(t.pending_permission().is_some());
+        assert!(t.pending_question().is_some());
+
+        let waiting = t.pending_prompt_ids();
+        assert_eq!(waiting, vec!["toolu_rm".to_string(), "toolu_ask".to_string()], "both were waiting");
+        let entries_before = t.entries.len();
+        t.apply(&ThreadEvent::PromptsRetired { tool_use_ids: waiting });
+
+        assert!(t.pending_permission().is_none(), "nothing is waiting on a person any more");
+        assert!(t.pending_question().is_none());
+        // The transcript says what happened, in the one wording the host's wire
+        // downgrade also sends.
+        match t.entries.last() {
+            Some(ThreadEntry::ContextCompaction { summary }) => {
+                assert_eq!(*summary, crate::thread::retired_prompts_notice(2));
+            }
+            other => panic!("expected the retirement notice, got {other:?}"),
+        }
+        assert_eq!(t.entries.len(), entries_before + 1, "one notice, nothing else added");
+        // Cut off, not erased: the request really was made, and a transcript
+        // that loses it is a worse record than one that shows what happened.
+        for (entry, id) in [(&t.entries[1], "toolu_rm"), (&t.entries[2], "toolu_ask")] {
+            match entry {
+                ThreadEntry::ToolCall(tc) => {
+                    assert_eq!(tc.id, id);
+                    assert_eq!(tc.status, ToolCallStatus::Canceled, "{id}");
+                }
+                other => panic!("expected the tool call, got {other:?}"),
+            }
+        }
+        assert!(t.pending_prompt_ids().is_empty(), "nothing left to retire");
+        // Applied twice (a resync replays the event), it adds nothing: the
+        // calls are no longer waiting, so there is nothing to say either.
+        let settled = t.entries.len();
+        t.apply(&ThreadEvent::PromptsRetired {
+            tool_use_ids: vec!["toolu_rm".into(), "toolu_ask".into()],
+        });
+        assert_eq!(t.entries.len(), settled, "a replayed retirement is a no-op");
+    }
+
+    /// The sentence has to survive someone's urge to say more than is known.
+    /// Both claims it once made were false in a reachable case: "the agent
+    /// restarted" when a process had simply exited, and "nothing was approved"
+    /// when a decision from another device had already reached the agent
+    /// without moving this fold.
+    #[test]
+    fn the_retirement_notice_claims_neither_a_restart_nor_an_approval() {
+        for n in [1, 2, 7] {
+            let text = crate::thread::retired_prompts_notice(n);
+            assert!(
+                !text.contains("restart"),
+                "a process that exited and was not replaced did not restart: {text}"
+            );
+            assert!(
+                !text.contains("approv"),
+                "a prompt answered from another device leaves this fold waiting, \
+                 so the approval state is not ours to state: {text}"
+            );
+            assert!(text.contains("cut off"), "it still says what happened: {text}");
+        }
+    }
+
+    /// The event names the prompts the departed process raised, so a fold
+    /// holding a prompt that restart did not touch keeps it. Without this a
+    /// subscriber would lose a live request to someone else's restart.
+    #[test]
+    fn a_retirement_leaves_a_prompt_it_does_not_name_alone() {
+        let mut t = ChatThread::new();
+        t.push_user_message("two jobs");
+        for (id, cmd, rid) in [("toolu_a", "rm -rf a", "rid-a"), ("toolu_b", "rm -rf b", "rid-b")] {
+            t.apply(&ThreadEvent::ToolCallStarted {
+                id: id.into(), name: "Bash".into(), input: json!({"command": cmd}) });
+            t.apply(&ThreadEvent::PermissionRequested {
+                request_id: rid.into(), tool_use_id: Some(id.into()),
+                tool_name: "Bash".into(), input: json!({"command": cmd}),
+                description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+        }
+
+        t.apply(&ThreadEvent::PromptsRetired { tool_use_ids: vec!["toolu_a".into()] });
+
+        assert_eq!(t.pending_prompt_ids(), vec!["toolu_b".to_string()], "the unnamed one still waits");
+        match t.entries.last() {
+            Some(ThreadEntry::ContextCompaction { summary }) => {
+                assert_eq!(*summary, crate::thread::retired_prompts_notice(1), "one, not two");
+            }
+            other => panic!("expected the retirement notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_respawn_leaves_a_settled_tool_call_alone() {
+        let mut t = ChatThread::new();
+        t.push_user_message("read it");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_read".into(), name: "Read".into(), input: json!({"path": "a"}) });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "toolu_read".into(), content: "contents".into(),
+            is_error: false, structured: None });
+
+        assert!(t.pending_prompt_ids().is_empty(), "a finished call is not waiting on anyone");
+        let settled = t.entries.len();
+        t.apply(&ThreadEvent::PromptsRetired { tool_use_ids: vec!["toolu_read".into()] });
+        assert_eq!(t.entries.len(), settled, "and naming it retires nothing, so nothing is said");
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Completed),
+            other => panic!("expected the tool call, got {other:?}"),
+        }
     }
 
     /// An edited approval annotates the card with what was ALLOWED while

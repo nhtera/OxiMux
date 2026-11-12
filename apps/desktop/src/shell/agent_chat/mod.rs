@@ -2158,9 +2158,7 @@ impl AgentChatView {
             return;
         }
         self.pending_respawn = false; // this respawn satisfies a deferred one
-        if let Some(old) = self.connection.take() {
-            old.shutdown();
-        }
+        self.end_the_old_process();
         let mut spec = self.respawn_spec(env, auth_method);
         Self::add_spawn_credential(&mut spec, &self.remote_session_id, self.backend.adapter_id.as_deref(), cx);
         match computer_use::connect_declaring(spec, &self.screen_control, cx) {

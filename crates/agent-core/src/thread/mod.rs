@@ -36,8 +36,8 @@ pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
 pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 pub use event::{
-    AuthMethodInfo, AuthMethodKind, McpServerStatus, PlanEntryLite, SessionMeta, ThreadEvent,
-    TurnUsage,
+    retired_prompts_notice, AuthMethodInfo, AuthMethodKind, McpServerStatus, PlanEntryLite,
+    SessionMeta, ThreadEvent, TurnUsage,
 };
 pub use mcp_server_spec::{to_claude_mcp_config, McpServerSpec};
 pub use question::{
