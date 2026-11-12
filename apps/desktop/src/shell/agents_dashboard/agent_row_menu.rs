@@ -22,7 +22,7 @@ use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
     SharedString, Styled, WeakEntity, Window, div, px,
 };
-use oximux_ui::MenuRow;
+use crate::ui::{FloatingSurface, MenuRow};
 use oximux_agents::attention::Attention;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -161,14 +161,16 @@ impl Render for AgentRowMenu {
         let density = self.density;
         let typography = self.typography.clone();
 
+        // The shared floating chrome — `bg_overlay`, the 1px `border_active`
+        // outline, `r_card` corners and the top inner-highlight — rather than
+        // the four lines every overlay used to hand-roll. Its `relative` sits
+        // on the card, while the positioning below is on the wrapper outside
+        // it, so the pointer anchor is untouched.
         let mut card = div()
             .flex()
             .flex_col()
             .p(px(density.pad_overlay))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg();
 
         // The shared row, not a seventh hand-rolled one: `MenuRow` exists
