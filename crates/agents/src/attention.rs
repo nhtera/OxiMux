@@ -22,6 +22,7 @@
 //!   as [`ExternalAttention`] from whoever knows about them, and are ranked
 //!   against the session's own state rather than rendered somewhere else.
 
+use oximux_core::AgentStatus;
 use crate::health::{HealthStatus, Liveness, SessionHealth};
 use crate::session_prefs::SessionPrefs;
 
@@ -319,27 +320,121 @@ pub fn of_external(
         })
 }
 
+/// The external item a cockpit (terminal) agent's parsed status raises, or
+/// `None` when it raises nothing.
+///
+/// A cockpit agent has no [`SessionHealth`]: OxiMux reads its PTY and parses
+/// an [`AgentStatus`], so it cannot go through [`of`]. It goes through
+/// [`of_external`] instead, as the item this returns — which keeps the kinds,
+/// the priority order and the "has it been dealt with?" lifecycle in exactly
+/// one place, rather than giving the cockpit a second evaluator to drift from.
+///
+/// **Two readers, one item.** The desktop's row builder asks for it so a row
+/// is in the right section the instant it is built, and the cockpit producer
+/// publishes it into the host's registry so the notifier, the badge and a
+/// phone see what the row sees. A row that waited for the producer to publish
+/// would show a blocked agent as "Working" until the first publication landed.
+///
+/// `since` is asked for the *alert*, not for the row, and that is the whole
+/// point of taking it as a function. With `key` it is the item's edge
+/// identity, so it must change when the alert changes and at no other time: a
+/// value taken from the row — a launch time fixed at insert, or the clock —
+/// either never changes while the row lives (so a second request is the first
+/// request and raises nothing) or changes on every refresh (so one alert is a
+/// new alert each time, read as unread again and announced again). In OxiMux
+/// the host answers it, because both readers above ask the same owner and so
+/// cannot disagree.
+pub fn external_of_agent_status(
+    key: String,
+    target: String,
+    status: &AgentStatus,
+    completed_turn: bool,
+    since: impl FnOnce(AttentionKind, &str) -> i64,
+) -> Option<ExternalAttention> {
+    let (kind, reason) = kind_of_agent_status(status, completed_turn)?;
+    let since = since(kind, &reason);
+    Some(ExternalAttention { key, target, kind, reason, since })
+}
+
+/// What a cockpit agent's parsed status raises, with the line to show for it.
+///
+/// Split out of [`external_of_agent_status`] for the callers that want the
+/// question "does this status need a person?" without an item to rank: the nav
+/// badge counts statuses, not alerts. One `match`, so the badge cannot drift
+/// from the row the way it did when it kept its own list.
+///
+/// `completed_turn` is the cockpit's "finished a turn" signal — a parked agent
+/// that has replied. The status alone cannot say it: the agent is `Idle`
+/// either way, and an agent that has never run a turn is not unread work. It
+/// is the counterpart of the `turn_id.is_some()` that [`of`] requires of a
+/// session's health for the same reason.
+pub fn kind_of_agent_status(
+    status: &AgentStatus,
+    completed_turn: bool,
+) -> Option<(AttentionKind, String)> {
+    if completed_turn && matches!(status, AgentStatus::Idle) {
+        return Some((AttentionKind::FinishedUnread, "Finished".to_string()));
+    }
+    let pair = match status {
+        // The captured prompt is the only thing that says *what* is being
+        // approved, so it is the reason verbatim.
+        AgentStatus::NeedsApproval(what) => (AttentionKind::NeedsPermission, what.clone()),
+        AgentStatus::WaitingForInput => {
+            (AttentionKind::NeedsInput, "Waiting for your reply".to_string())
+        }
+        AgentStatus::Failed(why) => (AttentionKind::Failed, why.clone()),
+        AgentStatus::Done { code: Some(0) } => {
+            (AttentionKind::FinishedUnread, "Finished".to_string())
+        }
+        AgentStatus::Done { code: Some(code) } => {
+            (AttentionKind::Failed, format!("Agent process exited (code {code})"))
+        }
+        // Killed by a signal: no code, and not a clean finish.
+        AgentStatus::Done { code: None } => {
+            (AttentionKind::Failed, "Agent process was killed".to_string())
+        }
+        // A user cancel, or a session that was alive at shutdown. Nobody is
+        // being asked anything, and it must not resurface on every boot.
+        AgentStatus::Interrupted => return None,
+        AgentStatus::Running | AgentStatus::Idle => return None,
+    };
+    Some(pair)
+}
+
 /// Whether the person has dealt with one external item.
 ///
 /// An unread finish counts here although it is not dismissible: a producer can
 /// raise one, and looking at the target is what reads it. Nothing else
 /// informational can be cleared by a look — a rate limit is still a rate limit
 /// once you have seen it.
+///
+/// A finish is read when **either** source says so: the watcher, which orders
+/// the look and the alert by observation, or a stored look that is strictly
+/// later than the finish.
+///
+/// It used to be the stored look alone, compared with `>=`. That cannot order
+/// a look and a finish falling in the same millisecond, and the tie went to
+/// "read" — a reply nobody is ever shown. The watcher settles those exactly.
+/// The stored look stays as the second source because a caller that watches
+/// nothing has only that: a phone asking what needs a person must not be told
+/// about a turn its owner read on the desktop. Strictly later, so the
+/// millisecond the two share is the watcher's to answer.
 fn seen_external(
     target: &str,
     item: &ExternalAttention,
     prefs: &SessionPrefs,
     seen: &dyn SeenEdges,
 ) -> bool {
-    if item.kind == AttentionKind::FinishedUnread {
-        return !prefs.unread_override
-            && prefs.last_viewed_at.is_some_and(|viewed| viewed >= item.since);
-    }
     let edge = AttentionEdge {
         target: target.to_string(),
         kind: item.kind,
         id: external_edge_id(&item.key, item.since),
     };
+    if item.kind == AttentionKind::FinishedUnread {
+        return !prefs.unread_override
+            && (seen.is_seen(&edge, item.since)
+                || prefs.last_viewed_at.is_some_and(|viewed| viewed > item.since));
+    }
     is_seen(item.kind, &edge, item.since, prefs, seen)
 }
 

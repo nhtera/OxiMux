@@ -589,15 +589,29 @@ fn render_agent_sub_row(
         });
     if row.is_focusable() {
         let target = row.target.clone();
+        let row_db_id = row.db_id.clone();
         base.cursor_pointer()
             .hover(|s| s.bg(theme.hover_overlay))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                let _ = weak_root.update(cx, |root, cx| match &target {
-                    RailAgentTarget::AgentSession { db_id } => {
-                        root.focus_agent_by_db_id(db_id, window, cx);
-                    }
-                    RailAgentTarget::AmbientTerminal { pty_id } => {
-                        root.focus_ambient_agent_terminal(pty_id, window, cx);
+                let _ = weak_root.update(cx, |root, cx| {
+                    let shown = match &target {
+                        RailAgentTarget::AgentSession { db_id } => {
+                            root.focus_agent_by_db_id(db_id, window, cx)
+                        }
+                        RailAgentTarget::AmbientTerminal { pty_id } => {
+                            root.focus_ambient_agent_terminal(pty_id, window, cx)
+                        }
+                        RailAgentTarget::Chat { session_id } => {
+                            root.focus_chat_by_session_id(session_id, window, cx)
+                        }
+                    };
+                    // The same look the dashboard card records, and on the same
+                    // condition: a row that opened nothing has shown the person
+                    // nothing to read.
+                    if shown {
+                        crate::shell::agents_dashboard::row_attention::mark_row_viewed(
+                            &row_db_id, &target, cx,
+                        );
                     }
                 });
             })

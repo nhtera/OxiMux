@@ -19,6 +19,8 @@ pub mod provision_progress;
 pub mod provisioning_transcript;
 pub mod rail_data;
 pub mod rename_ops;
+pub mod chat_rail_rows;
+pub mod cockpit_attention;
 pub mod session_merge;
 pub mod sidebar_build;
 pub mod workspace_dialog;

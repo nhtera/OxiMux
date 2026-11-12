@@ -61,7 +61,7 @@ use crate::left_rail_layout;
 
 use crate::actions::{OpenAddProjectDialog, OpenProjectPicker, OpenWorkspaceCreate};
 use crate::shell::agent_presentation::AmbientAgent;
-use crate::shell::agents_dashboard::model::{attention_rank, needs_attention};
+use crate::shell::agents_dashboard::model::{status_needs_you, workspace_sort_tier};
 use crate::shell::agents_dashboard::filter::StatusFilter;
 use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::locate_anchor::{LocateAnchor, new_anchor, reveal_offset};
@@ -572,7 +572,7 @@ impl LeftRail {
                 pinned_now.sort();
                 let sorted = sort_workspaces(&ws, &p.root_path, WorkspaceSortMode::Smart, |w| {
                     let status = self.latest_status.get(&w.id).cloned().flatten();
-                    attention_rank(
+                    workspace_sort_tier(
                         status.as_ref(),
                         self.live_worktrees.contains(&w.worktree_path),
                     )
@@ -1035,7 +1035,7 @@ impl LeftRail {
             for (ws_id, status) in &latest_status {
                 let was = self.latest_status.get(ws_id).cloned().flatten();
                 if status.as_ref() != was.as_ref()
-                    && status.as_ref().is_some_and(needs_attention)
+                    && status.as_ref().is_some_and(status_needs_you)
                 {
                     self.agents_unread = self.agents_unread.saturating_add(1);
                 }
@@ -1297,6 +1297,7 @@ impl Render for LeftRail {
                 theme,
                 density,
                 &typography,
+                cx.try_global::<crate::remote_control::RemoteControl>().and_then(|rc| rc.host_core()),
             )
         } else {
             // Read the pre-computed Smart-sort settle overrides (refreshed off
@@ -1562,7 +1563,7 @@ fn render_workspace_list(
             }
             WorkspaceSortMode::Smart => flat.sort_by_key(|(_, w)| {
                 let status = latest_status.get(&w.id).cloned().flatten();
-                attention_rank(status.as_ref(), live_worktrees.contains(&w.worktree_path))
+                workspace_sort_tier(status.as_ref(), live_worktrees.contains(&w.worktree_path))
             }),
         }
 
@@ -1665,7 +1666,7 @@ fn render_workspace_list(
         // what "needs attention" means.
         let workspaces = sort_workspaces(&workspaces, &project.root_path, sort_mode, |ws| {
             let status = latest_status.get(&ws.id).cloned().flatten();
-            attention_rank(status.as_ref(), live_worktrees.contains(&ws.worktree_path))
+            workspace_sort_tier(status.as_ref(), live_worktrees.contains(&ws.worktree_path))
         });
         // Apply a held Smart-sort order, if the settle window is keeping this
         // group's rows from reshuffling under the cursor.

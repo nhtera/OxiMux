@@ -564,3 +564,142 @@ fn a_chats_target_and_its_prefs_key_are_one_string() {
     assert_eq!(crate::session_prefs::chat_id("plan:7"), None, "a run root is not a chat");
     assert_eq!(crate::session_prefs::chat_id(&crate::session_prefs::chat_key("plan:7")), Some("plan:7"));
 }
+
+// ─── a cockpit agent's status, through the one evaluator ─────────────────────
+
+fn cockpit(status: AgentStatus) -> Option<ExternalAttention> {
+    external_of_agent_status("cockpit:7".into(), "cockpit:7".into(), &status, false, |_, _| NOW - MIN)
+}
+
+#[test]
+fn a_cockpit_status_raises_the_same_kinds_as_a_sessions_health() {
+    let kinds = |status| cockpit(status).map(|item| item.kind);
+    assert_eq!(
+        kinds(AgentStatus::NeedsApproval("rm -rf build/".into())),
+        Some(AttentionKind::NeedsPermission)
+    );
+    assert_eq!(kinds(AgentStatus::WaitingForInput), Some(AttentionKind::NeedsInput));
+    assert_eq!(kinds(AgentStatus::Failed("boom".into())), Some(AttentionKind::Failed));
+    assert_eq!(
+        kinds(AgentStatus::Done { code: Some(0) }),
+        Some(AttentionKind::FinishedUnread),
+        "a clean finish is unread work, not a failure"
+    );
+    assert_eq!(
+        kinds(AgentStatus::Done { code: Some(137) }),
+        Some(AttentionKind::Failed),
+        "a non-zero exit is a failure, whatever the section used to say"
+    );
+    assert_eq!(
+        kinds(AgentStatus::Done { code: None }),
+        Some(AttentionKind::Failed),
+        "killed by a signal is not a clean finish"
+    );
+}
+
+#[test]
+fn a_working_or_parked_cockpit_agent_wants_nothing() {
+    assert!(cockpit(AgentStatus::Running).is_none());
+    assert!(cockpit(AgentStatus::Idle).is_none(), "parked is not an alert");
+}
+
+#[test]
+fn an_interrupted_cockpit_agent_raises_nothing_so_a_boot_cannot_replay_it() {
+    // `Interrupted` is a user cancel, or a session that was alive at
+    // shutdown — which the boot sweep stamps on every unfinished row. Raising
+    // it would put every session the last quit killed back in "needs you" on
+    // every start. The old dashboard counted it as attention; that is the bug
+    // this replaces.
+    assert!(cockpit(AgentStatus::Interrupted).is_none());
+}
+
+#[test]
+fn the_reason_carries_what_is_being_approved() {
+    let item = cockpit(AgentStatus::NeedsApproval("rm -rf build/".into())).expect("raised");
+    assert_eq!(item.reason, "rm -rf build/", "the row has to say what it would run");
+    assert_eq!(item.since, NOW - MIN, "the session's own moment, not the clock");
+}
+
+#[test]
+fn a_cockpit_failure_is_cleared_by_a_look_and_a_later_one_is_raised_again() {
+    // The whole point of going through `of_external`: the cockpit inherits
+    // the dismissal lifecycle instead of implementing a second one.
+    let item = cockpit(AgentStatus::Failed("boom".into())).expect("raised");
+    let unseen = SessionPrefs::default();
+    assert!(
+        of_external("cockpit:7", &unseen, std::slice::from_ref(&item), &NothingSeen).is_some(),
+        "nobody has looked yet"
+    );
+
+    let looked = SessionPrefs { last_viewed_at: Some(NOW), ..SessionPrefs::default() };
+    let seen_after_the_look =
+        |edge: &AttentionEdge, since: i64| edge.target == "cockpit:7" && since <= NOW;
+    assert!(
+        of_external("cockpit:7", &looked, &[item], &seen_after_the_look).is_none(),
+        "a look clears it, exactly as it clears a chat's failure"
+    );
+
+    let later = external_of_agent_status(
+        "cockpit:7".into(),
+        "cockpit:7".into(),
+        &AgentStatus::Failed("boom again".into()),
+        false,
+        |_, _| NOW + MIN,
+    )
+    .expect("raised");
+    assert!(
+        of_external("cockpit:7", &looked, &[later], &seen_after_the_look).is_some(),
+        "a failure after the look is a new edge and is raised again"
+    );
+}
+
+#[test]
+fn a_parked_cockpit_agent_that_has_replied_is_unread_work() {
+    // The status is `Idle` whether the agent has run a turn or never has, so
+    // the status alone cannot tell unread work from an agent that has done
+    // nothing. `completed_turn` is what separates them, the same way `of`
+    // requires a `turn_id` of a session's health.
+    let replied = external_of_agent_status(
+        "cockpit:7".into(),
+        "cockpit:7".into(),
+        &AgentStatus::Idle,
+        true,
+        |_, _| NOW - MIN,
+    );
+    assert_eq!(
+        replied.map(|item| item.kind),
+        Some(AttentionKind::FinishedUnread),
+        "a parked agent with a reply is a finish nobody has read"
+    );
+    assert!(
+        external_of_agent_status(
+            "cockpit:7".into(),
+            "cockpit:7".into(),
+            &AgentStatus::Idle,
+            false,
+            |_, _| NOW - MIN,
+        )
+        .is_none(),
+        "an agent that never ran a turn is not unread work"
+    );
+}
+
+#[test]
+fn a_finish_in_the_same_millisecond_as_a_look_is_not_swallowed_by_it() {
+    // The tie the stored timestamp cannot break. A look and a turn finishing
+    // inside one millisecond are indistinguishable by clock, and read as
+    // "already read" is a reply nobody is ever shown — so the watcher's order
+    // decides, and a stored look only reads a finish that is strictly older.
+    let items = [external("run", AttentionKind::FinishedUnread, 0)];
+    let tie = SessionPrefs { last_viewed_at: Some(NOW), ..Default::default() };
+    assert_eq!(
+        of_external("plan:run-1", &tie, &items, &new_edges()).map(|a| a.kind),
+        Some(AttentionKind::FinishedUnread),
+        "the look cannot be shown to have come after it"
+    );
+    assert_eq!(
+        of_external("plan:run-1", &tie, &items, &seen_all()),
+        None,
+        "a watcher that saw the look land after it reads it"
+    );
+}

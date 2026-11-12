@@ -1476,6 +1476,22 @@ impl WorkspaceRoot {
         live
     }
 
+    /// End the cockpit alerts this window raised, because it is going away.
+    ///
+    /// The host is shared process-wide and only this window's pass retires its
+    /// own keys (`cockpit_attention`), so a window that closes with a blocked
+    /// terminal would leave that alert standing for the rest of the run.
+    pub(crate) fn retire_cockpit_attention(&mut self, cx: &gpui::App) {
+        if let Some(host) =
+            cx.try_global::<crate::remote_control::RemoteControl>().and_then(|rc| rc.host_core())
+        {
+            crate::shell::workspace::cockpit_attention::retire_cockpit_attention(
+                &host,
+                &mut self.cockpit_attention_raised,
+            );
+        }
+    }
+
     pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
         // Before the snapshot is read: let the rail's selection follow the
         // focused pane group when focus has moved since the last refresh.
@@ -1598,6 +1614,32 @@ impl WorkspaceRoot {
             &ambient_rows,
             &mut workspace_agents,
         );
+        // Chat sessions come from the host's registry, not the DB or the tabs:
+        // they keep no `agent_sessions` row, and a session another agent
+        // spawned has no tab of its own to be found through.
+        let chat_rows = crate::shell::workspace::chat_rail_rows::collect_chat_rows(
+            &workspaces_by_project,
+            workspace_path_for_ambient_terminal,
+            cx,
+        );
+        crate::shell::session_merge::append_chat_agent_rows(
+            &workspaces_by_project,
+            &chat_rows,
+            &mut workspace_agents,
+        );
+        // A terminal agent has no health for the host to read, so without this
+        // the notifier and a phone would believe nothing needs anyone. The
+        // rows do not depend on it — they resolve their own attention from the
+        // status in hand — and it publishes the identical item.
+        if let Some(host) =
+            cx.try_global::<crate::remote_control::RemoteControl>().and_then(|rc| rc.host_core())
+        {
+            crate::shell::workspace::cockpit_attention::publish_cockpit_attention(
+                &host,
+                &workspace_agents,
+                &mut self.cockpit_attention_raised,
+            );
+        }
         // The agent whose tab is the active pane keeps its disclosure row lit.
         // Resolve it from the active project's panes, then map to the rail's row
         // identity (`RailAgentTarget`): a tracked session by its DB id, an

@@ -135,6 +135,100 @@ pub struct AmbientRow {
     pub agent: AmbientAgent,
 }
 
+/// One registered chat session, as the caller reads it out of the host's
+/// `SessionRegistry`. Pure data so the merge below stays GPUI-free.
+///
+/// `worktree_path` is already resolved by the caller with the same cwd →
+/// workspace resolver the ambient rows use, because a session's cwd is not
+/// necessarily a worktree root: it can sit anywhere under one, and nested
+/// worktrees need the longest match rather than an equality test.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatRow {
+    /// The id the session is registered under — the row identity and the
+    /// focus target.
+    pub session_id: String,
+    pub worktree_path: String,
+    /// The fold's title, when it has one.
+    pub title: Option<String>,
+    /// Adapter display name for the row's primary text.
+    pub label: String,
+    /// Adapter slug for the icon. Empty for a session the desktop has no view
+    /// for (one another agent spawned), which falls back like any unknown
+    /// adapter.
+    pub adapter_id: String,
+    /// A turn is running, or a prompt is waiting on someone.
+    pub working: bool,
+    /// At least one permission request is outstanding.
+    pub awaiting_permission: bool,
+}
+
+/// Add a row for every registered chat session, grouped by its own worktree.
+///
+/// Sourced from the registry rather than from the open tabs on purpose: a
+/// session another agent spawned has no tab of its own, and the rail is where
+/// a person is meant to notice it. Chat sessions keep no `agent_sessions` row,
+/// so these cannot collide with the tracked rows the merge above builds.
+///
+/// A session whose worktree is not one of this project's workspaces is skipped
+/// rather than guessed at, the same as an ambient terminal outside them.
+pub fn append_chat_agent_rows(
+    workspaces_by_project: &HashMap<String, Vec<Workspace>>,
+    chat_rows: &[ChatRow],
+    workspace_agents: &mut WorkspaceAgentList,
+) {
+    for chat in chat_rows {
+        let Some(ws) = workspaces_by_project
+            .values()
+            .flat_map(|w| w.iter())
+            .find(|w| w.worktree_path == chat.worktree_path)
+        else {
+            continue;
+        };
+        let rows = workspace_agents.entry(ws.id.clone()).or_default();
+        // Idempotent if the same session is seen twice in one pass.
+        if rows.iter().any(|r| r.db_id == chat.session_id) {
+            continue;
+        }
+        rows.push(RailAgentRow {
+            db_id: chat.session_id.clone(),
+            target: RailAgentTarget::Chat {
+                session_id: chat.session_id.clone(),
+            },
+            workspace_key: ws.id.clone(),
+            adapter_id: chat.adapter_id.clone(),
+            label: chat.label.clone().into(),
+            is_live: true,
+            status_rx: None,
+            db_status: chat_display_status(chat),
+            started_at: None,
+            ended_at: None,
+            age_label: "now".to_string(),
+            persisted_title: chat.title.clone(),
+            persisted_message: None,
+            ambient_detail: None,
+        });
+        sort_and_cap_rows(rows);
+    }
+}
+
+/// The status a chat row's verb and state dot read.
+///
+/// **Display only.** What the row *needs from a person* comes from the one
+/// evaluator (`oximux_agents::attention`), never from here — this exists
+/// because the row widgets still take an `AgentStatus`, and PR D replaces them
+/// with `AttentionKind::verb` and its tone.
+fn chat_display_status(chat: &ChatRow) -> AgentStatus {
+    if chat.awaiting_permission {
+        // The row shows its reason from the attention, so the payload here is
+        // never read; an empty one keeps this from looking like a description.
+        AgentStatus::NeedsApproval(String::new())
+    } else if chat.working {
+        AgentStatus::Running
+    } else {
+        AgentStatus::Idle
+    }
+}
+
 /// Add live rows for agent CLIs detected inside plain terminal tabs — one row
 /// per PTY, so N hand-launched agents in a worktree list as N rows (the
 /// reference cockpit's per-pane identity) rather than collapsing to one. These
@@ -319,7 +413,14 @@ fn sort_and_cap_rows(rows: &mut Vec<RailAgentRow>) {
             .cmp(&a.is_live)
             .then_with(|| b.started_at.cmp(&a.started_at))
     });
-    rows.truncate(HISTORY_CAP);
+    // The cap bounds HISTORY; the live set bounds itself. A live row dropped
+    // to make room is a row the person cannot reach at all — and the rows with
+    // no `started_at` sort last among the live ones, which is every chat
+    // session and every ambient terminal, so a worktree busy with tracked
+    // agents hid exactly the rows that had nowhere else to appear. A chat
+    // waiting on an approval was one of them.
+    let live = rows.iter().filter(|r| r.is_live).count();
+    rows.truncate(HISTORY_CAP.max(live));
 }
 
 #[cfg(test)]
@@ -396,6 +497,170 @@ mod tests {
             comment: String::new(),
             phase: String::new(),
         }
+    }
+
+    fn chat(session_id: &str, worktree: &str) -> ChatRow {
+        ChatRow {
+            session_id: session_id.into(),
+            worktree_path: worktree.into(),
+            title: Some("Fix the parser".into()),
+            label: "Chat".into(),
+            adapter_id: String::new(),
+            working: false,
+            awaiting_permission: false,
+        }
+    }
+
+    fn by_project(workspaces: Vec<Workspace>) -> HashMap<String, Vec<Workspace>> {
+        HashMap::from([("proj-1".to_string(), workspaces)])
+    }
+
+    #[test]
+    fn a_registered_chat_session_becomes_a_row_under_its_own_worktree() {
+        let mut lists: WorkspaceAgentList = HashMap::new();
+        append_chat_agent_rows(&by_project(vec![ws(WS)]), &[chat("s1", "/tmp")], &mut lists);
+
+        let rows = lists.get(WS).expect("grouped under its workspace");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].db_id, "s1");
+        assert_eq!(
+            rows[0].target,
+            RailAgentTarget::Chat { session_id: "s1".into() },
+            "clicking it focuses the chat, not an agent tab or a terminal"
+        );
+        assert_eq!(rows[0].persisted_title.as_deref(), Some("Fix the parser"));
+        assert!(rows[0].is_live, "it is registered, so it is live");
+    }
+
+    #[test]
+    fn a_chat_session_outside_these_workspaces_is_skipped_not_guessed_at() {
+        let mut lists: WorkspaceAgentList = HashMap::new();
+        append_chat_agent_rows(
+            &by_project(vec![ws(WS)]),
+            &[chat("s1", "/somewhere/else")],
+            &mut lists,
+        );
+        assert!(lists.is_empty(), "no workspace owns it, so it belongs to none of them");
+    }
+
+    #[test]
+    fn seeing_one_chat_session_twice_adds_one_row() {
+        let mut lists: WorkspaceAgentList = HashMap::new();
+        let rows = [chat("s1", "/tmp"), chat("s1", "/tmp")];
+        append_chat_agent_rows(&by_project(vec![ws(WS)]), &rows, &mut lists);
+        assert_eq!(lists.get(WS).expect("grouped").len(), 1);
+    }
+
+    #[test]
+    fn a_chat_rows_status_is_for_its_verb_only() {
+        // Display only, and worth pinning because it is the one place a chat
+        // row still speaks `AgentStatus`: what the row *needs* comes from the
+        // evaluator, and this drives the verb and the state dot until PR D
+        // replaces them.
+        let waiting = ChatRow { awaiting_permission: true, ..chat("s1", "/tmp") };
+        assert!(matches!(chat_display_status(&waiting), AgentStatus::NeedsApproval(_)));
+        let working = ChatRow { working: true, ..chat("s2", "/tmp") };
+        assert_eq!(chat_display_status(&working), AgentStatus::Running);
+        assert_eq!(chat_display_status(&chat("s3", "/tmp")), AgentStatus::Idle);
+        let both = ChatRow { working: true, awaiting_permission: true, ..chat("s4", "/tmp") };
+        assert!(
+            matches!(chat_display_status(&both), AgentStatus::NeedsApproval(_)),
+            "being asked something wins over being busy"
+        );
+    }
+
+    #[test]
+    fn a_chat_row_does_not_collide_with_a_tracked_row() {
+        // Chat sessions keep no `agent_sessions` row, so the two sources
+        // cannot produce two rows for one agent. Pinned because the merge
+        // dedups only within a workspace list, by `db_id`.
+        let mut lists: WorkspaceAgentList = HashMap::new();
+        lists.insert(
+            WS.to_string(),
+            vec![RailAgentRow {
+                db_id: "tracked".into(),
+                target: RailAgentTarget::AgentSession { db_id: "tracked".into() },
+                workspace_key: WS.into(),
+                adapter_id: "claude-code".into(),
+                label: "Claude Code".into(),
+                is_live: true,
+                status_rx: None,
+                db_status: AgentStatus::Running,
+                started_at: Some(NOW.into()),
+                ended_at: None,
+                age_label: "now".into(),
+                persisted_title: None,
+                persisted_message: None,
+                ambient_detail: None,
+            }],
+        );
+        append_chat_agent_rows(&by_project(vec![ws(WS)]), &[chat("s1", "/tmp")], &mut lists);
+        let rows = lists.get(WS).expect("grouped");
+        assert_eq!(rows.len(), 2, "one tracked row and one chat row, side by side");
+    }
+
+    #[test]
+    fn a_busy_workspace_still_shows_its_chats() {
+        // `sort_and_cap_rows` used to truncate the whole list, live rows
+        // included, and a chat row has no `started_at` so it sorts after every
+        // live tracked agent. A worktree running HISTORY_CAP agents therefore
+        // dropped every chat — including one waiting on an approval, which has
+        // no other row anywhere to appear on.
+        let mut lists: WorkspaceAgentList = HashMap::new();
+        let live: Vec<RailAgentRow> = (0..HISTORY_CAP)
+            .map(|i| RailAgentRow {
+                db_id: format!("tracked-{i}"),
+                target: RailAgentTarget::AgentSession { db_id: format!("tracked-{i}") },
+                workspace_key: WS.into(),
+                adapter_id: "claude-code".into(),
+                label: "Claude Code".into(),
+                is_live: true,
+                status_rx: None,
+                db_status: AgentStatus::Running,
+                started_at: Some(NOW.into()),
+                ended_at: None,
+                age_label: "now".into(),
+                persisted_title: None,
+                persisted_message: None,
+                ambient_detail: None,
+            })
+            .collect();
+        lists.insert(WS.to_string(), live);
+        let waiting = ChatRow { awaiting_permission: true, ..chat("s1", "/tmp") };
+        append_chat_agent_rows(&by_project(vec![ws(WS)]), &[waiting], &mut lists);
+
+        let rows = lists.get(WS).expect("grouped");
+        assert_eq!(rows.len(), HISTORY_CAP + 1, "the cap bounds history, not what is live");
+        assert!(
+            rows.iter().any(|r| matches!(&r.target, RailAgentTarget::Chat { session_id } if session_id == "s1")),
+            "the chat waiting on a person is still in the list"
+        );
+    }
+
+    #[test]
+    fn history_is_still_capped_once_the_live_rows_are_in() {
+        // The other half of the rule: a long tail of finished sessions is cut
+        // down, so one worktree's history cannot fill the rail.
+        let mut rows: Vec<RailAgentRow> = (0..HISTORY_CAP + 7)
+            .map(|i| RailAgentRow {
+                db_id: format!("done-{i}"),
+                target: RailAgentTarget::AgentSession { db_id: format!("done-{i}") },
+                workspace_key: WS.into(),
+                adapter_id: "claude-code".into(),
+                label: "Claude Code".into(),
+                is_live: false,
+                status_rx: None,
+                db_status: AgentStatus::Done { code: Some(0) },
+                started_at: Some(NOW.into()),
+                ended_at: Some(NOW.into()),
+                age_label: "now".into(),
+                persisted_title: None,
+                persisted_message: None,
+                ambient_detail: None,
+            })
+            .collect();
+        sort_and_cap_rows(&mut rows);
+        assert_eq!(rows.len(), HISTORY_CAP);
     }
 
     #[test]

@@ -101,8 +101,11 @@ pub fn chat_id(key: &str) -> Option<&str> {
 
 /// The prefs key of a terminal (cockpit) agent, by its `agent_sessions.id`.
 pub fn cockpit_key(db_id: &str) -> String {
-    format!("cockpit:{db_id}")
+    format!("{COCKPIT}{db_id}")
 }
+
+/// The one spelling of a cockpit row's prefix, like [`CHAT`].
+const COCKPIT: &str = "cockpit:";
 
 /// The prefs table, backed by the app's SQLite database. Cloning shares the
 /// connection.

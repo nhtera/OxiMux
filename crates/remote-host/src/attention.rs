@@ -105,6 +105,25 @@ pub struct AttentionState {
     /// a timestamp cannot order them, so a failure arising just after a look
     /// read as covered by it. A counter cannot tie.
     onset: HashMap<String, Vec<(EdgeKey, u64)>>,
+    /// When each status-derived alert first appeared, by its producer's key.
+    ///
+    /// A cockpit row's state is a PTY-parsed `AgentStatus` with no moment of
+    /// its own: the row carries its launch time, fixed at insert, and its end
+    /// time once it has ended — an ambient row carries neither. Since an
+    /// external alert's edge identity is its key *and* its `since`, taking
+    /// that value from the row made the same unchanged approval a new alert on
+    /// every refresh, so a viewed alert read as unread and the notifier
+    /// announced it again; and a live row's launch time made a *second*
+    /// approval the same alert as the first, so it raised nothing.
+    ///
+    /// Held here because both the producer and the row resolver ask about the
+    /// same row in the same pass, and the two must agree. Whichever asks
+    /// first fixes the moment; it changes when the alert does and no sooner.
+    ///
+    /// One entry per cockpit row seen in this run — as `onset` holds one per
+    /// target — because the moment an alert ended is the floor the alert that
+    /// follows it under that key has to beat.
+    status_onset: HashMap<String, StatusOnset>,
     /// Where each target's last look sits in that same order, for the looks
     /// this process has seen.
     viewed_at: HashMap<String, u64>,
@@ -137,6 +156,57 @@ impl AttentionState {
     fn tick(&mut self) -> u64 {
         self.observed += 1;
         self.observed
+    }
+
+    /// When the alert `kind` + `reason` under `key` first appeared, stamping
+    /// it if this is the first time it has been asked about.
+    ///
+    /// The kind and the reason together are the alert: a permission that
+    /// became a failure is a different alert and gets its own moment, while
+    /// the same permission asked about again keeps the one it already has.
+    ///
+    /// `began` is what the row itself says about when its state began, when it
+    /// knows — and it is preferred over the clock for a reason that only shows
+    /// across a restart. `status_onset` lives in memory, so after a restart
+    /// every alert is asked about for the first time; stamping those with the
+    /// clock dated them *after* the stored look, and a finish the person had
+    /// read came back unread while a failure they had dismissed came back to
+    /// NEEDS YOU. That is precisely what the stored look exists to prevent. A
+    /// row's own end time survives the restart and is the moment the alert
+    /// really arose.
+    fn status_since(
+        &mut self,
+        key: &str,
+        kind: AttentionKind,
+        reason: &str,
+        began: Option<i64>,
+    ) -> i64 {
+        let alert = (kind, reason.to_string());
+        let floor = match self.status_onset.get(key) {
+            Some(held) if held.alert.as_ref() == Some(&alert) => return held.at,
+            // A different alert under a key that has held one: never the
+            // moment that one had. Two things can happen inside a
+            // millisecond, and an alert sharing both its key and its moment
+            // with the one it replaces *is* that edge — so a look taken
+            // between the two would swallow it.
+            Some(held) => held.at + 1,
+            None => i64::MIN,
+        };
+        let at = began.unwrap_or_else(|| chrono::Local::now().timestamp_millis()).max(floor);
+        self.status_onset.insert(key.to_string(), StatusOnset { alert: Some(alert), at });
+        at
+    }
+
+    /// Forget `key`'s alert, so the next one raised under it is a new alert
+    /// rather than the one that just ended.
+    ///
+    /// The moment stays behind as the floor for that next one: the key is
+    /// still the same row, and its next alert has to be a different edge from
+    /// the one that just ended.
+    fn forget_status(&mut self, key: &str) {
+        if let Some(held) = self.status_onset.get_mut(key) {
+            held.alert = None;
+        }
     }
 
     /// Remember when each of `edges` was observed, then forget history down to
@@ -213,6 +283,67 @@ impl AttentionState {
 /// since a finished turn and a later failure of it share the turn's id.
 type EdgeKey = (AttentionKind, String);
 
+/// What one cockpit key is holding: the alert it raises, and the moment that
+/// alert was stamped with — kept after the alert ends, as the floor the next
+/// one must beat. See [`AttentionState::status_onset`].
+struct StatusOnset {
+    alert: Option<(AttentionKind, String)>,
+    at: i64,
+}
+
+/// A caller's own reading of a cockpit row: the key its producer owns, and the
+/// alert the row's parsed status raises, if any.
+///
+/// The key travels even when there is no alert. A published item under it has
+/// to go in that case: the status is the newer word on the row, and a quiet
+/// status means the request that was published has ended.
+struct StatusView {
+    key: String,
+    item: Option<ExternalAttention>,
+}
+
+/// The alert a cockpit row's parsed status raises, stamped with the moment
+/// that alert first appeared.
+///
+/// Both the producer and the row resolver come through here, so the item that
+/// is published and the item a row shows are the same alert rather than two
+/// readings of one. See [`AttentionState::status_onset`] for why the moment
+/// cannot come from the row.
+fn status_item(
+    state: &mut AttentionState,
+    key: &str,
+    target: &str,
+    status: &oximux_core::AgentStatus,
+    completed_turn: bool,
+    began: Option<i64>,
+) -> Option<ExternalAttention> {
+    let item = attention::external_of_agent_status(
+        key.to_string(),
+        target.to_string(),
+        status,
+        completed_turn,
+        |kind, reason| state.status_since(key, kind, reason, began),
+    );
+    if item.is_none() {
+        // Nothing to raise: whatever this key held has ended, and the next
+        // alert under it is a new one.
+        state.forget_status(key);
+    }
+    item
+}
+
+/// Every session's preferences as of one moment — see
+/// [`HostCore::prefs_snapshot`].
+pub struct PrefsSnapshot(HashMap<String, SessionPrefs>);
+
+impl PrefsSnapshot {
+    /// What the person had seen of `target` as of this reading. A target with
+    /// no row has been neither viewed nor marked, which is the default.
+    fn of(&self, target: &str) -> SessionPrefs {
+        self.0.get(target).cloned().unwrap_or_default()
+    }
+}
+
 /// [`AttentionState`] read as the evaluator's record of what has been seen.
 struct Seen<'a>(&'a AttentionState, &'a SessionPrefs);
 
@@ -275,6 +406,10 @@ impl HostCore {
     pub fn clear_external(&self, key: &str) {
         let target = {
             let mut state = self.attention().state.lock().unwrap();
+            // The alert's moment goes with the alert. Kept, it would make the
+            // next alert under this key the same one — raised before the look
+            // that has since been taken, and so born already seen.
+            state.forget_status(key);
             match state.external.remove(key) {
                 Some(item) => item.target,
                 None => return,
@@ -292,18 +427,134 @@ impl HostCore {
     /// What one target wants from a person, computed now.
     pub fn attention_of(&self, target: &str) -> Option<Attention> {
         let mut state = self.attention().state.lock().unwrap();
-        self.current(target, &mut state).0
+        self.current_with(target, None, None, &mut state).0
+    }
+
+    /// As [`HostCore::attention_of`], against a reading of the preferences the
+    /// caller already has in hand.
+    ///
+    /// A surface asking about many rows takes one reading (see
+    /// [`HostCore::prefs_snapshot`]) and passes it to each call, instead of
+    /// paying a query per row.
+    pub fn attention_of_in(&self, target: &str, prefs: &PrefsSnapshot) -> Option<Attention> {
+        let mut state = self.attention().state.lock().unwrap();
+        self.current_with(target, None, Some(prefs), &mut state).0
+    }
+
+    /// The attention of a cockpit (terminal) agent, from the status the caller
+    /// is already holding.
+    ///
+    /// Terminal agents have no [`SessionHealth`], so their state arrives as a
+    /// parsed `AgentStatus`. It is mapped by
+    /// [`attention::external_of_agent_status`] — the one mapping, shared with
+    /// the producer, and stamped by the one owner — and then ranked against
+    /// whatever else was published against the same row, so a CI alert or a
+    /// plan breaker on that row still competes with it.
+    ///
+    /// The caller's status is the newer word on its own key: it replaces an
+    /// item the producer published under it, and a status that raises nothing
+    /// clears it.
+    pub fn attention_of_agent_status(
+        &self,
+        target: &str,
+        status: &oximux_core::AgentStatus,
+        completed_turn: bool,
+        began: Option<i64>,
+    ) -> Option<Attention> {
+        self.agent_status_attention(target, status, completed_turn, began, None)
+    }
+
+    /// As [`HostCore::attention_of_agent_status`], against a reading of the
+    /// preferences the caller already has in hand — the dashboard's per-pass
+    /// reading, see [`HostCore::prefs_snapshot`].
+    pub fn attention_of_agent_status_in(
+        &self,
+        target: &str,
+        status: &oximux_core::AgentStatus,
+        completed_turn: bool,
+        began: Option<i64>,
+        prefs: &PrefsSnapshot,
+    ) -> Option<Attention> {
+        self.agent_status_attention(target, status, completed_turn, began, Some(prefs))
+    }
+
+    fn agent_status_attention(
+        &self,
+        target: &str,
+        status: &oximux_core::AgentStatus,
+        completed_turn: bool,
+        began: Option<i64>,
+        prefs: Option<&PrefsSnapshot>,
+    ) -> Option<Attention> {
+        let mut state = self.attention().state.lock().unwrap();
+        // Key and target are the same string for a cockpit item: the producer
+        // owns one alert per row, so the row's key *is* its identity.
+        let view = StatusView {
+            key: target.to_string(),
+            item: status_item(&mut state, target, target, status, completed_turn, began),
+        };
+        self.current_with(target, Some(view), prefs, &mut state).0
+    }
+
+    /// The alert a cockpit row's parsed status raises right now, for the
+    /// producer that publishes it.
+    ///
+    /// The producer does not mint this itself: the alert's moment is the
+    /// host's ([`AttentionState::status_onset`]), so what is published and
+    /// what a row shows are the same alert rather than two readings of one.
+    ///
+    /// `began` is what the row says about when its state began — its end time,
+    /// else its launch time — and is used only when an alert is first stamped.
+    /// A caller that has no such moment passes `None` and gets the clock,
+    /// which is right for a row that has none (an ambient terminal) and
+    /// weaker for one that does: see [`AttentionState::status_since`].
+    pub fn cockpit_item(
+        &self,
+        key: &str,
+        target: &str,
+        status: &oximux_core::AgentStatus,
+        completed_turn: bool,
+        began: Option<i64>,
+    ) -> Option<ExternalAttention> {
+        let mut state = self.attention().state.lock().unwrap();
+        status_item(&mut state, key, target, status, completed_turn, began)
+    }
+
+    /// Every session's preferences in one query, for a pass that will ask
+    /// about many rows.
+    ///
+    /// The dashboard resolves attention for every row it builds, and a point
+    /// query per row put one SQLite read per row on the render path —
+    /// including the renders an agent's own output causes. One reading, taken
+    /// once and passed in, costs one query however many rows the pass holds.
+    ///
+    /// Deliberately short-lived: it is the table at one moment, so a pass
+    /// holding it reads a consistent world and nothing has to invalidate it.
+    pub fn prefs_snapshot(&self) -> PrefsSnapshot {
+        match self.attention().prefs.all() {
+            Ok(rows) => PrefsSnapshot(rows.into_iter().collect()),
+            Err(err) => {
+                tracing::warn!(%err, "could not read session prefs");
+                // Every row then reads as never viewed, the same reading a
+                // failed single read takes: an alert shown twice beats one
+                // swallowed.
+                PrefsSnapshot(HashMap::new())
+            }
+        }
     }
 
     /// Every target that needs a person, worst first. This is the number the
     /// chip, the nav badge and the hotkey cycle all read, so they cannot
     /// disagree.
     pub fn needs_you(&self) -> Vec<(String, Attention)> {
+        // One reading of the preferences for the whole walk: every target is
+        // asked about, so a query each would scale with the session count.
+        let prefs = self.prefs_snapshot();
         let mut state = self.attention().state.lock().unwrap();
         let mut out: Vec<(String, Attention)> = targets(&state, self.registry().ids())
             .into_iter()
             .filter_map(|target| {
-                let a = self.current(&target, &mut state).0?;
+                let a = self.current_with(&target, None, Some(&prefs), &mut state).0?;
                 a.kind.is_needs_you().then_some((target, a))
             })
             .collect();
@@ -432,8 +683,47 @@ impl HostCore {
         target: &str,
         state: &mut AttentionState,
     ) -> (Option<Attention>, Option<AttentionEdge>) {
-        let external = external_for(state, target);
-        let prefs = self.prefs_of(target);
+        self.current_with(target, None, None, state)
+    }
+
+    /// As [`HostCore::current`], with one external item supplied by the caller
+    /// rather than read from the registry.
+    ///
+    /// A cockpit row's state is a PTY-parsed `AgentStatus` the caller already
+    /// holds. Evaluating only what the producer has published would read
+    /// "Working" for a blocked agent until the first publication landed, and
+    /// evaluating it anywhere else would be a second evaluator. So it comes in
+    /// here, through the same ranking, the same prefs, the same looks and the
+    /// same onset recording as everything else.
+    fn current_with(
+        &self,
+        target: &str,
+        from_status: Option<StatusView>,
+        prefs: Option<&PrefsSnapshot>,
+        state: &mut AttentionState,
+    ) -> (Option<Attention>, Option<AttentionEdge>) {
+        let mut external = external_for(state, target);
+        if let Some(status) = from_status {
+            // The producer publishes under this same key. If its publication
+            // has already landed, the caller's reading is the fresher of the
+            // two, not a second alert — and a status that raises nothing is
+            // the fresher word too: the request it published has ended, so
+            // the published item goes with it rather than outliving the
+            // status it came from. Other producers' items on this row stay.
+            external.retain(|published| published.key != status.key);
+            if let Some(item) = status.item {
+                external.push(item);
+                // `external_for` returns them worst-first and the evaluator
+                // relies on that order for its tie-break.
+                external.sort_by(|a, b| {
+                    (a.kind.priority(), a.since, &a.key).cmp(&(b.kind.priority(), b.since, &b.key))
+                });
+            }
+        }
+        let prefs = match prefs {
+            Some(snapshot) => snapshot.of(target),
+            None => self.prefs_of(target),
+        };
         // **One** read of the session: one handle lookup, and the health, the
         // prompt id and the process that published them taken together. Two
         // lookups let a respawn land in between and brand the old process's

@@ -19,6 +19,11 @@ use oximux_core::AgentStatus;
 pub enum RailAgentTarget {
     AgentSession { db_id: String },
     AmbientTerminal { pty_id: String },
+    /// A chat session, by the id it is registered under in the host's
+    /// `SessionRegistry`. Sourced from the registry rather than from the open
+    /// tabs, because a session spawned by another agent has no tab of its own
+    /// and would otherwise be invisible in the rail.
+    Chat { session_id: String },
 }
 
 /// One agent in a workspace's rail list — a live session, a finished
@@ -82,8 +87,16 @@ impl RailAgentRow {
     }
 
     /// Whether this row currently has a live pane/tab to focus.
+    ///
+    /// A chat row is always focusable: it exists because the session is
+    /// registered. Clicking one with no open tab (a spawned child) focuses
+    /// nothing, which is the same no-op a history row has always been.
     pub fn is_focusable(&self) -> bool {
-        self.is_live || matches!(self.target, RailAgentTarget::AmbientTerminal { .. })
+        self.is_live
+            || matches!(
+                self.target,
+                RailAgentTarget::AmbientTerminal { .. } | RailAgentTarget::Chat { .. }
+            )
     }
 }
 

@@ -99,13 +99,13 @@ impl WorkspaceRoot {
         db_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some((session_id, workspace_key)) = self
             .live_agents
             .get(db_id)
             .map(|e| (e.session_id, e.workspace_key.clone()))
         else {
-            return;
+            return false;
         };
         // The session lives in exactly one project's panes; find its owner so
         // we switch to that project before searching it for the tab.
@@ -119,7 +119,7 @@ impl WorkspaceRoot {
                     .then(|| pid.clone())
             });
         let Some(project_id) = owner else {
-            return;
+            return false;
         };
         if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
             match self
@@ -130,13 +130,12 @@ impl WorkspaceRoot {
                 .cloned()
             {
                 Some(project) => self.set_active_project(project, window, cx),
-                None => return,
+                None => return false,
             }
         }
+        let mut focused = false;
         if let Some(panes) = self.active_project_panes() {
-            panes.update(cx, |p, cx| {
-                p.focus_agent_session(session_id, window, cx);
-            });
+            focused = panes.update(cx, |p, cx| p.focus_agent_session(session_id, window, cx));
             // Deferred focus: a synchronous focus inside the rail-row mouse-down
             // is clobbered by GPUI's post-click focus dispatch. Re-assert it on
             // the next frame so the agent's terminal is ready for input.
@@ -150,6 +149,52 @@ impl WorkspaceRoot {
         // repaint would otherwise occur.
         self.select_rail_workspace(&project_id, &workspace_key);
         cx.notify();
+        focused
+    }
+
+    /// Focus the chat session a rail row names.
+    ///
+    /// A session spawned by another agent has no tab of its own, so this is a
+    /// no-op for it — the same no-op a history row has always been. The row
+    /// still renders, which is the point of sourcing rows from the registry
+    /// rather than from the open tabs.
+    pub(crate) fn focus_chat_by_session_id(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let owner = self.project_panes_by_project.iter().find_map(|(pid, panes)| {
+            panes
+                .read(cx)
+                .has_agent_chat_for_remote_id(session_id, cx)
+                .then(|| pid.clone())
+        });
+        let Some(project_id) = owner else {
+            return false;
+        };
+        if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
+            match self
+                .app_state
+                .recent_projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            {
+                Some(project) => self.set_active_project(project, window, cx),
+                None => return false,
+            }
+        }
+        let mut focused = false;
+        if let Some(panes) = self.active_project_panes() {
+            focused =
+                panes.update(cx, |p, cx| p.focus_agent_chat_session(session_id, window, cx));
+            // Same deferral as the agent path: a synchronous focus inside the
+            // rail-row mouse-down is clobbered by GPUI's post-click dispatch.
+            crate::shell::workspace::workspace_ops::defer_focus_active(window, cx, panes);
+        }
+        cx.notify();
+        focused
     }
 
     /// Focus a hand-launched (ambient) agent the user clicked in the rail. The
@@ -161,13 +206,13 @@ impl WorkspaceRoot {
         pty_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let owner = self
             .project_panes_by_project
             .iter()
             .find_map(|(pid, panes)| panes.read(cx).has_terminal_pty(pty_id, cx).then(|| pid.clone()));
         let Some(project_id) = owner else {
-            return;
+            return false;
         };
         if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
             match self
@@ -178,13 +223,13 @@ impl WorkspaceRoot {
                 .cloned()
             {
                 Some(project) => self.set_active_project(project, window, cx),
-                None => return,
+                None => return false,
             }
         }
+        let mut focused = false;
         if let Some(panes) = self.active_project_panes() {
-            panes.update(cx, |p, cx| {
-                p.focus_ambient_agent_terminal(pty_id, window, cx);
-            });
+            focused =
+                panes.update(cx, |p, cx| p.focus_ambient_agent_terminal(pty_id, window, cx));
             // Deferred focus: a synchronous focus inside the rail-row mouse-down
             // is clobbered by GPUI's post-click focus dispatch. Re-assert it on
             // the next frame so the terminal is ready for input.
@@ -210,6 +255,7 @@ impl WorkspaceRoot {
             }
         }
         cx.notify();
+        focused
     }
 }
 

@@ -11,9 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use gpui::App;
-use oximux_core::{Project, Workspace};
+use oximux_agents::session_prefs::cockpit_key;
+use oximux_core::{AgentSessionId, Project, Workspace};
 
 use crate::shell::pane_group::render::tab_kind_icon;
+use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::{PaneGroupTab, PaneGroupTabKind, TabColor};
 use crate::shell::search_palette::model::{ProjectItem, Snapshot, TabItem, WorktreeItem};
 use crate::shell::search_palette::recency::{fallback_ms, now_ms};
@@ -86,10 +88,23 @@ fn collect_tabs(
     current_project: Option<&str>,
     cx: &App,
 ) -> Vec<TabItem> {
+    // One host read for the whole snapshot rather than one per tab.
+    let host = cx
+        .try_global::<crate::remote_control::RemoteControl>()
+        .and_then(|rc| rc.host_core());
     let by_path: HashMap<(&str, &str), &WorktreeItem> = worktrees
         .iter()
         .map(|w| ((w.project_id.as_str(), w.worktree_path.as_str()), w))
         .collect();
+    // A tab carries its runtime agent handle; the attention registry is keyed
+    // by the row's database id, which is what `live_agents` maps from. Built
+    // once for the snapshot, as is the reading of the looks.
+    let cockpit_keys: HashMap<AgentSessionId, String> = root
+        .live_agents
+        .iter()
+        .map(|(db_id, entry)| (entry.session_id, cockpit_key(db_id)))
+        .collect();
+    let prefs = host.as_deref().map(|host| host.prefs_snapshot());
     let mut tabs = Vec::new();
     for project in &root.app_state.recent_projects {
         let Some(panes) = root.project_panes_by_project.get(&project.id) else {
@@ -108,21 +123,36 @@ fn collect_tabs(
                 };
                 let path_key = worktree_path.to_string_lossy();
                 let wt = by_path.get(&(project.id.as_str(), path_key.as_ref())).copied();
-                tabs.push(tab_item(tab, project, wt, &worktree_path, is_active_group && idx == g.active()));
+                tabs.push(tab_item(
+                    tab,
+                    project,
+                    wt,
+                    &worktree_path,
+                    is_active_group && idx == g.active(),
+                    host.as_deref(),
+                    &cockpit_keys,
+                    prefs.as_ref(),
+                    cx,
+                ));
             }
         }
     }
     tabs
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tab_item(
     tab: &PaneGroupTab,
     project: &Project,
     wt: Option<&WorktreeItem>,
     worktree_path: &Path,
     is_current: bool,
+    host: Option<&oximux_remote_host::HostCore>,
+    cockpit_keys: &HashMap<AgentSessionId, String>,
+    prefs: Option<&oximux_remote_host::attention::PrefsSnapshot>,
+    cx: &App,
 ) -> TabItem {
-    let (aliases, path, needs_attention) = describe_kind(&tab.kind);
+    let (aliases, path) = describe_kind(&tab.kind);
     let seed = wt.map(|w| w.last_activity_ms).unwrap_or(0);
     TabItem {
         project_id: project.id.clone(),
@@ -142,36 +172,92 @@ fn tab_item(
         tint: wt.and_then(|w| w.tint),
         is_current,
         in_current_worktree: wt.is_some_and(|w| w.is_current),
-        needs_attention,
+        needs_attention: tab_needs_you(tab, host, cockpit_keys, prefs, cx),
         last_ms: if tab.last_focused_ms > 0 { tab.last_focused_ms } else { seed },
     }
 }
 
-/// `(aliases, backing path, needs attention)` for a tab kind.
-fn describe_kind(kind: &PaneGroupTabKind) -> (Vec<String>, Option<String>, bool) {
+/// Whether this tab is one somebody has to come back to, by the one
+/// definition in `oximux_agents::attention`.
+///
+/// This used to be `status.is_blocking()`, read off the tab kind — a third
+/// answer to the question, narrower than either of the other two: it saw a
+/// permission or a prompt and missed a failure entirely. And a chat tab was
+/// hard-coded `false`, so a chat waiting on an approval never surfaced here at
+/// all. `is_blocking` stays where it belongs, on the status machine.
+fn tab_needs_you(
+    tab: &PaneGroupTab,
+    host: Option<&oximux_remote_host::HostCore>,
+    cockpit_keys: &HashMap<AgentSessionId, String>,
+    prefs: Option<&oximux_remote_host::attention::PrefsSnapshot>,
+    cx: &App,
+) -> bool {
+    match (&tab.kind, &tab.content) {
+        // A cockpit agent: what the host holds for its row, so a failure the
+        // person has viewed or dismissed is gone from here too — the status
+        // alone cannot know about a look.
+        //
+        // Read from the published item rather than passed in as a status, as
+        // the dashboard does: the producer republishes every rail pass, and a
+        // palette is never open on the frame before the first one. The status
+        // is the fallback for a tab whose database row has not landed yet,
+        // which is the one case the registry cannot answer.
+        (PaneGroupTabKind::Agent { status_rx, session_id, .. }, _) => {
+            let published = host.zip(cockpit_keys.get(session_id)).and_then(|(host, key)| {
+                match prefs {
+                    Some(prefs) => host.attention_of_in(key, prefs),
+                    None => host.attention_of(key),
+                }
+            });
+            match published {
+                Some(attention) => attention.kind.is_needs_you(),
+                None if host.is_some() && cockpit_keys.contains_key(session_id) => false,
+                _ => crate::shell::agents_dashboard::model::status_needs_you(
+                    &status_rx.borrow().status,
+                ),
+            }
+        }
+        // A chat session: the host holds its health, so it is the authority.
+        // The id is on the view, not on the tab kind — and it is the REMOTE
+        // id, the key the session is registered and published under. The
+        // agent's own id is the same string once it has minted one, but a chat
+        // that has not finished a turn has none, and that is exactly a chat
+        // that is working right now and may be asking for something.
+        (PaneGroupTabKind::AgentChat { .. }, PaneContent::AgentChat(view)) => host
+            .and_then(|host| {
+                let key = oximux_agents::session_prefs::chat_key(view.read(cx).remote_session_id());
+                host.attention_of(&key)
+            })
+            .is_some_and(|attention| attention.kind.is_needs_you()),
+        _ => false,
+    }
+}
+
+/// `(aliases, backing path)` for a tab kind.
+fn describe_kind(kind: &PaneGroupTabKind) -> (Vec<String>, Option<String>) {
     let words = |ws: &[&str]| ws.iter().map(|w| w.to_string()).collect::<Vec<_>>();
     let file = |p: &Path| Some(p.to_string_lossy().to_string());
     match kind {
-        PaneGroupTabKind::Terminal => (words(&["terminal", "shell"]), None, false),
-        PaneGroupTabKind::Agent { adapter_id, status_rx, .. } => {
+        PaneGroupTabKind::Terminal => (words(&["terminal", "shell"]), None),
+        PaneGroupTabKind::Agent { adapter_id, .. } => {
             let mut aliases = words(&["agent", adapter_id]);
             // "claude-code" also answers to "claude".
             if let Some((head, _)) = adapter_id.split_once('-') {
                 aliases.push(head.to_string());
             }
-            (aliases, None, status_rx.borrow().status.is_blocking())
+            (aliases, None)
         }
-        PaneGroupTabKind::AgentChat { .. } => (words(&["chat", "agent"]), None, false),
-        PaneGroupTabKind::Editor { path } => (words(&["file", "editor"]), file(path), false),
+        PaneGroupTabKind::AgentChat { .. } => (words(&["chat", "agent"]), None),
+        PaneGroupTabKind::Editor { path } => (words(&["file", "editor"]), file(path)),
         PaneGroupTabKind::Diff { path, .. }
         | PaneGroupTabKind::BranchFile { path }
-        | PaneGroupTabKind::StashFile { path, .. } => (words(&["diff"]), file(path), false),
+        | PaneGroupTabKind::StashFile { path, .. } => (words(&["diff"]), file(path)),
         PaneGroupTabKind::Commit { .. }
         | PaneGroupTabKind::StashAll { .. }
-        | PaneGroupTabKind::CombinedDiff { .. } => (words(&["diff"]), None, false),
-        PaneGroupTabKind::Browser { url } => (words(&["browser", "web"]), Some(url.clone()), false),
-        PaneGroupTabKind::Tasks => (words(&["tasks", "issues"]), None, false),
-        PaneGroupTabKind::Automations => (words(&["automations", "schedules"]), None, false),
+        | PaneGroupTabKind::CombinedDiff { .. } => (words(&["diff"]), None),
+        PaneGroupTabKind::Browser { url } => (words(&["browser", "web"]), Some(url.clone())),
+        PaneGroupTabKind::Tasks => (words(&["tasks", "issues"]), None),
+        PaneGroupTabKind::Automations => (words(&["automations", "schedules"]), None),
     }
 }
 

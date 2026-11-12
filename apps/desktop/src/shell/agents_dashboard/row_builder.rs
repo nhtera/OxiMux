@@ -8,11 +8,13 @@
 
 use std::collections::HashMap;
 
+use oximux_agents::attention::Attention;
 use oximux_core::{Project, Workspace};
 
 use crate::shell::agent_presentation::adapter_icon_path;
 use crate::shell::agents_dashboard::model::{AgentRow, sort_agent_rows};
 use crate::shell::left_rail::WorkspaceAgentList;
+use crate::shell::left_rail::rail_agent_row::RailAgentRow;
 use crate::shell::left_rail::workspace_agent_rows::{
     collapse_ws, is_completed_turn, live_activity, live_prompt,
 };
@@ -29,11 +31,19 @@ use crate::shell::session_merge::relative_age_long;
 /// (a refresh race) is skipped. The prompt/activity/done fields reuse the
 /// rail's shared helpers so the card reads identically. Calls `sort_agent_rows`
 /// before returning so callers get an attention-sorted list.
+///
+/// `attention_of` resolves one row's attention. It is a parameter rather than a
+/// host call so this stays pure and testable without a window: the caller owns
+/// the host, and it is the caller that knows a chat row is read from the
+/// session registry while a cockpit row is read from its parsed status. Called
+/// once per row at build time, like every other field, so nothing asks the host
+/// anything inside a render closure.
 pub fn build_agent_rows(
     workspace_agents: &WorkspaceAgentList,
     projects: &[Project],
     workspaces_by_project: &HashMap<String, Vec<Workspace>>,
     now: &str,
+    attention_of: &dyn Fn(&RailAgentRow) -> Option<Attention>,
 ) -> Vec<AgentRow> {
     // workspace_key → (Workspace, project name). Built once before the loop so
     // each session resolves its badge in O(1) without rescanning projects.
@@ -81,6 +91,7 @@ pub fn build_agent_rows(
                 primary,
                 secondary,
                 completed_turn: is_completed_turn(rail),
+                attention: attention_of(rail),
             });
         }
     }
@@ -91,6 +102,26 @@ pub fn build_agent_rows(
 
 #[cfg(test)]
 mod tests {
+    /// A row's attention the way the app resolves a cockpit row's: through the
+    /// one mapping and the one evaluator, with nobody having looked at
+    /// anything. A stub returning `None` would let these tests pass while the
+    /// sections they feed were wrong.
+    fn unseen_attention(rail: &RailAgentRow) -> Option<oximux_agents::attention::Attention> {
+        let item = oximux_agents::attention::external_of_agent_status(
+            "t".into(),
+            "t".into(),
+            &rail.effective_status(),
+            is_completed_turn(rail),
+            |_, _| 0,
+        )?;
+        oximux_agents::attention::of_external(
+            "t",
+            &oximux_agents::session_prefs::SessionPrefs::default(),
+            &[item],
+            &oximux_agents::attention::NothingSeen,
+        )
+    }
+
     use super::*;
     use crate::shell::left_rail::{RailAgentRow, RailAgentTarget};
     use oximux_core::{AgentSnapshot, AgentStatus, SidebandDetail};
@@ -194,7 +225,7 @@ mod tests {
                 rail("s2", "a", "claude-code", AgentStatus::Idle),
             ],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         assert_eq!(rows.len(), 2);
         let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
         assert!(ids.contains(&"s1") && ids.contains(&"s2"));
@@ -206,7 +237,7 @@ mod tests {
         wbp.insert("p1".to_string(), vec![workspace("a", "p1")]);
         let projects = vec![project("p1", "MyProject")];
         let wa = list(vec![("a", vec![rail("s1", "a", "claude-code", AgentStatus::Idle)])]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         assert_eq!(rows[0].project_name, "MyProject");
         assert_eq!(rows[0].workspace.branch, "oximux/a");
         // No prompt captured → primary falls back to the adapter label.
@@ -221,7 +252,7 @@ mod tests {
             "ghost",
             vec![rail("s1", "ghost", "claude-code", AgentStatus::Running)],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         assert!(rows.is_empty());
     }
 
@@ -238,7 +269,7 @@ mod tests {
             "a",
             vec![live_rail("s1", "a", AgentStatus::Running, Some(detail))],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         assert_eq!(rows[0].primary.as_deref(), Some("fix the parser"));
         assert_eq!(rows[0].secondary.as_deref(), Some("Edit: src/lib.rs"));
         assert!(!rows[0].completed_turn);
@@ -256,7 +287,7 @@ mod tests {
             "a",
             vec![live_rail("s1", "a", AgentStatus::Idle, Some(detail))],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         assert!(rows[0].completed_turn);
         assert_eq!(rows[0].primary.as_deref(), Some("hi"));
         assert_eq!(rows[0].secondary.as_deref(), Some("All set — tests pass."));
@@ -272,7 +303,7 @@ mod tests {
                 rail("wait", "a", "claude-code", AgentStatus::WaitingForInput),
             ],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         assert_eq!(rows[0].db_id, "wait");
         assert_eq!(rows[1].db_id, "done");
     }
@@ -287,7 +318,7 @@ mod tests {
                 rail("bare", "a", "", AgentStatus::Running),
             ],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         let branded = rows.iter().find(|r| r.db_id == "branded").unwrap();
         let bare = rows.iter().find(|r| r.db_id == "bare").unwrap();
         assert_eq!(branded.icon_path, "icons/claude-code.svg");
@@ -301,7 +332,7 @@ mod tests {
         ended.ended_at = Some("2026-06-22T00:00:00+00:00".to_string());
         let started = rail("started", "a", "claude-code", AgentStatus::Running);
         let wa = list(vec![("a", vec![ended, started])]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         let e = rows.iter().find(|r| r.db_id == "ended").unwrap();
         let s = rows.iter().find(|r| r.db_id == "started").unwrap();
         assert_eq!(e.last_active_at.as_deref(), Some("2026-06-22T00:00:00+00:00"));
@@ -314,7 +345,7 @@ mod tests {
         // rail() defaults started_at to 2026-06-20; NOW is 4 days later.
         let r = rail("s1", "a", "claude-code", AgentStatus::Idle);
         let wa = list(vec![("a", vec![r])]);
-        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW, &unseen_attention);
         assert_eq!(rows[0].age_label, "4 days ago");
         assert_eq!(
             rows[0].target,

@@ -9,6 +9,7 @@
 
 pub mod filter;
 pub mod model;
+pub mod row_attention;
 pub mod row_builder;
 pub mod row_render;
 pub mod sections;
@@ -26,6 +27,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agents_dashboard::filter::{StatusFilter, apply_filter};
 use crate::shell::agents_dashboard::model::AgentRow;
+use crate::shell::agents_dashboard::row_attention::resolver as attention_resolver;
 use crate::shell::agents_dashboard::row_builder::build_agent_rows;
 use crate::shell::agents_dashboard::row_render::{render_agent_row, render_section_header};
 use crate::shell::agents_dashboard::sections::{DashboardItem, group_into_sections};
@@ -55,10 +57,15 @@ pub fn render_agents_dashboard(
     theme: Theme,
     density: Density,
     typography: &Typography,
+    host: Option<std::sync::Arc<oximux_remote_host::HostCore>>,
 ) -> AnyElement {
     // Build + sort once, narrow by the filter, then group into status sections.
+    // Attention is resolved per row here, before the `uniform_list` closure,
+    // so the host is asked once per row per frame and never inside the
+    // virtualization layer.
+    let attention_of = attention_resolver(host);
     let all_rows: Vec<AgentRow> =
-        build_agent_rows(workspace_agents, projects, workspaces_by_project, now);
+        build_agent_rows(workspace_agents, projects, workspaces_by_project, now, &attention_of);
     let had_any = !all_rows.is_empty();
     let rows = apply_filter(all_rows, filter_text, status_filter);
 
@@ -217,6 +224,9 @@ fn build_dashboard_row(
     let row_id: gpui::SharedString = format!("agent-row-{}", row.db_id).into();
     let is_focused = focused_agent == Some(&row.target);
     let target = row.target.clone();
+    // Carried for the look the click records: the row's key needs its id as
+    // well as its kind.
+    let row_db_id = row.db_id.clone();
     // The row's resolved workspace row id: a `workspaces.id`, or
     // `primary:<project_id>` for the repo-root row. Either way it names a rail
     // row, which is what the reveal needs.
@@ -230,13 +240,29 @@ fn build_dashboard_row(
         MouseButton::Left,
         move |_ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
             let _ = weak_root.update(cx, |root, cx| {
-                match &target {
+                let shown = match &target {
                     RailAgentTarget::AgentSession { db_id } => {
-                        root.focus_agent_by_db_id(db_id, window, cx);
+                        root.focus_agent_by_db_id(db_id, window, cx)
                     }
                     RailAgentTarget::AmbientTerminal { pty_id } => {
-                        root.focus_ambient_agent_terminal(pty_id, window, cx);
+                        root.focus_ambient_agent_terminal(pty_id, window, cx)
                     }
+                    RailAgentTarget::Chat { session_id } => {
+                        root.focus_chat_by_session_id(session_id, window, cx)
+                    }
+                };
+                // Reading a row is what drops a dealt-with failure out of
+                // NEEDS YOU and an unread finish into DONE — but only if the
+                // work was actually put in front of the person. A row with
+                // nothing to open (a history row, a chat another agent spawned
+                // and that has no tab) clears nothing: an alert shown twice
+                // beats one swallowed, and clearing it here would retire the
+                // only sign that it ever finished or failed. Those wait for
+                // PR D's explicit Dismiss.
+                if shown {
+                    crate::shell::agents_dashboard::row_attention::mark_row_viewed(
+                        &row_db_id, &target, cx,
+                    );
                 }
                 // Both calls above no-op for a history row — it has no live
                 // session to focus — which used to make the whole card a dead
