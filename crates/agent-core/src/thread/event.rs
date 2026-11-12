@@ -595,6 +595,55 @@ pub enum ThreadEvent {
     /// background task and is done reacting to it (a `result` marked
     /// `origin.kind == "task-notification"`). Host bookkeeping.
     ContinuationEnded,
+    /// The prompts these tool calls were waiting on are dead, because the
+    /// process that raised them is gone (a respawn reaped it, or it exited).
+    ///
+    /// A permission or a question is answered by routing a decision back to
+    /// the process that asked, by request id, so once that process has gone
+    /// nothing can carry an answer there — the request is dead whatever the
+    /// card still says. The fold marks each named call `Canceled` and adds a
+    /// notice saying so; a call that is not waiting is left alone.
+    ///
+    /// Like [`Self::Rewound`], this exists *because* a remote subscriber can
+    /// never observe it otherwise: the desktop retires these prompts in its
+    /// own thread directly, and without the event an already-open phone keeps
+    /// rendering answer buttons for a process that no longer exists.
+    ///
+    /// Carries the ids rather than meaning "retire whatever you are waiting
+    /// on", so a subscriber whose fold holds a prompt this host already
+    /// settled does not lose it to someone else's restart.
+    ///
+    /// Retiring says the *request* is dead, not that the tool never ran: a
+    /// decision taken from another device reaches the agent without any event
+    /// that moves this fold off `WaitingForConfirmation`, so one of these calls
+    /// may have been approved and acted on. That is why the notice claims
+    /// nothing about the approval (see [`retired_prompts_notice`]) — and why a
+    /// remote decision reaching the fold at decision time, as a local one
+    /// already does, is worth its own change.
+    PromptsRetired { tool_use_ids: Vec<String> },
+}
+
+/// What a transcript says when `n` prompts died with the process that raised
+/// them.
+///
+/// One definition, because three places say it: the fold, which writes it into
+/// the transcript when it applies [`ThreadEvent::PromptsRetired`], the host's
+/// wire downgrade, which sends exactly this prose to a peer whose decoder
+/// predates the event, and the CLI's renderer. They must not drift.
+///
+/// It asserts only what is known at this point, which is less than it is
+/// tempting to say:
+/// - not "the agent restarted" — the same retirement runs when a process
+///   exits on its own and nothing replaces it;
+/// - not "nothing was approved" — a decision taken from another device is
+///   recorded by the session handle and dispatched to the agent *without* any
+///   event that updates this fold, so a call shown as waiting here may have
+///   been approved, and even acted on, already.
+pub fn retired_prompts_notice(n: usize) -> String {
+    match n {
+        1 => "The agent process ended. The request it was waiting on was cut off.".to_string(),
+        n => format!("The agent process ended. The {n} requests it was waiting on were cut off."),
+    }
 }
 
 impl ThreadEvent {

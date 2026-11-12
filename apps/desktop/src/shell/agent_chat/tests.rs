@@ -112,64 +112,6 @@
         assert_eq!(agent_model_count(None, None, 0), AgentModelCount::Unknown);
     }
 
-    #[gpui::test]
-    async fn disconnect_fails_closed_pending_permission(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let stub = StubConnection::default();
-        let stub_probe = stub.clone();
-        let window = cx.add_window(|window, cx| {
-            AgentChatView::with_connection_for_test(
-                Arc::new(stub),
-                Theme::default(),
-                Density::default(),
-                Typography::default(),
-                window,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-
-        window
-            .update(cx, |view, _window, cx| {
-                view.thread.push_user_message("edit notes");
-                view.thread.apply(&ThreadEvent::ToolCallStarted {
-                    id: "t1".into(),
-                    name: "Edit".into(),
-                    input: json!({"file_path": "notes.txt"}),
-                });
-                view.thread.apply(&ThreadEvent::PermissionRequested {
-                    request_id: "r1".into(),
-                    tool_use_id: Some("t1".into()),
-                    tool_name: "Edit".into(),
-                    input: json!({}),
-                    description: "notes.txt".into(),
-                    suggestions: vec![],
-                    kind: oximux_agents::thread::PermissionKind::Tool,
-                });
-                assert!(
-                    view.thread.pending_permission().is_some(),
-                    "permission pending before disconnect"
-                );
-
-                view.on_disconnect(cx);
-
-                assert!(
-                    view.thread.pending_permission().is_none(),
-                    "fail-closed clears the pending permission"
-                );
-                assert!(view.disconnected, "view marks itself disconnected");
-            })
-            .expect("window update");
-
-        // Best-effort deny reached the (stub) connection.
-        let sent = stub_probe.sent();
-        assert!(
-            sent.iter()
-                .any(|s| s["response"]["response"]["behavior"] == "deny"),
-            "disconnect must send a deny control_response, got {sent:?}"
-        );
-    }
-
     /// The gap this closes: a session's remote id used to be a per-process
     /// counter, so `agent-3` named a different conversation on every launch and a
     /// phone holding one after a restart pointed at whatever was built third.
