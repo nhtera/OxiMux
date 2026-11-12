@@ -1476,6 +1476,22 @@ impl WorkspaceRoot {
         live
     }
 
+    /// End the cockpit alerts this window raised, because it is going away.
+    ///
+    /// The host is shared process-wide and only this window's pass retires its
+    /// own keys (`cockpit_attention`), so a window that closes with a blocked
+    /// terminal would leave that alert standing for the rest of the run.
+    pub(crate) fn retire_cockpit_attention(&mut self, cx: &gpui::App) {
+        if let Some(host) =
+            cx.try_global::<crate::remote_control::RemoteControl>().and_then(|rc| rc.host_core())
+        {
+            crate::shell::workspace::cockpit_attention::retire_cockpit_attention(
+                &host,
+                &mut self.cockpit_attention_raised,
+            );
+        }
+    }
+
     pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
         // Before the snapshot is read: let the rail's selection follow the
         // focused pane group when focus has moved since the last refresh.

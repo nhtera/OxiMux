@@ -159,12 +159,28 @@ impl AttentionState {
     }
 
     /// When the alert `kind` + `reason` under `key` first appeared, stamping
-    /// it now if this is the first time it has been asked about.
+    /// it if this is the first time it has been asked about.
     ///
     /// The kind and the reason together are the alert: a permission that
     /// became a failure is a different alert and gets its own moment, while
     /// the same permission asked about again keeps the one it already has.
-    fn status_since(&mut self, key: &str, kind: AttentionKind, reason: &str) -> i64 {
+    ///
+    /// `began` is what the row itself says about when its state began, when it
+    /// knows — and it is preferred over the clock for a reason that only shows
+    /// across a restart. `status_onset` lives in memory, so after a restart
+    /// every alert is asked about for the first time; stamping those with the
+    /// clock dated them *after* the stored look, and a finish the person had
+    /// read came back unread while a failure they had dismissed came back to
+    /// NEEDS YOU. That is precisely what the stored look exists to prevent. A
+    /// row's own end time survives the restart and is the moment the alert
+    /// really arose.
+    fn status_since(
+        &mut self,
+        key: &str,
+        kind: AttentionKind,
+        reason: &str,
+        began: Option<i64>,
+    ) -> i64 {
         let alert = (kind, reason.to_string());
         let floor = match self.status_onset.get(key) {
             Some(held) if held.alert.as_ref() == Some(&alert) => return held.at,
@@ -176,7 +192,7 @@ impl AttentionState {
             Some(held) => held.at + 1,
             None => i64::MIN,
         };
-        let at = chrono::Local::now().timestamp_millis().max(floor);
+        let at = began.unwrap_or_else(|| chrono::Local::now().timestamp_millis()).max(floor);
         self.status_onset.insert(key.to_string(), StatusOnset { alert: Some(alert), at });
         at
     }
@@ -299,13 +315,14 @@ fn status_item(
     target: &str,
     status: &oximux_core::AgentStatus,
     completed_turn: bool,
+    began: Option<i64>,
 ) -> Option<ExternalAttention> {
     let item = attention::external_of_agent_status(
         key.to_string(),
         target.to_string(),
         status,
         completed_turn,
-        |kind, reason| state.status_since(key, kind, reason),
+        |kind, reason| state.status_since(key, kind, reason, began),
     );
     if item.is_none() {
         // Nothing to raise: whatever this key held has ended, and the next
@@ -442,8 +459,9 @@ impl HostCore {
         target: &str,
         status: &oximux_core::AgentStatus,
         completed_turn: bool,
+        began: Option<i64>,
     ) -> Option<Attention> {
-        self.agent_status_attention(target, status, completed_turn, None)
+        self.agent_status_attention(target, status, completed_turn, began, None)
     }
 
     /// As [`HostCore::attention_of_agent_status`], against a reading of the
@@ -454,9 +472,10 @@ impl HostCore {
         target: &str,
         status: &oximux_core::AgentStatus,
         completed_turn: bool,
+        began: Option<i64>,
         prefs: &PrefsSnapshot,
     ) -> Option<Attention> {
-        self.agent_status_attention(target, status, completed_turn, Some(prefs))
+        self.agent_status_attention(target, status, completed_turn, began, Some(prefs))
     }
 
     fn agent_status_attention(
@@ -464,6 +483,7 @@ impl HostCore {
         target: &str,
         status: &oximux_core::AgentStatus,
         completed_turn: bool,
+        began: Option<i64>,
         prefs: Option<&PrefsSnapshot>,
     ) -> Option<Attention> {
         let mut state = self.attention().state.lock().unwrap();
@@ -471,7 +491,7 @@ impl HostCore {
         // owns one alert per row, so the row's key *is* its identity.
         let view = StatusView {
             key: target.to_string(),
-            item: status_item(&mut state, target, target, status, completed_turn),
+            item: status_item(&mut state, target, target, status, completed_turn, began),
         };
         self.current_with(target, Some(view), prefs, &mut state).0
     }
@@ -482,15 +502,22 @@ impl HostCore {
     /// The producer does not mint this itself: the alert's moment is the
     /// host's ([`AttentionState::status_onset`]), so what is published and
     /// what a row shows are the same alert rather than two readings of one.
+    ///
+    /// `began` is what the row says about when its state began — its end time,
+    /// else its launch time — and is used only when an alert is first stamped.
+    /// A caller that has no such moment passes `None` and gets the clock,
+    /// which is right for a row that has none (an ambient terminal) and
+    /// weaker for one that does: see [`AttentionState::status_since`].
     pub fn cockpit_item(
         &self,
         key: &str,
         target: &str,
         status: &oximux_core::AgentStatus,
         completed_turn: bool,
+        began: Option<i64>,
     ) -> Option<ExternalAttention> {
         let mut state = self.attention().state.lock().unwrap();
-        status_item(&mut state, key, target, status, completed_turn)
+        status_item(&mut state, key, target, status, completed_turn, began)
     }
 
     /// Every session's preferences in one query, for a pass that will ask

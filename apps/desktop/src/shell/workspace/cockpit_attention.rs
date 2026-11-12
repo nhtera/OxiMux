@@ -96,7 +96,13 @@ pub fn publish_cockpit_attention(
             let RowAttention::Own(key) = attention_for_row(row) else {
                 continue;
             };
-            match host.cockpit_item(&key, &key, &row.effective_status(), is_completed_turn(row)) {
+            match host.cockpit_item(
+                &key,
+                &key,
+                &row.effective_status(),
+                is_completed_turn(row),
+                crate::shell::agents_dashboard::row_attention::row_began(row),
+            ) {
                 Some(item) => host.publish_external(item),
                 // Nothing to raise, so whatever the key holds ends here.
                 None => host.clear_external(&key),
@@ -107,6 +113,19 @@ pub fn publish_cockpit_attention(
         host.clear_external(&key);
     }
     *raised = live;
+}
+
+/// End every alert this producer raised, because its rows are going.
+///
+/// A closing window's pass never runs again, and the host is shared across the
+/// process: without this, an alert the window raised would stand in NEEDS YOU
+/// for the rest of the run with no pass left to retire it. Called from the
+/// window-closed observer, which holds the root long enough for exactly this
+/// kind of teardown.
+pub fn retire_cockpit_attention(host: &HostCore, raised: &mut HashSet<String>) {
+    for key in raised.drain() {
+        host.clear_external(&key);
+    }
 }
 
 #[cfg(test)]

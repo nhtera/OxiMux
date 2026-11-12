@@ -16,6 +16,7 @@ use oximux_remote_host::attention::PrefsSnapshot;
 
 use crate::shell::left_rail::rail_agent_row::{RailAgentRow, RailAgentTarget};
 use crate::shell::left_rail::workspace_agent_rows::is_completed_turn;
+use crate::shell::search_palette::recency::rfc3339_ms;
 
 /// The key a row's attention and preferences live under.
 ///
@@ -33,6 +34,23 @@ pub fn attention_target(db_id: &str, target: &RailAgentTarget) -> String {
             cockpit_key(db_id)
         }
     }
+}
+
+/// What the row says about when its current state began: its end time, else
+/// its launch time, else nothing.
+///
+/// Seeds the moment the host stamps a cockpit row's alert with the first time
+/// it sees it. It matters across a restart and only then: `status_onset` is in
+/// memory, so after one every alert is new, and stamping an old finish or an
+/// old failure with the clock dates it after the stored look — the finish
+/// comes back unread, the dismissed failure comes back to NEEDS YOU. A DB
+/// row's `ended_at` survives the restart; an ambient row has neither
+/// timestamp and gets the clock, which is all a row re-detected after a
+/// restart could offer anyway.
+///
+/// Both readers call this, so the seed cannot differ between them.
+pub fn row_began(rail: &RailAgentRow) -> Option<i64> {
+    rail.ended_at.as_deref().or(rail.started_at.as_deref()).and_then(rfc3339_ms)
 }
 
 /// What `rail` wants from a person, or `None` when it wants nothing.
@@ -58,6 +76,7 @@ pub fn attention_of_row(
         &target,
         &rail.effective_status(),
         is_completed_turn(rail),
+        row_began(rail),
         prefs,
     )
 }
@@ -86,6 +105,12 @@ pub fn resolver(host: Option<Arc<HostCore>>) -> impl Fn(&RailAgentRow) -> Option
 /// stays unread until it is read. Opening the row *is* reading it — the click
 /// focuses its tab — so a row the person has opened stops asking for them.
 ///
+/// **Only when the click actually opened something.** A row with nothing to
+/// open — a history row, or a chat another agent spawned that has no tab —
+/// shows the person nothing, and clearing its alert would retire the only
+/// sign that it finished or failed. Both click sites test that first; an
+/// explicit Dismiss (PR D) is what clears those.
+///
 /// Silent when there is no host: there is then no attention to clear either.
 pub fn mark_row_viewed(db_id: &str, target: &RailAgentTarget, cx: &App) {
     let Some(host) = cx
@@ -100,6 +125,48 @@ pub fn mark_row_viewed(db_id: &str, target: &RailAgentTarget, cx: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rail_row(started: Option<&str>, ended: Option<&str>) -> RailAgentRow {
+        RailAgentRow {
+            db_id: "7".into(),
+            target: RailAgentTarget::AgentSession { db_id: "7".into() },
+            workspace_key: "ws".into(),
+            adapter_id: "claude-code".into(),
+            label: "Claude Code".into(),
+            is_live: true,
+            status_rx: None,
+            db_status: oximux_core::AgentStatus::Idle,
+            started_at: started.map(str::to_string),
+            ended_at: ended.map(str::to_string),
+            age_label: "now".into(),
+            persisted_title: None,
+            persisted_message: None,
+            ambient_detail: None,
+        }
+    }
+
+    #[test]
+    fn a_rows_moment_is_when_it_ended_else_when_it_started() {
+        // What the host stamps a first-seen alert with, and the only thing
+        // about it that survives a restart.
+        let ended = rfc3339_ms("2026-06-23T10:00:00Z").expect("a parseable fixture");
+        let started = rfc3339_ms("2026-06-23T09:00:00Z").expect("a parseable fixture");
+        assert_eq!(
+            row_began(&rail_row(Some("2026-06-23T09:00:00Z"), Some("2026-06-23T10:00:00Z"))),
+            Some(ended),
+            "a row that has ended arose when it ended"
+        );
+        assert_eq!(
+            row_began(&rail_row(Some("2026-06-23T09:00:00Z"), None)),
+            Some(started),
+            "a live row has only its launch"
+        );
+        assert_eq!(
+            row_began(&rail_row(None, None)),
+            None,
+            "an ambient row has neither, and the host falls back to the clock"
+        );
+    }
 
     #[test]
     fn each_kind_of_row_is_keyed_the_way_its_alert_is_published() {

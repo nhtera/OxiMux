@@ -239,23 +239,30 @@ fn build_dashboard_row(
     card.on_mouse_down(
         MouseButton::Left,
         move |_ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-            // Opening the row is reading it: this is what drops a dealt-with
-            // failure out of NEEDS YOU and an unread finish into DONE.
-            // Recorded before the focus, so a row that has no tab to focus —
-            // a history row, a session another agent spawned — still counts as
-            // read, which is the only way the person can clear it.
-            crate::shell::agents_dashboard::row_attention::mark_row_viewed(&row_db_id, &target, cx);
             let _ = weak_root.update(cx, |root, cx| {
-                match &target {
+                let shown = match &target {
                     RailAgentTarget::AgentSession { db_id } => {
-                        root.focus_agent_by_db_id(db_id, window, cx);
+                        root.focus_agent_by_db_id(db_id, window, cx)
                     }
                     RailAgentTarget::AmbientTerminal { pty_id } => {
-                        root.focus_ambient_agent_terminal(pty_id, window, cx);
+                        root.focus_ambient_agent_terminal(pty_id, window, cx)
                     }
                     RailAgentTarget::Chat { session_id } => {
-                        root.focus_chat_by_session_id(session_id, window, cx);
+                        root.focus_chat_by_session_id(session_id, window, cx)
                     }
+                };
+                // Reading a row is what drops a dealt-with failure out of
+                // NEEDS YOU and an unread finish into DONE — but only if the
+                // work was actually put in front of the person. A row with
+                // nothing to open (a history row, a chat another agent spawned
+                // and that has no tab) clears nothing: an alert shown twice
+                // beats one swallowed, and clearing it here would retire the
+                // only sign that it ever finished or failed. Those wait for
+                // PR D's explicit Dismiss.
+                if shown {
+                    crate::shell::agents_dashboard::row_attention::mark_row_viewed(
+                        &row_db_id, &target, cx,
+                    );
                 }
                 // Both calls above no-op for a history row — it has no live
                 // session to focus — which used to make the whole card a dead

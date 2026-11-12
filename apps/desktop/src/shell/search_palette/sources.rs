@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use gpui::App;
-use oximux_core::{Project, Workspace};
+use oximux_agents::session_prefs::cockpit_key;
+use oximux_core::{AgentSessionId, Project, Workspace};
 
 use crate::shell::pane_group::render::tab_kind_icon;
 use crate::shell::pane_content::PaneContent;
@@ -95,6 +96,15 @@ fn collect_tabs(
         .iter()
         .map(|w| ((w.project_id.as_str(), w.worktree_path.as_str()), w))
         .collect();
+    // A tab carries its runtime agent handle; the attention registry is keyed
+    // by the row's database id, which is what `live_agents` maps from. Built
+    // once for the snapshot, as is the reading of the looks.
+    let cockpit_keys: HashMap<AgentSessionId, String> = root
+        .live_agents
+        .iter()
+        .map(|(db_id, entry)| (entry.session_id, cockpit_key(db_id)))
+        .collect();
+    let prefs = host.as_deref().map(|host| host.prefs_snapshot());
     let mut tabs = Vec::new();
     for project in &root.app_state.recent_projects {
         let Some(panes) = root.project_panes_by_project.get(&project.id) else {
@@ -120,6 +130,8 @@ fn collect_tabs(
                     &worktree_path,
                     is_active_group && idx == g.active(),
                     host.as_deref(),
+                    &cockpit_keys,
+                    prefs.as_ref(),
                     cx,
                 ));
             }
@@ -136,6 +148,8 @@ fn tab_item(
     worktree_path: &Path,
     is_current: bool,
     host: Option<&oximux_remote_host::HostCore>,
+    cockpit_keys: &HashMap<AgentSessionId, String>,
+    prefs: Option<&oximux_remote_host::attention::PrefsSnapshot>,
     cx: &App,
 ) -> TabItem {
     let (aliases, path) = describe_kind(&tab.kind);
@@ -158,7 +172,7 @@ fn tab_item(
         tint: wt.and_then(|w| w.tint),
         is_current,
         in_current_worktree: wt.is_some_and(|w| w.is_current),
-        needs_attention: tab_needs_you(tab, host, cx),
+        needs_attention: tab_needs_you(tab, host, cockpit_keys, prefs, cx),
         last_ms: if tab.last_focused_ms > 0 { tab.last_focused_ms } else { seed },
     }
 }
@@ -174,12 +188,34 @@ fn tab_item(
 fn tab_needs_you(
     tab: &PaneGroupTab,
     host: Option<&oximux_remote_host::HostCore>,
+    cockpit_keys: &HashMap<AgentSessionId, String>,
+    prefs: Option<&oximux_remote_host::attention::PrefsSnapshot>,
     cx: &App,
 ) -> bool {
     match (&tab.kind, &tab.content) {
-        // A cockpit agent: its parsed status, through the one mapping.
-        (PaneGroupTabKind::Agent { status_rx, .. }, _) => {
-            crate::shell::agents_dashboard::model::status_needs_you(&status_rx.borrow().status)
+        // A cockpit agent: what the host holds for its row, so a failure the
+        // person has viewed or dismissed is gone from here too — the status
+        // alone cannot know about a look.
+        //
+        // Read from the published item rather than passed in as a status, as
+        // the dashboard does: the producer republishes every rail pass, and a
+        // palette is never open on the frame before the first one. The status
+        // is the fallback for a tab whose database row has not landed yet,
+        // which is the one case the registry cannot answer.
+        (PaneGroupTabKind::Agent { status_rx, session_id, .. }, _) => {
+            let published = host.zip(cockpit_keys.get(session_id)).and_then(|(host, key)| {
+                match prefs {
+                    Some(prefs) => host.attention_of_in(key, prefs),
+                    None => host.attention_of(key),
+                }
+            });
+            match published {
+                Some(attention) => attention.kind.is_needs_you(),
+                None if host.is_some() && cockpit_keys.contains_key(session_id) => false,
+                _ => crate::shell::agents_dashboard::model::status_needs_you(
+                    &status_rx.borrow().status,
+                ),
+            }
         }
         // A chat session: the host holds its health, so it is the authority.
         // The id is on the view, not on the tab kind — and it is the REMOTE

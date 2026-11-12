@@ -1251,17 +1251,17 @@ fn a_cockpit_rows_status_is_ranked_against_what_was_published_on_it() {
     let waiting = AgentStatus::NeedsApproval("rm -rf build/".into());
 
     let alone =
-        f.core.attention_of_agent_status(target, &waiting, false).expect("raised");
+        f.core.attention_of_agent_status(target, &waiting, false, None).expect("raised");
     assert_eq!(alone.kind, AttentionKind::NeedsPermission, "the status alone answers");
     assert_eq!(alone.reason.as_deref(), Some("rm -rf build/"), "the row says what it would run");
 
     f.core.publish_external(external("ci:7", target, AttentionKind::Failed));
     let ranked =
-        f.core.attention_of_agent_status(target, &waiting, false).expect("raised");
+        f.core.attention_of_agent_status(target, &waiting, false, None).expect("raised");
     assert_eq!(ranked.kind, AttentionKind::NeedsPermission, "a permission outranks a failure");
 
     let quiet = f.core
-        .attention_of_agent_status(target, &AgentStatus::Idle, false)
+        .attention_of_agent_status(target, &AgentStatus::Idle, false, None)
         .expect("the published alert outlives a quiet status");
     assert_eq!(quiet.kind, AttentionKind::Failed, "CI's alert is still on the row");
 }
@@ -1283,7 +1283,7 @@ fn the_producers_item_and_the_rows_status_are_one_alert_not_two() {
     });
 
     let fresh = f.core
-        .attention_of_agent_status(target, &AgentStatus::WaitingForInput, false)
+        .attention_of_agent_status(target, &AgentStatus::WaitingForInput, false, None)
         .expect("raised");
     assert_eq!(
         fresh.kind,
@@ -1309,7 +1309,7 @@ fn a_quiet_status_ends_the_item_published_under_the_rows_own_key() {
     });
 
     assert_eq!(
-        f.core.attention_of_agent_status(target, &AgentStatus::Running, false),
+        f.core.attention_of_agent_status(target, &AgentStatus::Running, false, None),
         None,
         "the request ended with the status that raised it"
     );
@@ -1318,7 +1318,7 @@ fn a_quiet_status_ends_the_item_published_under_the_rows_own_key() {
     f.core.publish_external(external("ci:7", target, AttentionKind::Failed));
     assert_eq!(
         f.core
-            .attention_of_agent_status(target, &AgentStatus::Running, false)
+            .attention_of_agent_status(target, &AgentStatus::Running, false, None)
             .map(|a| a.kind),
         Some(AttentionKind::Failed),
         "only the row's own key is the status's to speak for"
@@ -1335,19 +1335,19 @@ fn one_unchanged_alert_keeps_the_moment_it_first_appeared() {
     let target = "cockpit:ambient:pty-3";
     let blocked = AgentStatus::NeedsApproval("rm -rf build/".into());
 
-    let first = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
-    let again = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
+    let first = f.core.cockpit_item(target, target, &blocked, false, None).expect("raised");
+    let again = f.core.cockpit_item(target, target, &blocked, false, None).expect("raised");
     assert_eq!(first, again, "the same alert, asked about twice");
 
     // The row resolver asks the same owner, so it cannot disagree with what
     // the producer published.
     f.core.publish_external(first.clone());
-    let resolved = f.core.attention_of_agent_status(target, &blocked, false).expect("raised");
+    let resolved = f.core.attention_of_agent_status(target, &blocked, false, None).expect("raised");
     assert_eq!(resolved.since, first.since, "the row shows the alert that was published");
 
     // A different request is a different alert and gets its own moment.
     let other = AgentStatus::NeedsApproval("git push --force".into());
-    let next = f.core.cockpit_item(target, target, &other, false).expect("raised");
+    let next = f.core.cockpit_item(target, target, &other, false, None).expect("raised");
     assert_ne!(next.since, first.since, "a second request is not the first one");
 }
 
@@ -1362,20 +1362,20 @@ fn a_failure_after_a_look_is_raised_again_even_with_the_very_same_words() {
     let target = "cockpit:7";
     let failed = AgentStatus::Failed("boom".into());
     f.core
-        .publish_external(f.core.cockpit_item(target, target, &failed, false).expect("raised"));
+        .publish_external(f.core.cockpit_item(target, target, &failed, false, None).expect("raised"));
     f.core.mark_viewed(target);
     assert_eq!(
-        f.core.attention_of_agent_status(target, &failed, false),
+        f.core.attention_of_agent_status(target, &failed, false, None),
         None,
         "the look deals with the failure that was already there"
     );
 
     // Restarted, ran, failed again — the same words, the same key.
     f.core.clear_external(target);
-    let again = f.core.cockpit_item(target, target, &failed, false).expect("raised");
+    let again = f.core.cockpit_item(target, target, &failed, false, None).expect("raised");
     f.core.publish_external(again);
     assert_eq!(
-        f.core.attention_of_agent_status(target, &failed, false).map(|a| a.kind),
+        f.core.attention_of_agent_status(target, &failed, false, None).map(|a| a.kind),
         Some(AttentionKind::Failed),
         "a second failure is not the first one, however alike they read"
     );
@@ -1390,16 +1390,74 @@ fn a_cleared_rows_key_can_be_reused_without_inheriting_its_moment() {
     let f = fixture();
     let target = "cockpit:ambient:pty-3";
     let blocked = AgentStatus::NeedsApproval("rm -rf build/".into());
-    let first = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
+    let first = f.core.cockpit_item(target, target, &blocked, false, None).expect("raised");
     f.core.publish_external(first.clone());
 
     // The producer's sweep: the terminal is gone, so its alert is cleared.
     f.core.clear_external(target);
     assert_eq!(f.core.attention_of(target), None, "the row is gone and so is its alert");
 
-    let reused = f.core.cockpit_item(target, target, &blocked, false).expect("raised");
+    let reused = f.core.cockpit_item(target, target, &blocked, false, None).expect("raised");
     assert!(
         reused.since > first.since,
         "a new row's alert is a new alert, not the cleared row's"
+    );
+}
+
+#[test]
+fn a_restart_does_not_bring_back_a_finish_that_was_read() {
+    // `status_onset` is in memory, so after a restart every alert is asked
+    // about for the first time. Stamped with the clock, an old finish would be
+    // dated after the stored look and come back unread — and a dismissed
+    // failure would come back to NEEDS YOU, which is the one thing the stored
+    // look exists to prevent. The row's own end time survives the restart, so
+    // it is what the first stamp uses.
+    let db = Arc::new(oximux_storage::db::open_memory().unwrap());
+    let target = "cockpit:7";
+    let finished_at = now() - 60_000;
+
+    {
+        let f = fixture_on(db.clone());
+        let item = f
+            .core
+            .cockpit_item(target, target, &AgentStatus::Idle, true, Some(finished_at))
+            .expect("a finished turn nobody has read");
+        assert_eq!(item.since, finished_at, "the alert arose when the turn ended");
+        f.core.publish_external(item);
+        assert_eq!(
+            f.core
+                .attention_of_agent_status(target, &AgentStatus::Idle, true, Some(finished_at))
+                .map(|a| a.kind),
+            Some(AttentionKind::FinishedUnread),
+            "nobody has read it yet"
+        );
+    }
+
+    // Read it, then restart.
+    {
+        let f = fixture_on(db.clone());
+        f.core.mark_viewed(target);
+    }
+    assert_eq!(
+        fixture_on(db.clone()).core.attention_of_agent_status(
+            target,
+            &AgentStatus::Idle,
+            true,
+            Some(finished_at)
+        ),
+        None,
+        "the finish was read before the restart and stays read"
+    );
+    // The contrast, on its own fresh host, since the first ask is the one that
+    // stamps: any moment after the look reads as unread again, which is what a
+    // clock-stamped old finish is after a restart. Spelled as an explicit
+    // moment rather than `None` so it does not turn on how many milliseconds
+    // this test takes.
+    assert!(
+        fixture_on(db)
+            .core
+            .attention_of_agent_status(target, &AgentStatus::Idle, true, Some(now() + 60_000))
+            .is_some(),
+        "this is what taking the moment from the row prevents"
     );
 }

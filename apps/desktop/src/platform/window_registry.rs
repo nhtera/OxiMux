@@ -236,15 +236,24 @@ pub fn window_handle(cx: &App, persist_id: &str) -> Option<gpui::AnyWindowHandle
 /// Remove the entry for `window_id`, returning it so the caller can capture
 /// state before the strong `WorkspaceRoot` handle drops. `None` when the id
 /// isn't tracked (e.g. a non-workspace spike window).
+///
+/// Ends the window's cockpit attention on the way out. The host outlives the
+/// window and only this window's rail pass retires the keys it raised, so a
+/// window closed with a blocked terminal in it would leave that alert asking
+/// for someone with no row left to open. Done here rather than at the call
+/// site because this is the one place a window stops being tracked.
 pub fn remove(cx: &mut App, window_id: WindowId) -> Option<RegisteredWindow> {
     if !cx.has_global::<WindowRegistry>() {
         return None;
     }
     let reg = cx.global_mut::<WindowRegistry>();
-    reg.windows
+    let removed = reg
+        .windows
         .iter()
         .position(|w| w.window_id == window_id)
-        .map(|pos| reg.windows.remove(pos))
+        .map(|pos| reg.windows.remove(pos))?;
+    removed.workspace.clone().update(cx, |root, cx| root.retire_cockpit_attention(cx));
+    Some(removed)
 }
 
 /// Whether `window_id` is a tracked workspace window. `false` for transient
