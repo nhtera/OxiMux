@@ -813,6 +813,33 @@ shows over modals). Events route via the free `shell::toast::toast(cx, kind, tex
 to the active window's layer (`ToastBus` global, refreshed on window activation),
 or `WorkspaceRoot::push_toast` when the call site already holds the root.
 
+## Agent rows that need a person
+
+An agent row is the one place a status hue appears on a *list row* rather than
+on a banner or an indicator. It is deliberate, and narrow: the row is an inbox
+entry, and the whole point of the inbox is that you can tell at a glance which
+entry is the one to open.
+
+- **A 2px left accent bar, in the kind's own tone**, on the same contract as a
+  toast's: the bar *is* the accent, text stays `fg_base`, one per row.
+  `status_warn` for a permission or a question, `status_error` for a failure,
+  `status_muted` for a stall — nothing has gone wrong there, it has gone quiet.
+- **A finished turn wears no bar.** Unread work is a thing to collect, not a
+  thing to be alarmed by, and a bar on every completed agent would stripe the
+  whole list. Its emerald check carries it instead.
+- **A row that wants nothing wears no bar**, however it ended. A failure that
+  has been viewed or dismissed is not asking any more, so it loses its accent
+  along with its place in NEEDS YOU.
+- **The tone is not the row's to choose.** It comes from
+  `AttentionKind::tone()` in `oximux_agents`, the same answer the status-bar
+  chip and the notifier read, so a row and a banner can never disagree about
+  how bad a thing is. The desktop only maps a tone to a token
+  (`agents_dashboard/attention_look.rs`).
+
+This is an exception to "the brand IS the absence of accent": it buys the one
+thing the absence of accent cannot, which is a list you can triage without
+reading it.
+
 ## Composition rules
 
 - **One accent per surface.** A row uses `status_warn` *or* `status_info`, not both.
@@ -825,8 +852,25 @@ or `WorkspaceRoot::push_toast` when the call site already holds the root.
   ease-out to transparent). It's a transient locator, not a state — the steady
   focus marker stays the tab strip's bottom border. Single-group layouts don't
   flash (no ambiguity). Reuses `focus_ring`; no new token.
-- **No drop shadows** on dark UI. They look muddy. Use a 1px border in `border_active`
-  instead.
+- **No drop shadows** on dark UI *in the layout*. They look muddy. Use a 1px
+  border in `border_active` instead. This is about panels, rows, headers and
+  chrome that sit **in** the layout — anything that has a place in the
+  composition does not need to pretend to hover above it.
+- **Floating surfaces are the exception, and they take `shadow_lg`.** A surface
+  that floats **over** content — a context menu, a picker, a palette, a modal,
+  a popover, a drag image — has no place in the layout by definition, and a 1px
+  border is not enough to detach it from whatever it happens to be covering: a
+  menu over a dense list reads as part of the list. Every such surface in the
+  cockpit carries `shadow_lg`, which is the rule rather than a drift.
+  - The **top inner-highlight** is not an alternative to this; the two do
+    different jobs. The highlight (`edge_highlight`, applied by
+    `floating_chrome`) is *internal* elevation — it works at any size, never
+    muddies, and is what makes a surface read as raised rather than flat. The
+    shadow is *separation*, and only a surface with content beneath it needs
+    it. Read the "reads as elevation without a shadow" note on `edge_highlight`
+    as what the highlight buys on its own, not as a ban on pairing them.
+  - It does **not** extend to a row, a card or a section inside a surface. One
+    shadow per floating surface, on the surface itself.
 - **No gradients** outside of the focus ring.
 
 ## Anti-patterns

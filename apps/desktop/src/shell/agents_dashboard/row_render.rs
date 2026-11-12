@@ -19,6 +19,7 @@ use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px, svg};
 use oximux_core::AgentStatus;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::shell::agents_dashboard::attention_look;
 use crate::shell::agents_dashboard::model::AgentRow;
 use crate::shell::agents_dashboard::sections::SectionKind;
 use crate::shell::left_rail::workspace_agent_rows::{agent_state_indicator, agent_state_label};
@@ -87,6 +88,11 @@ fn state_line(row: &AgentRow, status: &AgentStatus) -> String {
     row.secondary
         .clone()
         .or_else(|| row.attention.as_ref().and_then(|a| a.reason.clone()))
+        // The evaluator's verb before the status label, for the same reason
+        // the glyph reads the attention: a row that wants something and has
+        // no reason to show should still say what it wants, not what its
+        // status happens to be.
+        .or_else(|| row.attention.as_ref().map(|a| a.kind.verb().to_string()))
         .unwrap_or_else(|| agent_state_label(status).to_string())
 }
 
@@ -104,8 +110,7 @@ pub fn render_agent_row(
     let status = row.status.clone().unwrap_or(AgentStatus::Idle);
     // The evaluator's answer, not a status guess: a failure that has been
     // viewed no longer wears the accent, and a stall now does.
-    let is_attention =
-        row.attention.as_ref().is_some_and(|attention| attention.kind.is_needs_you());
+    let accent = attention_look::accent_color(row.attention.as_ref(), theme);
 
     // ── leading column: state glyph + adapter icon, sat on the title line ──
     let lead = div()
@@ -115,12 +120,15 @@ pub fn render_agent_row(
         .flex_shrink_0()
         .h(px(20.))
         .gap(px(density.gap_inline))
-        .child(agent_state_indicator(
-            &status,
-            row.completed_turn,
-            &row.db_id,
-            theme,
-        ))
+        // The evaluator's answer first: a chat row's display status is `Idle`
+        // whenever it is not working, so a failed chat drew an idle dot right
+        // next to a NEEDS YOU header. The status still draws the rest — it is
+        // the only thing that knows about `Running`, which has no attention
+        // kind and needs a spinner.
+        .child(match row.attention.as_ref() {
+            Some(attention) => attention_look::attention_indicator(attention.kind, theme),
+            None => agent_state_indicator(&status, row.completed_turn, &row.db_id, theme),
+        })
         .child(
             svg()
                 .path(row.icon_path)
@@ -228,21 +236,17 @@ pub fn render_agent_row(
         .child(lead)
         .child(text_col);
 
-    if is_attention {
+    match accent {
         // Floating-card chrome (relative + border + rounded + top highlight)
-        // plus a 2px left accent bar in the warn color. The bar is absolute,
-        // anchored to the `relative` context floating_chrome establishes.
-        root.floating_chrome(&theme, &density).child(
-            div()
-                .absolute()
-                .left_0()
-                .top_0()
-                .bottom_0()
-                .w(px(2.))
-                .bg(theme.status_warn),
-        )
-    } else {
-        root.hover(|s| s.bg(theme.hover_overlay))
+        // plus a 2px left accent bar in the kind's own tone — warn for a
+        // prompt, error for a failure, muted for a stall, which is the one
+        // place a row says *how bad* this is before you read a word of it.
+        // The bar is absolute, anchored to the `relative` context
+        // `floating_chrome` establishes.
+        Some(color) => root.floating_chrome(&theme, &density).child(
+            div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(color),
+        ),
+        None => root.hover(|s| s.bg(theme.hover_overlay)),
     }
 }
 
@@ -318,5 +322,19 @@ mod tests {
     #[test]
     fn a_row_with_nothing_to_say_falls_back_to_its_state_label() {
         assert_eq!(state_line(&row(None, None), &AgentStatus::Running), "Working");
+    }
+
+    #[test]
+    fn a_reasonless_alert_says_what_it_wants_rather_than_its_status() {
+        // A stall has no reason of its own beyond "no output", and a chat's
+        // display status is `Idle` whenever it is not working — so without the
+        // verb this row read "Idle" under a NEEDS YOU header.
+        let stalled = Attention {
+            kind: AttentionKind::Stalled,
+            since: 0,
+            reason: None,
+            source: AttentionSource::Health,
+        };
+        assert_eq!(state_line(&row(None, Some(stalled)), &AgentStatus::Idle), "Stalled");
     }
 }

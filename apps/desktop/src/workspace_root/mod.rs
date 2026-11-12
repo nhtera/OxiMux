@@ -388,6 +388,9 @@ pub struct WorkspaceRoot {
     pub(crate) nav_replaying: bool,
     /// Sidebar Rename/Archive/Delete popover (mounted at root for full-window backdrop).
     pub(crate) row_menu: Entity<WorkspaceRowMenu>,
+    /// Right-click menu for a dashboard agent row (Dismiss, Mark as unread).
+    /// Same full-window-backdrop mount contract as `row_menu`.
+    pub(crate) agent_row_menu: Entity<crate::shell::agents_dashboard::agent_row_menu::AgentRowMenu>,
     /// Sidebar per-project-header action popover (Reveal/Copy/Remove).
     /// Same full-window-backdrop mount contract as `row_menu`.
     pub(crate) project_menu: Entity<ProjectRowMenu>,
@@ -1185,6 +1188,15 @@ impl WorkspaceRoot {
         let weak_for_menu: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let row_menu =
             cx.new(|_| WorkspaceRowMenu::new(theme, density, typography.clone(), weak_for_menu));
+        let weak_for_agent_menu: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let agent_row_menu = cx.new(|_| {
+            crate::shell::agents_dashboard::agent_row_menu::AgentRowMenu::new(
+                theme,
+                density,
+                typography.clone(),
+                weak_for_agent_menu,
+            )
+        });
         let weak_for_project_menu: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let project_menu = cx.new(|_| {
             ProjectRowMenu::new(theme, density, typography.clone(), weak_for_project_menu)
@@ -1559,6 +1571,7 @@ impl WorkspaceRoot {
             nav_cursor: 0,
             nav_replaying: false,
             row_menu,
+            agent_row_menu,
             project_menu,
             dashboard_status_menu,
             options_menu,

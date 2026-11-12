@@ -102,6 +102,57 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Open a dashboard row's context menu at the pointer.
+    ///
+    /// Closes the other overlays first: two full-window dismiss regions
+    /// competing is the bug the `close_modal_overlays` contract exists for.
+    pub(crate) fn open_agent_row_menu(
+        &mut self,
+        db_id: String,
+        target: crate::shell::left_rail::rail_agent_row::RailAgentTarget,
+        attention: Option<&oximux_agents::attention::Attention>,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_modal_overlays(cx);
+        let menu = self.agent_row_menu.clone();
+        menu.update(cx, |menu, cx| menu.open(db_id, target, attention, x, y, cx));
+        cx.notify();
+    }
+
+    /// Do what a row's context menu asked.
+    ///
+    /// Both write through the host, because both are facts about what the
+    /// person has seen and the host owns that: `mark_viewed` is the one call
+    /// behind "viewed" and "Dismiss", and the unread mark is what keeps a row
+    /// standing out after it has been read.
+    pub(crate) fn act_on_agent_row(
+        &mut self,
+        db_id: &str,
+        target: &crate::shell::left_rail::rail_agent_row::RailAgentTarget,
+        action: crate::shell::agents_dashboard::agent_row_menu::AgentRowAction,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::shell::agents_dashboard::agent_row_menu::AgentRowAction;
+        let Some(host) = cx
+            .try_global::<crate::remote_control::RemoteControl>()
+            .and_then(|rc| rc.host_core())
+        else {
+            return;
+        };
+        let key = crate::shell::agents_dashboard::row_attention::attention_target(db_id, target);
+        match action {
+            // A dismissal is a look: the person has seen this and dealt with
+            // it. The evaluator decides what that clears — a failure and a
+            // stall go, a permission stays, because the agent is still
+            // waiting on an answer.
+            AgentRowAction::Dismiss => host.mark_viewed(&key),
+            AgentRowAction::MarkUnread => host.mark_unread(&key),
+        }
+        cx.notify();
+    }
+
     /// Open the Agents page, for a banner whose session has no tab to focus.
     fn show_agents_page(&mut self, cx: &mut Context<Self>) {
         let rail = self.left_rail.clone();
