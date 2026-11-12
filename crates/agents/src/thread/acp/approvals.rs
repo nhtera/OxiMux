@@ -139,7 +139,7 @@ mod tests {
     }
 
     fn allow() -> PermissionDecision {
-        PermissionDecision::Allow { updated_input: json!({}) }
+        PermissionDecision::allow(json!({}))
     }
     fn deny() -> PermissionDecision {
         PermissionDecision::Deny { message: "no".into() }
@@ -212,14 +212,14 @@ mod tests {
             opt("yes", PermissionOptionKind::AllowOnce),
             opt("always", PermissionOptionKind::AllowAlways),
         ];
-        let decision = PermissionDecision::AllowWithSuggestion {
-            updated_input: json!({}),
-            suggestion: PermissionSuggestion {
+        let decision = PermissionDecision::allow_with_suggestion(
+            json!({}),
+            PermissionSuggestion {
                 kind: ACP_OPTION_KIND.into(),
                 label: "always".into(),
                 raw: json!({ "optionId": "always" }),
             },
-        };
+        );
         assert_eq!(outcome_id(&decision_to_outcome(&decision, &opts)).as_deref(), Some("always"));
     }
 }

@@ -291,7 +291,7 @@ fn events_response_round_trips() {
 #[test]
 fn resolve_permission_carries_decision_as_json() {
     let decision =
-        PermissionDecision::Allow { updated_input: json!({ "command": "rm -rf /tmp/x" }) };
+        PermissionDecision::allow(json!({ "command": "rm -rf /tmp/x" }));
     let payload = ResolvePermissionReq::new("s1", "req-7", &decision).expect("encode decision");
     assert_eq!(payload.decision().expect("decode decision"), decision);
 

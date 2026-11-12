@@ -252,9 +252,9 @@ impl AgentChatView {
                 // Pre-approved in settings: allowed without a card, but still
                 // through `resolve_permission`, which re-runs the policy and so
                 // records the grant (or refuses a target another chat took).
-                PermissionDecision::Allow { updated_input: input }
+                PermissionDecision::allow(input)
             }
-            Decision::Allow => PermissionDecision::Allow { updated_input: input },
+            Decision::Allow => PermissionDecision::allow(input),
             Decision::Refuse { reason } => {
                 // The sentence is on its way to the agent as the denial message.
                 // Keep a copy on the card, or the user watching this happen sees
@@ -390,7 +390,7 @@ impl AgentChatView {
         self.resolve_permission(
             tool_id,
             request_id,
-            PermissionDecision::Allow { updated_input: input },
+            PermissionDecision::allow(input),
             cx,
         );
     }

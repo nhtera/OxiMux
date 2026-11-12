@@ -116,6 +116,9 @@ pub struct HostCore {
     /// Counts the times this process won the data directory, so work begun
     /// under one ownership stops once it is given up (even if won back).
     owner_gen: std::sync::atomic::AtomicU64,
+    /// The one attention owner: what every surface that shows "needs you"
+    /// reads from (`attention.rs`).
+    attention: crate::attention::AttentionSlots,
 }
 
 impl HostCore {
@@ -126,6 +129,7 @@ impl HostCore {
     pub fn new(deps: HostCoreDeps) -> Arc<Self> {
         let (config, _) = watch::channel(deps.config.sanitized());
         let (drain, drain_rx) = mpsc::unbounded_channel();
+        let prefs = deps.lineage.prefs();
         let core = Arc::new(Self {
             rt: deps.rt,
             outbox: deps.lineage.outbox(),
@@ -139,10 +143,12 @@ impl HostCore {
             debounce: Mutex::new(EVENT_DEBOUNCE),
             catalog: Mutex::new(None),
             owner_gen: std::sync::atomic::AtomicU64::new(0),
+            attention: crate::attention::AttentionSlots::new(prefs),
         });
         core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
         core.spawn_health_ticker();
+        core.spawn_attention_watchers();
         core.rt.spawn(outbox_drainer::run(Arc::downgrade(&core), drain, drain_rx));
         core
     }
@@ -292,6 +298,11 @@ impl HostCore {
             };
             self.record_child_event(parent, &event, "ended");
         }
+    }
+
+    /// The attention slots, for `attention.rs`.
+    pub(crate) fn attention(&self) -> &crate::attention::AttentionSlots {
+        &self.attention
     }
 
     pub fn runtime(&self) -> &tokio::runtime::Handle {

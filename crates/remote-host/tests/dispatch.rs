@@ -144,7 +144,7 @@ fn full_pairing_and_session_control_over_the_loopback() {
             ResolvePermissionReq::new(
                 "sess-1",
                 "req-1",
-                &PermissionDecision::Allow { updated_input: json!({}) },
+                &PermissionDecision::allow(json!({})),
             )
             .unwrap(),
         );

@@ -106,7 +106,7 @@ fn client_pairs_and_drives_a_session_over_the_loopback() {
         client.cancel("sess-1").await.expect("cancel");
 
         // Resolve is idempotent: first call wins, a re-resolve reports already-decided.
-        let allow = PermissionDecision::Allow { updated_input: json!({}) };
+        let allow = PermissionDecision::allow(json!({}));
         assert!(client.resolve_permission("sess-1", "req-1", &allow).await.expect("resolve"));
         assert!(
             !client.resolve_permission("sess-1", "req-1", &allow).await.expect("re-resolve"),

@@ -51,7 +51,7 @@ fn main() {
                         println!(">>> permission for '{tool_name}' → {}",
                             if approve { "APPROVE" } else { "DENY" });
                         let decision = if approve {
-                            PermissionDecision::Allow { updated_input: serde_json::Value::Null }
+                            PermissionDecision::allow(serde_json::Value::Null)
                         } else {
                             PermissionDecision::Deny { message: "denied by smoke test".into() }
                         };

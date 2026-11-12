@@ -1095,9 +1095,8 @@ printf '{"type":"echo_for_test","raw":%s}\n' "$(printf '%s' "$answer" | sed 's/\
         // produces... simpler: the echo frame is an unknown event (mapped to
         // nothing), so assert by absence of failure AND by the pending set:
         // a second resolve for the same id must now be refused.
-        let second = conn.resolve_permission(&req.0, PermissionDecision::Allow {
-            updated_input: serde_json::Value::Null,
-        });
+        let second =
+            conn.resolve_permission(&req.0, PermissionDecision::allow(serde_json::Value::Null));
         assert!(second.is_err(), "an answered approval must not be answerable again");
         let _ = deadline;
     }

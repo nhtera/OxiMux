@@ -1779,7 +1779,7 @@ sleep 2
         let err = conn
             .resolve_permission(
                 "req-1",
-                PermissionDecision::Allow { updated_input: serde_json::Value::Null },
+                PermissionDecision::allow(serde_json::Value::Null),
             )
             .expect_err("pi has no approval round-trip to resolve");
         assert!(err.to_string().contains("posture"), "got {err}");

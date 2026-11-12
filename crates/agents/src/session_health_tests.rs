@@ -143,7 +143,7 @@ fn a_prompt_decided_through_the_host_is_answered_at_once() {
         ..live_at(now_ms())
     });
     assert_eq!(h.health().status, HealthStatus::NeedsPermission);
-    assert!(h.resolve_permission("req-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap());
+    assert!(h.resolve_permission("req-1", PermissionDecision::allow(serde_json::Value::Null)).unwrap());
     assert_eq!(h.health().status, HealthStatus::Working);
 }
 
@@ -180,7 +180,7 @@ fn a_continuation_answered_through_the_host_keeps_working() {
     assert_eq!(h.health().status, HealthStatus::NeedsPermission);
     // A host tick while the card is up changes nothing.
     h.refresh_health(now_ms(), ChildActivity::default());
-    assert!(h.resolve_permission("req-1", PermissionDecision::Allow { updated_input: serde_json::Value::Null }).unwrap());
+    assert!(h.resolve_permission("req-1", PermissionDecision::allow(serde_json::Value::Null)).unwrap());
     assert_eq!(h.health().status, HealthStatus::Working);
     assert!(h.health().stalled_since.is_none());
     h.refresh_health(now_ms() + MIN, ChildActivity::default());
@@ -194,7 +194,7 @@ fn a_respawn_forgets_the_old_processes_decided_requests() {
     use crate::health::PromptKind;
     use crate::thread::PermissionDecision;
     let (reg, h) = registry_with("s");
-    let allow = || PermissionDecision::Allow { updated_input: serde_json::Value::Null };
+    let allow = || PermissionDecision::allow(serde_json::Value::Null);
     assert!(h.resolve_permission("3", allow()).unwrap());
     let (respawned, _rx, _tx) = StubConnection::new();
     reg.register("s".into(), Arc::new(respawned));

@@ -366,6 +366,12 @@ impl LineageStore {
         crate::retry::store::RetryStore::new(self.conn.clone())
     }
 
+    /// What a person has already seen of each session, on the same database
+    /// (so a rekey carries it over in one transaction).
+    pub fn prefs(&self) -> crate::session_prefs::SessionPrefsRepo {
+        crate::session_prefs::SessionPrefsRepo::new(self.conn.clone())
+    }
+
     /// Take a slot for a child of `parent`, or refuse.
     ///
     /// In one `BEGIN IMMEDIATE` transaction: reconcile the parent's tree
@@ -623,6 +629,13 @@ impl LineageStore {
             params![old, new, chrono::Local::now().with_timezone(&chrono::Utc).to_rfc3339()],
         )?;
         tx.execute("UPDATE OR REPLACE turn_retries SET session_id = ?2 WHERE session_id = ?1", params![old, new])?;
+        // And what the person has already seen of it: the new id reading as
+        // never viewed would bring back every alert they had dealt with.
+        crate::session_prefs::rekey_in(
+            &tx,
+            &crate::session_prefs::chat_key(old),
+            &crate::session_prefs::chat_key(new),
+        )?;
         tx.commit().context("commit lineage rekey")?;
         Ok(())
     }

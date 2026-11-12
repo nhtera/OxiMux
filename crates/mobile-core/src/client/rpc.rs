@@ -132,7 +132,7 @@ impl MobileClient {
                 // malformed empty allow that the CLI would silently treat as a deny.
                 let updated_input = serde_json::from_str(&updated_input_json)
                     .map_err(|e| MobileError::Rpc(format!("updated_input is not valid JSON: {e}")))?;
-                PermissionDecision::Allow { updated_input }
+                PermissionDecision::allow(updated_input)
             }
             PermissionReply::AllowWithSuggestion { updated_input_json, suggestion_json } => {
                 let updated_input = serde_json::from_str(&updated_input_json)
@@ -144,7 +144,7 @@ impl MobileClient {
                 // half-understood payload is the wrong thing to guess at.
                 let suggestion = serde_json::from_str(&suggestion_json)
                     .map_err(|e| MobileError::Rpc(format!("suggestion is not valid JSON: {e}")))?;
-                PermissionDecision::AllowWithSuggestion { updated_input, suggestion }
+                PermissionDecision::allow_with_suggestion(updated_input, suggestion)
             }
             PermissionReply::Deny { message } => PermissionDecision::Deny { message },
         };

@@ -189,7 +189,7 @@ pub async fn allow(
     // the operator is explicitly correcting is the one outcome this flag must
     // not have.
     let decision =
-        PermissionDecision::Allow { updated_input: override_input.unwrap_or_else(|| input.clone()) };
+        PermissionDecision::allow(override_input.unwrap_or_else(|| input.clone()));
     resolve(client, session, request_id, &decision).await
 }
 

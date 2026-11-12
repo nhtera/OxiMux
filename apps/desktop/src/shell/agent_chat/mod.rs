@@ -3091,7 +3091,7 @@ impl AgentChatView {
         self.resolve_permission(
             tool_id,
             request_id,
-            PermissionDecision::AllowWithSuggestion { updated_input: input, suggestion },
+            PermissionDecision::allow_with_suggestion(input, suggestion),
             cx,
         );
         self.set_mode_chip(mode, cx);
