@@ -376,6 +376,13 @@ impl LaunchJob {
                         SpawnErrorKind::PostureUnenforceable,
                         format!("{why}. Spawn a Claude or Codex agent for this posture."),
                     ),
+                    // `NotAllowed` rather than a new wire kind: its own doc
+                    // already covers "this host cannot", and an enum variant
+                    // on the wire costs a protocol bump plus a client-side
+                    // gate for a refusal the message explains anyway.
+                    LaunchError::UnsupportedOnHost(why) => {
+                        refuse(SpawnErrorKind::NotAllowed, why)
+                    }
                     other => Response::Error(RpcError::BadRequest(other.to_string())),
                 };
             }
@@ -497,6 +504,7 @@ fn launch_reason(err: &LaunchError) -> &'static str {
         LaunchError::Failed => "the agent did not start",
         LaunchError::ModelUnsupported => "model not settable at spawn",
         LaunchError::PostureUnenforceable(_) => "posture unenforceable",
+        LaunchError::UnsupportedOnHost(_) => "children unsupported on this host",
     }
 }
 
