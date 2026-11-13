@@ -119,7 +119,7 @@ mod tests {
     ) -> (Option<oximux_agents::attention::Attention>, RowActions) {
         let attention = unseen_of(rail);
         let actions =
-            oximux_agents::row_actions::row_actions(attention.as_ref().map(|a| a.kind), &[], None);
+            oximux_agents::row_actions::row_actions(attention.as_ref().map(|a| a.kind), None);
         (attention, actions)
     }
 

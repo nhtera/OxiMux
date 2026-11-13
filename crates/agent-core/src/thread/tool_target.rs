@@ -20,15 +20,74 @@
 
 use serde_json::Value;
 
+/// What a tool call's one-line target is, and how much of the request it
+/// accounts for.
+///
+/// The extra two fields exist for the agents row's inline Allow. A label good
+/// enough for a collapsed card — "Edit: notes.txt" — is **not** good enough to
+/// approve from: the path is the whole of what it says, while `old_string` and
+/// `new_string` are the whole of what will happen. So a decider needs to know
+/// not just the sentence but whether the sentence covers the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolTarget {
+    /// The input key the text came from. `None` where it came from no single
+    /// key (a collab verb assembled from several).
+    pub key: Option<&'static str>,
+    pub text: String,
+    /// Whether `text` is that key's **entire** value, rather than a count or
+    /// a summary of it. False for "2 files", "3 actions", a coordinate pair,
+    /// and the first line of a longer prompt.
+    pub whole: bool,
+}
+
+/// Input keys that do not change what a tool will do, so a summary that
+/// leaves them out has still shown the request.
+///
+/// Deliberately tiny, and safe in the direction it fails: a key wrongly left
+/// off this list means no inline Allow (the card opens, which always works),
+/// while a key wrongly added could hide something. Nothing here can change a
+/// path, a command or a payload.
+const COSMETIC_KEYS: &[&str] = &["description", "explanation", "timeout", "timeout_ms"];
+
+/// Whether a row showing [`tool_target`]'s line has shown the whole request.
+///
+/// Three things have to hold: the text came from one named key, it is that
+/// key's entire value, and every other key in the input is cosmetic. An
+/// `Edit` fails the third, an `apply_patch` the second, and a `Task` the
+/// first — all three open the card instead.
+pub fn describes_whole_input(tool_name: &str, input: &Value) -> bool {
+    let Some(target) = describe(tool_name, input) else { return false };
+    let (Some(key), true) = (target.key, target.whole) else { return false };
+    let Some(map) = input.as_object() else { return false };
+    map.keys().all(|k| k == key || COSMETIC_KEYS.contains(&k.as_str()))
+}
+
 /// A short human target for the tool line — the file it touches, the command it
 /// runs, the query it searches, a click coordinate, or a subagent/task brief.
 /// `None` when the input carries none. Kept legible for the collapsed header,
 /// which is what the user sees without expanding the card.
 pub fn tool_target(tool_name: &str, input: &Value) -> Option<String> {
+    describe(tool_name, input).map(|t| t.text)
+}
+
+/// [`tool_target`], with the provenance a decider needs: see [`ToolTarget`].
+///
+/// One precedence, in one place — the row's eligibility rule and the card's
+/// label must read a call the same way or the row could offer Allow for a
+/// sentence the card would word differently.
+pub fn describe(tool_name: &str, input: &Value) -> Option<ToolTarget> {
+    // Text that is a named key's entire value.
+    let whole = |key: &'static str, text: String| {
+        Some(ToolTarget { key: Some(key), text, whole: true })
+    };
+    // Text that only summarises its key: a count, a coordinate, a first line.
+    let part = |key: &'static str, text: String| {
+        Some(ToolTarget { key: Some(key), text, whole: false })
+    };
     // A file the tool touches.
     for key in ["file_path", "path", "notebook_path"] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
-            return Some(s.to_string());
+            return whole(key, s.to_string());
         }
     }
     // A Codex `apply_patch` names its files inside `changes[]` rather than at
@@ -41,30 +100,41 @@ pub fn tool_target(tool_name: &str, input: &Value) -> Option<String> {
         if let [only] = changes.as_slice()
             && let Some(path) = only.get("path").and_then(Value::as_str)
         {
-            return Some(path.to_string());
+            // One path, but the diff that goes into it is not here.
+            return part("changes", path.to_string());
         }
-        return Some(format!("{} files", changes.len()));
+        return part("changes", format!("{} files", changes.len()));
     }
-    // The command a shell tool runs, minus any wrapper shell.
-    if input.get("command").and_then(Value::as_str).is_some() {
-        return Some(display_command(input).to_string());
+    // The command a shell tool runs, minus any wrapper shell. Whole only when
+    // no wrapper was unwrapped: where it was, the text is the inner script
+    // and the key's own value is the wrapper, so the two differ.
+    if let Some(raw) = input.get("command").and_then(Value::as_str) {
+        let shown = display_command(input);
+        return Some(ToolTarget {
+            key: Some("command"),
+            text: shown.to_string(),
+            whole: shown == raw,
+        });
     }
     // A pattern / url / query the tool acts on.
     for key in ["pattern", "url", "query"] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
-            return Some(s.to_string());
+            return whole(key, s.to_string());
         }
     }
     // A pointer target, e.g. computer-use clicks: `coordinate: [x, y]`.
     if let Some(coord) = input.get("coordinate").and_then(Value::as_array)
         && coord.len() >= 2
     {
-        return Some(format!("({}, {})", round_num(&coord[0]), round_num(&coord[1])));
+        return part(
+            "coordinate",
+            format!("({}, {})", round_num(&coord[0]), round_num(&coord[1])),
+        );
     }
     // A batch of UI actions → a count, not the whole array.
     if let Some(actions) = input.get("actions").and_then(Value::as_array) {
         let n = actions.len();
-        return Some(format!("{n} action{}", if n == 1 { "" } else { "s" }));
+        return part("actions", format!("{n} action{}", if n == 1 { "" } else { "s" }));
     }
     // A Codex collab/sub-agent item: its action verb and who it targets, rather
     // than the `prompt` the generic fallback below would pick — the prompt
@@ -73,14 +143,20 @@ pub fn tool_target(tool_name: &str, input: &Value) -> Option<String> {
     // `type` Codex carries on the input, so a Claude `Agent` call (no `type`
     // field) still falls through to its brief.
     if let Some(t) = collab_target(input) {
-        return Some(t);
+        // Assembled from several keys, so no single one names it.
+        return Some(ToolTarget { key: None, text: t, whole: false });
     }
     // Typed text / key chord, or a subagent/task brief → its first line.
     for key in ["text", "description", "prompt"] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
             let first = s.lines().next().unwrap_or(s);
             if !first.trim().is_empty() {
-                return Some(first.to_string());
+                // Whole only when the value WAS one line.
+                return Some(ToolTarget {
+                    key: Some(key),
+                    text: first.to_string(),
+                    whole: first == s,
+                });
             }
         }
     }
@@ -312,6 +388,56 @@ mod tests {
             tool_target("Task", &json!({"description": "Audit the parser", "prompt": "Check X"})),
             Some("Audit the parser".to_string())
         );
+    }
+
+    #[test]
+    fn a_label_is_not_a_description_of_the_request() {
+        // The finding this exists for: "Edit: notes.txt" is a perfectly good
+        // collapsed-card label and a terrible thing to approve from — the
+        // path is all it says, while the replacement text is all that will
+        // happen.
+        assert!(!describes_whole_input(
+            "Edit",
+            &json!({"file_path": "notes.txt", "old_string": "a", "new_string": "b"})
+        ));
+        // A patch names a file but not the diff going into it.
+        assert!(!describes_whole_input("apply_patch", &json!({"changes": [{"path": "a.rs"}]})));
+        // A count is not its array.
+        assert!(!describes_whole_input(
+            "mcp__computer-use__computer_batch",
+            &json!({"actions": [{}, {}]})
+        ));
+        // A first line is not the whole prompt.
+        assert!(!describes_whole_input("Task", &json!({"prompt": "Find it\nin detail"})));
+        // A wrapped Codex exec shows the inner script while the key holds
+        // the wrapper, so the two are not the same text.
+        assert!(!describes_whole_input(
+            "Bash",
+            &json!({"command": "/bin/zsh -lc 'echo hi'",
+                    "commandActions": [{"command": "echo hi"}]})
+        ));
+    }
+
+    #[test]
+    fn a_request_whose_one_line_is_all_of_it_is_fully_described() {
+        // The case inline Allow exists for.
+        assert!(describes_whole_input("Bash", &json!({"command": "pnpm db:reset"})));
+        // A cosmetic neighbour does not change what runs, so it does not
+        // stop the row from having shown the request.
+        assert!(describes_whole_input(
+            "Bash",
+            &json!({"command": "pnpm db:reset", "description": "Reset the dev database"})
+        ));
+        assert!(describes_whole_input("Read", &json!({"file_path": "src/main.rs"})));
+        assert!(describes_whole_input("Grep", &json!({"pattern": "fn main"})));
+        // But a neighbour that is NOT on the tiny cosmetic list does: a Read
+        // with an offset reads somewhere else than the line says.
+        assert!(!describes_whole_input(
+            "Read",
+            &json!({"file_path": "src/main.rs", "offset": 400})
+        ));
+        // A one-line prompt is the whole prompt.
+        assert!(describes_whole_input("Task", &json!({"prompt": "Find it"})));
     }
 
     #[test]

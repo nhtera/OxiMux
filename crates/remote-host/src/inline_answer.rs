@@ -23,9 +23,11 @@
 //! rather than what the agent asked for.
 
 use oximux_agents::attention::Attention;
-use oximux_agents::row_actions::{InlineAnswer, RowActions, question_actions, row_actions};
+use oximux_agents::row_actions::{
+    InlineAnswer, RowActions, SessionPending, question_actions, row_actions,
+};
 use oximux_agents::session_registry::{PendingPermissionView, SessionHandle};
-use oximux_agents::thread::{PermissionDecision, QuestionAnswers};
+use oximux_agents::thread::{PermissionDecision, QuestionAnswer, QuestionAnswers};
 
 use crate::HostCore;
 
@@ -40,20 +42,17 @@ impl HostCore {
     /// than re-read, so the buttons and the accent bar on one row are
     /// answering the same moment's question.
     ///
-    /// A target with no live session offers nothing to answer: a history row
-    /// or a cockpit agent has no registry handle, so there is no proposal to
-    /// approve and no connection to send a prompt to. Its Dismiss still comes
-    /// from the kind, so the row is not left mute.
+    /// A target with no live session is passed through as having none, not as
+    /// a session with an empty pending list: a cockpit row parsed as
+    /// "waiting for input" looks exactly like a live chat with nothing
+    /// pending, and offering it Reply produced a button whose every press
+    /// failed. Its Dismiss still comes from the kind, so the row is not mute.
     pub fn row_actions(&self, target: &str, attention: Option<&Attention>) -> RowActions {
         let kind = attention.map(|a| a.kind);
-        match self.session_of(target) {
-            Some(handle) => row_actions(
-                kind,
-                &handle.outstanding_permissions(),
-                handle.pending_question().as_ref(),
-            ),
-            None => row_actions(kind, &[], None),
-        }
+        let Some(handle) = self.session_of(target) else { return row_actions(kind, None) };
+        let permissions = handle.outstanding_permissions();
+        let question = handle.pending_question();
+        row_actions(kind, Some(SessionPending { permissions: &permissions, question: question.as_ref() }))
     }
 
     /// Approve the proposal the row was showing.
@@ -104,54 +103,79 @@ impl HostCore {
 
     /// Answer in free text: a question's `response`, or a new prompt.
     ///
-    /// Which of the two is decided **here, now**, not by what the row was
-    /// drawn with — a question answered in the chat between the paint and the
-    /// click would otherwise have this text sent as a prompt, which the agent
-    /// would read while still waiting on the question.
+    /// `answer` is what the row was painted for, and the send happens only
+    /// where that is still what is waiting. This is the digest rule applied
+    /// to a question: an answer has to name what it answers, or a reply
+    /// typed for one question lands on whichever question replaced it — and
+    /// the person never saw that one. The same holds the other way: text
+    /// typed at a session merely waiting for input must not be dropped into
+    /// a question raised since, because it was not written as that answer.
     ///
     /// Sending also records the look (B15): a session you have just answered
     /// can never sit in "unread", and the person has plainly seen it.
-    pub fn reply_from_row(&self, target: &str, text: &str) -> anyhow::Result<bool> {
+    pub fn reply_from_row(
+        &self,
+        target: &str,
+        answer: &InlineAnswer,
+        text: &str,
+    ) -> anyhow::Result<bool> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(false);
         }
         let handle = self.live_session(target)?;
-        // One read of the question, used for the decision AND the answer: two
-        // reads would let a withdrawn question be answered by its successor's
-        // id. `None` means nothing is being asked, so the text is a prompt.
-        let sent = match handle.pending_question() {
-            Some(question) => {
-                // Re-decided by the same table the row was drawn with. A
-                // question that has appeared since the paint is answered as a
-                // question rather than talked over; one that cannot be
-                // answered in a single line (options to pick, a secret) is
-                // not answerable from here at all.
-                let InlineAnswer::Question { request_id } = question_actions(&question).answer
-                else {
+        // One read of the question, used for the check AND the answer: two
+        // reads would let a withdrawn question be answered by its
+        // successor's id.
+        let pending = handle.pending_question();
+        match (answer, pending) {
+            // The question the row was showing, still the one waiting.
+            (InlineAnswer::Question { request_id }, Some(question))
+                if &question.request_id == request_id =>
+            {
+                // Re-decided by the same table the row was drawn with: a
+                // question that has grown options or a second question since
+                // the paint is no longer answerable from a row.
+                if !matches!(question_actions(&question).answer, InlineAnswer::Question { .. }) {
                     anyhow::bail!(
                         "{target} is waiting on a choice, not on a sentence; \
                          open the agent to answer it"
                     );
-                };
-                let answers = QuestionAnswers {
-                    response: Some(text.to_string()),
-                    ..QuestionAnswers::default()
-                };
-                handle.answer_question(&request_id, &question.questions, &answers)?
+                }
+                let sent = handle.answer_question(
+                    request_id,
+                    &question.questions,
+                    &free_text(&question.questions, text),
+                )?;
+                self.viewed_if(sent, target);
+                Ok(sent)
             }
-            // A proposal still pending is not in the way: a person who types
-            // instead of approving is steering, and the registry's own send
-            // gate decides whether that lands now or is queued.
-            None => {
+            // Painted for a question that is no longer the one waiting.
+            (InlineAnswer::Question { request_id }, _) => anyhow::bail!(
+                "question {request_id} is no longer the one waiting on an answer; \
+                 open the agent to see what it is asking"
+            ),
+            // Painted as a prompt, and a question has appeared since. Both
+            // routes would be wrong — a prompt leaves the question waiting,
+            // and answering it uses words written for something else.
+            (_, Some(_)) => anyhow::bail!(
+                "{target} is asking a question now; \
+                 open the agent so you can see what it wants"
+            ),
+            // Painted as a prompt, and that is still what it is.
+            (_, None) => {
                 handle.send_prompt(text, &[])?;
-                true
+                self.viewed_if(true, target);
+                Ok(true)
             }
-        };
+        }
+    }
+
+    /// Record the look for a send that happened.
+    fn viewed_if(&self, sent: bool, target: &str) {
         if sent {
             self.mark_viewed(target);
         }
-        Ok(sent)
     }
 
     /// The handle and the proposal `request_id` names, or why there is none.
@@ -182,6 +206,31 @@ impl HostCore {
         self.session_of(target)
             .ok_or_else(|| anyhow::anyhow!("{target} has no live session to answer"))
     }
+}
+
+
+/// One line of free text, in both dialects a backend might read it in.
+///
+/// Claude's `updated_input_json` takes `response` and ignores the map;
+/// Codex's `codex_answers_json` reads **only** the per-question map and
+/// ignores `response`, so a `response`-only answer reached a Codex session as
+/// `{"answers":{}}` — the text dropped, the request settled, and the row's
+/// box closing as though it had worked. Filling both is what makes one Reply
+/// box mean the same thing on every backend.
+///
+/// Safe for Claude because `response` still supersedes the map there, and the
+/// map holds the same sentence either way. Only called with a single
+/// question: [`question_actions`] refuses a request carrying more.
+fn free_text(questions: &[oximux_agents::thread::AskQuestion], text: &str) -> QuestionAnswers {
+    let mut answers =
+        QuestionAnswers { response: Some(text.to_string()), ..QuestionAnswers::default() };
+    for q in questions {
+        answers.by_question.insert(
+            q.id.clone(),
+            QuestionAnswer { selected: Vec::new(), custom: Some(text.to_string()) },
+        );
+    }
+    answers
 }
 
 #[cfg(test)]

@@ -42,7 +42,7 @@ impl WorkspaceRoot {
             // the box, and Enter in it sends. A pill that sent on click would
             // have nothing to send.
             RowAction::Reply => {
-                self.toggle_row_reply(target, window, cx);
+                self.toggle_row_reply(target, answer.clone(), window, cx);
                 return;
             }
             // A dismissal is a look, which is why it goes through the same
@@ -85,39 +85,44 @@ impl WorkspaceRoot {
     pub(crate) fn toggle_row_reply(
         &mut self,
         target: &str,
+        answer: InlineAnswer,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
         let rail = self.left_rail.clone();
-        rail.update(cx, |rail, cx| rail.toggle_row_reply(target, window, cx));
+        rail.update(cx, |rail, cx| rail.toggle_row_reply(target, answer, window, cx));
         cx.notify();
     }
 
-    /// Send what is in the open Reply box.
+    /// Send what is in the open Reply box, and say whether it went.
     ///
-    /// The host decides whether that text answers a question or starts a
-    /// turn, re-read at this moment rather than at the paint. On success the
-    /// box closes; on a refusal it stays open with the text still in it, so
-    /// the person can read the reason and copy what they wrote.
+    /// **Returns rather than closing the box itself.** The caller is a
+    /// subscription on `LeftRail`, so it is already inside that entity's
+    /// update; closing the box from here would re-enter `LeftRail` and panic
+    /// — after the answer had already reached the agent. The rail closes its
+    /// own box on `true`.
+    ///
+    /// `answer` is what the row was painted for; the host sends only where
+    /// that is still what is waiting. On a refusal the box stays open with
+    /// the text in it, so the person can read the reason and keep what they
+    /// wrote.
     pub(crate) fn send_row_reply(
         &mut self,
         target: &str,
+        answer: &InlineAnswer,
         text: &str,
-        window: &mut gpui::Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(host) = self.host(cx) else { return };
-        match host.reply_from_row(target, text) {
-            Ok(true) => {
-                let rail = self.left_rail.clone();
-                rail.update(cx, |rail, cx| rail.close_row_reply(window, cx));
+    ) -> bool {
+        let Some(host) = self.host(cx) else { return false };
+        let sent = match host.reply_from_row(target, answer, text) {
+            Ok(sent) => sent,
+            Err(err) => {
+                self.push_toast(ToastKind::Error, err.to_string(), cx);
+                false
             }
-            // Nothing to send: an empty box. Left open, since closing it
-            // would look like the reply went somewhere.
-            Ok(false) => {}
-            Err(err) => self.push_toast(ToastKind::Error, err.to_string(), cx),
-        }
+        };
         cx.notify();
+        sent
     }
 
     /// Collapse the open Reply box without sending it.

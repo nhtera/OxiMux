@@ -115,7 +115,7 @@ fn a_row_offers_allow_and_reject_for_the_one_call_it_can_show() {
 }
 
 #[test]
-fn a_target_with_no_live_session_still_offers_its_dismiss() {
+fn a_target_with_no_live_session_offers_its_dismiss_and_nothing_else() {
     let f = fixture();
     // A history row or a cockpit agent: nothing in the registry under this
     // key, so nothing to answer — but a failure there must still be
@@ -123,9 +123,13 @@ fn a_target_with_no_live_session_still_offers_its_dismiss() {
     let actions = f.core.row_actions("cockpit:7", Some(&asking(AttentionKind::Failed)));
     assert_eq!(actions.actions, vec![RowAction::Dismiss]);
     assert_eq!(actions.answer, InlineAnswer::Nothing);
-    // And it offers nothing to approve, since there is no proposal to hold.
-    let none = f.core.row_actions("cockpit:7", Some(&asking(AttentionKind::NeedsPermission)));
-    assert!(none.is_empty());
+    // And nothing to approve, since there is no proposal to hold.
+    assert!(f.core.row_actions("cockpit:7", Some(&asking(AttentionKind::NeedsPermission))).is_empty());
+    // Nor a Reply. The review's finding: a terminal agent parsed as "waiting
+    // for input" is indistinguishable from a live chat with nothing pending,
+    // so this offered a button whose every press failed with "no live
+    // session to answer".
+    assert!(f.core.row_actions("cockpit:7", Some(&asking(AttentionKind::NeedsInput))).is_empty());
 }
 
 #[test]
@@ -214,9 +218,10 @@ fn a_reply_answers_the_pending_question_rather_than_starting_a_turn() {
     let f = fixture();
     f.registry.ingest("s1", question("q-1", vec![]));
     let actions = f.core.row_actions(&target(), Some(&asking(AttentionKind::NeedsPermission)));
-    assert_eq!(actions.answer, InlineAnswer::Question { request_id: "q-1".into() });
+    let answer = InlineAnswer::Question { request_id: "q-1".into() };
+    assert_eq!(actions.answer, answer);
 
-    assert!(f.core.reply_from_row(&target(), "  the root one  ").unwrap());
+    assert!(f.core.reply_from_row(&target(), &answer, "  the root one  ").unwrap());
     let sent = f.conn.sent();
     let [only] = sent.as_slice() else { panic!("one answer, got {sent:?}") };
     // A question answer, not a user message: a prompt sent beside an
@@ -226,10 +231,22 @@ fn a_reply_answers_the_pending_question_rather_than_starting_a_turn() {
         Some("the root one"),
         "trimmed, and in the response field: {only}"
     );
+    // And in the per-question map as well. Codex reads ONLY that map and
+    // ignores `response`, so a response-only answer reached a Codex session
+    // as `{"answers":{}}`: the text dropped, the request settled, the box
+    // closing as though it had worked.
+    assert_eq!(
+        only
+            .pointer("/response/response/updatedInput/answers")
+            .and_then(|v| v.as_object())
+            .map(|m| m.len()),
+        Some(1),
+        "the sentence is in both dialects: {only}"
+    );
 }
 
 #[test]
-fn a_question_raised_between_the_paint_and_the_click_is_not_talked_over() {
+fn a_question_raised_between_the_paint_and_the_click_is_not_answered_by_accident() {
     let f = fixture();
     // Painted while the session merely waited on input: the row's Reply was
     // a prompt. The question arrives before the click.
@@ -237,13 +254,30 @@ fn a_question_raised_between_the_paint_and_the_click_is_not_talked_over() {
     assert_eq!(painted.answer, InlineAnswer::Prompt);
     f.registry.ingest("s1", question("q-1", vec![]));
 
-    assert!(f.core.reply_from_row(&target(), "the root one").unwrap());
-    let sent = f.conn.sent();
-    let [only] = sent.as_slice() else { panic!("one answer, got {sent:?}") };
-    assert!(
-        only.pointer("/response/response/updatedInput/response").is_some(),
-        "re-decided at the send, so it answered the question: {only}"
-    );
+    // Both routes would be wrong, so neither is taken. A prompt leaves the
+    // question waiting; answering it uses words written for something else,
+    // about a question the person has not seen. The text stays in the box.
+    let err = f.core.reply_from_row(&target(), &painted.answer, "carry on").expect_err("refused");
+    assert!(err.to_string().contains("asking a question now"), "{err}");
+    assert!(f.conn.sent().is_empty(), "nothing reached the agent");
+}
+
+#[test]
+fn a_reply_does_not_land_on_the_question_that_replaced_the_one_it_was_for() {
+    let f = fixture();
+    f.registry.ingest("s1", question("q-1", vec![]));
+    let painted = f.core.row_actions(&target(), Some(&asking(AttentionKind::NeedsPermission)));
+    assert_eq!(painted.answer, InlineAnswer::Question { request_id: "q-1".into() });
+
+    // Answered in the chat, and the agent asks something else.
+    f.handle.answer_question("q-1", &[], &Default::default()).unwrap();
+    f.registry.ingest("s1", question("q-2", vec![]));
+
+    // The digest rule, applied to a question: an answer has to name what it
+    // answers, or a reply typed for one question settles another.
+    let err = f.core.reply_from_row(&target(), &painted.answer, "the root one").expect_err("refused");
+    assert!(err.to_string().contains("no longer the one waiting"), "{err}");
+    assert_eq!(f.handle.pending_question().map(|q| q.request_id), Some("q-2".into()));
 }
 
 #[test]
@@ -251,10 +285,11 @@ fn a_reply_is_refused_while_a_choice_is_waiting() {
     let f = fixture();
     f.registry.ingest("s1", question("q-1", vec!["The root one", "The crate's"]));
     // The row offers nothing for a question with options, but the dispatch
-    // must refuse it too: the text would otherwise be sent as a prompt and
-    // the choice would still be waiting.
+    // must refuse it too: a row painted before the options arrived would
+    // otherwise answer a pick with free text.
     assert!(f.core.row_actions(&target(), Some(&asking(AttentionKind::NeedsPermission))).is_empty());
-    let err = f.core.reply_from_row(&target(), "the root one").expect_err("must refuse");
+    let answer = InlineAnswer::Question { request_id: "q-1".into() };
+    let err = f.core.reply_from_row(&target(), &answer, "the root one").expect_err("must refuse");
     assert!(err.to_string().contains("waiting on a choice"), "{err}");
     assert!(f.conn.sent().is_empty(), "nothing reached the agent");
 }
@@ -268,7 +303,7 @@ fn a_reply_with_no_question_pending_is_a_prompt() {
         turn_id: Some("inc:1".into()),
         ..Default::default()
     });
-    assert!(f.core.reply_from_row(&target(), "carry on").unwrap());
+    assert!(f.core.reply_from_row(&target(), &InlineAnswer::Prompt, "carry on").unwrap());
     let sent = f.conn.sent();
     let [only] = sent.as_slice() else { panic!("one send, got {sent:?}") };
     assert_eq!(only.get("type").and_then(|v| v.as_str()), Some("user"), "{only}");
@@ -277,7 +312,10 @@ fn a_reply_with_no_question_pending_is_a_prompt() {
 #[test]
 fn an_empty_reply_sends_nothing() {
     let f = fixture();
-    assert!(!f.core.reply_from_row(&target(), "   ").unwrap(), "nothing to say");
+    assert!(
+        !f.core.reply_from_row(&target(), &InlineAnswer::Prompt, "   ").unwrap(),
+        "nothing to say"
+    );
     assert!(f.conn.sent().is_empty());
 }
 
@@ -298,7 +336,7 @@ fn replying_clears_unread_because_the_person_has_plainly_seen_it() {
         "held unread by hand"
     );
 
-    assert!(f.core.reply_from_row(&target(), "carry on").unwrap());
+    assert!(f.core.reply_from_row(&target(), &InlineAnswer::Prompt, "carry on").unwrap());
     assert_eq!(f.core.attention_of(&target()), None, "answering it read it");
 }
 
@@ -308,7 +346,9 @@ fn nothing_can_be_answered_on_a_session_that_is_gone() {
     for err in [
         f.core.allow_from_row("chat:missing", "req-1", "deadbeef").expect_err("no session"),
         f.core.reject_from_row("chat:missing", "req-1").expect_err("no session"),
-        f.core.reply_from_row("chat:missing", "hello").expect_err("no session"),
+        f.core
+            .reply_from_row("chat:missing", &InlineAnswer::Prompt, "hello")
+            .expect_err("no session"),
     ] {
         assert!(err.to_string().contains("no live session"), "{err}");
     }

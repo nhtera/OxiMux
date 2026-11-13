@@ -306,13 +306,12 @@ mod tests {
             secondary: None,
             completed_turn: false,
             attention: unseen_attention(for_attention.as_ref()),
-            // A cockpit row has no registry handle, so the one table offers
+            // A cockpit row has no registry session, so the one table offers
             // it nothing to answer beyond a Dismiss — which these ordering
             // tests do not read. Built from the same attention so the row is
             // not internally inconsistent.
             actions: oximux_agents::row_actions::row_actions(
                 unseen_attention(for_attention.as_ref()).map(|a| a.kind),
-                &[],
                 None,
             ),
         }

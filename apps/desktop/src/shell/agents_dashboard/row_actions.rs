@@ -4,13 +4,15 @@
 //! the one table, and the host has already answered it by the time a row is
 //! built. This module is only the painting and the click.
 //!
-//! **Geometry.** A row with actions grows by one [`ACTION_LINE_HEIGHT`] line
-//! and an open Reply box by another, rather than squeezing buttons into the
-//! title's flex flow, which would shrink the title it sits beside
-//! ([[gpui-a-row-action-cluster-must-leave-the-flex-flow]]). The Reply input
-//! gets the full row width on its own line for the same reason the workspace
-//! rename field does: a gpui `Input` in a pinned or `flex_none` column
-//! collapses to about 24px
+//! **Geometry.** The controls take a line of their own and an open Reply box
+//! another, rather than being squeezed into the title's flex flow, which
+//! would shrink the title they sit beside
+//! ([[gpui-a-row-action-cluster-must-leave-the-flex-flow]]). The row takes
+//! `ROW_HEIGHT` as a minimum and **grows** with them: the first version added
+//! the lines up to a fixed total, forgot the summary, and pushed the buttons
+//! past the card's bottom edge. The Reply input gets the full row width on
+//! its own line for the same reason the workspace rename field does: a gpui
+//! `Input` in a pinned or `flex_none` column collapses to about 24px
 //! ([[gpui-pinned-control-column-collapses-a-text-field]]).
 //!
 //! **Every control stops mouse-down propagation.** The card itself carries an
@@ -25,19 +27,22 @@ use gpui::{
 };
 use gpui_component::Sizable as _;
 use gpui_component::input::{Escape as InputEscape, Input, InputState};
-use oximux_agents::row_actions::{RowAction, RowActions};
+use oximux_agents::row_actions::{InlineAnswer, RowAction, RowActions};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::RailAgentTarget;
 use crate::ui::pill_button;
 use crate::workspace_root::WorkspaceRoot;
 
-/// Height of the control line under a row's three text lines.
+/// Height of the control line under a row's text.
+///
+/// Only the controls' own line. The row no longer adds heights up to a fixed
+/// total — it takes `ROW_HEIGHT` as a **minimum** and grows with what is in
+/// it, because the version that summed them missed the summary line and
+/// pushed the buttons past the card's bottom edge. A list that is a plain
+/// scroll column rather than a `uniform_list` has no reason to make rows
+/// agree on a height.
 pub(crate) const ACTION_LINE_HEIGHT: f32 = 24.0;
-
-/// Height of the Reply line, which holds a `.small()` input (30px) plus the
-/// gap above it.
-pub(crate) const REPLY_LINE_HEIGHT: f32 = 34.0;
 
 /// Which row's Reply box is open, and the input it uses.
 ///
@@ -52,6 +57,14 @@ pub struct RowReply {
     pub open_for: Option<String>,
     /// The shared input, present once a Reply has ever been opened.
     pub input: Option<gpui::Entity<InputState>>,
+    /// What the row offered when the box was opened: the question this text
+    /// answers, or a prompt.
+    ///
+    /// Carried rather than re-read at send time for the same reason the
+    /// digest is: an answer has to name what it answers. A reply typed for
+    /// one question must not land on whichever question replaced it, and the
+    /// person never saw that one.
+    pub answer: Option<InlineAnswer>,
 }
 
 impl RowReply {
@@ -75,14 +88,6 @@ pub(crate) struct RowId<'a> {
     pub db_id: &'a str,
 }
 
-/// How much taller than [`super::row_render::ROW_HEIGHT`] this row is.
-pub(crate) fn extra_height(actions: &RowActions, reply_open: bool) -> f32 {
-    if actions.is_empty() {
-        return 0.0;
-    }
-    ACTION_LINE_HEIGHT + if reply_open { REPLY_LINE_HEIGHT } else { 0.0 }
-}
-
 /// The summary line a row shows above its buttons: what is actually being
 /// approved or asked.
 ///
@@ -103,8 +108,11 @@ pub(crate) fn summary_line(
             // `fg_muted`, not `fg_subtle`: this is the line the decision is
             // made from, so it must not read as the dimmest thing on the row.
             .text_color(theme.fg_muted)
-            .overflow_hidden()
-            .whitespace_nowrap()
+            // Wraps, where every other line on the row clips. A character
+            // budget is not a width, so clipping this one would hide the end
+            // of a command that passed the eligibility check — and the end is
+            // where a `--force` or a second path goes. Wrapping makes the
+            // budget a bound on how many lines it takes instead.
             .child(summary),
     )
 }
@@ -235,37 +243,18 @@ mod tests {
     use super::*;
     use oximux_agents::row_actions::InlineAnswer;
 
-    fn offering(actions: Vec<RowAction>) -> RowActions {
-        RowActions { actions, answer: InlineAnswer::Prompt, summary: None }
-    }
-
     #[test]
-    fn a_row_with_nothing_to_answer_keeps_its_height() {
-        assert_eq!(extra_height(&RowActions::nothing(), false), 0.0);
-        // Even if a stale "open" flag named it: a row with no Reply button
-        // must not reserve a line for a box it cannot show.
-        assert_eq!(
-            extra_height(&RowActions::nothing(), true),
-            0.0,
-            "no actions means no control line to put a box under"
-        );
-    }
-
-    #[test]
-    fn actions_add_one_line_and_an_open_reply_adds_another() {
-        let actions = offering(vec![RowAction::Reply]);
-        assert_eq!(extra_height(&actions, false), ACTION_LINE_HEIGHT);
-        assert_eq!(extra_height(&actions, true), ACTION_LINE_HEIGHT + REPLY_LINE_HEIGHT);
-    }
-
-    #[test]
-    fn only_the_row_whose_box_is_open_reserves_the_reply_line() {
-        // One box for the whole list: the open row grows, every other row
-        // offering Reply stays at the control line.
-        let reply = RowReply { open_for: Some("chat:a".into()), input: None };
+    fn only_one_row_at_a_time_has_the_box() {
+        // One box for the whole list: two half-typed replies is two drafts
+        // to keep track of, in a 250px rail.
+        let reply = RowReply {
+            open_for: Some("chat:a".into()),
+            input: None,
+            answer: Some(InlineAnswer::Prompt),
+        };
         assert!(reply.is_open_for("chat:a"));
         assert!(!reply.is_open_for("chat:b"));
-        assert!(!RowReply { open_for: None, input: None }.is_open_for("chat:a"));
+        assert!(!RowReply { open_for: None, input: None, answer: None }.is_open_for("chat:a"));
     }
 
     /// Every action set is laid out and painted, at both rail widths, with
@@ -343,10 +332,12 @@ mod tests {
             _window: &mut Window,
             _cx: &mut gpui::Context<Self>,
         ) -> impl gpui::IntoElement {
-            use oximux_agents::row_actions::InlineAnswer;
-            self.painted += 1;
-            let reply =
-                RowReply { open_for: Some("chat:c".to_string()), input: Some(self.input.clone()) };
+                self.painted += 1;
+            let reply = RowReply {
+                open_for: Some("chat:c".to_string()),
+                input: Some(self.input.clone()),
+                answer: Some(InlineAnswer::Question { request_id: "q1".into() }),
+            };
             let sets = [
                 (
                     "chat:a",

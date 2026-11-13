@@ -397,6 +397,7 @@ impl LeftRail {
             row_reply: crate::shell::agents_dashboard::row_actions::RowReply {
                 open_for: None,
                 input: None,
+                answer: None,
             },
             _row_reply_sub: None,
             list_scroll: ScrollHandle::new(),
@@ -555,6 +556,7 @@ impl LeftRail {
     pub(crate) fn toggle_row_reply(
         &mut self,
         target: &str,
+        answer: oximux_agents::row_actions::InlineAnswer,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -577,10 +579,19 @@ impl LeftRail {
                     // any one row, so a stale capture would send this reply to
                     // whichever row opened it first.
                     let Some(target) = this.row_reply.open_for.clone() else { return };
+                    let Some(answer) = this.row_reply.answer.clone() else { return };
                     let text = input.read(cx).value().to_string();
-                    let _ = this.weak_root.update(cx, |root, cx| {
-                        root.send_row_reply(&target, &text, window, cx);
-                    });
+                    // The root reports back rather than closing the box: this
+                    // callback is already inside `LeftRail`'s own update, and
+                    // a close from over there would re-enter this entity and
+                    // panic — after the answer had reached the agent.
+                    let sent = this
+                        .weak_root
+                        .update(cx, |root, cx| root.send_row_reply(&target, &answer, &text, cx))
+                        .unwrap_or(false);
+                    if sent {
+                        this.close_row_reply(window, cx);
+                    }
                 },
             );
             self.row_reply.input = Some(input);
@@ -594,6 +605,9 @@ impl LeftRail {
             window.focus(&focus, cx);
         }
         self.row_reply.open_for = Some(target.to_string());
+        // What this box's text will answer, fixed when it opened — so the
+        // send can refuse if that is no longer what the session is asking.
+        self.row_reply.answer = Some(answer);
         cx.notify();
     }
 
@@ -607,6 +621,7 @@ impl LeftRail {
             return;
         }
         self.row_reply.open_for = None;
+        self.row_reply.answer = None;
         if let Some(input) = self.row_reply.input.clone() {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }

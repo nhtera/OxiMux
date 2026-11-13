@@ -26,11 +26,10 @@ use crate::shell::agents_dashboard::sections::SectionKind;
 use crate::shell::left_rail::workspace_agent_rows::{agent_state_indicator, agent_state_label};
 use crate::ui::overlay::FloatingSurface;
 
-/// Height of the 3-line card (title + secondary + badges) with breathing
-/// room. A row that can be answered is taller by its control line, and by its
-/// Reply box when that is open — see `row_actions::extra_height`. The list is
-/// a plain scroll column, not a `uniform_list`, so rows need not agree on a
-/// height.
+/// The card's minimum height: the 3-line card (title + secondary + badges)
+/// with breathing room. A row that can be answered grows past it, by its
+/// summary, its control line and its Reply box. The list is a plain scroll
+/// column, not a `uniform_list`, so rows need not agree on a height.
 pub(crate) const ROW_HEIGHT: f32 = 64.0;
 
 /// Height of a status-section header row.
@@ -224,7 +223,6 @@ pub fn render_agent_row(
     // or what the question asked. Minted by the host from the proposal, so a
     // row cannot name one call while the digest covers another.
     let target = row_attention::attention_target(&row.db_id, &row.target);
-    let reply_open = reply.is_open_for(&target);
     let summary = row_actions::summary_line(&row.actions, theme, typography);
     let controls = row_actions::action_line(
         &row.actions,
@@ -256,7 +254,9 @@ pub fn render_agent_row(
         .flex_row()
         .items_start()
         .w_full()
-        .h(px(ROW_HEIGHT + row_actions::extra_height(&row.actions, reply_open)))
+        // A minimum, not a height: a row with a summary, a control line and
+        // an open Reply box is taller than any sum this could keep correct.
+        .min_h(px(ROW_HEIGHT))
         .px(px(density.pad_panel))
         .py(px(density.gap_inline))
         .gap(px(density.gap_inline))

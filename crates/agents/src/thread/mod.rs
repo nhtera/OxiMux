@@ -44,7 +44,7 @@ pub use oximux_agent_core::thread::{
 // `tool_target` above is both the module and its headline function (the
 // group import carries every namespace of the name); `display_command` is
 // the other function that module exports.
-pub use oximux_agent_core::thread::display_command;
+pub use oximux_agent_core::thread::{ToolTarget, describe, describes_whole_input, display_command};
 
 pub use acp::AcpConnection;
 pub use claude_catalog::{

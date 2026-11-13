@@ -52,5 +52,5 @@ pub use tool_call::{
     ToolCallStatus,
 };
 pub use tool_detail::ToolDetail;
-pub use tool_target::{display_command, tool_target};
+pub use tool_target::{ToolTarget, describe, describes_whole_input, display_command, tool_target};
 pub use turn_diff::TurnFileChange;
