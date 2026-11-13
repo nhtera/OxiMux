@@ -835,14 +835,31 @@ entry is the one to open.
   chip and the notifier read, so a row and a banner can never disagree about
   how bad a thing is. The desktop only maps a tone to a token
   (`agents_dashboard/attention_look.rs`).
+- **A row you can answer carries its verdict buttons' hues too**, and this is
+  the one place a row shows more than one. Allow is an outlined `status_ok`
+  pill and Reject an outlined `status_error` one — the chat permission card's
+  words and its control, shared from `crates/ui` rather than re-drawn. Reply
+  and Dismiss are `fg_muted`, because neither is a verdict on what the agent
+  asked. Outlined, never a filled `.primary()`: a solid Allow beside an
+  outlined Reject reads as the recommended one, and a tool approval must not
+  recommend.
+- **The buttons sit on their own line**, under the row's text and outside the
+  title's flex flow, with the line the decision is made from (`fg_muted`,
+  11px) directly above them. A row that cannot show that line in full offers
+  no Allow at all: an elided argument is not an argument the person has seen.
 
 This is an exception to "the brand IS the absence of accent": it buys the one
 thing the absence of accent cannot, which is a list you can triage without
-reading it.
+reading it. The verdict pills are a second, narrower exception to "one accent
+per surface" below — bounded to the row being answered, and to the two words
+that answer it.
 
 ## Composition rules
 
-- **One accent per surface.** A row uses `status_warn` *or* `status_info`, not both.
+- **One accent per surface.** A row uses `status_warn` *or* `status_info`, not
+  both. The single exception is an agent row with inline verdict buttons,
+  where the accent bar states what is being asked and the two pills state the
+  answers — see "Agent rows that need a person".
 - **Borders before backgrounds.** Use `border_inactive` to separate panels rather
   than a different bg.
 - **Selection ≠ focus.** `selection` is for text and the active-current row.

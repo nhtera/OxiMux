@@ -213,6 +213,8 @@ mod tests {
             secondary: None,
             completed_turn,
             attention,
+            // Sectioning reads the attention's kind, never the buttons.
+            actions: oximux_agents::row_actions::RowActions::nothing(),
         }
     }
 

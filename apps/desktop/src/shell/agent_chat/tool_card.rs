@@ -412,33 +412,14 @@ fn approval_row(
         .into_any_element()
 }
 
-/// A small accent-tinted action pill (Allow/Reject/Always/Submit/Skip). `accent`
-/// colors the label and border; the fill lights up on hover. `on_click` is an
-/// entity-bound listener (the output of `cx.listener`), passed straight to the
-/// element. Shared with the question card.
-pub(super) fn pill_button(
-    id: String,
-    label: impl Into<SharedString>,
-    accent: gpui::Hsla,
-    density: Density,
-    typo: &Typography,
-    on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-) -> AnyElement {
-    div()
-        .id(SharedString::from(id))
-        .px(px(10.0))
-        .py(px(3.0))
-        .rounded(px(density.r_chip))
-        .border_1()
-        .border_color(accent)
-        .text_size(px(typo.t_body_sm))
-        .text_color(accent)
-        .cursor_pointer()
-        .hover(|s| s.bg(accent.opacity(0.12)))
-        .on_click(on_click)
-        .child(label.into())
-        .into_any_element()
-}
+/// The shared accent-tinted action pill, re-exported under its old path so
+/// the chat's eleven call sites keep their spelling.
+///
+/// It lives in `crates/ui` now because the agents row's inline Allow has to
+/// be the same control as this card's: the row was written against these
+/// words, and a pill that drifted in one of the two places would make one
+/// decision look like two different affordances.
+pub(super) use crate::ui::pill_button;
 
 /// While a tool's args are still streaming (the live `content_block_start`
 /// opened the card but the finalized `tool_use` block hasn't landed), build an

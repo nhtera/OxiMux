@@ -804,7 +804,7 @@ impl HostCore {
     }
 
     /// The live session a target names, if it names one.
-    fn session_of(&self, target: &str) -> Option<Arc<SessionHandle>> {
+    pub(crate) fn session_of(&self, target: &str) -> Option<Arc<SessionHandle>> {
         self.registry().get(oximux_agents::session_prefs::chat_id(target)?)
     }
 

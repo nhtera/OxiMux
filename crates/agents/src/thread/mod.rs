@@ -39,8 +39,12 @@ pub mod transport;
 // import site (and this file's own type re-exports below) resolves unchanged.
 pub use oximux_agent_core::thread::{
     background_task, context_chip, entry, event, mcp_server_spec, question, state, stream_json,
-    tool_call, tool_detail, turn_diff,
+    tool_call, tool_detail, tool_target, turn_diff,
 };
+// `tool_target` above is both the module and its headline function (the
+// group import carries every namespace of the name); `display_command` is
+// the other function that module exports.
+pub use oximux_agent_core::thread::{ToolTarget, describe, describes_whole_input, display_command};
 
 pub use acp::AcpConnection;
 pub use claude_catalog::{

@@ -9,6 +9,7 @@
 //! is testable without a window.
 
 use oximux_agents::attention::Attention;
+use oximux_agents::row_actions::RowActions;
 use oximux_core::{AgentStatus, Workspace};
 
 use crate::shell::agents_dashboard::sections::section_of;
@@ -63,6 +64,11 @@ pub struct AgentRow {
     /// closure never asks the host anything. `None` also covers a row built
     /// without an evaluator, which only tests do.
     pub attention: Option<Attention>,
+    /// What this row can answer without being opened, from the one action
+    /// table (`oximux_agents::row_actions`), resolved in the same host pass
+    /// as `attention` — so the buttons and the accent bar on one row are
+    /// answering the same moment's question.
+    pub actions: RowActions,
 }
 
 /// Whether a status raises something a person has to act on, by the one
@@ -300,6 +306,14 @@ mod tests {
             secondary: None,
             completed_turn: false,
             attention: unseen_attention(for_attention.as_ref()),
+            // A cockpit row has no registry session, so the one table offers
+            // it nothing to answer beyond a Dismiss — which these ordering
+            // tests do not read. Built from the same attention so the row is
+            // not internally inconsistent.
+            actions: oximux_agents::row_actions::row_actions(
+                unseen_attention(for_attention.as_ref()).map(|a| a.kind),
+                None,
+            ),
         }
     }
 

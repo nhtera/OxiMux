@@ -12,6 +12,7 @@ use gpui::App;
 use oximux_agents::attention::Attention;
 use oximux_agents::session_prefs::{chat_key, cockpit_key};
 use oximux_remote_host::HostCore;
+use oximux_agents::row_actions::RowActions;
 use oximux_remote_host::attention::PrefsSnapshot;
 
 use crate::shell::left_rail::rail_agent_row::{RailAgentRow, RailAgentTarget};
@@ -96,11 +97,25 @@ pub fn attention_of_row(
 /// The preferences are read **once per pass**, here, rather than per row: the
 /// dashboard asks about every row it builds, and a point query each put one
 /// SQLite read per row on the render path.
-pub fn resolver(host: Option<Arc<HostCore>>) -> impl Fn(&RailAgentRow) -> Option<Attention> {
+pub fn resolver(
+    host: Option<Arc<HostCore>>,
+) -> impl Fn(&RailAgentRow) -> (Option<Attention>, RowActions) {
     let prefs = host.as_deref().map(|host| host.prefs_snapshot());
     move |rail| match (host.as_deref(), prefs.as_ref()) {
-        (Some(host), Some(prefs)) => attention_of_row(host, rail, prefs),
-        _ => None,
+        (Some(host), Some(prefs)) => {
+            let attention = attention_of_row(host, rail, prefs);
+            // Asked with the attention it was just given, not re-evaluated:
+            // a row whose buttons answered a different moment than its accent
+            // bar would offer Allow for an alert it is no longer showing.
+            let actions = host
+                .row_actions(&attention_target(&rail.db_id, &rail.target), attention.as_ref());
+            (attention, actions)
+        }
+        // No host: no attention, and nothing to answer. A window rendered
+        // before the host started shows rows sectioned by their own
+        // lifecycle, which is the reading that offers nothing rather than
+        // offering the wrong thing.
+        _ => (None, RowActions::nothing()),
     }
 }
 

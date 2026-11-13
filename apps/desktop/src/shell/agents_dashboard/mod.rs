@@ -11,6 +11,7 @@ pub mod agent_row_menu;
 pub mod attention_look;
 pub mod filter;
 pub mod model;
+pub mod row_actions;
 pub mod row_attention;
 pub mod row_builder;
 pub mod row_render;
@@ -29,6 +30,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agents_dashboard::filter::{StatusFilter, apply_filter};
 use crate::shell::agents_dashboard::model::AgentRow;
+use crate::shell::agents_dashboard::row_actions::RowReply;
 use crate::shell::agents_dashboard::row_attention::resolver as attention_resolver;
 use crate::shell::agents_dashboard::row_builder::build_agent_rows;
 use crate::shell::agents_dashboard::row_render::{render_agent_row, render_section_header};
@@ -60,6 +62,7 @@ pub fn render_agents_dashboard(
     density: Density,
     typography: &Typography,
     host: Option<std::sync::Arc<oximux_remote_host::HostCore>>,
+    reply: RowReply,
 ) -> AnyElement {
     // Build + sort once, narrow by the filter, then group into status sections.
     // Attention is resolved per row here, before the `uniform_list` closure,
@@ -113,6 +116,7 @@ pub fn render_agents_dashboard(
                 DashboardItem::Row(row) => col.child(build_dashboard_row(
                     *row,
                     focused_agent,
+                    &reply,
                     weak_root.clone(),
                     theme,
                     density,
@@ -215,9 +219,11 @@ fn render_dashboard_header(
 /// agent's tab (tracked) or terminal (ambient) — like the rail sub-rows — via
 /// `update` (not `update_in`), safe from a mouse-callback context with the
 /// outer `window`. The focused row keeps a resting highlight.
+#[allow(clippy::too_many_arguments)]
 fn build_dashboard_row(
     row: AgentRow,
     focused_agent: Option<&RailAgentTarget>,
+    reply: &RowReply,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -241,7 +247,8 @@ fn build_dashboard_row(
     let menu_db_id = row.db_id.clone();
     let weak_for_menu = weak_root.clone();
 
-    let mut card = render_agent_row(&row, theme, density, typography).id(row_id);
+    let mut card =
+        render_agent_row(&row, reply, weak_root.clone(), theme, density, typography).id(row_id);
     if is_focused {
         card = card.bg(theme.hover_overlay);
     }

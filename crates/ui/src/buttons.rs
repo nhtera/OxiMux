@@ -21,7 +21,8 @@
 
 use gpui::{
     AnyElement, App, ClickEvent, ElementId, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, Styled, Window, div, px,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px,
 };
 
 use oximux_settings::{Density, Theme, Typography};
@@ -82,5 +83,47 @@ where
                 on_click(&ClickEvent::default(), window, cx);
             },
         )
+        .into_any_element()
+}
+
+/// A small accent-tinted action pill (Allow / Reject / Always / Submit / Skip).
+///
+/// `accent` colours the label and the border; the fill lights up on hover.
+/// Outlined rather than solid on purpose: a row of these is a row of
+/// equal-weight choices, and a filled `.primary()` Allow next to an outlined
+/// Reject reads as the recommended one — which is not something a tool
+/// approval should suggest.
+///
+/// Lives here because the chat's permission card and the agents row's inline
+/// Allow must be the same control: the row was written against the card's
+/// words, and a pill that drifted in one of the two places would make the
+/// same decision look like two different affordances.
+///
+/// `on_click` is passed straight to the element, so an entity-bound listener
+/// (the output of `cx.listener`) and a plain closure both fit.
+pub fn pill_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    accent: gpui::Hsla,
+    // By value, matching every other density-taking helper in the app:
+    // `Density` is `Copy`, and the eleven chat call sites this is shared with
+    // all pass it that way.
+    density: Density,
+    typography: &Typography,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .px(px(10.0))
+        .py(px(3.0))
+        .rounded(px(density.r_chip))
+        .border_1()
+        .border_color(accent)
+        .text_size(px(typography.t_body_sm))
+        .text_color(accent)
+        .cursor_pointer()
+        .hover(move |s| s.bg(accent.opacity(0.12)))
+        .on_click(on_click)
+        .child(label.into())
         .into_any_element()
 }

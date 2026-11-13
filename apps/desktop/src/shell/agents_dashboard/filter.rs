@@ -180,6 +180,9 @@ mod tests {
             secondary: None,
             completed_turn: false,
             attention: None,
+            // The filter reads neither; a row that wants nothing offers
+            // nothing, which is what the one table says.
+            actions: oximux_agents::row_actions::RowActions::nothing(),
         }
     }
 
