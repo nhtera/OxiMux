@@ -132,6 +132,97 @@ fn a_guest_writes_nothing_until_it_owns_the_data_dir() {
 }
 
 #[test]
+fn a_release_cannot_return_while_a_pass_is_in_flight() {
+    // The bug this guards: `sync_lineage_states` tested ownership once and
+    // then wrote row by row, so a pass the subscriber had already begun went
+    // on writing after the main thread gave the directory up — it read the
+    // working flag *after* the release and revived a row it no longer owned.
+    // It failed about one CI run in ten, on Windows, where the runtime's
+    // thread happens to interleave this way.
+    //
+    // Racing threads cannot ask that question reliably: whether any of them
+    // lands inside the window is luck, and a test that misses it passes while
+    // testing nothing. So a pass is parked mid-flight on purpose, and the
+    // question is put directly — can a release come back while a pass is
+    // still running? If it cannot, the window does not exist.
+    let f = fixture(HostConfig::default());
+    f.core.start(PriorOwner::None);
+    register(&f, "parent");
+    let child = register(&f, "child");
+    spawn_child(&f, "parent", "child", SpawnPosture::Default);
+    f.core.sync_lineage_states();
+    assert_eq!(f.core.lineage().row("child").unwrap().unwrap().state, LineageState::Parked);
+
+    // Two rendezvous on one barrier: the first says a pass is in flight, the
+    // second lets it finish. Whichever pass arrives first is the one caught —
+    // the subscriber's would do as well as ours, since the claim is about any
+    // pass, not this one.
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    f.core.set_pass_gate(Some(gate.clone()));
+    let pass = {
+        let core = f.core.clone();
+        std::thread::spawn(move || core.sync_lineage_states())
+    };
+    gate.wait();
+    // Nothing later can be caught by it; the parked pass holds its own clone.
+    f.core.set_pass_gate(None);
+
+    // The release runs on its own thread, so this one stays free to answer.
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let releaser = {
+        let core = f.core.clone();
+        let released = released.clone();
+        std::thread::spawn(move || {
+            core.release();
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    // A pass is in flight, so the release must still be waiting. The wait is
+    // one-sided: the fix cannot finish early, since it provably blocks, so
+    // this never fails on correct code — a slow enough thread could only make
+    // it miss the bug, never invent one.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !released.load(std::sync::atomic::Ordering::SeqCst),
+        "release came back while a lineage pass was still running",
+    );
+
+    gate.wait();
+    pass.join().unwrap();
+    releaser.join().unwrap();
+    assert!(!f.core.is_owner());
+
+    // And with the release behind us, the guest writes nothing.
+    child.set_working(true);
+    f.core.sync_lineage_states();
+    assert_eq!(f.core.lineage().row("child").unwrap().unwrap().state, LineageState::Parked);
+}
+
+#[test]
+fn the_outbox_write_itself_refuses_a_guest() {
+    // `emit` and `note_ended` test ownership before reading the row, which is
+    // a saving and not an authorisation: both run on the runtime, where a
+    // release lands between that test and the push. So the gate is at the
+    // write, and this calls the write directly to say so.
+    let f = fixture(HostConfig::default());
+    f.core.start(PriorOwner::None);
+    let event = ChildEvent {
+        kind: ChildEventKind::Finished,
+        child: "child".into(),
+        depth: 1,
+        title: "child".into(),
+        status: None,
+        result: None,
+        permit: None,
+    };
+    f.core.record_child_event("parent", &event, "edge-1");
+    assert_eq!(f.core.outbox().pending_count("parent").unwrap(), 1, "the owner writes");
+    f.core.release();
+    f.core.record_child_event("parent", &event, "edge-2");
+    assert_eq!(f.core.outbox().pending_count("parent").unwrap(), 1, "a guest does not");
+}
+
+#[test]
 fn an_open_permission_prompt_counts_as_working() {
     let f = fixture(HostConfig::default());
     assert!(!f.core.working().is_working("nobody"), "unregistered is idle");

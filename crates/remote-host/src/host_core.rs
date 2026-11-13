@@ -119,6 +119,11 @@ pub struct HostCore {
     /// The one attention owner: what every surface that shows "needs you"
     /// reads from (`attention.rs`).
     attention: crate::attention::AttentionSlots,
+    /// Test-only: held open inside a lineage pass, so a test can park a pass
+    /// mid-flight and watch what `release` does while it runs. Per core, not
+    /// global, so a test that installs one cannot stall any other.
+    #[cfg(test)]
+    pass_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl HostCore {
@@ -144,6 +149,8 @@ impl HostCore {
             catalog: Mutex::new(None),
             owner_gen: std::sync::atomic::AtomicU64::new(0),
             attention: crate::attention::AttentionSlots::new(prefs),
+            #[cfg(test)]
+            pass_gate: Mutex::new(None),
         });
         core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
@@ -265,7 +272,19 @@ impl HostCore {
     }
 
     /// Write an event a child owes `parent`; a new one wakes the drainer.
+    ///
+    /// **The ownership gate is here, at the write, and not only at the callers
+    /// that decide to call it.** `emit` and [`Self::note_ended`] test ownership
+    /// before reading the row, which saves the read but cannot authorise the
+    /// write: both run on the runtime, where a release can land in between.
+    /// The lock is held across the push for the same reason
+    /// [`Self::sync_lineage_states`] holds it, and the wake it sends is to an
+    /// unbounded channel, so it cannot block while held.
     pub(crate) fn record_child_event(&self, parent: &str, event: &ChildEvent, edge_id: &str) {
+        let owner = self.prior.lock().unwrap();
+        if owner.is_none() {
+            return;
+        }
         match self.outbox.push(parent, event, edge_id, chrono::Local::now()) {
             Ok(true) => {
                 let _ = self.drain.send(DrainMsg::Wake);
@@ -368,10 +387,23 @@ impl HostCore {
     /// working, so an `active` row parks — parking is not ending: the row comes
     /// back on the next turn once it registers again. Only the data dir's owner
     /// writes; a guest does nothing.
+    ///
+    /// **The ownership lock is held for the whole pass, not just the check.**
+    /// The status subscriber runs this on the runtime while the main thread
+    /// can hand the directory over, so a pass that tested ownership and then
+    /// wrote row by row would keep writing after `release` returned: two
+    /// processes writing one directory, which is the single thing ownership
+    /// exists to prevent. `release` and `start` take the same lock, so they
+    /// wait out a pass in flight and no pass outlives the ownership that
+    /// allowed it. Nothing reachable from the loop takes this lock, and a
+    /// pass is bounded by the number of tracked children.
     pub fn sync_lineage_states(&self) {
-        if !self.is_owner() {
+        let owner = self.prior.lock().unwrap();
+        if owner.is_none() {
             return;
         }
+        #[cfg(test)]
+        self.hold_pass_open();
         let tracked = match self.lineage.tracked() {
             Ok(rows) => rows,
             Err(err) => {
@@ -453,6 +485,30 @@ impl HostCore {
             let activity = oximux_agents::session_health::child_activity(children.iter().map(|c| c.as_ref()));
             handle.refresh_health(now, activity);
         }
+    }
+
+    /// Test-only: park here until the test lets this pass go on, so it can
+    /// ask what `release` does with a pass in flight — the one question the
+    /// fix is about, and one no amount of racing threads can ask reliably.
+    ///
+    /// **Two rendezvous, not one.** The first tells the test a pass is in
+    /// flight; the second is what keeps it in flight while the test looks.
+    /// Waiting once only announces the pass, which then runs on and finishes,
+    /// and the test ends up measuring nothing — the ownership lock is free
+    /// again by the time it looks.
+    #[cfg(test)]
+    fn hold_pass_open(&self) {
+        let gate = self.pass_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.wait();
+            gate.wait();
+        }
+    }
+
+    /// Test-only: install (or clear) the pass gate.
+    #[cfg(test)]
+    pub(crate) fn set_pass_gate(&self, gate: Option<Arc<std::sync::Barrier>>) {
+        *self.pass_gate.lock().unwrap() = gate;
     }
 
     fn spawn_status_subscriber(self: &Arc<Self>) {
