@@ -19,14 +19,18 @@ use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px, svg};
 use oximux_core::AgentStatus;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::agents_dashboard::attention_look;
+use crate::shell::agents_dashboard::row_actions::RowReply;
+use crate::shell::agents_dashboard::{attention_look, row_actions, row_attention};
 use crate::shell::agents_dashboard::model::AgentRow;
 use crate::shell::agents_dashboard::sections::SectionKind;
 use crate::shell::left_rail::workspace_agent_rows::{agent_state_indicator, agent_state_label};
 use crate::ui::overlay::FloatingSurface;
 
-/// Fixed card height — fits the 3-line card (title + secondary + badges) with
-/// breathing room.
+/// Height of the 3-line card (title + secondary + badges) with breathing
+/// room. A row that can be answered is taller by its control line, and by its
+/// Reply box when that is open — see `row_actions::extra_height`. The list is
+/// a plain scroll column, not a `uniform_list`, so rows need not agree on a
+/// height.
 pub(crate) const ROW_HEIGHT: f32 = 64.0;
 
 /// Height of a status-section header row.
@@ -101,8 +105,11 @@ const ICON_GLYPH_SIZE: f32 = 14.0;
 
 /// Paint one `AgentRow` into a GPUI element. Height is `ROW_HEIGHT` so all
 /// cards share one height for `uniform_list`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_agent_row(
     row: &AgentRow,
+    reply: &RowReply,
+    weak_root: gpui::WeakEntity<crate::workspace_root::WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -213,6 +220,22 @@ pub fn render_agent_row(
                 .child(branch_or_slug.to_string()),
         );
 
+    // The line the decision is made from: what Allow would actually approve,
+    // or what the question asked. Minted by the host from the proposal, so a
+    // row cannot name one call while the digest covers another.
+    let target = row_attention::attention_target(&row.db_id, &row.target);
+    let reply_open = reply.is_open_for(&target);
+    let summary = row_actions::summary_line(&row.actions, theme, typography);
+    let controls = row_actions::action_line(
+        &row.actions,
+        row_actions::RowId { target: &target, kind: &row.target, db_id: &row.db_id },
+        reply,
+        weak_root,
+        theme,
+        density,
+        typography,
+    );
+
     let text_col = div()
         .flex()
         .flex_col()
@@ -221,14 +244,19 @@ pub fn render_agent_row(
         .gap(px(2.))
         .child(line1)
         .children(line2)
-        .child(line3);
+        .children(summary)
+        .child(line3)
+        // Its own line, left-aligned, outside the title's flex flow: buttons
+        // in that row would shrink the title they sit beside
+        // (`gpui-a-row-action-cluster-must-leave-the-flex-flow`).
+        .children(controls);
 
     let root = div()
         .flex()
         .flex_row()
         .items_start()
         .w_full()
-        .h(px(ROW_HEIGHT))
+        .h(px(ROW_HEIGHT + row_actions::extra_height(&row.actions, reply_open)))
         .px(px(density.pad_panel))
         .py(px(density.gap_inline))
         .gap(px(density.gap_inline))
@@ -290,6 +318,8 @@ mod tests {
             secondary: secondary.map(str::to_string),
             completed_turn: false,
             attention,
+            // These tests read the state line, not the controls.
+            actions: oximux_agents::row_actions::RowActions::nothing(),
         }
     }
 

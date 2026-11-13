@@ -77,8 +77,9 @@ pub struct RowActions {
 }
 
 impl RowActions {
-    /// A row that offers nothing.
-    fn none() -> Self {
+    /// A row that offers nothing: no alert, nothing pending it can answer, or
+    /// no host to ask.
+    pub fn nothing() -> Self {
         Self { actions: Vec::new(), answer: InlineAnswer::Nothing, summary: None }
     }
 
@@ -115,7 +116,7 @@ pub fn row_actions(
     permissions: &[PendingPermissionView],
     question: Option<&PendingQuestionView>,
 ) -> RowActions {
-    let Some(kind) = kind else { return RowActions::none() };
+    let Some(kind) = kind else { return RowActions::nothing() };
     // A dismissible kind is asked of the evaluator, never listed again here:
     // a second list of kinds is how the row and the menu came to disagree
     // about what could be dismissed.
@@ -124,7 +125,7 @@ pub fn row_actions(
     }
     if !kind.is_needs_you() {
         // Limited retries itself and an unread finish is read by reading it.
-        return RowActions::none();
+        return RowActions::nothing();
     }
     // A question first: it is the one that must not be answered with a
     // prompt, and a session can hold both (an `AskUserQuestion` is itself a
@@ -137,7 +138,7 @@ pub fn row_actions(
     }
     if permissions.len() > 1 {
         // Which one a single Allow answers is a guess.
-        return RowActions::none();
+        return RowActions::nothing();
     }
     // Waiting on a person with no request of its own: a reply is a new prompt.
     match kind {
@@ -148,7 +149,7 @@ pub fn row_actions(
         // moment ago, or raised by a process that has been replaced. Offering
         // Allow for a proposal nobody has would be offering to approve
         // nothing.
-        _ => RowActions::none(),
+        _ => RowActions::nothing(),
     }
 }
 
@@ -164,12 +165,12 @@ pub fn question_actions(question: &PendingQuestionView) -> RowActions {
     // the `QuestionCard` is for; a Reply box beside them would quietly answer
     // with free text instead of the option the person meant to choose.
     if question.questions.iter().any(|q| !q.options.is_empty()) {
-        return RowActions::none();
+        return RowActions::nothing();
     }
     // A secret answer never gets a row box: the row has no masking and the
     // redaction that keeps it out of the transcript lives on the chat.
     if question.questions.iter().any(|q| q.is_secret) {
-        return RowActions::none();
+        return RowActions::nothing();
     }
     let summary = question
         .questions
@@ -189,10 +190,10 @@ fn permission_actions(pending: &PendingPermissionView) -> RowActions {
     // Only a plain tool call. Every other kind carries something a row cannot
     // put in front of someone.
     if pending.kind != PermissionKind::Tool {
-        return RowActions::none();
+        return RowActions::nothing();
     }
     let Some(summary) = summary_of(&pending.tool_name, &pending.input) else {
-        return RowActions::none();
+        return RowActions::nothing();
     };
     RowActions::with(
         vec![RowAction::Allow, RowAction::Reject],

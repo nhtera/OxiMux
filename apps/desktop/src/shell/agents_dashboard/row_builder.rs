@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use oximux_agents::attention::Attention;
+use oximux_agents::row_actions::RowActions;
 use oximux_core::{Project, Workspace};
 
 use crate::shell::agent_presentation::adapter_icon_path;
@@ -32,7 +33,9 @@ use crate::shell::session_merge::relative_age_long;
 /// rail's shared helpers so the card reads identically. Calls `sort_agent_rows`
 /// before returning so callers get an attention-sorted list.
 ///
-/// `attention_of` resolves one row's attention. It is a parameter rather than a
+/// `attention_of` resolves one row's attention AND what it can answer —
+/// together, from one host pass, so a row cannot wear one moment's accent
+/// over another moment's buttons. It is a parameter rather than a
 /// host call so this stays pure and testable without a window: the caller owns
 /// the host, and it is the caller that knows a chat row is read from the
 /// session registry while a cockpit row is read from its parsed status. Called
@@ -43,7 +46,7 @@ pub fn build_agent_rows(
     projects: &[Project],
     workspaces_by_project: &HashMap<String, Vec<Workspace>>,
     now: &str,
-    attention_of: &dyn Fn(&RailAgentRow) -> Option<Attention>,
+    attention_of: &dyn Fn(&RailAgentRow) -> (Option<Attention>, RowActions),
 ) -> Vec<AgentRow> {
     // workspace_key → (Workspace, project name). Built once before the loop so
     // each session resolves its badge in O(1) without rescanning projects.
@@ -77,6 +80,7 @@ pub fn build_agent_rows(
                 .as_deref()
                 .map(|ts| relative_age_long(ts, now))
                 .unwrap_or_default();
+            let (attention, actions) = attention_of(rail);
             rows.push(AgentRow {
                 project_name: project_name.to_string(),
                 workspace: workspace.clone(),
@@ -91,7 +95,8 @@ pub fn build_agent_rows(
                 primary,
                 secondary,
                 completed_turn: is_completed_turn(rail),
-                attention: attention_of(rail),
+                attention,
+                actions,
             });
         }
     }
@@ -106,7 +111,19 @@ mod tests {
     /// one mapping and the one evaluator, with nobody having looked at
     /// anything. A stub returning `None` would let these tests pass while the
     /// sections they feed were wrong.
-    fn unseen_attention(rail: &RailAgentRow) -> Option<oximux_agents::attention::Attention> {
+    /// What the resolver answers for a cockpit row, minus the host: the one
+    /// evaluator and the one action table, with nobody having looked at
+    /// anything and no registry handle to hold a proposal.
+    fn unseen_attention(
+        rail: &RailAgentRow,
+    ) -> (Option<oximux_agents::attention::Attention>, RowActions) {
+        let attention = unseen_of(rail);
+        let actions =
+            oximux_agents::row_actions::row_actions(attention.as_ref().map(|a| a.kind), &[], None);
+        (attention, actions)
+    }
+
+    fn unseen_of(rail: &RailAgentRow) -> Option<oximux_agents::attention::Attention> {
         let item = oximux_agents::attention::external_of_agent_status(
             "t".into(),
             "t".into(),

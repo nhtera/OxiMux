@@ -290,6 +290,12 @@ pub struct LeftRail {
     dashboard_filter_input: Option<Entity<InputState>>,
     /// Held so the filter input's `Change → repaint` subscription stays alive.
     _dashboard_filter_sub: Option<Subscription>,
+    /// Which Agents-page row has its inline Reply box open, and the one input
+    /// they share. One box for the whole list: two half-typed replies is two
+    /// drafts to keep track of, in a 250px rail.
+    row_reply: crate::shell::agents_dashboard::row_actions::RowReply,
+    /// Held so the Reply box's `Enter → send` subscription stays alive.
+    _row_reply_sub: Option<Subscription>,
     /// Scroll position for the home workspace list (children = project
     /// groups). Drives the scroll-to-current-workspace affordance.
     list_scroll: ScrollHandle,
@@ -388,6 +394,11 @@ impl LeftRail {
             dashboard_filter: String::new(),
             dashboard_filter_input: None,
             _dashboard_filter_sub: None,
+            row_reply: crate::shell::agents_dashboard::row_actions::RowReply {
+                open_for: None,
+                input: None,
+            },
+            _row_reply_sub: None,
             list_scroll: ScrollHandle::new(),
             locate_glow_seq: 0,
             locate_anchor: new_anchor(),
@@ -532,6 +543,74 @@ impl LeftRail {
         self.dashboard_filter_input = Some(input.clone());
         self._dashboard_filter_sub = Some(sub);
         input
+    }
+
+    /// Open an Agents-page row's inline Reply box, or close it if it is
+    /// already the open one.
+    ///
+    /// Focus moves into the box here and nowhere else: the person clicked
+    /// Reply, so taking focus is what they asked for — while a row that
+    /// merely painted itself must never pull focus out of a composer someone
+    /// is typing in (F9).
+    pub(crate) fn toggle_row_reply(
+        &mut self,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.row_reply.is_open_for(target) {
+            self.close_row_reply(window, cx);
+            return;
+        }
+        // Lazily built (it needs a window) and reused, so opening a second
+        // row's box is a change of owner rather than a new widget.
+        if self.row_reply.input.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Reply…"));
+            let sub = cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event: &InputEvent, window, cx| {
+                    if !matches!(event, InputEvent::PressEnter { .. }) {
+                        return;
+                    }
+                    // The target is read here, not captured: the box outlives
+                    // any one row, so a stale capture would send this reply to
+                    // whichever row opened it first.
+                    let Some(target) = this.row_reply.open_for.clone() else { return };
+                    let text = input.read(cx).value().to_string();
+                    let _ = this.weak_root.update(cx, |root, cx| {
+                        root.send_row_reply(&target, &text, window, cx);
+                    });
+                },
+            );
+            self.row_reply.input = Some(input);
+            self._row_reply_sub = Some(sub);
+        }
+        if let Some(input) = self.row_reply.input.clone() {
+            // Empty for the new owner: carrying the last row's draft into
+            // this one is how a reply reaches the wrong agent.
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+            let focus = input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        self.row_reply.open_for = Some(target.to_string());
+        cx.notify();
+    }
+
+    /// Close the inline Reply box, clearing its text.
+    ///
+    /// The Escape affordance and what a sent reply does. Focus is not pushed
+    /// anywhere: the box simply stops being rendered, and gpui hands focus
+    /// back to the window.
+    pub(crate) fn close_row_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.row_reply.open_for.is_none() {
+            return;
+        }
+        self.row_reply.open_for = None;
+        if let Some(input) = self.row_reply.input.clone() {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        cx.notify();
     }
 
     /// Clear all held Smart-sort orders so the next render re-locks fresh
@@ -1338,6 +1417,7 @@ impl Render for LeftRail {
                 density,
                 &typography,
                 cx.try_global::<crate::remote_control::RemoteControl>().and_then(|rc| rc.host_core()),
+                self.row_reply.clone(),
             )
         } else {
             // Read the pre-computed Smart-sort settle overrides (refreshed off
