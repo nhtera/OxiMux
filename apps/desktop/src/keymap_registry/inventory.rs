@@ -16,10 +16,12 @@ use super::{ActionSpec, Category};
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
     DismissOverlay, FindNextMatch, FindPrevMatch, FocusNextPane, FocusNextSubPane, FocusPrevPane,
-    FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent,
+    FocusPrevSubPane, JumpToNextAttention, MarkUnread, MruNext, MruPrev, NavWorkspaceBack,
+    NavWorkspaceForward, NewAgent,
     NewAgentChat, NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
     OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, OpenWorkspaceCreate, OpenSearchPalette, PrevTab, RefreshSourceControl,
+    ShowNeedsYou,
     KillAllTerminalSessions, ReloadCustomCommands, RestartTerminalDaemon, RevealActiveWorkspace, Search, SelectExplorerTab, SelectHistoryTab,
     SelectSimulatorTab,
     SelectSearchTab,
@@ -274,6 +276,27 @@ pub const ACTIONS: &[ActionSpec] = &[
     ),
     entry!("insert_path", "Insert path into terminal", Terminal, "alt-cmd-p", InsertPathIntoTerminal),
     entry!("toggle_terminal_read_only", "Toggle read-only terminal", Terminal, "", ToggleTerminalReadOnly),
+    // Walks the sessions that need a person, worst first. Global rather than
+    // Terminal-scoped: the registry has no key context at all
+    // ([[oximux-keymap-registry-bindings-have-no-context]]), and an inbox
+    // shortcut that only worked with a terminal focused would be useless
+    // precisely when you are reading a chat.
+    //
+    // `secondary-shift-u` was free across the registry, the gpui-kit Input
+    // bindings and the terminal's own handler. The fallback if dogfooding
+    // finds a clash is `secondary-shift-m`.
+    entry!(
+        "jump_to_next_attention",
+        "Jump to next agent that needs you",
+        Global,
+        "secondary-shift-u",
+        JumpToNextAttention
+    ),
+    // Unbound by design: reachable from the palette and the status-bar chip.
+    // A shortcut for "show me the list" earns its keys less than one for
+    // "take me to the next thing", and the chord space is not free.
+    entry!("show_needs_you", "Show agents that need you", Global, "", ShowNeedsYou),
+    entry!("mark_session_unread", "Mark session as unread", Global, "", MarkUnread),
     // ---- Source Control ----------------------------------------------
     entry!("open_commit_dialog", "Commit dialog", Scm, "secondary-k", OpenCommitDialog),
     entry!(

@@ -525,6 +525,19 @@ actions!(
         FocusNextPane,
         /// Cycle focus to the previous pane in in-order traversal.
         FocusPrevPane,
+        /// Jump to the next session that needs a person, focusing its tab.
+        ///
+        /// Walks the host's `needs_you` order — worst first, then longest
+        /// waiting — and wraps. Answering one takes it out of the cycle, so
+        /// pressing it repeatedly clears the inbox rather than revisiting what
+        /// has been dealt with. Bound to ⌘⇧U / Ctrl+Shift+U.
+        JumpToNextAttention,
+        /// Open the Agents page on the sessions that need someone. The
+        /// status-bar chip's click and a palette entry; unbound by default.
+        ShowNeedsYou,
+        /// Keep the focused session standing out although it has been read.
+        /// A palette entry and the row's context menu; unbound by default.
+        MarkUnread,
         /// Open a new terminal tab at the workspace (group) level.
         NewTab,
         /// Open a new embedded browser tab at the workspace (group) level.

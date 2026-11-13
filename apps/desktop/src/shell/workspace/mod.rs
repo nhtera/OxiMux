@@ -4,6 +4,7 @@
 pub mod add_project_dialog;
 pub mod adopt;
 pub mod attention_surface;
+pub mod jump_to_attention;
 pub mod auto_rename_ops;
 pub mod base_choice;
 pub mod codename_ops;

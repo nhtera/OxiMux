@@ -1,74 +1,110 @@
-//! The Agents nav badge: how many sessions have started needing someone.
+//! How many sessions need a person — the number the rail badge and the
+//! status-bar chip both show.
 //!
 //! Its own module because `left_rail/mod.rs` is well past its size budget and
-//! this is a rule rather than layout — and because the rule was wrong in a way
-//! that took a reviewer to see. The badge used to count *workspace status*
-//! transitions, a map that holds one tracked agent per workspace and no chat
-//! sessions at all, so a chat waiting on an approval could sit in NEEDS YOU
-//! with the badge reading zero.
+//! this is a rule rather than layout — and because the rule was wrong twice
+//! before it was right. It counted *workspace status* transitions, a map that
+//! holds one tracked agent per workspace and no chat sessions at all, so a
+//! chat waiting on an approval sat in NEEDS YOU with the badge reading zero.
+//! Then it counted transitions of the host's answer, which was correct but
+//! still a tally: it needed a reset when the page opened, and it could drift
+//! from what the list actually showed.
 //!
-//! It counts the host's answer now, the same one the rail and the palette
-//! read. Still transitions, not a total: the badge is "what happened while you
-//! were not looking", so a session that has been waiting for an hour must not
-//! re-count on every refresh.
+//! It is a **count** now. The badge says how many sessions are asking, which
+//! is the same number the chip shows and the same number the list has rows
+//! for, so none of the three can disagree. It needs no resetting: dealing with
+//! a session removes it from the count, which is what "dealt with" should mean
+//! — and it survives a restart for free, because the host's answer does.
 
-use std::collections::HashSet;
+use oximux_agents::attention::{Attention, AttentionKind};
 
-/// How many new alerts to add after this pass.
+/// Everything that needs a person right now, worst first.
 ///
-/// `previous` and `current` are the sets of targets that needed a person then
-/// and now. A target in both has already been counted; one that has left does
-/// not take its count with it (the person still has not looked — opening the
-/// page is what clears the badge).
-pub fn newly_needing(previous: &HashSet<String>, current: &HashSet<String>) -> u32 {
-    current.difference(previous).count() as u32
-}
-
-/// Every target the host says needs a person right now.
-///
-/// Empty when the host has not started — remote disabled, or a frame before
-/// it — which reads as "nothing is asking", the same as the rail shows.
-pub fn targets_needing_you(cx: &gpui::App) -> HashSet<String> {
+/// One read per pass, shared by the badge and the chip. Empty when the host
+/// has not started — remote disabled, or a frame before it — which reads as
+/// "nothing is asking", the same as the rail shows.
+pub fn needs_you_now(cx: &gpui::App) -> Vec<(String, Attention)> {
     cx.try_global::<crate::remote_control::RemoteControl>()
         .and_then(|rc| rc.host_core())
-        .map(|host| host.needs_you().into_iter().map(|(target, _)| target).collect())
+        .map(|host| host.needs_you())
         .unwrap_or_default()
+}
+
+/// Whether the rail has to repaint because *which* sessions are asking has
+/// changed — not merely how many.
+///
+/// One session being dealt with as another starts asking leaves the count
+/// identical. Comparing only the count would leave the dashboard showing the
+/// row that has gone until some unrelated input happened to repaint it.
+pub fn membership_changed(
+    previous: &std::collections::HashSet<String>,
+    current: &std::collections::HashSet<String>,
+) -> bool {
+    previous != current
+}
+
+/// The worst kind among `needs_you`, which is what colours the chip.
+///
+/// `None` for an empty list, where there is nothing to colour. The order is
+/// the evaluator's `priority()`, not a local one, so the chip's colour and the
+/// list's top row always come from the same ranking.
+pub fn worst_kind(needs_you: &[(String, Attention)]) -> Option<AttentionKind> {
+    needs_you.iter().map(|(_, a)| a.kind).min_by_key(|kind| kind.priority())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oximux_agents::attention::AttentionSource;
 
-    fn set(targets: &[&str]) -> HashSet<String> {
-        targets.iter().map(|t| t.to_string()).collect()
+    fn needing(kinds: &[AttentionKind]) -> Vec<(String, Attention)> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(i, &kind)| {
+                (
+                    format!("chat:s{i}"),
+                    Attention { kind, since: 0, reason: None, source: AttentionSource::Health },
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn only_a_target_that_newly_needs_someone_counts() {
-        let before = set(&["chat:s1"]);
-        let after = set(&["chat:s1", "cockpit:7"]);
-        assert_eq!(newly_needing(&before, &after), 1, "the one that is new");
+    fn the_worst_kind_decides_the_colour() {
+        // A permission among failures still colours the chip warn, because a
+        // permission is the thing to deal with first — the same order the list
+        // puts its rows in.
         assert_eq!(
-            newly_needing(&after, &after),
-            0,
-            "a session still waiting has already been counted, however many \
-             times the rail refreshes"
+            worst_kind(&needing(&[
+                AttentionKind::Failed,
+                AttentionKind::NeedsPermission,
+                AttentionKind::Stalled
+            ])),
+            Some(AttentionKind::NeedsPermission)
+        );
+        assert_eq!(
+            worst_kind(&needing(&[AttentionKind::Stalled, AttentionKind::Failed])),
+            Some(AttentionKind::Failed),
+            "a failure outranks a stall"
         );
     }
 
     #[test]
-    fn an_alert_that_was_dealt_with_does_not_subtract() {
-        // The badge is what happened while the person was away, not a live
-        // total: dealing with one thing does not un-see another.
-        let before = set(&["chat:s1", "cockpit:7"]);
-        let after = set(&["cockpit:7"]);
-        assert_eq!(newly_needing(&before, &after), 0);
+    fn a_swap_with_no_change_in_count_still_repaints() {
+        // The case a count cannot see: one session answered in the same pass
+        // another starts asking. Two rows changed and the number did not.
+        let before: std::collections::HashSet<String> =
+            ["chat:a".to_string(), "cockpit:7".to_string()].into_iter().collect();
+        let after: std::collections::HashSet<String> =
+            ["cockpit:7".to_string(), "chat:b".to_string()].into_iter().collect();
+        assert_eq!(before.len(), after.len(), "the premise: the count is unchanged");
+        assert!(membership_changed(&before, &after));
+        assert!(!membership_changed(&before, &before.clone()), "and an unchanged set is quiet");
     }
 
     #[test]
-    fn a_chat_session_counts_like_any_other() {
-        // The bug this module exists for: the old counter read a map of
-        // workspace agent statuses, which has no chat rows in it at all.
-        assert_eq!(newly_needing(&HashSet::new(), &set(&["chat:s1"])), 1);
+    fn nothing_asking_has_no_colour_and_no_chip() {
+        assert_eq!(worst_kind(&[]), None);
     }
 }

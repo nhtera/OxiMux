@@ -9,9 +9,10 @@
 use gpui::Action;
 
 use crate::actions::{
-    ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab, NewTab,
+    ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab,
+    JumpToNextAttention, MarkUnread, NewTab,
     OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, OpenWorkspaceCreate, ReloadCustomCommands,
-    RevealActiveWorkspace, Search, SelectSourceControlTab, ShowWelcomeWizard, RestartTerminalDaemon, KillAllTerminalSessions, SplitHorizontal,
+    RevealActiveWorkspace, Search, SelectSourceControlTab, ShowNeedsYou, ShowWelcomeWizard, RestartTerminalDaemon, KillAllTerminalSessions, SplitHorizontal,
     SplitVertical, ToggleLeftSidebar,
     ToggleRightSidebar, UiZoomIn, UiZoomOut, UiZoomReset, InsertPathIntoTerminal, ToggleTerminalReadOnly,
 };
@@ -95,6 +96,23 @@ pub enum PaletteGroup {
 /// Static command catalog. Order = render order; first item is the default
 /// selected row in Command Palette mode.
 pub const PALETTE_COMMANDS: &[CommandEntry] = &[
+    // The inbox, first in the catalogue because it is the one list a person
+    // reaches for when they have been away.
+    CommandEntry {
+        name: "Agents: Jump to Next Needs You",
+        action_id: Some("jump_to_next_attention"),
+        make_action: || Box::new(JumpToNextAttention),
+    },
+    CommandEntry {
+        name: "Agents: Show Needs You",
+        action_id: Some("show_needs_you"),
+        make_action: || Box::new(ShowNeedsYou),
+    },
+    CommandEntry {
+        name: "Agents: Mark as Unread",
+        action_id: Some("mark_session_unread"),
+        make_action: || Box::new(MarkUnread),
+    },
     CommandEntry {
         name: "Split Pane Horizontally",
         action_id: Some("split_group_horizontal"),
@@ -387,15 +405,38 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_thirty_nine_entries() {
+    fn palette_commands_has_forty_two_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
         // + "Reveal Active Workspace" + "Show Mobile Emulator"
         // + the Android "Back" and "Recents" simulator rows
         // + "Restart Terminal Daemon" + "Kill All Terminal Sessions"
         // + a real phone's Volume Up / Volume Down and the iPhone's Action
-        // + "Insert Path into Terminal" + "Toggle Read-Only Terminal".
-        assert_eq!(PALETTE_COMMANDS.len(), 39);
+        // + "Insert Path into Terminal" + "Toggle Read-Only Terminal"
+        // + the three "Agents:" rows (jump to next, show, mark unread).
+        assert_eq!(PALETTE_COMMANDS.len(), 42);
+    }
+
+    /// The inbox rows are reachable by what people would type, not only by
+    /// their full names: "needs" and "unread" are the words, and the
+    /// `Agents:` prefix must not be the only way in.
+    #[test]
+    fn the_attention_commands_are_found_by_their_words() {
+        use crate::shell::command_palette::match_engine::filter_and_rank;
+        let items = build_palette_items(&[]);
+        let texts: Vec<&str> = items.iter().map(|i| i.search_text.as_str()).collect();
+        for (query, name) in [
+            ("needs", "Agents: Jump to Next Needs You"),
+            ("jump", "Agents: Jump to Next Needs You"),
+            ("unread", "Agents: Mark as Unread"),
+            ("agents show", "Agents: Show Needs You"),
+        ] {
+            let ranked = filter_and_rank(query, &texts);
+            assert!(
+                ranked.iter().any(|&i| items[i].name == name),
+                "query {query:?} must find {name}"
+            );
+        }
     }
 
     /// The daemon commands answer to what people call the thing.

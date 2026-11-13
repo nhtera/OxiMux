@@ -306,9 +306,11 @@ pub struct LeftRail {
     /// Agents page was NOT open. Shown as a badge on the Agents nav row;
     /// zeroed when the page is opened. Lives here (not on the dashboard
     /// view) because the rail entity survives project switches.
+    /// How many sessions need a person, as of the last pass. A count, not a
+    /// tally — see `badge`.
     agents_unread: u32,
-    /// The targets that needed someone at the last pass, so the badge counts
-    /// a session once rather than on every refresh.
+    /// *Which* sessions those were, so a repaint happens when the membership
+    /// changes and not only when the number does. Never displayed.
     agents_needing_you: std::collections::HashSet<String>,
     /// Per-project held Smart-sort order during the settle window (item:
     /// Smart rows don't reshuffle under the cursor right after a status
@@ -993,6 +995,12 @@ impl LeftRail {
     }
 
     /// Current rail width — read by `WorkspaceRoot` for pane reflow.
+    /// The agent row the rail has focused, if any — what "this session"
+    /// means for an action aimed at what the person is looking at.
+    pub(crate) fn focused_agent_target(&self) -> Option<RailAgentTarget> {
+        self.focused_agent.clone()
+    }
+
     pub(crate) fn width(&self) -> Pixels {
         self.width
     }
@@ -1036,18 +1044,26 @@ impl LeftRail {
         // page is closed. The host's answer, so a chat session counts like a
         // tracked agent — the status map this used to read holds neither chat
         // sessions nor more than one agent per workspace.
-        let needing = badge::targets_needing_you(cx);
-        let was_unread = self.agents_unread;
-        if self.active_nav != Some(NavItem::Agents) {
-            let fresh = badge::newly_needing(&self.agents_needing_you, &needing);
-            self.agents_unread = self.agents_unread.saturating_add(fresh);
-        }
+        // How many sessions are asking for someone, from the host — the same
+        // number the status-bar chip shows and the same number the list has
+        // rows for. A count rather than a tally of transitions: dealing with a
+        // session takes it out, which is what "dealt with" should mean, and it
+        // needs no resetting when the page opens.
+        let needing: std::collections::HashSet<String> =
+            badge::needs_you_now(cx).into_iter().map(|(target, _)| target).collect();
+        self.agents_unread = needing.len() as u32;
+        // Attention is a render input like any other, and none of the compared
+        // fields below carries it: a chat going stalled changes what the rows
+        // say without changing any status the rail displays.
+        //
+        // The *set*, not just the count: one session being dealt with as
+        // another starts asking leaves the number identical, and comparing
+        // only the number would leave the dashboard showing the row that has
+        // gone until some unrelated input happened to repaint. The badge
+        // itself is still the count — this is how the change is noticed, not
+        // what is displayed.
+        let badge_changed = badge::membership_changed(&self.agents_needing_you, &needing);
         self.agents_needing_you = needing;
-        // The badge is a render input like any other, and not one of the
-        // compared fields below: a chat going stalled changes the count
-        // without changing any status the rail displays, and the new number
-        // would sit unpainted until something else happened to repaint.
-        let badge_changed = self.agents_unread != was_unread;
         // Dirty-check: `WorkspaceRoot::render` pushes this snapshot down every
         // frame (and re-renders on every pane-output tick while an agent
         // streams), so notifying unconditionally rebuilds the whole rail
@@ -1198,9 +1214,25 @@ impl LeftRail {
         } else {
             Some(item)
         };
-        if self.active_nav == Some(NavItem::Agents) {
-            self.agents_unread = 0;
-        }
+        cx.notify();
+    }
+
+    /// Show the Agents page on the sessions that need someone.
+    ///
+    /// Not `select_nav`, which *toggles*: this is a "show" and must not close
+    /// the page when it happens to be open already. It also clears the text
+    /// filter and narrows the status filter to NEEDS YOU, because a stale
+    /// filter — a text query from an hour ago, or `Working` — would leave the
+    /// page open on none of the rows the person came to see.
+    pub(crate) fn show_needs_you(&mut self, cx: &mut Context<Self>) {
+        self.active_nav = Some(NavItem::Agents);
+        // The text filter's own state is cleared too, not just the string the
+        // list reads: leaving the box showing a stale query over an unfiltered
+        // list is worse than either.
+        self.dashboard_filter.clear();
+        self.dashboard_filter_input = None;
+        self._dashboard_filter_sub = None;
+        self.dashboard_status_filter = StatusFilter::Attention;
         cx.notify();
     }
 
