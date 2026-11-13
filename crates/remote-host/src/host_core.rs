@@ -265,7 +265,19 @@ impl HostCore {
     }
 
     /// Write an event a child owes `parent`; a new one wakes the drainer.
+    ///
+    /// **The ownership gate is here, at the write, and not only at the callers
+    /// that decide to call it.** `emit` and [`Self::note_ended`] test ownership
+    /// before reading the row, which saves the read but cannot authorise the
+    /// write: both run on the runtime, where a release can land in between.
+    /// The lock is held across the push for the same reason
+    /// [`Self::sync_lineage_states`] holds it, and the wake it sends is to an
+    /// unbounded channel, so it cannot block while held.
     pub(crate) fn record_child_event(&self, parent: &str, event: &ChildEvent, edge_id: &str) {
+        let owner = self.prior.lock().unwrap();
+        if owner.is_none() {
+            return;
+        }
         match self.outbox.push(parent, event, edge_id, chrono::Local::now()) {
             Ok(true) => {
                 let _ = self.drain.send(DrainMsg::Wake);
@@ -368,8 +380,19 @@ impl HostCore {
     /// working, so an `active` row parks — parking is not ending: the row comes
     /// back on the next turn once it registers again. Only the data dir's owner
     /// writes; a guest does nothing.
+    ///
+    /// **The ownership lock is held for the whole pass, not just the check.**
+    /// The status subscriber runs this on the runtime while the main thread
+    /// can hand the directory over, so a pass that tested ownership and then
+    /// wrote row by row would keep writing after `release` returned: two
+    /// processes writing one directory, which is the single thing ownership
+    /// exists to prevent. `release` and `start` take the same lock, so they
+    /// wait out a pass in flight and no pass outlives the ownership that
+    /// allowed it. Nothing reachable from the loop takes this lock, and a
+    /// pass is bounded by the number of tracked children.
     pub fn sync_lineage_states(&self) {
-        if !self.is_owner() {
+        let owner = self.prior.lock().unwrap();
+        if owner.is_none() {
             return;
         }
         let tracked = match self.lineage.tracked() {

@@ -132,6 +132,78 @@ fn a_guest_writes_nothing_until_it_owns_the_data_dir() {
 }
 
 #[test]
+fn a_pass_in_flight_cannot_write_past_the_release_it_raced() {
+    // The bug this guards: `sync_lineage_states` tested ownership once and
+    // then wrote row by row, so a pass the subscriber had already begun went
+    // on writing after the main thread gave the directory up — it read the
+    // working flag *after* the release and revived a row it no longer owned.
+    // It failed roughly one CI run in ten on Windows, where the runtime's
+    // thread happens to interleave this way; the loop is what makes it land
+    // on every platform rather than once in a while.
+    for _ in 0..200 {
+        let f = fixture(HostConfig::default());
+        f.core.start(PriorOwner::None);
+        register(&f, "parent");
+        let child = register(&f, "child");
+        spawn_child(&f, "parent", "child", SpawnPosture::Default);
+        f.core.sync_lineage_states();
+        assert_eq!(f.core.lineage().row("child").unwrap().unwrap().state, LineageState::Parked);
+
+        // A second thread in the subscriber's place, passing through the
+        // ownership gate over and over while the release lands.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let racer = {
+            let core = f.core.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    core.sync_lineage_states();
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        f.core.release();
+        // Only now is there anything to write: a pass that still believed it
+        // owned the directory would read this and revive the row.
+        child.set_working(true);
+        std::thread::sleep(Duration::from_millis(2));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        racer.join().unwrap();
+
+        assert_eq!(
+            f.core.lineage().row("child").unwrap().unwrap().state,
+            LineageState::Parked,
+            "a guest writes nothing, including a pass that was already running",
+        );
+    }
+}
+
+#[test]
+fn the_outbox_write_itself_refuses_a_guest() {
+    // `emit` and `note_ended` test ownership before reading the row, which is
+    // a saving and not an authorisation: both run on the runtime, where a
+    // release lands between that test and the push. So the gate is at the
+    // write, and this calls the write directly to say so.
+    let f = fixture(HostConfig::default());
+    f.core.start(PriorOwner::None);
+    let event = ChildEvent {
+        kind: ChildEventKind::Finished,
+        child: "child".into(),
+        depth: 1,
+        title: "child".into(),
+        status: None,
+        result: None,
+        permit: None,
+    };
+    f.core.record_child_event("parent", &event, "edge-1");
+    assert_eq!(f.core.outbox().pending_count("parent").unwrap(), 1, "the owner writes");
+    f.core.release();
+    f.core.record_child_event("parent", &event, "edge-2");
+    assert_eq!(f.core.outbox().pending_count("parent").unwrap(), 1, "a guest does not");
+}
+
+#[test]
 fn an_open_permission_prompt_counts_as_working() {
     let f = fixture(HostConfig::default());
     assert!(!f.core.working().is_working("nobody"), "unregistered is idle");
