@@ -44,7 +44,21 @@ mod tests {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let db = oximux_storage::db::open_memory().unwrap();
         let settings = oximux_storage::SettingsRepo::new(db.clone());
-        let stored = HostConfig { stall_after_s: 42, ..HostConfig::default() };
+        // Every field moved off its default, because a test that stores the
+        // default and reads the default proves nothing: it would pass against
+        // a host that ignored the store entirely.
+        let stored = HostConfig {
+            stall_after_s: 42,
+            caps: oximux_agents::lineage::SpawnCaps {
+                depth: 2,
+                active_per_parent: 3,
+                active_per_root: 5,
+                open_per_root: 7,
+                ..HostConfig::default().caps
+            },
+            ..HostConfig::default()
+        };
+        assert_ne!(stored.caps.depth, HostConfig::default().caps.depth, "the fixture must differ");
         for (key, value) in stored.entries() {
             settings.set(key, &value).unwrap();
         }
@@ -56,12 +70,12 @@ mod tests {
             &settings,
         );
 
-        assert_eq!(core.config().stall_after_s, 42, "the stall clock came from the store");
-        assert_eq!(
-            core.config().caps.depth,
-            stored.caps.depth,
-            "and so did the depth cap the desktop wrote",
-        );
+        let got = core.config();
+        assert_eq!(got.stall_after_s, 42, "the stall clock came from the store");
+        assert_eq!(got.caps.depth, stored.caps.depth, "and so did the depth cap");
+        assert_eq!(got.caps.active_per_parent, stored.caps.active_per_parent);
+        assert_eq!(got.caps.active_per_root, stored.caps.active_per_root);
+        assert_eq!(got.caps.open_per_root, stored.caps.open_per_root);
     }
 
     /// An empty store is defaults, not zeroes — a serve with no settings row

@@ -417,6 +417,9 @@ fn launch_detail(err: &crate::launcher::LaunchError) -> &'static str {
         crate::launcher::LaunchError::PostureUnenforceable(_) => {
             "this agent cannot be held to the posture asked for"
         }
+        crate::launcher::LaunchError::UnsupportedOnHost(_) => {
+            "this host cannot run agent-spawned children; run the team from the desktop app"
+        }
     }
 }
 

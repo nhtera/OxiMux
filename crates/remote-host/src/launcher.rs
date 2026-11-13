@@ -47,6 +47,17 @@ pub enum LaunchError {
     /// reviewer that could write). The launch is refused, never downgraded.
     #[error("this agent cannot be held to that posture: {0}")]
     PostureUnenforceable(String),
+    /// This host cannot run an agent-spawned child at all. Not a failure of
+    /// the launch but of the host: something it does not have would be needed
+    /// to carry the child's work back.
+    ///
+    /// Refused rather than started, because the half that is missing is never
+    /// the half the caller notices. A child that launches and whose finish
+    /// never reaches its parent leaves that parent waiting for a message that
+    /// cannot arrive — and a slot it holds forever. "Not here" is a worse
+    /// answer than "yes" only until the first time "yes" was a lie.
+    #[error("this host cannot run agent-spawned children: {0}")]
+    UnsupportedOnHost(String),
 }
 
 /// How a child agent is launched, beyond what [`SessionLauncher::create`]

@@ -416,6 +416,12 @@ async fn serve(
     // only says what to attribute to it (and whether the machine rebooted,
     // which proves its provider children are gone too). A missing or garbled
     // record is `Unknown`: gone, with no claim about why.
+    // The catalog before the start, not after: the start's recovery turns
+    // reach a child that is dormant (the usual case after a restart) only
+    // through the catalog, and a core without one drops each attempt instead
+    // of sending it. The dispatcher's own `with_catalog` is a different seam
+    // and does not reach the core.
+    host_core.set_catalog(catalog.clone());
     host_core.start(oximux_remote_host::PriorOwner::from_previous(host_lock.previous()));
 
     let mut dispatcher = Dispatcher::new(registry.clone(), auth.clone())

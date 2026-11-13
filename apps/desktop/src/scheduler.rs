@@ -265,6 +265,9 @@ fn launch_error_detail(err: &LaunchError) -> &'static str {
         LaunchError::ModelUnsupported => "this agent cannot be given a model when it starts",
         // Unreachable too: a schedule launches with no posture.
         LaunchError::PostureUnenforceable(_) => "this agent cannot be held to that posture",
+        // And unreachable on the desktop, which can run children: only the
+        // headless host refuses them, and it has its own scheduler.
+        LaunchError::UnsupportedOnHost(_) => "this host cannot run agent-spawned children",
     }
 }
 
