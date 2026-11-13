@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use oximux_agent_core::thread::ThreadEvent;
 use oximux_agents::session_registry::{RemotePrompt, SessionHandle, SessionMeta, SessionRegistry};
+use oximux_agents::health::Process;
+use oximux_agents::health_track::{HealthExtras, HealthTrack, inputs_from};
 use oximux_agents::thread::ChatThread;
 use oximux_storage::SettingsRepo;
 
@@ -166,6 +168,10 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         );
         fold.session_meta = seed.session_meta.clone();
         let mut blob = seed;
+        // What the fold does not keep: the last sign of life, an unanswered
+        // send, how the process ended. The same tracker the desktop folds its
+        // events into (`oximux_agents::health_track`).
+        let mut track = HealthTrack::default();
         let mut persist = Persist::new(settings, index, &fold);
         // A resumed session publishes its history immediately — `--resume`
         // replays nothing, so without this the transcript RPCs would answer
@@ -173,7 +179,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         persist.save_now(&handle, &mut blob, &fold);
 
         for event in buffered {
-            apply(&handle, &mut fold, &event, &turn_tx, /* ingest */ true);
+            apply(&handle, &mut fold, &mut track, &event, &turn_tx, /* ingest */ true);
         }
         persist.maybe_save(&handle, &mut blob, &fold);
 
@@ -206,7 +212,10 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     while let Ok(prompt) = prompt_rx.try_recv() {
                         fold.push_user_message_with_images(prompt.text, prompt.images);
                         refresh_meta(&handle, &fold);
-                        let _ = turn_tx.send(true);
+                        // A send, not a frame: the turn is this host's own
+                        // doing, and the fold does not know it started.
+                        track.note_sent(oximux_agents::session_health::now_ms(), None);
+                        publish_state(&handle, &fold, &track, &turn_tx, true, Process::Live);
                     }
                     let Some(event) = event else {
                         // The agent's stream closed: the child exited. An
@@ -215,7 +224,12 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                         if fold.turn_active {
                             fold.interrupt();
                         }
-                        let _ = turn_tx.send(false);
+                        // Published before the registry entry goes: this is
+                        // the only frame that says the process died, and a
+                        // watcher reading an unregistered session reads
+                        // nothing at all.
+                        track.note_exit(/* stopped */ false, None);
+                        publish_state(&handle, &fold, &track, &turn_tx, false, Process::Dormant);
                         persist.save_now(&handle, &mut blob, &fold);
                         // Back to dormant: with the registry entry gone the
                         // catalog lists it again and `open()` resumes it
@@ -230,7 +244,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                             | ThreadEvent::PermissionRequested { .. }
                             | ThreadEvent::QuestionAsked { .. }
                     );
-                    apply(&handle, &mut fold, &event, &turn_tx, true);
+                    apply(&handle, &mut fold, &mut track, &event, &turn_tx, true);
                     if settled {
                         persist.save_now(&handle, &mut blob, &fold);
                     }
@@ -240,7 +254,8 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                         Some(prompt) => {
                             fold.push_user_message_with_images(prompt.text, prompt.images);
                             refresh_meta(&handle, &fold);
-                            let _ = turn_tx.send(true);
+                            track.note_sent(oximux_agents::session_health::now_ms(), None);
+                            publish_state(&handle, &fold, &track, &turn_tx, true, Process::Live);
                         }
                         None => prompt_open = false,
                     }
@@ -248,7 +263,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                 synth = futures::StreamExt::next(&mut synth_rx), if synth_open => {
                     match synth {
                         Some(event) => {
-                            apply(&handle, &mut fold, &event, &turn_tx, /* ingest */ false);
+                            apply(&handle, &mut fold, &mut track, &event, &turn_tx, /* ingest */ false);
                             persist.maybe_save(&handle, &mut blob, &fold);
                         }
                         None => synth_open = false,
@@ -266,7 +281,9 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     if fold.turn_active {
                         fold.interrupt();
                     }
-                    let _ = turn_tx.send(false);
+                    // The host is draining, which is not the agent dying: no
+                    // exit is claimed, only that nothing is running.
+                    publish_state(&handle, &fold, &track, &turn_tx, false, Process::Dormant);
                     persist.save_now(&handle, &mut blob, &fold);
                     break;
                 }
@@ -279,10 +296,51 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
     });
 }
 
+/// Say what this session is doing: to the pump's own turn channel, and to the
+/// health facts every remote client and the host core read — in one call, so
+/// the two cannot disagree.
+///
+/// It used to be the channel and nothing else, so nothing outside this process
+/// ever heard. A spawned child was set working once by the spawn and never
+/// unset: it held its slot under the fan-out cap for the life of the host, and
+/// nothing anywhere said why its parent could no longer spawn.
+///
+/// **The registry's `working` flag is not written here.** `publish_health`
+/// derives it from these facts under the same lock as the health itself, and
+/// a second write would be a second opinion — one that is wrong whenever an
+/// unanswered send or an open continuation means working while no turn runs.
+///
+/// What this host cannot answer yet is left at its default rather than
+/// guessed, and each is owed by a named step of phase 4b: `limited_until` and
+/// `limit_reason` by the retry driver (F9), `interrupted` by serve's `Cancel`
+/// (F7), `recovery_note_owed` by the recovery note (F11), `held`/`queued` by
+/// the persisted queue (F10). `children_active` is 0 because this host refuses
+/// agent-spawned children — truthful today, and F5's job to keep truthful.
+fn publish_state(
+    handle: &SessionHandle,
+    fold: &ChatThread,
+    track: &HealthTrack,
+    turn_tx: &tokio::sync::watch::Sender<bool>,
+    working: bool,
+    process: Process,
+) {
+    let _ = turn_tx.send(working);
+    handle.publish_health(inputs_from(
+        fold,
+        track,
+        HealthExtras {
+            process_while_running: process,
+            incarnation: handle.incarnation().to_string(),
+            ..HealthExtras::default()
+        },
+    ));
+}
+
 /// Fold + registry bookkeeping for one event.
 fn apply(
     handle: &SessionHandle,
     fold: &mut ChatThread,
+    track: &mut HealthTrack,
     event: &ThreadEvent,
     turn_tx: &tokio::sync::watch::Sender<bool>,
     ingest: bool,
@@ -291,7 +349,8 @@ fn apply(
         handle.ingest(event.clone());
     }
     fold.apply(event);
-    let _ = turn_tx.send(fold.turn_active);
+    track.note_event(event, oximux_agents::session_health::now_ms());
+    publish_state(handle, fold, track, turn_tx, fold.turn_active, Process::Live);
     // Keep the registry's list-row metadata current on the events that change it.
     //
     // `UserMessage` is in the list because it is what makes a title derivable:
@@ -392,6 +451,58 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         false
+    }
+
+    /// A turn that ends releases the session, rather than leaving it working
+    /// for ever.
+    ///
+    /// The registry's flag is what the host core reads to park a child and to
+    /// count the fan-out cap, and this host never wrote it: a spawned child
+    /// was set working once by the spawn and stayed `active` for the life of
+    /// the process, holding its slot and giving no reason why its parent could
+    /// not spawn again. The private turn channel said the right thing the
+    /// whole time, which is why it went unnoticed — two places saying one
+    /// thing, only one of them read by the thing that matters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finished_turn_releases_the_session_it_was_holding() {
+        let registry = Arc::new(SessionRegistry::new());
+        let handle = registry.register("s-1".into(), Arc::new(StubConnection::default()));
+        let db = oximux_storage::open_memory().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pumps = PumpSet::new();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                // A turn begins with the user's message: the sibling test
+                // relies on the same thing, and an assistant frame on its own
+                // folds into no turn at all.
+                buffered: vec![ThreadEvent::UserMessage { text: "hi".into(), images: vec![] }],
+                seed: ChatBlob::new("s-1".into()),
+                settings: SettingsRepo::new(db),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            pumps.clone(),
+        );
+
+        tx.send(ThreadEvent::AssistantText("working…".into())).unwrap();
+        assert!(
+            wait_until(5_000, || handle.status_snapshot().working),
+            "a running turn reads working in the registry, not only in the pump",
+        );
+        assert!(handle.health_published(), "and it is the published facts that say so");
+
+        tx.send(ThreadEvent::TurnEnded { is_error: false, result: None, usage: None, turn_diff: None }).unwrap();
+        assert!(
+            wait_until(5_000, || !handle.status_snapshot().working),
+            "and the end of that turn gives the slot back",
+        );
+        // The pump's own channel agrees — they are published together.
+        assert_eq!(pumps.active_turns(), 0);
     }
 
     /// The bug a review caught before it shipped: an agent whose stream closes
