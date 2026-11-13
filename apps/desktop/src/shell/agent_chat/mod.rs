@@ -579,8 +579,14 @@ pub struct AgentChatView {
     send_gate: Arc<std::sync::Mutex<oximux_agents::send_gate::SendGate>>,
     /// The id the next write goes out under (a gate item's), else a fresh one.
     pending_send_uuid: Option<uuid::Uuid>,
-    /// Health facts the fold does not keep (`health_link.rs`).
-    health: health_link::HealthTrack,
+    /// Health facts the fold does not keep — the same tracker the headless
+    /// host folds its events into (`oximux_agents::health_track`).
+    health: oximux_agents::health_track::HealthTrack,
+    /// Restored sends nobody answered, still held and marked: the blob keeps
+    /// each (with its own text) until the user sends or drops its card. A
+    /// window's own business, not a health fact, so it lives here and not on
+    /// the tracker.
+    unconfirmed_held: Vec<crate::persisted_chat::UnconfirmedSend>,
     /// What a restart cut short, owed to the agent on the next message.
     recovery_note: Option<String>,
     /// The live tie into the remote-control [`SessionRegistry`], or `None` when
