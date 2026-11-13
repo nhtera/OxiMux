@@ -15,6 +15,7 @@
 
 mod blob;
 mod catalog;
+mod host;
 mod launcher;
 mod projects;
 mod pump;
@@ -169,8 +170,13 @@ async fn serve(
     // rebinding over its own live listener is legitimate (the desktop's
     // Settings → Remote toggle does exactly that), and on unix that is
     // indistinguishable from a second host by looking at the socket alone.
-    let _host_lock = match oximux_single_instance::try_acquire(
+    // `_as("serve")` so the record says which kind of host holds the directory;
+    // the guard is kept (not `_`-dropped) because winning the lock is also what
+    // hands us the previous owner's record, which the host core needs further
+    // down — and the database it needs is not open yet at this point.
+    let host_lock = match oximux_single_instance::try_acquire_as(
         &data_dir.join(oximux_remote_local::HOST_LOCK_FILENAME),
+        "serve",
     ) {
         Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => guard,
         Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
@@ -396,7 +402,24 @@ async fn serve(
     }
     let coord = Arc::new(oximux_agents::coord::CoordStore::new(db.conn()));
 
+    // ---- the host core ----
+    //
+    // Without it the dispatcher answers `Unsupported` to `ListChildren`,
+    // `CancelAgent` and every spawn verb (`dispatcher/spawn.rs`), keeps no
+    // lineage and publishes no attention: an agent under `oximux serve` could
+    // not delegate at all. It is the same core the desktop runs, from the same
+    // database and the same settings keys, so one data directory enforces one
+    // set of caps whichever host holds it.
+    let host_core =
+        host::build_host_core(tokio::runtime::Handle::current(), &db, registry.clone(), &settings);
+    // We hold the lock, so the previous holder is provably gone; its record
+    // only says what to attribute to it (and whether the machine rebooted,
+    // which proves its provider children are gone too). A missing or garbled
+    // record is `Unknown`: gone, with no claim about why.
+    host_core.start(oximux_remote_host::PriorOwner::from_previous(host_lock.previous()));
+
     let mut dispatcher = Dispatcher::new(registry.clone(), auth.clone())
+        .with_host_core(host_core.clone())
         .with_launcher(launcher)
         .with_catalog(catalog)
         .with_projects(provider)
