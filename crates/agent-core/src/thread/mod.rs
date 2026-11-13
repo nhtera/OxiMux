@@ -30,6 +30,7 @@ pub mod state;
 pub mod stream_json;
 pub mod tool_call;
 pub mod tool_detail;
+pub mod tool_target;
 pub mod turn_diff;
 
 pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
@@ -51,4 +52,5 @@ pub use tool_call::{
     ToolCallStatus,
 };
 pub use tool_detail::ToolDetail;
+pub use tool_target::{display_command, tool_target};
 pub use turn_diff::TurnFileChange;
