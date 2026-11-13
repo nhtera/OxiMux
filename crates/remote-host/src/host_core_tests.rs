@@ -132,51 +132,70 @@ fn a_guest_writes_nothing_until_it_owns_the_data_dir() {
 }
 
 #[test]
-fn a_pass_in_flight_cannot_write_past_the_release_it_raced() {
+fn a_release_cannot_return_while_a_pass_is_in_flight() {
     // The bug this guards: `sync_lineage_states` tested ownership once and
     // then wrote row by row, so a pass the subscriber had already begun went
     // on writing after the main thread gave the directory up — it read the
     // working flag *after* the release and revived a row it no longer owned.
-    // It failed roughly one CI run in ten on Windows, where the runtime's
-    // thread happens to interleave this way; the loop is what makes it land
-    // on every platform rather than once in a while.
-    for _ in 0..200 {
-        let f = fixture(HostConfig::default());
-        f.core.start(PriorOwner::None);
-        register(&f, "parent");
-        let child = register(&f, "child");
-        spawn_child(&f, "parent", "child", SpawnPosture::Default);
-        f.core.sync_lineage_states();
-        assert_eq!(f.core.lineage().row("child").unwrap().unwrap().state, LineageState::Parked);
+    // It failed about one CI run in ten, on Windows, where the runtime's
+    // thread happens to interleave this way.
+    //
+    // Racing threads cannot ask that question reliably: whether any of them
+    // lands inside the window is luck, and a test that misses it passes while
+    // testing nothing. So a pass is parked mid-flight on purpose, and the
+    // question is put directly — can a release come back while a pass is
+    // still running? If it cannot, the window does not exist.
+    let f = fixture(HostConfig::default());
+    f.core.start(PriorOwner::None);
+    register(&f, "parent");
+    let child = register(&f, "child");
+    spawn_child(&f, "parent", "child", SpawnPosture::Default);
+    f.core.sync_lineage_states();
+    assert_eq!(f.core.lineage().row("child").unwrap().unwrap().state, LineageState::Parked);
 
-        // A second thread in the subscriber's place, passing through the
-        // ownership gate over and over while the release lands.
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let racer = {
-            let core = f.core.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    core.sync_lineage_states();
-                    std::thread::yield_now();
-                }
-            })
-        };
+    // Two rendezvous on one barrier: the first says a pass is in flight, the
+    // second lets it finish. Whichever pass arrives first is the one caught —
+    // the subscriber's would do as well as ours, since the claim is about any
+    // pass, not this one.
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    f.core.set_pass_gate(Some(gate.clone()));
+    let pass = {
+        let core = f.core.clone();
+        std::thread::spawn(move || core.sync_lineage_states())
+    };
+    gate.wait();
+    // Nothing later can be caught by it; the parked pass holds its own clone.
+    f.core.set_pass_gate(None);
 
-        f.core.release();
-        // Only now is there anything to write: a pass that still believed it
-        // owned the directory would read this and revive the row.
-        child.set_working(true);
-        std::thread::sleep(Duration::from_millis(2));
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        racer.join().unwrap();
+    // The release runs on its own thread, so this one stays free to answer.
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let releaser = {
+        let core = f.core.clone();
+        let released = released.clone();
+        std::thread::spawn(move || {
+            core.release();
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    // A pass is in flight, so the release must still be waiting. The wait is
+    // one-sided: the fix cannot finish early, since it provably blocks, so
+    // this never fails on correct code — a slow enough thread could only make
+    // it miss the bug, never invent one.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !released.load(std::sync::atomic::Ordering::SeqCst),
+        "release came back while a lineage pass was still running",
+    );
 
-        assert_eq!(
-            f.core.lineage().row("child").unwrap().unwrap().state,
-            LineageState::Parked,
-            "a guest writes nothing, including a pass that was already running",
-        );
-    }
+    gate.wait();
+    pass.join().unwrap();
+    releaser.join().unwrap();
+    assert!(!f.core.is_owner());
+
+    // And with the release behind us, the guest writes nothing.
+    child.set_working(true);
+    f.core.sync_lineage_states();
+    assert_eq!(f.core.lineage().row("child").unwrap().unwrap().state, LineageState::Parked);
 }
 
 #[test]

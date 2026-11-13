@@ -119,6 +119,11 @@ pub struct HostCore {
     /// The one attention owner: what every surface that shows "needs you"
     /// reads from (`attention.rs`).
     attention: crate::attention::AttentionSlots,
+    /// Test-only: held open inside a lineage pass, so a test can park a pass
+    /// mid-flight and watch what `release` does while it runs. Per core, not
+    /// global, so a test that installs one cannot stall any other.
+    #[cfg(test)]
+    pass_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl HostCore {
@@ -144,6 +149,8 @@ impl HostCore {
             catalog: Mutex::new(None),
             owner_gen: std::sync::atomic::AtomicU64::new(0),
             attention: crate::attention::AttentionSlots::new(prefs),
+            #[cfg(test)]
+            pass_gate: Mutex::new(None),
         });
         core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
@@ -395,6 +402,8 @@ impl HostCore {
         if owner.is_none() {
             return;
         }
+        #[cfg(test)]
+        self.hold_pass_open();
         let tracked = match self.lineage.tracked() {
             Ok(rows) => rows,
             Err(err) => {
@@ -476,6 +485,30 @@ impl HostCore {
             let activity = oximux_agents::session_health::child_activity(children.iter().map(|c| c.as_ref()));
             handle.refresh_health(now, activity);
         }
+    }
+
+    /// Test-only: park here until the test lets this pass go on, so it can
+    /// ask what `release` does with a pass in flight — the one question the
+    /// fix is about, and one no amount of racing threads can ask reliably.
+    ///
+    /// **Two rendezvous, not one.** The first tells the test a pass is in
+    /// flight; the second is what keeps it in flight while the test looks.
+    /// Waiting once only announces the pass, which then runs on and finishes,
+    /// and the test ends up measuring nothing — the ownership lock is free
+    /// again by the time it looks.
+    #[cfg(test)]
+    fn hold_pass_open(&self) {
+        let gate = self.pass_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.wait();
+            gate.wait();
+        }
+    }
+
+    /// Test-only: install (or clear) the pass gate.
+    #[cfg(test)]
+    pub(crate) fn set_pass_gate(&self, gate: Option<Arc<std::sync::Barrier>>) {
+        *self.pass_gate.lock().unwrap() = gate;
     }
 
     fn spawn_status_subscriber(self: &Arc<Self>) {
