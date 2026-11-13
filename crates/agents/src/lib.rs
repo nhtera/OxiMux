@@ -29,6 +29,7 @@ pub mod schedule;
 pub mod send_gate;
 pub mod send_receipts;
 pub mod session_health;
+pub mod row_actions;
 pub mod session_prefs;
 pub mod session_registry;
 pub mod runtime_impl;

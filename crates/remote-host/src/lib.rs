@@ -19,6 +19,7 @@ pub mod catalog;
 mod child_watcher;
 pub mod dispatcher;
 pub mod host_config;
+mod inline_answer;
 pub mod host_core;
 pub mod identity;
 pub mod launcher;
