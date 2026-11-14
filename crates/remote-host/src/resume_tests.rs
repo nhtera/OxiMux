@@ -274,9 +274,13 @@ fn a_pass_that_comes_out_of_its_reads_after_a_release_builds_nothing() {
     //
     // It must build nothing: opening a child spawns its agent and is billed,
     // which is why the gate is at the reservation, ahead of the open.
+    //
+    // The parent stays closed, so the driver this `start` spawns waits for it
+    // and never reaches the child itself: what the assertions below see is the
+    // one stale attempt and nothing else. `qualifies` does not ask whether the
+    // parent is open — only `drive` does — so the attempt is the real one.
     let f = fixture(3);
     working_child(&f, "root", "c1", SpawnOrigin::Agent);
-    open_parent(&f, "root");
     f.core.start(previous_host());
     let began_under = f.core.ownership().expect("the host owns the directory");
     f.core.release();

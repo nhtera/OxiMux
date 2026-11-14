@@ -251,14 +251,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // reaches the channel-closed branch below — measured at ~900%
                     // CPU on a host with a dozen sessions. Draining cannot do that;
                     // it stops on empty and on terminated alike.
-                    while let Ok(prompt) = prompt_rx.try_recv() {
-                        fold.push_user_message_with_images(prompt.text, prompt.images);
-                        refresh_meta(&handle, &fold);
-                        // A send, not a frame: the turn is this host's own
-                        // doing, and the fold does not know it started.
-                        track.note_sent(oximux_agents::session_health::now_ms(), None);
-                        publish_state(&handle, &fold, &track, &gate, &turn_tx, true, Process::Live);
-                    }
+                    fold_queued_sends(&mut prompt_rx, &handle, &mut fold, &mut track, &gate, &turn_tx);
                     let Some(event) = event else {
                         // The agent's stream closed: the child exited. An
                         // in-flight turn can never finish now — mark it so
@@ -305,6 +298,11 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                 synth = futures::StreamExt::next(&mut synth_rx), if synth_open => {
                     match synth {
                         Some(event) => {
+                            // For the reason the backend arm drains: `apply`
+                            // publishes the fold's state, and a prompt still
+                            // sitting in the channel means that state says
+                            // idle while a turn is running.
+                            fold_queued_sends(&mut prompt_rx, &handle, &mut fold, &mut track, &gate, &turn_tx);
                             apply(&handle, &mut fold, &mut track, &gate, &event, &turn_tx, /* ingest */ false);
                             persist.maybe_save(&handle, &mut blob, &fold);
                         }
@@ -353,6 +351,35 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
     });
 }
 
+/// Fold the prompts this host has written that the fold has not seen yet.
+///
+/// A send and a backend frame arrive on separate channels, so `select!` gives
+/// no order between them; `send_prompt` holds the session's prompt order
+/// across the backend write and the bridge takes it before handing an event
+/// over, so a queued prompt is always the earlier of the two, and draining
+/// here is what turns that into fold order.
+///
+/// Every arm that publishes the fold's state drains first. Published with a
+/// prompt still in the channel, the fold reads idle while a turn is running —
+/// and the gate, told the turn ended, lets the next queued line out beside it.
+fn fold_queued_sends(
+    prompt_rx: &mut futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
+    handle: &SessionHandle,
+    fold: &mut ChatThread,
+    track: &mut HealthTrack,
+    gate: &Arc<Mutex<SendGate>>,
+    turn_tx: &tokio::sync::watch::Sender<bool>,
+) {
+    while let Ok(prompt) = prompt_rx.try_recv() {
+        fold.push_user_message_with_images(prompt.text, prompt.images);
+        refresh_meta(handle, fold);
+        // A send, not a frame: the turn is this host's own doing, and the fold
+        // does not know it started.
+        track.note_sent(oximux_agents::session_health::now_ms(), None);
+        publish_state(handle, fold, track, gate, turn_tx, true, Process::Live);
+    }
+}
+
 /// Write whatever the gate will let go now.
 ///
 /// Called on the gate's waker (something was pushed) **and** after every
@@ -363,6 +390,10 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
 /// any thread takes, and the write is a pipe write to a child process; the
 /// drainer also takes it on every pass.
 fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) {
+    if gate.lock().unwrap().take_stop_request() {
+        stop_the_turn(session_id, handle, gate);
+        return;
+    }
     loop {
         let Some(item) = gate.lock().unwrap().take_next_if_open() else { return };
         // A recovery turn is owed the restart's note, and only a chat view
@@ -376,7 +407,11 @@ fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) 
                 session = session_id,
                 "a recovery turn reached a headless gate; refused (it is owed a note this host cannot write)",
             );
-            gate.lock().unwrap().report_sent(item.uuid, false);
+            // `take_next_if_open` opened a turn for this item; nothing was
+            // written, so give the gate back the state the item found.
+            let mut gate = gate.lock().unwrap();
+            gate.report_sent(item.uuid, false);
+            gate.on_turn_end();
             continue;
         }
         // The item's own source, not a guess: it decides whether the text is
@@ -391,6 +426,14 @@ fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) 
         // carried, by its uuid.
         let mut gate = gate.lock().unwrap();
         gate.report_sent(item.uuid, sent.is_ok());
+        // The take opened a turn for this item. A write that failed started
+        // none, so the gate goes back to what the item found — it was open,
+        // or the take would have handed nothing over. Left set, it closes the
+        // gate to every later item until the next backend event publishes the
+        // holds again, which a quiet backend never does.
+        if sent.is_err() {
+            gate.on_turn_end();
+        }
         // An agent that cannot say what it started on (every backend but
         // Claude) drops the id this line went out under, so no receipt will
         // ever name it. Noted here, the next frame stands in for the one the
@@ -403,6 +446,39 @@ fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) 
         if sent.is_err() {
             return;
         }
+    }
+}
+
+/// Interrupt the turn, for a Stop that came from somewhere else.
+///
+/// A Stop from a phone or the CLI reaches `SessionHandle::cancel`, which hands
+/// it to the gate rather than the backend whenever a gate is attached and
+/// listening: only the gate's driver can take back the lines it wrote into
+/// the turn. On the desktop that driver is the chat view; here it is this
+/// pump, so the request is taken here and the backend asked directly. Without
+/// this the gate held the request and nothing read it: a remote Stop answered
+/// `Ok` and the turn ran on.
+///
+/// What it does **not** do is hold the queue afterwards. The desktop's Stop
+/// parks a child's events until the person's next message releases them, and
+/// nothing headless can release such a hold yet, so a Stop here interrupts
+/// the turn and leaves the queue as it was.
+fn stop_the_turn(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) {
+    // Serve never offers steering (`steer_supported` is false in every
+    // publish), so no line is ever waiting to be taken back. One that was
+    // would be lost rather than retried, so it is reported unsent — which
+    // gives the outbox rows it carried back to the drainer.
+    {
+        let mut gate = gate.lock().unwrap();
+        let unstarted = gate.take_unstarted();
+        for (uuid, _) in unstarted {
+            tracing::warn!(session = session_id, %uuid, "a line written into the stopped turn was dropped");
+            gate.report_sent(uuid, false);
+        }
+    }
+    // The gate's lock is not held across the backend call, as nothing here is.
+    if let Err(err) = handle.cancel_backend() {
+        tracing::warn!(%err, session = session_id, "a Stop could not interrupt the turn");
     }
 }
 
@@ -659,6 +735,92 @@ mod tests {
             wait_until(5_000, || !conn.sent().is_empty()),
             "the send the gate swallowed is the send the pump writes",
         );
+    }
+
+    /// A Stop from a phone or the CLI interrupts the agent.
+    ///
+    /// `SessionHandle::cancel` hands a Stop to the gate whenever one is
+    /// attached and listening, because only the gate's driver can take back
+    /// the lines it wrote into the turn. Headless that driver is this pump, so
+    /// without it reading the request the gate holds a Stop nobody acts on:
+    /// the caller is told `Ok` and the turn runs on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_from_elsewhere_interrupts_the_agent() {
+        let registry = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        let db = oximux_storage::open_memory().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: vec![ThreadEvent::UserMessage { text: "hi".into(), images: vec![] }],
+                seed: ChatBlob::new("s-1".into()),
+                settings: SettingsRepo::new(db),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        assert!(
+            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+            "the pump attached its gate",
+        );
+        tx.send(ThreadEvent::AssistantText("working…".into())).unwrap();
+        assert!(wait_until(5_000, || handle.status_snapshot().working), "a turn is running");
+
+        // The route a phone's Cancel takes.
+        handle.cancel().unwrap();
+        assert!(wait_until(5_000, || conn.cancels() == 1), "the Stop reached the agent");
+    }
+
+    /// A send that could not be written leaves the gate as it found it.
+    ///
+    /// Taking an item opens a turn for it. A write that failed started none,
+    /// and a turn left open closes the gate to every later send until
+    /// something publishes the holds again — which a backend that says
+    /// nothing never does, so the queue would stall for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_that_could_not_be_written_does_not_wedge_the_queue() {
+        let registry = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        let db = oximux_storage::open_memory().unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: Vec::new(),
+                seed: ChatBlob::new("s-1".into()),
+                settings: SettingsRepo::new(db),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        assert!(
+            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+            "the pump attached its gate",
+        );
+
+        conn.fail_sends(true);
+        handle.send_prompt("this one cannot be written", &[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(conn.sent().is_empty(), "nothing reached the agent");
+
+        // No backend event in between: the only thing that can reopen the gate
+        // is the failed write putting back what it took.
+        conn.fail_sends(false);
+        handle.send_prompt("and this one can", &[]).unwrap();
+        assert!(wait_until(5_000, || !conn.sent().is_empty()), "the next send still goes out");
     }
 
     /// A send that arrives mid-turn waits for the turn, then goes.

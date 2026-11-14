@@ -992,6 +992,17 @@ impl SessionHandle {
         self.conn().cancel()
     }
 
+    /// Interrupt the current turn at the backend, with no gate in the way.
+    ///
+    /// [`Self::cancel`] hands a Stop to the gate whenever one is attached and
+    /// listening, because only the gate's driver can take back the lines it
+    /// wrote into the turn. This is the call that driver makes once it has
+    /// taken the request: going back through `cancel` would set the flag
+    /// again and interrupt nothing.
+    pub fn cancel_backend(&self) -> Result<()> {
+        self.conn().cancel()
+    }
+
     /// The current connection, cloned out so no lock is held across a backend call
     /// (those can block, and a swap must never wait behind one).
     fn conn(&self) -> Arc<dyn AgentConnection> {
