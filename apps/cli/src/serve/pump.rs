@@ -13,7 +13,7 @@ use oximux_agent_core::thread::ThreadEvent;
 use oximux_agents::session_registry::{RemotePrompt, SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::health::Process;
 use oximux_agents::health_track::{HealthExtras, HealthTrack, inputs_from};
-use oximux_agents::thread::ChatThread;
+use oximux_agents::thread::{ChatThread, TaskStatus};
 use oximux_storage::SettingsRepo;
 
 use super::blob::{self, ChatBlob};
@@ -167,11 +167,30 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             seed.slash_commands.clone(),
         );
         fold.session_meta = seed.session_meta.clone();
+        // A session with history behind it was reopened, not started: its
+        // backend replays nothing, so until a frame arrives nothing has
+        // confirmed that the conversation on disk is the one this process is
+        // now holding. That is `RestoredUnconfirmed`, and it is a truer first
+        // answer than `Idle`. The first frame clears it (`note_event`).
+        //
+        // `prior_host_gone` stays false: it is a claim that the previous
+        // host's processes are provably gone, which only the won host lock and
+        // its record can say, and the pump has neither. Claiming it would turn
+        // a reopened session that had been mid-turn into `Interrupted` on no
+        // evidence. The proof half is F14's.
+        let reopened = !seed.entries.is_empty();
+        let was_mid_turn = fold.turn_active
+            || fold.continuations_open > 0
+            || fold.background_tasks.iter().any(|t| t.status == TaskStatus::Running);
         let mut blob = seed;
         // What the fold does not keep: the last sign of life, an unanswered
         // send, how the process ended. The same tracker the desktop folds its
         // events into (`oximux_agents::health_track`).
-        let mut track = HealthTrack::default();
+        let mut track = if reopened {
+            HealthTrack::restored(was_mid_turn, /* prior_host_gone */ false)
+        } else {
+            HealthTrack::default()
+        };
         let mut persist = Persist::new(settings, index, &fold);
         // A resumed session publishes its history immediately — `--resume`
         // replays nothing, so without this the transcript RPCs would answer
@@ -182,6 +201,14 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             apply(&handle, &mut fold, &mut track, &event, &turn_tx, /* ingest */ true);
         }
         persist.maybe_save(&handle, &mut blob, &fold);
+        // Say something now, even with nothing to replay — especially then.
+        // A reopened backend replays nothing and can stay silent until the
+        // next prompt, and `health_push` sends a client no frame at all until
+        // a session has published once: without this, every device would read
+        // a session someone just reopened as a default. The catalog's own
+        // comment beside `buffered: Vec::new()` already promised it ("the
+        // pump publishes the persisted fold immediately").
+        publish_state(&handle, &fold, &track, &turn_tx, fold.turn_active, Process::Live);
 
         let mut save_tick = tokio::time::interval(SAVE_INTERVAL);
         save_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -451,6 +478,58 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         false
+    }
+
+    /// A reopened session says so before its backend says anything.
+    ///
+    /// Both reviewers caught this independently, and the catalog's own comment
+    /// had already promised it: a resumed backend replays nothing, so the
+    /// buffer is empty, and `health_push` sends a client no frame at all
+    /// until a session has published once. Every device would have read a
+    /// session someone just reopened as a default-idle one.
+    ///
+    /// And the first answer is `RestoredUnconfirmed`, not `Idle`: nothing has
+    /// yet confirmed that the conversation on disk is the one this process now
+    /// holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reopened_session_publishes_before_its_backend_speaks() {
+        let registry = Arc::new(SessionRegistry::new());
+        let handle = registry.register("s-1".into(), Arc::new(StubConnection::default()));
+        let db = oximux_storage::open_memory().unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        // A session with history: what `HeadlessCatalog::resume` hands over,
+        // including its empty buffer.
+        let mut seed = ChatBlob::new("s-1".into());
+        seed.entries = vec![oximux_agents::thread::ThreadEntry::User {
+            text: "ship it".into(),
+            images: vec![],
+            checkpoint: None,
+        }];
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: Vec::new(),
+                seed,
+                settings: SettingsRepo::new(db),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+
+        assert!(
+            wait_until(5_000, || handle.health_published()),
+            "a silent backend is no reason for a client to hear nothing",
+        );
+        assert_eq!(
+            handle.health_snapshot().health.liveness,
+            oximux_agents::health::Liveness::RestoredUnconfirmed,
+            "reopened, and nothing has confirmed it yet",
+        );
     }
 
     /// A turn that ends releases the session, rather than leaving it working
