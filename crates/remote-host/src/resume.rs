@@ -11,7 +11,9 @@
 //! [`HostConfig::max_resumes`](crate::HostConfig) run at once (the rest wait
 //! in order), and each is sent under a key derived from the child and the
 //! restart, reserved in the host's receipts first: a second pass over the same
-//! restart finds the key taken and sends nothing.
+//! restart finds the key taken and sends nothing. That reservation is also
+//! where ownership is tested, because it is a recovery turn's first write and
+//! every later step of one waits for it (`HostCore::reserve_recovery`).
 //!
 //! A child is sent one only while its chat still owes the restart's note (a
 //! lock given up and won back cut nothing short; a message someone else sent
@@ -33,7 +35,7 @@ use oximux_agents::send_gate::SendSource;
 use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};
 
 use crate::dispatcher::send_v2::send_uuid;
-use crate::host_core::{HostCore, PriorOwner};
+use crate::host_core::{HostCore, PriorOwner, Reserved};
 
 /// What a recovery turn says. The child's view puts its owed note ahead of it.
 pub const CONTINUE_LINE: &str = "Continue the task you were working on.";
@@ -115,7 +117,10 @@ async fn drive(weak: Weak<HostCore>, mut waiting_parent: Vec<String>, restart: R
     loop {
         let Some(core) = weak.upgrade() else { return };
         // The data directory was given up (even if won back since): what is
-        // owed now is the new ownership's to decide.
+        // owed now is the new ownership's to decide. This spares the pass; it
+        // cannot authorise it, because the reads below wait on the store's
+        // lock that a release holds — the gate is at the reservation
+        // (`HostCore::reserve_recovery`).
         if core.ownership() != Some(restart.generation) {
             return;
         }
@@ -184,7 +189,8 @@ async fn drive(weak: Weak<HostCore>, mut waiting_parent: Vec<String>, restart: R
 
 /// Send `child` its recovery turn; the receipt key of the line it went out
 /// on. `None` when it is no longer owed one, was already sent one for this
-/// restart, or could not be reached.
+/// restart, belongs to an ownership this process has given up, or could not
+/// be reached.
 async fn resume_one(core: &HostCore, child: &str, restart: Restart) -> Option<String> {
     // Looked at again now: it may be working in this process already.
     if !qualifies(core, child) {
@@ -193,13 +199,15 @@ async fn resume_one(core: &HostCore, child: &str, restart: Restart) -> Option<St
     let continuation = continuation_id(child, restart.epoch);
     let key = key_hash(KeyKind::V2, &continuation);
     let receipts = core.lineage().receipts();
-    match receipts.reserve(child, &key, core.instance(), chrono::Local::now()) {
-        Ok(None) => {}
-        Ok(Some(_)) => return None,
-        Err(err) => {
-            tracing::warn!(%err, child, "recovery turn not reserved");
-            return None;
-        }
+    // The reservation is this recovery turn's ownership gate, because it is
+    // its first write and everything after it waits for it: the reads above
+    // wait on the store's lock, which a release holds while it works, so a
+    // pass that tested ownership before them can arrive here under an
+    // ownership that is gone. Refused means nothing was written, so there is
+    // nothing to forget.
+    match core.reserve_recovery(restart.generation, child, &key) {
+        Reserved::Ours => {}
+        Reserved::Taken | Reserved::Refused => return None,
     }
     let forget = || {
         let _ = receipts.forget_pending(child, &key);

@@ -596,6 +596,10 @@ pub struct StubConnection {
     exit: Arc<Mutex<Option<i32>>>,
     /// Whether a tagged send fails, as a write to a dead agent's stdin does.
     fail_sends: Arc<std::sync::atomic::AtomicBool>,
+    /// Interrupts this backend was asked for. Counted apart from [`Self::sent`]
+    /// so a test can tell that a Stop reached the agent without disturbing any
+    /// assertion about what was written to it.
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Read `child`'s exit code without blocking (`128 + signal` when a signal
@@ -689,6 +693,11 @@ impl StubConnection {
         self.fail_sends.store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// How many times this backend was asked to interrupt its turn.
+    pub fn cancels(&self) -> usize {
+        self.cancels.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The JSON payloads that were written to the agent's stdin, in order.
     pub fn sent(&self) -> Vec<Value> {
         self.sent.lock().map(|g| g.clone()).unwrap_or_default()
@@ -739,6 +748,11 @@ impl AgentConnection for StubConnection {
     }
     fn reports_receipts(&self) -> bool {
         self.receipts
+    }
+    /// Counted, not recorded: a test asks whether the Stop reached the agent.
+    fn cancel(&self) -> Result<()> {
+        self.cancels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         self.record(control_response_json(request_id, &decision));

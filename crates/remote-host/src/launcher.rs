@@ -56,6 +56,11 @@ pub enum LaunchError {
     /// never reaches its parent leaves that parent waiting for a message that
     /// cannot arrive — and a slot it holds forever. "Not here" is a worse
     /// answer than "yes" only until the first time "yes" was a lie.
+    ///
+    /// Nothing returns this today: the headless host did, until it could
+    /// carry a child's result back, and the next caller is the ACP and omp
+    /// refusal (phase 4b F3), whose transports a headless host cannot launch
+    /// at all.
     #[error("this host cannot run agent-spawned children: {0}")]
     UnsupportedOnHost(String),
 }

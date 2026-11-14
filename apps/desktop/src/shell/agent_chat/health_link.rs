@@ -35,7 +35,6 @@ impl AgentChatView {
                 limit_reason: self.retry.pending.as_ref().map(|p| p.reason.clone()),
                 interrupted: self.interrupted,
                 recovery_note_owed: self.recovery_note.is_some(),
-                children_active: 0,
             },
         )
     }
