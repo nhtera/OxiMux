@@ -221,6 +221,63 @@ fn serve_lists_persisted_sessions_across_restarts() {
     serve.stop_hard();
 }
 
+/// The settings verbs against a real serve: what a `set` reports is what the
+/// host enforces, what it clamps it says so about, and what it stores survives
+/// a restart.
+///
+/// Driven through the binary rather than the handler, because the claim is
+/// about the whole path — a CLI that writes the database directly would pass
+/// every unit test here and change nothing on a running host.
+#[test]
+fn serve_reads_and_changes_its_own_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("serve-home");
+    let serve = boot_serve(&data_dir);
+
+    let out = client(&data_dir).args(["--json", "config", "list"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let listed = json_stdout(&out);
+    let settings = listed["data"]["settings"].as_array().unwrap();
+    assert!(settings.len() >= 10, "every setting this host has: {settings:?}");
+    let depth = settings
+        .iter()
+        .find(|e| e["key"] == "agents.delegation.cap.depth")
+        .expect("the depth cap is listed");
+    assert_eq!(depth["is_default"], true, "nobody has set it yet");
+
+    // Above the ceiling on purpose: the answer must be the number in force.
+    let out = client(&data_dir)
+        .args(["--json", "config", "set", "agents.delegation.cap.depth", "9"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let set = json_stdout(&out);
+    assert_eq!(set["data"]["value"], "2", "clamped, and said so rather than echoed");
+    assert_eq!(set["data"]["is_default"], false);
+
+    // The plain `get` prints the value alone, which is what a script reads.
+    let out = client(&data_dir).args(["config", "get", "agents.delegation.cap.depth"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+
+    // A key this host has no setting for is the caller's mistake, not a crash.
+    let out = client(&data_dir).args(["config", "get", "agents.delegation.cap.deptth"]).output().unwrap();
+    assert_ne!(out.status.code(), Some(0), "an unknown key is refused");
+
+    #[cfg(unix)]
+    serve.stop_gracefully();
+    #[cfg(not(unix))]
+    serve.stop_hard();
+
+    let serve = boot_serve(&data_dir);
+    let out = client(&data_dir).args(["--json", "config", "get", "agents.delegation.cap.depth"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let after = json_stdout(&out);
+    assert_eq!(after["data"]["value"], "2", "the change outlived the host that made it");
+    assert_eq!(after["data"]["is_default"], false, "and is still somebody's choice, not a default");
+    serve.stop_hard();
+}
+
 /// The pairing surface over a live serve: a non-terminal invocation is
 /// refused and leaks no ticket; the explicit override mints one; the
 /// enrollment list answers; and an agent-scoped caller is denied outright.

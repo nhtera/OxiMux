@@ -28,13 +28,13 @@ mod update;
 use clap::Parser as _;
 
 use cli::{
-    Cli, Command, DelegateCommand, GitCommand, HeartbeatCommand, HostsCommand, ModeCommand, ModelCommand,
+    Cli, Command, ConfigCommand, DelegateCommand, GitCommand, HeartbeatCommand, HostsCommand, ModeCommand, ModelCommand,
     PermitCommand, ProjectsCommand, ScheduleCommand, StateCommand, TeamCommand, TeamReportStatus,
     TermCommand, WorktreeCommand, SimButtonArg, SimCommand,
 };
 use client::Client;
 use oximux_remote_proto::proto::{
-    CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SPAWN_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
+    CREATE_WORKTREE_BASE_MIN_VERSION, HOST_CONFIG_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SPAWN_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
     SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_EXEC_MIN_VERSION, SIMULATOR_FLOW_MIN_VERSION, SIMULATOR_RN_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
@@ -369,6 +369,12 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
             Some((17, "schedule run-once"))
         }
         // v16: the worktree surface, paginated transcripts, pairing admin.
+        // v39: the host's own settings. The whole family, because there is no
+        // older verb to fall back to — an earlier host cannot decode the
+        // request at all, and would answer "undecodable request frame": a
+        // message about a malformed request, for a version problem. This
+        // refusal is the fallback.
+        Command::Config { .. } => Some((HOST_CONFIG_MIN_VERSION, "config")),
         Command::Worktree { .. } => Some((16, "worktree")),
         Command::Transcript { .. } => Some((16, "transcript")),
         Command::PairNew { .. } | Command::PairLs | Command::PairRm { .. } => {
@@ -692,6 +698,13 @@ fn host_verb(mut args: Cli) -> u8 {
                         commands::worktree::set(&client, &id, comment, phase).await
                     }
                 },
+                Command::Config { command } => match command {
+                    ConfigCommand::Get { key } => commands::config::get(&client, &key).await,
+                    ConfigCommand::Set { key, value } => {
+                        commands::config::set(&client, &key, &value).await
+                    }
+                    ConfigCommand::List => commands::config::list(&client).await,
+                },
                 Command::Heartbeat { command } => match command {
                     HeartbeatCommand::Create { prompt, name, cron, session } => {
                         commands::heartbeat::create(&client, session, name, &cron, prompt).await
@@ -830,6 +843,12 @@ mod tests {
             (vec!["oximux", "sim", "button", "volume-down"], Some(26)),
             (vec!["oximux", "schedule", "run-once", "sch-1"], Some(17)),
             (vec!["oximux", "worktree", "ls"], Some(16)),
+            // The settings verbs, the whole family: there is no older verb to
+            // fall back to, so the gate's refusal is the only thing a pre-v39
+            // host can be told.
+            (vec!["oximux", "config", "list"], Some(39)),
+            (vec!["oximux", "config", "get", "agents.delegation.cap.depth"], Some(39)),
+            (vec!["oximux", "config", "set", "agents.delegation.cap.depth", "2"], Some(39)),
             (vec!["oximux", "transcript", "s1"], Some(16)),
             (vec!["oximux", "pair-ls"], Some(16)),
             // The long-standing surface every host has spoken since v1–v12.
