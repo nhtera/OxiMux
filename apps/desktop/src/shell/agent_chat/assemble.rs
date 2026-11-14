@@ -358,6 +358,7 @@ impl AgentChatView {
             send_gate,
             pending_send_uuid: None,
             health: Default::default(),
+            unconfirmed_held: Vec::new(),
             recovery_note: None,
             remote,
             backend,

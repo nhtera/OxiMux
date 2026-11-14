@@ -38,6 +38,7 @@ impl AgentChatView {
 
         let focus = cx.focus_handle();
         Self {
+            unconfirmed_held: Vec::new(),
             thread: ChatThread::new(),
             connection: Some(connection),
             remote_session_id,

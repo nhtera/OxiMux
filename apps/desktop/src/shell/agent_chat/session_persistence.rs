@@ -255,7 +255,7 @@ impl AgentChatView {
             stopped_tasks: self.running_task_descriptions(),
             recovery_note: self.recovery_note.clone(),
             unanswered_send: self.unanswered_send(),
-            unconfirmed_held: self.health.unconfirmed_held.clone(),
+            unconfirmed_held: self.unconfirmed_held.clone(),
             choices: PersistedChoices {
                 models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
                 modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),

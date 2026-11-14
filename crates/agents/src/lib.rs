@@ -15,6 +15,7 @@ pub mod commit_message_heuristic;
 pub mod coord;
 pub mod envelope;
 pub mod health;
+pub mod health_track;
 pub mod lineage;
 pub mod outbox;
 pub mod osc_sideband;

@@ -9,187 +9,35 @@
 //! process ended, and what a restart left behind.
 
 use gpui::Context;
-use oximux_agents::health::{
-    self, ExitProof, HealthInputs, PromptKind, Process, Restored,
-};
+use oximux_agents::health::{self, ExitProof, HealthInputs, Process};
+use oximux_agents::health_track::{HealthExtras, HealthTrack, exit_message, inputs_from};
 use oximux_agents::session_health::now_ms;
-use oximux_agents::thread::{TaskStatus, ThreadEntry, ThreadEvent};
+use oximux_agents::thread::ThreadEntry;
 
 use super::AgentChatView;
 
-/// What the view tracks for its health beyond the fold.
-#[derive(Debug, Default)]
-pub(super) struct HealthTrack {
-    /// The last sign of life (any provider frame, or a send).
-    last_activity_at: i64,
-    /// A send went out and no frame has answered it yet.
-    sent_unanswered: bool,
-    /// The id that send went out under.
-    sent_id: Option<String>,
-    /// Restored sends nobody answered, still held and marked: the blob keeps
-    /// each (with its own text) until the user sends or drops its card.
-    pub(super) unconfirmed_held: Vec<crate::persisted_chat::UnconfirmedSend>,
-    /// The agent took the last send (receipt) and has produced nothing since.
-    accepted_at: Option<i64>,
-    /// How the process ended, once it has.
-    exit: Option<ExitProof>,
-    /// Sends and process exits so far, for the edge ids.
-    turns: u32,
-    exits: u32,
-    /// Set on restore until the first frame on the new connection.
-    restored: Option<Restored>,
-    /// The last turn ended in error (its message); cleared by the next send
-    /// or a turn that ends well. Only a turn's own result, not a failed fork
-    /// or rewind, makes a session read failed.
-    failed_turn: Option<String>,
-    /// The composer's queue: restored messages held, and messages waiting to drain.
-    pub(super) held: u32,
-    pub(super) queued: u32,
-    /// A permission or question was open at the last publish.
-    prompt_open: bool,
-}
-
-impl HealthTrack {
-    /// A restored chat: unconfirmed until its first frame. `was_mid_turn`:
-    /// its saved state had a turn or background work running.
-    pub(super) fn restored(was_mid_turn: bool, prior_host_gone: bool) -> Self {
-        Self { restored: Some(Restored { was_mid_turn, prior_host_gone }), ..Self::default() }
-    }
-
-    /// A frame from the agent. Receipts are bookkeeping, not a sign of life,
-    /// except that acceptance starts the "accepted, not started" clock.
-    pub(super) fn note_event(&mut self, ev: &ThreadEvent, now: i64) {
-        if ev.is_receipt() {
-            if matches!(ev, ThreadEvent::UserMessageAccepted { .. }) && self.sent_unanswered {
-                self.accepted_at.get_or_insert(now);
-            }
-            return;
-        }
-        self.last_activity_at = now;
-        self.sent_unanswered = false;
-        self.accepted_at = None;
-        self.restored = None;
-        if let ThreadEvent::TurnEnded { is_error, result, .. } = ev {
-            self.failed_turn = is_error.then(|| result.clone().unwrap_or_else(|| "Turn failed".into()));
-        }
-    }
-
-    /// The last turn failed and nothing has been sent since: the queue waits
-    /// for the user rather than draining into a failing session.
-    pub(super) fn holds_queue(&self) -> bool {
-        self.failed_turn.is_some()
-    }
-
-    /// The conversation was cleared: its failed turn no longer holds anything.
-    pub(super) fn forget_failed_turn(&mut self) {
-        self.failed_turn = None;
-    }
-
-    /// The id of the last send, when it was tagged.
-    pub(super) fn sent_id(&self) -> Option<String> {
-        self.sent_id.clone()
-    }
-
-    /// A send was written to the agent, under `id` when it was tagged.
-    pub(super) fn note_sent(&mut self, now: i64, id: Option<String>) {
-        self.sent_id = id;
-        self.turns += 1;
-        self.sent_unanswered = true;
-        self.accepted_at = None;
-        self.last_activity_at = now;
-        self.exit = None;
-        self.failed_turn = None;
-    }
-
-    /// Waiting on a person is not silence: an answer, while the process
-    /// lives, is the last sign of life (the stall clock restarts there).
-    pub(super) fn note_prompt(&mut self, open: bool, now: i64) {
-        if std::mem::replace(&mut self.prompt_open, open) && !open && self.exit.is_none() {
-            self.last_activity_at = self.last_activity_at.max(now);
-        }
-    }
-
-    /// The process ended. Returns the proof recorded.
-    pub(super) fn note_exit(&mut self, stopped: bool, code: Option<i32>) -> ExitProof {
-        let proof = match (stopped, code) {
-            (true, _) => ExitProof::UserStop,
-            (false, Some(code)) => ExitProof::ExitCode(code),
-            (false, None) => ExitProof::ConnectionClosed,
-        };
-        self.exits += 1;
-        self.exit = Some(proof);
-        self.sent_unanswered = false;
-        self.accepted_at = None;
-        proof
-    }
-
-    /// A new process took over (a respawn): its exit is not the old one's.
-    pub(super) fn note_connected(&mut self) {
-        self.exit = None;
-    }
-}
-
-/// The error a dead process leaves on the chat.
-pub(super) fn exit_message(code: Option<i32>) -> String {
-    match code {
-        Some(code) => format!("Agent process exited (code {code})."),
-        None => "Agent process exited.".into(),
-    }
-}
-
 impl AgentChatView {
-    /// The facts as they stand.
+    /// The facts as they stand: the fold and the tracker read by the one
+    /// mapping both hosts use, plus what only a window knows.
     pub(super) fn health_inputs(&self) -> HealthInputs {
-        let t = &self.health;
-        let incarnation = self.remote.as_ref().map(|b| b.incarnation()).unwrap_or_default();
-        let process = match (t.exit, &self.connection) {
-            (Some(proof), _) => Process::Exited(proof),
-            (None, Some(_)) => Process::Live,
-            (None, None) => Process::Dormant,
-        };
-        HealthInputs {
-            turn_active: self.thread.turn_active,
-            continuations_open: self.thread.continuations_open,
-            pending_unanswered_send: t.sent_unanswered,
-            accepted_unstarted_since: t.accepted_at,
-            background_active: self
-                .thread
-                .background_tasks
-                .iter()
-                .filter(|task| task.status == TaskStatus::Running)
-                .count() as u32,
-            children_active: 0,
-            prompt: if self.thread.pending_permission().is_some() {
-                Some(PromptKind::Permission)
-            } else if self.thread.pending_question().is_some() {
-                Some(PromptKind::Question)
-            } else {
-                None
+        inputs_from(
+            &self.thread,
+            &self.health,
+            HealthExtras {
+                // What the tracker's own `exit` does not already settle: a
+                // chat with no connection is dormant, not dead.
+                process_while_running: match self.connection {
+                    Some(_) => Process::Live,
+                    None => Process::Dormant,
+                },
+                incarnation: self.remote.as_ref().map(|b| b.incarnation()).unwrap_or_default(),
+                limited_until: self.retry.pending.as_ref().map(|p| p.wake_at_ms),
+                limit_reason: self.retry.pending.as_ref().map(|p| p.reason.clone()),
+                interrupted: self.interrupted,
+                recovery_note_owed: self.recovery_note.is_some(),
+                children_active: 0,
             },
-            prompt_request: self
-                .thread
-                .pending_permission()
-                .map(|(_, req)| req.request_id.clone())
-                .or_else(|| self.thread.pending_question().map(|(_, req)| req.request_id.clone())),
-            limited_until: self.retry.pending.as_ref().map(|p| p.wake_at_ms),
-            limit_reason: self.retry.pending.as_ref().map(|p| p.reason.clone()),
-            // The fold's message when it has one: it folds in the stderr
-            // diagnostic the raw result lacks.
-            last_turn_failure: t
-                .failed_turn
-                .as_ref()
-                .filter(|_| !self.thread.turn_active)
-                .map(|raw| self.thread.last_error.clone().unwrap_or_else(|| raw.clone())),
-            interrupted: self.interrupted,
-            process,
-            restored: t.restored,
-            recovery_note_owed: self.recovery_note.is_some(),
-            held_restored: t.held,
-            queued: t.queued,
-            last_activity_at: t.last_activity_at,
-            turn_id: (t.turns > 0).then(|| format!("{incarnation}:{}", t.turns)),
-            exit_seq: (t.exits > 0).then(|| format!("{incarnation}:{}", t.exits)),
-        }
+        )
     }
 
     /// Publish the facts to the session handle (when bound). Silence never
@@ -290,7 +138,7 @@ impl AgentChatView {
         // whenever that lands: keep them across the reset.
         let (held, queued) = (self.health.held, self.health.queued);
         self.health = HealthTrack::restored(mid_turn, prior_host_gone);
-        self.health.unconfirmed_held = unconfirmed;
+        self.unconfirmed_held = unconfirmed;
         (self.health.held, self.health.queued) = (held, queued);
         // A dormant chat is not bound to the host yet, so this is where its
         // restored state can be seen.
@@ -334,9 +182,9 @@ impl AgentChatView {
     /// can mark a card after an earlier event was queued.
     pub(super) fn sync_unconfirmed(&mut self, cx: &mut Context<Self>) {
         let marked = self.composer.read(cx).unconfirmed_texts();
-        let before = self.health.unconfirmed_held.len();
-        self.health.unconfirmed_held.retain(|u| marked.contains(&u.text));
-        if self.health.unconfirmed_held.len() != before {
+        let before = self.unconfirmed_held.len();
+        self.unconfirmed_held.retain(|u| marked.contains(&u.text));
+        if self.unconfirmed_held.len() != before {
             self.meta_dirty.set(true);
         }
     }
@@ -359,6 +207,7 @@ impl AgentChatView {
 
 #[cfg(test)]
 mod tests {
+    use oximux_agents::thread::ThreadEvent;
     use std::sync::Arc;
 
     use gpui::TestAppContext;
@@ -653,7 +502,7 @@ mod tests {
                 view.sync_unconfirmed(cx);
                 view.sync_unconfirmed(cx);
                 let marked = crate::persisted_chat::UnconfirmedSend { id: "u-1".into(), text: "ship it".into() };
-                assert_eq!(view.health.unconfirmed_held, vec![marked]);
+                assert_eq!(view.unconfirmed_held, vec![marked]);
                 assert_eq!(view.queued_texts(cx), vec!["then tests"]);
             })
             .expect("window update");
@@ -675,7 +524,7 @@ mod tests {
                 view.health.note_event(&ThreadEvent::ProviderTurnStarted, now_ms());
                 // What the blob saves (`build_transcript` copies these).
                 assert_eq!(view.unanswered_send(), None, "the later send was answered");
-                let saved = view.health.unconfirmed_held.clone();
+                let saved = view.unconfirmed_held.clone();
                 assert_eq!(saved.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), ["ship it"]);
 
                 let turn = crate::shell::agent_chat::RestoredTurn { unconfirmed_held: saved, ..Default::default() };
@@ -687,7 +536,7 @@ mod tests {
                 // Dropped: forgotten (the handler, run by hand as above).
                 view.composer.update(cx, |c, cx| c.drop_all_held_for_test(cx));
                 view.sync_unconfirmed(cx);
-                assert!(view.health.unconfirmed_held.is_empty(), "dropped, forgotten");
+                assert!(view.unconfirmed_held.is_empty(), "dropped, forgotten");
             })
             .expect("window update");
     }
