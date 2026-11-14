@@ -17,7 +17,7 @@ use oximux_single_instance::HolderRecord;
 
 use super::*;
 use crate::catalog::{DormantChoices, DormantSession, DormantTranscript, SessionCatalog};
-use crate::host_core::HostCoreDeps;
+use crate::host_core::{HostCoreDeps, Reserved};
 use crate::host_config::HostConfig;
 
 /// Builds a child the way the desktop does: registers it with a stub agent.
@@ -81,7 +81,7 @@ struct Fixture {
     core: Arc<HostCore>,
     registry: Arc<SessionRegistry>,
     catalog: Arc<Catalog>,
-    _rt: tokio::runtime::Runtime,
+    rt: tokio::runtime::Runtime,
 }
 
 fn fixture(max_resumes: u32) -> Fixture {
@@ -96,7 +96,7 @@ fn fixture(max_resumes: u32) -> Fixture {
     });
     let catalog = Arc::new(Catalog { registry: registry.clone(), agents: Mutex::default(), gates: Mutex::default(), opened: Mutex::default() });
     core.set_catalog(catalog.clone());
-    Fixture { core, registry, catalog, _rt: rt }
+    Fixture { core, registry, catalog, rt }
 }
 
 /// A child the previous host had working (its row `active`).
@@ -262,6 +262,58 @@ fn a_host_that_gave_the_directory_up_sends_nothing_more() {
     open_parent(&f, "root");
     settle();
     assert!(f.catalog.opened.lock().unwrap().is_empty(), "the recovery belonged to the ownership given up");
+}
+
+#[test]
+fn a_pass_that_comes_out_of_its_reads_after_a_release_builds_nothing() {
+    // The pass the Windows job caught: the driver tested ownership, went into
+    // the lineage reads — which wait on the store's lock that `release` and
+    // `start` hold while they work — and came out of them here, under an
+    // ownership that was gone. So it is `resume_one` that is called with the
+    // ownership that began the pass, after the directory changed hands.
+    //
+    // It must build nothing: opening a child spawns its agent and is billed,
+    // which is why the gate is at the reservation, ahead of the open.
+    let f = fixture(3);
+    working_child(&f, "root", "c1", SpawnOrigin::Agent);
+    open_parent(&f, "root");
+    f.core.start(previous_host());
+    let began_under = f.core.ownership().expect("the host owns the directory");
+    f.core.release();
+    f.core.start(previous_host());
+    let sent = f.rt.block_on(resume_one(&f.core, "c1", Restart { epoch: EPOCH, generation: began_under }));
+    assert!(sent.is_none(), "the turn was not sent");
+    assert!(f.catalog.opened.lock().unwrap().is_empty(), "and the child was never built");
+    let key = key_hash(KeyKind::V2, &continuation_id("c1", EPOCH));
+    assert_eq!(f.core.lineage().receipts().state("c1", &key).unwrap(), None, "and nothing was reserved");
+}
+
+#[test]
+fn a_reservation_is_refused_once_the_ownership_that_asked_for_it_is_gone() {
+    // The bug this guards: the driver tested ownership at the top of its pass
+    // and then read the lineage, and those reads wait on the store's lock
+    // that `release` and `start` hold while they work. A pass could wait in
+    // there and come out under an ownership that was gone, and build the
+    // child anyway — spawning its agent, which is billed. So the gate sits at
+    // the reservation, a recovery turn's first write, and this calls that
+    // write directly to say so. The Windows job found the window on
+    // `a_host_that_gave_the_directory_up_sends_nothing_more`.
+    let f = fixture(3);
+    f.core.start(previous_host());
+    let ours = f.core.ownership().expect("the host owns the directory");
+    assert_eq!(f.core.reserve_recovery(ours, "c1", "line-1"), Reserved::Ours);
+    assert_eq!(f.core.reserve_recovery(ours, "c1", "line-1"), Reserved::Taken, "the same key twice");
+    f.core.release();
+    assert_eq!(f.core.reserve_recovery(ours, "c1", "line-2"), Reserved::Refused, "a guest writes nothing");
+    f.core.start(previous_host());
+    assert_eq!(
+        f.core.reserve_recovery(ours, "c1", "line-2"),
+        Reserved::Refused,
+        "nor does a pass that belongs to the ownership this one replaced",
+    );
+    assert_eq!(f.core.lineage().receipts().state("c1", "line-2").unwrap(), None, "and nothing was written");
+    let now = f.core.ownership().expect("the host owns it again");
+    assert_eq!(f.core.reserve_recovery(now, "c1", "line-2"), Reserved::Ours, "the ownership that holds it may");
 }
 
 #[test]
