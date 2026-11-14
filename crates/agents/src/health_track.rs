@@ -147,9 +147,14 @@ pub struct HealthExtras {
     pub interrupted: bool,
     /// A restart cut a turn short and the agent has not been told yet.
     pub recovery_note_owed: bool,
-    /// Children of this session that are working.
-    pub children_active: u32,
 }
+
+// No `children_active` here, deliberately. A driver cannot usefully supply it:
+// `SessionHandle::refresh_health` overwrites it from the host's own periodic
+// look at the lineage (`session_health.rs`: `inputs.children_active =
+// children.working`), which is the only place that knows. A field a caller can
+// set and nothing can read is worse than no field — the next person to pass it
+// carefully would be wasting their care.
 
 /// The one reading of a session's health from its fold and its tracker.
 pub fn inputs_from(fold: &ChatThread, track: &HealthTrack, extras: HealthExtras) -> HealthInputs {
@@ -167,7 +172,8 @@ pub fn inputs_from(fold: &ChatThread, track: &HealthTrack, extras: HealthExtras)
             .iter()
             .filter(|task| task.status == TaskStatus::Running)
             .count() as u32,
-        children_active: extras.children_active,
+        // Overwritten by the host's own look (see the note on `HealthExtras`).
+        children_active: 0,
         prompt: if fold.pending_permission().is_some() {
             Some(PromptKind::Permission)
         } else if fold.pending_question().is_some() {

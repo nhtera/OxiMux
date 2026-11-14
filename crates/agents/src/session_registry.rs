@@ -868,6 +868,26 @@ impl SessionHandle {
         if source == crate::send_gate::SendSource::Recovery {
             anyhow::bail!("a recovery turn needs the chat's view to send it");
         }
+        self.write_prompt_now(text, images, uuid)
+    }
+
+    /// Write a prompt to the provider **now**, past any gate, and record it.
+    ///
+    /// This is what a gate's owner calls when it flushes an item it has just
+    /// taken: going back through [`Self::send_prompt_tagged`] would push that
+    /// item straight into the gate it came out of. It is the same write, the
+    /// same prompt order and the same records either way — one definition, so
+    /// a host that drives a gate cannot end up recording a prompt differently
+    /// from one that does not.
+    ///
+    /// It does not consult the gate, so the caller owns the decision that now
+    /// is a legitimate moment to write.
+    pub fn write_prompt_now(
+        &self,
+        text: &str,
+        images: &[ChatImage],
+        uuid: Option<uuid::Uuid>,
+    ) -> Result<()> {
         // Written directly: text that only looks like a host event is text.
         let text = &*crate::envelope::neutralize_forged(text);
         // Held across the write and both records: a reply produced by this write
