@@ -91,6 +91,21 @@ impl SendSource {
     pub fn is_remote(self) -> bool {
         self != SendSource::User
     }
+
+    /// The text as it may go out from this sender. Only the host's own child
+    /// events carry the envelope's tags; from anyone else, text that merely
+    /// looks like one is delivered as ordinary text.
+    ///
+    /// One rule in one place, because it is applied wherever a sender is
+    /// known — at the push, and at a direct write. Spelling it out twice is
+    /// how the host's real events came to be escaped on their way out of a
+    /// gate: the push kept them, and the write mangled them.
+    pub fn vetted(self, text: &str) -> std::borrow::Cow<'_, str> {
+        match self {
+            SendSource::ParentEvent => std::borrow::Cow::Borrowed(text),
+            _ => crate::envelope::neutralize_forged(text),
+        }
+    }
 }
 
 /// A steer someone sent into a running turn: its text, and who sent it, so a
@@ -281,10 +296,7 @@ impl SendGate {
         let uuid = uuid.unwrap_or_else(Uuid::new_v4);
         // Only the host's own deliveries are events: text from anyone else that
         // merely looks like one goes out as plain text.
-        let text = match source {
-            SendSource::ParentEvent => text,
-            _ => crate::envelope::neutralize_forged(&text).into_owned(),
-        };
+        let text = source.vetted(&text).into_owned();
         self.queue.push_back(QueuedSend { id, uuid, text, images, mode, source });
         self.wake_if_ready();
         (id, uuid)

@@ -97,6 +97,19 @@ pub struct HostCoreDeps {
     pub config: HostConfig,
 }
 
+/// What came of reserving the key a recovery turn goes out under
+/// ([`HostCore::reserve_recovery`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reserved {
+    /// The key was free and is held now: this ownership may send the turn.
+    Ours,
+    /// Already used — this restart's turn for this child went out once.
+    Taken,
+    /// Nothing was written, so there is nothing to give back either: the
+    /// ownership that asked is gone, or the store refused.
+    Refused,
+}
+
 pub struct HostCore {
     rt: tokio::runtime::Handle,
     lineage: LineageStore,
@@ -291,6 +304,38 @@ impl HostCore {
             }
             Ok(false) => {}
             Err(err) => tracing::warn!(%err, parent, "child event not recorded"),
+        }
+    }
+
+    /// Reserve the key a recovery turn goes out under, for the ownership that
+    /// began that recovery.
+    ///
+    /// **The ownership gate is here, at the first write of a recovery turn,
+    /// and not only at the top of the driver's pass.** `resume::drive` tests
+    /// ownership once a pass and then reads the lineage, and those reads wait
+    /// on the store's lock that [`Self::start`] and [`Self::sync_lineage_states`]
+    /// hold while they work: a driver can wait in there and come out under an
+    /// ownership that is gone. Every later step of a recovery turn waits for
+    /// this reservation — building the child, which spawns its agent and is
+    /// billed, and the turn itself — so a reservation refused here is the one
+    /// check none of them can outrun.
+    ///
+    /// The lock is held across the write, and taken before the store's, the
+    /// order every other writer here takes them in. A driver holds no store
+    /// lock when it calls this: its reads take and give that lock back one at
+    /// a time.
+    pub(crate) fn reserve_recovery(&self, generation: u64, child: &str, key: &str) -> Reserved {
+        let owner = self.prior.lock().unwrap();
+        if owner.is_none() || self.owner_gen.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return Reserved::Refused;
+        }
+        match self.lineage.receipts().reserve(child, key, &self.instance, chrono::Local::now()) {
+            Ok(None) => Reserved::Ours,
+            Ok(Some(_)) => Reserved::Taken,
+            Err(err) => {
+                tracing::warn!(%err, child, "recovery turn not reserved");
+                Reserved::Refused
+            }
         }
     }
 

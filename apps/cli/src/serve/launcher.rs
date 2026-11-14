@@ -310,88 +310,11 @@ impl SessionLauncher for HeadlessLauncher {
         Ok(spawned.session_id)
     }
 
-    /// A child an agent asked for: refused here, for now.
-    ///
-    /// The trait's default would fall through to [`Self::create`] and start
-    /// one, and it would run. What is missing is everything that makes a
-    /// child *useful to its parent*: this host attaches no send gate, so the
-    /// outbox drainer skips the parent and the child's finish never reaches
-    /// it (`outbox_drainer.rs`: `let Some(gate) = handle.gate() else {
-    /// continue }`), and the pump publishes no working state, so the child
-    /// stays `working` for ever — holding its slot under the fan-out cap
-    /// until this process exits.
-    ///
-    /// A parent waiting for a message that cannot arrive, and a cap that
-    /// fills and never empties, are both worse than being told no. The
-    /// refusal goes away in the same change that lands the gate and the
-    /// working-state publisher, not before.
-    async fn create_child(
-        &self,
-        _cwd: &str,
-        _agent_id: Option<&str>,
-        _model: Option<&str>,
-        _ctx: oximux_remote_host::launcher::ChildCtx,
-    ) -> Result<String, LaunchError> {
-        Err(LaunchError::UnsupportedOnHost(
-            "A headless host cannot yet carry a child's result back to its parent.              Run this agent in the desktop app to delegate."
-                .into(),
-        ))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A child an agent asks for is refused, not quietly started.
-    ///
-    /// The trait's default `create_child` falls through to `create`, so this
-    /// is a method that has to be *overridden* to say no — and a reviewer
-    /// reading `serve/mod.rs` would see a host core wired up and reasonably
-    /// conclude delegation works. It launches fine; it is the carrying-back
-    /// that is missing. Deleting the override is how that regresses, and the
-    /// symptom is a parent waiting forever rather than an error.
-    #[tokio::test]
-    async fn a_child_an_agent_asked_for_is_refused_while_nothing_can_carry_its_result_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let listener = Arc::new(
-            oximux_remote_local::LocalControlListener::bind(
-                dir.path(),
-                &oximux_remote_local::generate_token(),
-            )
-            .unwrap(),
-        );
-        let db = oximux_storage::db::open_memory().unwrap();
-        let launcher = HeadlessLauncher::new(
-            Arc::new(SessionRegistry::new()),
-            SettingsRepo::new(db.clone()),
-            PumpSet::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(SessionIndex::default()),
-            listener,
-        );
-
-        let err = launcher
-            .create_child(
-                dir.path().to_str().unwrap(),
-                Some("claude"),
-                None,
-                oximux_remote_host::launcher::ChildCtx {
-                    parent_session_id: Some("parent".into()),
-                    activate: false,
-                    posture: oximux_agents::thread::launch_posture::SpawnPosture::Default,
-                },
-            )
-            .await
-            .expect_err("a headless host cannot deliver a child's result yet");
-
-        assert!(
-            matches!(err, LaunchError::UnsupportedOnHost(_)),
-            "refused as a host limit, not as a launch failure: {err:?}",
-        );
-        // The caller is an agent, and the message is the only thing it gets.
-        assert!(err.to_string().contains("desktop app"), "it says what to do instead: {err}");
-    }
 
     /// The split, stated as the property rather than as two numbers: a backend the
     /// host can name may be waited on briefly, and one it cannot must be waited on
