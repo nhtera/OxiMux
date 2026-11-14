@@ -379,13 +379,27 @@ fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) 
             gate.lock().unwrap().report_sent(item.uuid, false);
             continue;
         }
-        let sent = handle.write_prompt_now(&item.text, &item.images, Some(item.uuid));
+        // The item's own source, not a guess: it decides whether the text is
+        // the host's batch of child events or a paste that merely looks like
+        // one. A batch escaped on its way out would reach its parent in the
+        // very form that marks a forged event as ordinary text.
+        let sent = handle.write_prompt_now(&item.text, &item.images, Some(item.uuid), item.source);
         if let Err(err) = &sent {
             tracing::warn!(%err, session = session_id, "a queued send could not be written");
         }
         // The drainer's hook settles (or returns) the outbox rows this item
         // carried, by its uuid.
-        gate.lock().unwrap().report_sent(item.uuid, sent.is_ok());
+        let mut gate = gate.lock().unwrap();
+        gate.report_sent(item.uuid, sent.is_ok());
+        // An agent that cannot say what it started on (every backend but
+        // Claude) drops the id this line went out under, so no receipt will
+        // ever name it. Noted here, the next frame stands in for the one the
+        // agent does not send; without that the drainer gives up after its
+        // 30 s window and marks a line it did deliver `unconfirmed`.
+        if sent.is_ok() && !handle.reports_receipts() {
+            gate.note_unreported(item.uuid);
+        }
+        drop(gate);
         if sent.is_err() {
             return;
         }
@@ -464,6 +478,10 @@ fn apply(
 ) {
     if ingest {
         handle.ingest(event.clone());
+        // Only the backend's own frames prove it started on the host's line.
+        // A host-synthesized event (an operator-edited approval) is this
+        // process talking to itself, and proves nothing about the agent.
+        stand_in_for_a_missing_receipt(handle, gate, event);
     }
     fold.apply(event);
     track.note_event(event, oximux_agents::session_health::now_ms());
@@ -487,6 +505,35 @@ fn apply(
             | ThreadEvent::UserMessage { .. }
     ) {
         refresh_meta(handle, fold);
+    }
+}
+
+/// Say what the agent would have said about the host's last line, for an
+/// agent that cannot say it.
+///
+/// Only Claude reports which tagged line it started on. Every other backend
+/// drops the id, so a line the host wrote is never named by any receipt — and
+/// the outbox drainer, which settles its rows from receipts alone, gives up
+/// after 30 s and records a delivered update as `unconfirmed`. The agent's
+/// next frame is the proof it started, and the turn ending is the proof it
+/// finished; both are stood in for here under the line's own id, exactly as
+/// the desktop's driver does, so a parent's updates read as what they were.
+fn stand_in_for_a_missing_receipt(handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>, event: &ThreadEvent) {
+    if handle.reports_receipts() {
+        return;
+    }
+    // The lock is dropped before the ingest: it reaches the drainer, which
+    // takes this same gate on its pass.
+    let stand_in = {
+        let mut gate = gate.lock().unwrap();
+        if matches!(event, ThreadEvent::TurnEnded { .. }) {
+            gate.unreported_delivered().map(|u| ThreadEvent::UserMessagesDelivered { uuids: vec![u.to_string()] })
+        } else {
+            gate.unreported_accepted().map(|u| ThreadEvent::UserMessageAccepted { uuid: u.to_string() })
+        }
+    };
+    if let Some(receipt) = stand_in {
+        handle.ingest(receipt);
     }
 }
 
@@ -712,6 +759,117 @@ mod tests {
             handle.health_snapshot().health.liveness,
             oximux_agents::health::Liveness::RestoredUnconfirmed,
             "reopened, and nothing has confirmed it yet",
+        );
+    }
+
+    /// A batch of child events reaches its parent as the events it is.
+    ///
+    /// The gate keeps the host's own envelope intact at the push and escapes
+    /// everyone else's lookalike text. Writing the item back through the
+    /// direct path applied that escaping a second time, so a real update
+    /// arrived at its parent in the very form that marks a forged one as
+    /// ordinary text — on the one host whose whole job in this change is to
+    /// run children.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_childs_events_reach_their_parent_with_the_envelope_intact() {
+        let registry = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        let db = oximux_storage::open_memory().unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: Vec::new(),
+                seed: ChatBlob::new("s-1".into()),
+                settings: SettingsRepo::new(db),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        assert!(
+            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+            "the gate is attached",
+        );
+        // Pushed as the outbox drainer pushes: the host's own batch, under
+        // its own source.
+        let events = oximux_agents::envelope::render(&[oximux_agents::envelope::ChildEvent {
+            kind: oximux_agents::envelope::ChildEventKind::Finished,
+            child: "c-1".into(),
+            depth: 1,
+            title: "a child".into(),
+            status: Some("exit 0".into()),
+            result: Some("done".into()),
+            permit: None,
+        }]);
+        assert!(events.contains("<oximux-event"), "the envelope carries its tags");
+        handle.gate().unwrap().lock().unwrap().push(
+            events,
+            Vec::new(),
+            SendSource::ParentEvent,
+            oximux_agents::send_gate::DeliveryMode::Queue,
+            None,
+        );
+        assert!(wait_until(5_000, || !conn.sent().is_empty()), "the batch is written");
+        let written = conn.sent()[0].to_string();
+        assert!(written.contains("<oximux-event"), "written as events: {written}");
+        assert!(!written.contains("&lt;oximux-event"), "and not escaped: {written}");
+    }
+
+    /// A line an agent cannot acknowledge is confirmed by its next frame.
+    ///
+    /// Only Claude reports which tagged line it started on; every other
+    /// backend drops the id, so nothing will ever name the host's write. The
+    /// outbox drainer settles its rows from receipts alone and gives up after
+    /// 30 s, so without a stand-in a parent's updates read `unconfirmed`
+    /// although they were delivered and acted on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_line_an_agent_cannot_acknowledge_is_confirmed_by_its_next_frame() {
+        let registry = Arc::new(SessionRegistry::new());
+        // The default stub reports no receipts, like Codex and pi.
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        assert!(!handle.reports_receipts(), "the backend this test is about");
+        let db = oximux_storage::open_memory().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut receipts = handle.subscribe_receipts();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: Vec::new(),
+                seed: ChatBlob::new("s-1".into()),
+                settings: SettingsRepo::new(db),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        assert!(
+            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+            "the gate is attached",
+        );
+        handle.send_prompt("ship it", &[]).unwrap();
+        assert!(wait_until(5_000, || !conn.sent().is_empty()), "the line is written");
+        assert!(receipts.try_recv().is_err(), "no agent said anything about it yet");
+
+        tx.send(ThreadEvent::AssistantText("on it".into())).unwrap();
+        assert!(
+            wait_until(5_000, || matches!(receipts.try_recv(), Ok(ThreadEvent::UserMessageAccepted { .. }))),
+            "the frame stands in for the receipt the agent cannot send",
+        );
+        tx.send(ThreadEvent::TurnEnded { is_error: false, result: None, usage: None, turn_diff: None }).unwrap();
+        assert!(
+            wait_until(5_000, || matches!(receipts.try_recv(), Ok(ThreadEvent::UserMessagesDelivered { .. }))),
+            "and the turn ending says it was carried",
         );
     }
 

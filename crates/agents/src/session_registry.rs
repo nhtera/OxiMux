@@ -868,7 +868,7 @@ impl SessionHandle {
         if source == crate::send_gate::SendSource::Recovery {
             anyhow::bail!("a recovery turn needs the chat's view to send it");
         }
-        self.write_prompt_now(text, images, uuid)
+        self.write_prompt_now(text, images, uuid, source)
     }
 
     /// Write a prompt to the provider **now**, past any gate, and record it.
@@ -882,14 +882,24 @@ impl SessionHandle {
     ///
     /// It does not consult the gate, so the caller owns the decision that now
     /// is a legitimate moment to write.
+    ///
+    /// `source` is who the line is from, and decides one thing: whether
+    /// envelope-shaped text is the host's own batch of child events or
+    /// someone else's paste. A gate's owner passes the item's source, so a
+    /// batch reaches its parent as the events it is — escaping it a second
+    /// time here is how a real update came out looking like a forged one.
     pub fn write_prompt_now(
         &self,
         text: &str,
         images: &[ChatImage],
         uuid: Option<uuid::Uuid>,
+        source: crate::send_gate::SendSource,
     ) -> Result<()> {
-        // Written directly: text that only looks like a host event is text.
-        let text = &*crate::envelope::neutralize_forged(text);
+        // Text that only looks like a host event is text — from everyone but
+        // the host itself. The gate applies the same rule at the push, and
+        // this is the same call, so an item that came out of a gate is not
+        // escaped again.
+        let text = &*source.vetted(text);
         // Held across the write and both records: a reply produced by this write
         // cannot be folded until the user's bubble has been. See `prompt_order`.
         let _order = self.prompt_order.lock().unwrap();
@@ -986,6 +996,13 @@ impl SessionHandle {
     /// (those can block, and a swap must never wait behind one).
     fn conn(&self) -> Arc<dyn AgentConnection> {
         self.conn.lock().unwrap().clone()
+    }
+
+    /// Whether this session's agent reports, per line, that it started on it
+    /// (Claude's receipts). A driver that writes the host's lines stands in
+    /// for the missing proof when it does not — see the serve pump.
+    pub fn reports_receipts(&self) -> bool {
+        self.conn().reports_receipts()
     }
 
     /// Re-point this session at a new backend, keeping its `seq`, backlog, live
