@@ -19,6 +19,7 @@ mod git;
 mod handlers;
 mod handshake;
 mod health_push;
+mod host_config;
 mod heartbeats;
 mod pairing_admin;
 mod schedules;
@@ -392,6 +393,8 @@ impl Dispatcher {
             Request::ListChildren { of, recursive } => self.list_children(peer, &of, recursive),
             Request::CancelAgent { id, cascade } => self.cancel_agent(peer, &id, cascade),
             Request::Whoami => self.whoami(peer),
+            Request::HostConfigRead { key } => self.host_config_read(peer, key.as_deref()),
+            Request::HostConfigWrite { key, value } => self.host_config_write(peer, &key, &value),
             Request::AnswerQuestion(r) => self.answer_question(peer, r),
             Request::Steer { session_id, text } => self.steer(peer, &session_id, &text),
             Request::Cancel { session_id } => self.scoped(peer, &session_id, |h| h.cancel()),

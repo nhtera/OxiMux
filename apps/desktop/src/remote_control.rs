@@ -500,20 +500,30 @@ impl RemoteControl {
     }
 
     /// Build the host core over this host's registry. Called once at boot, with
-    /// the process runtime and the shared database's lineage store; the core
-    /// runs from then on whether or not any listener is enabled.
+    /// the process runtime, the shared database's lineage store and its
+    /// settings; the core runs from then on whether or not any listener is
+    /// enabled.
+    ///
+    /// The config is read here rather than passed in, because it and the store
+    /// `oximux config` writes through must be the same database: a write read
+    /// back from somewhere else is a setting that never takes.
     pub fn install_host_core(
         &mut self,
         rt: tokio::runtime::Handle,
         lineage: oximux_agents::lineage::LineageStore,
-        config: oximux_remote_host::HostConfig,
+        settings: oximux_storage::SettingsRepo,
     ) {
-        self.host_core = Some(oximux_remote_host::HostCore::new(oximux_remote_host::HostCoreDeps {
+        // The same settings keys `oximux serve` reads, so both hosts enforce
+        // the same caps.
+        let config = oximux_remote_host::HostConfig::load(|key| settings.get(key).ok().flatten());
+        let core = oximux_remote_host::HostCore::new(oximux_remote_host::HostCoreDeps {
             rt,
             lineage,
             registry: self.registry.clone(),
             config,
-        }));
+        });
+        core.set_settings(settings);
+        self.host_core = Some(core);
     }
 
     /// The host core, once installed.
@@ -1399,7 +1409,11 @@ mod tests {
         let db = oximux_storage::db::open_memory().unwrap();
         let lineage = LineageStore::new(db.conn());
         let mut rc = RemoteControl::new();
-        rc.install_host_core(rt.handle().clone(), lineage.clone(), oximux_remote_host::HostConfig::default());
+        rc.install_host_core(
+            rt.handle().clone(),
+            lineage.clone(),
+            oximux_storage::SettingsRepo::new(db.clone()),
+        );
         rc.bind("agent-7", a_conn());
         let spec = SpawnSpec {
             request_id: "r1".into(),
@@ -1438,7 +1452,7 @@ mod tests {
         rc.install_host_core(
             rt.handle().clone(),
             oximux_agents::lineage::LineageStore::new(db.conn()),
-            oximux_remote_host::HostConfig::default(),
+            oximux_storage::SettingsRepo::new(db.clone()),
         );
         assert!(rc.mint_chat_credential("agent-1").is_none(), "no listener, no credential");
 

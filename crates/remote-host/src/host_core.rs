@@ -32,8 +32,14 @@ use oximux_single_instance::HolderRecord;
 use tokio::sync::{mpsc, watch};
 
 use crate::child_watcher::ChildWatcher;
-use crate::host_config::HostConfig;
+use crate::host_config::{self, ConfigEntry, ConfigError, HostConfig};
 use crate::outbox_drainer::{self, DrainMsg};
+
+/// One setting read from `settings`: the value in force, and whether anything
+/// is stored for it at all.
+fn entry(settings: &oximux_storage::SettingsRepo, key: &'static str, value: String) -> ConfigEntry {
+    ConfigEntry { key, value, is_default: settings.get(key).ok().flatten().is_none() }
+}
 
 /// How long a recorded child event waits for others before it is delivered,
 /// so children that finish together reach their parent as one message.
@@ -126,6 +132,15 @@ pub struct HostCore {
     /// Builds a dormant session so a recovery turn can reach it; installed
     /// by the host after the core (see [`Self::set_catalog`]).
     catalog: Mutex<Option<Arc<dyn crate::catalog::SessionCatalog>>>,
+    /// Where this host's own settings live, installed after the core like the
+    /// catalog (see [`Self::set_settings`]).
+    ///
+    /// No seam over it, because there is nothing to abstract: both hosts
+    /// already keep these keys in a `SettingsRepo` over the shared database —
+    /// that is what makes one data directory enforce one set of caps — and a
+    /// trait with a single implementation would only hide which store a host
+    /// is reading.
+    settings: Mutex<Option<oximux_storage::SettingsRepo>>,
     /// Counts the times this process won the data directory, so work begun
     /// under one ownership stops once it is given up (even if won back).
     owner_gen: std::sync::atomic::AtomicU64,
@@ -160,6 +175,7 @@ impl HostCore {
             drain: drain.clone(),
             debounce: Mutex::new(EVENT_DEBOUNCE),
             catalog: Mutex::new(None),
+            settings: Mutex::new(None),
             owner_gen: std::sync::atomic::AtomicU64::new(0),
             attention: crate::attention::AttentionSlots::new(prefs),
             #[cfg(test)]
@@ -277,6 +293,50 @@ impl HostCore {
 
     pub(crate) fn catalog(&self) -> Option<Arc<dyn crate::catalog::SessionCatalog>> {
         self.catalog.lock().unwrap().clone()
+    }
+
+    /// Install the store this host's settings live in. Called once at boot
+    /// with the same `SettingsRepo` the config was loaded from: the two must
+    /// be one database, or a write would be read back from somewhere else.
+    pub fn set_settings(&self, settings: oximux_storage::SettingsRepo) {
+        *self.settings.lock().unwrap() = Some(settings);
+    }
+
+    fn settings(&self) -> Result<oximux_storage::SettingsRepo, ConfigError> {
+        self.settings.lock().unwrap().clone().ok_or(ConfigError::NoStore)
+    }
+
+    /// Every setting this host has, as it enforces them now.
+    pub fn config_entries(&self) -> Result<Vec<ConfigEntry>, ConfigError> {
+        let settings = self.settings()?;
+        Ok(self.config().entries().into_iter().map(|(key, value)| entry(&settings, key, value)).collect())
+    }
+
+    /// One setting, by key.
+    pub fn config_entry(&self, key: &str) -> Result<ConfigEntry, ConfigError> {
+        if host_config::kind_of(key).is_none() {
+            return Err(ConfigError::UnknownKey);
+        }
+        self.config_entries()?.into_iter().find(|e| e.key == key).ok_or(ConfigError::UnknownKey)
+    }
+
+    /// Validate `value`, persist it, apply it, and answer with the setting as
+    /// it now stands.
+    ///
+    /// **In that order, and all four here.** The value is checked before it is
+    /// written, because stored text the loader ignores would read back as the
+    /// default and look like a setting that had been applied. It is then read
+    /// back *through the loader* rather than assigned field by field, so the
+    /// answer is what this host enforces — a depth of 9 reads as 2 — and so
+    /// there is one mapping from keys to config, not two that can disagree.
+    pub fn set_config_value(&self, key: &str, value: &str) -> Result<ConfigEntry, ConfigError> {
+        let kind = host_config::kind_of(key).ok_or(ConfigError::UnknownKey)?;
+        let text = kind.canonical(value).map_err(ConfigError::BadValue)?;
+        let settings = self.settings()?;
+        settings.set(key, &text).map_err(|err| ConfigError::Write(err.to_string()))?;
+        self.set_config(HostConfig::load(|key| settings.get(key).ok().flatten()));
+        tracing::info!(key, value = %text, "host setting changed");
+        self.config_entry(key)
     }
 
     /// Change [`Self::event_debounce`] (tests shorten it).

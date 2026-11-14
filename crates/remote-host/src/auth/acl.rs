@@ -242,6 +242,46 @@ impl AuthStore {
         }
     }
 
+    /// May this caller read the host's own settings (`oximux config get|list`)?
+    ///
+    /// Full scope, read-only included, for the reason
+    /// [`may_read_worktrees`](Self::may_read_worktrees) requires it: a setting
+    /// names no session, so a session-confined device has nothing to be
+    /// narrowed against — and these are the caps that device is confined by,
+    /// which is not a list it should be able to enumerate. The entries carry
+    /// no path and no credential, so a full-scope device across the network
+    /// may read them.
+    pub fn may_read_host_config(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(scope) => scope.is_full(),
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                matches!(
+                    st.devices.get(pubkey),
+                    Some(d) if !d.revoked && matches!(d.scope, DeviceScope::Full)
+                )
+            }
+        }
+    }
+
+    /// May this caller change them (`oximux config set`)?
+    ///
+    /// **Local operator only**, as strict as
+    /// [`may_administer_pairing`](Self::may_administer_pairing) and for the
+    /// same shape of reason: these settings are the spawn caps and the
+    /// confinement every agent on this host runs under, so a caller that could
+    /// write them could turn confinement off and hand the next chat agent the
+    /// operator's own credential. That is privilege escalation by
+    /// configuration, and a device across a network — even a full-scope,
+    /// write-capable one — is refused it. The person at the machine has the
+    /// same switches in the desktop's Settings pane.
+    pub fn may_change_host_config(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(scope) => scope.is_full(),
+            PeerKind::Remote(_) => false,
+        }
+    }
+
     /// Every recorded device — the data behind the paired-devices list, its
     /// revoke/forget actions, and its read-only toggle.
     ///

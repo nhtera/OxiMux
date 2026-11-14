@@ -25,6 +25,7 @@
 //! representation, so encoding is reused rather than reinvented.
 
 pub mod delivery;
+pub mod host_config;
 pub mod lineage;
 pub mod messages;
 pub mod pairing;

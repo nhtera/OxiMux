@@ -556,11 +556,7 @@ fn main() {
         // which thread later calls into it.
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
-                // The same settings keys `oximux serve` reads, from the shared
-                // database, so both hosts enforce the same caps.
-                let settings = app_state.settings_repo();
-                let config = oximux_remote_host::HostConfig::load(|key| settings.get(key).ok().flatten());
-                remote_control.install_host_core(rt, app_state.lineage_store(), config);
+                remote_control.install_host_core(rt, app_state.lineage_store(), app_state.settings_repo().clone());
             }
             Err(_) => tracing::warn!("no tokio runtime; agent orchestration host core not started"),
         }
