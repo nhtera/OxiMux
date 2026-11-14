@@ -52,13 +52,16 @@ pub async fn set(client: &Client, key: &str, value: &str) -> Result<(Value, Stri
         ask(client, Request::HostConfigWrite { key: key.into(), value: value.into() }, "config set").await?,
         "config set",
     )?;
-    // A cap is clamped to its ceiling, so what the host enforces is not always
-    // what was asked for. Said plainly, because a limit someone believes they
-    // have and does not is worse than a refusal.
+    // What the host enforces is not always what was asked for: a cap is
+    // clamped to its ceiling, and `yes` is stored as `true`. Both are reported
+    // the same way — the value in force, and what was asked — without naming a
+    // reason this side cannot tell apart. A limit someone believes they have
+    // and does not is worse than a refusal; a wrong explanation of why is
+    // worse than none.
     let human = if entry.value == asked {
         format!("{} = {}", entry.key, entry.value)
     } else {
-        format!("{} = {} (asked for {asked}; this host's limit)", entry.key, entry.value)
+        format!("{} = {} (asked for {asked}; this is what the host now enforces)", entry.key, entry.value)
     };
     Ok((entry_json(&entry), human))
 }

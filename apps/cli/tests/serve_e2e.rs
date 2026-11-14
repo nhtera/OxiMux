@@ -159,6 +159,14 @@ fn seed_session(data_dir: &Path, session_id: &str) {
 
 fn client(data_dir: &Path) -> Command {
     let mut cmd = bin();
+    // `--dir` does not pin the target: `resolve_and_connect` reads the hosts
+    // file and OXIMUX_HOST first and only then falls back to the local socket.
+    // On a machine with a paired default — any developer's — these invocations
+    // would reach that host instead of the serve under test, and `config set`
+    // would change its settings. The same isolation `hosts_e2e` uses, for the
+    // same reason.
+    cmd.env_remove("OXIMUX_HOST");
+    cmd.env("OXIMUX_CONFIG_DIR", data_dir.with_extension("hosts"));
     cmd.args(["--dir", data_dir.to_str().unwrap(), "--timeout", "15"]);
     cmd
 }

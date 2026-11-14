@@ -23,7 +23,8 @@ use crate::auth::Peer;
 use crate::host_config::{ConfigEntry, ConfigError};
 
 /// How a refusal reads on the wire. An unknown key and a bad value are the
-/// caller's to fix; a host with no settings store has nothing to answer with.
+/// caller's to fix; a host with no settings store has nothing to answer with;
+/// a store that cannot be read or written is this host's own problem.
 fn refusal(key: &str, err: ConfigError) -> Response {
     let error = match err {
         ConfigError::UnknownKey => RpcError::BadRequest(format!(
@@ -31,7 +32,7 @@ fn refusal(key: &str, err: ConfigError) -> Response {
         )),
         ConfigError::BadValue(takes) => RpcError::BadRequest(format!("{key} {takes}")),
         ConfigError::NoStore => RpcError::Unsupported,
-        ConfigError::Write(why) => RpcError::Internal(why),
+        ConfigError::Write(why) | ConfigError::Read(why) => RpcError::Internal(why),
     };
     Response::Error(error)
 }

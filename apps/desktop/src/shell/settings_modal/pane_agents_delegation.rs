@@ -26,14 +26,27 @@ fn current(cx: &gpui::App) -> HostConfig {
 /// Store `next` in the settings keys and hand it to the running core.
 fn apply(modal: &SettingsModal, next: HostConfig, cx: &mut gpui::Context<SettingsModal>) {
     let next = next.sanitized();
-    let confinement_switched_on = next.confine_chat && !current(cx).confine_chat;
-    for (key, value) in next.entries() {
-        if let Err(err) = modal.notify_repo.set(key, &value) {
-            tracing::warn!(%err, key, "agent delegation setting not saved");
+    let confinement_switched_on =
+        RemoteControl::confinement_switched_on(current(cx).confine_chat, next.confine_chat);
+    match cx.try_global::<RemoteControl>().and_then(|rc| rc.host_core()) {
+        // Through the core, which holds its settings-write lock across the
+        // store and the apply: this pane writes every key at once, and
+        // `oximux config set` writes one, so two unlocked writers could leave
+        // the store and what the host enforces disagreeing.
+        Some(core) => {
+            if let Err(err) = core.replace_config(next) {
+                tracing::warn!(?err, "agent delegation settings not saved");
+            }
         }
-    }
-    if let Some(core) = cx.try_global::<RemoteControl>().and_then(|rc| rc.host_core()) {
-        core.set_config(next);
+        // No core yet (no runtime at boot): there is nothing to apply and no
+        // lock to take, but the keys must still be stored for the next start.
+        None => {
+            for (key, value) in next.entries() {
+                if let Err(err) = modal.notify_repo.set(key, &value) {
+                    tracing::warn!(%err, key, "agent delegation setting not saved");
+                }
+            }
+        }
     }
     if confinement_switched_on {
         // Open chats' agents were spawned without a credential: respawn them

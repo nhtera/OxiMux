@@ -17,6 +17,7 @@ use crate::host_core::{HostCore, HostCoreDeps};
 struct Fixture {
     dispatcher: Dispatcher,
     core: Arc<HostCore>,
+    db: oximux_storage::db::Db,
     settings: oximux_storage::SettingsRepo,
     auth: Arc<AuthStore>,
     _rt: tokio::runtime::Runtime,
@@ -36,7 +37,7 @@ fn fixture() -> Fixture {
     core.set_settings(settings.clone());
     let auth = Arc::new(AuthStore::new());
     let dispatcher = Dispatcher::new(registry, auth.clone()).with_host_core(core.clone());
-    Fixture { dispatcher, core, settings, auth, _rt: rt }
+    Fixture { dispatcher, core, db, settings, auth, _rt: rt }
 }
 
 fn operator() -> Peer {
@@ -166,6 +167,124 @@ fn a_value_the_loader_would_ignore_is_refused() {
         assert_eq!(f.settings.get(key).unwrap(), None, "{key} was not stored");
     }
     assert_eq!(f.core.config(), HostConfig::default(), "and nothing was applied");
+}
+
+/// A second writer waits for the first, and the store and the host agree
+/// afterwards.
+///
+/// Each connection serves on its own task of a multi-threaded runtime, so two
+/// writers are two operators (or one, twice over). The sequence is write →
+/// read every key → apply, and unserialized it interleaves: A writes, B writes
+/// and applies, A applies the config it read before B's write. The store then
+/// says one thing and the host enforces another until the next write.
+///
+/// Staged rather than stressed: a loop of concurrent writers passes against
+/// the unserialized code, because the store's own lock makes the bad
+/// interleaving rare. So the first writer is parked in the one window that
+/// matters and the second is watched not entering it.
+#[test]
+fn a_second_writer_waits_for_the_first() {
+    let f = fixture();
+    let (release, parked) = std::sync::mpsc::channel();
+    f.core.set_config_gate(parked);
+
+    let first = {
+        let core = f.core.clone();
+        std::thread::spawn(move || core.set_config_value(keys::STALL_AFTER_S, "900"))
+    };
+    // Its value in the store means it is past the write and inside the window.
+    let waited = (0..200).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        f.settings.get(keys::STALL_AFTER_S).unwrap().as_deref() == Some("900")
+    });
+    assert!(waited, "the first writer reached the store");
+
+    let second = {
+        let core = f.core.clone();
+        std::thread::spawn(move || core.set_config_value(keys::CAP_ACTIVE_PER_PARENT, "7"))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(!first.is_finished(), "the first writer is still in the window");
+    assert!(
+        !second.is_finished(),
+        "and the second waited for it instead of applying a config read around it",
+    );
+
+    drop(release);
+    first.join().expect("first writer").expect("set");
+    second.join().expect("second writer").expect("set");
+
+    let stored = HostConfig::load(|key| f.settings.get(key).ok().flatten());
+    assert_eq!(f.core.config(), stored, "what the host enforces is what the store holds");
+    assert_eq!(f.core.config().caps.active_per_parent, 7, "and the later write was not undone");
+}
+
+/// The whole-config write the desktop's Settings pane uses: every key stored,
+/// the sanitized result applied, under the same lock one key takes.
+#[test]
+fn a_whole_config_is_stored_and_applied_together() {
+    let f = fixture();
+    let next = HostConfig {
+        confine_chat: false,
+        stall_after_s: 45,
+        caps: oximux_agents::lineage::SpawnCaps { depth: 9, ..HostConfig::default().caps },
+        ..HostConfig::default()
+    };
+
+    f.core.replace_config(next).expect("replace");
+
+    assert_eq!(f.core.config().stall_after_s, 45);
+    assert!(!f.core.config().confine_chat);
+    assert_eq!(f.core.config().caps.depth, oximux_agents::lineage::MAX_DEPTH, "sanitized on the way in");
+    for (key, value) in f.core.config().entries() {
+        assert_eq!(f.settings.get(key).unwrap().as_deref(), Some(value.as_str()), "{key} was stored");
+    }
+}
+
+/// A store that cannot be read applies nothing.
+///
+/// `HostConfig::load` cannot tell an unreadable key from an unset one, so a
+/// read error reaching it would substitute the shipped defaults for every
+/// setting and report the write as applied — the settings equivalent of losing
+/// them all.
+#[test]
+fn a_store_that_cannot_be_read_changes_nothing() {
+    let f = fixture();
+    f.dispatcher.host_config_write(&operator(), keys::STALL_AFTER_S, "90");
+    assert_eq!(f.core.config().stall_after_s, 90);
+
+    // The write has to succeed and the read-back fail, so the store is taken
+    // away while a writer is parked between the two.
+    let (release, parked) = std::sync::mpsc::channel();
+    f.core.set_config_gate(parked);
+    let writer = {
+        let core = f.core.clone();
+        std::thread::spawn(move || core.set_config_value(keys::STALL_AFTER_S, "120"))
+    };
+    let inside = (0..200).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        f.settings.get(keys::STALL_AFTER_S).unwrap().as_deref() == Some("120")
+    });
+    assert!(inside, "the writer stored its value and parked");
+    f.db.with_conn(|c| c.execute("DROP TABLE settings", [])).expect("drop the table");
+    drop(release);
+
+    let refused = writer.join().expect("writer");
+    assert!(matches!(refused, Err(ConfigError::Read(_))), "{refused:?}");
+    assert_eq!(f.core.config().stall_after_s, 90, "the defaults were not applied over it");
+}
+
+/// The config a follower reads is one the host is already enforcing. The
+/// desktop watches this to respawn open chats when confinement is switched on,
+/// and a notification that arrived before the apply would race its own cause.
+#[test]
+fn a_follower_sees_the_config_after_it_is_in_force() {
+    let f = fixture();
+    let mut config = f.core.subscribe_config();
+    f.dispatcher.host_config_write(&operator(), keys::CONFINE_CHAT, "false");
+    assert!(config.has_changed().expect("the channel is open"), "a change was published");
+    assert!(!config.borrow_and_update().confine_chat, "and it is the new value");
+    assert!(!f.core.config().confine_chat, "which the host already enforces");
 }
 
 /// A core with no settings store answers rather than pretending: there is

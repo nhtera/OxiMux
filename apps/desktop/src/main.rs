@@ -662,6 +662,12 @@ fn main() {
             remote_control.set_transcriber(transcriber);
         }
         cx.set_global(remote_control);
+        // A confinement switch that came over the protocol (`oximux config
+        // set`) has to reach chats that are already open: their agents were
+        // spawned with the operator's reach and only a respawn gives them a
+        // confined credential. Reads the global, so it starts here and not
+        // beside the core it watches.
+        oximux_app::remote_control::RemoteControl::watch_confinement(cx);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an
         // already-paired phone simply cannot reach it until someone opens Settings

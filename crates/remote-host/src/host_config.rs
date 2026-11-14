@@ -134,6 +134,11 @@ pub enum ConfigError {
     NoStore,
     /// The store refused the write.
     Write(String),
+    /// The store could not be read back, so nothing was applied: a missing
+    /// value and an unreadable one are the same to [`HostConfig::load`], and
+    /// applying the defaults it would substitute would silently undo settings
+    /// this host is still holding.
+    Read(String),
 }
 
 /// The kind `key` takes, or `None` when this host has no such setting.
