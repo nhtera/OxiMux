@@ -182,9 +182,10 @@ pub struct HostCore {
     /// interleave in if the sequence were not serialized, and the window a
     /// store can break in between a write that worked and a read that does
     /// not. The first writer to find it takes it, so a second one is never
-    /// parked by it. Per core, like `pass_gate`.
+    /// parked by it. Per core, like `pass_gate`. The sender is how a parked
+    /// writer announces that it got there: see [`Self::hold_config_write`].
     #[cfg(test)]
-    config_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    config_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl HostCore {
@@ -373,6 +374,7 @@ impl HostCore {
     pub fn set_config_value(&self, key: &str, value: &str) -> Result<ConfigEntry, ConfigError> {
         let kind = host_config::kind_of(key).ok_or(ConfigError::UnknownKey)?;
         let text = kind.canonical(value).map_err(ConfigError::BadValue)?;
+        host_config::within_store_limit(key, &text)?;
         let settings = self.settings()?;
         // One writer at a time, for the whole sequence: see `config_write`.
         let _write = self.config_write.lock().unwrap();
@@ -416,9 +418,11 @@ impl HostCore {
         let mut next = before.clone();
         edit(&mut next);
         let after = next.sanitized();
-        settings
-            .set_many(&after.entries())
-            .map_err(|err| ConfigError::Write(err.to_string()))?;
+        let entries = after.entries();
+        for (key, text) in &entries {
+            host_config::within_store_limit(key, text)?;
+        }
+        settings.set_many(&entries).map_err(|err| ConfigError::Write(err.to_string()))?;
         self.set_config(after.clone());
         Ok(ConfigEdit { before, after })
     }
@@ -706,21 +710,33 @@ impl HostCore {
         *self.pass_gate.lock().unwrap() = gate;
     }
 
-    /// Test-only: park here until the test lets go, if it installed a gate.
-    /// The gate's own lock is released before the wait, so nothing else
-    /// blocks on it.
+    /// Test-only: announce that a writer reached the window, then park here
+    /// until the test lets go — if it installed a gate. The gate's own lock is
+    /// released before the wait, so nothing else blocks on it.
+    ///
+    /// **Arrival is announced, not timed.** A test that staged its second
+    /// writer after a sleep would pass or fail on scheduling: with the first
+    /// writer not yet run, the second would take the lock first and the
+    /// interleaving under test would never happen. So the test waits for this
+    /// signal instead, and the lock is held for certain by the time it does.
     #[cfg(test)]
     fn hold_config_write(&self) {
         let gate = self.config_gate.lock().unwrap().take();
-        if let Some(gate) = gate {
-            let _ = gate.recv();
+        if let Some((arrived, release)) = gate {
+            let _ = arrived.send(());
+            let _ = release.recv();
         }
     }
 
-    /// Test-only: install [`Self::hold_config_write`]'s one-shot gate.
+    /// Test-only: install [`Self::hold_config_write`]'s one-shot gate — the
+    /// sender it announces arrival on, and the receiver it parks on.
     #[cfg(test)]
-    pub(crate) fn set_config_gate(&self, gate: std::sync::mpsc::Receiver<()>) {
-        *self.config_gate.lock().unwrap() = Some(gate);
+    pub(crate) fn set_config_gate(
+        &self,
+        arrived: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.config_gate.lock().unwrap() = Some((arrived, release));
     }
 
     fn spawn_status_subscriber(self: &Arc<Self>) {

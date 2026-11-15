@@ -12,6 +12,11 @@ use crate::auth::{AuthStore, LocalScope, PairingSlot, registration_proof};
 use crate::host_config::{HostConfig, keys};
 use crate::host_core::{HostCore, HostCoreDeps};
 
+/// How long a test waits for a parked writer to announce it got to the gate.
+/// Generous: it is a deadlock guard, not a timing assumption — the signal
+/// arrives as soon as the writer is scheduled, and the test does not sleep.
+const GATE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A dispatcher over a core whose settings live in an in-memory database, plus
 /// the store so a test can see what was (or was not) written.
 struct Fixture {
@@ -186,24 +191,23 @@ fn a_value_the_loader_would_ignore_is_refused() {
 fn a_second_writer_waits_for_the_first() {
     let f = fixture();
     let (release, parked) = std::sync::mpsc::channel();
-    f.core.set_config_gate(parked);
+    let (arrived, at_gate) = std::sync::mpsc::channel();
+    f.core.set_config_gate(arrived, parked);
 
     let first = {
         let core = f.core.clone();
         std::thread::spawn(move || core.set_config_value(keys::STALL_AFTER_S, "900"))
     };
-    // Its value in the store means it is past the write and inside the window.
-    let waited = (0..200).any(|_| {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        f.settings.get(keys::STALL_AFTER_S).unwrap().as_deref() == Some("900")
-    });
-    assert!(waited, "the first writer reached the store");
+    // The gate says so: the first writer is past its store write, inside the
+    // window and holding the lock. Waited for rather than slept past, so the
+    // second writer cannot be the one that gets there first.
+    at_gate.recv_timeout(GATE).expect("the first writer reached the window");
+    assert_eq!(f.settings.get(keys::STALL_AFTER_S).unwrap().as_deref(), Some("900"), "its value is stored");
 
     let second = {
         let core = f.core.clone();
         std::thread::spawn(move || core.set_config_value(keys::CAP_ACTIVE_PER_PARENT, "7"))
     };
-    std::thread::sleep(std::time::Duration::from_millis(150));
     assert!(!first.is_finished(), "the first writer is still in the window");
     assert!(
         !second.is_finished(),
@@ -255,21 +259,23 @@ fn an_edit_that_waits_for_the_lock_keeps_what_landed_meanwhile() {
     let f = fixture();
     assert_ne!(f.core.config().stall_after_s, 90, "the fixture must differ");
 
-    // A single-key writer parked inside its window, holding the lock.
+    // A single-key writer parked inside its window, holding the lock. The
+    // gate's acknowledgement is what makes the order certain: started after a
+    // sleep, the edit could win the lock and the staging would prove nothing.
     let (release, parked) = std::sync::mpsc::channel();
-    f.core.set_config_gate(parked);
+    let (arrived, at_gate) = std::sync::mpsc::channel();
+    f.core.set_config_gate(arrived, parked);
     let single = {
         let core = std::sync::Arc::clone(&f.core);
         std::thread::spawn(move || core.set_config_value(keys::STALL_AFTER_S, "90"))
     };
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    at_gate.recv_timeout(GATE).expect("the single writer reached the window");
 
     // The pane's edit, which has to wait for that lock.
     let edit = {
         let core = std::sync::Arc::clone(&f.core);
         std::thread::spawn(move || core.edit_config(|config| config.confine_chat = true))
     };
-    std::thread::sleep(std::time::Duration::from_millis(150));
     assert!(!edit.is_finished(), "the edit is waiting for the lock");
 
     drop(release);
@@ -342,16 +348,14 @@ fn a_store_that_cannot_be_read_changes_nothing() {
     // The write has to succeed and the read-back fail, so the store is taken
     // away while a writer is parked between the two.
     let (release, parked) = std::sync::mpsc::channel();
-    f.core.set_config_gate(parked);
+    let (arrived, at_gate) = std::sync::mpsc::channel();
+    f.core.set_config_gate(arrived, parked);
     let writer = {
         let core = f.core.clone();
         std::thread::spawn(move || core.set_config_value(keys::STALL_AFTER_S, "120"))
     };
-    let inside = (0..200).any(|_| {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        f.settings.get(keys::STALL_AFTER_S).unwrap().as_deref() == Some("120")
-    });
-    assert!(inside, "the writer stored its value and parked");
+    at_gate.recv_timeout(GATE).expect("the writer stored its value and parked");
+    assert_eq!(f.settings.get(keys::STALL_AFTER_S).unwrap().as_deref(), Some("120"), "the write landed");
     f.db.with_conn(|c| c.execute("DROP TABLE settings", [])).expect("drop the table");
     drop(release);
 
@@ -412,4 +416,50 @@ fn the_verbs_are_routed() {
         oximux_remote_proto::proto::PROTOCOL_VERSION,
     );
     assert_eq!(entries(&reply)[0].value, "0", "{reply:?}");
+}
+
+/// Rules the store must not be given are refused before it is written to.
+///
+/// `SettingsRepo` takes whatever it is handed, so a value over its 64 KiB
+/// contract would be stored and read back at the next start as the posture to
+/// enforce. Every rule here is valid, so only the size can refuse it.
+#[test]
+fn a_rules_value_too_big_for_the_store_is_refused() {
+    let f = fixture();
+    let before = f.settings.get(keys::VERIFY_ALLOW).unwrap();
+    let huge = (0..6000).map(|n| format!("Bash(cmd{n}:*)")).collect::<Vec<_>>().join("\n");
+    assert!(huge.len() > oximux_storage::SettingsRepo::MAX_VALUE_BYTES, "the value has to be over the limit");
+
+    let refused = f.core.set_config_value(keys::VERIFY_ALLOW, &huge);
+    assert!(matches!(refused, Err(ConfigError::BadValue(_))), "{refused:?}");
+    assert_eq!(f.settings.get(keys::VERIFY_ALLOW).unwrap(), before, "and nothing was stored");
+    assert_eq!(f.core.config(), HostConfig::default(), "nor applied");
+}
+
+/// The whole-config path holds the same limit, and holds it for every key.
+///
+/// The pane writes every key at once, so a check on the one value a verb was
+/// given would miss it entirely: the oversized text arrives inside a config.
+#[test]
+fn a_whole_config_too_big_for_the_store_is_refused() {
+    let f = fixture();
+    let before = f.core.config();
+    let stored_before: Vec<(&str, Option<String>)> =
+        before.entries().iter().map(|(key, _)| (*key, f.settings.get(key).unwrap())).collect();
+    let huge: Vec<String> = (0..6000).map(|n| format!("Bash(cmd{n}:*)")).collect();
+    assert!(
+        huge.join("\n").len() > oximux_storage::SettingsRepo::MAX_VALUE_BYTES,
+        "the rules have to be over the limit once stored"
+    );
+
+    let refused = f.core.edit_config(|config| {
+        config.confine_chat = true;
+        config.verify_allow = huge;
+    });
+
+    assert!(matches!(refused, Err(ConfigError::BadValue(_))), "{refused:?}");
+    assert_eq!(f.core.config(), before, "the host still enforces what it did");
+    for (key, value) in stored_before {
+        assert_eq!(f.settings.get(key).unwrap(), value, "{key} was left alone");
+    }
 }

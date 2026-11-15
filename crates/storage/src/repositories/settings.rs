@@ -12,6 +12,13 @@ pub struct SettingsRepo {
 }
 
 impl SettingsRepo {
+    /// The most a stored value may hold.
+    ///
+    /// Enforcement stays with the callers — this store takes what it is given
+    /// — but the number lives with the contract it belongs to, so the write
+    /// paths that hold it cannot drift apart from each other.
+    pub const MAX_VALUE_BYTES: usize = 64 * 1024;
+
     pub fn new(db: Db) -> Self {
         Self { db }
     }

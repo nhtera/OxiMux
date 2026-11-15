@@ -7,6 +7,7 @@
 //! restart needed.
 
 use oximux_agents::lineage::SpawnCaps;
+use oximux_storage::SettingsRepo;
 
 /// Settings keys, shared by both hosts' loaders.
 pub mod keys {
@@ -153,6 +154,26 @@ pub enum ConfigError {
     /// applying the defaults it would substitute would silently undo settings
     /// this host is still holding.
     Read(String),
+}
+
+/// Refuse text the settings store must not be given.
+///
+/// [`SettingsRepo`] stores whatever it is handed and leaves the limit to its
+/// callers, so **every** config write path has to hold it: an oversized value
+/// would be stored, read back at the next start as the posture to enforce, and
+/// carried to every surface that lists the config. Only `Rules` can plausibly
+/// reach the limit — a flag or a count cannot — but it is checked per stored
+/// value, so a key that grows a longer kind later is covered without a second
+/// rule to keep in step.
+pub(crate) fn within_store_limit(key: &str, text: &str) -> Result<(), ConfigError> {
+    if text.len() > SettingsRepo::MAX_VALUE_BYTES {
+        return Err(ConfigError::BadValue(format!(
+            "takes at most {} KiB, and {key} was given {} KiB",
+            SettingsRepo::MAX_VALUE_BYTES / 1024,
+            text.len() / 1024,
+        )));
+    }
+    Ok(())
 }
 
 /// The kind `key` takes, or `None` when this host has no such setting.
