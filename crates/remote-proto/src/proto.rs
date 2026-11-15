@@ -208,12 +208,19 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// can answer. A v37 peer's decoder does not know the event and is sent the
 /// prose instead: see [`PROMPTS_RETIRED_MIN_VERSION`].
 ///
+/// v39: **the host's own settings** ([`Request::HostConfigRead`],
+/// [`Request::HostConfigWrite`] and the [`Response::HostConfig`] reply): the
+/// caps, flags and clocks both hosts enforce, read and changed over the
+/// protocol — validated, persisted and applied by the host, which then says
+/// what it enforces. A v38 host cannot decode the requests and has no older
+/// equivalent to fall back to: see [`HOST_CONFIG_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -235,6 +242,18 @@ pub const PERMISSION_EDITED_MIN_VERSION: u32 = 20;
 /// reopens the session, but it is told the request was cut off and nothing was
 /// approved, which is the part that matters.
 pub const PROMPTS_RETIRED_MIN_VERSION: u32 = 38;
+
+/// The oldest host that can decode [`Request::HostConfigRead`] and
+/// [`Request::HostConfigWrite`].
+///
+/// Read by the **client**, like [`TEAM_PER_ROLE_MIN_VERSION`], and gated on
+/// what the command asks for rather than on the family it belongs to. Unlike
+/// those, there is **no fallback to pick**: `oximux config` has no older
+/// equivalent, so an older host could only answer "undecodable request frame"
+/// — a message about a malformed request, for a version problem. The refusal
+/// this gate produces is the whole story the caller gets, and it is the one
+/// worth getting.
+pub const HOST_CONFIG_MIN_VERSION: u32 = 39;
 
 /// The oldest peer that can decode [`Response::StateChanged`]. Like
 /// [`SCHEDULE_PUSH_MIN_VERSION`], this exists because a push reaches a peer
@@ -1031,6 +1050,23 @@ pub enum Request {
     /// A prompt under an idempotency key. Replies [`Response::SendOutcome`]:
     /// `Queued` for a new key, `Duplicate` (nothing sent) for a seen one.
     SendV2(crate::delivery::SendV2Req),
+
+    // ---- v39: the host's own settings ----
+    /// Read one of this host's settings, or every one (`key` `None`). Replies
+    /// [`Response::HostConfig`]; a key this host has no setting for is
+    /// [`RpcError::BadRequest`]. Full scope, read-only included: the entries
+    /// name no session and carry no credential.
+    HostConfigRead { key: Option<String> },
+    /// Set one of this host's settings: validated, persisted, and applied to
+    /// what it enforces from now on. Replies [`Response::HostConfig`] with
+    /// that one entry as it now stands — the value **after** clamping, which
+    /// is not always the one asked for.
+    ///
+    /// The local operator only. These are the caps and the confinement every
+    /// agent on this host runs under, so a paired device across a network may
+    /// read them and not widen them, for the reason
+    /// [`Request::PairNew`] is local-only.
+    HostConfigWrite { key: String, value: String },
 }
 
 /// Host → client.
@@ -1289,6 +1325,12 @@ pub enum Response {
     /// A session's health, **pushed** to a subscriber at or above
     /// [`HEALTH_PUSH_MIN_VERSION`]: once on subscribe, then on every change.
     SessionHealth(crate::delivery::SessionHealthFrame),
+
+    // ---- v39: the host's own settings ----
+    /// Reply to [`Request::HostConfigRead`] and [`Request::HostConfigWrite`]:
+    /// the settings asked about, as this host now enforces them. One entry for
+    /// a named key, every entry for a whole read.
+    HostConfig(Vec<crate::host_config::HostConfigEntryWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

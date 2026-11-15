@@ -384,6 +384,35 @@ Say what is happening in a worktree — a one-line comment, a work phase, or bot
 | `--comment` | yes | The status line — what is happening here right now. `""` clears it |
 | `--phase` | yes | The work phase: todo, in-progress, in-review, or done. `""` clears it. An unrecognised value is refused |
 
+### `oximux config`
+
+Read and change the host's own settings: the spawn caps, the delegation switches, the stall clock.
+
+_No arguments._
+
+#### `oximux config get`
+
+Print one setting's value, and nothing else — for a script to read
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<KEY>` | yes | The setting's key (`oximux config list` names them all) |
+
+#### `oximux config set`
+
+Change one setting. The host validates it, stores it, and applies it.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<KEY>` | yes | The setting's key (`oximux config list` names them all) |
+| `<VALUE>` | yes | Its new value. A flag takes true/false; a cap a whole number |
+
+#### `oximux config list`
+
+List every setting this host has, with which ones anybody has set
+
+_No arguments._
+
 ### `oximux open`
 
 Open a folder as a project in the OxiMux app (`oximux .` for this one).

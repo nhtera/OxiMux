@@ -7,6 +7,7 @@
 //! restart needed.
 
 use oximux_agents::lineage::SpawnCaps;
+use oximux_storage::SettingsRepo;
 
 /// Settings keys, shared by both hosts' loaders.
 pub mod keys {
@@ -43,6 +44,142 @@ pub const DEFAULT_VERIFY_ALLOW: &[&str] = &[
     "Bash(pytest:*)",
     "Bash(git status:*)",
 ];
+
+/// What kind of value a setting takes, for the one verb that writes them
+/// (`oximux config set`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// `true` or `false` (`1`/`0`, `on`/`off`, `yes`/`no` are taken too).
+    Flag,
+    /// A whole number. The caps are clamped on load, so what a host enforces
+    /// is not always the number stored — which is why `set` answers with the
+    /// effective value rather than echoing the request.
+    Count,
+    /// One `Bash(<command>)` rule per line.
+    Rules,
+}
+
+impl ValueKind {
+    /// The text to store for `value`, or what this kind takes instead.
+    ///
+    /// **Validation is here and not in the loader.** [`HostConfig::load`]
+    /// keeps a default for anything it cannot read, which is right for a
+    /// hand-edited row at startup and wrong for a verb: stored text the loader
+    /// ignores would be reported back as the default and read as a setting
+    /// that had been applied. So a value is refused before it is written.
+    pub fn canonical(self, value: &str) -> Result<String, String> {
+        let value = value.trim();
+        match self {
+            Self::Flag => match value {
+                "true" | "1" | "on" | "yes" => Ok("true".into()),
+                "false" | "0" | "off" | "no" => Ok("false".into()),
+                _ => Err("takes true or false".into()),
+            },
+            Self::Count => {
+                value.parse::<u32>().map(|n| n.to_string()).map_err(|_| "takes a whole number".into())
+            }
+            Self::Rules => {
+                let rules: Vec<&str> = value.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                let Some(bad) = rules.iter().find(|rule| !is_command_rule(rule)) else {
+                    return if rules.is_empty() {
+                        Err("takes one Bash(<command>) rule per line".into())
+                    } else {
+                        Ok(rules.join("\n"))
+                    };
+                };
+                Err(format!("{bad} is not a Bash(<command>) rule, which is all a verifier may run"))
+            }
+        }
+    }
+}
+
+/// Every setting this host reads, and the kind of value it takes.
+///
+/// One list, because the verb's key set, its validation and the loader must
+/// not drift: [`HostConfig::entries`] is the value side of these same keys,
+/// and `settable_and_entries_name_the_same_keys` holds the two together.
+pub const SETTABLE: &[(&str, ValueKind)] = &[
+    (keys::DELEGATION_ENABLED, ValueKind::Flag),
+    (keys::CONFINE_CHAT, ValueKind::Flag),
+    (keys::EXPOSE_TOOLS, ValueKind::Flag),
+    (keys::STEER_EVENTS, ValueKind::Flag),
+    (keys::CAP_DEPTH, ValueKind::Count),
+    (keys::CAP_ACTIVE_PER_PARENT, ValueKind::Count),
+    (keys::CAP_ACTIVE_PER_ROOT, ValueKind::Count),
+    (keys::CAP_OPEN_PER_ROOT, ValueKind::Count),
+    (keys::VERIFY_ALLOW, ValueKind::Rules),
+    (keys::STALL_AFTER_S, ValueKind::Count),
+    (keys::MAX_RESUMES, ValueKind::Count),
+];
+
+/// One setting as a host enforces it now: what `oximux config` prints, and
+/// what the wire entry is built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub key: &'static str,
+    /// In force now — after loading and clamping, not as it was asked for.
+    pub value: String,
+    /// Nothing is stored for this key: the value is the shipped default.
+    pub is_default: bool,
+}
+
+/// The config either side of one [`crate::HostCore::edit_config`] call.
+///
+/// Both are read under the settings-write lock, so a caller can tell what its
+/// own edit changed without racing another writer: comparing against a config
+/// it read beforehand could attribute an `oximux config set` to itself, or
+/// miss its own change entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEdit {
+    /// In force before the edit.
+    pub before: HostConfig,
+    /// In force now — sanitized, and already stored.
+    pub after: HostConfig,
+}
+
+/// Why a settings read or write was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// This host has no setting by that name.
+    UnknownKey,
+    /// Not what the key takes; the text says what it does take.
+    BadValue(String),
+    /// This host keeps no settings store, so there is nothing to read back or
+    /// persist into — a core built without one answers rather than pretending.
+    NoStore,
+    /// The store refused the write.
+    Write(String),
+    /// The store could not be read back, so nothing was applied: a missing
+    /// value and an unreadable one are the same to [`HostConfig::load`], and
+    /// applying the defaults it would substitute would silently undo settings
+    /// this host is still holding.
+    Read(String),
+}
+
+/// Refuse text the settings store must not be given.
+///
+/// [`SettingsRepo`] stores whatever it is handed and leaves the limit to its
+/// callers, so **every** config write path has to hold it: an oversized value
+/// would be stored, read back at the next start as the posture to enforce, and
+/// carried to every surface that lists the config. Only `Rules` can plausibly
+/// reach the limit — a flag or a count cannot — but it is checked per stored
+/// value, so a key that grows a longer kind later is covered without a second
+/// rule to keep in step.
+pub(crate) fn within_store_limit(key: &str, text: &str) -> Result<(), ConfigError> {
+    if text.len() > SettingsRepo::MAX_VALUE_BYTES {
+        return Err(ConfigError::BadValue(format!(
+            "takes at most {} KiB, and {key} was given {} KiB",
+            SettingsRepo::MAX_VALUE_BYTES / 1024,
+            text.len() / 1024,
+        )));
+    }
+    Ok(())
+}
+
+/// The kind `key` takes, or `None` when this host has no such setting.
+pub fn kind_of(key: &str) -> Option<ValueKind> {
+    SETTABLE.iter().find(|(k, _)| *k == key).map(|(_, kind)| *kind)
+}
 
 /// What the host reads to decide spawns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +323,29 @@ fn is_command_rule(rule: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verb's key set and the loader's are the same set. Two lists of the
+    /// same keys is how `oximux config list` comes to omit a setting the host
+    /// obeys, or to name one it does not.
+    #[test]
+    fn settable_and_entries_name_the_same_keys() {
+        let mut settable: Vec<&str> = SETTABLE.iter().map(|(key, _)| *key).collect();
+        let mut loaded: Vec<&str> = HostConfig::default().entries().into_iter().map(|(key, _)| key).collect();
+        settable.sort_unstable();
+        loaded.sort_unstable();
+        assert_eq!(settable, loaded);
+    }
+
+    /// Every settable key takes its own default back. A kind that disagrees
+    /// with the loader — a flag listed as a count — would refuse the value the
+    /// host itself writes.
+    #[test]
+    fn every_key_accepts_the_value_the_host_writes_for_it() {
+        for (key, value) in HostConfig::default().entries() {
+            let kind = kind_of(key).expect("a settable key");
+            assert_eq!(kind.canonical(&value).as_deref(), Ok(value.as_str()), "{key}");
+        }
+    }
 
     #[test]
     fn sanitizing_clamps_depth_and_count_caps() {

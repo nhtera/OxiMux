@@ -500,20 +500,30 @@ impl RemoteControl {
     }
 
     /// Build the host core over this host's registry. Called once at boot, with
-    /// the process runtime and the shared database's lineage store; the core
-    /// runs from then on whether or not any listener is enabled.
+    /// the process runtime, the shared database's lineage store and its
+    /// settings; the core runs from then on whether or not any listener is
+    /// enabled.
+    ///
+    /// The config is read here rather than passed in, because it and the store
+    /// `oximux config` writes through must be the same database: a write read
+    /// back from somewhere else is a setting that never takes.
     pub fn install_host_core(
         &mut self,
         rt: tokio::runtime::Handle,
         lineage: oximux_agents::lineage::LineageStore,
-        config: oximux_remote_host::HostConfig,
+        settings: oximux_storage::SettingsRepo,
     ) {
-        self.host_core = Some(oximux_remote_host::HostCore::new(oximux_remote_host::HostCoreDeps {
+        // The same settings keys `oximux serve` reads, so both hosts enforce
+        // the same caps.
+        let config = oximux_remote_host::HostConfig::load(|key| settings.get(key).ok().flatten());
+        let core = oximux_remote_host::HostCore::new(oximux_remote_host::HostCoreDeps {
             rt,
             lineage,
             registry: self.registry.clone(),
             config,
-        }));
+        });
+        core.set_settings(settings);
+        self.host_core = Some(core);
     }
 
     /// The host core, once installed.
@@ -1073,6 +1083,52 @@ impl RemoteControl {
         }
     }
 
+    /// Respawn open chats when something other than the Settings pane switches
+    /// confinement on — `oximux config set agents.delegation.confine_chat true`
+    /// over the protocol, which applies to the host at once and knows nothing
+    /// about this app's open windows.
+    ///
+    /// Without this the switch would report success while the agents of chats
+    /// already open kept the operator reach they were spawned with: a security
+    /// setting that did not take. The pane does the same step itself, and both
+    /// read the same edge ([`Self::confinement_switched_on`]).
+    ///
+    /// Started once at boot, after the core is installed; it ends when the
+    /// core's config channel closes, which is when the core itself goes.
+    pub fn watch_confinement(cx: &mut gpui::App) {
+        let Some(core) = cx.try_global::<RemoteControl>().and_then(|rc| rc.host_core()) else {
+            return;
+        };
+        let mut config = core.subscribe_config();
+        let mut confined = config.borrow().confine_chat;
+        drop(core);
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            while config.changed().await.is_ok() {
+                // Read and release: nothing holds the watch's borrow across an
+                // await, and the respawn below runs on the app thread.
+                let next = config.borrow_and_update().confine_chat;
+                let switched_on = Self::confinement_switched_on(confined, next);
+                confined = next;
+                if switched_on {
+                    cx.update(Self::refresh_chat_credentials);
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Whether a settings change switched chat confinement **on**.
+    ///
+    /// One rule, read by both writers: the Settings pane
+    /// (`pane_agents_delegation::apply`) and the config watcher that catches
+    /// `oximux config set agents.delegation.confine_chat true`. Only the
+    /// false → true edge matters — chats spawned while confinement was off
+    /// have no credential, and switching it off takes nothing away from the
+    /// ones that do.
+    pub fn confinement_switched_on(before: bool, after: bool) -> bool {
+        after && !before
+    }
+
     /// Drop a chat's credential when its agent process is gone.
     pub fn revoke_chat_credential(&self, session_id: &str) {
         let Some(credential) = self.chat_credentials.lock().unwrap().remove(session_id) else {
@@ -1138,6 +1194,18 @@ mod tests {
     use oximux_remote_host::{AppPubkey, StoredDevice};
 
     use super::*;
+
+    /// The one edge that costs a respawn, read by both writers: the Settings
+    /// pane and the watcher that catches `oximux config set`. Switching
+    /// confinement *off* takes nothing away from a chat that already has a
+    /// credential, and a republish of the same value is not a change.
+    #[test]
+    fn only_switching_confinement_on_asks_for_a_respawn() {
+        assert!(RemoteControl::confinement_switched_on(false, true));
+        assert!(!RemoteControl::confinement_switched_on(true, false));
+        assert!(!RemoteControl::confinement_switched_on(true, true));
+        assert!(!RemoteControl::confinement_switched_on(false, false));
+    }
 
     fn a_conn() -> Arc<dyn AgentConnection> {
         Arc::new(StubConnection::default())
@@ -1399,7 +1467,11 @@ mod tests {
         let db = oximux_storage::db::open_memory().unwrap();
         let lineage = LineageStore::new(db.conn());
         let mut rc = RemoteControl::new();
-        rc.install_host_core(rt.handle().clone(), lineage.clone(), oximux_remote_host::HostConfig::default());
+        rc.install_host_core(
+            rt.handle().clone(),
+            lineage.clone(),
+            oximux_storage::SettingsRepo::new(db.clone()),
+        );
         rc.bind("agent-7", a_conn());
         let spec = SpawnSpec {
             request_id: "r1".into(),
@@ -1438,7 +1510,7 @@ mod tests {
         rc.install_host_core(
             rt.handle().clone(),
             oximux_agents::lineage::LineageStore::new(db.conn()),
-            oximux_remote_host::HostConfig::default(),
+            oximux_storage::SettingsRepo::new(db.clone()),
         );
         assert!(rc.mint_chat_credential("agent-1").is_none(), "no listener, no credential");
 

@@ -12,6 +12,13 @@ pub struct SettingsRepo {
 }
 
 impl SettingsRepo {
+    /// The most a stored value may hold.
+    ///
+    /// Enforcement stays with the callers — this store takes what it is given
+    /// — but the number lives with the contract it belongs to, so the write
+    /// paths that hold it cannot drift apart from each other.
+    pub const MAX_VALUE_BYTES: usize = 64 * 1024;
+
     pub fn new(db: Db) -> Self {
         Self { db }
     }
@@ -42,6 +49,28 @@ impl SettingsRepo {
                 params![key, value],
             )
             .map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    /// Upsert every pair in **one transaction**: all of them land, or none do.
+    ///
+    /// A whole-config write (the desktop's Agent-delegation pane) must not be
+    /// able to half-apply. `set` commits per key, so a failure part way through
+    /// a loop would leave the store holding a mixture of the old and the new
+    /// config — and a later host start would read that mixture back as the
+    /// posture to enforce. Values MUST be <= 64 KiB, as in [`Self::set`].
+    pub fn set_many(&self, entries: &[(&str, String)]) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            for (key, value) in entries {
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, value],
+                )?;
+            }
+            tx.commit()
         })?;
         Ok(())
     }

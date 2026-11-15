@@ -556,11 +556,7 @@ fn main() {
         // which thread later calls into it.
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
-                // The same settings keys `oximux serve` reads, from the shared
-                // database, so both hosts enforce the same caps.
-                let settings = app_state.settings_repo();
-                let config = oximux_remote_host::HostConfig::load(|key| settings.get(key).ok().flatten());
-                remote_control.install_host_core(rt, app_state.lineage_store(), config);
+                remote_control.install_host_core(rt, app_state.lineage_store(), app_state.settings_repo().clone());
             }
             Err(_) => tracing::warn!("no tokio runtime; agent orchestration host core not started"),
         }
@@ -666,6 +662,12 @@ fn main() {
             remote_control.set_transcriber(transcriber);
         }
         cx.set_global(remote_control);
+        // A confinement switch that came over the protocol (`oximux config
+        // set`) has to reach chats that are already open: their agents were
+        // spawned with the operator's reach and only a respawn gives them a
+        // confined credential. Reads the global, so it starts here and not
+        // beside the core it watches.
+        oximux_app::remote_control::RemoteControl::watch_confinement(cx);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an
         // already-paired phone simply cannot reach it until someone opens Settings

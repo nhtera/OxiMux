@@ -23,19 +23,49 @@ fn current(cx: &gpui::App) -> HostConfig {
         .map_or_else(HostConfig::default, |core| core.config())
 }
 
-/// Store `next` in the settings keys and hand it to the running core.
-fn apply(modal: &SettingsModal, next: HostConfig, cx: &mut gpui::Context<SettingsModal>) {
-    let next = next.sanitized();
-    let confinement_switched_on = next.confine_chat && !current(cx).confine_chat;
-    for (key, value) in next.entries() {
-        if let Err(err) = modal.notify_repo.set(key, &value) {
-            tracing::warn!(%err, key, "agent delegation setting not saved");
+/// Apply one field's `edit` to the host settings and store the result.
+///
+/// The edit is a closure, not a finished `HostConfig`, so the core can run it
+/// on the config in force while it holds its write lock: a struct built from a
+/// config this pane read first would write back whatever an `oximux config set`
+/// changed in between.
+fn apply(
+    modal: &SettingsModal,
+    edit: impl FnOnce(&mut HostConfig),
+    cx: &mut gpui::Context<SettingsModal>,
+) {
+    let switched_on = match cx.try_global::<RemoteControl>().and_then(|rc| rc.host_core()) {
+        // Through the core, which holds its settings-write lock across the
+        // read, the store and the apply: this pane stores every key at once,
+        // and `oximux config set` stores one, so two unlocked writers could
+        // leave the store and what the host enforces disagreeing.
+        Some(core) => match core.edit_config(edit) {
+            Ok(change) => RemoteControl::confinement_switched_on(
+                change.before.confine_chat,
+                change.after.confine_chat,
+            ),
+            // Nothing was stored and nothing is in force that was not before,
+            // so there is no new posture for open chats to pick up.
+            Err(err) => {
+                tracing::warn!(?err, "agent delegation settings not saved");
+                false
+            }
+        },
+        // No core yet (no runtime at boot): there is nothing to apply and no
+        // lock to take, but the keys must still be stored for the next start,
+        // and no chat is open to respawn.
+        None => {
+            let mut next = current(cx);
+            edit(&mut next);
+            for (key, value) in next.sanitized().entries() {
+                if let Err(err) = modal.notify_repo.set(key, &value) {
+                    tracing::warn!(%err, key, "agent delegation setting not saved");
+                }
+            }
+            false
         }
-    }
-    if let Some(core) = cx.try_global::<RemoteControl>().and_then(|rc| rc.host_core()) {
-        core.set_config(next);
-    }
-    if confinement_switched_on {
+    };
+    if switched_on {
         // Open chats' agents were spawned without a credential: respawn them
         // (after any running turn) so they pick one up.
         cx.defer(RemoteControl::refresh_chat_credentials);
@@ -87,9 +117,8 @@ pub(super) fn commit_verify_allow(modal: &SettingsModal, raw: &str, cx: &mut gpu
     if rules.is_empty() {
         rules = HostConfig::default().verify_allow;
     }
-    let now = current(cx);
-    if rules != now.verify_allow {
-        apply(modal, HostConfig { verify_allow: rules, ..now }, cx);
+    if rules != current(cx).verify_allow {
+        apply(modal, move |config| config.verify_allow = rules, cx);
     }
 }
 
@@ -163,14 +192,10 @@ fn cap_row(
         density,
         typography,
         move |this: &mut SettingsModal, _w, cx| {
-            let mut next = current(cx);
-            set(&mut next, value.saturating_sub(1).max(1));
-            apply(this, next, cx);
+            apply(this, |config| set(config, value.saturating_sub(1).max(1)), cx);
         },
         move |this: &mut SettingsModal, _w, cx| {
-            let mut next = current(cx);
-            set(&mut next, (value + 1).min(max));
-            apply(this, next, cx);
+            apply(this, |config| set(config, (value + 1).min(max)), cx);
         },
         cx,
     );
@@ -190,9 +215,7 @@ pub(super) fn entries(
         config.delegation_enabled,
         theme,
         |this: &mut SettingsModal, _w, cx| {
-            let mut next = current(cx);
-            next.delegation_enabled = !next.delegation_enabled;
-            apply(this, next, cx);
+            apply(this, |config| config.delegation_enabled = !config.delegation_enabled, cx);
         },
         cx,
     );
@@ -201,9 +224,7 @@ pub(super) fn entries(
         config.confine_chat,
         theme,
         |this: &mut SettingsModal, _w, cx| {
-            let mut next = current(cx);
-            next.confine_chat = !next.confine_chat;
-            apply(this, next, cx);
+            apply(this, |config| config.confine_chat = !config.confine_chat, cx);
         },
         cx,
     );
@@ -212,9 +233,7 @@ pub(super) fn entries(
         config.expose_tools,
         theme,
         |this: &mut SettingsModal, _w, cx| {
-            let mut next = current(cx);
-            next.expose_tools = !next.expose_tools;
-            apply(this, next, cx);
+            apply(this, |config| config.expose_tools = !config.expose_tools, cx);
         },
         cx,
     );

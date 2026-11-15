@@ -315,6 +315,18 @@ pub enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    /// Read and change the host's own settings: the spawn caps, the
+    /// delegation switches, the stall clock.
+    ///
+    /// The host validates, stores and applies each change, so it takes effect
+    /// without a restart and whichever host holds the data directory enforces
+    /// it. Changing one is the local operator's alone; a paired device may
+    /// read them.
+    #[command(verbatim_doc_comment)]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Open a folder as a project in the OxiMux app (`oximux .` for this one).
     ///
     /// A project OxiMux already knows that holds the folder is selected again,
@@ -846,6 +858,29 @@ pub enum SkillsCommand {
         #[arg(long, value_name = "SLUG")]
         agent: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Print one setting's value, and nothing else — for a script to read.
+    Get {
+        /// The setting's key (`oximux config list` names them all).
+        key: String,
+    },
+    /// Change one setting. The host validates it, stores it, and applies it.
+    ///
+    /// The value printed back is the one now in force, which is not always the
+    /// one asked for: the caps are clamped to their ceilings.
+    #[command(verbatim_doc_comment)]
+    Set {
+        /// The setting's key (`oximux config list` names them all).
+        key: String,
+        /// Its new value. A flag takes true/false; a cap a whole number.
+        value: String,
+    },
+    /// List every setting this host has, with which ones anybody has set.
+    #[command(visible_alias = "ls")]
+    List,
 }
 
 #[derive(Subcommand, Debug)]

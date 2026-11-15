@@ -24,11 +24,12 @@ fn chat_with_host_on(
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
     let db = oximux_storage::db::open_memory().unwrap();
     let lineage = oximux_agents::lineage::LineageStore::new(db.conn());
+    let settings = oximux_storage::SettingsRepo::new(db.clone());
     let handle = rt.handle().clone();
     cx.update(gpui_component::init);
     cx.update(|cx| {
         let mut rc = RemoteControl::new();
-        rc.install_host_core(handle, lineage, oximux_remote_host::HostConfig::default());
+        rc.install_host_core(handle, lineage, settings);
         cx.set_global(rc);
         cx.set_global(AgentRetrySettings::shipped());
     });

@@ -159,6 +159,14 @@ fn seed_session(data_dir: &Path, session_id: &str) {
 
 fn client(data_dir: &Path) -> Command {
     let mut cmd = bin();
+    // `--dir` does not pin the target: `resolve_and_connect` reads the hosts
+    // file and OXIMUX_HOST first and only then falls back to the local socket.
+    // On a machine with a paired default — any developer's — these invocations
+    // would reach that host instead of the serve under test, and `config set`
+    // would change its settings. The same isolation `hosts_e2e` uses, for the
+    // same reason.
+    cmd.env_remove("OXIMUX_HOST");
+    cmd.env("OXIMUX_CONFIG_DIR", data_dir.with_extension("hosts"));
     cmd.args(["--dir", data_dir.to_str().unwrap(), "--timeout", "15"]);
     cmd
 }
@@ -218,6 +226,63 @@ fn serve_lists_persisted_sessions_across_restarts() {
         1,
         "a session created before the restart is listed after it"
     );
+    serve.stop_hard();
+}
+
+/// The settings verbs against a real serve: what a `set` reports is what the
+/// host enforces, what it clamps it says so about, and what it stores survives
+/// a restart.
+///
+/// Driven through the binary rather than the handler, because the claim is
+/// about the whole path — a CLI that writes the database directly would pass
+/// every unit test here and change nothing on a running host.
+#[test]
+fn serve_reads_and_changes_its_own_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("serve-home");
+    let serve = boot_serve(&data_dir);
+
+    let out = client(&data_dir).args(["--json", "config", "list"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let listed = json_stdout(&out);
+    let settings = listed["data"]["settings"].as_array().unwrap();
+    assert!(settings.len() >= 10, "every setting this host has: {settings:?}");
+    let depth = settings
+        .iter()
+        .find(|e| e["key"] == "agents.delegation.cap.depth")
+        .expect("the depth cap is listed");
+    assert_eq!(depth["is_default"], true, "nobody has set it yet");
+
+    // Above the ceiling on purpose: the answer must be the number in force.
+    let out = client(&data_dir)
+        .args(["--json", "config", "set", "agents.delegation.cap.depth", "9"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let set = json_stdout(&out);
+    assert_eq!(set["data"]["value"], "2", "clamped, and said so rather than echoed");
+    assert_eq!(set["data"]["is_default"], false);
+
+    // The plain `get` prints the value alone, which is what a script reads.
+    let out = client(&data_dir).args(["config", "get", "agents.delegation.cap.depth"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+
+    // A key this host has no setting for is the caller's mistake, not a crash.
+    let out = client(&data_dir).args(["config", "get", "agents.delegation.cap.deptth"]).output().unwrap();
+    assert_ne!(out.status.code(), Some(0), "an unknown key is refused");
+
+    #[cfg(unix)]
+    serve.stop_gracefully();
+    #[cfg(not(unix))]
+    serve.stop_hard();
+
+    let serve = boot_serve(&data_dir);
+    let out = client(&data_dir).args(["--json", "config", "get", "agents.delegation.cap.depth"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let after = json_stdout(&out);
+    assert_eq!(after["data"]["value"], "2", "the change outlived the host that made it");
+    assert_eq!(after["data"]["is_default"], false, "and is still somebody's choice, not a default");
     serve.stop_hard();
 }
 

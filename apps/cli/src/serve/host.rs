@@ -22,14 +22,18 @@ pub(crate) fn build_host_core(
     registry: Arc<SessionRegistry>,
     settings: &oximux_storage::SettingsRepo,
 ) -> Arc<HostCore> {
-    HostCore::new(HostCoreDeps {
+    let core = HostCore::new(HostCoreDeps {
         rt,
         lineage: oximux_agents::lineage::LineageStore::new(db.conn()),
         registry,
         // Not `HostConfig::default()`: the keys the desktop's Settings pane
         // writes are the keys this host obeys.
         config: HostConfig::load(|key| settings.get(key).ok().flatten()),
-    })
+    });
+    // The same store the config was just read from, so `oximux config` writes
+    // where this host reads — and so a change applies here without a restart.
+    core.set_settings(settings.clone());
+    core
 }
 
 #[cfg(test)]
@@ -76,6 +80,26 @@ mod tests {
         assert_eq!(got.caps.active_per_parent, stored.caps.active_per_parent);
         assert_eq!(got.caps.active_per_root, stored.caps.active_per_root);
         assert_eq!(got.caps.open_per_root, stored.caps.open_per_root);
+    }
+
+    /// The settings verb writes where this host reads. Without the store
+    /// installed, `oximux config set` against a serve answers `Unsupported`.
+    #[test]
+    fn the_core_can_change_a_setting_and_enforces_it_at_once() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let db = oximux_storage::db::open_memory().unwrap();
+        let settings = oximux_storage::SettingsRepo::new(db.clone());
+
+        let core = build_host_core(rt.handle().clone(), &db, Arc::new(SessionRegistry::new()), &settings);
+        let entry = core.set_config_value("agents.health.stall_after_s", "90").expect("set");
+
+        assert_eq!(entry.value, "90");
+        assert_eq!(core.config().stall_after_s, 90, "this host enforces it now");
+        assert_eq!(
+            settings.get("agents.health.stall_after_s").unwrap().as_deref(),
+            Some("90"),
+            "and the next host reads it from the same row",
+        );
     }
 
     /// An empty store is defaults, not zeroes — a serve with no settings row

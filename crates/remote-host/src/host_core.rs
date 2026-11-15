@@ -32,8 +32,29 @@ use oximux_single_instance::HolderRecord;
 use tokio::sync::{mpsc, watch};
 
 use crate::child_watcher::ChildWatcher;
-use crate::host_config::HostConfig;
+use crate::host_config::{self, ConfigEdit, ConfigEntry, ConfigError, HostConfig};
 use crate::outbox_drainer::{self, DrainMsg};
+
+/// Every settable key that has a stored value, read in one pass.
+///
+/// A read that fails is returned as an error, not as an absent key: absent
+/// means "nobody set this, use the shipped default", and a store that cannot
+/// be read says nothing about what anybody set.
+fn stored_values(
+    settings: &oximux_storage::SettingsRepo,
+) -> Result<std::collections::HashMap<&'static str, String>, ConfigError> {
+    let mut stored = std::collections::HashMap::new();
+    for (key, _) in host_config::SETTABLE {
+        match settings.get(key) {
+            Ok(Some(value)) => {
+                stored.insert(*key, value);
+            }
+            Ok(None) => {}
+            Err(err) => return Err(ConfigError::Read(err.to_string())),
+        }
+    }
+    Ok(stored)
+}
 
 /// How long a recorded child event waits for others before it is delivered,
 /// so children that finish together reach their parent as one message.
@@ -126,6 +147,25 @@ pub struct HostCore {
     /// Builds a dormant session so a recovery turn can reach it; installed
     /// by the host after the core (see [`Self::set_catalog`]).
     catalog: Mutex<Option<Arc<dyn crate::catalog::SessionCatalog>>>,
+    /// Where this host's own settings live, installed after the core like the
+    /// catalog (see [`Self::set_settings`]).
+    ///
+    /// No seam over it, because there is nothing to abstract: both hosts
+    /// already keep these keys in a `SettingsRepo` over the shared database —
+    /// that is what makes one data directory enforce one set of caps — and a
+    /// trait with a single implementation would only hide which store a host
+    /// is reading.
+    settings: Mutex<Option<oximux_storage::SettingsRepo>>,
+    /// Held across a settings write-reload-apply, so two of them cannot
+    /// interleave.
+    ///
+    /// Each connection serves its requests on its own task of a multi-threaded
+    /// runtime, so two operators (or one, twice over) reach the write at the
+    /// same time. Without this, A could store its value, B could store and
+    /// apply a newer one, and A could then apply the config it had already
+    /// read — leaving the store saying one thing and the host enforcing
+    /// another until the next write or a restart.
+    config_write: Mutex<()>,
     /// Counts the times this process won the data directory, so work begun
     /// under one ownership stops once it is given up (even if won back).
     owner_gen: std::sync::atomic::AtomicU64,
@@ -137,6 +177,15 @@ pub struct HostCore {
     /// global, so a test that installs one cannot stall any other.
     #[cfg(test)]
     pass_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    /// Test-only: a one-shot park inside a settings write, after the store
+    /// write and before the read-back — inside the window two writers would
+    /// interleave in if the sequence were not serialized, and the window a
+    /// store can break in between a write that worked and a read that does
+    /// not. The first writer to find it takes it, so a second one is never
+    /// parked by it. Per core, like `pass_gate`. The sender is how a parked
+    /// writer announces that it got there: see [`Self::hold_config_write`].
+    #[cfg(test)]
+    config_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl HostCore {
@@ -160,10 +209,14 @@ impl HostCore {
             drain: drain.clone(),
             debounce: Mutex::new(EVENT_DEBOUNCE),
             catalog: Mutex::new(None),
+            settings: Mutex::new(None),
+            config_write: Mutex::new(()),
             owner_gen: std::sync::atomic::AtomicU64::new(0),
             attention: crate::attention::AttentionSlots::new(prefs),
             #[cfg(test)]
             pass_gate: Mutex::new(None),
+            #[cfg(test)]
+            config_gate: Mutex::new(None),
         });
         core.registry.set_health_config(core.config().health());
         core.spawn_status_subscriber();
@@ -277,6 +330,107 @@ impl HostCore {
 
     pub(crate) fn catalog(&self) -> Option<Arc<dyn crate::catalog::SessionCatalog>> {
         self.catalog.lock().unwrap().clone()
+    }
+
+    /// Install the store this host's settings live in. Called once at boot
+    /// with the same `SettingsRepo` the config was loaded from: the two must
+    /// be one database, or a write would be read back from somewhere else.
+    pub fn set_settings(&self, settings: oximux_storage::SettingsRepo) {
+        *self.settings.lock().unwrap() = Some(settings);
+    }
+
+    fn settings(&self) -> Result<oximux_storage::SettingsRepo, ConfigError> {
+        self.settings.lock().unwrap().clone().ok_or(ConfigError::NoStore)
+    }
+
+    /// Every setting this host has, as it enforces them now.
+    pub fn config_entries(&self) -> Result<Vec<ConfigEntry>, ConfigError> {
+        let stored = stored_values(&self.settings()?)?;
+        Ok(self
+            .config()
+            .entries()
+            .into_iter()
+            .map(|(key, value)| ConfigEntry { key, value, is_default: !stored.contains_key(key) })
+            .collect())
+    }
+
+    /// One setting, by key.
+    pub fn config_entry(&self, key: &str) -> Result<ConfigEntry, ConfigError> {
+        if host_config::kind_of(key).is_none() {
+            return Err(ConfigError::UnknownKey);
+        }
+        self.config_entries()?.into_iter().find(|e| e.key == key).ok_or(ConfigError::UnknownKey)
+    }
+
+    /// Validate `value`, persist it, apply it, and answer with the setting as
+    /// it now stands.
+    ///
+    /// **In that order, and all four here.** The value is checked before it is
+    /// written, because stored text the loader ignores would read back as the
+    /// default and look like a setting that had been applied. It is then read
+    /// back *through the loader* rather than assigned field by field, so the
+    /// answer is what this host enforces — a depth of 9 reads as 2 — and so
+    /// there is one mapping from keys to config, not two that can disagree.
+    pub fn set_config_value(&self, key: &str, value: &str) -> Result<ConfigEntry, ConfigError> {
+        let kind = host_config::kind_of(key).ok_or(ConfigError::UnknownKey)?;
+        let text = kind.canonical(value).map_err(ConfigError::BadValue)?;
+        host_config::within_store_limit(key, &text)?;
+        let settings = self.settings()?;
+        // One writer at a time, for the whole sequence: see `config_write`.
+        let _write = self.config_write.lock().unwrap();
+        settings.set(key, &text).map_err(|err| ConfigError::Write(err.to_string()))?;
+        #[cfg(test)]
+        self.hold_config_write();
+        // Every key read before anything is applied, and a read that fails is
+        // an error rather than a missing value: `load` substitutes defaults for
+        // what it cannot read, so an unreadable store would quietly undo every
+        // other setting and report success.
+        let stored = stored_values(&settings)?;
+        self.set_config(HostConfig::load(|key| stored.get(key).cloned()));
+        tracing::info!(key, value = %text, "host setting changed");
+        // Released before the read-back, which takes the store's lock again.
+        drop(_write);
+        self.config_entry(key)
+    }
+
+    /// Edit the whole config and apply it, under the same lock one key takes.
+    ///
+    /// The desktop's Settings pane changes a field at a time but stores every
+    /// key at once, so it writes through here rather than looping over the
+    /// store itself: otherwise its write and an `oximux config set` could
+    /// interleave, and whichever applied second would hold a config the store
+    /// no longer agrees with.
+    ///
+    /// **`edit` runs inside the lock, on the config in force.** A caller that
+    /// read the config first and handed the whole struct in would write back
+    /// whatever a `config set` changed in between — the lock serialises the
+    /// writes, but it cannot protect a snapshot taken before it. The store is
+    /// written in one transaction for the same reason: a loop that failed part
+    /// way through would leave the rows disagreeing with what is enforced, and
+    /// the next host start would read that mixture back as its posture.
+    pub fn edit_config<F>(&self, edit: F) -> Result<ConfigEdit, ConfigError>
+    where
+        F: FnOnce(&mut HostConfig),
+    {
+        let settings = self.settings()?;
+        let _write = self.config_write.lock().unwrap();
+        let before = self.config();
+        let mut next = before.clone();
+        edit(&mut next);
+        let after = next.sanitized();
+        let entries = after.entries();
+        for (key, text) in &entries {
+            host_config::within_store_limit(key, text)?;
+        }
+        settings.set_many(&entries).map_err(|err| ConfigError::Write(err.to_string()))?;
+        self.set_config(after.clone());
+        Ok(ConfigEdit { before, after })
+    }
+
+    /// Follow the host settings. A change applies to the core before it is
+    /// published here, so a follower reads the config that is already in force.
+    pub fn subscribe_config(&self) -> watch::Receiver<HostConfig> {
+        self.config.subscribe()
     }
 
     /// Change [`Self::event_debounce`] (tests shorten it).
@@ -554,6 +708,35 @@ impl HostCore {
     #[cfg(test)]
     pub(crate) fn set_pass_gate(&self, gate: Option<Arc<std::sync::Barrier>>) {
         *self.pass_gate.lock().unwrap() = gate;
+    }
+
+    /// Test-only: announce that a writer reached the window, then park here
+    /// until the test lets go — if it installed a gate. The gate's own lock is
+    /// released before the wait, so nothing else blocks on it.
+    ///
+    /// **Arrival is announced, not timed.** A test that staged its second
+    /// writer after a sleep would pass or fail on scheduling: with the first
+    /// writer not yet run, the second would take the lock first and the
+    /// interleaving under test would never happen. So the test waits for this
+    /// signal instead, and the lock is held for certain by the time it does.
+    #[cfg(test)]
+    fn hold_config_write(&self) {
+        let gate = self.config_gate.lock().unwrap().take();
+        if let Some((arrived, release)) = gate {
+            let _ = arrived.send(());
+            let _ = release.recv();
+        }
+    }
+
+    /// Test-only: install [`Self::hold_config_write`]'s one-shot gate — the
+    /// sender it announces arrival on, and the receiver it parks on.
+    #[cfg(test)]
+    pub(crate) fn set_config_gate(
+        &self,
+        arrived: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.config_gate.lock().unwrap() = Some((arrived, release));
     }
 
     fn spawn_status_subscriber(self: &Arc<Self>) {

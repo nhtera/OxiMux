@@ -58,6 +58,10 @@ struct Row {
     manage_worktrees: bool,
     administer_pairing: bool,
     manage_teams: bool,
+    // The host's own settings: read at full scope, changed only at the
+    // keyboard — they are the caps and the confinement every agent runs under.
+    read_host_config: bool,
+    change_host_config: bool,
     // A run the caller is in, and one it is not.
     read_own_team_run: bool,
     read_other_team_run: bool,
@@ -104,6 +108,8 @@ fn observe(store: &AuthStore, peer: &Peer) -> Row {
         manage_worktrees: store.may_manage_worktrees(peer),
         administer_pairing: store.may_administer_pairing(peer),
         manage_teams: store.may_manage_teams(peer),
+        read_host_config: store.may_read_host_config(peer),
+        change_host_config: store.may_change_host_config(peer),
         read_own_team_run: store.may_read_team_run(peer, &[IN_SCOPE.to_string()]),
         read_other_team_run: store.may_read_team_run(peer, &[OUT_OF_SCOPE.to_string()]),
         attempt_heartbeat_writes: store.may_attempt_heartbeat_writes(peer),
@@ -148,6 +154,8 @@ const NOTHING: Row = Row {
     manage_worktrees: false,
     administer_pairing: false,
     manage_teams: false,
+    read_host_config: false,
+    change_host_config: false,
     read_own_team_run: false,
     read_other_team_run: false,
     attempt_heartbeat_writes: false,
@@ -226,6 +234,8 @@ fn a_local_operator_reaches_everything_including_pairing() {
             manage_worktrees: true,
             administer_pairing: true,
             manage_teams: true,
+            read_host_config: true,
+            change_host_config: true,
             read_own_team_run: true,
             read_other_team_run: true,
             attempt_heartbeat_writes: true,
@@ -351,6 +361,10 @@ fn a_full_remote_device_reaches_everything_except_pairing() {
             // The strictest gate on the protocol: local operator only.
             administer_pairing: false,
             manage_teams: true,
+            // It may read the caps it runs under; changing them could turn
+            // confinement off, which is the pairing gate's reasoning again.
+            read_host_config: true,
+            change_host_config: false,
             read_own_team_run: true,
             read_other_team_run: true,
             attempt_heartbeat_writes: true,
@@ -390,6 +404,7 @@ fn a_read_only_remote_device_watches_but_never_acts() {
             use_terminals: true,
             read_schedules: true,
             read_worktrees: true,
+            read_host_config: true,
             read_own_team_run: true,
             read_other_team_run: true,
             read_state: true,
