@@ -77,6 +77,9 @@ pub struct HeadlessCatalog {
     /// session id already exists, so the credential is granted under it
     /// directly and never needs rebinding.
     local: Arc<oximux_remote_local::LocalControlListener>,
+    /// Handed to every pump this catalog resumes: the pump reports the
+    /// failures, the driver holds the timer.
+    retry: Arc<super::retry::ServeRetry>,
 }
 
 impl HeadlessCatalog {
@@ -89,6 +92,7 @@ impl HeadlessCatalog {
         draining: Arc<AtomicBool>,
         index: Arc<SessionIndex>,
         local: Arc<oximux_remote_local::LocalControlListener>,
+        retry: Arc<super::retry::ServeRetry>,
     ) -> Self {
         match settings.list_prefixed(CHAT_KEY_PREFIX) {
             Ok(rows) => {
@@ -112,7 +116,7 @@ impl HeadlessCatalog {
             Err(err) => tracing::warn!(%err, "chat blob scan failed; catalog starts empty"),
         }
         tracing::info!(sessions = index.rows.lock().unwrap().len(), "session catalog scanned");
-        Self { registry, settings, pumps, draining, gate: OpenGate::new(), index, local }
+        Self { registry, settings, pumps, draining, gate: OpenGate::new(), index, local, retry }
     }
 
     /// The resume path: reconnect the persisted session's agent and pump it.
@@ -196,6 +200,7 @@ impl HeadlessCatalog {
                 settings: self.settings.clone(),
                 registry: self.registry.clone(),
                 index: self.index.clone(),
+                retry: self.retry.clone(),
                 on_end: Some({
                     let local = self.local.clone();
                     let session_id = session_id.to_string();

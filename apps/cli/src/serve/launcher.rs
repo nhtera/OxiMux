@@ -112,6 +112,9 @@ pub struct HeadlessLauncher {
     index: Arc<SessionIndex>,
     /// The local socket, for minting each agent's own confined credential.
     local: Arc<LocalControlListener>,
+    /// Handed to every pump this launcher starts: the pump reports the
+    /// failures, the driver holds the timer.
+    retry: Arc<super::retry::ServeRetry>,
 }
 
 impl HeadlessLauncher {
@@ -122,8 +125,9 @@ impl HeadlessLauncher {
         draining: Arc<AtomicBool>,
         index: Arc<SessionIndex>,
         local: Arc<LocalControlListener>,
+        retry: Arc<super::retry::ServeRetry>,
     ) -> Self {
-        Self { registry, settings, pumps, draining, index, local }
+        Self { registry, settings, pumps, draining, index, local, retry }
     }
 }
 
@@ -300,6 +304,7 @@ impl SessionLauncher for HeadlessLauncher {
                 settings: self.settings.clone(),
                 registry: self.registry.clone(),
                 index: self.index.clone(),
+                retry: self.retry.clone(),
                 on_end: Some({
                     let local = self.local.clone();
                     Box::new(move || local.revoke_session(&label))

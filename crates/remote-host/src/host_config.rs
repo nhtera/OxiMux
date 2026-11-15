@@ -7,7 +7,7 @@
 //! restart needed.
 
 use oximux_agents::lineage::SpawnCaps;
-use oximux_settings::agent_retry::MaxAutomaticWait;
+pub use oximux_settings::agent_retry::MaxAutomaticWait;
 use oximux_storage::SettingsRepo;
 
 /// Settings keys, shared by both hosts' loaders.

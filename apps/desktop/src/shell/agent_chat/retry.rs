@@ -33,9 +33,7 @@ use super::*;
 /// a limit that expired without them.
 const RESTORE_GRACE_MS: i64 = 5 * 60 * 1000;
 
-/// The reason a usage window gives: the one wait that is a limit resetting
-/// (an overload is a backoff), so the card's chip reads "Limited".
-pub(super) const WINDOW_REASON: &str = "Usage limit reached";
+pub(super) use oximux_agents::retry::{WINDOW_REASON, reason_for};
 
 /// Why no automatic retry was armed for a retryable failure: the attempts ran
 /// out, or (before any) the wait is longer than the user allows.
@@ -47,8 +45,7 @@ fn exhausted_note(class: oximux_agents::retry::RetryClass, attempts: u32) -> &'s
     }
 }
 
-/// What a retry sends when the failed turn had already started working.
-const CONTINUE_PROMPT: &str = "Please continue.";
+use oximux_agents::retry::CONTINUE_PROMPT;
 
 /// A retry the app has committed to, holding the timer that will fire it.
 ///
@@ -101,18 +98,6 @@ impl ChatRetry {
             reason: p.reason.clone(),
             attempt: self.attempt,
         })
-    }
-}
-
-/// The one-line reason shown on the card for a class.
-pub(super) fn reason_for(class: oximux_agents::retry::RetryClass) -> String {
-    use oximux_agents::retry::RetryClass;
-    match class {
-        RetryClass::Window { .. } => WINDOW_REASON.into(),
-        RetryClass::Overload => "Provider overloaded".into(),
-        // Never armed, so never rendered; kept total rather than `unreachable!`
-        // so a future class cannot panic the transcript.
-        RetryClass::Spend | RetryClass::Other => "Turn failed".into(),
     }
 }
 

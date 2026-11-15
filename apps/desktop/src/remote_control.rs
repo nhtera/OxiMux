@@ -1111,7 +1111,7 @@ impl RemoteControl {
                 let next = config.borrow_and_update().clone();
                 let switched_on = Self::confinement_switched_on(confined, next.confine_chat);
                 confined = next.confine_chat;
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     // The retry settings are a view of this config, so an
                     // `oximux config set agents.retry.enabled false` has to
                     // reach a chat that is holding a turn right now — not at

@@ -17,7 +17,7 @@ use oximux_agents::retry::RetryClass;
 use oximux_agents::retry::store::{Resolution, RetryStore};
 use oximux_agents::send_receipts::{KeyKind, ReceiptState, Receipts, key_hash};
 
-use oximux_agents::thread::{ThreadEntry, ThreadEvent};
+use oximux_agents::thread::ThreadEvent;
 
 use super::AgentChatView;
 
@@ -131,16 +131,9 @@ impl AgentChatView {
     /// The key the failed turn's retries count under: the receipt key of the
     /// send that started it.
     pub(super) fn retry_turn_key(&self) -> String {
-        let id = self.health.sent_id().unwrap_or_else(|| {
-            // An untagged send: its text and place in the transcript.
-            let at = self.thread.entries.iter().rposition(|e| matches!(e, ThreadEntry::User { .. }));
-            let text = at.and_then(|i| match &self.thread.entries[i] {
-                ThreadEntry::User { text, .. } => Some(text.as_str()),
-                _ => None,
-            });
-            format!("untagged:{}:{}", at.unwrap_or(0), text.unwrap_or_default())
-        });
-        key_hash(KeyKind::Gate, &id)
+        // The shared rule: the headless host counts attempts against the same
+        // key, so a turn's four attempts stay four across both of them.
+        oximux_agents::retry::turn_key(self.health.sent_id().as_deref(), &self.thread.entries)
     }
 
     /// Attempts already fired for `turn_key`, as the host recorded them.
