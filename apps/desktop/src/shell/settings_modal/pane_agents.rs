@@ -300,6 +300,12 @@ fn ai_entries(
     // it is one behaviour of the agent conversation, and burying it a click
     // deeper would hide the only control over something that spends time (and,
     // if the classifier were ever wrong, money) on the user's behalf.
+    //
+    // Read from the host config and written through the core, like the
+    // delegation rows above it: these two values are what `oximux serve`
+    // obeys as well, so a working copy on this modal would be a second
+    // answer to a question only the host can settle.
+    let retry = super::pane_agents_delegation::current(cx);
     let retry_enabled = segmented(
         "retry-enabled",
         [true, false]
@@ -307,10 +313,9 @@ fn ai_entries(
             .map(|on| {
                 Segment::new(
                     if on { "On" } else { "Off" },
-                    modal.retry.enabled == on,
+                    retry.retry_enabled == on,
                     move |this, _w, cx| {
-                        this.retry.enabled = on;
-                        this.persist_retry(cx);
+                        super::pane_agents_delegation::apply(this, |c| c.retry_enabled = on, cx);
                     },
                 )
             })
@@ -326,9 +331,8 @@ fn ai_entries(
             .iter()
             .copied()
             .map(|w| {
-                Segment::new(w.label(), modal.retry.max_automatic_wait == w, move |this, _w, cx| {
-                    this.retry.max_automatic_wait = w;
-                    this.persist_retry(cx);
+                Segment::new(w.label(), retry.retry_max_wait == w, move |this, _w, cx| {
+                    super::pane_agents_delegation::apply(this, |c| c.retry_max_wait = w, cx);
                 })
             })
             .collect(),
@@ -358,7 +362,7 @@ fn ai_entries(
         "Re-send a turn by itself when a usage window closes. Spend limits are never retried.",
         retry_enabled,
     ));
-    if modal.retry.enabled {
+    if retry.retry_enabled {
         entries.push(entry(
             "Maximum automatic wait",
             "A reset farther out than this is reported as an error instead of being held.",

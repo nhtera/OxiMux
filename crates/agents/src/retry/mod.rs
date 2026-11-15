@@ -72,9 +72,20 @@ pub struct RetrySettings {
     pub max_automatic_wait: Option<Duration>,
 }
 
+impl RetrySettings {
+    /// The shipped ceiling: a day. Long enough for every five-hour window and
+    /// a same-day weekly reset, short enough that a held turn is still about
+    /// the conversation the user left.
+    ///
+    /// A constant rather than only a `Default` body, because a host stores
+    /// this number as a setting and has to be able to name the shipped one
+    /// without constructing a value.
+    pub const SHIPPED_MAX_WAIT: Option<Duration> = Some(Duration::from_secs(24 * 60 * 60));
+}
+
 impl Default for RetrySettings {
     fn default() -> Self {
-        Self { max_automatic_wait: Some(Duration::from_secs(24 * 60 * 60)) }
+        Self { max_automatic_wait: Self::SHIPPED_MAX_WAIT }
     }
 }
 

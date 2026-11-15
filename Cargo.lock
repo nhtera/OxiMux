@@ -8653,6 +8653,7 @@ dependencies = [
  "oximux-git",
  "oximux-owner-only",
  "oximux-remote-proto",
+ "oximux-settings",
  "oximux-single-instance",
  "oximux-storage",
  "rand 0.8.6",

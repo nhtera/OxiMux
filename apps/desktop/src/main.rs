@@ -399,7 +399,6 @@ fn main() {
         // The answer is only acted on where there is an updater to have
         // performed the upgrade; the settings install itself still has to run.
         #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_variables))]
-        oximux_app::agent_retry_settings::install(cx);
         oximux_app::git_settings::install(cx);
         // Session search (off by default). The service starts its indexer
         // thread only when enabled, and never blocks boot.
@@ -667,7 +666,11 @@ fn main() {
         // spawned with the operator's reach and only a respawn gives them a
         // confined credential. Reads the global, so it starts here and not
         // beside the core it watches.
-        oximux_app::remote_control::RemoteControl::watch_confinement(cx);
+        oximux_app::remote_control::RemoteControl::watch_config(cx);
+        // The rate-limit retry settings are two rows of that same host
+        // config, so the global a chat reads is seeded here, once the core
+        // exists to be read — and kept current by the watcher above.
+        oximux_app::agent_retry_settings::install(cx);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an
         // already-paired phone simply cannot reach it until someone opens Settings

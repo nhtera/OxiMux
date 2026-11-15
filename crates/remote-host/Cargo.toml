@@ -32,6 +32,11 @@ oximux-core = { workspace = true }
 oximux-owner-only = { workspace = true }
 # The host lock record, for the previous holder handed to `HostCore::start`.
 oximux-single-instance = { workspace = true }
+# One vocabulary for the settings both hosts obey: the retry ceiling is the
+# same three-way choice the desktop's pane offers, stored under the same
+# token. `default-features = false` is what that crate's `gpui` feature is
+# for — a headless host reads these without linking the UI toolkit.
+oximux-settings = { workspace = true, default-features = false }
 # Schedule rows carry `DateTime<Local>` fires; this boundary formats them to
 # RFC-3339 for the wire and derives the tick clock from the injected `now_secs`.
 chrono = { workspace = true }

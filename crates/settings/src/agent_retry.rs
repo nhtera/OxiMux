@@ -37,7 +37,7 @@ impl MaxAutomaticWait {
     pub const ALL: &'static [Self] = &[Self::SixHours, Self::OneDay, Self::NoLimit];
 
     /// The cap as a duration; `None` for [`Self::NoLimit`].
-    pub fn duration(self) -> Option<Duration> {
+    pub const fn duration(self) -> Option<Duration> {
         match self {
             Self::SixHours => Some(Duration::from_secs(6 * 60 * 60)),
             Self::OneDay => Some(Duration::from_secs(24 * 60 * 60)),
@@ -57,7 +57,7 @@ impl MaxAutomaticWait {
     /// Stable token for persistence. Parsed by [`Self::from_token`], which
     /// falls back to the default rather than failing — an unreadable setting
     /// must not stop the app from starting.
-    pub fn token(self) -> &'static str {
+    pub const fn token(self) -> &'static str {
         match self {
             Self::SixHours => "six-hours",
             Self::OneDay => "one-day",
