@@ -906,17 +906,19 @@ async fn a_send_that_supersedes_a_resend_takes_it_out_of_the_queue() {
         "the pump attached its gate",
     );
 
-    // A window this host is already waiting out, reopening shortly: long
-    // enough to queue a line behind the hold, short enough to fire here. A
-    // real window's grace and jitter put its wake minutes out, which is why
-    // this goes through the restore path rather than a rate-limit event.
+    // A window this host is already waiting out. Its wake is an hour away and
+    // the test fires it by hand: a wake time short enough to wait out here is
+    // one that a loaded machine can reach while this is still setting up, and
+    // the resend would then race the line queued below. A real window's grace
+    // and jitter put its wake minutes out anyway, which is why this goes
+    // through the restore path rather than a rate-limit event.
     store
         .arm(
             "s-1",
             "key-1",
             "window",
             "Usage limit reached",
-            oximux_agents::session_health::now_ms() + 800,
+            oximux_agents::session_health::now_ms() + 60 * 60 * 1000,
             "host-0",
             chrono::Local::now(),
         )
@@ -932,9 +934,11 @@ async fn a_send_that_supersedes_a_resend_takes_it_out_of_the_queue() {
     handle.send_prompt("and this too", &[]).unwrap();
     assert!(!wait_until(300, || !conn.sent().is_empty()), "it waits out the window");
 
+    // The window reopens.
+    retry.fire_now("s-1", "key-1").await;
     assert!(
         wait_until(10_000, || !conn.sent().is_empty()),
-        "the window reopened and the queue moved",
+        "the hold lifted and the queue moved",
     );
     assert_eq!(conn.sent().len(), 1, "one line opens the turn");
     assert!(

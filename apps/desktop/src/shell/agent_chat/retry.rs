@@ -227,15 +227,18 @@ impl AgentChatView {
                     .copied()
                     .unwrap_or_else(AgentRetrySettings::shipped)
                     .enabled;
+                if !enabled {
+                    // What the card's own Cancel does, and for the same
+                    // reason: arming cleared `last_error` to swap the failure
+                    // card for the queued one, so a retry that ends without
+                    // putting it back leaves the chat showing neither the
+                    // failure nor anything to retry it with.
+                    view.cancel_retry(cx);
+                    return;
+                }
                 // Attempt is counted at fire time, not at arm time, so a retry
                 // the user cancels costs nothing.
                 view.retry.pending = None;
-                if !enabled {
-                    view.record_retry_resolved(Resolution::Cancelled, cx);
-                    view.mark_retry_dirty();
-                    cx.notify();
-                    return;
-                }
                 view.retry.attempt += 1;
                 if let Some(key) = view.retry.turn_key.clone() {
                     view.record_retry_fired(key, cx);
@@ -761,6 +764,10 @@ mod tests {
             .update(cx, |view, _window, _cx| {
                 assert!(!view.retry.is_armed(), "the wait is over");
                 assert!(!view.thread.turn_active, "and the turn was not sent again");
+                assert!(
+                    view.thread.last_error.is_some(),
+                    "the failure the retry was for is showing again, with its Retry",
+                );
             })
             .expect("window update");
     }

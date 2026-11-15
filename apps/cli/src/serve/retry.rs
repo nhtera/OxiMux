@@ -159,6 +159,17 @@ impl ServeRetry {
         self.armed.lock().unwrap().get(session_id).map(|a| a.generation)
     }
 
+    /// Fire this session's armed retry now, at its own generation.
+    ///
+    /// Test-only, for the reason [`Self::armed_generation`] gives: a wake time
+    /// short enough for a test to wait out is one a loaded machine can reach
+    /// while the test is still setting up.
+    #[cfg(test)]
+    pub(super) async fn fire_now(self: &Arc<Self>, session_id: &str, turn_key: &str) {
+        let Some(generation) = self.armed_generation(session_id) else { return };
+        self.clone().fire(session_id, turn_key, generation).await;
+    }
+
     /// Follow "something armed or unarmed", for a pump to republish on. One
     /// counter for the host rather than one per session: a republish a pump
     /// did not need is a publish of facts that have not changed, and the
@@ -409,10 +420,7 @@ impl ServeRetry {
         // hours long, and a user who switches retries off during it has said
         // no to this send. Checked before the reopen, so a session is never
         // woken for a retry that is not going to happen.
-        if !self.config.borrow().retry_enabled {
-            if self.claim(session_id, generation).is_some() {
-                self.resolve(session_id, Resolution::Cancelled);
-            }
+        if self.cancel_if_disabled(session_id, generation) {
             return;
         }
 
@@ -440,6 +448,12 @@ impl ServeRetry {
                 }
             }
         };
+        // Asked again on the other side of the reopen, which is the one slow
+        // step here: a reopen spawns an agent process, and a user who switches
+        // retries off while it starts has said no to this send too.
+        if self.cancel_if_disabled(session_id, generation) {
+            return;
+        }
         // Still ours? A newer arm, a send, a stop or a turn that ended while
         // this one was reopening all win over it.
         let Some(line) = self.claim(session_id, generation) else { return };
@@ -449,8 +463,27 @@ impl ServeRetry {
         };
         // Spent at fire time, not at arm time, so a retry that is cancelled
         // or superseded before it fires costs nothing.
-        if let Err(err) = self.store.fired(session_id, turn_key) {
-            tracing::warn!(%err, session = session_id, "a fired retry was not counted");
+        //
+        // Not counted means not sent, which is `arm`'s rule one step later: a
+        // resend with no durable record of itself leaves the stored count low,
+        // so the next failure — or a restart — measures the cap against a
+        // number that is short by one and allows an extra automatic send. The
+        // failure the pump published stands instead, and the row is left as it
+        // is, so a restart can still pick this retry up.
+        //
+        // A count of zero says the same thing as an error: the row this turn's
+        // attempts are counted against is not there to update.
+        match self.store.fired(session_id, turn_key) {
+            Ok(1..) => {}
+            counted => {
+                tracing::warn!(
+                    session = session_id,
+                    ?counted,
+                    "a retry's attempt could not be counted; not sent",
+                );
+                self.release(session_id, line);
+                return;
+            }
         }
 
         let Some(blob) = blob::load(&self.settings, session_id) else {
@@ -487,6 +520,33 @@ impl ServeRetry {
         if let Err(err) = sent {
             tracing::warn!(session = session_id, %err, "a retry could not be sent");
             self.resolve(session_id, Resolution::Exhausted);
+        }
+    }
+
+    /// End this generation because retries have been switched off, and say
+    /// whether that is what happened.
+    ///
+    /// Asked on both sides of the reopen: before it, so a dormant session is
+    /// never woken for a send that is not going to happen, and after it,
+    /// because starting an agent takes long enough for the answer to change.
+    fn cancel_if_disabled(&self, session_id: &str, generation: u64) -> bool {
+        if self.config.borrow().retry_enabled {
+            return false;
+        }
+        if self.claim(session_id, generation).is_some() {
+            self.resolve(session_id, Resolution::Cancelled);
+        }
+        true
+    }
+
+    /// Give up a reserved line without sending it.
+    ///
+    /// By its uuid, so a reservation some later retry has since made in this
+    /// session's name is left alone.
+    fn release(&self, session_id: &str, line: Uuid) {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        if in_flight.get(session_id) == Some(&line) {
+            in_flight.remove(session_id);
         }
     }
 

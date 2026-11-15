@@ -448,3 +448,27 @@ async fn a_timer_a_newer_arm_replaced_sends_nothing() {
     assert_eq!(f.retry.armed("s-1"), Some(armed), "and leaves the live retry alone");
     assert_eq!(f.store.attempts("s-1", "key-1").unwrap(), 0, "spending no attempt of its own");
 }
+
+/// An attempt that could not be counted is not sent. A resend with no durable
+/// record of itself leaves the stored count short by one, and the next failure
+/// measures the cap of four against that number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_whose_attempt_cannot_be_counted_is_not_sent() {
+    let f = fixture(HostConfig::default());
+    let conn = Arc::new(StubConnection::default());
+    f.registry.register("s-1".into(), conn.clone());
+    store_blob(&f.settings, "s-1", vec![user("ship it")]);
+    let fold = failed_turn(Some(window_limit(now_ms() + 60 * 60 * 1000)));
+    f.retry.on_turn_failed("s-1", &fold, &track_for(&fold));
+
+    // A key the store has no row for. The update counts nothing — which is
+    // what a write that fails outright leaves behind as well.
+    f.retry.fire_now("s-1", "no-row-for-this-key").await;
+
+    assert!(conn.sent().is_empty(), "an attempt nothing recorded is not spent on a send");
+    assert_eq!(
+        f.retry.on_line_written("s-1", Uuid::new_v4()),
+        None,
+        "and the line it had reserved is given up, not left for the gate",
+    );
+}
