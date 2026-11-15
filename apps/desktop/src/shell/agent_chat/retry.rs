@@ -218,9 +218,24 @@ impl AgentChatView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
+                // The setting is read again, not as it was when the retry was
+                // armed: the wait can be hours long, and a user who switches
+                // retries off during it has said no to this send. `serve`
+                // checks the same thing at the same moment.
+                let enabled = cx
+                    .try_global::<AgentRetrySettings>()
+                    .copied()
+                    .unwrap_or_else(AgentRetrySettings::shipped)
+                    .enabled;
                 // Attempt is counted at fire time, not at arm time, so a retry
                 // the user cancels costs nothing.
                 view.retry.pending = None;
+                if !enabled {
+                    view.record_retry_resolved(Resolution::Cancelled, cx);
+                    view.mark_retry_dirty();
+                    cx.notify();
+                    return;
+                }
                 view.retry.attempt += 1;
                 if let Some(key) = view.retry.turn_key.clone() {
                     view.record_retry_fired(key, cx);
@@ -565,7 +580,14 @@ mod tests {
     /// that is where `restore_pending_retry` reads them from — deliberately at
     /// restore time rather than from the blob, so a user who switched the
     /// feature off while the app was closed is obeyed.
-    async fn with_view<F>(cx: &mut TestAppContext, settings: AgentRetrySettings, f: F)
+    ///
+    /// The window comes back so a test can let the countdown run and look
+    /// again: what a retry does when it *fires* is a second question.
+    async fn with_view<F>(
+        cx: &mut TestAppContext,
+        settings: AgentRetrySettings,
+        f: F,
+    ) -> gpui::WindowHandle<AgentChatView>
     where
         F: FnOnce(&mut AgentChatView, &mut Context<AgentChatView>),
     {
@@ -583,6 +605,7 @@ mod tests {
         });
         cx.run_until_parked();
         window.update(cx, |view, _window, cx| f(view, cx)).expect("window update");
+        window
     }
 
     /// The point of persisting a retry at all: a five-hour window outlives the
@@ -715,6 +738,31 @@ mod tests {
             assert!(!view.retry.is_armed(), "auto-retry off means nothing re-arms");
         })
         .await;
+    }
+
+    /// Switching retries off while one is waiting stops it before it sends.
+    /// The wait can be hours long, so the setting has to mean what it says at
+    /// the send and not only at the arm — which is where `serve` reads it too.
+    #[gpui::test]
+    async fn a_retry_switched_off_while_it_waits_does_not_fire(cx: &mut TestAppContext) {
+        let window = with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            view.send_text("build it".into(), Vec::new(), cx);
+            view.thread.turn_active = false;
+            // A wake time already past: the countdown has no sleep left, so
+            // what it does when it gets there is the whole question.
+            view.restore_pending_retry(saved(-30_000, 0), cx);
+            assert!(view.retry.is_armed(), "it is waiting when the setting changes");
+            cx.set_global(AgentRetrySettings { enabled: false, ..AgentRetrySettings::shipped() });
+        })
+        .await;
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(!view.retry.is_armed(), "the wait is over");
+                assert!(!view.thread.turn_active, "and the turn was not sent again");
+            })
+            .expect("window update");
     }
 
     /// Shortening `max_automatic_wait` while the app was closed also applies:

@@ -60,13 +60,23 @@ pub struct ArmedRetry {
 /// step with the other two.
 struct Armed {
     retry: ArmedRetry,
+    /// Which timer this entry belongs to. A newer arm replaces the entry
+    /// while the old timer may already be awake, so "is this still mine?" has
+    /// to be answerable by the timer itself — see [`ServeRetry::claim`].
+    generation: u64,
     /// Cancels the timer on drop, so resolving needs no second step.
-    timer: tokio::task::JoinHandle<()>,
+    ///
+    /// `None` in two moments, both deliberate: between the entry being
+    /// recorded and its timer being spawned, and once the timer has claimed
+    /// the entry to fire — a task must not abort itself.
+    timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for Armed {
     fn drop(&mut self) {
-        self.timer.abort();
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
     }
 }
 
@@ -100,6 +110,9 @@ pub struct ServeRetry {
     /// attempt count and the turn key with it, and the next failure would
     /// start counting from zero — four attempts without end.
     in_flight: Mutex<HashMap<String, Uuid>>,
+    /// Hands out [`Armed::generation`]. One counter for the host: the entries
+    /// are per session, so the numbers only ever have to differ.
+    generations: std::sync::atomic::AtomicU64,
 }
 
 impl ServeRetry {
@@ -120,6 +133,7 @@ impl ServeRetry {
             armed: Mutex::new(HashMap::new()),
             changed: tokio::sync::watch::channel(0).0,
             in_flight: Mutex::new(HashMap::new()),
+            generations: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -133,6 +147,16 @@ impl ServeRetry {
     /// A map read: the pump asks on every publish.
     pub fn armed(&self, session_id: &str) -> Option<ArmedRetry> {
         self.armed.lock().unwrap().get(session_id).map(|a| a.retry.clone())
+    }
+
+    /// Which timer this session's armed retry belongs to.
+    ///
+    /// Test-only, and only so a test can fire a retry *at* its generation
+    /// rather than waiting for its wake time: a margin wide enough to beat a
+    /// loaded machine is a race either way.
+    #[cfg(test)]
+    pub(super) fn armed_generation(&self, session_id: &str) -> Option<u64> {
+        self.armed.lock().unwrap().get(session_id).map(|a| a.generation)
     }
 
     /// Follow "something armed or unarmed", for a pump to republish on. One
@@ -159,7 +183,9 @@ impl ServeRetry {
         let class = classify_failure(fold.last_rate_limit.as_ref(), fold.last_turn_failure.clone());
         if !class.is_retryable() {
             // A turn that had a retry and now fails for good: that retry is
-            // over, and the failure is the session's own answer.
+            // over, and the failure is the session's own answer. Nothing of
+            // this driver's can be queued: a failure means the turn it would
+            // have resent has already been answered.
             self.resolve(session_id, Resolution::Cancelled);
             return;
         }
@@ -182,7 +208,9 @@ impl ServeRetry {
             // Out of attempts, or a wait longer than this host may hold a
             // turn. Either way nothing more is automatic, and the failure the
             // pump already published stands.
-            Next::Exhausted => self.resolve(session_id, Resolution::Exhausted),
+            Next::Exhausted => {
+                self.resolve(session_id, Resolution::Exhausted);
+            }
             Next::Never => {}
         }
     }
@@ -202,12 +230,30 @@ impl ServeRetry {
     /// something: while a retry is armed the gate holds every other sender
     /// anyway, so the common case is a `resolve` that matches no row — one
     /// no-op statement against a table with one row per session.
-    pub fn on_line_written(&self, session_id: &str, uuid: Uuid) {
-        if self.in_flight.lock().unwrap().get(session_id) == Some(&uuid) {
-            self.in_flight.lock().unwrap().remove(session_id);
-            return;
+    ///
+    /// Returns this driver's own resend when it is still queued behind the
+    /// line that superseded it, for the caller to take out of the gate.
+    #[must_use = "a resend left in the gate goes out after the send that superseded it"]
+    pub fn on_line_written(&self, session_id: &str, uuid: Uuid) -> Option<Uuid> {
+        {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            if in_flight.get(session_id) == Some(&uuid) {
+                in_flight.remove(session_id);
+                return None;
+            }
         }
-        self.resolve(session_id, Resolution::Superseded);
+        self.resolve(session_id, Resolution::Superseded)
+    }
+
+    /// The person stopped the turn. Nothing is more clearly a takeover: a
+    /// Stop says no to the very turn the retry is waiting to send again.
+    ///
+    /// Returns a queued resend to withdraw, as [`Self::on_line_written`]
+    /// does. `take_unstarted` cannot reach it — that is about lines already
+    /// written into the running turn, and this one never got that far.
+    #[must_use = "a resend left in the gate goes out after the turn that was stopped"]
+    pub fn on_stopped(&self, session_id: &str) -> Option<Uuid> {
+        self.resolve(session_id, Resolution::Cancelled)
     }
 
     /// Re-arm every retry the last host left live. Called once at boot,
@@ -277,6 +323,22 @@ impl ServeRetry {
     /// path and by [`Self::restore`], so a retry rebuilt at boot waits and
     /// fires by exactly the same code as one armed a moment ago.
     fn hold_until(self: &Arc<Self>, session_id: &str, turn_key: String, reason: String, wake_at_ms: i64) {
+        let generation = self.generations.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Recorded *before* the timer is spawned. A wake time already past —
+        // every retry a restart carries over late — leaves no sleep at all,
+        // so the task can be inside `fire` on another worker before this
+        // function returns. With the entry written afterwards, that fire
+        // would find nothing to claim and the insert would then stand armed
+        // with no timer behind it: a hold on the queue that never lifts.
+        //
+        // Replacing an entry drops the previous timer, which aborts it: one
+        // retry per session, and the newest decision is the live one.
+        self.armed.lock().unwrap().insert(
+            session_id.to_string(),
+            Armed { retry: ArmedRetry { wake_at_ms, reason }, generation, timer: None },
+        );
+        self.note_changed();
+
         let driver = self.clone();
         let session = session_id.to_string();
         let key = turn_key;
@@ -285,30 +347,74 @@ impl ServeRetry {
             if wait > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(wait as u64)).await;
             }
-            driver.fire(&session, &key).await;
+            driver.fire(&session, &key, generation).await;
         });
-        // Replacing the entry drops the previous timer, which aborts it:
-        // one retry per session, and the newest decision is the live one.
-        self.armed
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), Armed { retry: ArmedRetry { wake_at_ms, reason }, timer });
+        // The entry may be gone already (this timer fired at once) or belong
+        // to a newer arm. Either way the handle is simply dropped, which
+        // detaches rather than cancels: the task's own generation check is
+        // what keeps a timer nobody can abort from doing anything.
+        match self.armed.lock().unwrap().get_mut(session_id) {
+            Some(entry) if entry.generation == generation => entry.timer = Some(timer),
+            _ => {}
+        }
+    }
+
+    /// Take this session's armed entry, if it is still this timer's own, and
+    /// reserve the line this retry will send.
+    ///
+    /// `None` means another arm replaced the entry or something resolved it
+    /// while this timer was waiting or reopening: it has been superseded and
+    /// must do nothing at all.
+    ///
+    /// The entry is removed without aborting its timer, because the timer it
+    /// names is the task calling this. Removing the hold is what lets the
+    /// queue move again, and it is announced before the resend is pushed: the
+    /// gate's waker fires on a push and only while the gate is open, so a
+    /// line pushed into a gate still holding for this retry would wake nobody.
+    ///
+    /// The reservation is taken here and not at the push, because lifting the
+    /// hold is what lets the pump flush — so the send that supersedes this
+    /// retry is likely to be written in the moment between the two. Reserved
+    /// first, that send finds the reservation and hands it back; reserved at
+    /// the push, it would find nothing, resolve the retry, and leave the
+    /// resend to go out after it anyway.
+    fn claim(&self, session_id: &str, generation: u64) -> Option<Uuid> {
+        let line = Uuid::new_v4();
+        {
+            // `armed` before `in_flight` wherever both are taken.
+            let mut armed = self.armed.lock().unwrap();
+            match armed.get_mut(session_id) {
+                // Detached, not aborted: the timer it names is this task.
+                Some(entry) if entry.generation == generation => entry.timer = None,
+                _ => return None,
+            }
+            armed.remove(session_id);
+            self.in_flight.lock().unwrap().insert(session_id.to_string(), line);
+        }
         self.note_changed();
+        Some(line)
     }
 
     /// The wait is over: spend the attempt and send the turn again.
-    async fn fire(self: Arc<Self>, session_id: &str, turn_key: &str) {
-        // Spent at fire time, not at arm time, so a retry that is cancelled
-        // or superseded before it fires costs nothing.
-        if let Err(err) = self.store.fired(session_id, turn_key) {
-            tracing::warn!(%err, session = session_id, "a fired retry was not counted");
+    ///
+    /// **Everything that can await happens before the entry is claimed.** The
+    /// entry owns this task's own `JoinHandle`, so dropping it stops this
+    /// function at its next await — and reopening a dormant session is
+    /// exactly such an await. Claimed first, a cancel there would have spent
+    /// the attempt, cleared the wake time and sent nothing, and no restart
+    /// would recover it. Awaiting first also means a retry the user cancels
+    /// while it reopens costs no attempt at all.
+    async fn fire(self: Arc<Self>, session_id: &str, turn_key: &str, generation: u64) {
+        // Read again, not as it was when the retry was armed: a wait can be
+        // hours long, and a user who switches retries off during it has said
+        // no to this send. Checked before the reopen, so a session is never
+        // woken for a retry that is not going to happen.
+        if !self.config.borrow().retry_enabled {
+            if self.claim(session_id, generation).is_some() {
+                self.resolve(session_id, Resolution::Cancelled);
+            }
+            return;
         }
-        // The hold is over whether or not the send lands: left in place, the
-        // gate would keep holding this session's queue behind a retry that
-        // has already happened. Announced before the send below, so the pump
-        // has republished its holds by the time the line is pushed.
-        self.armed.lock().unwrap().remove(session_id);
-        self.note_changed();
 
         let handle = match self.registry.get(session_id) {
             Some(handle) => Some(handle),
@@ -334,10 +440,18 @@ impl ServeRetry {
                 }
             }
         };
+        // Still ours? A newer arm, a send, a stop or a turn that ended while
+        // this one was reopening all win over it.
+        let Some(line) = self.claim(session_id, generation) else { return };
         let Some(handle) = handle else {
             self.resolve(session_id, Resolution::Exhausted);
             return;
         };
+        // Spent at fire time, not at arm time, so a retry that is cancelled
+        // or superseded before it fires costs nothing.
+        if let Err(err) = self.store.fired(session_id, turn_key) {
+            tracing::warn!(%err, session = session_id, "a fired retry was not counted");
+        }
 
         let Some(blob) = blob::load(&self.settings, session_id) else {
             tracing::warn!(session = session_id, "a retry found no transcript to re-send");
@@ -353,28 +467,48 @@ impl ServeRetry {
             }
         };
 
-        // Recorded before the write: the pump sees the line as soon as it is
-        // flushed, and a line it cannot recognise as this retry's own would
-        // supersede the retry that sent it.
-        let line = Uuid::new_v4();
-        self.in_flight.lock().unwrap().insert(session_id.to_string(), line);
+        // The reservation is checked and the line pushed under one lock, and
+        // the supersede path takes that same lock. So a send that takes this
+        // session over either lands before the push — and the reservation is
+        // gone, so nothing is pushed at all — or after it, when the line is
+        // in the gate and can be taken back out of it.
+        //
         // `Remote` and not a sender of its own: this is the person's turn
         // going out again, from no one at a screen — which is what a phone's
         // send already means to the gate.
-        if let Err(err) = handle.send_prompt_tagged(&text, &images, SendSource::Remote, Some(line)) {
+        let sent = {
+            let in_flight = self.in_flight.lock().unwrap();
+            if in_flight.get(session_id) != Some(&line) {
+                tracing::debug!(session = session_id, "a retry was taken over before it could send");
+                return;
+            }
+            handle.send_prompt_tagged(&text, &images, SendSource::Remote, Some(line))
+        };
+        if let Err(err) = sent {
             tracing::warn!(session = session_id, %err, "a retry could not be sent");
-            self.in_flight.lock().unwrap().remove(session_id);
             self.resolve(session_id, Resolution::Exhausted);
         }
     }
 
-    /// This session's retry is over. Drops the timer with it.
-    fn resolve(&self, session_id: &str, how: Resolution) {
-        self.armed.lock().unwrap().remove(session_id);
+    /// This session's retry is over. Drops the timer with it, and hands back
+    /// a resend of this driver's that is queued but not yet written.
+    ///
+    /// Left in the gate, that line goes out *after* whatever ended the retry
+    /// — re-sending the old turn on top of the message that took over, which
+    /// is the surprise the supersede rule exists to prevent. The gate belongs
+    /// to the pump, not to this driver, so the withdrawal is the pump's.
+    fn resolve(&self, session_id: &str, how: Resolution) -> Option<Uuid> {
+        // `armed` before `in_flight`, as in `claim`.
+        let queued = {
+            let mut armed = self.armed.lock().unwrap();
+            armed.remove(session_id);
+            self.in_flight.lock().unwrap().remove(session_id)
+        };
         self.note_changed();
         if let Err(err) = self.store.resolve(session_id, how, chrono::Local::now()) {
             tracing::warn!(%err, session = session_id, "a retry's record was not resolved");
         }
+        queued
     }
 
     /// The jitter seed. Per *session*, not per call: every thread on one

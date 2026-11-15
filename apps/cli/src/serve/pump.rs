@@ -360,7 +360,20 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // which lifts its own hold and queues a line in the same
                     // breath — pushes into a gate still holding for it and
                     // wakes nobody at all.
+                    //
+                    // Drained first, for the reason the synth arm drains: a
+                    // resend the flush has already written is a prompt still
+                    // sitting in the channel, so the fold would report idle
+                    // and this publish would clear the gate's hold on the
+                    // very turn that resend just opened.
+                    fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
                     publish_state(&pump, &fold, &track, fold.turn_active, Process::Live);
+                    // Saved here for the same reason, one step on: a prompt
+                    // this arm folded is one the prompt arm will never see,
+                    // and the save that clears the stored failure is that
+                    // arm's. Left out, a restart would restore a failure the
+                    // send had already answered.
+                    persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
                 _ = save_tick.tick() => {
                     persist.maybe_save(&handle, &mut blob, &fold, &track);
@@ -453,6 +466,7 @@ fn fold_queued_sends(
 fn flush(pump: &Pump<'_>) {
     let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
     if gate.lock().unwrap().take_stop_request() {
+        withdraw(gate, pump.retry.on_stopped(session_id));
         stop_the_turn(pump);
         return;
     }
@@ -490,7 +504,7 @@ fn flush(pump: &Pump<'_>) {
             // Whoever sent this has taken over from an armed retry of an
             // earlier turn — unless it *is* that retry's own line, which the
             // driver recognises by this id.
-            pump.retry.on_line_written(session_id, item.uuid);
+            withdraw(gate, pump.retry.on_line_written(session_id, item.uuid));
         }
         let mut gate = gate.lock().unwrap();
         gate.report_sent(item.uuid, sent.is_ok());
@@ -531,6 +545,20 @@ fn flush(pump: &Pump<'_>) {
 /// parks a child's events until the person's next message releases them, and
 /// nothing headless can release such a hold yet, so a Stop here interrupts
 /// the turn and leaves the queue as it was.
+/// Take a line the retry driver has given up on out of the queue.
+///
+/// A fired retry lifts its own hold and pushes its resend, so anything that
+/// was waiting behind the hold is *ahead* of that resend. When one of those
+/// goes out first it supersedes the retry — and the resend, still queued,
+/// would then re-send the superseded turn on top of the message that took
+/// over.
+fn withdraw(gate: &Mutex<SendGate>, line: Option<uuid::Uuid>) {
+    let Some(line) = line else { return };
+    let mut gate = gate.lock().unwrap();
+    let Some(id) = gate.queued().find(|q| q.uuid == line).map(|q| q.id) else { return };
+    gate.remove(id);
+}
+
 fn stop_the_turn(pump: &Pump<'_>) {
     let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
     // Serve never offers steering (`steer_supported` is false in every

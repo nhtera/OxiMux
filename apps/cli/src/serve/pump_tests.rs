@@ -860,3 +860,96 @@ async fn a_prompt_injected_over_the_protocol_still_titles_the_live_row() {
     );
     drop(tx);
 }
+
+/// A send that overtakes a fired retry takes the retry's own resend out of
+/// the queue with it.
+///
+/// A fired retry lifts its own hold and pushes its resend, so everything the
+/// hold was keeping back is *ahead* of that resend. The first of those to go
+/// out supersedes the retry — and the resend, left queued, would then re-send
+/// the superseded turn on top of the message that took over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_supersedes_a_resend_takes_it_out_of_the_queue() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let retry = retry_driver(registry.clone(), &settings, &db);
+    let store = oximux_agents::retry::store::RetryStore::new(db.conn());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // The transcript a fired retry reads to know what to send again.
+    let mut seed = ChatBlob::new("s-1".into());
+    seed.entries = vec![oximux_agents::thread::ThreadEntry::User {
+        text: "ship it".into(),
+        images: Vec::new(),
+        checkpoint: None,
+    }];
+    start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: vec![],
+            seed,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry.clone(),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    // A window this host is already waiting out, reopening shortly: long
+    // enough to queue a line behind the hold, short enough to fire here. A
+    // real window's grace and jitter put its wake minutes out, which is why
+    // this goes through the restore path rather than a rate-limit event.
+    store
+        .arm(
+            "s-1",
+            "key-1",
+            "window",
+            "Usage limit reached",
+            oximux_agents::session_health::now_ms() + 800,
+            "host-0",
+            chrono::Local::now(),
+        )
+        .expect("arm");
+    retry.restore();
+    assert!(
+        wait_until(5_000, || handle.health().limited_until.is_some()),
+        "the pump is holding the queue for the limit: {:?}",
+        handle.health(),
+    );
+
+    // The person's own message, queued behind the hold.
+    handle.send_prompt("and this too", &[]).unwrap();
+    assert!(!wait_until(300, || !conn.sent().is_empty()), "it waits out the window");
+
+    assert!(
+        wait_until(10_000, || !conn.sent().is_empty()),
+        "the window reopened and the queue moved",
+    );
+    assert_eq!(conn.sent().len(), 1, "one line opens the turn");
+    assert!(
+        conn.sent()[0].to_string().contains("and this too"),
+        "and it is the person's, which had been waiting longest: {:?}",
+        conn.sent(),
+    );
+
+    // The turn that line opened ends. Nothing of the retry's is left to go
+    // out behind it.
+    tx.send(ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None })
+        .unwrap();
+    assert!(
+        !wait_until(1_000, || conn.sent().len() > 1),
+        "the resend went with the retry the person's message superseded: {:?}",
+        conn.sent(),
+    );
+}

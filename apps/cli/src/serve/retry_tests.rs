@@ -25,8 +25,9 @@ struct Fixture {
     registry: Arc<SessionRegistry>,
     settings: SettingsRepo,
     store: RetryStore,
-    /// Kept alive so the driver's receiver keeps seeing this config.
-    _config: tokio::sync::watch::Sender<HostConfig>,
+    /// Kept alive so the driver's receiver keeps seeing this config — and
+    /// so a test can change a setting while a retry is already waiting.
+    config: tokio::sync::watch::Sender<HostConfig>,
 }
 
 fn fixture(config: HostConfig) -> Fixture {
@@ -42,7 +43,7 @@ fn fixture(config: HostConfig) -> Fixture {
         rx,
         "host-1".to_string(),
     );
-    Fixture { retry, registry, settings, store, _config: tx }
+    Fixture { retry, registry, settings, store, config: tx }
 }
 
 /// A fold holding one user message whose turn failed on `class`.
@@ -291,14 +292,15 @@ async fn a_retrys_own_line_does_not_supersede_it() {
     // The pump's report of that very line, by the id it was written under.
     let line = conn.sent()[0]["uuid"].as_str().and_then(|id| Uuid::parse_str(id).ok());
     let line = line.expect("the retry tags the line it writes");
-    f.retry.on_line_written("s-1", line);
+    assert_eq!(f.retry.on_line_written("s-1", line), None, "nothing of its own to withdraw");
     assert!(
         f.store.live("s-1").expect("read").is_some(),
         "its own line leaves the record live, so the attempt count keeps counting",
     );
 
-    // Anyone else's line ends it.
-    f.retry.on_line_written("s-1", Uuid::new_v4());
+    // Anyone else's line ends it. Nothing is handed back to withdraw: the
+    // reservation went with the retry's own line when it was reported.
+    assert_eq!(f.retry.on_line_written("s-1", Uuid::new_v4()), None);
     assert!(
         f.store.live("s-1").expect("read").is_none(),
         "a person's message takes over from the retry of an earlier turn",
@@ -361,4 +363,88 @@ fn what_a_retry_sends_depends_on_whether_the_turn_had_begun() {
         checkpoint: None,
     };
     assert_eq!(resend(&[with_image]).map(|p| p.1.len()), Some(1), "its attachments go with it");
+}
+
+/// A retry switched off while it waits does not send. The wait can be hours
+/// long, and the setting means what it says at the moment of the send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_switched_off_while_it_waits_sends_nothing() {
+    let f = fixture(HostConfig::default());
+    let conn = Arc::new(StubConnection::default());
+    f.registry.register("s-1".into(), conn.clone());
+    store_blob(&f.settings, "s-1", vec![user("ship it")]);
+    let fold = failed_turn(Some(window_limit(now_ms() + 60 * 60 * 1000)));
+    f.retry.on_turn_failed("s-1", &fold, &track_for(&fold));
+    let generation = f.retry.armed_generation("s-1").expect("it is waiting out the window");
+
+    f.config.send(HostConfig { retry_enabled: false, ..HostConfig::default() }).expect("send");
+    // That timer's own wake, an hour early: the question is what it does when
+    // it gets there, not how long it sleeps.
+    f.retry.clone().fire("s-1", "key-1", generation).await;
+
+    assert!(conn.sent().is_empty(), "nothing was sent for a retry the user switched off");
+    assert!(f.retry.armed("s-1").is_none(), "the wait is over");
+    assert!(f.store.live("s-1").expect("read").is_none(), "the record is resolved, not left live");
+    assert_eq!(f.store.attempts("s-1", "key-1").unwrap(), 0, "and it cost no attempt");
+}
+
+/// A Stop is the clearest takeover there is: the person said no to the very
+/// turn the retry is holding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_ends_the_retry_it_was_waiting_on() {
+    let f = fixture(HostConfig::default());
+    let fold = failed_turn(Some(window_limit(now_ms() + 60 * 60 * 1000)));
+    f.retry.on_turn_failed("s-1", &fold, &track_for(&fold));
+    assert!(f.retry.armed("s-1").is_some(), "there is a retry for the stop to end");
+
+    let withdraw = f.retry.on_stopped("s-1");
+
+    assert!(withdraw.is_none(), "nothing of this driver's was queued");
+    assert!(f.retry.armed("s-1").is_none(), "the stop ended it");
+    assert!(f.store.live("s-1").expect("read").is_none(), "durably, so a restart does not revive it");
+}
+
+/// A send that supersedes a retry hands this driver's own resend back to be
+/// taken out of the queue: it is behind the message that took over, and
+/// written later it would re-send the superseded turn on top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_a_later_send_superseded_is_handed_back() {
+    let f = fixture(HostConfig::default());
+    let conn = Arc::new(StubConnection::default());
+    f.registry.register("s-1".into(), conn.clone());
+    store_blob(&f.settings, "s-1", vec![user("ship it")]);
+    f.store
+        .arm("s-1", "key-1", "window", "Usage limit reached", now_ms(), "host-0", chrono::Local::now())
+        .expect("arm");
+    f.retry.restore();
+    assert!(wait_until(5_000, || !conn.sent().is_empty()), "the retry sent its line");
+
+    let someone_else = Uuid::new_v4();
+    let withdraw = f.retry.on_line_written("s-1", someone_else);
+
+    let withdraw = withdraw.expect("the resend is handed back");
+    assert_ne!(withdraw, someone_else, "what comes back is this driver's line, not theirs");
+    assert!(f.store.live("s-1").expect("read").is_none(), "and the retry is over");
+}
+
+/// A timer a newer arm replaced does nothing when it wakes. It cannot be
+/// aborted once it is running, so it has to answer "am I still the live
+/// retry?" itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timer_a_newer_arm_replaced_sends_nothing() {
+    let f = fixture(HostConfig::default());
+    let conn = Arc::new(StubConnection::default());
+    f.registry.register("s-1".into(), conn.clone());
+    store_blob(&f.settings, "s-1", vec![user("ship it")]);
+    let fold = failed_turn(Some(window_limit(now_ms() + 60 * 60 * 1000)));
+    f.retry.on_turn_failed("s-1", &fold, &track_for(&fold));
+    let armed = f.retry.armed("s-1").expect("a retry is armed");
+
+    // A generation this driver has never handed out: the same position an
+    // older timer is in once a newer arm has replaced its entry.
+    f.retry.clone().fire("s-1", "key-1", u64::MAX).await;
+
+    assert!(conn.sent().is_empty(), "a superseded timer sends nothing");
+    assert_eq!(f.retry.armed("s-1"), Some(armed), "and leaves the live retry alone");
+    assert_eq!(f.store.attempts("s-1", "key-1").unwrap(), 0, "spending no attempt of its own");
 }
