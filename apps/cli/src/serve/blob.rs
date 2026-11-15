@@ -62,6 +62,17 @@ pub struct ChatBlob {
     pub pi_posture: Option<oximux_agents::thread::pi::posture::PiPosture>,
     #[serde(default)]
     pub choices: BlobChoices,
+    /// The error the last turn ended in, when nothing has been sent since.
+    ///
+    /// The fold keeps no durable trace of a failure: `last_error` is
+    /// transient and an errored `TurnEnded` leaves no entry behind. So
+    /// without this a host restart turns a session that died failing into
+    /// one that reads idle — and a queue the failure was holding drains into
+    /// it. The desktop does not write this field and drops it on its own
+    /// save, which costs that session the same restored failure it has
+    /// today; closing that is the desktop's half of F8.
+    #[serde(default)]
+    pub last_failure: Option<String>,
     /// Everything else the writer knew — the desktop's `thinking_level`, any
     /// future field — preserved verbatim across a headless rewrite.
     #[serde(flatten)]
@@ -82,6 +93,7 @@ impl ChatBlob {
             codex_posture: None,
             pi_posture: None,
             choices: BlobChoices::default(),
+            last_failure: None,
             extra: serde_json::Map::new(),
         }
     }

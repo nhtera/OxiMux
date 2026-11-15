@@ -192,6 +192,20 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         } else {
             HealthTrack::default()
         };
+        // A session that died failing comes back failing. The fold keeps no
+        // durable trace of it — `last_error` is transient and an errored
+        // `TurnEnded` leaves no entry — so the failure is restored from the
+        // blob into both the tracker (which decides the health and holds the
+        // queue) and the fold (whose text the health reports). Restored into
+        // only one of the two, the session would read failed with no reason,
+        // or carry a reason nothing reads.
+        //
+        // The next send clears both: `note_sent` drops the tracker's, and a
+        // user message clears the fold's.
+        if let Some(failure) = blob.last_failure.clone() {
+            fold.last_error = Some(failure.clone());
+            track.failed_turn = Some(failure);
+        }
         let mut persist = Persist::new(settings, index, &fold);
 
         // The send gate. Attaching it **takes over the send path**: from here
@@ -210,12 +224,12 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         // A resumed session publishes its history immediately — `--resume`
         // replays nothing, so without this the transcript RPCs would answer
         // empty until the first new turn.
-        persist.save_now(&handle, &mut blob, &fold);
+        persist.save_now(&handle, &mut blob, &fold, &track);
 
         for event in buffered {
             apply(&handle, &mut fold, &mut track, &gate, &event, &turn_tx, /* ingest */ true);
         }
-        persist.maybe_save(&handle, &mut blob, &fold);
+        persist.maybe_save(&handle, &mut blob, &fold, &track);
         // Say something now, even with nothing to replay — especially then.
         // A reopened backend replays nothing and can stay silent until the
         // next prompt, and `health_push` sends a client no frame at all until
@@ -265,7 +279,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                         // nothing at all.
                         track.note_exit(/* stopped */ false, None);
                         publish_state(&handle, &fold, &track, &gate, &turn_tx, false, Process::Dormant);
-                        persist.save_now(&handle, &mut blob, &fold);
+                        persist.save_now(&handle, &mut blob, &fold, &track);
                         // Back to dormant: with the registry entry gone the
                         // catalog lists it again and `open()` resumes it
                         // fresh, instead of "already live" answering for a
@@ -281,7 +295,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     );
                     apply(&handle, &mut fold, &mut track, &gate, &event, &turn_tx, true);
                     if settled {
-                        persist.save_now(&handle, &mut blob, &fold);
+                        persist.save_now(&handle, &mut blob, &fold, &track);
                     }
                 }
                 prompt = futures::StreamExt::next(&mut prompt_rx), if prompt_open => {
@@ -291,6 +305,13 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                             refresh_meta(&handle, &fold);
                             track.note_sent(oximux_agents::session_health::now_ms(), None);
                             publish_state(&handle, &fold, &track, &gate, &turn_tx, true, Process::Live);
+                            // The send is the thing that supersedes a stored
+                            // failure, so the blob has to learn about it
+                            // here. Left to the next backend frame or the
+                            // save tick, a restart in between would restore
+                            // a failure the user had already answered — and
+                            // hold the queue behind it.
+                            persist.maybe_save(&handle, &mut blob, &fold, &track);
                         }
                         None => prompt_open = false,
                     }
@@ -304,7 +325,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                             // idle while a turn is running.
                             fold_queued_sends(&mut prompt_rx, &handle, &mut fold, &mut track, &gate, &turn_tx);
                             apply(&handle, &mut fold, &mut track, &gate, &event, &turn_tx, /* ingest */ false);
-                            persist.maybe_save(&handle, &mut blob, &fold);
+                            persist.maybe_save(&handle, &mut blob, &fold, &track);
                         }
                         None => synth_open = false,
                     }
@@ -316,7 +337,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // runs after every pass.
                 }
                 _ = save_tick.tick() => {
-                    persist.maybe_save(&handle, &mut blob, &fold);
+                    persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
                 _ = finalize.changed() => {
                     if !*finalize.borrow() {
@@ -330,7 +351,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // The host is draining, which is not the agent dying: no
                     // exit is claimed, only that nothing is running.
                     publish_state(&handle, &fold, &track, &gate, &turn_tx, false, Process::Dormant);
-                    persist.save_now(&handle, &mut blob, &fold);
+                    persist.save_now(&handle, &mut blob, &fold, &track);
                     break;
                 }
             }
@@ -541,6 +562,25 @@ fn publish_state(
     });
 }
 
+/// The failure a restart must carry, exactly as the health reports it.
+///
+/// `inputs_from` is the one reading of a session's health, and it answers
+/// `last_turn_failure` from the tracker's failure with the fold's fuller text
+/// preferred — the fold folds in the stderr diagnostic that the raw result
+/// lacks. Persisting that same string, rather than either half, is what makes
+/// a restored session report the words it reported before the restart instead
+/// of a shorter version of them.
+///
+/// `None` while a turn runs, for the same reason the health reads it that
+/// way: a turn that started has superseded the last one's failure.
+fn failure_to_persist(fold: &ChatThread, track: &HealthTrack) -> Option<String> {
+    track
+        .failed_turn
+        .as_ref()
+        .filter(|_| !fold.turn_active)
+        .map(|raw| fold.last_error.clone().unwrap_or_else(|| raw.clone()))
+}
+
 /// Fold + registry bookkeeping for one event.
 #[allow(clippy::too_many_arguments)]
 fn apply(
@@ -646,14 +686,30 @@ impl Persist {
         Self { settings, index, last_saved_revision: fold.revision().wrapping_sub(1) }
     }
 
-    fn maybe_save(&mut self, handle: &SessionHandle, blob: &mut ChatBlob, fold: &ChatThread) {
+    fn maybe_save(
+        &mut self,
+        handle: &SessionHandle,
+        blob: &mut ChatBlob,
+        fold: &ChatThread,
+        track: &HealthTrack,
+    ) {
         if fold.revision() != self.last_saved_revision {
-            self.save_now(handle, blob, fold);
+            self.save_now(handle, blob, fold, track);
         }
     }
 
-    fn save_now(&mut self, handle: &SessionHandle, blob: &mut ChatBlob, fold: &ChatThread) {
+    fn save_now(
+        &mut self,
+        handle: &SessionHandle,
+        blob: &mut ChatBlob,
+        fold: &ChatThread,
+        track: &HealthTrack,
+    ) {
         self.last_saved_revision = fold.revision();
+        // Written on every save, cleared as well as set: a send clears the
+        // tracker's failure, and a blob that only ever gained the field
+        // would report a failure the session has since moved past.
+        blob.last_failure = failure_to_persist(fold, track);
         blob.model = fold.model.clone();
         blob.entries = fold.entries.clone();
         blob.slash_commands = fold.slash_commands.clone();
@@ -680,6 +736,7 @@ impl Persist {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oximux_agents::send_gate::{DeliveryMode, SendWait};
     use oximux_agents::thread::StubConnection;
 
     fn wait_until(deadline_ms: u64, mut probe: impl FnMut() -> bool) -> bool {
@@ -734,6 +791,141 @@ mod tests {
         assert!(
             wait_until(5_000, || !conn.sent().is_empty()),
             "the send the gate swallowed is the send the pump writes",
+        );
+    }
+
+    /// A turn that failed is still failed after the host restarts.
+    ///
+    /// The fold keeps no durable trace of a failure, so before this the
+    /// session came back reading idle — and the queue the failure was holding
+    /// drained into an agent nobody had fixed. The second pump here is the
+    /// restart: same blob, same store, a new process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_turn_is_still_failed_after_a_restart() {
+        let registry = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        let db = oximux_storage::open_memory().unwrap();
+        let settings = SettingsRepo::new(db);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: vec![ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] }],
+                seed: ChatBlob::new("s-1".into()),
+                settings: settings.clone(),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        tx.send(ThreadEvent::TurnEnded {
+            result: Some("the provider refused".into()),
+            usage: None,
+            is_error: true,
+            turn_diff: None,
+        })
+        .unwrap();
+        assert!(
+            wait_until(5_000, || blob::load(&settings, "s-1")
+                .and_then(|b| b.last_failure)
+                .is_some()),
+            "the failure is written where a restart will find it",
+        );
+
+        // The restart. The agent's stream is new and silent, which is the
+        // case that matters: a resumed backend replays nothing, so nothing
+        // but the blob can say this session failed.
+        drop(tx);
+        registry.unregister("s-1");
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: Vec::new(),
+                seed: blob::load(&settings, "s-1").expect("the stored blob"),
+                settings: settings.clone(),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+
+        assert!(
+            wait_until(5_000, || handle.health().status
+                == oximux_agents::health::HealthStatus::Failed),
+            "the restored session reports the failure, not idle: {:?}",
+            handle.health(),
+        );
+        assert_eq!(
+            handle.health().reason.as_deref(),
+            Some("the provider refused"),
+            "and reports the words it reported before the restart",
+        );
+        // And the failure still holds the queue: another agent's message
+        // waits for a person rather than feeding a session nobody has fixed.
+        // No turn is running here, so `Busy` can only be the failure.
+        let gate = handle.gate().expect("the pump attached its gate");
+        let mut gate = gate.lock().unwrap();
+        gate.push("a child finished".into(), Vec::new(), SendSource::Agent, DeliveryMode::Queue, None);
+        let queued = gate.queued().next().expect("the item is queued").clone();
+        assert_eq!(gate.wait_of(&queued), SendWait::Busy);
+    }
+
+    /// The stored failure is cleared by the next send, not only written.
+    ///
+    /// A blob that could gain the field and never lose it would report a
+    /// failure the session has since moved past — for the life of the
+    /// session, since nothing else writes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_clears_the_failure_the_blob_carries() {
+        let registry = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        let db = oximux_storage::open_memory().unwrap();
+        let settings = SettingsRepo::new(db);
+        let mut seed = ChatBlob::new("s-1".into());
+        seed.last_failure = Some("the provider refused".into());
+        seed.entries = vec![oximux_agents::thread::ThreadEntry::User {
+            text: "ship it".into(),
+            images: Vec::new(),
+            checkpoint: None,
+        }];
+        let (_tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: Vec::new(),
+                seed,
+                settings: settings.clone(),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        assert!(
+            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+            "the pump attached its gate",
+        );
+
+        handle.send_prompt("try again", &[]).unwrap();
+        assert!(
+            wait_until(5_000, || blob::load(&settings, "s-1")
+                .is_some_and(|b| b.last_failure.is_none())),
+            "the send that supersedes the failure clears what a restart would read",
         );
     }
 
