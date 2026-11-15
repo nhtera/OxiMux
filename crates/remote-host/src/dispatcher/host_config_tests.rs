@@ -224,20 +224,106 @@ fn a_second_writer_waits_for_the_first() {
 #[test]
 fn a_whole_config_is_stored_and_applied_together() {
     let f = fixture();
-    let next = HostConfig {
-        confine_chat: false,
-        stall_after_s: 45,
-        caps: oximux_agents::lineage::SpawnCaps { depth: 9, ..HostConfig::default().caps },
-        ..HostConfig::default()
-    };
 
-    f.core.replace_config(next).expect("replace");
+    let change = f
+        .core
+        .edit_config(|config| {
+            config.confine_chat = false;
+            config.stall_after_s = 45;
+            config.caps.depth = 9;
+        })
+        .expect("edit");
 
+    assert_eq!(change.after, f.core.config(), "the answer is what is in force");
     assert_eq!(f.core.config().stall_after_s, 45);
     assert!(!f.core.config().confine_chat);
     assert_eq!(f.core.config().caps.depth, oximux_agents::lineage::MAX_DEPTH, "sanitized on the way in");
     for (key, value) in f.core.config().entries() {
         assert_eq!(f.settings.get(key).unwrap().as_deref(), Some(value.as_str()), "{key} was stored");
+    }
+}
+
+/// The pane's edit runs on the config **in force**, not on one it read first.
+///
+/// The lock serialises the two writes, but it cannot protect a snapshot taken
+/// before it: a pane that built a whole `HostConfig` from a config it read,
+/// then waited for the lock, would store that stale copy and undo whatever
+/// `oximux config set` changed while it waited. Staged with the write gate, so
+/// the interleaving is the one that matters and not a timing accident.
+#[test]
+fn an_edit_that_waits_for_the_lock_keeps_what_landed_meanwhile() {
+    let f = fixture();
+    assert_ne!(f.core.config().stall_after_s, 90, "the fixture must differ");
+
+    // A single-key writer parked inside its window, holding the lock.
+    let (release, parked) = std::sync::mpsc::channel();
+    f.core.set_config_gate(parked);
+    let single = {
+        let core = std::sync::Arc::clone(&f.core);
+        std::thread::spawn(move || core.set_config_value(keys::STALL_AFTER_S, "90"))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // The pane's edit, which has to wait for that lock.
+    let edit = {
+        let core = std::sync::Arc::clone(&f.core);
+        std::thread::spawn(move || core.edit_config(|config| config.confine_chat = true))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(!edit.is_finished(), "the edit is waiting for the lock");
+
+    drop(release);
+    single.join().expect("single writer").expect("set");
+    let change = edit.join().expect("edit").expect("edit");
+
+    assert!(change.after.confine_chat, "the edit applied");
+    assert_eq!(change.before.stall_after_s, 90, "it read the config the other writer left");
+    assert_eq!(f.core.config().stall_after_s, 90, "which it did not undo");
+    let stored = HostConfig::load(|key| f.settings.get(key).ok().flatten());
+    assert_eq!(f.core.config(), stored, "what the host enforces is what the store holds");
+}
+
+/// A whole-config write that cannot be stored applies nothing and reports it.
+///
+/// `set_many` is one transaction for this reason: a loop that failed part way
+/// through would leave the rows holding a mixture of the old config and the
+/// new one, and the next host start would read that mixture back as the
+/// posture to enforce — including a confinement change nobody completed.
+#[test]
+fn a_whole_config_that_cannot_be_stored_leaves_both_the_store_and_the_host_alone() {
+    let f = fixture();
+    f.dispatcher.host_config_write(&operator(), keys::STALL_AFTER_S, "90");
+    let before = f.core.config();
+    let stored_before: Vec<(&str, Option<String>)> =
+        before.entries().iter().map(|(key, _)| (*key, f.settings.get(key).unwrap())).collect();
+
+    // `entries()` writes the rules key ninth, so eight keys have already gone
+    // into the transaction when it is refused: exactly the partial write.
+    f.db.with_conn(|c| {
+        c.execute_batch(&format!(
+            "CREATE TRIGGER refuse_one BEFORE INSERT ON settings \
+             WHEN NEW.key = '{}' BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            keys::VERIFY_ALLOW
+        ))
+    })
+    .expect("trigger");
+
+    let err = f
+        .core
+        .edit_config(|config| {
+            config.confine_chat = !config.confine_chat;
+            config.stall_after_s = 45;
+        })
+        .expect_err("the write is refused");
+
+    assert!(matches!(err, ConfigError::Write(_)), "reported as a write failure: {err:?}");
+    assert_eq!(f.core.config(), before, "the host enforces what it did before");
+    for (key, was) in stored_before {
+        assert_eq!(
+            f.settings.get(key).unwrap(),
+            was,
+            "{key} was rolled back with the rest of the batch",
+        );
     }
 }
 

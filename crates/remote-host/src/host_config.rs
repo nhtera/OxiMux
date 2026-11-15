@@ -122,6 +122,20 @@ pub struct ConfigEntry {
     pub is_default: bool,
 }
 
+/// The config either side of one [`crate::HostCore::edit_config`] call.
+///
+/// Both are read under the settings-write lock, so a caller can tell what its
+/// own edit changed without racing another writer: comparing against a config
+/// it read beforehand could attribute an `oximux config set` to itself, or
+/// miss its own change entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEdit {
+    /// In force before the edit.
+    pub before: HostConfig,
+    /// In force now — sanitized, and already stored.
+    pub after: HostConfig,
+}
+
 /// Why a settings read or write was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {

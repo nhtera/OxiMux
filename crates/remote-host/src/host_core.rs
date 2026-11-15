@@ -32,7 +32,7 @@ use oximux_single_instance::HolderRecord;
 use tokio::sync::{mpsc, watch};
 
 use crate::child_watcher::ChildWatcher;
-use crate::host_config::{self, ConfigEntry, ConfigError, HostConfig};
+use crate::host_config::{self, ConfigEdit, ConfigEntry, ConfigError, HostConfig};
 use crate::outbox_drainer::{self, DrainMsg};
 
 /// Every settable key that has a stored value, read in one pass.
@@ -391,21 +391,36 @@ impl HostCore {
         self.config_entry(key)
     }
 
-    /// Store a whole config and apply it, under the same lock one key takes.
+    /// Edit the whole config and apply it, under the same lock one key takes.
     ///
-    /// The desktop's Settings pane edits every key at once, so it writes
-    /// through here rather than looping over the store itself: otherwise its
-    /// write and a `oximux config set` could interleave, and whichever applied
-    /// second would hold a config the store no longer agrees with.
-    pub fn replace_config(&self, next: HostConfig) -> Result<(), ConfigError> {
-        let next = next.sanitized();
+    /// The desktop's Settings pane changes a field at a time but stores every
+    /// key at once, so it writes through here rather than looping over the
+    /// store itself: otherwise its write and an `oximux config set` could
+    /// interleave, and whichever applied second would hold a config the store
+    /// no longer agrees with.
+    ///
+    /// **`edit` runs inside the lock, on the config in force.** A caller that
+    /// read the config first and handed the whole struct in would write back
+    /// whatever a `config set` changed in between — the lock serialises the
+    /// writes, but it cannot protect a snapshot taken before it. The store is
+    /// written in one transaction for the same reason: a loop that failed part
+    /// way through would leave the rows disagreeing with what is enforced, and
+    /// the next host start would read that mixture back as its posture.
+    pub fn edit_config<F>(&self, edit: F) -> Result<ConfigEdit, ConfigError>
+    where
+        F: FnOnce(&mut HostConfig),
+    {
         let settings = self.settings()?;
         let _write = self.config_write.lock().unwrap();
-        for (key, value) in next.entries() {
-            settings.set(key, &value).map_err(|err| ConfigError::Write(err.to_string()))?;
-        }
-        self.set_config(next);
-        Ok(())
+        let before = self.config();
+        let mut next = before.clone();
+        edit(&mut next);
+        let after = next.sanitized();
+        settings
+            .set_many(&after.entries())
+            .map_err(|err| ConfigError::Write(err.to_string()))?;
+        self.set_config(after.clone());
+        Ok(ConfigEdit { before, after })
     }
 
     /// Follow the host settings. A change applies to the core before it is
