@@ -405,7 +405,7 @@ Change one setting. The host validates it, stores it, and applies it.
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<KEY>` | yes | The setting's key (`oximux config list` names them all) |
-| `<VALUE>` | yes | Its new value. A flag takes true/false; a cap a whole number |
+| `<VALUE>` | yes | Its new value. A flag takes true/false, a cap a whole number, and a choice one of its own words — a refusal names what the key takes |
 
 #### `oximux config list`
 

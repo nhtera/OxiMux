@@ -1167,12 +1167,19 @@ fn a_look_dismisses_the_showing_alert_however_crowded_the_history() {
 }
 
 #[test]
-fn a_session_gone_before_the_watcher_ever_saw_it_is_still_reconciled() {
+fn an_alert_the_watchers_snapshot_never_saw_is_still_reconciled() {
     // A session can register, publish through its follower and unregister
-    // between two of the watcher's passes, so it never enters `known`. A
-    // difference against `known` alone left its published edge with nothing to
-    // retire it, and a view still holding the handle keeps its watches open,
-    // so its own follower never wakes to do it either.
+    // between two of the watcher's passes, so it enters neither `known` nor
+    // `live`. A difference against `known` alone left its published edge with
+    // nothing to retire it, and a view still holding the handle keeps its
+    // watches open, so its own follower never wakes to do it either.
+    //
+    // The session is left registered on purpose. `chats_to_retire` reads only
+    // the two sets it is handed, so the gap is modelled by passing the empty
+    // snapshot the watcher held before the session appeared. Unregistering
+    // here instead wakes the *real* watcher — the fixture runs one — and its
+    // own pass retires the alert, leaving `last` empty: the one state this
+    // assertion cannot tell apart from the bug it guards.
     let f = fixture();
     let target = chat_target("s1");
     let handle = register(&f, "s1");
@@ -1183,13 +1190,12 @@ fn a_session_gone_before_the_watcher_ever_saw_it_is_still_reconciled() {
         "there has to be a published alert for there to be anything to retire"
     );
 
-    f.registry.unregister("s1");
     // The watcher's own view of this pass: it never sampled the session, so
-    // `known` is empty, and it is not live now either.
+    // `known` is empty, and its `live` was taken before the session appeared.
     let stale = f.core.chats_to_retire(&HashSet::new(), &HashSet::new());
     assert!(
         stale.contains(&target),
-        "a target published but never sampled is still gone and wants nothing: {stale:?}"
+        "a target published but never sampled is still reconciled: {stale:?}"
     );
     drop(handle);
 }

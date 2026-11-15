@@ -19,6 +19,7 @@ use oximux_storage::SettingsRepo;
 
 use super::blob::{self, ChatBlob};
 use super::catalog::SessionIndex;
+use super::retry::ServeRetry;
 
 /// How often a dirty fold is written even mid-turn, so a long turn's transcript
 /// survives a crash reasonably intact.
@@ -101,6 +102,10 @@ pub struct PumpSpec {
     /// a secret outliving the process it was minted for is a secret nothing
     /// is watching.
     pub on_end: Option<Box<dyn FnOnce() + Send>>,
+    /// The host's retry driver. The pump sees the failures and the lines; the
+    /// driver owns the timer, because a turn that failed is often the one
+    /// that killed the agent, and a timer held here would die with it.
+    pub retry: Arc<ServeRetry>,
 }
 
 /// Start one session's pump. Returns immediately; the pump runs until the
@@ -121,6 +126,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         registry,
         index,
         on_end,
+        retry,
     } = spec;
 
     // Bridge the transports' std receiver onto the async world. The blocking
@@ -192,6 +198,20 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         } else {
             HealthTrack::default()
         };
+        // A session that died failing comes back failing. The fold keeps no
+        // durable trace of it — `last_error` is transient and an errored
+        // `TurnEnded` leaves no entry — so the failure is restored from the
+        // blob into both the tracker (which decides the health and holds the
+        // queue) and the fold (whose text the health reports). Restored into
+        // only one of the two, the session would read failed with no reason,
+        // or carry a reason nothing reads.
+        //
+        // The next send clears both: `note_sent` drops the tracker's, and a
+        // user message clears the fold's.
+        if let Some(failure) = blob.last_failure.clone() {
+            fold.last_error = Some(failure.clone());
+            track.failed_turn = Some(failure);
+        }
         let mut persist = Persist::new(settings, index, &fold);
 
         // The send gate. Attaching it **takes over the send path**: from here
@@ -207,15 +227,24 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             let _ = wake_tx.send(());
         });
         handle.set_gate(Some(gate.clone()));
+        // Everything the helpers below share, built once: the session they
+        // all act on rather than five of its parts.
+        let pump = Pump {
+            session_id: &session_id,
+            handle: &handle,
+            gate: &gate,
+            turn_tx: &turn_tx,
+            retry: &retry,
+        };
         // A resumed session publishes its history immediately — `--resume`
         // replays nothing, so without this the transcript RPCs would answer
         // empty until the first new turn.
-        persist.save_now(&handle, &mut blob, &fold);
+        persist.save_now(&handle, &mut blob, &fold, &track);
 
         for event in buffered {
-            apply(&handle, &mut fold, &mut track, &gate, &event, &turn_tx, /* ingest */ true);
+            apply(&pump, &mut fold, &mut track, &event, /* ingest */ true);
         }
-        persist.maybe_save(&handle, &mut blob, &fold);
+        persist.maybe_save(&handle, &mut blob, &fold, &track);
         // Say something now, even with nothing to replay — especially then.
         // A reopened backend replays nothing and can stay silent until the
         // next prompt, and `health_push` sends a client no frame at all until
@@ -223,8 +252,9 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         // a session someone just reopened as a default. The catalog's own
         // comment beside `buffered: Vec::new()` already promised it ("the
         // pump publishes the persisted fold immediately").
-        publish_state(&handle, &fold, &track, &gate, &turn_tx, fold.turn_active, Process::Live);
+        publish_state(&pump, &fold, &track, fold.turn_active, Process::Live);
 
+        let mut retry_changed = retry.subscribe();
         let mut save_tick = tokio::time::interval(SAVE_INTERVAL);
         save_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // A relay arm whose sender is gone returns `Ready(None)` on every poll —
@@ -251,7 +281,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // reaches the channel-closed branch below — measured at ~900%
                     // CPU on a host with a dozen sessions. Draining cannot do that;
                     // it stops on empty and on terminated alike.
-                    fold_queued_sends(&mut prompt_rx, &handle, &mut fold, &mut track, &gate, &turn_tx);
+                    fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
                     let Some(event) = event else {
                         // The agent's stream closed: the child exited. An
                         // in-flight turn can never finish now — mark it so
@@ -264,8 +294,8 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                         // watcher reading an unregistered session reads
                         // nothing at all.
                         track.note_exit(/* stopped */ false, None);
-                        publish_state(&handle, &fold, &track, &gate, &turn_tx, false, Process::Dormant);
-                        persist.save_now(&handle, &mut blob, &fold);
+                        publish_state(&pump, &fold, &track, false, Process::Dormant);
+                        persist.save_now(&handle, &mut blob, &fold, &track);
                         // Back to dormant: with the registry entry gone the
                         // catalog lists it again and `open()` resumes it
                         // fresh, instead of "already live" answering for a
@@ -279,9 +309,9 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                             | ThreadEvent::PermissionRequested { .. }
                             | ThreadEvent::QuestionAsked { .. }
                     );
-                    apply(&handle, &mut fold, &mut track, &gate, &event, &turn_tx, true);
+                    apply(&pump, &mut fold, &mut track, &event, true);
                     if settled {
-                        persist.save_now(&handle, &mut blob, &fold);
+                        persist.save_now(&handle, &mut blob, &fold, &track);
                     }
                 }
                 prompt = futures::StreamExt::next(&mut prompt_rx), if prompt_open => {
@@ -290,7 +320,14 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                             fold.push_user_message_with_images(prompt.text, prompt.images);
                             refresh_meta(&handle, &fold);
                             track.note_sent(oximux_agents::session_health::now_ms(), None);
-                            publish_state(&handle, &fold, &track, &gate, &turn_tx, true, Process::Live);
+                            publish_state(&pump, &fold, &track, true, Process::Live);
+                            // The send is the thing that supersedes a stored
+                            // failure, so the blob has to learn about it
+                            // here. Left to the next backend frame or the
+                            // save tick, a restart in between would restore
+                            // a failure the user had already answered — and
+                            // hold the queue behind it.
+                            persist.maybe_save(&handle, &mut blob, &fold, &track);
                         }
                         None => prompt_open = false,
                     }
@@ -302,9 +339,9 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                             // publishes the fold's state, and a prompt still
                             // sitting in the channel means that state says
                             // idle while a turn is running.
-                            fold_queued_sends(&mut prompt_rx, &handle, &mut fold, &mut track, &gate, &turn_tx);
-                            apply(&handle, &mut fold, &mut track, &gate, &event, &turn_tx, /* ingest */ false);
-                            persist.maybe_save(&handle, &mut blob, &fold);
+                            fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
+                            apply(&pump, &mut fold, &mut track, &event, /* ingest */ false);
+                            persist.maybe_save(&handle, &mut blob, &fold, &track);
                         }
                         None => synth_open = false,
                     }
@@ -315,8 +352,31 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // wake exists to break this select, and the flush below
                     // runs after every pass.
                 }
+                _ = retry_changed.changed() => {
+                    // A retry was armed or is over, which this pump's holds
+                    // and health both report. Republished here because
+                    // nothing else would: the gate's waker fires on a push
+                    // and only while the gate is open, so a retry firing —
+                    // which lifts its own hold and queues a line in the same
+                    // breath — pushes into a gate still holding for it and
+                    // wakes nobody at all.
+                    //
+                    // Drained first, for the reason the synth arm drains: a
+                    // resend the flush has already written is a prompt still
+                    // sitting in the channel, so the fold would report idle
+                    // and this publish would clear the gate's hold on the
+                    // very turn that resend just opened.
+                    fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
+                    publish_state(&pump, &fold, &track, fold.turn_active, Process::Live);
+                    // Saved here for the same reason, one step on: a prompt
+                    // this arm folded is one the prompt arm will never see,
+                    // and the save that clears the stored failure is that
+                    // arm's. Left out, a restart would restore a failure the
+                    // send had already answered.
+                    persist.maybe_save(&handle, &mut blob, &fold, &track);
+                }
                 _ = save_tick.tick() => {
-                    persist.maybe_save(&handle, &mut blob, &fold);
+                    persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
                 _ = finalize.changed() => {
                     if !*finalize.borrow() {
@@ -329,8 +389,8 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     }
                     // The host is draining, which is not the agent dying: no
                     // exit is claimed, only that nothing is running.
-                    publish_state(&handle, &fold, &track, &gate, &turn_tx, false, Process::Dormant);
-                    persist.save_now(&handle, &mut blob, &fold);
+                    publish_state(&pump, &fold, &track, false, Process::Dormant);
+                    persist.save_now(&handle, &mut blob, &fold, &track);
                     break;
                 }
             }
@@ -339,7 +399,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             // hold lifting, which the gate's waker never reports. Both halves
             // are needed, and the push half alone is the bug where a child's
             // events sit in the gate until something unrelated arrives.
-            flush(&session_id, &handle, &gate);
+            flush(&pump);
         }
         // Writes go direct again from here: a gate with no one draining it
         // would swallow every later send in silence.
@@ -349,6 +409,22 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             on_end();
         }
     });
+}
+
+/// What every one of a pump's helpers needs and none of them changes.
+///
+/// Grouped rather than threaded: these five travel together through the
+/// publish, the flush, the fold and the Stop, and passing them one by one had
+/// already put `apply` over the argument limit before the retry driver
+/// arrived. A helper that takes this takes the session, not five of its
+/// parts.
+struct Pump<'a> {
+    session_id: &'a str,
+    handle: &'a SessionHandle,
+    gate: &'a Arc<Mutex<SendGate>>,
+    /// The pump's own "is a turn running" channel, which shutdown reads.
+    turn_tx: &'a tokio::sync::watch::Sender<bool>,
+    retry: &'a Arc<ServeRetry>,
 }
 
 /// Fold the prompts this host has written that the fold has not seen yet.
@@ -363,20 +439,18 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
 /// prompt still in the channel, the fold reads idle while a turn is running —
 /// and the gate, told the turn ended, lets the next queued line out beside it.
 fn fold_queued_sends(
+    pump: &Pump<'_>,
     prompt_rx: &mut futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
-    handle: &SessionHandle,
     fold: &mut ChatThread,
     track: &mut HealthTrack,
-    gate: &Arc<Mutex<SendGate>>,
-    turn_tx: &tokio::sync::watch::Sender<bool>,
 ) {
     while let Ok(prompt) = prompt_rx.try_recv() {
         fold.push_user_message_with_images(prompt.text, prompt.images);
-        refresh_meta(handle, fold);
+        refresh_meta(pump.handle, fold);
         // A send, not a frame: the turn is this host's own doing, and the fold
         // does not know it started.
         track.note_sent(oximux_agents::session_health::now_ms(), None);
-        publish_state(handle, fold, track, gate, turn_tx, true, Process::Live);
+        publish_state(pump, fold, track, true, Process::Live);
     }
 }
 
@@ -389,9 +463,11 @@ fn fold_queued_sends(
 /// The lock is dropped before the write. It is the lock a `send_prompt` from
 /// any thread takes, and the write is a pipe write to a child process; the
 /// drainer also takes it on every pass.
-fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) {
+fn flush(pump: &Pump<'_>) {
+    let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
     if gate.lock().unwrap().take_stop_request() {
-        stop_the_turn(session_id, handle, gate);
+        withdraw(gate, pump.retry.on_stopped(session_id));
+        stop_the_turn(pump);
         return;
     }
     loop {
@@ -424,6 +500,12 @@ fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) 
         }
         // The drainer's hook settles (or returns) the outbox rows this item
         // carried, by its uuid.
+        if sent.is_ok() {
+            // Whoever sent this has taken over from an armed retry of an
+            // earlier turn — unless it *is* that retry's own line, which the
+            // driver recognises by this id.
+            withdraw(gate, pump.retry.on_line_written(session_id, item.uuid));
+        }
         let mut gate = gate.lock().unwrap();
         gate.report_sent(item.uuid, sent.is_ok());
         // The take opened a turn for this item. A write that failed started
@@ -463,7 +545,22 @@ fn flush(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) 
 /// parks a child's events until the person's next message releases them, and
 /// nothing headless can release such a hold yet, so a Stop here interrupts
 /// the turn and leaves the queue as it was.
-fn stop_the_turn(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<SendGate>>) {
+/// Take a line the retry driver has given up on out of the queue.
+///
+/// A fired retry lifts its own hold and pushes its resend, so anything that
+/// was waiting behind the hold is *ahead* of that resend. When one of those
+/// goes out first it supersedes the retry — and the resend, still queued,
+/// would then re-send the superseded turn on top of the message that took
+/// over.
+fn withdraw(gate: &Mutex<SendGate>, line: Option<uuid::Uuid>) {
+    let Some(line) = line else { return };
+    let mut gate = gate.lock().unwrap();
+    let Some(id) = gate.queued().find(|q| q.uuid == line).map(|q| q.id) else { return };
+    gate.remove(id);
+}
+
+fn stop_the_turn(pump: &Pump<'_>) {
+    let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
     // Serve never offers steering (`steer_supported` is false in every
     // publish), so no line is ever waiting to be taken back. One that was
     // would be lost rather than retried, so it is reported unsent — which
@@ -503,21 +600,25 @@ fn stop_the_turn(session_id: &str, handle: &SessionHandle, gate: &Arc<Mutex<Send
 /// the persisted queue (F10). `children_active` is 0 because this host refuses
 /// agent-spawned children — truthful today, and F5's job to keep truthful.
 fn publish_state(
-    handle: &SessionHandle,
+    pump: &Pump<'_>,
     fold: &ChatThread,
     track: &HealthTrack,
-    gate: &Arc<Mutex<SendGate>>,
-    turn_tx: &tokio::sync::watch::Sender<bool>,
     working: bool,
     process: Process,
 ) {
-    let _ = turn_tx.send(working);
+    let (handle, gate) = (pump.handle, pump.gate);
+    let _ = pump.turn_tx.send(working);
+    // The one read of the retry driver, so the health and the gate's hold
+    // cannot disagree about whether this session is waiting out a limit.
+    let armed = pump.retry.armed(pump.session_id);
     handle.publish_health(inputs_from(
         fold,
         track,
         HealthExtras {
             process_while_running: process,
             incarnation: handle.incarnation().to_string(),
+            limited_until: armed.as_ref().map(|a| a.wake_at_ms),
+            limit_reason: armed.as_ref().map(|a| a.reason.clone()),
             ..HealthExtras::default()
         },
     ));
@@ -526,11 +627,12 @@ fn publish_state(
     // the one that has to look again — see `flush`.
     gate.lock().unwrap().set_holds(Holds {
         turn_active: working,
-        // Serve has no Stop of its own yet (F7's `Cancel`) and no retry
-        // driver (F9); both stay false rather than guessed, as in the health
-        // facts above.
+        // Serve has no Stop of its own yet (F7's `Cancel`), so `interrupted`
+        // stays false rather than guessed, as in the health facts above.
         interrupted: false,
-        retry_armed: false,
+        // A turn held for a limit holds the queue with it: a line let out
+        // beside it would start a second turn into the same closed window.
+        retry_armed: armed.is_some(),
         disconnected: matches!(process, Process::Dormant),
         prompt_pending: fold.pending_permission().is_some() || fold.pending_question().is_some(),
         failed: track.holds_queue(),
@@ -541,17 +643,34 @@ fn publish_state(
     });
 }
 
+/// The failure a restart must carry, exactly as the health reports it.
+///
+/// `inputs_from` is the one reading of a session's health, and it answers
+/// `last_turn_failure` from the tracker's failure with the fold's fuller text
+/// preferred — the fold folds in the stderr diagnostic that the raw result
+/// lacks. Persisting that same string, rather than either half, is what makes
+/// a restored session report the words it reported before the restart instead
+/// of a shorter version of them.
+///
+/// `None` while a turn runs, for the same reason the health reads it that
+/// way: a turn that started has superseded the last one's failure.
+fn failure_to_persist(fold: &ChatThread, track: &HealthTrack) -> Option<String> {
+    track
+        .failed_turn
+        .as_ref()
+        .filter(|_| !fold.turn_active)
+        .map(|raw| fold.last_error.clone().unwrap_or_else(|| raw.clone()))
+}
+
 /// Fold + registry bookkeeping for one event.
-#[allow(clippy::too_many_arguments)]
 fn apply(
-    handle: &SessionHandle,
+    pump: &Pump<'_>,
     fold: &mut ChatThread,
     track: &mut HealthTrack,
-    gate: &Arc<Mutex<SendGate>>,
     event: &ThreadEvent,
-    turn_tx: &tokio::sync::watch::Sender<bool>,
     ingest: bool,
 ) {
+    let (handle, gate) = (pump.handle, pump.gate);
     if ingest {
         handle.ingest(event.clone());
         // Only the backend's own frames prove it started on the host's line.
@@ -561,7 +680,17 @@ fn apply(
     }
     fold.apply(event);
     track.note_event(event, oximux_agents::session_health::now_ms());
-    publish_state(handle, fold, track, gate, turn_tx, fold.turn_active, Process::Live);
+    // After the fold and the tracker, which is where the failure's class
+    // comes from, and before the publish, so a retry armed by this very
+    // event is already in the health frame it produces.
+    if let ThreadEvent::TurnEnded { is_error, .. } = event {
+        if *is_error {
+            pump.retry.on_turn_failed(pump.session_id, fold, track);
+        } else {
+            pump.retry.on_turn_succeeded(pump.session_id);
+        }
+    }
+    publish_state(pump, fold, track, fold.turn_active, Process::Live);
     // Keep the registry's list-row metadata current on the events that change it.
     //
     // `UserMessage` is in the list because it is what makes a title derivable:
@@ -646,14 +775,30 @@ impl Persist {
         Self { settings, index, last_saved_revision: fold.revision().wrapping_sub(1) }
     }
 
-    fn maybe_save(&mut self, handle: &SessionHandle, blob: &mut ChatBlob, fold: &ChatThread) {
+    fn maybe_save(
+        &mut self,
+        handle: &SessionHandle,
+        blob: &mut ChatBlob,
+        fold: &ChatThread,
+        track: &HealthTrack,
+    ) {
         if fold.revision() != self.last_saved_revision {
-            self.save_now(handle, blob, fold);
+            self.save_now(handle, blob, fold, track);
         }
     }
 
-    fn save_now(&mut self, handle: &SessionHandle, blob: &mut ChatBlob, fold: &ChatThread) {
+    fn save_now(
+        &mut self,
+        handle: &SessionHandle,
+        blob: &mut ChatBlob,
+        fold: &ChatThread,
+        track: &HealthTrack,
+    ) {
         self.last_saved_revision = fold.revision();
+        // Written on every save, cleared as well as set: a send clears the
+        // tracker's failure, and a blob that only ever gained the field
+        // would report a failure the session has since moved past.
+        blob.last_failure = failure_to_persist(fold, track);
         blob.model = fold.model.clone();
         blob.entries = fold.entries.clone();
         blob.slash_commands = fold.slash_commands.clone();
@@ -678,587 +823,5 @@ impl Persist {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use oximux_agents::thread::StubConnection;
-
-    fn wait_until(deadline_ms: u64, mut probe: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
-        while std::time::Instant::now() < deadline {
-            if probe() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        false
-    }
-
-    /// A queued send is written when nothing holds the gate.
-    ///
-    /// Attaching a gate takes the send path over: `send_prompt_tagged` queues
-    /// instead of writing, for every sender. So the flush is not an extra —
-    /// without it this host sends nothing at all.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_queued_send_is_written_once_the_gate_is_open() {
-        let registry = Arc::new(SessionRegistry::new());
-        let conn = Arc::new(StubConnection::default());
-        let handle = registry.register("s-1".into(), conn.clone());
-        let db = oximux_storage::open_memory().unwrap();
-        let (_tx, rx) = std::sync::mpsc::channel();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: Vec::new(),
-                seed: ChatBlob::new("s-1".into()),
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            PumpSet::new(),
-        );
-        // `has_waker` and not merely `is_some`: that is the exact test the
-        // outbox drainer makes before it will hand a parent its children's
-        // events (`outbox_drainer.rs`: `if !gate.has_waker() { continue }`).
-        assert!(
-            wait_until(5_000, || handle
-                .gate()
-                .is_some_and(|g| g.lock().unwrap().has_waker())),
-            "the pump attaches a gate the drainer will deliver into",
-        );
-
-        handle.send_prompt("ship it", &[]).unwrap();
-        assert!(
-            wait_until(5_000, || !conn.sent().is_empty()),
-            "the send the gate swallowed is the send the pump writes",
-        );
-    }
-
-    /// A Stop from a phone or the CLI interrupts the agent.
-    ///
-    /// `SessionHandle::cancel` hands a Stop to the gate whenever one is
-    /// attached and listening, because only the gate's driver can take back
-    /// the lines it wrote into the turn. Headless that driver is this pump, so
-    /// without it reading the request the gate holds a Stop nobody acts on:
-    /// the caller is told `Ok` and the turn runs on.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stop_from_elsewhere_interrupts_the_agent() {
-        let registry = Arc::new(SessionRegistry::new());
-        let conn = Arc::new(StubConnection::default());
-        let handle = registry.register("s-1".into(), conn.clone());
-        let db = oximux_storage::open_memory().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: vec![ThreadEvent::UserMessage { text: "hi".into(), images: vec![] }],
-                seed: ChatBlob::new("s-1".into()),
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            PumpSet::new(),
-        );
-        assert!(
-            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
-            "the pump attached its gate",
-        );
-        tx.send(ThreadEvent::AssistantText("working…".into())).unwrap();
-        assert!(wait_until(5_000, || handle.status_snapshot().working), "a turn is running");
-
-        // The route a phone's Cancel takes.
-        handle.cancel().unwrap();
-        assert!(wait_until(5_000, || conn.cancels() == 1), "the Stop reached the agent");
-    }
-
-    /// A send that could not be written leaves the gate as it found it.
-    ///
-    /// Taking an item opens a turn for it. A write that failed started none,
-    /// and a turn left open closes the gate to every later send until
-    /// something publishes the holds again — which a backend that says
-    /// nothing never does, so the queue would stall for good.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_send_that_could_not_be_written_does_not_wedge_the_queue() {
-        let registry = Arc::new(SessionRegistry::new());
-        let conn = Arc::new(StubConnection::default());
-        let handle = registry.register("s-1".into(), conn.clone());
-        let db = oximux_storage::open_memory().unwrap();
-        let (_tx, rx) = std::sync::mpsc::channel();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: Vec::new(),
-                seed: ChatBlob::new("s-1".into()),
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            PumpSet::new(),
-        );
-        assert!(
-            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
-            "the pump attached its gate",
-        );
-
-        conn.fail_sends(true);
-        handle.send_prompt("this one cannot be written", &[]).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(conn.sent().is_empty(), "nothing reached the agent");
-
-        // No backend event in between: the only thing that can reopen the gate
-        // is the failed write putting back what it took.
-        conn.fail_sends(false);
-        handle.send_prompt("and this one can", &[]).unwrap();
-        assert!(wait_until(5_000, || !conn.sent().is_empty()), "the next send still goes out");
-    }
-
-    /// A send that arrives mid-turn waits for the turn, then goes.
-    ///
-    /// The gate's waker fires when something is pushed and never when a hold
-    /// lifts, so a flush wired only to the waker leaves a child's events
-    /// sitting there until something unrelated happens to arrive.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_send_that_arrives_mid_turn_goes_out_when_the_turn_ends() {
-        let registry = Arc::new(SessionRegistry::new());
-        let conn = Arc::new(StubConnection::default());
-        let handle = registry.register("s-1".into(), conn.clone());
-        let db = oximux_storage::open_memory().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: vec![ThreadEvent::UserMessage { text: "hi".into(), images: vec![] }],
-                seed: ChatBlob::new("s-1".into()),
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            PumpSet::new(),
-        );
-        tx.send(ThreadEvent::AssistantText("working…".into())).unwrap();
-        assert!(wait_until(5_000, || handle.status_snapshot().working), "a turn is running");
-        let during = conn.sent().len();
-
-        handle.send_prompt("and this too", &[]).unwrap();
-        // Nothing may be written into a running turn: this host is queue-only.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert_eq!(conn.sent().len(), during, "held while the turn runs");
-
-        tx.send(ThreadEvent::TurnEnded {
-            is_error: false,
-            result: None,
-            usage: None,
-            turn_diff: None,
-        })
-        .unwrap();
-        assert!(
-            wait_until(5_000, || conn.sent().len() > during),
-            "and written when the turn ends — the hold lifting is what opens the gate",
-        );
-    }
-
-    /// A reopened session says so before its backend says anything.
-    ///
-    /// Both reviewers caught this independently, and the catalog's own comment
-    /// had already promised it: a resumed backend replays nothing, so the
-    /// buffer is empty, and `health_push` sends a client no frame at all
-    /// until a session has published once. Every device would have read a
-    /// session someone just reopened as a default-idle one.
-    ///
-    /// And the first answer is `RestoredUnconfirmed`, not `Idle`: nothing has
-    /// yet confirmed that the conversation on disk is the one this process now
-    /// holds.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reopened_session_publishes_before_its_backend_speaks() {
-        let registry = Arc::new(SessionRegistry::new());
-        let handle = registry.register("s-1".into(), Arc::new(StubConnection::default()));
-        let db = oximux_storage::open_memory().unwrap();
-        let (_tx, rx) = std::sync::mpsc::channel();
-        // A session with history: what `HeadlessCatalog::resume` hands over,
-        // including its empty buffer.
-        let mut seed = ChatBlob::new("s-1".into());
-        seed.entries = vec![oximux_agents::thread::ThreadEntry::User {
-            text: "ship it".into(),
-            images: vec![],
-            checkpoint: None,
-        }];
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: Vec::new(),
-                seed,
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            PumpSet::new(),
-        );
-
-        assert!(
-            wait_until(5_000, || handle.health_published()),
-            "a silent backend is no reason for a client to hear nothing",
-        );
-        assert_eq!(
-            handle.health_snapshot().health.liveness,
-            oximux_agents::health::Liveness::RestoredUnconfirmed,
-            "reopened, and nothing has confirmed it yet",
-        );
-    }
-
-    /// A batch of child events reaches its parent as the events it is.
-    ///
-    /// The gate keeps the host's own envelope intact at the push and escapes
-    /// everyone else's lookalike text. Writing the item back through the
-    /// direct path applied that escaping a second time, so a real update
-    /// arrived at its parent in the very form that marks a forged one as
-    /// ordinary text — on the one host whose whole job in this change is to
-    /// run children.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_childs_events_reach_their_parent_with_the_envelope_intact() {
-        let registry = Arc::new(SessionRegistry::new());
-        let conn = Arc::new(StubConnection::default());
-        let handle = registry.register("s-1".into(), conn.clone());
-        let db = oximux_storage::open_memory().unwrap();
-        let (_tx, rx) = std::sync::mpsc::channel();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: Vec::new(),
-                seed: ChatBlob::new("s-1".into()),
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            PumpSet::new(),
-        );
-        assert!(
-            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
-            "the gate is attached",
-        );
-        // Pushed as the outbox drainer pushes: the host's own batch, under
-        // its own source.
-        let events = oximux_agents::envelope::render(&[oximux_agents::envelope::ChildEvent {
-            kind: oximux_agents::envelope::ChildEventKind::Finished,
-            child: "c-1".into(),
-            depth: 1,
-            title: "a child".into(),
-            status: Some("exit 0".into()),
-            result: Some("done".into()),
-            permit: None,
-        }]);
-        assert!(events.contains("<oximux-event"), "the envelope carries its tags");
-        handle.gate().unwrap().lock().unwrap().push(
-            events,
-            Vec::new(),
-            SendSource::ParentEvent,
-            oximux_agents::send_gate::DeliveryMode::Queue,
-            None,
-        );
-        assert!(wait_until(5_000, || !conn.sent().is_empty()), "the batch is written");
-        let written = conn.sent()[0].to_string();
-        assert!(written.contains("<oximux-event"), "written as events: {written}");
-        assert!(!written.contains("&lt;oximux-event"), "and not escaped: {written}");
-    }
-
-    /// A line an agent cannot acknowledge is confirmed by its next frame.
-    ///
-    /// Only Claude reports which tagged line it started on; every other
-    /// backend drops the id, so nothing will ever name the host's write. The
-    /// outbox drainer settles its rows from receipts alone and gives up after
-    /// 30 s, so without a stand-in a parent's updates read `unconfirmed`
-    /// although they were delivered and acted on.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_line_an_agent_cannot_acknowledge_is_confirmed_by_its_next_frame() {
-        let registry = Arc::new(SessionRegistry::new());
-        // The default stub reports no receipts, like Codex and pi.
-        let conn = Arc::new(StubConnection::default());
-        let handle = registry.register("s-1".into(), conn.clone());
-        assert!(!handle.reports_receipts(), "the backend this test is about");
-        let db = oximux_storage::open_memory().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut receipts = handle.subscribe_receipts();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: Vec::new(),
-                seed: ChatBlob::new("s-1".into()),
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            PumpSet::new(),
-        );
-        assert!(
-            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
-            "the gate is attached",
-        );
-        handle.send_prompt("ship it", &[]).unwrap();
-        assert!(wait_until(5_000, || !conn.sent().is_empty()), "the line is written");
-        assert!(receipts.try_recv().is_err(), "no agent said anything about it yet");
-
-        tx.send(ThreadEvent::AssistantText("on it".into())).unwrap();
-        assert!(
-            wait_until(5_000, || matches!(receipts.try_recv(), Ok(ThreadEvent::UserMessageAccepted { .. }))),
-            "the frame stands in for the receipt the agent cannot send",
-        );
-        tx.send(ThreadEvent::TurnEnded { is_error: false, result: None, usage: None, turn_diff: None }).unwrap();
-        assert!(
-            wait_until(5_000, || matches!(receipts.try_recv(), Ok(ThreadEvent::UserMessagesDelivered { .. }))),
-            "and the turn ending says it was carried",
-        );
-    }
-
-    /// A turn that ends releases the session, rather than leaving it working
-    /// for ever.
-    ///
-    /// The registry's flag is what the host core reads to park a child and to
-    /// count the fan-out cap, and this host never wrote it: a spawned child
-    /// was set working once by the spawn and stayed `active` for the life of
-    /// the process, holding its slot and giving no reason why its parent could
-    /// not spawn again. The private turn channel said the right thing the
-    /// whole time, which is why it went unnoticed — two places saying one
-    /// thing, only one of them read by the thing that matters.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_finished_turn_releases_the_session_it_was_holding() {
-        let registry = Arc::new(SessionRegistry::new());
-        let handle = registry.register("s-1".into(), Arc::new(StubConnection::default()));
-        let db = oximux_storage::open_memory().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let pumps = PumpSet::new();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                // A turn begins with the user's message: the sibling test
-                // relies on the same thing, and an assistant frame on its own
-                // folds into no turn at all.
-                buffered: vec![ThreadEvent::UserMessage { text: "hi".into(), images: vec![] }],
-                seed: ChatBlob::new("s-1".into()),
-                settings: SettingsRepo::new(db),
-                registry: registry.clone(),
-                index: Arc::new(SessionIndex::default()),
-                on_end: None,
-            },
-            pumps.clone(),
-        );
-
-        tx.send(ThreadEvent::AssistantText("working…".into())).unwrap();
-        assert!(
-            wait_until(5_000, || handle.status_snapshot().working),
-            "a running turn reads working in the registry, not only in the pump",
-        );
-        assert!(handle.health_published(), "and it is the published facts that say so");
-
-        tx.send(ThreadEvent::TurnEnded { is_error: false, result: None, usage: None, turn_diff: None }).unwrap();
-        assert!(
-            wait_until(5_000, || !handle.status_snapshot().working),
-            "and the end of that turn gives the slot back",
-        );
-        // The pump's own channel agrees — they are published together.
-        assert_eq!(pumps.active_turns(), 0);
-    }
-
-    /// The bug a review caught before it shipped: an agent whose stream closes
-    /// must return its session to the dormant set — final state persisted,
-    /// registry entry gone (so `open()` can resume it fresh), and the shared
-    /// index still listing it. Without the unregister, one agent crash
-    /// stranded the session as live-looking-but-dead until a host restart.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_dead_agent_returns_its_session_to_dormant() {
-        let registry = Arc::new(SessionRegistry::new());
-        let handle = registry.register("s-1".into(), Arc::new(StubConnection::default()));
-        let db = oximux_storage::open_memory().unwrap();
-        let settings = SettingsRepo::new(db);
-        let index = Arc::new(SessionIndex::default());
-        let pumps = PumpSet::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-        // The credential-revoking hook the launcher installs, stubbed: what
-        // matters here is that a dead agent runs it at all, since a credential
-        // that outlives its process is the leak this hook exists to close.
-        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ended_flag = ended.clone();
-
-        start(
-            PumpSpec {
-                session_id: "s-1".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: vec![ThreadEvent::UserMessage { text: "hi".into(), images: vec![] }],
-                seed: ChatBlob::new("s-1".into()),
-                settings: settings.clone(),
-                registry: registry.clone(),
-                index: index.clone(),
-                on_end: Some(Box::new(move || {
-                    ended_flag.store(true, std::sync::atomic::Ordering::SeqCst)
-                })),
-            },
-            pumps.clone(),
-        );
-
-        // A turn starts, then the agent dies mid-turn.
-        tx.send(ThreadEvent::AssistantText("working…".into())).unwrap();
-        assert!(
-            wait_until(5_000, || pumps.active_turns() == 1),
-            "the pump tracks the in-flight turn"
-        );
-        drop(tx);
-
-        assert!(
-            wait_until(5_000, || registry.get("s-1").is_none()),
-            "a dead agent's session leaves the registry"
-        );
-        assert!(wait_until(5_000, || pumps.live_pumps() == 0), "the pump ends");
-        assert!(
-            wait_until(5_000, || ended.load(std::sync::atomic::Ordering::SeqCst)),
-            "the end hook runs, so the agent's credential is revoked with it"
-        );
-        // The final state reached disk, interruption marked (turn no longer
-        // active in the persisted fold), and the index still knows the row.
-        let blob = blob::load(&settings, "s-1").expect("final state persisted");
-        assert!(!blob.entries.is_empty(), "the fold reached disk");
-        assert_eq!(
-            index.title_of("s-1"),
-            Some(Some("hi".into())),
-            "the index lists the now-dormant session"
-        );
-    }
-
-    /// A LIVE session lists by its prompt, not by its own UUID.
-    ///
-    /// The registry row is what `oximux ls` reads while a session is running,
-    /// and it used to publish `fold.title` alone. These backends never send
-    /// `TitleUpdated`, so that stayed `None` for the session's whole life and
-    /// the wire fell back to the session id — every row reading
-    /// `<project> · <uuid>`, with the uuid already in the id column. Measured
-    /// against a real `claude`: three live sessions were three indistinguishable
-    /// rows, and *restarting the host* fixed them, because only the persistence
-    /// path applied the derived-title fallback.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_live_session_lists_by_its_prompt_rather_than_its_own_id() {
-        let registry = Arc::new(SessionRegistry::new());
-        let handle = registry.register("s-2".into(), Arc::new(StubConnection::default()));
-        let db = oximux_storage::open_memory().unwrap();
-        let settings = SettingsRepo::new(db);
-        let index = Arc::new(SessionIndex::default());
-        let pumps = PumpSet::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        start(
-            PumpSpec {
-                session_id: "s-2".into(),
-                handle: handle.clone(),
-                events: rx,
-                buffered: vec![ThreadEvent::UserMessage {
-                    text: "Summarise what a.txt contains".into(),
-                    images: vec![],
-                }],
-                seed: ChatBlob::new("s-2".into()),
-                settings,
-                registry: registry.clone(),
-                index,
-                on_end: None,
-            },
-            pumps.clone(),
-        );
-
-        // Still live — this is the registry row, not the dormant index.
-        assert!(
-            wait_until(5_000, || registry
-                .get("s-2")
-                .and_then(|h| h.meta_snapshot().title)
-                .is_some_and(|t| t == "Summarise what a.txt contains")),
-            "a live session's list row carries the derived title, got {:?}",
-            registry.get("s-2").and_then(|h| h.meta_snapshot().title),
-        );
-        drop(tx);
-    }
-
-    /// The order the buffered-event test cannot see: the backend announces
-    /// BEFORE the first prompt lands, and the prompt arrives over the protocol
-    /// (`send_prompt` → relay sink), never as a `ThreadEvent` — no backend
-    /// echoes the user's half. The `SessionInit` trigger then fires on an empty
-    /// fold, and if the prompt arms skip the meta refresh the row shows the
-    /// session's own UUID for the session's whole life. A resumed session hits
-    /// the same hole unconditionally, having no `SessionInit` at all.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_prompt_injected_over_the_protocol_still_titles_the_live_row() {
-        let registry = Arc::new(SessionRegistry::new());
-        let handle = registry.register("s-3".into(), Arc::new(StubConnection::default()));
-        let db = oximux_storage::open_memory().unwrap();
-        let settings = SettingsRepo::new(db);
-        let index = Arc::new(SessionIndex::default());
-        let pumps = PumpSet::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        start(
-            PumpSpec {
-                session_id: "s-3".into(),
-                handle: handle.clone(),
-                events: rx,
-                // The backend has already announced; the fold holds no user
-                // entry when the SessionInit trigger fires.
-                buffered: vec![ThreadEvent::SessionInit {
-                    session_id: "s-3".into(),
-                    model: "fake".into(),
-                    permission_mode: "default".into(),
-                    slash_commands: vec![],
-                    meta: Default::default(),
-                }],
-                seed: ChatBlob::new("s-3".into()),
-                settings,
-                registry: registry.clone(),
-                index,
-                on_end: None,
-            },
-            pumps.clone(),
-        );
-        assert!(
-            wait_until(5_000, || registry
-                .get("s-3")
-                .map(|h| h.meta_snapshot().model.as_deref() == Some("fake"))
-                .unwrap_or(false)),
-            "the pump applied the buffered SessionInit",
-        );
-
-        handle.send_prompt("Fix the flaky test", &[]).unwrap();
-
-        assert!(
-            wait_until(5_000, || registry
-                .get("s-3")
-                .and_then(|h| h.meta_snapshot().title)
-                .is_some_and(|t| t == "Fix the flaky test")),
-            "a protocol-injected prompt titles the live row, got {:?}",
-            registry.get("s-3").and_then(|h| h.meta_snapshot().title),
-        );
-        drop(tx);
-    }
-}
+#[path = "pump_tests.rs"]
+mod tests;

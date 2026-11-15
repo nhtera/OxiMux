@@ -1091,11 +1091,13 @@ impl RemoteControl {
     /// Without this the switch would report success while the agents of chats
     /// already open kept the operator reach they were spawned with: a security
     /// setting that did not take. The pane does the same step itself, and both
-    /// read the same edge ([`Self::confinement_switched_on`]).
+    /// read the same edge ([`Self::confinement_switched_on`]). The retry
+    /// settings ride the same channel: they are a view of this config too,
+    /// and one watcher cannot fall behind the other.
     ///
     /// Started once at boot, after the core is installed; it ends when the
     /// core's config channel closes, which is when the core itself goes.
-    pub fn watch_confinement(cx: &mut gpui::App) {
+    pub fn watch_config(cx: &mut gpui::App) {
         let Some(core) = cx.try_global::<RemoteControl>().and_then(|rc| rc.host_core()) else {
             return;
         };
@@ -1105,13 +1107,20 @@ impl RemoteControl {
         cx.spawn(async move |cx: &mut gpui::AsyncApp| {
             while config.changed().await.is_ok() {
                 // Read and release: nothing holds the watch's borrow across an
-                // await, and the respawn below runs on the app thread.
-                let next = config.borrow_and_update().confine_chat;
-                let switched_on = Self::confinement_switched_on(confined, next);
-                confined = next;
-                if switched_on {
-                    cx.update(Self::refresh_chat_credentials);
-                }
+                // await, and both steps below run on the app thread.
+                let next = config.borrow_and_update().clone();
+                let switched_on = Self::confinement_switched_on(confined, next.confine_chat);
+                confined = next.confine_chat;
+                cx.update(|cx| {
+                    // The retry settings are a view of this config, so an
+                    // `oximux config set agents.retry.enabled false` has to
+                    // reach a chat that is holding a turn right now — not at
+                    // the next launch.
+                    crate::agent_retry_settings::apply(&next, cx);
+                    if switched_on {
+                        Self::refresh_chat_credentials(cx);
+                    }
+                });
             }
         })
         .detach();

@@ -19,6 +19,7 @@ mod host;
 mod launcher;
 mod projects;
 mod pump;
+mod retry;
 mod scheduler;
 #[cfg(windows)]
 pub mod service_windows;
@@ -259,6 +260,21 @@ async fn serve(
     let draining = Arc::new(AtomicBool::new(false));
     // One index, three writers: the boot scan, the launcher, and every pump.
     let index = Arc::new(catalog::SessionIndex::default());
+    // The host core is built here rather than beside its `start` below,
+    // because the retry driver reads its config channel and its instance id,
+    // and every pump the launcher and catalog start needs that driver. Only
+    // `set_catalog` and `start` have to wait for the catalog.
+    let host_core =
+        host::build_host_core(tokio::runtime::Handle::current(), &db, registry.clone(), &settings);
+    // The retry driver: one per host, outliving every pump, because the turn
+    // that failed is often the one that killed the agent.
+    let retry = retry::ServeRetry::new(
+        registry.clone(),
+        oximux_agents::retry::store::RetryStore::new(db.conn()),
+        settings.clone(),
+        host_core.subscribe_config(),
+        host_core.instance().to_string(),
+    );
     let launcher = Arc::new(launcher::HeadlessLauncher::new(
         registry.clone(),
         settings.clone(),
@@ -266,6 +282,7 @@ async fn serve(
         draining.clone(),
         index.clone(),
         local_listener.clone(),
+        retry.clone(),
     ));
     let catalog = Arc::new(catalog::HeadlessCatalog::scan(
         registry.clone(),
@@ -274,7 +291,11 @@ async fn serve(
         draining.clone(),
         index,
         local_listener.clone(),
+        retry.clone(),
     ));
+    // Now the catalog exists, so a retry can reopen a session whose agent
+    // exited while its turn was held.
+    retry.set_catalog(&catalog);
     let provider = Arc::new(projects::StaticProjects::load(args.projects, &data_dir));
 
     // ---- worktrees ----
@@ -410,8 +431,6 @@ async fn serve(
     // not delegate at all. It is the same core the desktop runs, from the same
     // database and the same settings keys, so one data directory enforces one
     // set of caps whichever host holds it.
-    let host_core =
-        host::build_host_core(tokio::runtime::Handle::current(), &db, registry.clone(), &settings);
     // We hold the lock, so the previous holder is provably gone; its record
     // only says what to attribute to it (and whether the machine rebooted,
     // which proves its provider children are gone too). A missing or garbled
@@ -423,6 +442,11 @@ async fn serve(
     // and does not reach the core.
     host_core.set_catalog(catalog.clone());
     host_core.start(oximux_remote_host::PriorOwner::from_previous(host_lock.previous()));
+    // After the start, so the config the driver reads is the one this host
+    // will enforce: a user who switched retries off while this host was down
+    // is obeyed, and a wake time already long past is dropped rather than
+    // fired at a person who has not seen the failure since.
+    retry.restore();
 
     let mut dispatcher = Dispatcher::new(registry.clone(), auth.clone())
         .with_host_core(host_core.clone())

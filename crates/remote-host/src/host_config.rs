@@ -7,6 +7,7 @@
 //! restart needed.
 
 use oximux_agents::lineage::SpawnCaps;
+pub use oximux_settings::agent_retry::MaxAutomaticWait;
 use oximux_storage::SettingsRepo;
 
 /// Settings keys, shared by both hosts' loaders.
@@ -22,6 +23,8 @@ pub mod keys {
     pub const VERIFY_ALLOW: &str = "agents.delegation.verify_allow";
     pub const STALL_AFTER_S: &str = "agents.health.stall_after_s";
     pub const MAX_RESUMES: &str = "agents.recovery.max_resumes";
+    pub const RETRY_ENABLED: &str = "agents.retry.enabled";
+    pub const RETRY_MAX_WAIT: &str = "agents.retry.max_automatic_wait";
 }
 
 /// The commands a Claude verifier may run when nothing else is configured:
@@ -45,6 +48,20 @@ pub const DEFAULT_VERIFY_ALLOW: &[&str] = &[
     "Bash(git status:*)",
 ];
 
+/// The retry ceiling's stored tokens, taken from the choice itself rather
+/// than listed again here: a fourth variant must not become a value the verb
+/// refuses and the pane offers.
+static WAIT_TOKENS: &[&str] = &[
+    MaxAutomaticWait::SixHours.token(),
+    MaxAutomaticWait::OneDay.token(),
+    MaxAutomaticWait::NoLimit.token(),
+];
+
+// A variant added to the choice and not to the list above would be a value
+// the pane offers and the verb refuses. The list cannot be derived from
+// `ALL` in a const, so it is checked against it here instead.
+const _: () = assert!(WAIT_TOKENS.len() == MaxAutomaticWait::ALL.len());
+
 /// What kind of value a setting takes, for the one verb that writes them
 /// (`oximux config set`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +74,10 @@ pub enum ValueKind {
     Count,
     /// One `Bash(<command>)` rule per line.
     Rules,
+    /// One of a fixed set of tokens. The set is the setting's own, so the
+    /// verb offers exactly what the pane offers and a token one accepts
+    /// cannot be one the other refuses.
+    Choice(&'static [&'static str]),
 }
 
 impl ValueKind {
@@ -78,6 +99,11 @@ impl ValueKind {
             Self::Count => {
                 value.parse::<u32>().map(|n| n.to_string()).map_err(|_| "takes a whole number".into())
             }
+            Self::Choice(allowed) => allowed
+                .iter()
+                .find(|t| **t == value)
+                .map(|t| (*t).to_string())
+                .ok_or_else(|| format!("takes one of {}", allowed.join(", "))),
             Self::Rules => {
                 let rules: Vec<&str> = value.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
                 let Some(bad) = rules.iter().find(|rule| !is_command_rule(rule)) else {
@@ -110,6 +136,8 @@ pub const SETTABLE: &[(&str, ValueKind)] = &[
     (keys::VERIFY_ALLOW, ValueKind::Rules),
     (keys::STALL_AFTER_S, ValueKind::Count),
     (keys::MAX_RESUMES, ValueKind::Count),
+    (keys::RETRY_ENABLED, ValueKind::Flag),
+    (keys::RETRY_MAX_WAIT, ValueKind::Choice(WAIT_TOKENS)),
 ];
 
 /// One setting as a host enforces it now: what `oximux config` prints, and
@@ -208,6 +236,17 @@ pub struct HostConfig {
     /// agent and is billed); the rest wait in line. 0 sends none: the
     /// children stay parked and each gets the note with its next message.
     pub max_resumes: u32,
+    /// A turn a provider limit closed is re-sent automatically. Off means a
+    /// limit surfaces as an ordinary failure at once, which is what the app
+    /// did before retries existed.
+    pub retry_enabled: bool,
+    /// Longest a host may hold a turn waiting for a limit to reset.
+    ///
+    /// A weekly window that reopens in six days is technically retryable, and
+    /// holding a turn for six days is worse than reporting the failure: a
+    /// held turn and a forgotten one look the same, and one that fires days
+    /// late lands in a context the user has left behind.
+    pub retry_max_wait: MaxAutomaticWait,
 }
 
 impl Default for HostConfig {
@@ -221,6 +260,8 @@ impl Default for HostConfig {
             verify_allow: DEFAULT_VERIFY_ALLOW.iter().map(|r| r.to_string()).collect(),
             stall_after_s: (oximux_agents::health::DEFAULT_STALL_AFTER_MS / 1000) as u32,
             max_resumes: oximux_agents::resume_governor::DEFAULT_MAX_RESUMES,
+            retry_enabled: true,
+            retry_max_wait: MaxAutomaticWait::default(),
         }
     }
 }
@@ -255,6 +296,11 @@ impl HostConfig {
                 .unwrap_or(d.verify_allow),
             stall_after_s: num(keys::STALL_AFTER_S, d.stall_after_s),
             max_resumes: num(keys::MAX_RESUMES, d.max_resumes),
+            retry_enabled: flag(keys::RETRY_ENABLED, d.retry_enabled),
+            // `from_token` answers the default for anything it does not
+            // know, which is this loader's own rule for an unreadable value.
+            retry_max_wait: get(keys::RETRY_MAX_WAIT)
+                .map_or(d.retry_max_wait, |t| MaxAutomaticWait::from_token(t.trim())),
         }
         .sanitized()
     }
@@ -273,7 +319,19 @@ impl HostConfig {
             (keys::VERIFY_ALLOW, self.verify_allow.join("\n")),
             (keys::STALL_AFTER_S, self.stall_after_s.to_string()),
             (keys::MAX_RESUMES, self.max_resumes.to_string()),
+            (keys::RETRY_ENABLED, self.retry_enabled.to_string()),
+            (keys::RETRY_MAX_WAIT, self.retry_max_wait.token().to_string()),
         ]
+    }
+
+    /// The retry policy this config sets, as the pure scheduler takes it.
+    ///
+    /// `retry_enabled` is deliberately not folded in here: the policy answers
+    /// *when* to retry, and "never, the user switched it off" is a different
+    /// question from "never, waiting cannot fix this". A caller that checked
+    /// only the schedule would report a disabled retry as an exhausted one.
+    pub fn retry(&self) -> oximux_agents::retry::RetrySettings {
+        oximux_agents::retry::RetrySettings { max_automatic_wait: self.retry_max_wait.duration() }
     }
 
     /// The health thresholds this config sets.
@@ -347,6 +405,59 @@ mod tests {
         }
     }
 
+    /// The host's shipped ceiling is the retry module's own, not a second
+    /// copy of the number that could drift from it.
+    #[test]
+    fn the_shipped_retry_ceiling_is_the_retry_modules_own() {
+        let shipped = HostConfig::default();
+        assert!(shipped.retry_enabled, "retries ship on");
+        assert_eq!(
+            shipped.retry().max_automatic_wait,
+            oximux_agents::retry::RetrySettings::default().max_automatic_wait
+        );
+    }
+
+    /// The stored choice becomes the ceiling the scheduler takes, "no limit"
+    /// included — which is the absence of a ceiling, not a zero one.
+    #[test]
+    fn the_stored_choice_becomes_the_ceiling_the_scheduler_takes() {
+        let capped = HostConfig { retry_max_wait: MaxAutomaticWait::SixHours, ..HostConfig::default() };
+        assert_eq!(
+            capped.retry().max_automatic_wait,
+            Some(std::time::Duration::from_secs(6 * 60 * 60))
+        );
+        let uncapped = HostConfig { retry_max_wait: MaxAutomaticWait::NoLimit, ..HostConfig::default() };
+        assert_eq!(uncapped.retry().max_automatic_wait, None);
+    }
+
+    /// A token this build does not know is refused by the verb, so the only
+    /// way into the store is one the loader can read back. The choice's own
+    /// list is the verb's, so the two cannot offer different sets.
+    #[test]
+    fn the_wait_takes_its_own_tokens_and_nothing_else() {
+        let kind = kind_of(keys::RETRY_MAX_WAIT).expect("a settable key");
+        for choice in MaxAutomaticWait::ALL {
+            assert_eq!(kind.canonical(choice.token()).as_deref(), Ok(choice.token()), "{choice:?}");
+            assert_eq!(
+                MaxAutomaticWait::from_token(choice.token()),
+                *choice,
+                "a token the verb stores must read back as what it named"
+            );
+        }
+        assert!(kind.canonical("six-hour").is_err(), "a near miss is not a choice");
+        assert!(kind.canonical("3600").is_err(), "nor is a number of seconds");
+    }
+
+    /// Switching retries off is not a ceiling of zero: the policy still
+    /// schedules, and the caller is the one that must not consult it. A host
+    /// that folded the flag into the policy would report "retries exhausted"
+    /// for a feature the user simply turned off.
+    #[test]
+    fn switching_retries_off_does_not_change_the_policy() {
+        let off = HostConfig { retry_enabled: false, ..HostConfig::default() };
+        assert_eq!(off.retry(), HostConfig::default().retry());
+    }
+
     #[test]
     fn sanitizing_clamps_depth_and_count_caps() {
         let wild = HostConfig {
@@ -378,6 +489,8 @@ mod tests {
             verify_allow: vec!["Bash(just test:*)".into(), "Bash(cargo nextest run:*)".into()],
             stall_after_s: 90,
             max_resumes: 5,
+            retry_enabled: false,
+            retry_max_wait: MaxAutomaticWait::SixHours,
         };
         let stored: std::collections::HashMap<&str, String> = custom.entries().into_iter().collect();
         assert_eq!(HostConfig::load(|k| stored.get(k).cloned()), custom);

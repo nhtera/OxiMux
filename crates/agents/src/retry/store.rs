@@ -170,6 +170,34 @@ impl RetryStore {
             .optional()?)
     }
 
+    /// Every session's live retry, for a host rebuilding its timers at boot.
+    ///
+    /// Only rows with a wake time: a live row without one is a retry that has
+    /// already fired and is waiting on the turn it sent, and re-arming it
+    /// would send that turn a second time.
+    pub fn live_all(&self) -> Result<Vec<(String, LiveRetry)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, turn_key, class, reason, attempts, next_wake_at_ms \
+             FROM turn_retries WHERE resolved IS NULL AND next_wake_at_ms IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    LiveRetry {
+                        turn_key: r.get(1)?,
+                        class: r.get(2)?,
+                        reason: r.get(3)?,
+                        attempts: r.get(4)?,
+                        next_wake_at_ms: r.get(5)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Drop rows resolved more than [`KEEP_HOURS`] ago, and live rows
     /// abandoned for [`ABANDONED_DAYS`]: first failed that long ago and with
     /// no wake since. A retry still waiting on a far reset is kept.

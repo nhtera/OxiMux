@@ -34,6 +34,8 @@ pub use classify::{RetryClass, classify_failure};
 
 use std::time::Duration;
 
+use oximux_agent_core::thread::ThreadEntry;
+
 /// Most automatic attempts for one turn.
 ///
 /// Four is the cap the user cannot raise. A window retry consumes one attempt
@@ -61,6 +63,68 @@ pub const WINDOW_GRACE: Duration = Duration::from_secs(30);
 /// watching a countdown does not notice.
 pub const JITTER_SPAN: Duration = Duration::from_secs(120);
 
+/// What a retry sends when the failed turn had already started working.
+///
+/// Sending the prompt again would start the work over, so the agent is asked
+/// to carry on instead.
+pub const CONTINUE_PROMPT: &str = "Please continue.";
+
+/// Whether the failed turn had begun — the agent said or ran something after
+/// the user's last message.
+///
+/// Shared, because it decides what a retry *sends*: get it wrong and a turn
+/// that was half-done is started from the beginning, or one that never began
+/// is told to continue a prompt the agent never saw. Both hosts must answer
+/// it the same way.
+pub fn turn_had_output(entries: &[ThreadEntry]) -> bool {
+    entries
+        .iter()
+        .rev()
+        .take_while(|e| !matches!(e, ThreadEntry::User { .. }))
+        .any(|e| matches!(e, ThreadEntry::Assistant(_) | ThreadEntry::ToolCall(_)))
+}
+
+/// The key a turn's automatic attempts are counted against, in the durable
+/// [`store::RetryStore`].
+///
+/// The send's own id when it was tagged, and its text and place in the
+/// transcript when it was not. Shared for the reason the count is durable at
+/// all: two hosts deriving the key differently would each start a failed turn
+/// at zero attempts, and four attempts would become eight.
+pub fn turn_key(sent_id: Option<&str>, entries: &[ThreadEntry]) -> String {
+    let id = match sent_id {
+        Some(id) => id.to_string(),
+        None => {
+            let at = entries.iter().rposition(|e| matches!(e, ThreadEntry::User { .. }));
+            let text = at.and_then(|i| match &entries[i] {
+                ThreadEntry::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            });
+            format!("untagged:{}:{}", at.unwrap_or(0), text.unwrap_or_default())
+        }
+    };
+    crate::send_receipts::key_hash(crate::send_receipts::KeyKind::Gate, &id)
+}
+
+/// The reason a usage window gives: the one wait that is a limit resetting
+/// (an overload is a backoff), so a chip reads "Limited".
+pub const WINDOW_REASON: &str = "Usage limit reached";
+
+/// The one-line reason a class gives, shown on a card and carried in the
+/// health as `limit_reason`.
+///
+/// Shared, because a phone reading a headless host's reason and a desktop
+/// card reading its own must say the same thing about the same failure.
+pub fn reason_for(class: RetryClass) -> String {
+    match class {
+        RetryClass::Window { .. } => WINDOW_REASON.into(),
+        RetryClass::Overload => "Provider overloaded".into(),
+        // Never armed, so never rendered; kept total rather than
+        // `unreachable!` so a future class cannot panic a transcript.
+        RetryClass::Spend | RetryClass::Other => "Turn failed".into(),
+    }
+}
+
 /// User-facing retry configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetrySettings {
@@ -72,9 +136,20 @@ pub struct RetrySettings {
     pub max_automatic_wait: Option<Duration>,
 }
 
+impl RetrySettings {
+    /// The shipped ceiling: a day. Long enough for every five-hour window and
+    /// a same-day weekly reset, short enough that a held turn is still about
+    /// the conversation the user left.
+    ///
+    /// A constant rather than only a `Default` body, because a host stores
+    /// this number as a setting and has to be able to name the shipped one
+    /// without constructing a value.
+    pub const SHIPPED_MAX_WAIT: Option<Duration> = Some(Duration::from_secs(24 * 60 * 60));
+}
+
 impl Default for RetrySettings {
     fn default() -> Self {
-        Self { max_automatic_wait: Some(Duration::from_secs(24 * 60 * 60)) }
+        Self { max_automatic_wait: Self::SHIPPED_MAX_WAIT }
     }
 }
 

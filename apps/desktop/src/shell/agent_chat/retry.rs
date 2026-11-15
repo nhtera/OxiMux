@@ -33,9 +33,7 @@ use super::*;
 /// a limit that expired without them.
 const RESTORE_GRACE_MS: i64 = 5 * 60 * 1000;
 
-/// The reason a usage window gives: the one wait that is a limit resetting
-/// (an overload is a backoff), so the card's chip reads "Limited".
-pub(super) const WINDOW_REASON: &str = "Usage limit reached";
+pub(super) use oximux_agents::retry::{WINDOW_REASON, reason_for};
 
 /// Why no automatic retry was armed for a retryable failure: the attempts ran
 /// out, or (before any) the wait is longer than the user allows.
@@ -47,8 +45,7 @@ fn exhausted_note(class: oximux_agents::retry::RetryClass, attempts: u32) -> &'s
     }
 }
 
-/// What a retry sends when the failed turn had already started working.
-const CONTINUE_PROMPT: &str = "Please continue.";
+use oximux_agents::retry::CONTINUE_PROMPT;
 
 /// A retry the app has committed to, holding the timer that will fire it.
 ///
@@ -101,18 +98,6 @@ impl ChatRetry {
             reason: p.reason.clone(),
             attempt: self.attempt,
         })
-    }
-}
-
-/// The one-line reason shown on the card for a class.
-pub(super) fn reason_for(class: oximux_agents::retry::RetryClass) -> String {
-    use oximux_agents::retry::RetryClass;
-    match class {
-        RetryClass::Window { .. } => WINDOW_REASON.into(),
-        RetryClass::Overload => "Provider overloaded".into(),
-        // Never armed, so never rendered; kept total rather than `unreachable!`
-        // so a future class cannot panic the transcript.
-        RetryClass::Spend | RetryClass::Other => "Turn failed".into(),
     }
 }
 
@@ -233,6 +218,24 @@ impl AgentChatView {
                 }
             }
             let _ = this.update(cx, |view, cx| {
+                // The setting is read again, not as it was when the retry was
+                // armed: the wait can be hours long, and a user who switches
+                // retries off during it has said no to this send. `serve`
+                // checks the same thing at the same moment.
+                let enabled = cx
+                    .try_global::<AgentRetrySettings>()
+                    .copied()
+                    .unwrap_or_else(AgentRetrySettings::shipped)
+                    .enabled;
+                if !enabled {
+                    // What the card's own Cancel does, and for the same
+                    // reason: arming cleared `last_error` to swap the failure
+                    // card for the queued one, so a retry that ends without
+                    // putting it back leaves the chat showing neither the
+                    // failure nor anything to retry it with.
+                    view.cancel_retry(cx);
+                    return;
+                }
                 // Attempt is counted at fire time, not at arm time, so a retry
                 // the user cancels costs nothing.
                 view.retry.pending = None;
@@ -580,7 +583,14 @@ mod tests {
     /// that is where `restore_pending_retry` reads them from — deliberately at
     /// restore time rather than from the blob, so a user who switched the
     /// feature off while the app was closed is obeyed.
-    async fn with_view<F>(cx: &mut TestAppContext, settings: AgentRetrySettings, f: F)
+    ///
+    /// The window comes back so a test can let the countdown run and look
+    /// again: what a retry does when it *fires* is a second question.
+    async fn with_view<F>(
+        cx: &mut TestAppContext,
+        settings: AgentRetrySettings,
+        f: F,
+    ) -> gpui::WindowHandle<AgentChatView>
     where
         F: FnOnce(&mut AgentChatView, &mut Context<AgentChatView>),
     {
@@ -598,6 +608,7 @@ mod tests {
         });
         cx.run_until_parked();
         window.update(cx, |view, _window, cx| f(view, cx)).expect("window update");
+        window
     }
 
     /// The point of persisting a retry at all: a five-hour window outlives the
@@ -730,6 +741,35 @@ mod tests {
             assert!(!view.retry.is_armed(), "auto-retry off means nothing re-arms");
         })
         .await;
+    }
+
+    /// Switching retries off while one is waiting stops it before it sends.
+    /// The wait can be hours long, so the setting has to mean what it says at
+    /// the send and not only at the arm — which is where `serve` reads it too.
+    #[gpui::test]
+    async fn a_retry_switched_off_while_it_waits_does_not_fire(cx: &mut TestAppContext) {
+        let window = with_view(cx, AgentRetrySettings::shipped(), |view, cx| {
+            view.send_text("build it".into(), Vec::new(), cx);
+            view.thread.turn_active = false;
+            // A wake time already past: the countdown has no sleep left, so
+            // what it does when it gets there is the whole question.
+            view.restore_pending_retry(saved(-30_000, 0), cx);
+            assert!(view.retry.is_armed(), "it is waiting when the setting changes");
+            cx.set_global(AgentRetrySettings { enabled: false, ..AgentRetrySettings::shipped() });
+        })
+        .await;
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(!view.retry.is_armed(), "the wait is over");
+                assert!(!view.thread.turn_active, "and the turn was not sent again");
+                assert!(
+                    view.thread.last_error.is_some(),
+                    "the failure the retry was for is showing again, with its Retry",
+                );
+            })
+            .expect("window update");
     }
 
     /// Shortening `max_automatic_wait` while the app was closed also applies:

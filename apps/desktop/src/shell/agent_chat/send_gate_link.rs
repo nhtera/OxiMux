@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Context};
 use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource, Steered};
-use oximux_agents::thread::ThreadEntry;
 use oximux_agents::thread::{ChatImage, PermissionDecision, PermissionKind, ThreadEvent, ToolCallStatus, Transport};
 use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};
 use uuid::Uuid;
@@ -91,12 +90,9 @@ impl AgentChatView {
 
     /// Whether the agent has said anything since the latest prompt.
     pub(super) fn turn_has_output(&self) -> bool {
-        self.thread
-            .entries
-            .iter()
-            .rev()
-            .take_while(|e| !matches!(e, ThreadEntry::User { .. }))
-            .any(|e| matches!(e, ThreadEntry::Assistant(_) | ThreadEntry::ToolCall(_)))
+        // The shared rule: it decides what a retry sends, and the headless
+        // host answers the same question from the same entries.
+        oximux_agents::retry::turn_had_output(&self.thread.entries)
     }
 
     /// Whether this agent reports, per line, that it started on it (Claude).

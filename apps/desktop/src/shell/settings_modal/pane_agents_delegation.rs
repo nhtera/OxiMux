@@ -17,7 +17,7 @@ use super::layout::{SettingEntry, card_surface, entries_card, entry, section_tit
 use crate::remote_control::RemoteControl;
 
 /// The host's config right now, or the defaults before the core is installed.
-fn current(cx: &gpui::App) -> HostConfig {
+pub(super) fn current(cx: &gpui::App) -> HostConfig {
     cx.try_global::<RemoteControl>()
         .and_then(|rc| rc.host_core())
         .map_or_else(HostConfig::default, |core| core.config())
@@ -29,7 +29,7 @@ fn current(cx: &gpui::App) -> HostConfig {
 /// on the config in force while it holds its write lock: a struct built from a
 /// config this pane read first would write back whatever an `oximux config set`
 /// changed in between.
-fn apply(
+pub(super) fn apply(
     modal: &SettingsModal,
     edit: impl FnOnce(&mut HostConfig),
     cx: &mut gpui::Context<SettingsModal>,

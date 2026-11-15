@@ -875,7 +875,8 @@ pub enum ConfigCommand {
     Set {
         /// The setting's key (`oximux config list` names them all).
         key: String,
-        /// Its new value. A flag takes true/false; a cap a whole number.
+        /// Its new value. A flag takes true/false, a cap a whole number, and
+        /// a choice one of its own words — a refusal names what the key takes.
         value: String,
     },
     /// List every setting this host has, with which ones anybody has set.
