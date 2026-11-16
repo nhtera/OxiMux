@@ -341,7 +341,20 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
                         // provider had died. This is the same channel a failed
                         // turn already persists through, and the next send
                         // clears it the same way.
-                        let reason = oximux_agents::health::exited_reason(proof);
+                        //
+                        // Appended to a failure already recorded, never
+                        // replacing it: a provider that reported "API error
+                        // 529" and then exited has explained itself, and the
+                        // exit is the consequence. Someone reopening the
+                        // session needs the explanation, not only the epitaph
+                        // — so both are kept, in that order.
+                        let exit = oximux_agents::health::exited_reason(proof);
+                        let explained =
+                            fold.last_error.clone().or_else(|| track.failed_turn.clone());
+                        let reason = match explained {
+                            Some(failed) => format!("{failed} — {exit}"),
+                            None => exit,
+                        };
                         fold.last_error = Some(reason.clone());
                         track.failed_turn = Some(reason);
                         // Published before the registry entry goes: a watcher

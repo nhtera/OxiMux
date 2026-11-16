@@ -91,11 +91,18 @@ impl std::error::Error for HeldByAnotherHost {}
 /// read as one — a record from a machine whose clock has since moved, say.
 /// Unreadable is left out rather than printed raw: a bare epoch count helps
 /// nobody standing at a terminal.
+///
+/// With the UTC offset, because the point of printing the start time is to
+/// tell one process from another: across a daylight-saving fold two instants
+/// an hour apart format to the same local clock time, and then the time no
+/// longer distinguishes what it was added to distinguish.
 fn started_at(unix_s: u64) -> Option<String> {
     use chrono::TimeZone as _;
     let secs = i64::try_from(unix_s).ok()?;
     match chrono::Local.timestamp_opt(secs, 0) {
-        chrono::offset::LocalResult::Single(at) => Some(at.format("%Y-%m-%d %H:%M:%S").to_string()),
+        chrono::offset::LocalResult::Single(at) => {
+            Some(at.format("%Y-%m-%d %H:%M:%S%:z").to_string())
+        }
         _ => None,
     }
 }
