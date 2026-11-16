@@ -519,7 +519,10 @@ fn host_verb(mut args: Cli) -> u8 {
             // below ever sees anything but a full id.
             target::resolve_in_place(&client, &mut args.command).await?;
             match args.command {
-                Command::Status => commands::status::run(&client).await,
+                Command::Status { session: None } => commands::status::run(&client).await,
+                Command::Status { session: Some(session) } => {
+                    commands::status::session(&client, &session).await
+                }
                 Command::Ls { .. } => commands::sessions::ls(&client).await,
                 Command::Projects { command: ProjectsCommand::Ls } => {
                     commands::sessions::projects_ls(&client).await

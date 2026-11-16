@@ -86,7 +86,17 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Is a host reachable, and what is it running? (versions, session counts)
-    Status,
+    ///
+    /// With a session id, what that session is doing instead: the host's own
+    /// verdict on it — working, waiting on you, rate-limited, failed — and
+    /// whether its agent process is known to be alive. This is the host's
+    /// health, not a guess from the event stream, so it is what to read when a
+    /// session looks stuck and the transcript says nothing.
+    #[command(verbatim_doc_comment)]
+    Status {
+        /// A session id, or a unique prefix of it (see `oximux ls`).
+        session: Option<String>,
+    },
     /// List the host's agent sessions.
     Ls {
         /// List every paired host's sessions, and this machine's, in one table

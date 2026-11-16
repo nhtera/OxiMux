@@ -114,14 +114,20 @@ pub struct AgentBehaviour {
     /// Take the prompt, ask a permission, and never answer — leaves a turn in
     /// flight for the recovery suite to interrupt.
     pub stall: bool,
+    /// Answer the prompt, end the turn, and exit — a provider that is
+    /// provably gone rather than merely silent.
+    pub exit: bool,
 }
 
 impl AgentBehaviour {
     pub fn probing() -> Self {
-        Self { probe: true, stall: false }
+        Self { probe: true, ..Self::default() }
     }
     pub fn stalling() -> Self {
-        Self { probe: false, stall: true }
+        Self { stall: true, ..Self::default() }
+    }
+    pub fn exiting() -> Self {
+        Self { exit: true, ..Self::default() }
     }
 }
 
@@ -178,6 +184,11 @@ pub fn boot_serve(
         cmd.env("OXIMUX_FAKE_AGENT_STALL", "1");
     } else {
         cmd.env_remove("OXIMUX_FAKE_AGENT_STALL");
+    }
+    if behaviour.exit {
+        cmd.env("OXIMUX_FAKE_AGENT_EXIT", "1");
+    } else {
+        cmd.env_remove("OXIMUX_FAKE_AGENT_EXIT");
     }
 
     let mut child =
