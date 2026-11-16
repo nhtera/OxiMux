@@ -106,7 +106,7 @@ fn a_headless_session_waiting_on_a_person_says_so_and_says_it_is_alive() {
     let (data_dir, session, serve) = stalled_turn(dir.path(), "parity-waiting");
 
     let v = status(&data_dir, &session);
-    assert_eq!(v["data"]["open"], true, "{v}");
+    assert_eq!(v["data"]["health_published"], true, "{v}");
     assert_eq!(v["data"]["health"]["status"], "needsPermission", "{v}");
     assert_eq!(
         v["data"]["health"]["liveness"], "live",
@@ -150,7 +150,9 @@ fn a_provider_that_answers_and_leaves_goes_back_to_dormant_with_its_turn_kept() 
     std::fs::create_dir_all(&cwd).unwrap();
     let session = session_of(&run_prompt(&data_dir, &cwd, "answer and leave"));
 
-    let v = await_status(&data_dir, &session, "not open", |d| d["open"] == false);
+    let v = await_status(&data_dir, &session, "no published verdict", |d| {
+        d["health_published"] == false
+    });
     assert_eq!(v["data"]["health"], Value::Null, "nothing is running it: {v}");
 
     // Still listed, and its turn is on disk: dormant means "not running", not
@@ -292,7 +294,7 @@ fn reading_a_session_that_is_not_running_answers_at_once_and_starts_nothing() {
 
     let started = Instant::now();
     let v = status(&data_dir, &session);
-    assert_eq!(v["data"]["open"], false, "{v}");
+    assert_eq!(v["data"]["health_published"], false, "{v}");
     assert_eq!(v["data"]["health"], Value::Null, "{v}");
     assert!(
         started.elapsed() < Duration::from_secs(10),

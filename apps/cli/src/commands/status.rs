@@ -53,34 +53,27 @@ const FIRST_HEALTH_WITHIN: std::time::Duration = std::time::Duration::from_secs(
 ///
 /// **It never starts anything.** A diagnostic that spawned the provider it was
 /// asked about would answer a question nobody asked, and on a headless host
-/// the spawn is a real process with a real bill. So this uses only the two
-/// requests that do not build a dormant session — `ListSessions` and
-/// `Subscribe` — and deliberately not `GetSessionInfo`, which is in serve's
-/// build list and resurrected the very session being examined. That showed up
-/// as a session reading `restoredUnconfirmed` moments after its agent had
-/// exited: not the host's verdict at all, but the echo of this verb's own
-/// side effect.
+/// the spawn is a real process with a real bill. So the whole read is one
+/// `Subscribe` — which waits for a dormant session rather than building it —
+/// and deliberately not `GetSessionInfo`, which is in serve's build list and
+/// resurrected the very session being examined. That showed up as a session
+/// reading `restoredUnconfirmed` moments after its agent had exited: not the
+/// host's verdict at all, but the echo of this verb's own side effect.
 pub async fn session(client: &Client, session: &str) -> Result<(Value, String), Failure> {
     client.require_version(
         oximux_remote_proto::proto::HEALTH_PUSH_MIN_VERSION,
         "status <session>",
     )?;
-    // Known at all? The listing covers live and dormant sessions alike and
-    // builds neither, so an unknown id is told apart from a quiet one without
-    // touching anything.
-    let known = match client.call(Request::ListSessions).await? {
-        Response::Sessions(rows) => rows.iter().any(|s| s.session_id == session),
-        Response::Error(e) => return Err(rpc_failure(e)),
-        other => return Err(unexpected_reply("ListSessions", &other)),
-    };
-    if !known {
-        return Err(rpc_failure(oximux_remote_proto::proto::RpcError::UnknownSession));
-    }
-
-    // Subscribing waits for a session rather than building it, and the host
-    // sends the current health first — so this is a read. It arrives as a push
-    // *after* the subscribe reply, so both arrival points are handled: one
-    // during the call, one after it.
+    // One call, and it is the host that decides whether this session exists
+    // and whether this caller may read it: `Subscribe` answers `Unauthorized`
+    // or `UnknownSession` itself, and the host's rule for reading is wider
+    // than the session list is — an agent's listing holds only its own
+    // session, while a parent may read the children it spawned. Gating on the
+    // listing refused a parent asking after its own child.
+    //
+    // The host sends the current health first, so this is a read. It arrives
+    // as a push *after* the subscribe reply, so both arrival points are
+    // handled: one during the call, one after it.
     //
     // The reply replays the retained ring, which this discards. That is the
     // price of not asking for a cursor first: the only request that reports one
@@ -111,14 +104,17 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
         };
         health = tokio::time::timeout(FIRST_HEALTH_WITHIN, first).await.ok().transpose()?;
     }
-    let Some(frame) = health else { return Ok(not_published(session)) };
+    let Some(frame) = health else { return Ok(no_verdict(session)) };
     let wire = frame.health().map_err(|e| {
         Failure::new("decode", exit::ERROR, format!("the host's health frame did not parse: {e}"))
     })?;
 
     let data = json!({
         "session_id": session,
-        "open": true,
+        // The host published a verdict, which is the only thing this reports.
+        // Whether the session is "open" is deliberately not claimed: see
+        // `no_verdict`.
+        "health_published": true,
         // Which host process published this. A client that reconnects and sees
         // a different id knows the host restarted, so whatever it was tracking
         // per-session has to be re-read rather than resumed.
@@ -152,19 +148,27 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
     Ok((data, human))
 }
 
-/// The answer for a session this host knows but has published no health for.
+/// The answer when the host published no verdict within the budget.
 ///
-/// Worded for what was observed rather than for what it probably means. The
-/// ordinary cause is a session this host is not running — most of them, on a
-/// server — but a pump that registered its session and then wedged before
-/// publishing looks the same from here, and that is worth knowing rather than
-/// being told "not running".
-fn not_published(session: &str) -> (Value, String) {
+/// Reports the observation and nothing more. The ordinary cause is a session
+/// this host is not running — most of them, on a server — but a pump that
+/// registered its session and then wedged before publishing looks identical
+/// from out here, and so does a push that simply took longer than the budget.
+/// Calling any of those "stopped" would be the verb inventing the one thing it
+/// was built to stop other surfaces inventing: a definite state with no
+/// evidence behind it.
+///
+/// So the likely reading is offered to the person as a likelihood, and the
+/// machine-readable half says only what was seen.
+fn no_verdict(session: &str) -> (Value, String) {
     (
-        json!({ "session_id": session, "open": false, "health": Value::Null }),
+        json!({ "session_id": session, "health_published": false, "health": Value::Null }),
         format!(
-            "{session}: no health published — this host is not running it\n\
-             send it a message to open it (`oximux ls` shows every session it knows)"
+            "{session}: no health published in {}s\n\
+             a running session publishes before it is open, so this host is \
+             most likely not running it — `oximux ls` lists what it knows, and \
+             a message opens it",
+            FIRST_HEALTH_WITHIN.as_secs(),
         ),
     )
 }
@@ -173,7 +177,6 @@ fn not_published(session: &str) -> (Value, String) {
 mod tests {
     use super::*;
     use oximux_remote_proto::delivery::{SessionHealthFrame, SessionHealthWire};
-    use oximux_remote_proto::messages::SessionSummary;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -185,32 +188,46 @@ mod tests {
     /// the reply would find nothing. One queue, popped in order, reproduces
     /// that without a timing assumption.
     struct ScriptedHost {
-        /// Frames to hand back, oldest first.
-        outbox: Mutex<VecDeque<Vec<u8>>>,
-        /// Whether the session is in the host's registry.
-        live: bool,
-        /// What `ListSessions` knows, for telling dormant from unknown.
-        listed: Vec<&'static str>,
+        /// Frames to hand back, oldest first. Shared so a late verdict can be
+        /// queued from a task without cloning the host.
+        outbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        /// What the subscribe is answered with.
+        answer: Answer,
         health: SessionHealthWire,
+    }
+
+    enum Answer {
+        /// A verdict follows the reply, after this long.
+        Health(std::time::Duration),
+        /// The reply, and then nothing — a session nothing is running.
+        Silence,
+        /// The host refuses the subscribe.
+        Refused(oximux_remote_proto::proto::RpcError),
     }
 
     impl ScriptedHost {
         fn live_with(health: SessionHealthWire) -> Arc<Self> {
-            Arc::new(Self {
-                outbox: Mutex::new(VecDeque::new()),
-                live: true,
-                listed: vec!["s-1"],
-                health,
-            })
+            Self::new(Answer::Health(std::time::Duration::ZERO), health)
         }
 
-        fn dormant(listed: Vec<&'static str>) -> Arc<Self> {
-            Arc::new(Self {
-                outbox: Mutex::new(VecDeque::new()),
-                live: false,
-                listed,
-                health: SessionHealthWire::default(),
-            })
+        fn silent() -> Arc<Self> {
+            Self::new(Answer::Silence, SessionHealthWire::default())
+        }
+
+        fn refusing(err: oximux_remote_proto::proto::RpcError) -> Arc<Self> {
+            Self::new(Answer::Refused(err), SessionHealthWire::default())
+        }
+
+        /// A host whose verdict arrives later than the budget allows.
+        fn slow() -> Arc<Self> {
+            Self::new(
+                Answer::Health(FIRST_HEALTH_WITHIN + std::time::Duration::from_secs(1)),
+                SessionHealthWire { status: "working".into(), liveness: "live".into(), ..SessionHealthWire::default() },
+            )
+        }
+
+        fn new(answer: Answer, health: SessionHealthWire) -> Arc<Self> {
+            Arc::new(Self { outbox: Arc::new(Mutex::new(VecDeque::new())), answer, health })
         }
 
         fn queue(&self, frames: Vec<Response>) {
@@ -224,51 +241,54 @@ mod tests {
     #[async_trait::async_trait]
     impl oximux_remote_proto::Transport for ScriptedHost {
         async fn send(&self, frame: Vec<u8>) -> Result<(), oximux_remote_proto::TransportError> {
-            match Request::from_bytes(&frame).expect("a request") {
-                // `GetSessionInfo` is absent on purpose: it builds a dormant
-                // session on serve, so a status read that sent it would start
-                // the agent it was asked about. The panic arm below is what
-                // keeps that from coming back.
-                Request::ListSessions => self.queue(vec![Response::Sessions(
-                    self.listed
-                        .iter()
-                        .map(|id| SessionSummary {
-                            session_id: (*id).to_string(),
-                            title: String::new(),
-                            model: None,
-                            last_seq: 0,
-                            awaiting_permission: false,
-                        })
-                        .collect(),
-                )]),
-                Request::Subscribe { session_id, .. } if self.live => self.queue(vec![
-                    // The reply, then an event that is not what we asked for,
-                    // then the push that is. A verb that stopped at the first
-                    // push would read the event and never find the health.
-                    Response::Events(vec![]),
-                    Response::Event(
-                        oximux_remote_proto::messages::HostEvent::new(
-                            &session_id,
-                            8,
-                            &oximux_agent_core::thread::ThreadEvent::AssistantText("hi".into()),
-                            oximux_remote_proto::messages::SessionStatusWire {
-                                last_seq: 8,
-                                awaiting_permission: true,
-                            },
-                        )
-                        .expect("a frame"),
-                    ),
-                    Response::SessionHealth(SessionHealthFrame::new(
+            // One request, and it is `Subscribe`. Every other arm panics —
+            // `GetSessionInfo` above all, which builds a dormant session on
+            // serve, so a read that sent it would start the agent it was asked
+            // about. This is what keeps that from coming back.
+            let Request::Subscribe { session_id, .. } = Request::from_bytes(&frame).expect("a request")
+            else {
+                panic!("status should send nothing but Subscribe");
+            };
+            match &self.answer {
+                Answer::Refused(err) => self.queue(vec![Response::Error(err.clone())]),
+                Answer::Silence => self.queue(vec![Response::Events(vec![])]),
+                Answer::Health(after) => {
+                    // The reply, then an event that is not what we asked for:
+                    // a verb that stopped at the first push would read the
+                    // event and never find the health.
+                    self.queue(vec![
+                        Response::Events(vec![]),
+                        Response::Event(
+                            oximux_remote_proto::messages::HostEvent::new(
+                                &session_id,
+                                8,
+                                &oximux_agent_core::thread::ThreadEvent::AssistantText("hi".into()),
+                                oximux_remote_proto::messages::SessionStatusWire {
+                                    last_seq: 8,
+                                    awaiting_permission: true,
+                                },
+                            )
+                            .expect("a frame"),
+                        ),
+                    ]);
+                    let frame = Response::SessionHealth(SessionHealthFrame::new(
                         &session_id,
                         "host-instance-7",
                         &self.health,
-                    )),
-                ]),
-                // A session nothing is running: the subscribe is answered and
-                // then simply never pushes health, which is what a dormant
-                // session looks like from a client.
-                Request::Subscribe { .. } => self.queue(vec![Response::Events(vec![])]),
-                other => panic!("status should not have sent {other:?}"),
+                    ));
+                    if after.is_zero() {
+                        self.queue(vec![frame]);
+                    } else {
+                        // Queued late, so the budget decides what the verb
+                        // reports rather than the test's ordering.
+                        let outbox = self.outbox.clone();
+                        let after = *after;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(after).await;
+                            outbox.lock().unwrap().push_back(frame.to_bytes().expect("a response"));
+                        });
+                    }
+                }
             }
             Ok(())
         }
@@ -310,7 +330,7 @@ mod tests {
         });
         let (data, human) = session(&client_over(host), "s-1").await.expect("status");
 
-        assert_eq!(data["open"], true);
+        assert_eq!(data["health_published"], true);
         assert_eq!(data["health"]["status"], "limited");
         assert_eq!(data["health"]["liveness"], "live");
         assert_eq!(data["health"]["limited_until"], 1_700_000_060_000i64);
@@ -325,30 +345,64 @@ mod tests {
         assert!(human.contains("held from before a restart"), "a held queue is actionable: {human}");
     }
 
-    /// A session nothing is running answers promptly, saying no health was
-    /// published — and without sending the one request that would have
-    /// started it.
+    /// A session the host publishes no verdict for answers promptly, and
+    /// without sending the one request that would have started it.
     ///
-    /// The scripted host panics on `GetSessionInfo`, so this also pins the
-    /// no-side-effects half: that request builds a dormant session on serve,
-    /// and reaching for it here is how the first draft of this verb
+    /// The scripted host panics on anything but `Subscribe`, so this pins the
+    /// no-side-effects half too: `GetSessionInfo` builds a dormant session on
+    /// serve, and reaching for it is how the first draft of this verb
     /// resurrected the agent it was asked to describe.
     #[tokio::test]
-    async fn a_session_nothing_is_running_says_so_and_starts_nothing() {
-        let (data, human) =
-            session(&client_over(ScriptedHost::dormant(vec!["s-1"])), "s-1").await.expect("status");
+    async fn a_session_with_no_published_verdict_says_so_and_starts_nothing() {
+        let (data, human) = session(&client_over(ScriptedHost::silent()), "s-1").await.expect("status");
 
-        assert_eq!(data["open"], false);
+        assert_eq!(data["health_published"], false);
         assert_eq!(data["health"], Value::Null);
-        assert!(human.contains("not running it"), "{human}");
+        assert!(human.contains("no health published"), "{human}");
+        assert!(
+            human.contains("most likely"),
+            "the likely reading is offered as a likelihood, not as a state: {human}",
+        );
     }
 
-    /// An id this host has never heard of is refused, not reported as dormant.
+    /// A verdict that arrives later than the budget is reported as *not
+    /// published*, never as a session that stopped.
+    ///
+    /// The distinction is the whole point of this verb. Every other surface
+    /// infers a state from silence, which is what makes a rate-limited
+    /// session, a dead one and a slow one look alike; a diagnostic that did
+    /// the same with its own timeout would be inventing exactly that.
+    #[tokio::test(start_paused = true)]
+    async fn a_verdict_that_arrives_late_is_not_reported_as_a_stopped_session() {
+        let (data, human) = session(&client_over(ScriptedHost::slow()), "s-1").await.expect("status");
+
+        assert_eq!(data["health_published"], false, "nothing was published in time: {data}");
+        assert_eq!(data["health"], Value::Null, "and no verdict may be invented: {data}");
+        assert!(
+            !human.contains("not running it\n") && !human.contains("stopped"),
+            "a late push is not evidence of a stopped session: {human}",
+        );
+    }
+
+    /// The host decides whether the session exists and whether this caller may
+    /// read it, and its answer is passed through.
+    ///
+    /// Not a listing check: the host's reading rule is wider than any one
+    /// caller's session list — an agent's listing holds only its own session,
+    /// while a parent may read the children it spawned — so gating on the
+    /// listing refused a parent asking after its own child.
     #[tokio::test]
-    async fn an_unknown_session_is_refused() {
-        let err = session(&client_over(ScriptedHost::dormant(vec!["someone-else"])), "s-1")
+    async fn the_host_decides_whether_a_session_can_be_read() {
+        use oximux_remote_proto::proto::RpcError;
+
+        let err = session(&client_over(ScriptedHost::refusing(RpcError::UnknownSession)), "s-1")
             .await
             .expect_err("refused");
         assert_eq!(err.code, "unknown-session");
+
+        let err = session(&client_over(ScriptedHost::refusing(RpcError::Unauthorized)), "s-1")
+            .await
+            .expect_err("refused");
+        assert_eq!(err.code, "denied");
     }
 }
