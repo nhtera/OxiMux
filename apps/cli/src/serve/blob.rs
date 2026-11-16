@@ -91,6 +91,24 @@ pub struct ChatBlob {
     /// today; closing that is the desktop's half of F8.
     #[serde(default)]
     pub last_failure: Option<String>,
+    /// A turn, a continuation or background work was running when this host
+    /// stopped, so the restart cut it short.
+    ///
+    /// The desktop's own field, by name and by meaning: a session saved by
+    /// one host and reopened by the other must owe the agent the same note.
+    #[serde(default)]
+    pub mid_turn: bool,
+    /// What the background tasks running at that moment were doing, for the
+    /// note to name them.
+    #[serde(default)]
+    pub stopped_tasks: Vec<String>,
+    /// A note a restart left owed and nothing has sent yet.
+    ///
+    /// Kept so a second restart before the next message does not lose it —
+    /// and so the note the agent eventually reads names the restart that
+    /// actually interrupted it rather than the latest one.
+    #[serde(default)]
+    pub recovery_note: Option<String>,
     /// What this host had queued and had not written when it stopped.
     ///
     /// Without it the queue simply vanished with the process: a message a
@@ -125,6 +143,9 @@ impl ChatBlob {
             pi_posture: None,
             choices: BlobChoices::default(),
             last_failure: None,
+            mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
             queued: Vec::new(),
             extra: serde_json::Map::new(),
         }

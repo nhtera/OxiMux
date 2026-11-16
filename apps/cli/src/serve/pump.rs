@@ -186,9 +186,11 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         // a reopened session that had been mid-turn into `Interrupted` on no
         // evidence. The proof half is F14's.
         let reopened = !seed.entries.is_empty();
-        let was_mid_turn = fold.turn_active
-            || fold.continuations_open > 0
-            || fold.background_tasks.iter().any(|t| t.status == TaskStatus::Running);
+        // The blob's own answer is preferred over the fold's: `mid_turn` was
+        // written by the host that was actually interrupted, while the fold
+        // only shows a turn left marked running on disk. They agree in the
+        // ordinary case; where they differ, the writer knew.
+        let was_mid_turn = seed.mid_turn || mid_turn(&fold);
         let mut blob = seed;
         // What the fold does not keep: the last sign of life, an unanswered
         // send, how the process ended. The same tracker the desktop folds its
@@ -212,7 +214,15 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             fold.last_error = Some(failure.clone());
             track.failed_turn = Some(failure);
         }
-        let mut persist = Persist::new(settings, index, &fold);
+        // What a restart owes the agent: a note saying its turn was cut short,
+        // once, on the next message. An earlier restart's note that nothing
+        // has sent yet is kept rather than replaced — the agent needs to hear
+        // about the restart that interrupted it, not the latest one.
+        let note = Arc::new(Mutex::new(blob.recovery_note.clone().or_else(|| {
+            let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            was_mid_turn.then(|| oximux_agents::recovery_note::build(&at, &blob.stopped_tasks))
+        })));
+        let mut persist = Persist::new(settings, index, &fold, note.clone());
 
         // The send gate. Attaching it **takes over the send path**: from here
         // `SessionHandle::send_prompt_tagged` queues instead of writing, for
@@ -244,6 +254,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             gate: &gate,
             turn_tx: &turn_tx,
             retry: &retry,
+            note: &note,
         };
         // A resumed session publishes its history immediately — `--resume`
         // replays nothing, so without this the transcript RPCs would answer
@@ -391,6 +402,16 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     if !*finalize.borrow() {
                         continue;
                     }
+                    // Recorded before the interrupt below, which is what makes
+                    // the fold stop saying a turn was running: this host is
+                    // stopping with one in flight, so the next one owes the
+                    // agent a note about it.
+                    //
+                    // Only on this path. The agent's stream closing is the
+                    // *agent* dying, which the session already reports with
+                    // its own reason — a note saying OxiMux restarted would be
+                    // telling it something that did not happen.
+                    persist.note_stopping_mid_turn(mid_turn(&fold));
                     // Drain: an unfinished turn is reported as interrupted,
                     // never silently truncated.
                     if fold.turn_active {
@@ -434,6 +455,15 @@ struct Pump<'a> {
     /// The pump's own "is a turn running" channel, which shutdown reads.
     turn_tx: &'a tokio::sync::watch::Sender<bool>,
     retry: &'a Arc<ServeRetry>,
+    /// The note a restart left owed, until a message carries it.
+    ///
+    /// The one piece of this struct that changes, and behind a lock rather
+    /// than threaded through every helper: what owes it is the restart, what
+    /// spends it is the next write, and what reports it is the publish —
+    /// three places in one task. A `RefCell` would read more honestly and
+    /// costs the spawned future its `Send`, so a mutex it is; no guard here
+    /// outlives the statement that takes it.
+    note: &'a Arc<Mutex<Option<String>>>,
 }
 
 /// Fold the prompts this host has written that the fold has not seen yet.
@@ -481,16 +511,15 @@ fn flush(pump: &Pump<'_>) {
     }
     loop {
         let Some(item) = gate.lock().unwrap().take_next_if_open() else { return };
-        // A recovery turn is owed the restart's note, and only a chat view
-        // writes that; serve has none, so the direct path refuses it (F11
-        // owns the headless half). It cannot arrive today — `resume_one`
-        // bails unless the session reports `recovery_note_owed`, which this
-        // host never sets — so this is the guard that keeps it true rather
-        // than a path. Reported not-sent, never silently dropped.
-        if item.source == SendSource::Recovery {
-            tracing::warn!(
+        // A recovery turn exists to carry the restart's note. Once the note
+        // has gone — with a message written meanwhile — or was never owed,
+        // sending it would be a second, unasked turn on the person's bill.
+        // Dropped, and reported not-sent so whoever is waiting on its key
+        // stops waiting.
+        if item.source == SendSource::Recovery && pump.note.lock().unwrap().is_none() {
+            tracing::info!(
                 session = session_id,
-                "a recovery turn reached a headless gate; refused (it is owed a note this host cannot write)",
+                "a recovery turn this session no longer owes a note for was dropped",
             );
             // `take_next_if_open` opened a turn for this item; nothing was
             // written, so give the gate back the state the item found.
@@ -499,13 +528,33 @@ fn flush(pump: &Pump<'_>) {
             gate.on_turn_end();
             continue;
         }
+        // The restart's note goes ahead of the first message to leave after
+        // it, as one line — never a turn of its own, which would be a turn
+        // the person did not ask for and is billed for. Taken before the
+        // write and put back if it fails: a note that went nowhere is still
+        // owed.
+        let note = pump.note.lock().unwrap().take();
+        let with_note;
+        let text = match &note {
+            Some(note) => {
+                with_note = oximux_agents::recovery_note::attach(note, &item.text);
+                with_note.as_str()
+            }
+            None => item.text.as_str(),
+        };
         // The item's own source, not a guess: it decides whether the text is
         // the host's batch of child events or a paste that merely looks like
         // one. A batch escaped on its way out would reach its parent in the
         // very form that marks a forged event as ordinary text.
-        let sent = handle.write_prompt_now(&item.text, &item.images, Some(item.uuid), item.source);
+        let sent = handle.write_prompt_now(text, &item.images, Some(item.uuid), item.source);
         if let Err(err) = &sent {
             tracing::warn!(%err, session = session_id, "a queued send could not be written");
+            // Nothing reached the agent, so the note is still owed.
+            *pump.note.lock().unwrap() = note;
+        } else if note.is_some() {
+            // Said in the transcript, so a person reading it later knows the
+            // agent was told about the restart and when.
+            handle.post_notice(oximux_agents::recovery_note::SENT_NOTICE);
         }
         // The drainer's hook settles (or returns) the outbox rows this item
         // carried, by its uuid.
@@ -635,6 +684,7 @@ fn publish_state(
             incarnation: handle.incarnation().to_string(),
             limited_until: armed.as_ref().map(|a| a.wake_at_ms),
             limit_reason: armed.as_ref().map(|a| a.reason.clone()),
+            recovery_note_owed: pump.note.lock().unwrap().is_some(),
             ..HealthExtras::default()
         },
     ));
@@ -657,6 +707,26 @@ fn publish_state(
         // started on, so a Stop can take it back. Spike S5.5 owns that.
         steer_supported: false,
     });
+}
+
+/// Whether a restart stopping now would cut something short.
+///
+/// One expression, used by the save that records it and by the restore that
+/// reads it back: a session that saved `mid_turn` one way and judged it
+/// another would owe the agent a note on one host and not on the other.
+fn mid_turn(fold: &ChatThread) -> bool {
+    fold.turn_active
+        || fold.continuations_open > 0
+        || fold.background_tasks.iter().any(|t| t.status == TaskStatus::Running)
+}
+
+/// What the background tasks running now are doing, for a note to name them.
+fn stopped_tasks(fold: &ChatThread) -> Vec<String> {
+    fold.background_tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Running)
+        .map(|t| t.description.clone())
+        .collect()
 }
 
 /// The queue a restart must carry: what this host has accepted and not yet
@@ -804,21 +874,40 @@ fn refresh_meta(handle: &SessionHandle, fold: &ChatThread) {
 struct Persist {
     settings: SettingsRepo,
     index: Arc<SessionIndex>,
+    /// The restart's note, shared with the pump: what is still owed at the
+    /// moment of a save is what a restart after it has to owe again.
+    note: Arc<Mutex<Option<String>>>,
     last_saved_revision: u64,
     /// The queue as it was last written, so a save can be triggered by the
     /// queue moving and not only by the transcript.
     last_saved_queue: Vec<blob::BlobQueuedSend>,
+    /// This host stopped while a turn was running. Sticky: once it is
+    /// stopping it stays stopping, and the save that follows the interrupt
+    /// has to record what the fold no longer says.
+    stopping_mid_turn: bool,
 }
 
 impl Persist {
-    fn new(settings: SettingsRepo, index: Arc<SessionIndex>, fold: &ChatThread) -> Self {
+    fn new(
+        settings: SettingsRepo,
+        index: Arc<SessionIndex>,
+        fold: &ChatThread,
+        note: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         // Start one behind so the initial save always runs.
         Self {
             settings,
             index,
+            note,
             last_saved_revision: fold.revision().wrapping_sub(1),
             last_saved_queue: Vec::new(),
+            stopping_mid_turn: false,
         }
+    }
+
+    /// The host is stopping, and a turn was running when it started to.
+    fn note_stopping_mid_turn(&mut self, mid: bool) {
+        self.stopping_mid_turn |= mid;
     }
 
     fn maybe_save(
@@ -855,6 +944,13 @@ impl Persist {
         blob.last_failure = failure_to_persist(fold, track);
         self.last_saved_queue = queue_to_persist(handle);
         blob.queued = self.last_saved_queue.clone();
+        // What a restart would cut short if it happened now, and what it
+        // would owe the agent. Written on every save, cleared as well as
+        // set: a note that has gone out must not come back on the next
+        // restart, and a session that is idle now did not end mid-turn.
+        blob.mid_turn = self.stopping_mid_turn || mid_turn(fold);
+        blob.stopped_tasks = stopped_tasks(fold);
+        blob.recovery_note = self.note.lock().unwrap().clone();
         blob.model = fold.model.clone();
         blob.entries = fold.entries.clone();
         blob.slash_commands = fold.slash_commands.clone();

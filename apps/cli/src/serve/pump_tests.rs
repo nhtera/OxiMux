@@ -1050,3 +1050,127 @@ async fn a_queued_message_survives_a_restart_and_comes_back_held() {
         "and it says why it is waiting",
     );
 }
+
+/// A restart that cut a turn short owes the agent a note, and the next
+/// message carries it.
+///
+/// The agent's own process is gone but its session is not: resumed, it would
+/// carry on from a state that no longer exists. The note says so once, ahead
+/// of the next message rather than as a turn of its own — a turn nobody asked
+/// for is a turn the person is billed for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_mid_turn_owes_a_note_the_next_message_carries() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pumps = PumpSet::new();
+
+    start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            // A turn is running when the host is told to stop.
+            buffered: vec![ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] }],
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        pumps.clone(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    // The host drains.
+    pumps.finalize_all();
+    assert!(wait_until(5_000, || pumps.live_pumps() == 0), "the pump finalized");
+    let stored = blob::load(&settings, "s-1").expect("the stored blob");
+    assert!(stored.mid_turn, "the blob says a turn was cut short");
+    drop(tx);
+
+    // The restart.
+    registry.unregister("s-1");
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let (_tx, rx) = std::sync::mpsc::channel();
+    start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: stored,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.health_inputs().recovery_note_owed),
+        "the restored session says it owes the agent a note: {:?}",
+        handle.health(),
+    );
+    assert!(conn.sent().is_empty(), "and the note is not a turn of its own");
+
+    // A second restart before anything is sent keeps the *same* note: the
+    // agent has to hear about the restart that interrupted it, and by now the
+    // blob is the only thing that still says there was one — this host was not
+    // mid-turn and would build nothing of its own.
+    let carried = blob::load(&settings, "s-1").expect("the stored blob");
+    assert!(!carried.mid_turn, "nothing was running under this host");
+    let note = carried.recovery_note.clone().expect("the note is still owed, durably");
+    assert!(note.contains("Your previous turn was interrupted"), "{note}");
+    registry.unregister("s-1");
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let (_tx2, rx) = std::sync::mpsc::channel();
+    start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: carried,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.health_inputs().recovery_note_owed),
+        "the note outlived a restart that had nothing of its own to report",
+    );
+
+    // The next message takes it.
+    handle.send_prompt("carry on", &[]).unwrap();
+    assert!(wait_until(5_000, || !conn.sent().is_empty()), "the message went out");
+    let line = conn.sent()[0].to_string();
+    assert!(line.contains("Your previous turn was interrupted"), "the note went with it: {line}");
+    assert!(line.contains("carry on"), "and so did the message: {line}");
+
+    assert!(
+        wait_until(5_000, || !handle.health_inputs().recovery_note_owed),
+        "once sent it is not owed again: {:?}",
+        handle.health(),
+    );
+    assert!(
+        wait_until(5_000, || blob::load(&settings, "s-1")
+            .is_some_and(|b| b.recovery_note.is_none())),
+        "nor after another restart: {:?}",
+        blob::load(&settings, "s-1").map(|b| b.recovery_note),
+    );
+}
