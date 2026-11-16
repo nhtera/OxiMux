@@ -197,17 +197,24 @@ pub fn load(settings: &SettingsRepo, session_id: &str) -> Option<ChatBlob> {
     }
 }
 
-/// Write one blob. Failures are logged, not propagated — history persistence
-/// must never take the live session down with it.
-pub fn save(settings: &SettingsRepo, blob: &ChatBlob) {
+/// Write one blob, reporting whether it landed.
+///
+/// Failures are logged, never propagated — history persistence must not take
+/// the live session down with it. The caller is still told, because a caller
+/// that remembers "this is saved" after a write that did not happen will skip
+/// the next one too, and the thing it skipped can be a queued message.
+#[must_use = "a save that did not land must not be remembered as one that did"]
+pub fn save(settings: &SettingsRepo, blob: &ChatBlob) -> bool {
     let json = match serde_json::to_string(blob) {
         Ok(json) => json,
         Err(err) => {
             tracing::warn!(session_id = %blob.session_id, %err, "chat blob serialize failed");
-            return;
+            return false;
         }
     };
     if let Err(err) = settings.set(&chat_settings_key(&blob.session_id), &json) {
         tracing::warn!(session_id = %blob.session_id, %err, "chat blob save failed");
+        return false;
     }
+    true
 }

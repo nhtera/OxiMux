@@ -110,7 +110,17 @@ pub struct PumpSpec {
 
 /// Start one session's pump. Returns immediately; the pump runs until the
 /// agent's stream closes or serve finalizes.
-pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
+/// Start a session's pump.
+///
+/// The returned receiver fires once the pump has published the session's
+/// state for the first time. A caller that looks before that reads a default
+/// — `recovery_note_owed: false` among them, which is exactly the answer that
+/// makes a child's resume decide no recovery turn is owed and give up on it.
+/// Whoever's next step depends on what this session *is* waits for the ack
+/// rather than for a duration.
+#[must_use = "a caller that reads this session's state before the first publish reads defaults"]
+pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Receiver<()> {
+    let (published_tx, published_rx) = tokio::sync::oneshot::channel();
     let (turn_tx, turn_rx) = tokio::sync::watch::channel(false);
     pumps.register(&spec.session_id, turn_rx);
     let mut finalize = pumps.finalize.subscribe();
@@ -273,6 +283,8 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         // comment beside `buffered: Vec::new()` already promised it ("the
         // pump publishes the persisted fold immediately").
         publish_state(&pump, &fold, &mut track, fold.turn_active, Process::Live);
+        // This session now answers for itself; whoever started it may look.
+        let _ = published_tx.send(());
 
         let mut retry_changed = retry.subscribe();
         let mut save_tick = tokio::time::interval(SAVE_INTERVAL);
@@ -396,12 +408,27 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
                 _ = save_tick.tick() => {
+                    // Republished, not only saved. A message pushed into a
+                    // held gate wakes nobody — the gate's waker fires when
+                    // something *can* go, which is a contract its own tests
+                    // name — so without this the `queued` count a client
+                    // reads stays at its last published value for as long as
+                    // the hold lasts. This bounds that at one tick.
+                    fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
+                    publish_state(&pump, &fold, &mut track, fold.turn_active, Process::Live);
                     persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
                 _ = finalize.changed() => {
                     if !*finalize.borrow() {
                         continue;
                     }
+                    // Folded first, as every other arm that reads the fold
+                    // does: a line `flush` has just written is a prompt still
+                    // in the relay, so the fold would say idle. This arm then
+                    // records `mid_turn: false`, skips the interrupt, and
+                    // saves a queue that is missing the line — and the next
+                    // host owes no note for the turn it cut short.
+                    fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
                     // Recorded before the interrupt below, which is what makes
                     // the fold stop saying a turn was running: this host is
                     // stopping with one in flight, so the next one owes the
@@ -439,6 +466,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             on_end();
         }
     });
+    published_rx
 }
 
 /// What every one of a pump's helpers needs and none of them changes.
@@ -937,13 +965,11 @@ impl Persist {
         fold: &ChatThread,
         track: &HealthTrack,
     ) {
-        self.last_saved_revision = fold.revision();
         // Written on every save, cleared as well as set: a send clears the
         // tracker's failure, and a blob that only ever gained the field
         // would report a failure the session has since moved past.
         blob.last_failure = failure_to_persist(fold, track);
-        self.last_saved_queue = queue_to_persist(handle);
-        blob.queued = self.last_saved_queue.clone();
+        blob.queued = queue_to_persist(handle);
         // What a restart would cut short if it happened now, and what it
         // would owe the agent. Written on every save, cleared as well as
         // set: a note that has gone out must not come back on the next
@@ -962,7 +988,17 @@ impl Persist {
         // The SQLite write happens inline: the blob is bounded by one
         // conversation and this task owns no latency contract — there is no
         // UI thread here to protect.
-        blob::save(&self.settings, blob);
+        //
+        // What was saved is remembered only once it *is* saved. Advanced
+        // first, a write that failed would leave `maybe_save` believing the
+        // queue on disk matches the one in the gate, and it would skip every
+        // save until something else moved — so a message accepted just before
+        // the failure would be missing after a restart. Left as they are, the
+        // next tick tries again.
+        if blob::save(&self.settings, blob) {
+            self.last_saved_revision = fold.revision();
+            self.last_saved_queue = blob.queued.clone();
+        }
         // Keep the shared list-row index as fresh as the blob, so the session
         // lists correctly the moment it goes dormant.
         self.index.note(
