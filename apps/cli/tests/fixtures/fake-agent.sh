@@ -16,6 +16,10 @@
 #   OXIMUX_FAKE_AGENT_STALL    if set, take the prompt and never answer it —
 #                              the turn stays in flight, which is what the
 #                              recovery suite needs to catch the host mid-turn
+#   OXIMUX_FAKE_AGENT_EXIT     if set, answer the prompt and then exit — a
+#                              provider that is provably gone, which is the
+#                              one liveness a host may assert from evidence
+#                              rather than from silence
 #
 # and the *host* hands over OXIMUX_SESSION_ID / OXIMUX_SESSION_TOKEN, which is
 # the thing under test. We never write the token anywhere — it is a live
@@ -141,6 +145,19 @@ if [ -n "${OXIMUX_FAKE_AGENT_STALL:-}" ]; then
     printf '{"type":"control_request","request_id":"rid-stall","request":{"subtype":"can_use_tool","tool_name":"Edit","display_name":"Edit","input":{"file_path":"notes.txt","old_string":"a","new_string":"b","replace_all":false},"description":"notes.txt","tool_use_id":"toolu_stall"}}\n'
     note "stalling=1"
     while IFS= read -r _; do :; done
+    exit 0
+fi
+
+# 4b. The exit: a complete turn, then gone.
+#
+#     A host may only call a provider dead on proof, and a process that has
+#     exited is the proof. Answering first matters: a provider that died
+#     mid-turn and one that finished and left are different truths, and this is
+#     the second — so what follows must read `exited` without any failure.
+if [ -n "${OXIMUX_FAKE_AGENT_EXIT:-}" ]; then
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"done and leaving"}]}}\n'
+    printf '{"type":"result","subtype":"success","result":"done","total_cost_usd":0.0}\n'
+    note "exiting=1"
     exit 0
 fi
 

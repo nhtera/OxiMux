@@ -113,7 +113,9 @@ pub fn slot(command: &mut Command) -> Option<(Kind, &mut String)> {
         Command::Term { command: TermCommand::Attach { pty } | TermCommand::Send { pty, .. } } => {
             Some((Kind::Terminal, pty))
         }
-        Command::Events { session: Some(s), .. } => session(s),
+        Command::Events { session: Some(s), .. } | Command::Status { session: Some(s) } => {
+            session(s)
+        }
         _ => None,
     }
 }
@@ -286,6 +288,7 @@ mod tests {
         &["term", "attach", "a1b2"],
         &["term", "send", "a1b2", "ls"],
         &["events", "--session", "a1b2"],
+        &["status", "a1b2"],
     ];
 
     fn parse(args: &[&str]) -> crate::cli::Cli {

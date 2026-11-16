@@ -44,7 +44,9 @@ These apply to every command.
 
 Is a host reachable, and what is it running? (versions, session counts)
 
-_No arguments._
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<SESSION>` | yes | A session id, or a unique prefix of it (see `oximux ls`) |
 
 ### `oximux ls`
 
