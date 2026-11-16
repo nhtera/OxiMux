@@ -217,6 +217,29 @@ pub async fn allow(
             "that request is a question — answer it with `oximux permit answer`",
         ));
     };
+    // A host that predates the digest would take this approval and apply it
+    // without checking anything: the decision crosses as JSON and an unknown
+    // `args_digest` field is simply ignored there. The operator asked for a
+    // check and would have got silence, which is worse than not asking.
+    //
+    // Detected rather than version-gated, because there is no version to gate
+    // on — that is the price of appending a field instead of bumping the
+    // protocol. A current host stamps *every* permission request, so a
+    // request that reached us without one is a host that cannot check one.
+    if read_digest.is_some() && args_digest.is_none() {
+        return Err(Failure::new(
+            "digest-unchecked",
+            exit::ERROR,
+            format!(
+                "this host did not say what request {request_id} is asking for, \
+                 so it cannot check --digest and would approve without checking"
+            ),
+        )
+        .with_steps([
+            "upgrade the host, then `oximux permit ls --json` prints each request's `args_digest`".into(),
+            "or approve without --digest, which approves what this command just read".into(),
+        ]));
+    }
     // An allow always carries the input the tool will run with. Without
     // `--input` that is the agent's own, echoed unmodified — the plain
     // approval. With it, the operator's replaces it: the agent is told the call
@@ -457,5 +480,102 @@ mod tests {
     #[test]
     fn an_empty_object_is_a_valid_override() {
         assert_eq!(parse_input_override("{}").unwrap(), serde_json::json!({}));
+    }
+
+    /// A host that predates the digest, answering the two calls `allow` makes
+    /// before it decides anything.
+    ///
+    /// Its permission request carries no `args_digest`, which is the whole
+    /// point: a host that stamps nothing also checks nothing, and the decision
+    /// crosses as JSON, so it would ignore the field and approve.
+    struct HostWithoutDigests {
+        asked: std::sync::Mutex<Vec<&'static str>>,
+        reply: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl oximux_remote_proto::Transport for HostWithoutDigests {
+        async fn send(&self, frame: Vec<u8>) -> Result<(), oximux_remote_proto::TransportError> {
+            let status =
+                oximux_remote_proto::messages::SessionStatusWire { last_seq: 1, awaiting_permission: true };
+            let (asked, reply) = match Request::from_bytes(&frame).expect("a request") {
+                Request::GetSessionInfo { .. } => (
+                    "info",
+                    Response::SessionInfo(oximux_remote_proto::messages::SessionInfoWire {
+                        summary: oximux_remote_proto::messages::SessionSummary {
+                            session_id: "s-1".into(),
+                            title: String::new(),
+                            model: None,
+                            last_seq: 1,
+                            awaiting_permission: true,
+                        },
+                        meta: Default::default(),
+                    }),
+                ),
+                Request::EventsSince { .. } => (
+                    "events",
+                    Response::Events(vec![
+                        oximux_remote_proto::messages::HostEvent::new(
+                            "s-1",
+                            1,
+                            &ThreadEvent::PermissionRequested {
+                                request_id: "req-1".into(),
+                                tool_use_id: None,
+                                tool_name: "Bash".into(),
+                                input: json!({ "command": "ls" }),
+                                description: "Run ls".into(),
+                                suggestions: vec![],
+                                kind: oximux_agent_core::thread::PermissionKind::Tool,
+                                // An older host stamps none.
+                                args_digest: None,
+                            },
+                            status,
+                        )
+                        .expect("a frame"),
+                    ]),
+                ),
+                Request::ResolvePermission(_) => ("resolve", Response::Ack),
+                other => panic!("allow should not have sent {other:?}"),
+            };
+            self.asked.lock().unwrap().push(asked);
+            *self.reply.lock().unwrap() = Some(reply.to_bytes().expect("a response"));
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Option<Vec<u8>>, oximux_remote_proto::TransportError> {
+            Ok(self.reply.lock().unwrap().take())
+        }
+    }
+
+    /// `--digest` against a host that cannot check it refuses, and sends no
+    /// decision at all.
+    ///
+    /// Silence would be the bad outcome: the decision crosses as JSON and an
+    /// unknown field is ignored, so such a host would approve the request
+    /// without comparing anything — the operator asked for a check and would
+    /// have been told it passed.
+    #[tokio::test]
+    async fn a_digest_a_host_cannot_check_refuses_instead_of_approving() {
+        let host = std::sync::Arc::new(HostWithoutDigests {
+            asked: std::sync::Mutex::new(Vec::new()),
+            reply: std::sync::Mutex::new(None),
+        });
+        let client = crate::client::client_for_test(host.clone(), 1);
+
+        let err = allow(&client, "s-1", Some("req-1"), None, Some("deadbeef"))
+            .await
+            .expect_err("refused");
+
+        assert_eq!(err.code, "digest-unchecked");
+        assert!(
+            err.next_steps.iter().any(|s| s.contains("--digest")),
+            "it says what to do instead: {:?}",
+            err.next_steps
+        );
+        assert!(
+            !host.asked.lock().unwrap().contains(&"resolve"),
+            "nothing was decided: {:?}",
+            host.asked.lock().unwrap()
+        );
     }
 }
