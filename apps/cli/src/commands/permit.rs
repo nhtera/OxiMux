@@ -75,8 +75,25 @@ async fn pending(client: &Client, session: &str) -> Result<Vec<Pending>, Failure
             Ok(ThreadEvent::TurnEnded { .. }) => list.clear(),
             Ok(ThreadEvent::PermissionRequested {
                 request_id, tool_name, description, input, args_digest, ..
-            }) => list
-                .push(Pending::Permission { request_id, tool_name, description, input, args_digest }),
+            }) => {
+                // A re-raised request *replaces* the one it supersedes rather
+                // than queueing behind it. The host keys its proposals by id,
+                // so two events under one id are one request and the later is
+                // what is pending; a list that kept both showed the request
+                // twice, and — now that an approval carries a digest — let
+                // `permit allow <session> <id>` echo the superseded proposal's
+                // digest forever, refused every time with no way back.
+                //
+                // In place, not appended: the entry keeps the position its
+                // first event gave it, so "the latest pending" stays the
+                // newest *request* rather than the newest edit of an old one.
+                let entry =
+                    Pending::Permission { request_id, tool_name, description, input, args_digest };
+                match list.iter_mut().find(|p| p.request_id() == entry.request_id()) {
+                    Some(superseded) => *superseded = entry,
+                    None => list.push(entry),
+                }
+            }
             Ok(ThreadEvent::QuestionAsked { request_id, questions, .. }) => {
                 list.push(Pending::Question { request_id, questions })
             }
@@ -107,7 +124,7 @@ pub async fn ls(client: &Client, session: &str) -> Result<(Value, String), Failu
     let rows: Vec<Value> = list
         .iter()
         .map(|p| match p {
-            Pending::Permission { request_id, tool_name, description, input, .. } => json!({
+            Pending::Permission { request_id, tool_name, description, input, args_digest } => json!({
                 "kind": "permission",
                 "request_id": request_id,
                 "tool": tool_name,
@@ -118,6 +135,14 @@ pub async fn ls(client: &Client, session: &str) -> Result<(Value, String), Failu
                 // it — without it an operator narrowing an over-broad call
                 // would have to guess the tool's own field names.
                 "input": input,
+                // What `permit allow --digest` echoes back. Here because
+                // reading and deciding are two commands: between them the
+                // agent can replace the proposal, and an approval that does
+                // not name the one that was read would be an approval of
+                // arguments nobody saw. Absent against a host that predates
+                // the digest. JSON only — it is for a script to pass through,
+                // not for a person to read.
+                "args_digest": args_digest,
             }),
             Pending::Question { request_id, questions } => json!({
                 "kind": "question",
@@ -175,6 +200,7 @@ pub async fn allow(
     session: &str,
     request: Option<&str>,
     edited_input: Option<&str>,
+    read_digest: Option<&str>,
 ) -> Result<(Value, String), Failure> {
     // Parse the override BEFORE touching the host. It is a mistake in the argv
     // that no host can fix, and checking it after the lookup meant a malformed
@@ -205,16 +231,25 @@ pub async fn allow(
     // The digest rides with it, echoed exactly as the host minted it. It says
     // *which proposal* this operator read before deciding, which is a
     // different question from what the tool should now run: the host compares
-    // it against the arguments it still holds, so an approval typed against a
-    // proposal that has since changed under us is refused rather than applied
-    // to whatever replaced it.
+    // it against the arguments it still holds, so an approval written against
+    // a proposal that has since changed is refused rather than applied to
+    // whatever replaced it.
     //
     // So it is sent with `--input` too. The edit changes what runs; it does
     // not change which request was read, and dropping the digest there would
     // leave the one path that rewrites a tool call as the one path with no
     // check on what it was rewriting.
+    //
+    // `--digest` is which reading counts. Without it the digest is the one
+    // this invocation just fetched, so the approval is of what *it* read —
+    // which is all it can attest to, and not necessarily what the person read
+    // in an earlier `permit ls`. Between the two commands the agent can
+    // replace its proposal under the same id, and nothing inside one
+    // invocation can notice. Passing the digest from that listing is what
+    // carries the reading across the gap: it no longer matches, so the host
+    // refuses and the person looks again.
     let decision = PermissionDecision::allow(override_input.unwrap_or_else(|| input.clone()))
-        .with_args_digest(args_digest.clone());
+        .with_args_digest(read_digest.map(|d| d.trim().to_string()).or_else(|| args_digest.clone()));
     resolve(client, session, request_id, &decision).await
 }
 

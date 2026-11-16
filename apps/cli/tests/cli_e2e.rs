@@ -740,26 +740,94 @@ fn offline_verbs_need_no_host() {
     assert_eq!(out.status.code(), Some(2));
 }
 
-/// `permit allow` echoes the digest the host minted with the request, so an
-/// approval against arguments that have changed since they were listed is
-/// refused — in words the operator can act on.
+/// A re-raised request is one request, and naming it approves what it asks
+/// for now.
 ///
-/// Through the compiled binary because the echo is the CLI's half: nothing
-/// else in this process would notice if `allow` stopped sending the digest.
-/// If it did, this approval would be *accepted* — the operator would have
-/// approved `rm -rf /` while reading `ls`, which is the hazard the digest
-/// exists to remove.
+/// The host keys its proposals by id, so the CLI's reconstruction from the
+/// event stream has to as well. Keeping both events showed the request twice
+/// and — once an approval carries a digest — let a named approval echo the
+/// superseded proposal's digest forever, refused every time with no way back
+/// from the CLI.
 #[test]
-fn permit_allow_is_refused_when_the_proposal_changed_after_it_was_listed() {
-    use oximux_agent_core::thread::ThreadEvent;
-
+fn permit_keeps_one_entry_per_request_and_names_the_proposal_that_is_pending() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let runtime_dir = dir.path().join("host");
     let (_secret, registry) = serve_host_with_registry(&rt, &runtime_dir);
     let handle = registry.get("sess-1").unwrap();
 
-    let request = |command: &str| ThreadEvent::PermissionRequested {
+    handle.ingest(permission_request("ls"));
+    // The agent re-raises it with different arguments: an adapter replacing an
+    // undecided call, which `resolve_permission` treats as a new request.
+    handle.ingest(permission_request("rm -rf /"));
+
+    let out = bin(&runtime_dir).args(["--json", "permit", "ls", "sess-1"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let rows = json_stdout(&out);
+    assert_eq!(rows["data"].as_array().unwrap().len(), 1, "one request, not two: {rows}");
+    assert_eq!(rows["data"][0]["input"]["command"], "rm -rf /", "the one that is pending");
+
+    // And naming it works, which is what a second proposal used to break.
+    let out = bin(&runtime_dir)
+        .args(["--json", "permit", "allow", "sess-1", "req-1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(json_stdout(&out)["data"]["decided"], true);
+}
+
+/// `permit allow --digest` carries the reading across the two commands, so a
+/// proposal that changed in between is refused instead of approved.
+///
+/// This is the hole the digest exists to close, and it only closes if the
+/// value can cross the gap: `allow` on its own re-reads the request, so it can
+/// only ever attest to what *it* read, which may not be what the person read
+/// in `permit ls`. Through the compiled binary, because carrying the digest
+/// between two invocations is the whole behaviour under test.
+#[test]
+fn permit_allow_with_the_digest_it_read_refuses_a_proposal_that_changed() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let (_secret, registry) = serve_host_with_registry(&rt, &runtime_dir);
+    let handle = registry.get("sess-1").unwrap();
+    handle.ingest(permission_request("ls"));
+
+    // What the operator reads.
+    let out = bin(&runtime_dir).args(["--json", "permit", "ls", "sess-1"]).output().unwrap();
+    let listed = json_stdout(&out);
+    assert_eq!(listed["data"][0]["input"]["command"], "ls");
+    let digest = listed["data"][0]["args_digest"].as_str().expect("a digest to carry").to_string();
+
+    // What the agent asks for by the time they decide.
+    handle.ingest(permission_request("rm -rf /"));
+
+    let out = bin(&runtime_dir)
+        .args(["--json", "permit", "allow", "sess-1", "req-1", "--digest", &digest])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_ne!(out.status.code(), Some(0), "approving arguments nobody read must fail");
+    assert_eq!(v["error"]["code"], "bad-request");
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("changed since they were shown"), "saw {message:?}");
+
+    // Nothing was approved, so it is still there to look at again.
+    let out = bin(&runtime_dir).args(["--json", "permit", "ls", "sess-1"]).output().unwrap();
+    assert_eq!(json_stdout(&out)["data"][0]["request_id"], "req-1");
+
+    // And without `--digest` the same approval goes through, because then it
+    // is an approval of what `allow` itself just read.
+    let out = bin(&runtime_dir)
+        .args(["--json", "permit", "allow", "sess-1", "req-1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// One pending request on `sess-1`, asking to run `command`.
+fn permission_request(command: &str) -> oximux_agent_core::thread::ThreadEvent {
+    oximux_agent_core::thread::ThreadEvent::PermissionRequested {
         request_id: "req-1".into(),
         tool_use_id: None,
         tool_name: "Bash".into(),
@@ -768,32 +836,7 @@ fn permit_allow_is_refused_when_the_proposal_changed_after_it_was_listed() {
         suggestions: vec![],
         kind: oximux_agent_core::thread::PermissionKind::Tool,
         args_digest: None,
-    };
-    handle.ingest(request("ls"));
-
-    // Listed, and this is what the operator reads.
-    let out = bin(&runtime_dir).args(["--json", "permit", "ls", "sess-1"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(json_stdout(&out)["data"][0]["input"]["command"], "ls");
-
-    // The agent re-raises the same request with different arguments.
-    handle.ingest(request("rm -rf /"));
-
-    // Naming the request that was read is what carries its digest, so the
-    // host can tell this approval was written against the older proposal.
-    let out = bin(&runtime_dir)
-        .args(["--json", "permit", "allow", "sess-1", "req-1"])
-        .output()
-        .unwrap();
-    let v = json_stdout(&out);
-    assert_ne!(out.status.code(), Some(0), "an approval of other arguments must not succeed");
-    assert_eq!(v["error"]["code"], "bad-request");
-    let message = v["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("changed since they were shown"), "saw {message:?}");
-
-    // Nothing was approved, so it is still there to decide.
-    let out = bin(&runtime_dir).args(["--json", "permit", "ls", "sess-1"]).output().unwrap();
-    assert_eq!(json_stdout(&out)["data"][0]["request_id"], "req-1");
+    }
 }
 
 /// The phase-3 scripted loop, end to end against the compiled binary:

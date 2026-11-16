@@ -619,12 +619,13 @@ fn host_verb(mut args: Cli) -> u8 {
                 }
                 Command::Permit { command } => match command {
                     PermitCommand::Ls { session } => commands::permit::ls(&client, &session).await,
-                    PermitCommand::Allow { session, request, input } => {
+                    PermitCommand::Allow { session, request, input, digest } => {
                         commands::permit::allow(
                             &client,
                             &session,
                             request.as_deref(),
                             input.as_deref(),
+                            digest.as_deref(),
                         )
                         .await
                     }
