@@ -957,3 +957,96 @@ async fn a_send_that_supersedes_a_resend_takes_it_out_of_the_queue() {
         conn.sent(),
     );
 }
+
+/// A message queued when the host stopped comes back, and comes back held.
+///
+/// Before this the queue went with the process: a line a phone sent while a
+/// turn was running was accepted, held, and then lost. Restoring it *sent*
+/// would be worse — a restart is the one moment nobody has reviewed what was
+/// waiting — so it comes back visible and waiting for a person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_message_survives_a_restart_and_comes_back_held() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            // A turn is running, so what follows queues behind it.
+            buffered: vec![ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] }],
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    handle.send_prompt("and this too", &[]).unwrap();
+    assert!(!wait_until(300, || conn.sent().len() > 1), "it waits behind the running turn");
+
+    // The host stops: the agent's stream closing is what the pump sees.
+    drop(tx);
+    assert!(
+        wait_until(5_000, || blob::load(&settings, "s-1")
+            .is_some_and(|b| !b.queued.is_empty())),
+        "the queue reached the blob: {:?}",
+        blob::load(&settings, "s-1").map(|b| b.queued),
+    );
+    let stored = blob::load(&settings, "s-1").expect("the stored blob");
+    assert_eq!(stored.queued.len(), 1, "one line was waiting: {:?}", stored.queued);
+    assert_eq!(stored.queued[0].text, "and this too");
+    assert_eq!(stored.queued[0].source, "remote", "and it keeps who sent it");
+
+    // The restart.
+    registry.unregister("s-1");
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let (_tx, rx) = std::sync::mpsc::channel();
+    start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: stored,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+
+    assert!(
+        wait_until(5_000, || handle.health().held_restored == 1),
+        "the restored session says it is holding one message: {:?}",
+        handle.health(),
+    );
+    // Nothing runs here, so the gate is open — and it still does not take it.
+    assert!(
+        !wait_until(500, || !conn.sent().is_empty()),
+        "a restart does not send what nobody has reviewed: {:?}",
+        conn.sent(),
+    );
+    let gate = handle.gate().expect("the pump attached its gate");
+    let gate = gate.lock().unwrap();
+    assert_eq!(
+        gate.wait_of(gate.queued().next().expect("the line is in the queue")),
+        oximux_agents::send_gate::SendWait::HeldRestored,
+        "and it says why it is waiting",
+    );
+}

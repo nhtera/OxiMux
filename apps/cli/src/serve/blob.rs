@@ -38,6 +38,24 @@ pub struct BlobChoices {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// One message this host had queued and never wrote.
+///
+/// Text only, with the id the line would have been reported by. Images are
+/// not carried: the desktop's own restore drops them too ("text only"), and a
+/// blob is not the place for attachment bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BlobQueuedSend {
+    pub text: String,
+    /// Who queued it, so a restored line keeps the standing it had — a child's
+    /// event batch is not a person's message.
+    #[serde(default)]
+    pub source: String,
+    /// The send key it carried, kept so a receipt can later say whether the
+    /// agent ever saw it.
+    #[serde(default)]
+    pub send_key: Option<String>,
+}
+
 /// One session's persisted transcript + launch facts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatBlob {
@@ -73,6 +91,19 @@ pub struct ChatBlob {
     /// today; closing that is the desktop's half of F8.
     #[serde(default)]
     pub last_failure: Option<String>,
+    /// What this host had queued and had not written when it stopped.
+    ///
+    /// Without it the queue simply vanished with the process: a message a
+    /// phone sent while a turn ran was accepted, held, and then lost. Restored
+    /// **held** — a restart is exactly the moment nobody has reviewed what was
+    /// queued, so it waits for a person rather than draining into the agent.
+    ///
+    /// Serve's own field, like [`ChatBlob::last_failure`]: the desktop keeps
+    /// its queue in the tab-layout records and drops this on its own save, so
+    /// a session the desktop reopens loses what serve was holding. Closing
+    /// that is the desktop's half, as it is for the failure.
+    #[serde(default)]
+    pub queued: Vec<BlobQueuedSend>,
     /// Everything else the writer knew — the desktop's `thinking_level`, any
     /// future field — preserved verbatim across a headless rewrite.
     #[serde(flatten)]
@@ -94,6 +125,7 @@ impl ChatBlob {
             pi_posture: None,
             choices: BlobChoices::default(),
             last_failure: None,
+            queued: Vec::new(),
             extra: serde_json::Map::new(),
         }
     }

@@ -227,6 +227,15 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             let _ = wake_tx.send(());
         });
         handle.set_gate(Some(gate.clone()));
+        // The queue this session had when the last host stopped, back in the
+        // gate and **held**: a restart is the one moment nobody has reviewed
+        // what was waiting, so these sit visible until a person releases
+        // them rather than draining into the agent on the way up. Before the
+        // first publish, so the counts a client reads include them.
+        for q in std::mem::take(&mut blob.queued) {
+            let uuid = q.send_key.as_deref().and_then(|k| uuid::Uuid::parse_str(k).ok());
+            gate.lock().unwrap().push_restored(q.text, SendSource::from_wire(&q.source), uuid);
+        }
         // Everything the helpers below share, built once: the session they
         // all act on rather than five of its parts.
         let pump = Pump {
@@ -252,7 +261,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         // a session someone just reopened as a default. The catalog's own
         // comment beside `buffered: Vec::new()` already promised it ("the
         // pump publishes the persisted fold immediately").
-        publish_state(&pump, &fold, &track, fold.turn_active, Process::Live);
+        publish_state(&pump, &fold, &mut track, fold.turn_active, Process::Live);
 
         let mut retry_changed = retry.subscribe();
         let mut save_tick = tokio::time::interval(SAVE_INTERVAL);
@@ -294,7 +303,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                         // watcher reading an unregistered session reads
                         // nothing at all.
                         track.note_exit(/* stopped */ false, None);
-                        publish_state(&pump, &fold, &track, false, Process::Dormant);
+                        publish_state(&pump, &fold, &mut track, false, Process::Dormant);
                         persist.save_now(&handle, &mut blob, &fold, &track);
                         // Back to dormant: with the registry entry gone the
                         // catalog lists it again and `open()` resumes it
@@ -320,7 +329,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                             fold.push_user_message_with_images(prompt.text, prompt.images);
                             refresh_meta(&handle, &fold);
                             track.note_sent(oximux_agents::session_health::now_ms(), None);
-                            publish_state(&pump, &fold, &track, true, Process::Live);
+                            publish_state(&pump, &fold, &mut track, true, Process::Live);
                             // The send is the thing that supersedes a stored
                             // failure, so the blob has to learn about it
                             // here. Left to the next backend frame or the
@@ -367,7 +376,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // and this publish would clear the gate's hold on the
                     // very turn that resend just opened.
                     fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
-                    publish_state(&pump, &fold, &track, fold.turn_active, Process::Live);
+                    publish_state(&pump, &fold, &mut track, fold.turn_active, Process::Live);
                     // Saved here for the same reason, one step on: a prompt
                     // this arm folded is one the prompt arm will never see,
                     // and the save that clears the stored failure is that
@@ -389,7 +398,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     }
                     // The host is draining, which is not the agent dying: no
                     // exit is claimed, only that nothing is running.
-                    publish_state(&pump, &fold, &track, false, Process::Dormant);
+                    publish_state(&pump, &fold, &mut track, false, Process::Dormant);
                     persist.save_now(&handle, &mut blob, &fold, &track);
                     break;
                 }
@@ -593,21 +602,28 @@ fn stop_the_turn(pump: &Pump<'_>) {
 /// a second write would be a second opinion — one that is wrong whenever an
 /// unanswered send or an open continuation means working while no turn runs.
 ///
+/// `held` and `queued` are read from the gate here, which is why this takes
+/// the tracker by `&mut`: they are the gate's own counts, and a copy kept in
+/// step from every push and take would be a second answer that can disagree
+/// with the one being published.
+///
 /// What this host cannot answer yet is left at its default rather than
-/// guessed, and each is owed by a named step of phase 4b: `limited_until` and
-/// `limit_reason` by the retry driver (F9), `interrupted` by serve's `Cancel`
-/// (F7), `recovery_note_owed` by the recovery note (F11), `held`/`queued` by
-/// the persisted queue (F10). `children_active` is 0 because this host refuses
-/// agent-spawned children — truthful today, and F5's job to keep truthful.
+/// guessed: `interrupted`, owed by serve's `Cancel` (F7). `children_active` is
+/// 0 because the host's own periodic look at the lineage overwrites it, which
+/// is the only place that knows.
 fn publish_state(
     pump: &Pump<'_>,
     fold: &ChatThread,
-    track: &HealthTrack,
+    track: &mut HealthTrack,
     working: bool,
     process: Process,
 ) {
     let (handle, gate) = (pump.handle, pump.gate);
     let _ = pump.turn_tx.send(working);
+    // Read here, not kept in step from every place that pushes or takes: the
+    // gate is the only thing that knows, and one read beside the publish
+    // cannot drift from what is about to be published.
+    (track.held, track.queued) = gate.lock().unwrap().counts();
     // The one read of the retry driver, so the health and the gate's hold
     // cannot disagree about whether this session is waiting out a limit.
     let armed = pump.retry.armed(pump.session_id);
@@ -641,6 +657,28 @@ fn publish_state(
         // started on, so a Stop can take it back. Spike S5.5 owns that.
         steer_supported: false,
     });
+}
+
+/// The queue a restart must carry: what this host has accepted and not yet
+/// written.
+///
+/// Two senders are left out, both because they already have a durable path
+/// and would otherwise arrive twice — a child's event batch is an outbox
+/// delivery, which the outbox hands back to the drainer at boot, and a
+/// recovery turn is minted from the lineage by whoever resumes the child.
+/// `SendSource::survives_a_restart` is that rule, stated once.
+fn queue_to_persist(handle: &SessionHandle) -> Vec<blob::BlobQueuedSend> {
+    let Some(gate) = handle.gate() else { return Vec::new() };
+    gate.lock()
+        .unwrap()
+        .queued()
+        .filter(|q| q.source.survives_a_restart())
+        .map(|q| blob::BlobQueuedSend {
+            text: q.text.clone(),
+            source: q.source.wire_name().to_string(),
+            send_key: Some(q.uuid.to_string()),
+        })
+        .collect()
 }
 
 /// The failure a restart must carry, exactly as the health reports it.
@@ -767,12 +805,20 @@ struct Persist {
     settings: SettingsRepo,
     index: Arc<SessionIndex>,
     last_saved_revision: u64,
+    /// The queue as it was last written, so a save can be triggered by the
+    /// queue moving and not only by the transcript.
+    last_saved_queue: Vec<blob::BlobQueuedSend>,
 }
 
 impl Persist {
     fn new(settings: SettingsRepo, index: Arc<SessionIndex>, fold: &ChatThread) -> Self {
         // Start one behind so the initial save always runs.
-        Self { settings, index, last_saved_revision: fold.revision().wrapping_sub(1) }
+        Self {
+            settings,
+            index,
+            last_saved_revision: fold.revision().wrapping_sub(1),
+            last_saved_queue: Vec::new(),
+        }
     }
 
     fn maybe_save(
@@ -782,7 +828,15 @@ impl Persist {
         fold: &ChatThread,
         track: &HealthTrack,
     ) {
-        if fold.revision() != self.last_saved_revision {
+        // The queue is checked as well as the revision: queueing a message
+        // does not move the fold — the fold learns of a line only when it is
+        // written — so a revision check alone would leave a queued send
+        // unpersisted until something unrelated happened to the transcript.
+        // The desktop has the same hole for its armed retry and plugs it the
+        // same way, with its own dirty mark.
+        if fold.revision() != self.last_saved_revision
+            || queue_to_persist(handle) != self.last_saved_queue
+        {
             self.save_now(handle, blob, fold, track);
         }
     }
@@ -799,6 +853,8 @@ impl Persist {
         // tracker's failure, and a blob that only ever gained the field
         // would report a failure the session has since moved past.
         blob.last_failure = failure_to_persist(fold, track);
+        self.last_saved_queue = queue_to_persist(handle);
+        blob.queued = self.last_saved_queue.clone();
         blob.model = fold.model.clone();
         blob.entries = fold.entries.clone();
         blob.slash_commands = fold.slash_commands.clone();
