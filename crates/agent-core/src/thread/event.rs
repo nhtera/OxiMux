@@ -319,6 +319,26 @@ pub enum ThreadEvent {
         /// Claude's `ExitPlanMode`, `Mcp` for a Codex MCP elicitation. Routes the
         /// request to a dedicated card in the view.
         kind: PermissionKind,
+        /// An opaque digest of what is being asked, for a client that is not
+        /// in this process to echo back with its approval.
+        ///
+        /// **Minted by the host, never by a producer.** Every adapter builds
+        /// this event with `None`; `SessionHandle::ingest` stamps it as it
+        /// records the proposal, over the same three values it stores, so the
+        /// digest a client is shown and the digest the approval is checked
+        /// against cannot be taken from different moments. An adapter that
+        /// filled it in would be hashing what it parsed rather than what the
+        /// host holds.
+        ///
+        /// A field rather than a follow-up event (the `ToolKind` pattern) for
+        /// a protocol reason: a client's decoder ignores a field it does not
+        /// know, so an older peer needs no version gate and no downgrade,
+        /// while an unknown *variant* would fail its decode outright. `None`
+        /// is therefore also what an older host's events read as — and a
+        /// decision carrying no digest is accepted as before, which is what
+        /// keeps those clients working.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args_digest: Option<String>,
     },
     /// Claude called `AskUserQuestion`: a multiple-choice clarification the user
     /// answers via the interactive question card. Distinct from a permission

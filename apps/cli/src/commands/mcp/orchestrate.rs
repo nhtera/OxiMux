@@ -262,7 +262,7 @@ async fn run(ctx: &Ctx, name: &str, args: &Value) -> Result<String, String> {
         "oximux_answer_permit" => {
             let (id, request) = (required("id")?, required("request_id")?);
             let outcome = match text("decision").as_deref() {
-                Some("allow") => permit::allow(&client, &id, Some(&request), None).await,
+                Some("allow") => permit::allow(&client, &id, Some(&request), None, None).await,
                 Some("deny") => {
                     let message = text("message").unwrap_or_else(|| "Denied by the agent that started this one.".into());
                     permit::deny(&client, &id, Some(&request), &message).await

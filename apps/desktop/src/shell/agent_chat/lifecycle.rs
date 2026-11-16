@@ -124,6 +124,7 @@ mod tests {
                     description: "build".into(),
                     suggestions: vec![],
                     kind: oximux_agents::thread::PermissionKind::Tool,
+                    args_digest: None,
                 });
                 view.thread.apply(&ThreadEvent::ToolCallStarted {
                     id: "t1".into(),
@@ -138,6 +139,7 @@ mod tests {
                     description: "notes.txt".into(),
                     suggestions: vec![],
                     kind: oximux_agents::thread::PermissionKind::Tool,
+                    args_digest: None,
                 });
                 assert_eq!(
                     view.thread.pending_permissions().len(),

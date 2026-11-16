@@ -198,6 +198,21 @@ pub fn args_digest(tool_name: &str, kind: crate::thread::PermissionKind, input: 
     format!("{:x}", hash.finalize())
 }
 
+/// Why a decision was turned away: it does not name the request the decider
+/// was shown.
+///
+/// A typed cause rather than a bare `anyhow!`, because one layer up the two
+/// outcomes must be told apart. A transport failure is flattened to
+/// "internal" — its text can carry paths and backend shapes — while this is a
+/// sentence written for whoever pressed Allow, and the only thing that says
+/// why nothing happened. The rule itself stays in
+/// [`SessionHandle::resolve_permission`]; this only labels its answer so a
+/// remote decider is told, rather than being left to press Allow again
+/// against a request that will refuse it every time.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct NotTheProposalShown(pub String);
+
 /// An undecided permission request, as a decider must see it before choosing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingPermissionView {
@@ -410,9 +425,22 @@ impl SessionHandle {
         }
         // Track outstanding permission requests for the coarse status snapshot —
         // and keep the proposal, so a decision that edits it can be recorded.
-        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, tool_name, input, kind, .. } =
-            &event
+        //
+        // The digest is stamped here too, in the same statement that records
+        // the proposal and from the same three values, so what a client is
+        // shown and what its approval is checked against cannot come from
+        // different moments. Producers all build the event with `None`: a
+        // digest minted anywhere else would be a hash of what that code
+        // parsed rather than of what this handle now holds, and
+        // `resolve_permission` compares against the handle.
+        //
+        // Unconditional, not `get_or_insert`: it is a pure function of the
+        // fields beside it, so re-stamping is the same string, and an event
+        // replayed from an older host carries none to keep.
+        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, tool_name, input, kind, args_digest: digest, .. } =
+            &mut event
         {
+            *digest = Some(args_digest(tool_name, *kind, input));
             self.pending.lock().unwrap().insert(
                 request_id.clone(),
                 PendingPermission {
@@ -608,18 +636,27 @@ impl SessionHandle {
                 // A proposal from a process that has since been replaced. The
                 // id may name a different request now, so matching arguments
                 // do not make it the same request.
-                Some(pending) if pending.generation != generation => anyhow::bail!(
-                    "request {request_id} belongs to an agent process that has been replaced; \
-                     open the agent to see where it stands"
-                ),
-                Some(_) => anyhow::bail!(
-                    "the arguments of request {request_id} changed since they were shown; \
-                     open the agent and decide there"
-                ),
-                None => anyhow::bail!(
-                    "request {request_id} is no longer waiting on an answer; \
-                     open the agent to see where it stands"
-                ),
+                Some(pending) if pending.generation != generation => {
+                    return Err(NotTheProposalShown(format!(
+                        "request {request_id} belongs to an agent process that has been replaced; \
+                         open the agent to see where it stands"
+                    ))
+                    .into());
+                }
+                Some(_) => {
+                    return Err(NotTheProposalShown(format!(
+                        "the arguments of request {request_id} changed since they were shown; \
+                         open the agent and decide there"
+                    ))
+                    .into());
+                }
+                None => {
+                    return Err(NotTheProposalShown(format!(
+                        "request {request_id} is no longer waiting on an answer; \
+                         open the agent to see where it stands"
+                    ))
+                    .into());
+                }
             }
         }
         #[cfg(test)]
@@ -1503,6 +1540,7 @@ mod tests {
             description: String::new(),
             suggestions: vec![],
             kind: crate::thread::PermissionKind::Tool,
+            args_digest: None,
         }
     }
 
@@ -1537,6 +1575,71 @@ mod tests {
         // A different request with different arguments digests differently.
         reg.ingest("s1", permission_request("req-2", "Bash", serde_json::json!({"command": "rm -rf /"})));
         assert_ne!(handle.pending_permission("req-2").unwrap().args_digest, first);
+    }
+
+    /// The digest leaves on the event, which is the only thing a client not in
+    /// this process ever sees of the request.
+    ///
+    /// It is the same string the check compares against, because both come
+    /// from the one stamp at ingest. A digest minted a second time — by an
+    /// adapter, or by a client hashing what it rendered — could be a hash of
+    /// other arguments, and the refusal would then be about the two mints
+    /// rather than about the request.
+    #[test]
+    fn the_digest_rides_out_on_the_event_a_client_reads() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        // As every producer builds it: with none.
+        reg.ingest("s1", permission_request("req-1", "Bash", serde_json::json!({"command": "ls"})));
+
+        let on_the_wire = handle
+            .events_since(0)
+            .into_iter()
+            .find_map(|(_, event)| match event {
+                ThreadEvent::PermissionRequested { request_id, args_digest, .. }
+                    if request_id == "req-1" =>
+                {
+                    Some(args_digest)
+                }
+                _ => None,
+            })
+            .expect("the request is in the ring a client reads");
+        assert_eq!(
+            on_the_wire.as_deref(),
+            Some(handle.pending_permission("req-1").unwrap().args_digest.as_str()),
+            "the host stamped the event with the digest it will check against",
+        );
+
+        // And a decision carrying exactly that is the one that is accepted.
+        assert!(handle.resolve_permission("req-1", allow().with_args_digest(on_the_wire)).unwrap());
+    }
+
+    /// A refusal a remote decider has to be told about is typed, so a
+    /// dispatcher can forward the sentence instead of flattening it.
+    ///
+    /// Both arms are pinned here, because the dispatcher branches on exactly
+    /// this: a transport failure's text can carry paths and backend shapes and
+    /// must stay host-side, while this one is written for whoever pressed
+    /// Allow and is the only thing that explains why nothing happened.
+    #[test]
+    fn a_refusal_is_told_apart_from_a_failure_by_its_type() {
+        let reg = SessionRegistry::new();
+        let conn = Arc::new(RecordingConn { fail_resolve: true, ..RecordingConn::default() });
+        let handle = reg.register("s1".into(), conn.clone());
+        reg.ingest("s1", permission_request("req-1", "Bash", serde_json::json!({"command": "ls"})));
+
+        let stale = allow().with_args_digest(Some("not-the-one".into()));
+        let refused = handle.resolve_permission("req-1", stale).expect_err("refused");
+        assert!(
+            refused.downcast_ref::<NotTheProposalShown>().is_some(),
+            "a refusal a person must read: {refused}",
+        );
+
+        let failed = handle.resolve_permission("req-1", allow()).expect_err("the transport is down");
+        assert!(
+            failed.downcast_ref::<NotTheProposalShown>().is_none(),
+            "a transport failure is not a sentence to forward: {failed}",
+        );
     }
 
     #[test]
@@ -2306,6 +2409,7 @@ mod tests {
             description: String::new(),
             suggestions: vec![],
             kind: crate::thread::PermissionKind::Tool,
+            args_digest: None,
         };
 
         reg.ingest("s1", request("req-1"));
@@ -2486,6 +2590,7 @@ mod tests {
                 description: String::new(),
                 suggestions: vec![],
                 kind: crate::thread::PermissionKind::Tool,
+                args_digest: None,
             },
         );
         assert!(status.borrow().awaiting_permission, "request outstanding");
@@ -2514,6 +2619,7 @@ mod tests {
                 description: String::new(),
                 suggestions: vec![],
                 kind: crate::thread::PermissionKind::Tool,
+                args_digest: None,
             },
         );
         let cursor_after_ingest = status.borrow().last_seq;

@@ -170,6 +170,7 @@ mod tests {
             description: "run ls".into(),
             suggestions: vec![],
             kind: PermissionKind::Tool,
+            args_digest: None,
         });
 
         let snap = ThreadSnapshot::build("s", 2, &thread).unwrap();
@@ -200,6 +201,7 @@ mod tests {
             description: "edit a file".into(),
             suggestions: vec![],
             kind: PermissionKind::Tool,
+            args_digest: None,
         });
         assert!(ThreadSnapshot::build("s", 1, &thread).unwrap().awaiting_permission);
 

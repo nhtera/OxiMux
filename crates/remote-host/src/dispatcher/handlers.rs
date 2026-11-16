@@ -247,11 +247,28 @@ impl Dispatcher {
             // A benign race: someone already decided it. Idempotent — the client
             // treats this as success.
             Ok(false) => Response::Error(RpcError::AlreadyDecided),
+            // The decision named a request that is no longer the one this
+            // handle holds: a replaced process, arguments that changed since
+            // they were shown, or a proposal already gone. The sentence is the
+            // host's own, written for whoever pressed Allow, so it is
+            // forwarded — flattened to "internal" it left a remote decider
+            // pressing Allow against a request that would refuse it every
+            // time. `BadRequest` rather than a variant of its own: every
+            // client already renders its text as a sentence, so no peer needs
+            // to learn a new word for this.
             Err(e) => {
-                // Log the detail host-side; never forward raw backend error text
-                // to the client (it can carry paths / internal shapes).
-                tracing::warn!(error = %e, session = %req.session_id, "resolve_permission failed");
-                Response::Error(RpcError::Internal("permission resolve failed".into()))
+                match e.downcast_ref::<oximux_agents::session_registry::NotTheProposalShown>() {
+                    Some(refusal) => {
+                        tracing::info!(session = %req.session_id, request = %req.request_id, %refusal, "permission decision refused");
+                        Response::Error(RpcError::BadRequest(refusal.to_string()))
+                    }
+                    // Log the detail host-side; never forward raw backend error
+                    // text to the client (it can carry paths / internal shapes).
+                    None => {
+                        tracing::warn!(error = %e, session = %req.session_id, "resolve_permission failed");
+                        Response::Error(RpcError::Internal("permission resolve failed".into()))
+                    }
+                }
             }
         }
     }

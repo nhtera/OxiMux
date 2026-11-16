@@ -234,6 +234,7 @@ async fn an_event_started_turn_cannot_leave_plan_mode(cx: &mut TestAppContext) {
         description: "do it".into(),
         suggestions: Vec::new(),
         kind: PermissionKind::Plan,
+        args_digest: None,
     };
     window
         .update(cx, |view, _window, _cx| {

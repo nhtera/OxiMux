@@ -199,6 +199,7 @@ mod tests {
                     description: String::new(),
                     suggestions: vec![],
                     kind: oximux_agents::thread::PermissionKind::Tool,
+                    args_digest: None,
                 }];
                 assert!(!view.drain_batch(generation, queued, cx), "the dead process's drain stops");
                 assert!(

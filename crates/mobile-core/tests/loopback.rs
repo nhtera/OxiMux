@@ -103,6 +103,7 @@ fn seeded_registry() -> (Arc<SessionRegistry>, Arc<SessionHandle>) {
         description: "run ls".into(),
         suggestions: vec![],
         kind: PermissionKind::Tool,
+        args_digest: None,
     });
     (registry, handle)
 }
@@ -985,6 +986,7 @@ async fn a_permission_suggestion_reaches_the_agent_verbatim() {
         description: "edit a.rs".into(),
         suggestions: vec![],
         kind: PermissionKind::Tool,
+        args_digest: None,
     });
 
     let auth = Arc::new(AuthStore::new());
@@ -1056,6 +1058,7 @@ async fn a_malformed_suggestion_is_refused_rather_than_sent() {
         description: "edit".into(),
         suggestions: vec![],
         kind: PermissionKind::Tool,
+        args_digest: None,
     });
 
     let auth = Arc::new(AuthStore::new());

@@ -66,8 +66,90 @@ fn seeded_registry() -> Arc<SessionRegistry> {
         description: "run ls".into(),
         suggestions: vec![],
         kind: PermissionKind::Tool,
+        args_digest: None,
     });
     registry
+}
+
+/// An approval that names a proposal which has changed since it was shown is
+/// refused — and the refusal says so in the host's own words.
+///
+/// The words matter as much as the refusal. Deciding from a CLI or a phone is
+/// one shot: the operator cannot see what the host now holds, so "permission
+/// resolve failed" leaves them pressing Allow against a request that will
+/// turn them away every time. The sentence is the host's own and names no
+/// path, which is why it is the one error text this call forwards.
+#[test]
+fn an_approval_against_a_proposal_that_changed_is_refused_in_words() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry.clone(), auth).with_clock(clock);
+    // `[0x33; 32]` because it is a valid ed25519 curve point; most arbitrary
+    // fills are not, and `VerifyingKey::from_bytes` refusing one reads as
+    // `Unauthorized` — a pairing refusal, which is the wrong place to look.
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let registered = call(&client, Request::Register(register_req(pubkey))).await;
+        let Response::Registered { .. } = registered else {
+            panic!("expected Registered, got {registered:?}");
+        };
+        let Response::Events(frames) = call(
+            &client,
+            Request::EventsSince { session_id: "sess-1".into(), after_seq: 0 },
+        )
+        .await
+        else {
+            panic!("expected Events");
+        };
+        let ThreadEvent::PermissionRequested { args_digest, .. } = frames[1].event().unwrap() else {
+            panic!("expected the permission request");
+        };
+
+        // The agent re-raises the same request with different arguments — an
+        // adapter replacing an undecided call. What the client read is now
+        // stale, and it has no way to know.
+        registry.get("sess-1").unwrap().ingest(ThreadEvent::PermissionRequested {
+            request_id: "req-1".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: json!({ "command": "rm -rf /" }),
+            description: "run rm".into(),
+            suggestions: vec![],
+            kind: PermissionKind::Tool,
+            args_digest: None,
+        });
+
+        let stale = Request::ResolvePermission(
+            ResolvePermissionReq::new(
+                "sess-1",
+                "req-1",
+                &PermissionDecision::allow(json!({ "command": "ls" }))
+                    .with_args_digest(args_digest),
+            )
+            .unwrap(),
+        );
+        match call(&client, stale).await {
+            Response::Error(RpcError::BadRequest(message)) => assert!(
+                message.contains("changed since they were shown"),
+                "the operator is told what happened, not \"internal\": {message}",
+            ),
+            other => panic!("expected a refusal in words, got {other:?}"),
+        }
+
+        // And nothing was decided: the request is still waiting, so deciding
+        // it from the chat — where the current arguments are visible — works.
+        let Response::SessionInfo(info) =
+            call(&client, Request::GetSessionInfo { session_id: "sess-1".into() }).await
+        else {
+            panic!("expected SessionInfo");
+        };
+        assert!(info.summary.awaiting_permission, "the request stays pending");
+    };
+    block_on(async { join(serve, script).await });
 }
 
 #[test]
@@ -114,7 +196,13 @@ fn full_pairing_and_session_control_over_the_loopback() {
         };
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].event().unwrap(), ThreadEvent::AssistantText("hi".into()));
-        assert!(matches!(frames[1].event().unwrap(), ThreadEvent::PermissionRequested { .. }));
+        let ThreadEvent::PermissionRequested { args_digest, .. } = frames[1].event().unwrap() else {
+            panic!("expected the permission request");
+        };
+        // The host stamped it on the way in. This is the only copy a client
+        // outside the host process has, so an approval it sends can only be
+        // checked if the digest travelled with the request.
+        assert!(args_digest.is_some(), "the request a client reads carries its digest");
 
         // Commands ack.
         assert_eq!(

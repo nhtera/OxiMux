@@ -89,6 +89,7 @@ fn ask_permission(handle: &SessionHandle) {
         description: "Run cargo test".into(),
         suggestions: vec![],
         kind: PermissionKind::Tool,
+        args_digest: None,
     });
 }
 

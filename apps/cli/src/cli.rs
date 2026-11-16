@@ -618,6 +618,17 @@ pub enum PermitCommand {
         /// proposal; keep your own record there if it matters for audit.
         #[arg(long, value_name = "JSON")]
         input: Option<String>,
+        /// Approve only if the request still asks for what you read:
+        /// `permit ls --json` prints each request's `args_digest`, and this
+        /// echoes one back.
+        ///
+        /// Reading and deciding are two commands, and between them the agent
+        /// can replace its proposal under the same request id. Without this,
+        /// the approval carries whatever `allow` itself just read, which may
+        /// not be what you read; with it, a changed proposal is refused and
+        /// nothing is approved.
+        #[arg(long, value_name = "HEX")]
+        digest: Option<String>,
     },
     /// Deny a pending permission request.
     Deny {

@@ -13,6 +13,7 @@
 //! JSON — and never anything else (no secret can end up in a journal that
 //! captures stdout). Logs go to stderr.
 
+mod attention_log;
 mod blob;
 mod catalog;
 mod host;
@@ -266,6 +267,12 @@ async fn serve(
     // `set_catalog` and `start` have to wait for the catalog.
     let host_core =
         host::build_host_core(tokio::runtime::Handle::current(), &db, registry.clone(), &settings);
+    // Before the first session can register, because subscribing is what
+    // starts the core's attention followers: they run only while something is
+    // listening, so a host with no subscriber never evaluates attention at
+    // all. The log is that subscriber here, and the push planner will be the
+    // second.
+    attention_log::start(&host_core);
     // The retry driver: one per host, outliving every pump, because the turn
     // that failed is often the one that killed the agent.
     let retry = retry::ServeRetry::new(

@@ -19,7 +19,19 @@ use crate::output::Failure;
 
 /// One undecided request, as reconstructed from the event stream.
 enum Pending {
-    Permission { request_id: String, tool_name: String, description: String, input: Value },
+    Permission {
+        request_id: String,
+        tool_name: String,
+        description: String,
+        input: Value,
+        /// The digest the host minted with this request, as it reached us.
+        ///
+        /// `None` from a host that predates it: the decision then carries
+        /// none, which `resolve_permission` accepts as it always has. That
+        /// fallback is the only reason this is an `Option` — a missing digest
+        /// is an older host, never an operator skipping the check.
+        args_digest: Option<String>,
+    },
     Question { request_id: String, questions: Vec<AskQuestion> },
 }
 
@@ -62,8 +74,26 @@ async fn pending(client: &Client, session: &str) -> Result<Vec<Pending>, Failure
             // either got decided or died with the turn.
             Ok(ThreadEvent::TurnEnded { .. }) => list.clear(),
             Ok(ThreadEvent::PermissionRequested {
-                request_id, tool_name, description, input, ..
-            }) => list.push(Pending::Permission { request_id, tool_name, description, input }),
+                request_id, tool_name, description, input, args_digest, ..
+            }) => {
+                // A re-raised request *replaces* the one it supersedes rather
+                // than queueing behind it. The host keys its proposals by id,
+                // so two events under one id are one request and the later is
+                // what is pending; a list that kept both showed the request
+                // twice, and — now that an approval carries a digest — let
+                // `permit allow <session> <id>` echo the superseded proposal's
+                // digest forever, refused every time with no way back.
+                //
+                // In place, not appended: the entry keeps the position its
+                // first event gave it, so "the latest pending" stays the
+                // newest *request* rather than the newest edit of an old one.
+                let entry =
+                    Pending::Permission { request_id, tool_name, description, input, args_digest };
+                match list.iter_mut().find(|p| p.request_id() == entry.request_id()) {
+                    Some(superseded) => *superseded = entry,
+                    None => list.push(entry),
+                }
+            }
             Ok(ThreadEvent::QuestionAsked { request_id, questions, .. }) => {
                 list.push(Pending::Question { request_id, questions })
             }
@@ -94,7 +124,7 @@ pub async fn ls(client: &Client, session: &str) -> Result<(Value, String), Failu
     let rows: Vec<Value> = list
         .iter()
         .map(|p| match p {
-            Pending::Permission { request_id, tool_name, description, input } => json!({
+            Pending::Permission { request_id, tool_name, description, input, args_digest } => json!({
                 "kind": "permission",
                 "request_id": request_id,
                 "tool": tool_name,
@@ -105,6 +135,14 @@ pub async fn ls(client: &Client, session: &str) -> Result<(Value, String), Failu
                 // it — without it an operator narrowing an over-broad call
                 // would have to guess the tool's own field names.
                 "input": input,
+                // What `permit allow --digest` echoes back. Here because
+                // reading and deciding are two commands: between them the
+                // agent can replace the proposal, and an approval that does
+                // not name the one that was read would be an approval of
+                // arguments nobody saw. Absent against a host that predates
+                // the digest. JSON only — it is for a script to pass through,
+                // not for a person to read.
+                "args_digest": args_digest,
             }),
             Pending::Question { request_id, questions } => json!({
                 "kind": "question",
@@ -162,6 +200,7 @@ pub async fn allow(
     session: &str,
     request: Option<&str>,
     edited_input: Option<&str>,
+    read_digest: Option<&str>,
 ) -> Result<(Value, String), Failure> {
     // Parse the override BEFORE touching the host. It is a mistake in the argv
     // that no host can fix, and checking it after the lookup meant a malformed
@@ -171,13 +210,36 @@ pub async fn allow(
 
     let list = pending(client, session).await?;
     let picked = pick(&list, request)?;
-    let Pending::Permission { request_id, input, .. } = picked else {
+    let Pending::Permission { request_id, input, args_digest, .. } = picked else {
         return Err(Failure::new(
             "wrong-kind",
             exit::ERROR,
             "that request is a question — answer it with `oximux permit answer`",
         ));
     };
+    // A host that predates the digest would take this approval and apply it
+    // without checking anything: the decision crosses as JSON and an unknown
+    // `args_digest` field is simply ignored there. The operator asked for a
+    // check and would have got silence, which is worse than not asking.
+    //
+    // Detected rather than version-gated, because there is no version to gate
+    // on — that is the price of appending a field instead of bumping the
+    // protocol. A current host stamps *every* permission request, so a
+    // request that reached us without one is a host that cannot check one.
+    if read_digest.is_some() && args_digest.is_none() {
+        return Err(Failure::new(
+            "digest-unchecked",
+            exit::ERROR,
+            format!(
+                "this host did not say what request {request_id} is asking for, \
+                 so it cannot check --digest and would approve without checking"
+            ),
+        )
+        .with_steps([
+            "upgrade the host, then `oximux permit ls --json` prints each request's `args_digest`".into(),
+            "or approve without --digest, which approves what this command just read".into(),
+        ]));
+    }
     // An allow always carries the input the tool will run with. Without
     // `--input` that is the agent's own, echoed unmodified — the plain
     // approval. With it, the operator's replaces it: the agent is told the call
@@ -188,8 +250,29 @@ pub async fn allow(
     // key means "leave it" or "remove it", and guessing wrong on a tool call
     // the operator is explicitly correcting is the one outcome this flag must
     // not have.
-    let decision =
-        PermissionDecision::allow(override_input.unwrap_or_else(|| input.clone()));
+    //
+    // The digest rides with it, echoed exactly as the host minted it. It says
+    // *which proposal* this operator read before deciding, which is a
+    // different question from what the tool should now run: the host compares
+    // it against the arguments it still holds, so an approval written against
+    // a proposal that has since changed is refused rather than applied to
+    // whatever replaced it.
+    //
+    // So it is sent with `--input` too. The edit changes what runs; it does
+    // not change which request was read, and dropping the digest there would
+    // leave the one path that rewrites a tool call as the one path with no
+    // check on what it was rewriting.
+    //
+    // `--digest` is which reading counts. Without it the digest is the one
+    // this invocation just fetched, so the approval is of what *it* read —
+    // which is all it can attest to, and not necessarily what the person read
+    // in an earlier `permit ls`. Between the two commands the agent can
+    // replace its proposal under the same id, and nothing inside one
+    // invocation can notice. Passing the digest from that listing is what
+    // carries the reading across the gap: it no longer matches, so the host
+    // refuses and the person looks again.
+    let decision = PermissionDecision::allow(override_input.unwrap_or_else(|| input.clone()))
+        .with_args_digest(read_digest.map(|d| d.trim().to_string()).or_else(|| args_digest.clone()));
     resolve(client, session, request_id, &decision).await
 }
 
@@ -397,5 +480,102 @@ mod tests {
     #[test]
     fn an_empty_object_is_a_valid_override() {
         assert_eq!(parse_input_override("{}").unwrap(), serde_json::json!({}));
+    }
+
+    /// A host that predates the digest, answering the two calls `allow` makes
+    /// before it decides anything.
+    ///
+    /// Its permission request carries no `args_digest`, which is the whole
+    /// point: a host that stamps nothing also checks nothing, and the decision
+    /// crosses as JSON, so it would ignore the field and approve.
+    struct HostWithoutDigests {
+        asked: std::sync::Mutex<Vec<&'static str>>,
+        reply: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl oximux_remote_proto::Transport for HostWithoutDigests {
+        async fn send(&self, frame: Vec<u8>) -> Result<(), oximux_remote_proto::TransportError> {
+            let status =
+                oximux_remote_proto::messages::SessionStatusWire { last_seq: 1, awaiting_permission: true };
+            let (asked, reply) = match Request::from_bytes(&frame).expect("a request") {
+                Request::GetSessionInfo { .. } => (
+                    "info",
+                    Response::SessionInfo(oximux_remote_proto::messages::SessionInfoWire {
+                        summary: oximux_remote_proto::messages::SessionSummary {
+                            session_id: "s-1".into(),
+                            title: String::new(),
+                            model: None,
+                            last_seq: 1,
+                            awaiting_permission: true,
+                        },
+                        meta: Default::default(),
+                    }),
+                ),
+                Request::EventsSince { .. } => (
+                    "events",
+                    Response::Events(vec![
+                        oximux_remote_proto::messages::HostEvent::new(
+                            "s-1",
+                            1,
+                            &ThreadEvent::PermissionRequested {
+                                request_id: "req-1".into(),
+                                tool_use_id: None,
+                                tool_name: "Bash".into(),
+                                input: json!({ "command": "ls" }),
+                                description: "Run ls".into(),
+                                suggestions: vec![],
+                                kind: oximux_agent_core::thread::PermissionKind::Tool,
+                                // An older host stamps none.
+                                args_digest: None,
+                            },
+                            status,
+                        )
+                        .expect("a frame"),
+                    ]),
+                ),
+                Request::ResolvePermission(_) => ("resolve", Response::Ack),
+                other => panic!("allow should not have sent {other:?}"),
+            };
+            self.asked.lock().unwrap().push(asked);
+            *self.reply.lock().unwrap() = Some(reply.to_bytes().expect("a response"));
+            Ok(())
+        }
+
+        async fn recv(&self) -> Result<Option<Vec<u8>>, oximux_remote_proto::TransportError> {
+            Ok(self.reply.lock().unwrap().take())
+        }
+    }
+
+    /// `--digest` against a host that cannot check it refuses, and sends no
+    /// decision at all.
+    ///
+    /// Silence would be the bad outcome: the decision crosses as JSON and an
+    /// unknown field is ignored, so such a host would approve the request
+    /// without comparing anything — the operator asked for a check and would
+    /// have been told it passed.
+    #[tokio::test]
+    async fn a_digest_a_host_cannot_check_refuses_instead_of_approving() {
+        let host = std::sync::Arc::new(HostWithoutDigests {
+            asked: std::sync::Mutex::new(Vec::new()),
+            reply: std::sync::Mutex::new(None),
+        });
+        let client = crate::client::client_for_test(host.clone(), 1);
+
+        let err = allow(&client, "s-1", Some("req-1"), None, Some("deadbeef"))
+            .await
+            .expect_err("refused");
+
+        assert_eq!(err.code, "digest-unchecked");
+        assert!(
+            err.next_steps.iter().any(|s| s.contains("--digest")),
+            "it says what to do instead: {:?}",
+            err.next_steps
+        );
+        assert!(
+            !host.asked.lock().unwrap().contains(&"resolve"),
+            "nothing was decided: {:?}",
+            host.asked.lock().unwrap()
+        );
     }
 }

@@ -267,6 +267,7 @@ fn a_permission_prompt_on_a_child_is_reported_with_its_request() {
         input: serde_json::json!({ "file_path": "/repo/a.rs" }),
         kind: Default::default(),
         suggestions: Vec::new(),
+        args_digest: None,
     });
     let batch = wait_for("the permit", || queued_events(&parent).into_iter().next());
     assert!(batch.text.contains("kind=\"needs_permission\""), "{}", batch.text);

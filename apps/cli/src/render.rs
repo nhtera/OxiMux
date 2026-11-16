@@ -364,6 +364,7 @@ mod tests {
                     description: "Run cargo test".into(),
                     suggestions: vec![],
                     kind: oximux_agent_core::thread::PermissionKind::Tool,
+                    args_digest: None,
                 },
                 Some("⚠ permission needed: Run cargo test (request req-9) — decide with `oximux permit`"),
             ),

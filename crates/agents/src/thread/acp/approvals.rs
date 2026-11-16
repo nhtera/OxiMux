@@ -41,6 +41,7 @@ pub(crate) fn permission_event(req: &RequestPermissionRequest, request_id: &str)
         description: label,
         suggestions: allow_option_suggestions(&req.options),
         kind: PermissionKind::Tool,
+        args_digest: None,
     }
 }
 

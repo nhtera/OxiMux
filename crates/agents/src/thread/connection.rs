@@ -997,6 +997,7 @@ mod tests {
             tool_name: "Edit".into(), input: json!({"file_path": "notes.txt"}),
             description: "notes.txt".into(), suggestions: vec![],
             kind: crate::thread::tool_call::PermissionKind::Tool,
+            args_digest: None,
         }).unwrap();
         while let Ok(ev) = rx.try_recv() {
             thread.apply(&ev);

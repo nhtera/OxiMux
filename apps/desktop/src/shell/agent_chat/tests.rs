@@ -989,6 +989,7 @@
                         description: name.into(),
                         suggestions: vec![],
                         kind: oximux_agents::thread::PermissionKind::Tool,
+                        args_digest: None,
                     });
                 }
 
@@ -1129,6 +1130,7 @@
                     description: "x".into(),
                     suggestions: vec![],
                     kind: oximux_agents::thread::PermissionKind::Tool,
+                    args_digest: None,
                 });
                 // First answer: allow.
                 view.resolve_permission(
@@ -1194,6 +1196,7 @@
                     description: "x".into(),
                     suggestions: vec![],
                     kind: oximux_agents::thread::PermissionKind::Tool,
+                    args_digest: None,
                 });
                 assert!(view.thread.turn_active, "turn active before Stop");
 
