@@ -152,6 +152,7 @@ Approve a pending permission request.
 | `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 | `<REQUEST>` | yes | The request id (from `permit ls`; default: the latest pending) |
 | `--input` | yes | Replace the tool's input with this JSON object before approving. `permit ls --json` prints the proposed input to edit from. The object is passed through as given, so it must carry every field the tool needs — it replaces the input, it does not merge into it |
+| `--digest` | yes | Approve only if the request still asks for what you read: `permit ls --json` prints each request's `args_digest`, and this echoes one back |
 
 #### `oximux permit deny`
 
