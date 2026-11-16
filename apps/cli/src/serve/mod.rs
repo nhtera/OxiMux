@@ -60,12 +60,22 @@ pub const EXIT_HELD_BY_ANOTHER_HOST: u8 = 6;
 #[derive(Debug)]
 struct HeldByAnotherHost {
     data_dir: std::path::PathBuf,
-    holder_pid: Option<u32>,
+    holder: Option<oximux_single_instance::HolderRecord>,
 }
 
 impl std::fmt::Display for HeldByAnotherHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let who = self.holder_pid.map(|pid| format!(" (PID {pid})")).unwrap_or_default();
+        // The start time beside the pid, because a pid alone cannot identify a
+        // process: by the time anyone reads this it may belong to something
+        // else entirely, and then the refusal sends them to the wrong place.
+        // Both are already in the record the holder wrote.
+        let who = match &self.holder {
+            Some(h) => match h.started_at_unix_s.and_then(started_at) {
+                Some(when) => format!(" (PID {}, running since {when})", h.pid),
+                None => format!(" (PID {})", h.pid),
+            },
+            None => String::new(),
+        };
         write!(
             f,
             "another OxiMux host is already serving {}{who}. Stop it first, \
@@ -76,6 +86,19 @@ impl std::fmt::Display for HeldByAnotherHost {
 }
 
 impl std::error::Error for HeldByAnotherHost {}
+
+/// A holder's start time as a local timestamp, or `None` when it cannot be
+/// read as one — a record from a machine whose clock has since moved, say.
+/// Unreadable is left out rather than printed raw: a bare epoch count helps
+/// nobody standing at a terminal.
+fn started_at(unix_s: u64) -> Option<String> {
+    use chrono::TimeZone as _;
+    let secs = i64::try_from(unix_s).ok()?;
+    match chrono::Local.timestamp_opt(secs, 0) {
+        chrono::offset::LocalResult::Single(at) => Some(at.format("%Y-%m-%d %H:%M:%S").to_string()),
+        _ => None,
+    }
+}
 
 /// Boot and run until a shutdown signal, then drain. The process exit code is
 /// the verb's result: 0 after a clean drain, 1 on a boot failure — except the
@@ -181,10 +204,10 @@ async fn serve(
         "serve",
     ) {
         Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => guard,
-        Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+        Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder }) => {
             return Err(anyhow::Error::new(HeldByAnotherHost {
                 data_dir: data_dir.clone(),
-                holder_pid,
+                holder,
             }));
         }
         // A lock that cannot be evaluated must not silently authorise a second
@@ -390,10 +413,10 @@ async fn serve(
                 });
                 Some(Arc::new(oximux_remote_host::TickerRunner(ticker)))
             }
-            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder: record }) => {
                 // One line, once — this is the expected state beside a running
                 // desktop, not an error to nag about.
-                let holder = holder_pid
+                let holder = record.map(|r| r.pid)
                     .map(|p| format!("process {p}"))
                     .unwrap_or_else(|| "another OxiMux process".into());
                 tracing::info!(

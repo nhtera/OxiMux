@@ -106,6 +106,20 @@ pub enum PromptKind {
     Question,
 }
 
+/// How a dead provider is described to a person.
+///
+/// One wording, because two readers need it and they must not drift: the live
+/// health frame says it now, and a host that records it for later (so the
+/// reason survives a restart) says it then. The same sentence either way, or a
+/// session would explain itself one way while running and another after a
+/// reboot.
+pub fn exited_reason(proof: ExitProof) -> String {
+    match proof {
+        ExitProof::ExitCode(code) => format!("agent process exited (code {code})"),
+        _ => "agent process exited".into(),
+    }
+}
+
 /// The facts [`compute`] reads. Times are Unix milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HealthInputs {
@@ -230,11 +244,7 @@ fn classify(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> (HealthStatus, Li
             if proof == ExitProof::HostLock {
                 return (S::Interrupted, Liveness::Exited(proof), Some("OxiMux restarted".into()), false);
             }
-            let reason = match proof {
-                ExitProof::ExitCode(code) => format!("agent process exited (code {code})"),
-                _ => "agent process exited".into(),
-            };
-            return (S::Failed, Liveness::Exited(proof), Some(reason), true);
+            return (S::Failed, Liveness::Exited(proof), Some(exited_reason(proof)), true);
         }
         Process::Dormant => {
             // No process to ask. A restart that provably cut a running turn

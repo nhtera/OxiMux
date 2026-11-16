@@ -246,6 +246,12 @@ impl ServeUnderTest {
     }
 
     /// SIGKILL — no drain, no flush, nothing runs.
+    /// The host process's pid, for a test that asserts on what a *contender*
+    /// is told about it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn kill_hard(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
