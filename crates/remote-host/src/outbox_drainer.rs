@@ -48,7 +48,12 @@ pub(crate) enum DrainMsg {
     /// The gate's owner wrote the item queued under `uuid` (or failed to).
     Sent { uuid: Uuid, ok: bool },
     /// A receipt from a parent's CLI.
-    Receipt(ThreadEvent),
+    ///
+    /// Boxed because a `ThreadEvent` is far larger than either sibling — a
+    /// permission request alone carries several strings and its arguments —
+    /// and every message through this channel would otherwise be sized for
+    /// the rarest one.
+    Receipt(Box<ThreadEvent>),
 }
 
 /// A parent whose gate and receipts the drainer is attached to.
@@ -130,30 +135,35 @@ fn handle(core: &HostCore, msg: DrainMsg, awaiting: &mut HashMap<Uuid, Instant>,
             awaiting.remove(&uuid);
             outbox.release_with_backoff(uuid, now).and_then(|()| outbox.unclaim(uuid).map(drop))
         }
-        DrainMsg::Receipt(ThreadEvent::UserMessageAccepted { uuid }) => match Uuid::parse_str(&uuid) {
-            Ok(uuid) => {
-                awaiting.remove(&uuid);
-                outbox.mark_accepted(uuid, now).map(drop)
+        // Unboxed in one step: a pattern cannot reach through a `Box`, and
+        // three arms each dereferencing it would be three places to keep in
+        // step with the variant.
+        DrainMsg::Receipt(receipt) => match *receipt {
+            ThreadEvent::UserMessageAccepted { uuid } => match Uuid::parse_str(&uuid) {
+                Ok(uuid) => {
+                    awaiting.remove(&uuid);
+                    outbox.mark_accepted(uuid, now).map(drop)
+                }
+                Err(_) => Ok(()),
+            },
+            ThreadEvent::UserMessagesDelivered { uuids } => {
+                let mut result = Ok(());
+                for uuid in uuids.iter().filter_map(|u| Uuid::parse_str(u).ok()) {
+                    awaiting.remove(&uuid);
+                    result = result.and(outbox.mark_delivered(uuid, now).map(drop));
+                }
+                result
             }
-            Err(_) => Ok(()),
+            // The CLI dropped the line unstarted: the rows go out again (new key).
+            ThreadEvent::UserMessageDropped { uuid } => match Uuid::parse_str(&uuid) {
+                Ok(uuid) => {
+                    awaiting.remove(&uuid);
+                    outbox.unclaim(uuid).map(drop)
+                }
+                Err(_) => Ok(()),
+            },
+            _ => Ok(()),
         },
-        DrainMsg::Receipt(ThreadEvent::UserMessagesDelivered { uuids }) => {
-            let mut result = Ok(());
-            for uuid in uuids.iter().filter_map(|u| Uuid::parse_str(u).ok()) {
-                awaiting.remove(&uuid);
-                result = result.and(outbox.mark_delivered(uuid, now).map(drop));
-            }
-            result
-        }
-        // The CLI dropped the line unstarted: the rows go out again (new key).
-        DrainMsg::Receipt(ThreadEvent::UserMessageDropped { uuid }) => match Uuid::parse_str(&uuid) {
-            Ok(uuid) => {
-                awaiting.remove(&uuid);
-                outbox.unclaim(uuid).map(drop)
-            }
-            Err(_) => Ok(()),
-        },
-        DrainMsg::Receipt(_) => Ok(()),
     };
     if let Err(err) = result {
         tracing::warn!(%err, "outbox: settling a delivery failed");
@@ -197,7 +207,7 @@ fn link(
         loop {
             match receipts.recv().await {
                 Ok(receipt) => {
-                    if forward.send(DrainMsg::Receipt(receipt)).is_err() {
+                    if forward.send(DrainMsg::Receipt(Box::new(receipt))).is_err() {
                         return;
                     }
                 }

@@ -464,6 +464,13 @@ impl ChatThread {
             }
             ThreadEvent::PermissionRequested {
                 request_id, tool_use_id, tool_name, input, description, suggestions, kind,
+                // Not folded: a surface in this process answers through the
+                // handle, which holds the proposal and checks it there. The
+                // digest exists for a client that is not in this process, and
+                // a card reached it through the event rather than the fold.
+                // Named rather than `..`, so a field added later still has to
+                // be considered here.
+                args_digest: _,
             } => {
                 let req = PermissionRequest {
                     request_id: request_id.clone(),
@@ -1302,7 +1309,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "rid-1".into(), tool_use_id: Some("toolu_9".into()),
             tool_name: "Edit".into(), input: json!({}), description: "notes.txt".into(),
-            suggestions: vec![], kind: PermissionKind::Tool });
+            suggestions: vec![], kind: PermissionKind::Tool, args_digest: None });
 
         let (tool_id, req) = t.pending_permission().expect("a pending permission");
         assert_eq!(tool_id, "toolu_9");
@@ -1330,7 +1337,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "rid".into(), tool_use_id: Some("toolu_rm".into()),
             tool_name: "Bash".into(), input: json!({"command": "rm -rf build"}),
-            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool, args_digest: None });
         let ask = json!({"questions":[{"question":"Which first?","header":"Order",
             "options":[{"label":"Tests","description":""},{"label":"Docs","description":""}],
             "multiSelect":false}]});
@@ -1414,7 +1421,7 @@ mod tests {
             t.apply(&ThreadEvent::PermissionRequested {
                 request_id: rid.into(), tool_use_id: Some(id.into()),
                 tool_name: "Bash".into(), input: json!({"command": cmd}),
-                description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+                description: "".into(), suggestions: vec![], kind: PermissionKind::Tool, args_digest: None });
         }
 
         t.apply(&ThreadEvent::PromptsRetired { tool_use_ids: vec!["toolu_a".into()] });
@@ -1462,7 +1469,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "rid-e".into(), tool_use_id: Some("toolu_rm".into()),
             tool_name: "Bash".into(), input: json!({"command": "rm -f f.txt && ls"}),
-            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool, args_digest: None });
 
         t.apply(&ThreadEvent::PermissionEdited {
             request_id: "rid-e".into(), tool_use_id: Some("toolu_rm".into()),
@@ -1491,7 +1498,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "rid-f".into(), tool_use_id: None,
             tool_name: "Bash".into(), input: json!({"command": "x"}),
-            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool, args_digest: None });
 
         t.apply(&ThreadEvent::PermissionEdited {
             request_id: "rid-f".into(), tool_use_id: None,
@@ -1770,7 +1777,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "rid-orphan".into(), tool_use_id: None,
             tool_name: "Bash".into(), input: json!({"command":"ls"}),
-            description: "ls".into(), suggestions: vec![], kind: PermissionKind::Tool });
+            description: "ls".into(), suggestions: vec![], kind: PermissionKind::Tool, args_digest: None });
 
         let (tool_id, req) = t.pending_permission().expect("synthesized pending permission");
         assert_eq!(tool_id, "rid-orphan", "falls back to request_id as the tool id");
@@ -1866,7 +1873,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "r1".into(), tool_use_id: Some("t1".into()),
             tool_name: "Edit".into(), input: json!({}), description: "x".into(),
-            suggestions: vec![], kind: PermissionKind::Tool });
+            suggestions: vec![], kind: PermissionKind::Tool, args_digest: None });
         assert!(t.turn_active);
         assert!(t.pending_permission().is_some());
 

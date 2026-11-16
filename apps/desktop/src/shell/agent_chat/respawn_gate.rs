@@ -207,6 +207,7 @@ pub(super) mod tests {
                 description: String::new(),
                 suggestions: vec![],
                 kind: PermissionKind::Tool,
+                args_digest: None,
             });
         }
     }

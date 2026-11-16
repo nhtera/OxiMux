@@ -740,6 +740,62 @@ fn offline_verbs_need_no_host() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// `permit allow` echoes the digest the host minted with the request, so an
+/// approval against arguments that have changed since they were listed is
+/// refused — in words the operator can act on.
+///
+/// Through the compiled binary because the echo is the CLI's half: nothing
+/// else in this process would notice if `allow` stopped sending the digest.
+/// If it did, this approval would be *accepted* — the operator would have
+/// approved `rm -rf /` while reading `ls`, which is the hazard the digest
+/// exists to remove.
+#[test]
+fn permit_allow_is_refused_when_the_proposal_changed_after_it_was_listed() {
+    use oximux_agent_core::thread::ThreadEvent;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let (_secret, registry) = serve_host_with_registry(&rt, &runtime_dir);
+    let handle = registry.get("sess-1").unwrap();
+
+    let request = |command: &str| ThreadEvent::PermissionRequested {
+        request_id: "req-1".into(),
+        tool_use_id: None,
+        tool_name: "Bash".into(),
+        input: serde_json::json!({ "command": command }),
+        description: format!("Run {command}"),
+        suggestions: vec![],
+        kind: oximux_agent_core::thread::PermissionKind::Tool,
+        args_digest: None,
+    };
+    handle.ingest(request("ls"));
+
+    // Listed, and this is what the operator reads.
+    let out = bin(&runtime_dir).args(["--json", "permit", "ls", "sess-1"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(json_stdout(&out)["data"][0]["input"]["command"], "ls");
+
+    // The agent re-raises the same request with different arguments.
+    handle.ingest(request("rm -rf /"));
+
+    // Naming the request that was read is what carries its digest, so the
+    // host can tell this approval was written against the older proposal.
+    let out = bin(&runtime_dir)
+        .args(["--json", "permit", "allow", "sess-1", "req-1"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_ne!(out.status.code(), Some(0), "an approval of other arguments must not succeed");
+    assert_eq!(v["error"]["code"], "bad-request");
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("changed since they were shown"), "saw {message:?}");
+
+    // Nothing was approved, so it is still there to decide.
+    let out = bin(&runtime_dir).args(["--json", "permit", "ls", "sess-1"]).output().unwrap();
+    assert_eq!(json_stdout(&out)["data"][0]["request_id"], "req-1");
+}
+
 /// The phase-3 scripted loop, end to end against the compiled binary:
 /// `run --bg` → `wait --until needs-approval` → `permit ls`/`allow` →
 /// `wait --until done` → `transcript --json`. The host side is a stub agent
@@ -775,6 +831,7 @@ fn scripted_loop_run_wait_permit_transcript() {
         description: "Run cargo test".into(),
         suggestions: vec![],
         kind: oximux_agent_core::thread::PermissionKind::Tool,
+        args_digest: None,
     });
 
     let out = bin(&runtime_dir)

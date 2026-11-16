@@ -74,6 +74,7 @@ fn permission(id: &str, tool: &str, input: serde_json::Value) -> ThreadEvent {
         description: String::new(),
         suggestions: vec![],
         kind: PermissionKind::Tool,
+        args_digest: None,
     }
 }
 

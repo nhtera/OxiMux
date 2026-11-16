@@ -134,6 +134,7 @@ pub fn map_server_request(
                 description,
                 suggestions: Vec::new(),
                 kind: PermissionKind::Mcp,
+                args_digest: None,
             }])
         }
         // Everything else (legacy exec/apply-patch approvals, permissions,
@@ -185,6 +186,7 @@ fn emit_permission(
         description,
         suggestions: Vec::new(),
         kind,
+        args_digest: None,
     }])
 }
 

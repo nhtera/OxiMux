@@ -537,6 +537,7 @@ fn decode_control_request(v: &Value) -> Vec<ThreadEvent> {
             description: plan.to_string(),
             suggestions: Vec::new(),
             kind: PermissionKind::Plan,
+            args_digest: None,
         }];
     }
     let suggestions = req["permission_suggestions"]
@@ -551,6 +552,8 @@ fn decode_control_request(v: &Value) -> Vec<ThreadEvent> {
         description: str_field(req, "description"),
         suggestions,
         kind: PermissionKind::Tool,
+        // The host mints it at ingest, over the values it stores.
+        args_digest: None,
     }]
 }
 

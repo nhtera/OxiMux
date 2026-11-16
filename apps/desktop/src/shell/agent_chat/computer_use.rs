@@ -636,6 +636,7 @@ mod view_tests {
                         description: String::new(),
                         suggestions: vec![],
                         kind: oximux_agents::thread::PermissionKind::Tool,
+                        args_digest: None,
                     },
                     cx,
                 );
@@ -818,6 +819,7 @@ mod view_tests {
                         description: String::new(),
                         suggestions: vec![],
                         kind: oximux_agents::thread::PermissionKind::Screen,
+                        args_digest: None,
                     },
                     cx,
                 );
@@ -869,6 +871,7 @@ mod view_tests {
                         description: String::new(),
                         suggestions: vec![],
                         kind: oximux_agents::thread::PermissionKind::Screen,
+                        args_digest: None,
                     },
                     cx,
                 );
@@ -919,6 +922,7 @@ mod view_tests {
                         description: "ls".into(),
                         suggestions: vec![],
                         kind: oximux_agents::thread::PermissionKind::Tool,
+                        args_digest: None,
                     },
                     cx,
                 );

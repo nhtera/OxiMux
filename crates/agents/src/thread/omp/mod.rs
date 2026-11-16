@@ -409,6 +409,7 @@ impl OmpRpcConnection {
                                     description: approval.body,
                                     suggestions: Vec::new(),
                                     kind: PermissionKind::Tool,
+                                    args_digest: None,
                                 })
                                 .is_err()
                             {

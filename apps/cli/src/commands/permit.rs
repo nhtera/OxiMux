@@ -19,7 +19,19 @@ use crate::output::Failure;
 
 /// One undecided request, as reconstructed from the event stream.
 enum Pending {
-    Permission { request_id: String, tool_name: String, description: String, input: Value },
+    Permission {
+        request_id: String,
+        tool_name: String,
+        description: String,
+        input: Value,
+        /// The digest the host minted with this request, as it reached us.
+        ///
+        /// `None` from a host that predates it: the decision then carries
+        /// none, which `resolve_permission` accepts as it always has. That
+        /// fallback is the only reason this is an `Option` — a missing digest
+        /// is an older host, never an operator skipping the check.
+        args_digest: Option<String>,
+    },
     Question { request_id: String, questions: Vec<AskQuestion> },
 }
 
@@ -62,8 +74,9 @@ async fn pending(client: &Client, session: &str) -> Result<Vec<Pending>, Failure
             // either got decided or died with the turn.
             Ok(ThreadEvent::TurnEnded { .. }) => list.clear(),
             Ok(ThreadEvent::PermissionRequested {
-                request_id, tool_name, description, input, ..
-            }) => list.push(Pending::Permission { request_id, tool_name, description, input }),
+                request_id, tool_name, description, input, args_digest, ..
+            }) => list
+                .push(Pending::Permission { request_id, tool_name, description, input, args_digest }),
             Ok(ThreadEvent::QuestionAsked { request_id, questions, .. }) => {
                 list.push(Pending::Question { request_id, questions })
             }
@@ -94,7 +107,7 @@ pub async fn ls(client: &Client, session: &str) -> Result<(Value, String), Failu
     let rows: Vec<Value> = list
         .iter()
         .map(|p| match p {
-            Pending::Permission { request_id, tool_name, description, input } => json!({
+            Pending::Permission { request_id, tool_name, description, input, .. } => json!({
                 "kind": "permission",
                 "request_id": request_id,
                 "tool": tool_name,
@@ -171,7 +184,7 @@ pub async fn allow(
 
     let list = pending(client, session).await?;
     let picked = pick(&list, request)?;
-    let Pending::Permission { request_id, input, .. } = picked else {
+    let Pending::Permission { request_id, input, args_digest, .. } = picked else {
         return Err(Failure::new(
             "wrong-kind",
             exit::ERROR,
@@ -188,8 +201,20 @@ pub async fn allow(
     // key means "leave it" or "remove it", and guessing wrong on a tool call
     // the operator is explicitly correcting is the one outcome this flag must
     // not have.
-    let decision =
-        PermissionDecision::allow(override_input.unwrap_or_else(|| input.clone()));
+    //
+    // The digest rides with it, echoed exactly as the host minted it. It says
+    // *which proposal* this operator read before deciding, which is a
+    // different question from what the tool should now run: the host compares
+    // it against the arguments it still holds, so an approval typed against a
+    // proposal that has since changed under us is refused rather than applied
+    // to whatever replaced it.
+    //
+    // So it is sent with `--input` too. The edit changes what runs; it does
+    // not change which request was read, and dropping the digest there would
+    // leave the one path that rewrites a tool call as the one path with no
+    // check on what it was rewriting.
+    let decision = PermissionDecision::allow(override_input.unwrap_or_else(|| input.clone()))
+        .with_args_digest(args_digest.clone());
     resolve(client, session, request_id, &decision).await
 }
 

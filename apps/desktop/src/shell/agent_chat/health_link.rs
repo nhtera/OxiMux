@@ -285,6 +285,7 @@ mod tests {
                     description: String::new(),
                     suggestions: vec![],
                     kind: oximux_agents::thread::PermissionKind::Tool,
+                    args_digest: None,
                 });
                 let inputs = view.health_inputs();
                 assert_eq!(inputs.prompt_request.as_deref(), Some("rid"), "waiting on a person");

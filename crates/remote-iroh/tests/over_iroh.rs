@@ -43,6 +43,7 @@ fn seeded_registry() -> Arc<SessionRegistry> {
         description: "run ls".into(),
         suggestions: vec![],
         kind: PermissionKind::Tool,
+        args_digest: None,
     });
     registry
 }
