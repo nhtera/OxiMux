@@ -348,3 +348,84 @@ fn receipts_carried_by_a_line_settle_with_it() {
     }
     assert!(gate.carried_by(&line.to_string()).is_empty(), "only the last few lines are remembered");
 }
+
+#[test]
+fn a_restored_message_waits_for_a_person_and_nothing_else_releases_it() {
+    // A restart is the one moment nobody has reviewed what was queued, so the
+    // things that ordinarily let the queue move must all leave it alone.
+    let mut gate = SendGate::new();
+    let seen = wakes(&mut gate);
+    gate.push_restored("queued before the restart".into(), SendSource::Remote, None);
+
+    assert_eq!(seen.load(Ordering::SeqCst), 0, "nothing to wake for: it is not sendable");
+    assert_eq!(gate.ready(), Ready::Idle, "an open gate does not take it");
+    assert!(gate.take_next_if_open().is_none());
+    assert_eq!(
+        gate.wait_of(gate.queued().next().unwrap()),
+        SendWait::HeldRestored,
+        "and it says why it is waiting",
+    );
+
+    // A turn that comes and goes is the usual thing that drains a queue.
+    gate.begin_turn(SendSource::User);
+    gate.on_turn_end();
+    assert!(gate.take_next_if_open().is_none(), "a completed turn does not release it");
+
+    // So is a person's own message after a Stop, which takes the child
+    // events held with it.
+    gate.request_stop();
+    gate.take_stop_request();
+    assert!(gate.take_held_events().is_empty(), "nor does a Stop's release of held events");
+    assert_eq!(gate.counts(), (1, 0), "it is still there, and counted as held");
+}
+
+#[test]
+fn the_counts_tell_held_from_waiting() {
+    let mut gate = SendGate::new();
+    gate.push_restored("before".into(), SendSource::Remote, None);
+    user(&mut gate, "since");
+    assert_eq!(gate.counts(), (1, 1));
+    // The one that may go, goes; the held one stays held.
+    assert_eq!(gate.take_next_if_open().unwrap().text, "since");
+    assert_eq!(gate.counts(), (1, 0));
+}
+
+#[test]
+fn a_restored_batch_of_child_events_is_held_like_any_other() {
+    // `take_held_events` partitions on the sender, so a restored batch would
+    // have gone out with the next person's message had the hold not outranked
+    // that — and the person would never have seen it.
+    let mut gate = SendGate::new();
+    gate.push_restored("<event/>".into(), SendSource::ParentEvent, None);
+    gate.request_stop();
+    gate.take_stop_request();
+    assert!(gate.take_held_events().is_empty());
+    assert_eq!(gate.counts(), (1, 0));
+}
+
+#[test]
+fn only_a_sender_with_no_durable_path_of_its_own_is_carried_across_a_restart() {
+    // A child's event batch is an outbox row and a recovery turn is minted
+    // from the lineage: carried here too, each would arrive twice.
+    assert!(SendSource::User.survives_a_restart());
+    assert!(SendSource::Remote.survives_a_restart());
+    assert!(SendSource::Agent.survives_a_restart());
+    assert!(!SendSource::ParentEvent.survives_a_restart());
+    assert!(!SendSource::Recovery.survives_a_restart());
+}
+
+#[test]
+fn a_stored_sender_reads_back_as_itself_and_an_unknown_one_reads_as_remote() {
+    for source in [
+        SendSource::User,
+        SendSource::Remote,
+        SendSource::Agent,
+        SendSource::ParentEvent,
+        SendSource::Recovery,
+    ] {
+        assert_eq!(SendSource::from_wire(source.wire_name()), source, "{source:?}");
+    }
+    // Never `ParentEvent`: that is the one sender whose text may carry the
+    // host's own event tags.
+    assert_eq!(SendSource::from_wire("somethingNewer"), SendSource::Remote);
+}

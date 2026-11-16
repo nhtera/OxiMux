@@ -19,6 +19,13 @@ pub fn build(restarted_at: &str, stopped: &[String]) -> String {
     note
 }
 
+/// What the transcript records when a note went out with a message.
+///
+/// Shared for the same reason the note is: the agent reads the note and the
+/// person reads this, and a session moved between hosts must not say it two
+/// different ways.
+pub const SENT_NOTICE: &str = "A recovery note about the restart went with this message.";
+
 /// `text` with the note ahead of it, as one message.
 pub fn attach(note: &str, text: &str) -> String {
     if text.trim().is_empty() { note.to_string() } else { format!("{note}\n\n{text}") }

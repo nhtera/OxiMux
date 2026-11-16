@@ -38,6 +38,24 @@ pub struct BlobChoices {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// One message this host had queued and never wrote.
+///
+/// Text only, with the id the line would have been reported by. Images are
+/// not carried: the desktop's own restore drops them too ("text only"), and a
+/// blob is not the place for attachment bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BlobQueuedSend {
+    pub text: String,
+    /// Who queued it, so a restored line keeps the standing it had — a child's
+    /// event batch is not a person's message.
+    #[serde(default)]
+    pub source: String,
+    /// The send key it carried, kept so a receipt can later say whether the
+    /// agent ever saw it.
+    #[serde(default)]
+    pub send_key: Option<String>,
+}
+
 /// One session's persisted transcript + launch facts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatBlob {
@@ -73,6 +91,37 @@ pub struct ChatBlob {
     /// today; closing that is the desktop's half of F8.
     #[serde(default)]
     pub last_failure: Option<String>,
+    /// A turn, a continuation or background work was running when this host
+    /// stopped, so the restart cut it short.
+    ///
+    /// The desktop's own field, by name and by meaning: a session saved by
+    /// one host and reopened by the other must owe the agent the same note.
+    #[serde(default)]
+    pub mid_turn: bool,
+    /// What the background tasks running at that moment were doing, for the
+    /// note to name them.
+    #[serde(default)]
+    pub stopped_tasks: Vec<String>,
+    /// A note a restart left owed and nothing has sent yet.
+    ///
+    /// Kept so a second restart before the next message does not lose it —
+    /// and so the note the agent eventually reads names the restart that
+    /// actually interrupted it rather than the latest one.
+    #[serde(default)]
+    pub recovery_note: Option<String>,
+    /// What this host had queued and had not written when it stopped.
+    ///
+    /// Without it the queue simply vanished with the process: a message a
+    /// phone sent while a turn ran was accepted, held, and then lost. Restored
+    /// **held** — a restart is exactly the moment nobody has reviewed what was
+    /// queued, so it waits for a person rather than draining into the agent.
+    ///
+    /// Serve's own field, like [`ChatBlob::last_failure`]: the desktop keeps
+    /// its queue in the tab-layout records and drops this on its own save, so
+    /// a session the desktop reopens loses what serve was holding. Closing
+    /// that is the desktop's half, as it is for the failure.
+    #[serde(default)]
+    pub queued: Vec<BlobQueuedSend>,
     /// Everything else the writer knew — the desktop's `thinking_level`, any
     /// future field — preserved verbatim across a headless rewrite.
     #[serde(flatten)]
@@ -94,6 +143,10 @@ impl ChatBlob {
             pi_posture: None,
             choices: BlobChoices::default(),
             last_failure: None,
+            mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            queued: Vec::new(),
             extra: serde_json::Map::new(),
         }
     }
@@ -144,17 +197,24 @@ pub fn load(settings: &SettingsRepo, session_id: &str) -> Option<ChatBlob> {
     }
 }
 
-/// Write one blob. Failures are logged, not propagated — history persistence
-/// must never take the live session down with it.
-pub fn save(settings: &SettingsRepo, blob: &ChatBlob) {
+/// Write one blob, reporting whether it landed.
+///
+/// Failures are logged, never propagated — history persistence must not take
+/// the live session down with it. The caller is still told, because a caller
+/// that remembers "this is saved" after a write that did not happen will skip
+/// the next one too, and the thing it skipped can be a queued message.
+#[must_use = "a save that did not land must not be remembered as one that did"]
+pub fn save(settings: &SettingsRepo, blob: &ChatBlob) -> bool {
     let json = match serde_json::to_string(blob) {
         Ok(json) => json,
         Err(err) => {
             tracing::warn!(session_id = %blob.session_id, %err, "chat blob serialize failed");
-            return;
+            return false;
         }
     };
     if let Err(err) = settings.set(&chat_settings_key(&blob.session_id), &json) {
         tracing::warn!(session_id = %blob.session_id, %err, "chat blob save failed");
+        return false;
     }
+    true
 }

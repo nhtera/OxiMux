@@ -58,7 +58,7 @@ async fn a_queued_send_is_written_once_the_gate_is_open() {
     let settings = SettingsRepo::new(db.clone());
     let (_tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -108,7 +108,7 @@ async fn a_limit_holds_the_queue_and_lifting_it_lets_the_queue_go() {
     let retry = retry_driver(registry.clone(), &settings, &db);
     let (tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -196,7 +196,7 @@ async fn a_failed_turn_is_still_failed_after_a_restart() {
     let settings = SettingsRepo::new(db.clone());
     let (tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -233,7 +233,7 @@ async fn a_failed_turn_is_still_failed_after_a_restart() {
     let conn = Arc::new(StubConnection::default());
     let handle = registry.register("s-1".into(), conn.clone());
     let (_tx, rx) = std::sync::mpsc::channel();
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -291,7 +291,7 @@ async fn a_send_clears_the_failure_the_blob_carries() {
     }];
     let (_tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -335,7 +335,7 @@ async fn a_stop_from_elsewhere_interrupts_the_agent() {
     let settings = SettingsRepo::new(db.clone());
     let (tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -377,7 +377,7 @@ async fn a_send_that_could_not_be_written_does_not_wedge_the_queue() {
     let settings = SettingsRepo::new(db.clone());
     let (_tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -423,7 +423,7 @@ async fn a_send_that_arrives_mid_turn_goes_out_when_the_turn_ends() {
     let settings = SettingsRepo::new(db.clone());
     let (tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -487,7 +487,7 @@ async fn a_reopened_session_publishes_before_its_backend_speaks() {
         checkpoint: None,
     }];
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -531,7 +531,7 @@ async fn a_childs_events_reach_their_parent_with_the_envelope_intact() {
     let settings = SettingsRepo::new(db.clone());
     let (_tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -594,7 +594,7 @@ async fn a_line_an_agent_cannot_acknowledge_is_confirmed_by_its_next_frame() {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut receipts = handle.subscribe_receipts();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -648,7 +648,7 @@ async fn a_finished_turn_releases_the_session_it_was_holding() {
     let (tx, rx) = std::sync::mpsc::channel();
     let pumps = PumpSet::new();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -703,7 +703,7 @@ async fn a_dead_agent_returns_its_session_to_dormant() {
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ended_flag = ended.clone();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -769,7 +769,7 @@ async fn a_live_session_lists_by_its_prompt_rather_than_its_own_id() {
     let pumps = PumpSet::new();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-2".into(),
             handle: handle.clone(),
@@ -817,7 +817,7 @@ async fn a_prompt_injected_over_the_protocol_still_titles_the_live_row() {
     let pumps = PumpSet::new();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-3".into(),
             handle: handle.clone(),
@@ -886,7 +886,7 @@ async fn a_send_that_supersedes_a_resend_takes_it_out_of_the_queue() {
         images: Vec::new(),
         checkpoint: None,
     }];
-    start(
+    let _pump = start(
         PumpSpec {
             session_id: "s-1".into(),
             handle: handle.clone(),
@@ -955,5 +955,273 @@ async fn a_send_that_supersedes_a_resend_takes_it_out_of_the_queue() {
         !wait_until(1_000, || conn.sent().len() > 1),
         "the resend went with the retry the person's message superseded: {:?}",
         conn.sent(),
+    );
+}
+
+/// A message queued when the host stopped comes back, and comes back held.
+///
+/// Before this the queue went with the process: a line a phone sent while a
+/// turn was running was accepted, held, and then lost. Restoring it *sent*
+/// would be worse — a restart is the one moment nobody has reviewed what was
+/// waiting — so it comes back visible and waiting for a person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_message_survives_a_restart_and_comes_back_held() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            // A turn is running, so what follows queues behind it.
+            buffered: vec![ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] }],
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    handle.send_prompt("and this too", &[]).unwrap();
+    assert!(!wait_until(300, || conn.sent().len() > 1), "it waits behind the running turn");
+
+    // The host stops: the agent's stream closing is what the pump sees.
+    drop(tx);
+    assert!(
+        wait_until(5_000, || blob::load(&settings, "s-1")
+            .is_some_and(|b| !b.queued.is_empty())),
+        "the queue reached the blob: {:?}",
+        blob::load(&settings, "s-1").map(|b| b.queued),
+    );
+    let stored = blob::load(&settings, "s-1").expect("the stored blob");
+    assert_eq!(stored.queued.len(), 1, "one line was waiting: {:?}", stored.queued);
+    assert_eq!(stored.queued[0].text, "and this too");
+    assert_eq!(stored.queued[0].source, "remote", "and it keeps who sent it");
+
+    // The restart.
+    registry.unregister("s-1");
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: stored,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+
+    assert!(
+        wait_until(5_000, || handle.health().held_restored == 1),
+        "the restored session says it is holding one message: {:?}",
+        handle.health(),
+    );
+    // Nothing runs here, so the gate is open — and it still does not take it.
+    assert!(
+        !wait_until(500, || !conn.sent().is_empty()),
+        "a restart does not send what nobody has reviewed: {:?}",
+        conn.sent(),
+    );
+    let gate = handle.gate().expect("the pump attached its gate");
+    let gate = gate.lock().unwrap();
+    assert_eq!(
+        gate.wait_of(gate.queued().next().expect("the line is in the queue")),
+        oximux_agents::send_gate::SendWait::HeldRestored,
+        "and it says why it is waiting",
+    );
+}
+
+/// A restart that cut a turn short owes the agent a note, and the next
+/// message carries it.
+///
+/// The agent's own process is gone but its session is not: resumed, it would
+/// carry on from a state that no longer exists. The note says so once, ahead
+/// of the next message rather than as a turn of its own — a turn nobody asked
+/// for is a turn the person is billed for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_mid_turn_owes_a_note_the_next_message_carries() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pumps = PumpSet::new();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            // A turn is running when the host is told to stop.
+            buffered: vec![ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] }],
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        pumps.clone(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    // The host drains.
+    pumps.finalize_all();
+    assert!(wait_until(5_000, || pumps.live_pumps() == 0), "the pump finalized");
+    let stored = blob::load(&settings, "s-1").expect("the stored blob");
+    assert!(stored.mid_turn, "the blob says a turn was cut short");
+    drop(tx);
+
+    // The restart.
+    registry.unregister("s-1");
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: stored,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.health_inputs().recovery_note_owed),
+        "the restored session says it owes the agent a note: {:?}",
+        handle.health(),
+    );
+    assert!(conn.sent().is_empty(), "and the note is not a turn of its own");
+
+    // A second restart before anything is sent keeps the *same* note: the
+    // agent has to hear about the restart that interrupted it, and by now the
+    // blob is the only thing that still says there was one — this host was not
+    // mid-turn and would build nothing of its own.
+    let carried = blob::load(&settings, "s-1").expect("the stored blob");
+    assert!(!carried.mid_turn, "nothing was running under this host");
+    let note = carried.recovery_note.clone().expect("the note is still owed, durably");
+    assert!(note.contains("Your previous turn was interrupted"), "{note}");
+    registry.unregister("s-1");
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let (_tx2, rx) = std::sync::mpsc::channel();
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: carried,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.health_inputs().recovery_note_owed),
+        "the note outlived a restart that had nothing of its own to report",
+    );
+
+    // The next message takes it.
+    handle.send_prompt("carry on", &[]).unwrap();
+    assert!(wait_until(5_000, || !conn.sent().is_empty()), "the message went out");
+    let line = conn.sent()[0].to_string();
+    assert!(line.contains("Your previous turn was interrupted"), "the note went with it: {line}");
+    assert!(line.contains("carry on"), "and so did the message: {line}");
+
+    assert!(
+        wait_until(5_000, || !handle.health_inputs().recovery_note_owed),
+        "once sent it is not owed again: {:?}",
+        handle.health(),
+    );
+    assert!(
+        wait_until(5_000, || blob::load(&settings, "s-1")
+            .is_some_and(|b| b.recovery_note.is_none())),
+        "nor after another restart: {:?}",
+        blob::load(&settings, "s-1").map(|b| b.recovery_note),
+    );
+}
+
+/// A session answers for itself by the time `start` says it has published.
+///
+/// `resume_one` reads `recovery_note_owed` the moment `open` returns, to
+/// decide whether a child whose turn a restart cut short gets its recovery
+/// turn. The pump publishes from its own task, so a caller that looks before
+/// that reads the default — `false` — and gives up on the child instead of
+/// retrying it. The ack is what the caller waits for, rather than a duration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_answers_for_itself_once_its_pump_says_it_published() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (_tx, rx) = std::sync::mpsc::channel();
+
+    // A session the last host stopped mid-turn: it owes the agent a note.
+    let mut seed = ChatBlob::new("s-1".into());
+    seed.entries = vec![oximux_agents::thread::ThreadEntry::User {
+        text: "ship it".into(),
+        images: Vec::new(),
+        checkpoint: None,
+    }];
+    seed.mid_turn = true;
+
+    let published = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    published.await.expect("the pump published before it ended");
+
+    // No waiting and no polling here on purpose: the ack is the claim under
+    // test, so reading straight after it is what proves the claim.
+    assert!(
+        handle.health_inputs().recovery_note_owed,
+        "the session says it owes a note as soon as it is open: {:?}",
+        handle.health(),
     );
 }

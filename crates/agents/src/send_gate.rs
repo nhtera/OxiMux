@@ -92,6 +92,50 @@ impl SendSource {
         self != SendSource::User
     }
 
+    /// The token a host stores this sender as.
+    ///
+    /// One mapping, in one place, so a queue written by one host and read back
+    /// by another cannot disagree about who sent a line — and so a sender that
+    /// is added later cannot be silently read as a different one.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            SendSource::User => "user",
+            SendSource::Remote => "remote",
+            SendSource::Agent => "agent",
+            SendSource::ParentEvent => "parentEvent",
+            SendSource::Recovery => "recovery",
+        }
+    }
+
+    /// The sender a stored token names.
+    ///
+    /// Anything this build does not know reads as [`SendSource::Remote`]: the
+    /// sender decides two things — whether the text may carry the host's own
+    /// event tags, and whether a Stop holds it — and `Remote` is the cautious
+    /// answer to the first and the ordinary answer to the second. Reading an
+    /// unknown token as `ParentEvent` is the one answer that would be unsafe,
+    /// since that is the sender allowed to carry those tags.
+    pub fn from_wire(token: &str) -> Self {
+        match token {
+            "user" => SendSource::User,
+            "agent" => SendSource::Agent,
+            "parentEvent" => SendSource::ParentEvent,
+            "recovery" => SendSource::Recovery,
+            _ => SendSource::Remote,
+        }
+    }
+
+    /// Whether a host should carry this sender's queued line across a restart.
+    ///
+    /// `false` for the two that already have a durable path of their own, and
+    /// would otherwise arrive twice: a child's event batch is an outbox
+    /// delivery, and the outbox hands its unwritten rows back to the drainer
+    /// at boot; a recovery turn is minted from the lineage by whoever resumes
+    /// the child, and a stale one is dropped rather than kept.
+    pub fn survives_a_restart(self) -> bool {
+        !matches!(self, SendSource::ParentEvent | SendSource::Recovery)
+    }
+
     /// The text as it may go out from this sender. Only the host's own child
     /// events carry the envelope's tags; from anyone else, text that merely
     /// looks like one is delivered as ordinary text.
@@ -159,6 +203,15 @@ pub struct QueuedSend {
     pub images: Vec<ChatImage>,
     pub mode: DeliveryMode,
     pub source: SendSource,
+    /// Queued before a restart and brought back by it: waits for the person,
+    /// and nothing else releases it.
+    ///
+    /// A restart is exactly the moment the user has *not* yet seen what was
+    /// queued, so a completed turn, a recovery note or a new message must all
+    /// leave these where they are. [`SendGate::next_sendable`] skips them and
+    /// [`SendGate::wait_of`] says why; releasing one is an explicit act,
+    /// which on a host with no screen means a client verb.
+    pub held: bool,
 }
 
 /// What the owner should do now.
@@ -297,9 +350,44 @@ impl SendGate {
         // Only the host's own deliveries are events: text from anyone else that
         // merely looks like one goes out as plain text.
         let text = source.vetted(&text).into_owned();
-        self.queue.push_back(QueuedSend { id, uuid, text, images, mode, source });
+        self.queue.push_back(QueuedSend { id, uuid, text, images, mode, source, held: false });
         self.wake_if_ready();
         (id, uuid)
+    }
+
+    /// Put back a message that was queued when the host last stopped.
+    ///
+    /// Held (see [`QueuedSend::held`]), so it is *not* sent by the restart:
+    /// the queue the person left behind comes back visible and waiting rather
+    /// than draining into an agent they have not looked at since. No wake,
+    /// because nothing here is sendable.
+    pub fn push_restored(
+        &mut self,
+        text: String,
+        source: SendSource,
+        uuid: Option<Uuid>,
+    ) -> (u64, Uuid) {
+        self.next_id += 1;
+        let id = self.next_id;
+        let uuid = uuid.unwrap_or_else(Uuid::new_v4);
+        let text = source.vetted(&text).into_owned();
+        self.queue.push_back(QueuedSend {
+            id,
+            uuid,
+            text,
+            images: Vec::new(),
+            mode: DeliveryMode::Queue,
+            source,
+            held: true,
+        });
+        (id, uuid)
+    }
+
+    /// How many queued messages are held from before a restart, and how many
+    /// are waiting to go out — the two counts a session's health reports.
+    pub fn counts(&self) -> (u32, u32) {
+        let held = self.queue.iter().filter(|q| q.held).count() as u32;
+        (held, self.queue.len() as u32 - held)
     }
 
     /// Drop an item (the user edited or cancelled its chip). `None` when it
@@ -319,6 +407,11 @@ impl SendGate {
 
     /// Why `item` is waiting (or [`SendWait::None`]).
     pub fn wait_of(&self, item: &QueuedSend) -> SendWait {
+        // First, because it outranks every other reason: a restart's own hold
+        // is lifted by the person and by nothing that happens to the session.
+        if item.held {
+            return SendWait::HeldRestored;
+        }
         if item.source.held_by_stop() && self.stopped() {
             return SendWait::StoppedByUser;
         }
@@ -373,7 +466,9 @@ impl SendGate {
         if !self.open() {
             return None;
         }
-        self.queue.iter().position(|q| !q.source.held_by_stop() || !(self.stopped() || self.failed))
+        self.queue
+            .iter()
+            .position(|q| !q.held && (!q.source.held_by_stop() || !(self.stopped() || self.failed)))
     }
 
     /// Put an item the owner took but could not send back at the front, as it
@@ -497,8 +592,10 @@ impl SendGate {
     /// them go first, as part of the same turn. Clears the Stop hold.
     pub fn take_held_events(&mut self) -> Vec<QueuedSend> {
         self.stopped_by_user = false;
+        // Not the ones a restart is holding: their hold is the person's to
+        // lift, and a message that takes them along would lift it for them.
         let (events, rest): (VecDeque<_>, VecDeque<_>) =
-            self.queue.drain(..).partition(|q| q.source == SendSource::ParentEvent);
+            self.queue.drain(..).partition(|q| q.source == SendSource::ParentEvent && !q.held);
         self.queue = rest;
         events.into()
     }

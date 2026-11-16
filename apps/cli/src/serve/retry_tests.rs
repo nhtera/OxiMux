@@ -75,7 +75,7 @@ fn now_ms() -> i64 {
 fn store_blob(settings: &SettingsRepo, session_id: &str, entries: Vec<ThreadEntry>) {
     let mut b = blob::ChatBlob::new(session_id.to_string());
     b.entries = entries;
-    blob::save(settings, &b);
+    assert!(blob::save(settings, &b), "the fixture blob is written");
 }
 
 fn user(text: &str) -> ThreadEntry {

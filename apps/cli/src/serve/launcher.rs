@@ -294,7 +294,7 @@ impl SessionLauncher for HeadlessLauncher {
         // The fold re-derives model/meta from the buffered `SessionInit`; the
         // seed only has to carry what init does not — the provider and cwd
         // that a later resume needs.
-        pump::start(
+        let published = pump::start(
             PumpSpec {
                 session_id: spawned.session_id.clone(),
                 handle: handle.clone(),
@@ -312,6 +312,10 @@ impl SessionLauncher for HeadlessLauncher {
             },
             self.pumps.clone(),
         );
+        // As in the catalog's resume: the id goes back to a caller that will
+        // read this session's state, and a read before the first publish
+        // reads defaults.
+        let _ = published.await;
         Ok(spawned.session_id)
     }
 

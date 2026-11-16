@@ -15,6 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Context};
+use oximux_agents::recovery_note::SENT_NOTICE as RECOVERY_NOTE_SENT;
 use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource, Steered};
 use oximux_agents::thread::{ChatImage, PermissionDecision, PermissionKind, ThreadEvent, ToolCallStatus, Transport};
 use oximux_agents::send_receipts::{KeyKind, ReceiptState, key_hash};
@@ -27,9 +28,6 @@ const PLAN_REFUSED: &str = "Leaving plan mode needs you: this turn was started b
 
 /// What the transcript says when held child events go out with a message.
 const HELD_EVENTS_NOTE: &str = "Child events that arrived after the Stop went with this message.";
-
-/// What the transcript says when a recovery note went out with a message.
-const RECOVERY_NOTE_SENT: &str = "A recovery note about the restart went with this message.";
 
 /// How long after its turn ended a steered line may take to start (or be
 /// reported dropped) before the chat stops waiting for it.

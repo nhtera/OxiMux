@@ -190,7 +190,7 @@ impl HeadlessCatalog {
         // A resumed backend replays nothing, so there is nothing to buffer:
         // the pump publishes the persisted fold immediately and the live
         // stream extends it from the next event on.
-        pump::start(
+        let published = pump::start(
             PumpSpec {
                 session_id: session_id.to_string(),
                 handle,
@@ -209,6 +209,15 @@ impl HeadlessCatalog {
             },
             self.pumps.clone(),
         );
+        // "Open" means the session can answer for itself, so this waits for
+        // its first publish. Returning earlier hands the caller a session
+        // whose state is still at its defaults — and the caller that matters
+        // reads `recovery_note_owed` the moment this returns, to decide
+        // whether a child whose turn a restart cut short gets one back. Read
+        // too early it says no, and the child is given up on rather than
+        // retried. An error means the pump ended before publishing; there is
+        // nothing to wait for either way.
+        let _ = published.await;
         Ok(())
     }
 }
