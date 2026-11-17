@@ -101,6 +101,15 @@ pub struct SessionHealthWire {
     pub last_activity_at: i64,
     pub pending_unanswered_send: bool,
     pub held_restored: u32,
+    /// A restart cut a turn short and the agent has not been told yet: the
+    /// next message this session sends carries a note saying so.
+    ///
+    /// Here so a client can say it before the person types — a message that
+    /// silently grows a paragraph nobody wrote is the kind of surprise a
+    /// remote surface has no other way to warn about. The note's own text is
+    /// not on the frame: it reaches the transcript when it goes, and a client
+    /// that wants to word the warning its own way needs only the fact.
+    pub recovery_note_owed: bool,
     /// Edge identities: a client notifies once per turn and per exit.
     pub turn_id: Option<String>,
     pub exit_seq: Option<String>,
@@ -121,6 +130,22 @@ mod tests {
         };
         let frame = SessionHealthFrame::new("s", "host-a", &wire);
         assert_eq!(frame.health().unwrap(), wire);
+
+        // The owed-note flag crosses as itself.
+        let owed = SessionHealthFrame::new(
+            "s",
+            "host-a",
+            &SessionHealthWire { recovery_note_owed: true, ..Default::default() },
+        );
+        assert!(owed.health().unwrap().recovery_note_owed);
+        // And a frame from a host that predates it reads as not owed, rather
+        // than warning about a note that is not coming.
+        let older = SessionHealthFrame {
+            session_id: "s".into(),
+            host_instance_id: "h".into(),
+            health_json: r#"{"status":"idle"}"#.into(),
+        };
+        assert!(!older.health().unwrap().recovery_note_owed);
 
         // A newer host's extra field is skipped; a missing one defaults.
         let newer = SessionHealthFrame {

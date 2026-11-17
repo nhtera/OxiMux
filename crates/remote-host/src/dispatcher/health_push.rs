@@ -128,7 +128,86 @@ pub(super) fn wire(h: &SessionHealth) -> SessionHealthWire {
         last_activity_at: h.last_activity_at,
         pending_unanswered_send: h.pending_unanswered_send,
         held_restored: h.held_restored,
+        recovery_note_owed: h.recovery_note_owed,
         turn_id: h.turn_id.clone(),
         exit_seq: h.exit_seq.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything the host knows about a session's health reaches the frame.
+    ///
+    /// Field by field, because this function is the only crossing: a value
+    /// `compute` sets and `wire` forgets is invisible to every client while
+    /// every test on either side of it passes. That is not hypothetical — the
+    /// owed-note flag below was added with a test on the computation and a
+    /// test on a hand-built frame, and neither would have noticed this
+    /// function dropping it.
+    #[test]
+    fn every_fact_the_host_computes_crosses_to_the_frame() {
+        let health = SessionHealth {
+            status: HealthStatus::Limited,
+            liveness: Liveness::Exited(ExitProof::ExitCode(137)),
+            limited_until: Some(1_700_000_060_000),
+            stalled_since: Some(1_700_000_000_000),
+            exited_unexpectedly: true,
+            reason: Some("rate limited".into()),
+            last_activity_at: 1_700_000_000_111,
+            pending_unanswered_send: true,
+            held_restored: 3,
+            recovery_note_owed: true,
+            turn_id: Some("inc-1:2".into()),
+            exit_seq: Some("exit-1".into()),
+        };
+
+        let w = wire(&health);
+
+        assert_eq!(w.status, "limited");
+        assert_eq!(w.liveness, "exited");
+        assert_eq!(w.exit_proof.as_deref(), Some("exitCode"));
+        assert_eq!(w.exit_code, Some(137));
+        assert_eq!(w.limited_until, health.limited_until);
+        assert_eq!(w.stalled_since, health.stalled_since);
+        assert!(w.exited_unexpectedly);
+        assert_eq!(w.reason, health.reason);
+        assert_eq!(w.last_activity_at, health.last_activity_at);
+        assert!(w.pending_unanswered_send);
+        assert_eq!(w.held_restored, 3);
+        assert!(w.recovery_note_owed, "an owed note has to cross, or no client can warn about it");
+        assert_eq!(w.turn_id, health.turn_id);
+        assert_eq!(w.exit_seq, health.exit_seq);
+    }
+
+    /// And the other exit proofs keep their own words.
+    #[test]
+    fn each_exit_proof_crosses_as_its_own_word() {
+        for (proof, word) in [
+            (ExitProof::UserStop, "userStop"),
+            (ExitProof::HostLock, "hostLock"),
+            (ExitProof::ConnectionClosed, "connectionClosed"),
+        ] {
+            let w = wire(&SessionHealth {
+                liveness: Liveness::Exited(proof),
+                ..SessionHealth {
+                    status: HealthStatus::Failed,
+                    liveness: Liveness::Live,
+                    limited_until: None,
+                    stalled_since: None,
+                    exited_unexpectedly: false,
+                    reason: None,
+                    last_activity_at: 0,
+                    pending_unanswered_send: false,
+                    held_restored: 0,
+                    recovery_note_owed: false,
+                    turn_id: None,
+                    exit_seq: None,
+                }
+            });
+            assert_eq!(w.exit_proof.as_deref(), Some(word));
+            assert_eq!(w.exit_code, None, "{word} has no code of its own");
+        }
     }
 }
