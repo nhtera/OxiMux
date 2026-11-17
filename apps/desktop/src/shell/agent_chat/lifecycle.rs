@@ -67,9 +67,24 @@ impl AgentChatView {
             return;
         }
         self.disconnected = true;
-        if self.thread.last_error.is_none() {
-            self.thread.last_error = Some(self.exit_error());
-        }
+        // Both halves, through the one call that sets them together. The fold's
+        // text is what the error card shows and the tracker's is what
+        // `failure_to_persist` reads — so without the tracker's, a chat whose
+        // process died persisted nothing and came back *idle* after a relaunch,
+        // with nothing anywhere to say what had happened. Measured on serve,
+        // where the same half was missing (2026-11-17).
+        //
+        // An explanation already in hand wins: a turn that failed says more
+        // than the exit it caused, and the exit is in the health's own reason
+        // either way.
+        let failure = self.thread.last_error.clone().unwrap_or_else(|| self.exit_error());
+        oximux_agents::health_track::record_failure(&mut self.thread, &mut self.health, failure);
+        // And the blob is now out of date. Neither half of the line above
+        // moves `ChatThread::revision()`, so without this an already-saved
+        // chat skipped its blob at the next save and the death reached disk
+        // only if something else happened to dirty it — which is the whole
+        // thing this change exists to stop.
+        self.meta_dirty.set(true);
         self.sync_composer(cx);
         cx.notify();
     }

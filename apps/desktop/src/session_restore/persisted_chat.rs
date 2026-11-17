@@ -166,6 +166,7 @@ pub struct PersistedChatTranscript {
     /// that offers no choices.
     #[serde(default)]
     pub choices: PersistedChoices,
+
     /// A retry this chat had armed when it was last saved, so a turn held for a
     /// five-hour or seven-day window resumes at its reset even if the app was
     /// quit in between — which is the ordinary case for a window that long.
@@ -186,6 +187,21 @@ pub struct PersistedChatTranscript {
     /// recovery note a mid-turn restore attaches to the next message.
     #[serde(default)]
     pub stopped_tasks: Vec<String>,
+    /// The error the last turn ended in, when nothing has been sent since —
+    /// including a provider that died, which is the ordinary way a session
+    /// stops being usable.
+    ///
+    /// The fold keeps no durable trace of a failure (`last_error` is transient
+    /// and an errored `TurnEnded` leaves no entry), so without this a chat that
+    /// died failing came back reading *idle*: the one state that invites
+    /// someone to carry on as though nothing had happened. `#[serde(default)]`
+    /// keeps older blobs loadable; those restore with no failure, which is
+    /// their pre-existing behaviour.
+    ///
+    /// The same field `oximux serve` writes, by name and meaning, so a session
+    /// moved between the hosts explains itself the same way on both.
+    #[serde(default)]
+    pub last_failure: Option<String>,
     /// A recovery note the chat was restored with and has not sent yet, so a
     /// second restart before the next message does not lose it.
     #[serde(default)]
@@ -234,9 +250,42 @@ pub fn save_chat_transcript(repo: &SettingsRepo, transcript: &PersistedChatTrans
             return;
         }
     };
+    let json = merged_over_stored(repo, &key, json);
     if let Err(err) = repo.set(&key, &json) {
         tracing::warn!(?err, session_id = %transcript.session_id, "save_chat_transcript: settings.set failed");
     }
+}
+
+/// `json` with any key the stored blob has and this build does not model
+/// carried through untouched.
+///
+/// Both hosts write this one blob, and a save here is a **rewrite** of
+/// whatever is on disk — so without this, opening a session the headless host
+/// had been holding and letting the desktop save it silently dropped that
+/// host's own fields (`queued`, today). `oximux serve` keeps the same promise
+/// in the other direction through its mirror's `extra`, and it has to be kept
+/// at the write rather than on the struct: this host assembles its blob from
+/// the live chat, so a catch-all field would be empty every time.
+///
+/// Only *unknown* keys survive. Every field this build models is written on
+/// every save, so the fresh value always wins — a note just consumed stays
+/// consumed.
+pub(crate) fn merged_over_stored(repo: &SettingsRepo, key: &str, json: String) -> String {
+    let (Ok(Some(stored)), Ok(serde_json::Value::Object(fresh))) =
+        (repo.get(key), serde_json::from_str::<serde_json::Value>(&json))
+    else {
+        return json;
+    };
+    let Ok(serde_json::Value::Object(mut merged)) =
+        serde_json::from_str::<serde_json::Value>(&stored)
+    else {
+        return json;
+    };
+    if merged.keys().all(|k| fresh.contains_key(k)) {
+        return json;
+    }
+    merged.extend(fresh);
+    serde_json::to_string(&merged).unwrap_or(json)
 }
 
 /// Load one transcript blob by session id. `None` when absent or corrupt — a
@@ -269,6 +318,105 @@ mod tests {
         SettingsRepo::new(open_memory().expect("in-memory db"))
     }
 
+    /// An empty transcript for `session_id`, for a test that cares about one
+    /// field rather than the whole blob.
+    fn fresh(session_id: &str) -> PersistedChatTranscript {
+        PersistedChatTranscript {
+            session_id: session_id.into(),
+            model: None,
+            entries: Vec::new(),
+            slash_commands: Vec::new(),
+            session_meta: Default::default(),
+            thinking_level: Default::default(),
+            provider: Default::default(),
+            acp_command: None,
+            acp_args: Vec::new(),
+            adapter_id: None,
+            launch_profile: None,
+            codex_posture: None,
+            pi_posture: None,
+            omp_posture: None,
+            claude_fast_mode: None,
+            choices: Default::default(),
+            pending_retry: None,
+            last_failure: None,
+            mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
+        }
+    }
+
+    /// A chat that ended in a failure comes back in it.
+    ///
+    /// The fold keeps no durable trace of one, so a blob that dropped this
+    /// brought the chat back reading *idle* — the one state that invites
+    /// someone to carry on as though nothing had happened. An older blob
+    /// without the field still loads, with no failure.
+    #[test]
+    fn the_last_failure_survives_the_blob_and_older_blobs_still_load() {
+        let repo = repo();
+        let mut t = fresh("sid-failed");
+        t.last_failure = Some("agent process exited (code 137)".into());
+        save_chat_transcript(&repo, &t);
+        assert_eq!(
+            load_chat_transcript(&repo, "sid-failed").and_then(|t| t.last_failure).as_deref(),
+            Some("agent process exited (code 137)"),
+        );
+
+        // A blob written before the field: loadable, and nothing invented.
+        repo.set(
+            &chat_settings_key("sid-old"),
+            &serde_json::json!({ "session_id": "sid-old", "entries": [] }).to_string(),
+        )
+        .unwrap();
+        let old = load_chat_transcript(&repo, "sid-old").expect("an older blob still loads");
+        assert_eq!(old.last_failure, None);
+    }
+
+    /// A save here does not erase what the other host wrote.
+    ///
+    /// Both hosts write this one blob and a save is a rewrite of it, so a
+    /// session the headless host had been holding used to lose that host's own
+    /// fields the moment the desktop saved it — its held queue among them.
+    /// Only *unknown* keys survive: everything this build models is written on
+    /// every save, so the fresh value still wins.
+    #[test]
+    fn a_save_keeps_the_fields_this_build_does_not_model() {
+        let repo = repo();
+        let key = chat_settings_key("sid-shared");
+        // As the headless host leaves it: its own `queued`, and a model this
+        // build is about to change.
+        repo.set(
+            &key,
+            &serde_json::json!({
+                "session_id": "sid-shared",
+                "entries": [],
+                "model": "stale-model",
+                "queued": [{ "text": "held for the user", "source": "remote" }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut t = fresh("sid-shared");
+        t.model = Some("fresh-model".into());
+        save_chat_transcript(&repo, &t);
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&repo.get(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            raw["queued"][0]["text"], "held for the user",
+            "the other host's field survived a save from this one: {raw}",
+        );
+        assert_eq!(raw["model"], "fresh-model", "and a field this build owns is still authoritative");
+        assert!(
+            load_chat_transcript(&repo, "sid-shared").is_some(),
+            "and the merged blob is still loadable here",
+        );
+    }
+
     /// The fast-mode pick survives the blob, and an older blob without the
     /// field loads as "never touched".
     #[test]
@@ -297,6 +445,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "sid-fast").expect("saved blob loads");
@@ -334,6 +483,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "pi-sess").expect("blob loads");
@@ -374,6 +524,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "omp-sess").expect("blob loads");
@@ -452,6 +603,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         }
     }
 
@@ -506,6 +658,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
@@ -549,6 +702,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "acp-sess").unwrap();

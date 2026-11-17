@@ -65,6 +65,9 @@ pub struct RestoredTurn {
     pub unanswered_send: Option<String>,
     /// Restored sends still held and marked at save time.
     pub unconfirmed_held: Vec<crate::persisted_chat::UnconfirmedSend>,
+    /// The failure this chat last ended in, so one whose provider died comes
+    /// back saying so rather than idle.
+    pub last_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -251,6 +254,11 @@ impl AgentChatView {
             // The armed retry, so a turn held for a five-hour window resumes
             // at its reset even across a quit. `None` whenever nothing is armed.
             pending_retry: self.retry.persisted(),
+            // By the shared rule, not a local reading of it: the health
+            // answers `last_turn_failure` from the tracker with the fold's
+            // fuller text preferred, and persisting anything else would have a
+            // restored chat report a different sentence than the live one did.
+            last_failure: oximux_agents::health_track::failure_to_persist(&self.thread, &self.health),
             mid_turn: self.mid_turn(),
             stopped_tasks: self.running_task_descriptions(),
             recovery_note: self.recovery_note.clone(),

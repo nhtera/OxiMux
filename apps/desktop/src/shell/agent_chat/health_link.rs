@@ -75,7 +75,16 @@ impl AgentChatView {
                         {
                             view.health.exit = Some(ExitProof::ExitCode(code));
                             if view.thread.last_error.as_deref() == Some(exit_message(None).as_str()) {
-                                view.thread.last_error = Some(exit_message(Some(code)));
+                                // Both halves, and the blob marked stale: this
+                                // is the reason a restart will read, and it
+                                // arrived after the save that recorded the
+                                // codeless one.
+                                oximux_agents::health_track::record_failure(
+                                    &mut view.thread,
+                                    &mut view.health,
+                                    exit_message(Some(code)),
+                                );
+                                view.meta_dirty.set(true);
                             }
                             cx.notify();
                         }
@@ -93,6 +102,7 @@ impl AgentChatView {
     /// message (kept if an earlier restore's note is still unsent).
     pub fn restore_health(&mut self, turn: super::RestoredTurn, cx: &mut Context<Self>) {
         let mid_turn = turn.mid_turn;
+        let restored_failure = turn.last_failure.clone();
         // The send nothing answered before the quit may or may not have reached
         // the agent: offer it back, held and marked, never resend it unasked.
         let last_user = self.thread.entries.iter().rev().find_map(|e| match e {
@@ -139,6 +149,17 @@ impl AgentChatView {
         self.health = HealthTrack::restored(mid_turn, prior_host_gone);
         self.unconfirmed_held = unconfirmed;
         (self.health.held, self.health.queued) = (held, queued);
+        // A chat that ended in a failure comes back in it, in both halves the
+        // one call sets: the tracker decides the health and the fold holds the
+        // text the health reports, so a restore that set only one would read
+        // failed with no reason or carry a reason nothing reads.
+        //
+        // Here and not at the top of this function, because the line above
+        // replaces the tracker wholesale — the same reason the counts are
+        // re-applied rather than set earlier.
+        if let Some(failure) = restored_failure {
+            oximux_agents::health_track::record_failure(&mut self.thread, &mut self.health, failure);
+        }
         // A dormant chat is not bound to the host yet, so this is where its
         // restored state can be seen.
         let h = health::compute(&self.health_inputs(), now_ms(), &health::HealthConfig::default());
@@ -403,6 +424,99 @@ mod tests {
                 assert_ne!(status, HealthStatus::Failed);
                 view.health.note_event(&ThreadEvent::ProviderTurnStarted, now_ms());
                 assert_eq!(health_of(view).1, Liveness::Live);
+            })
+            .expect("window update");
+    }
+
+    /// A chat whose provider died comes back **in** that failure, not idle.
+    ///
+    /// Two halves have to arrive together: the tracker decides the health and
+    /// the fold holds the text the health reports, so a restore that set only
+    /// one would read failed with no reason or carry a reason nothing reads.
+    /// Idle is the state that matters here — it invites someone to carry on as
+    /// though nothing had happened.
+    #[gpui::test]
+    async fn a_restored_chat_that_died_failing_comes_back_failed(cx: &mut TestAppContext) {
+        let window = chat(cx, StubConnection::default());
+        window
+            .update(cx, |view, _window, cx| {
+                view.restore_health(
+                    crate::shell::agent_chat::RestoredTurn {
+                        last_failure: Some("agent process exited (code 137)".into()),
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                let (status, _, reason) = health_of(view);
+                assert_eq!(status, HealthStatus::Failed, "a chat that died failing is not idle");
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("agent process exited (code 137)"),
+                    "and it still says why",
+                );
+            })
+            .expect("window update");
+    }
+
+    /// What a dying process leaves for the *next* run to read.
+    ///
+    /// The health frame a death publishes is live only; the blob is what
+    /// outlives the process. `failure_to_persist` reads the tracker, so the
+    /// disconnect has to set that half too — without it the blob carried
+    /// nothing and the chat came back idle.
+    #[gpui::test]
+    async fn a_dead_process_leaves_its_reason_for_the_next_run(cx: &mut TestAppContext) {
+        let stub = StubConnection::default();
+        stub.set_exit_code(Some(137));
+        let window = chat(cx, stub);
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("go");
+                view.on_disconnect(cx);
+                assert_eq!(
+                    oximux_agents::health_track::failure_to_persist(&view.thread, &view.health)
+                        .as_deref(),
+                    Some("Agent process exited (code 137)."),
+                    "the reason a restart would read, by the rule both hosts persist with",
+                );
+            })
+            .expect("window update");
+    }
+
+    /// A death reaches the **save path** of a chat that was already saved.
+    ///
+    /// Recording the failure moves neither the thread's revision nor any field
+    /// the save watches, so without marking the blob stale an already-clean
+    /// chat skipped its body at the next save and the death never reached
+    /// disk — the fix would have been inert in the app while every unit test
+    /// around it passed. Hence the commit before the disconnect: a dirty chat
+    /// would have saved anyway and proved nothing.
+    #[gpui::test]
+    async fn a_death_marks_an_already_saved_chats_blob_stale(cx: &mut TestAppContext) {
+        let stub = StubConnection::default();
+        stub.set_exit_code(Some(137));
+        let window = chat(cx, stub);
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.session_id = Some("sess-dirty".into());
+                view.thread.push_user_message("go");
+                // Saved and clean, as an idle chat on disk is.
+                let (sid, _) = view.transcript_snapshot_for_save().expect("a body to save");
+                view.commit_transcript_save(&[sid]);
+                assert!(
+                    view.transcript_snapshot_for_save().is_some_and(|(_, body)| body.is_none()),
+                    "the fixture has to start clean or this proves nothing",
+                );
+
+                view.on_disconnect(cx);
+
+                let (_, body) = view.transcript_snapshot_for_save().expect("still persistable");
+                let body = body.expect("a death makes the blob stale");
+                assert_eq!(
+                    body.last_failure.as_deref(),
+                    Some("Agent process exited (code 137)."),
+                    "and the body carries the reason a restart will read",
+                );
             })
             .expect("window update");
     }

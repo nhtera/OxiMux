@@ -443,6 +443,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices,
+            last_failure: None,
         }
     }
 
