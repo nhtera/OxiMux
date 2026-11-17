@@ -75,7 +75,16 @@ impl AgentChatView {
                         {
                             view.health.exit = Some(ExitProof::ExitCode(code));
                             if view.thread.last_error.as_deref() == Some(exit_message(None).as_str()) {
-                                view.thread.last_error = Some(exit_message(Some(code)));
+                                // Both halves, and the blob marked stale: this
+                                // is the reason a restart will read, and it
+                                // arrived after the save that recorded the
+                                // codeless one.
+                                oximux_agents::health_track::record_failure(
+                                    &mut view.thread,
+                                    &mut view.health,
+                                    exit_message(Some(code)),
+                                );
+                                view.meta_dirty.set(true);
                             }
                             cx.notify();
                         }
@@ -469,6 +478,44 @@ mod tests {
                         .as_deref(),
                     Some("Agent process exited (code 137)."),
                     "the reason a restart would read, by the rule both hosts persist with",
+                );
+            })
+            .expect("window update");
+    }
+
+    /// A death reaches the **save path** of a chat that was already saved.
+    ///
+    /// Recording the failure moves neither the thread's revision nor any field
+    /// the save watches, so without marking the blob stale an already-clean
+    /// chat skipped its body at the next save and the death never reached
+    /// disk — the fix would have been inert in the app while every unit test
+    /// around it passed. Hence the commit before the disconnect: a dirty chat
+    /// would have saved anyway and proved nothing.
+    #[gpui::test]
+    async fn a_death_marks_an_already_saved_chats_blob_stale(cx: &mut TestAppContext) {
+        let stub = StubConnection::default();
+        stub.set_exit_code(Some(137));
+        let window = chat(cx, stub);
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.session_id = Some("sess-dirty".into());
+                view.thread.push_user_message("go");
+                // Saved and clean, as an idle chat on disk is.
+                let (sid, _) = view.transcript_snapshot_for_save().expect("a body to save");
+                view.commit_transcript_save(&[sid]);
+                assert!(
+                    view.transcript_snapshot_for_save().is_some_and(|(_, body)| body.is_none()),
+                    "the fixture has to start clean or this proves nothing",
+                );
+
+                view.on_disconnect(cx);
+
+                let (_, body) = view.transcript_snapshot_for_save().expect("still persistable");
+                let body = body.expect("a death makes the blob stale");
+                assert_eq!(
+                    body.last_failure.as_deref(),
+                    Some("Agent process exited (code 137)."),
+                    "and the body carries the reason a restart will read",
                 );
             })
             .expect("window update");

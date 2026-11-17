@@ -79,6 +79,12 @@ impl AgentChatView {
         // either way.
         let failure = self.thread.last_error.clone().unwrap_or_else(|| self.exit_error());
         oximux_agents::health_track::record_failure(&mut self.thread, &mut self.health, failure);
+        // And the blob is now out of date. Neither half of the line above
+        // moves `ChatThread::revision()`, so without this an already-saved
+        // chat skipped its blob at the next save and the death reached disk
+        // only if something else happened to dirty it — which is the whole
+        // thing this change exists to stop.
+        self.meta_dirty.set(true);
         self.sync_composer(cx);
         cx.notify();
     }

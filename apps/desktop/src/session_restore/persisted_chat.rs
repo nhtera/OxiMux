@@ -270,7 +270,7 @@ pub fn save_chat_transcript(repo: &SettingsRepo, transcript: &PersistedChatTrans
 /// Only *unknown* keys survive. Every field this build models is written on
 /// every save, so the fresh value always wins — a note just consumed stays
 /// consumed.
-fn merged_over_stored(repo: &SettingsRepo, key: &str, json: String) -> String {
+pub(crate) fn merged_over_stored(repo: &SettingsRepo, key: &str, json: String) -> String {
     let (Ok(Some(stored)), Ok(serde_json::Value::Object(fresh))) =
         (repo.get(key), serde_json::from_str::<serde_json::Value>(&json))
     else {

@@ -1605,6 +1605,14 @@ pub(crate) fn save_persisted_tabs(
         let chat_key = crate::persisted_chat::chat_settings_key(&transcript.session_id);
         match serde_json::to_string(transcript) {
             Ok(t_json) => {
+                // Through the merge, because this is the writer the app
+                // actually uses: both hosts write this blob and a save here is
+                // a rewrite of it, so a field only the headless host models
+                // (its held queue) would be dropped the moment a chat changed.
+                // The read it costs lands only on chats being rewritten — a
+                // clean one's body never reaches this loop.
+                let t_json =
+                    crate::persisted_chat::merged_over_stored(repo, &chat_key, t_json);
                 if set_deduped(repo, chat_key, &t_json) {
                     synced.push(transcript.session_id.clone());
                 }
@@ -2131,6 +2139,86 @@ mod tests {
             load_persisted_tabs(&repo, "proj", "main"),
             LoadedTabs::Absent
         ));
+    }
+
+    /// The writer the app actually uses keeps the other host's fields.
+    ///
+    /// Both hosts write this one blob and a save here is a **rewrite** of it,
+    /// so a session the headless host had been holding lost that host's own
+    /// fields — its held queue among them — the moment a chat changed and the
+    /// desktop saved. Asserted through `save_persisted_tabs` rather than
+    /// through `save_chat_transcript`, because the latter is only reached by
+    /// tests: the first version of this fix merged in the wrong writer and
+    /// changed nothing in the app.
+    #[test]
+    fn the_real_save_path_keeps_the_fields_this_build_does_not_model() {
+        use crate::persisted_chat::chat_settings_key;
+
+        let repo = SettingsRepo::new(oximux_storage::open_memory().expect("db"));
+        let sid = "sess-shared-save";
+        let key = chat_settings_key(sid);
+        // As the headless host leaves it: its own `queued`, plus a model this
+        // save is about to change.
+        repo.set(
+            &key,
+            &serde_json::json!({
+                "session_id": sid,
+                "entries": [],
+                "model": "stale-model",
+                "queued": [{ "text": "held for the user", "source": "remote" }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut transcript = crate::persisted_chat::PersistedChatTranscript {
+            session_id: sid.into(),
+            model: Some("fresh-model".into()),
+            entries: Vec::new(),
+            slash_commands: Vec::new(),
+            session_meta: Default::default(),
+            thinking_level: Default::default(),
+            provider: Default::default(),
+            acp_command: None,
+            acp_args: Vec::new(),
+            adapter_id: None,
+            launch_profile: None,
+            codex_posture: None,
+            pi_posture: None,
+            omp_posture: None,
+            claude_fast_mode: None,
+            choices: Default::default(),
+            pending_retry: None,
+            last_failure: Some("agent process exited (code 137)".into()),
+            mid_turn: false,
+            stopped_tasks: Vec::new(),
+            recovery_note: None,
+            unanswered_send: None,
+            unconfirmed_held: Vec::new(),
+        };
+        transcript.entries.push(oximux_agents::thread::ThreadEntry::User {
+            text: "go".into(),
+            images: Vec::new(),
+            checkpoint: None,
+        });
+        let snap = PersistedTabs {
+            chat_transcripts: vec![transcript],
+            ..PersistedTabs::default()
+        };
+
+        save_persisted_tabs(&repo, "proj-shared-save", "main", &snap);
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&repo.get(&key).unwrap().expect("blob")).unwrap();
+        assert_eq!(
+            raw["queued"][0]["text"], "held for the user",
+            "the other host's field survived a save from this one: {raw}",
+        );
+        assert_eq!(raw["model"], "fresh-model", "and a field this build owns is authoritative");
+        assert_eq!(
+            raw["last_failure"], "agent process exited (code 137)",
+            "as is the failure this save carried",
+        );
     }
 
     #[test]
