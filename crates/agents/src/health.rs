@@ -203,6 +203,16 @@ pub struct SessionHealth {
     pub last_activity_at: i64,
     pub pending_unanswered_send: bool,
     pub held_restored: u32,
+    /// A restart cut a turn short and the agent has not been told yet: the
+    /// next message carries the note.
+    ///
+    /// On the output as well as the input because a client has to be able to
+    /// *see* it. The host already acts on it — a child whose turn a restart
+    /// cut short is given a recovery turn — but nothing said so to a phone or
+    /// a terminal, so a person's next message silently grew a paragraph they
+    /// had not written. A fact rather than prose: a client says it in its own
+    /// words, and the note's own text is in the transcript once it goes.
+    pub recovery_note_owed: bool,
     pub turn_id: Option<String>,
     pub exit_seq: Option<String>,
 }
@@ -229,6 +239,7 @@ pub fn compute(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> SessionHealth 
         last_activity_at: i.last_activity_at,
         pending_unanswered_send: i.pending_unanswered_send,
         held_restored: i.held_restored,
+        recovery_note_owed: i.recovery_note_owed,
         turn_id: i.turn_id.clone(),
         exit_seq: i.exit_seq.clone(),
     }

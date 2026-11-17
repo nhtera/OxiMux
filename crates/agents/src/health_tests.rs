@@ -98,6 +98,22 @@ fn a_restored_row_reads_restored_unconfirmed() {
 /// after a relaunch — the one state that invites carrying on as though
 /// nothing had happened. A *dormant* row with the same failure has always
 /// read Failed; this is the restored case agreeing with it.
+/// An owed recovery note reaches the health a client reads.
+///
+/// The host has always acted on it — a child whose turn a restart cut short
+/// gets a recovery turn — but it was an input only, so nothing could tell a
+/// person that their next message would carry a paragraph they had not
+/// written. It rides whatever else the session is: a note is owed by a
+/// session that is also idle, working or failed.
+#[test]
+fn an_owed_recovery_note_is_reported_whatever_else_the_session_is() {
+    for base in [live(), HealthInputs { turn_active: true, ..live() }] {
+        let h = health(&HealthInputs { recovery_note_owed: true, ..base.clone() });
+        assert!(h.recovery_note_owed, "status was {:?}", h.status);
+    }
+    assert!(!health(&live()).recovery_note_owed, "and it is not invented");
+}
+
 #[test]
 fn a_restored_row_that_died_failing_reads_failed_with_its_reason() {
     let h = health(&HealthInputs {

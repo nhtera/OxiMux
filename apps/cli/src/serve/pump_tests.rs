@@ -1121,6 +1121,14 @@ async fn a_restart_mid_turn_owes_a_note_the_next_message_carries() {
         "the restored session says it owes the agent a note: {:?}",
         handle.health(),
     );
+    // And the health a client reads says it, not just the input the host acts
+    // on. Without this the next message silently grew a paragraph nobody
+    // typed, and no surface could warn about it.
+    assert!(
+        handle.health_snapshot().health.recovery_note_owed,
+        "the published health carries it: {:?}",
+        handle.health_snapshot().health,
+    );
     assert!(conn.sent().is_empty(), "and the note is not a turn of its own");
 
     // A second restart before anything is sent keeps the *same* note: the

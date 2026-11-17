@@ -131,6 +131,7 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
             "last_activity_at": wire.last_activity_at,
             "pending_unanswered_send": wire.pending_unanswered_send,
             "held_restored": wire.held_restored,
+            "recovery_note_owed": wire.recovery_note_owed,
             "turn_id": wire.turn_id,
             "exit_seq": wire.exit_seq,
         },
@@ -138,6 +139,11 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
     let mut human = format!("{session}: {} ({})", wire.status, wire.liveness);
     if let Some(reason) = &wire.reason {
         human.push_str(&format!("\n{reason}"));
+    }
+    if wire.recovery_note_owed {
+        human.push_str(
+            "\nthe next message will carry a note telling the agent a restart cut its turn short",
+        );
     }
     if wire.held_restored > 0 {
         human.push_str(&format!(
@@ -343,6 +349,27 @@ mod tests {
         assert!(human.contains("limited"), "{human}");
         assert!(human.contains("rate limited until 09:01"), "the reason is for a person: {human}");
         assert!(human.contains("held from before a restart"), "a held queue is actionable: {human}");
+    }
+
+    /// An owed recovery note is told to whoever is about to send a message.
+    ///
+    /// Their next message will carry a paragraph they did not write — the
+    /// host has always known, and until now said so to nobody.
+    #[tokio::test]
+    async fn an_owed_recovery_note_is_reported_before_the_next_message() {
+        let host = ScriptedHost::live_with(SessionHealthWire {
+            status: "idle".into(),
+            liveness: "live".into(),
+            recovery_note_owed: true,
+            ..SessionHealthWire::default()
+        });
+        let (data, human) = session(&client_over(host), "s-1").await.expect("status");
+
+        assert_eq!(data["health"]["recovery_note_owed"], true);
+        assert!(
+            human.contains("carry a note"),
+            "and a person is told what their next message will do: {human}",
+        );
     }
 
     /// A session the host publishes no verdict for answers promptly, and
