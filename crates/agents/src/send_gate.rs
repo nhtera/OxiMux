@@ -383,6 +383,35 @@ impl SendGate {
         (id, uuid)
     }
 
+    /// Lift the restart's hold on every message it is holding, and return how
+    /// many it lifted.
+    ///
+    /// The counterpart of [`SendGate::push_restored`]: the hold exists so the
+    /// person can look before their queue drains into an agent they have not
+    /// seen since, so lifting it is *their* act and nothing else's. Each line
+    /// becomes an ordinary queued send — it still waits on a running turn, a
+    /// Stop or a pending prompt, because releasing a hold is not a licence to
+    /// bypass the others.
+    ///
+    /// All of them, not one, because a client can only read how *many* are
+    /// held ([`SendGate::counts`], the health's `held_restored`): the queue's
+    /// ids never cross the wire, so there is no line for a caller to name.
+    ///
+    /// Wakes the owner if that makes something sendable; a release into a
+    /// busy gate wakes nobody, and the lines go with the turn's end like any
+    /// other queued send.
+    pub fn release_held(&mut self) -> u32 {
+        let mut released = 0;
+        for item in self.queue.iter_mut().filter(|q| q.held) {
+            item.held = false;
+            released += 1;
+        }
+        if released > 0 {
+            self.wake_if_ready();
+        }
+        released
+    }
+
     /// How many queued messages are held from before a restart, and how many
     /// are waiting to go out — the two counts a session's health reports.
     pub fn counts(&self) -> (u32, u32) {

@@ -34,7 +34,7 @@ use cli::{
 };
 use client::Client;
 use oximux_remote_proto::proto::{
-    CREATE_WORKTREE_BASE_MIN_VERSION, HOST_CONFIG_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SPAWN_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
+    CREATE_WORKTREE_BASE_MIN_VERSION, HOST_CONFIG_MIN_VERSION, RELEASE_HELD_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, SPAWN_MIN_VERSION, SIMULATOR_ANDROID_BUTTONS_MIN_VERSION, SIMULATOR_MIN_VERSION,
     SIMULATOR_DEVICE_STATE_MIN_VERSION, SIMULATOR_DIAG_MIN_VERSION, SIMULATOR_EXEC_MIN_VERSION, SIMULATOR_FLOW_MIN_VERSION, SIMULATOR_RN_MIN_VERSION, SIMULATOR_VERIFY_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION,
 };
 use output::render;
@@ -375,6 +375,12 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         // message about a malformed request, for a version problem. This
         // refusal is the fallback.
         Command::Config { .. } => Some((HOST_CONFIG_MIN_VERSION, "config")),
+        // v40: letting a held queue go. For the reason `config` refuses as a
+        // family — a pre-v40 host cannot decode `ReleaseHeld` and there is no
+        // older verb that releases a held line, so this refusal is the
+        // fallback. Without it the caller gets "undecodable request frame": a
+        // complaint about the frame for a version problem.
+        Command::Release { .. } => Some((RELEASE_HELD_MIN_VERSION, "release")),
         Command::Worktree { .. } => Some((16, "worktree")),
         Command::Transcript { .. } => Some((16, "transcript")),
         Command::PairNew { .. } | Command::PairLs | Command::PairRm { .. } => {
@@ -617,6 +623,9 @@ fn host_verb(mut args: Cli) -> u8 {
                     commands::transcript::run(&client, &session).await
                 }
                 Command::Stop { session } => commands::session_ctl::stop(&client, &session).await,
+                Command::Release { session } => {
+                    commands::session_ctl::release(&client, &session).await
+                }
                 Command::Steer { session, text } => {
                     commands::session_ctl::steer(&client, &session, &text).await
                 }
@@ -1025,6 +1034,28 @@ mod tests {
         precheck(&mut command, false).expect("ok");
         let Command::Send { prompt, .. } = &command else { panic!("send") };
         assert_eq!(prompt, "do the thing");
+    }
+
+    /// `release` asks for v40, and the verbs beside it do not.
+    ///
+    /// The gate is the whole fallback for this one: a pre-v40 host cannot
+    /// decode `ReleaseHeld` and has no older verb that lets a held line go, so
+    /// without the arm the caller is told "undecodable request frame" — a
+    /// complaint about the frame for what is really a version problem.
+    /// Nothing else would catch its loss: the rest of `required_version` is
+    /// unaffected, and the skew suite skips itself unless `OXIMUX_SKEW_CLI`
+    /// is set.
+    #[test]
+    fn only_release_asks_for_the_version_that_can_let_a_hold_go() {
+        let v = |args: &[&str]| required_version(&command_of(args)).map(|(v, _)| v);
+
+        assert_eq!(v(&["oximux", "release", "s1"]), Some(RELEASE_HELD_MIN_VERSION));
+        // The session controls beside it are old verbs and must stay ungated:
+        // refusing them against an older host would strand callers over a
+        // feature they never asked for.
+        assert!(v(&["oximux", "stop", "s1"]).is_none());
+        assert!(v(&["oximux", "steer", "s1", "focus"]).is_none());
+        assert!(v(&["oximux", "status", "s1"]).is_none());
     }
 
     /// `team` is split the same way: only a run that actually names a per-role

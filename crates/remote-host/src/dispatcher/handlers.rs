@@ -634,6 +634,31 @@ impl Dispatcher {
     /// Every caller of this is state-changing (prompt/steer/cancel), so the gate is
     /// `may_write` — a read-only device is refused here even though it may read the
     /// same session.
+    /// Lift the hold a restart put on a session's restored queue.
+    ///
+    /// Not [`Dispatcher::scoped`], which answers `Ack`: the caller is told how
+    /// many lines went, because that is the one thing it cannot work out for
+    /// itself — the queue's ids never cross the wire, so it can read a count
+    /// and not a line, and a bare acknowledgment would leave "did anything
+    /// happen?" unanswered.
+    ///
+    /// The write tier, like a send, since this is what sends those lines. A
+    /// session the host does not have is `UnknownSession` — the catalog is
+    /// given its chance to open a dormant one before this runs (see
+    /// `session_to_build`), so reaching here with nothing means there is
+    /// nothing to release.
+    pub(super) fn release_held(&self, peer: &Peer, session_id: &str) -> Response {
+        if !self.may_drive_session(peer, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        let released = handle.release_held();
+        tracing::info!(session = %session_id, released, "released a restart's held queue");
+        Response::Released { released }
+    }
+
     pub(super) fn scoped<F>(&self, peer: &Peer, session_id: &str, f: F) -> Response
     where
         F: FnOnce(&SessionHandle) -> anyhow::Result<()>,

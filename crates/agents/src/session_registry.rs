@@ -538,6 +538,18 @@ impl SessionHandle {
         self.gate.lock().unwrap().clone()
     }
 
+    /// Let a restart's held queue go, and say how many lines it let go.
+    ///
+    /// `0` for a session whose driver has attached no gate: nothing is held
+    /// because nothing can be, which is the same answer as a session with an
+    /// empty hold and the truthful one either way.
+    pub fn release_held(&self) -> u32 {
+        match self.gate() {
+            Some(gate) => gate.lock().unwrap().release_held(),
+            None => 0,
+        }
+    }
+
     /// Receipts for the host's sends to this session, from now on.
     pub fn subscribe_receipts(&self) -> broadcast::Receiver<ThreadEvent> {
         self.receipts.subscribe()

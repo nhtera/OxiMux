@@ -92,6 +92,7 @@ pub fn slot(command: &mut Command) -> Option<(Kind, &mut String)> {
         | Command::Wait { session: s, .. }
         | Command::Transcript { session: s }
         | Command::Stop { session: s }
+        | Command::Release { session: s }
         | Command::Steer { session: s, .. } => session(s),
         Command::Permit { command } => match command {
             PermitCommand::Ls { session: s }
@@ -273,6 +274,7 @@ mod tests {
         &["transcript", "a1b2"],
         &["stop", "a1b2"],
         &["steer", "a1b2", "hi"],
+        &["release", "a1b2"],
         &["permit", "ls", "a1b2"],
         &["permit", "allow", "a1b2", "r1"],
         &["permit", "deny", "a1b2", "r1"],

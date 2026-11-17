@@ -251,6 +251,26 @@ pub enum Command {
         /// The session id, or a unique prefix of it (see `oximux ls`).
         session: String,
     },
+    /// Let a session's held queue go: send the messages a host restart put on
+    /// hold.
+    ///
+    /// When a host stops with messages still queued, the next one brings them
+    /// back HELD rather than sending them — so a queue you left behind does
+    /// not drain into an agent you have not looked at since. `oximux status
+    /// <session>` reports how many are held; this is what sends them.
+    ///
+    /// Released lines are ordinary queued sends again: they still wait for a
+    /// running turn to end, for a pending permission to be answered, and for
+    /// a Stop to be lifted. Prints how many went; nothing held is 0 and a
+    /// success.
+    ///
+    /// Serve's hold is the one this lifts. The desktop holds its restored
+    /// messages in the composer, where they are released by its own Send.
+    #[command(verbatim_doc_comment)]
+    Release {
+        /// The session id, or a unique prefix of it (see `oximux ls`).
+        session: String,
+    },
     /// Interrupt a session's in-flight turn. The session stays open.
     Stop {
         /// The session id, or a unique prefix of it (see `oximux ls`).

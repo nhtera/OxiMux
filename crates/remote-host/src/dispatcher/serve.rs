@@ -53,7 +53,13 @@ fn session_to_build(req: &Request) -> Option<&str> {
         | Request::GitCommit { session_id, .. }
         | Request::ListForgeItems { session_id, .. }
         | Request::GetForgeItemDetail { session_id, .. }
-        | Request::ListForgeChecks { session_id } => Some(session_id),
+        | Request::ListForgeChecks { session_id }
+        // Releasing a hold is the one read-like-sounding verb that must open:
+        // the lines it releases are in the persisted queue of a session that
+        // is not running, and the gate they go back into does not exist until
+        // the catalog opens it. Opened here, before the handler, so the hold
+        // it lifts is the one the restart put on a restored queue.
+        | Request::ReleaseHeld { session_id } => Some(session_id),
         Request::SendPrompt(r) => Some(&r.session_id),
         Request::SendV2(r) => Some(&r.session_id),
         Request::ResolvePermission(r) => Some(&r.session_id),

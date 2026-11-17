@@ -215,12 +215,19 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// what it enforces. A v38 host cannot decode the requests and has no older
 /// equivalent to fall back to: see [`HOST_CONFIG_MIN_VERSION`].
 ///
+/// v40: **letting a held queue go** ([`Request::ReleaseHeld`] and its
+/// [`Response::Released`] reply): a restart holds the queue it restored so the
+/// person can look first, and until now a client could read how many lines
+/// were held and had no way to send them. A v39 host cannot decode the request
+/// and has no older equivalent to fall back to: see
+/// [`RELEASE_HELD_MIN_VERSION`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -254,6 +261,15 @@ pub const PROMPTS_RETIRED_MIN_VERSION: u32 = 38;
 /// this gate produces is the whole story the caller gets, and it is the one
 /// worth getting.
 pub const HOST_CONFIG_MIN_VERSION: u32 = 39;
+
+/// The oldest host that takes [`Request::ReleaseHeld`].
+///
+/// Read by the **client**, like [`HOST_CONFIG_MIN_VERSION`] and for the same
+/// reason: an earlier host cannot decode the request and there is no older
+/// verb that lets a held line go, so the client's gate refuses rather than
+/// letting postcard answer "undecodable request frame" — a complaint about the
+/// frame for what is really a version problem.
+pub const RELEASE_HELD_MIN_VERSION: u32 = 40;
 
 /// The oldest peer that can decode [`Response::StateChanged`]. Like
 /// [`SCHEDULE_PUSH_MIN_VERSION`], this exists because a push reaches a peer
@@ -1067,6 +1083,22 @@ pub enum Request {
     /// read them and not widen them, for the reason
     /// [`Request::PairNew`] is local-only.
     HostConfigWrite { key: String, value: String },
+
+    // ---- v40: letting a held queue go ----
+    /// Lift the hold a restart put on this session's restored queue: every
+    /// held line becomes an ordinary queued send. Replies
+    /// [`Response::Released`] with how many lines were let go — `0` when
+    /// nothing was held, which is a success and not an error.
+    ///
+    /// Needs the write tier, like [`Request::SendPrompt`]: these are lines
+    /// that will reach the agent, and the hold is what a person lifts after
+    /// looking. A dormant session is opened first, so its persisted queue is
+    /// back in the gate before the hold is lifted.
+    ///
+    /// Serve's hold is the one this reaches. The desktop keeps its restored
+    /// messages as composer cards rather than in the gate, so there is
+    /// nothing held for this to lift there; see `SendGate::push_restored`.
+    ReleaseHeld { session_id: String },
 }
 
 /// Host → client.
@@ -1331,6 +1363,12 @@ pub enum Response {
     /// the settings asked about, as this host now enforces them. One entry for
     /// a named key, every entry for a whole read.
     HostConfig(Vec<crate::host_config::HostConfigEntryWire>),
+
+    // ---- v40: letting a held queue go ----
+    /// Reply to [`Request::ReleaseHeld`]: how many held lines were let go.
+    /// `0` is the answer for a session holding nothing, and for one whose
+    /// driver keeps its restored messages somewhere other than the gate.
+    Released { released: u32 },
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

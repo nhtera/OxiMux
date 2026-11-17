@@ -1,6 +1,7 @@
-//! `oximux stop` / `oximux steer` — the two one-shot session controls. Stop
-//! interrupts the in-flight turn (the session stays open); steer injects
-//! guidance into a running turn on backends that support it.
+//! `oximux stop` / `oximux steer` / `oximux release` — the one-shot session
+//! controls. Stop interrupts the in-flight turn (the session stays open);
+//! steer injects guidance into a running turn on backends that support it;
+//! release lets go of the queue a host restart put on hold.
 
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
@@ -55,5 +56,28 @@ pub async fn steer(client: &Client, session: &str, text: &str) -> Result<(Value,
         )),
         Response::Error(e) => Err(steer_failure(e)),
         other => Err(unexpected_reply("Steer", &other)),
+    }
+}
+
+/// `oximux release` — let go of the queue a restart is holding.
+///
+/// Reports the count the host returns rather than inferring one: the caller
+/// can read how *many* lines a session holds (the health's `held_restored`)
+/// and never which, so the number that went is the host's to say. Zero is a
+/// success — "nothing was held" is an answer, not a failure — and the sentence
+/// says so plainly so a script's operator is not left wondering whether the
+/// verb worked.
+pub async fn release(client: &Client, session: &str) -> Result<(Value, String), Failure> {
+    match client.call(Request::ReleaseHeld { session_id: session.into() }).await? {
+        Response::Released { released } => Ok((
+            json!({ "session_id": session, "released": released }),
+            match released {
+                0 => format!("{session} was holding nothing — no messages to release"),
+                1 => format!("1 held message released to {session}"),
+                n => format!("{n} held messages released to {session}"),
+            },
+        )),
+        Response::Error(e) => Err(rpc_failure(e)),
+        other => Err(unexpected_reply("ReleaseHeld", &other)),
     }
 }
