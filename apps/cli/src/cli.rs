@@ -260,9 +260,10 @@ pub enum Command {
     /// <session>` reports how many are held; this is what sends them.
     ///
     /// Released lines are ordinary queued sends again: they still wait for a
-    /// running turn to end, for a pending permission to be answered, and for
-    /// a Stop to be lifted. Prints how many went; nothing held is 0 and a
-    /// success.
+    /// running turn to end and for a pending permission to be answered. A
+    /// Stop holds only what another agent sent — a person's or a phone's line
+    /// is what ends a Stop, so releasing one may start the next turn. Prints
+    /// how many went; nothing held is 0 and a success.
     ///
     /// Serve's hold is the one this lifts. The desktop holds its restored
     /// messages in the composer, where they are released by its own Send.

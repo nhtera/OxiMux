@@ -296,23 +296,25 @@ fn a_client_can_let_a_restored_hold_go_and_is_told_how_many_went() {
     });
     serve.kill_hard();
 
-    // Back up, and reopened by a message — the only thing that opens a
-    // session, so this send is the act of reopening rather than part of what
-    // is being measured.
+    // Back up — and nothing reopens the session first. `release` is the whole
+    // act here, which is the only way to test the half of it that opens a
+    // dormant session: a send beforehand would do that opening, and a
+    // regression dropping `ReleaseHeld` from serve's build list would pass
+    // unnoticed. The session is on disk and not running; its queue is in the
+    // blob and its gate does not exist yet.
     let shim_dir = dir.path().join("shim");
     let report = dir.path().join("report.txt");
     let serve =
         boot_serve(&data_dir, &shim_dir, &report, "parity-release", AgentBehaviour::stalling());
-    let out = cli(&data_dir)
-        .args(["send", &session, "and this one too", "--no-wait"])
-        .output()
-        .expect("send");
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    await_status(&data_dir, &session, "a held message", |d| {
-        d["health"]["held_restored"].as_u64().is_some_and(|n| n >= 1)
-    });
+    let out = cli(&data_dir).arg("ls").output().expect("ls");
+    let rows = json_of(&out);
+    assert!(
+        rows["data"].as_array().expect("rows").iter().any(|r| r["session_id"] == session.as_str()),
+        "the session is the host's to open and nothing has opened it: {rows}",
+    );
 
-    // The verb, as a scripted caller runs it.
+    // The verb, as a scripted caller runs it, against a session that is not
+    // running.
     let out = cli(&data_dir).args(["release", &session]).output().expect("release");
     assert_eq!(
         out.status.code(),
@@ -324,29 +326,44 @@ fn a_client_can_let_a_restored_hold_go_and_is_told_how_many_went() {
     let released = json_of(&out);
     assert_eq!(
         released["data"]["released"], 1,
-        "the one line the restart was holding, and not the message that reopened the session: {released}",
+        "the line the restart was holding — so the verb opened the session, restored its \
+         queue and lifted the hold, in that order: {released}",
     );
 
-    // The host now agrees: nothing is held any more.
-    let v = await_status(&data_dir, &session, "no held message", |d| {
-        d["health"]["held_restored"] == 0
+    // The host agrees, and the line went: nothing holds a fresh session, so
+    // the released message starts its turn and reaches the agent. This is the
+    // round trip the hold had no exit from before — the one thing a client
+    // could not do was get these lines delivered.
+    await_status(&data_dir, &session, "the released line delivered", |_| {
+        let persisted = blob(&data_dir, &session);
+        // `contains`, not equality: this restart owed a recovery note (it
+        // killed a turn that was waiting on a person), and the note rides
+        // out with the first message to go — which is this one.
+        let written = persisted["entries"].as_array().is_some_and(|es| {
+            es.iter().any(|e| {
+                e["User"]["text"].as_str().is_some_and(|t| t.contains("look at this later"))
+            })
+        });
+        let still_queued = persisted["queued"]
+            .as_array()
+            .is_some_and(|q| q.iter().any(|l| l["text"] == "look at this later"));
+        written && !still_queued
     });
+    let v = status(&data_dir, &session);
     assert_eq!(
-        v["data"]["health"]["status"], "needsPermission",
-        "and the session is where it was — releasing a hold is not answering a prompt: {v}",
+        v["data"]["health"]["held_restored"], 0,
+        "and nothing is held any more: {v}",
+    );
+    assert_eq!(
+        v["data"]["health"]["recovery_note_owed"], false,
+        "the note the restart owed rode out with the released line, so it is owed no longer: {v}",
     );
 
-    // Released, not sent, and not discarded. The agent is still holding its
-    // permission request, so the other holds still apply: the line stays in
-    // the queue, on disk, for this host to write when the prompt is answered
-    // or for the next host to carry. `queued` is not on the health frame —
-    // only `held_restored` is — so the blob is where a test can see it.
-    let persisted = blob(&data_dir, &session);
-    let queued = persisted["queued"].as_array().expect("a queue");
-    assert!(
-        queued.iter().any(|q| q["text"] == "look at this later"),
-        "lifting the restart's hold must not bypass the prompt's: {persisted}",
-    );
+    // That the other holds still apply to a released line is the gate's own
+    // claim and is tested there (`a_released_line_still_waits_on_everything_else`):
+    // it cannot be shown here, because a session nothing has reopened has no
+    // turn and no prompt to hold it — which is exactly the state that makes
+    // the delivery above the honest end-to-end answer.
 
     // Releasing again has nothing to lift, and says so rather than failing —
     // what a retrying script depends on.

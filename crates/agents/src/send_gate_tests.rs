@@ -426,6 +426,27 @@ fn a_released_line_still_waits_on_everything_else() {
 }
 
 #[test]
+fn a_stop_holds_a_released_line_only_from_the_sender_it_holds() {
+    // The help and `release_held`'s doc both say which senders a Stop keeps
+    // waiting, and getting that backwards is the kind of promise a person
+    // acts on: told a Stop would hold them, they would release an old queue
+    // expecting to review it again. Among the senders a restart carries,
+    // `Agent` is the only one a Stop holds — a person's or a phone's message
+    // is what ends a Stop.
+    let mut gate = SendGate::new();
+    gate.push_restored("from a phone".into(), SendSource::Remote, None);
+    gate.push_restored("from another agent".into(), SendSource::Agent, None);
+    assert_eq!(gate.release_held(), 2);
+    gate.stop_by_user();
+
+    let waits: Vec<_> = gate.queued().map(|q| (q.text.as_str(), gate.wait_of(q))).collect();
+    assert_eq!(
+        waits,
+        vec![("from a phone", SendWait::None), ("from another agent", SendWait::StoppedByUser)],
+    );
+}
+
+#[test]
 fn the_counts_tell_held_from_waiting() {
     let mut gate = SendGate::new();
     gate.push_restored("before".into(), SendSource::Remote, None);

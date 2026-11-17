@@ -130,12 +130,22 @@ async fn an_empty_hold_answers_zero_rather_than_failing() {
     .await;
 }
 
-/// A session with no gate attached — nothing drives it, so nothing can be
-/// held — answers zero too, and not an internal fault. This is also the
-/// desktop's answer: it keeps its restored messages in the composer rather
-/// than the gate, so there is nothing here for this verb to lift.
+/// A session with no gate attached says it cannot answer yet — it does **not**
+/// report zero.
+///
+/// This is the window between `resume` registering the handle and the pump
+/// attaching the gate with the restored queue in it. A `0` there is a
+/// confident answer about a hold that is about to exist, and a caller
+/// believes it: it would read "nothing was held" and never ask again, while
+/// its messages came back held a moment later. "Not yet" is what a caller can
+/// act on, and it retries.
+///
+/// This is not the desktop's answer. The desktop attaches and detaches its
+/// gate with its registry binding, so a session it is running always has one
+/// and answers `Some(0)` — it simply keeps its restored messages in the
+/// composer, where there is nothing for this verb to lift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_session_with_no_gate_answers_zero() {
+async fn a_session_whose_queue_is_not_back_yet_says_so_rather_than_reporting_zero() {
     let registry = Arc::new(SessionRegistry::new());
     registry.register("sess-1".into(), Arc::new(StubConnection::default()));
     let auth = Arc::new(AuthStore::new());
@@ -144,9 +154,13 @@ async fn a_session_with_no_gate_answers_zero() {
         else {
             panic!("expected Registered");
         };
-        assert_eq!(
-            call(&client, Request::ReleaseHeld { session_id: "sess-1".into() }).await,
-            Response::Released { released: 0 },
+        let reply = call(&client, Request::ReleaseHeld { session_id: "sess-1".into() }).await;
+        let Response::Error(RpcError::BadRequest(why)) = &reply else {
+            panic!("expected a refusal that says to try again, got {reply:?}");
+        };
+        assert!(
+            why.contains("still opening") && why.contains("try again"),
+            "and the sentence has to tell the caller what to do: {why}",
         );
         drop(client);
     })

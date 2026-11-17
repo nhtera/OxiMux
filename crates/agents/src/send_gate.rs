@@ -389,9 +389,12 @@ impl SendGate {
     /// The counterpart of [`SendGate::push_restored`]: the hold exists so the
     /// person can look before their queue drains into an agent they have not
     /// seen since, so lifting it is *their* act and nothing else's. Each line
-    /// becomes an ordinary queued send — it still waits on a running turn, a
-    /// Stop or a pending prompt, because releasing a hold is not a licence to
-    /// bypass the others.
+    /// becomes an ordinary queued send, because releasing one hold is not a
+    /// licence to bypass the others: a running turn and a pending prompt
+    /// still hold it, and a Stop holds it if [`SendSource::held_by_stop`]
+    /// names its sender — which among the senders a restart carries is
+    /// [`SendSource::Agent`] alone. A person's or a phone's released line may
+    /// therefore start the next turn, which is what their messages do.
     ///
     /// All of them, not one, because a client can only read how *many* are
     /// held ([`SendGate::counts`], the health's `held_restored`): the queue's
