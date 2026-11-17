@@ -1225,3 +1225,167 @@ async fn a_session_answers_for_itself_once_its_pump_says_it_published() {
         handle.health(),
     );
 }
+
+/// A provider's death is still this session's state after a host restart.
+///
+/// The frame that says a process died is the only live word on the subject:
+/// it reaches whoever is subscribed at that instant, and then the registry
+/// entry goes. So without recording it, a host restart left a session that
+/// died reading *live* on its next message, with nothing anywhere to say what
+/// had happened — measured on a real serve on 2026-11-17, which is why this
+/// test exists.
+///
+/// Two halves, because the write and the read are in different places: the
+/// exit lands in the blob with its code, and the next host reads it back as
+/// the session's state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_providers_death_is_still_the_sessions_state_after_a_restart() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    // Killed, not asked to stop: `128 + SIGKILL`, the code a reader needs to
+    // tell "something killed it" from "it closed its stream".
+    conn.set_exit_code(Some(137));
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    // The agent's stream closing is the child exiting.
+    drop(tx);
+
+    assert!(
+        wait_until(5_000, || blob::load(&settings, "s-1")
+            .is_some_and(|b| b.last_failure.is_some())),
+        "the exit has to reach the disk: it is the only place it can outlive the host",
+    );
+    let persisted = blob::load(&settings, "s-1").expect("a blob");
+    assert_eq!(
+        persisted.last_failure.as_deref(),
+        Some("agent process exited (code 137)"),
+        "with the code, not a bare 'the connection closed': {persisted:?}",
+    );
+    // Waited for, not assumed: `save_now` commits the blob and returns, and
+    // the unregister is a later statement — so the probe above can win the
+    // race and this would fail against a pump doing exactly the right thing.
+    assert!(
+        wait_until(5_000, || registry.get("s-1").is_none()),
+        "and the session went back to dormant",
+    );
+
+    // The next host, over the same blob. A fresh registration, as `resume`
+    // makes: the point is what it says before anything runs.
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("s-1".into(), conn);
+    let (_tx2, rx2) = std::sync::mpsc::channel();
+    let published = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx2,
+            buffered: Vec::new(),
+            seed: persisted,
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    published.await.expect("the pump publishes before it acks");
+    let health = handle.health_snapshot();
+    assert_eq!(
+        health.health.status,
+        oximux_agents::health::HealthStatus::Failed,
+        "a session whose provider died does not come back idle: {health:?}",
+    );
+    assert_eq!(
+        health.health.reason.as_deref(),
+        Some("agent process exited (code 137)"),
+        "and it still says why",
+    );
+}
+
+/// A turn that failed and a process that then exited leave **both** facts.
+///
+/// The exit is usually the failure's consequence — a provider reports "API
+/// error 529" and dies — so a record that kept only the exit would replace
+/// the explanation with its epitaph, and whoever reopened the session would
+/// read that the process is gone with no idea why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_turn_keeps_its_explanation_when_the_process_then_exits() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    conn.set_exit_code(Some(7));
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            events: rx,
+            buffered: Vec::new(),
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    tx.send(ThreadEvent::TurnEnded {
+        result: Some("API error 529: overloaded".into()),
+        usage: None,
+        is_error: true,
+        turn_diff: None,
+    })
+    .unwrap();
+    assert!(
+        wait_until(5_000, || blob::load(&settings, "s-1")
+            .is_some_and(|b| b.last_failure.is_some())),
+        "the failed turn is the session's state first",
+    );
+
+    // And then the process goes.
+    drop(tx);
+    assert!(
+        wait_until(5_000, || blob::load(&settings, "s-1")
+            .and_then(|b| b.last_failure)
+            .is_some_and(|f| f.contains("exited"))),
+        "the exit reaches the blob",
+    );
+    let failure = blob::load(&settings, "s-1").and_then(|b| b.last_failure).expect("a failure");
+    assert_eq!(
+        failure, "API error 529: overloaded — agent process exited (code 7)",
+        "the explanation, then how it ended — not one in place of the other",
+    );
+}

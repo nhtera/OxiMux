@@ -504,6 +504,16 @@ impl SessionHandle {
         self.conn_generation.load(Ordering::SeqCst)
     }
 
+    /// How the agent's process ended, from the connection this handle holds.
+    ///
+    /// `None` while it runs, and for a backend that cannot tell. Read *after*
+    /// the output closes: the stream ending and the process being reaped are
+    /// different moments, so a read at the first sign of death often has no
+    /// code yet.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.conn.lock().unwrap().exit_code()
+    }
+
     /// See the `incarnation` field.
     pub fn incarnation(&self) -> &str {
         &self.incarnation

@@ -1237,7 +1237,8 @@ fn enforce_single_instance() -> Option<oximux_app::single_instance::SingleInstan
     let lock_path = lock_path_in(&dir);
     match try_acquire(&lock_path) {
         Ok(AcquireOutcome::Acquired(guard)) => Some(guard),
-        Ok(AcquireOutcome::AlreadyRunning { holder_pid }) => {
+        Ok(AcquireOutcome::AlreadyRunning { holder }) => {
+            let holder_pid = holder.map(|h| h.pid);
             if let Some(pid) = holder_pid {
                 activate_existing_instance(pid);
             }

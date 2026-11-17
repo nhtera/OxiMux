@@ -175,11 +175,12 @@ pub fn install(
     };
     let lock = match oximux_single_instance::try_acquire(&dir.join(TICKER_LOCK_FILENAME)) {
         Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => guard,
-        Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+        Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder: record }) => {
             // One line, once — a repeating warning would train users to
             // ignore it, and this is the *expected* state on a machine
             // running both hosts.
-            let holder = holder_pid
+            let holder = record
+                .map(|r| r.pid)
                 .map(|p| format!("process {p}"))
                 .unwrap_or_else(|| "another OxiMux process".into());
             tracing::info!(

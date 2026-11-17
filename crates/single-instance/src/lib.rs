@@ -153,10 +153,17 @@ impl SingleInstanceGuard {
 pub enum AcquireOutcome {
     /// This process now owns the lock.
     Acquired(SingleInstanceGuard),
-    /// Another live instance already owns it. `holder_pid` is the PID the holder
-    /// recorded beside the lock (when readable + parseable), so the contender
-    /// can name — or, for the GUI role, activate — the process that has it.
-    AlreadyRunning { holder_pid: Option<u32> },
+    /// Another live instance already owns it. `holder` is the record that
+    /// holder left beside the lock (when readable + parseable), so the
+    /// contender can name — or, for the GUI role, activate — the process that
+    /// has it.
+    ///
+    /// The whole record rather than its pid, because a pid alone cannot
+    /// identify a process: it can have been recycled since, and then naming it
+    /// sends whoever reads the refusal to an unrelated process. The start time
+    /// beside it is what makes the identification sound, and it is already on
+    /// disk — that is what the record is for.
+    AlreadyRunning { holder: Option<HolderRecord> },
 }
 
 /// Try to take the exclusive lock at `lock_path` without blocking.
@@ -219,9 +226,7 @@ fn acquire(lock_path: &Path, role: Option<&str>) -> std::io::Result<AcquireOutco
     if won {
         Ok(AcquireOutcome::Acquired(SingleInstanceGuard { _lock: lock, previous }))
     } else {
-        Ok(AcquireOutcome::AlreadyRunning {
-            holder_pid: read_holder_pid(lock_path),
-        })
+        Ok(AcquireOutcome::AlreadyRunning { holder: read_holder_record(lock_path) })
     }
 }
 
@@ -310,7 +315,8 @@ mod tests {
             AcquireOutcome::AlreadyRunning { .. } => panic!("first acquire must win"),
         };
         match try_acquire(&path).unwrap() {
-            AcquireOutcome::AlreadyRunning { holder_pid } => {
+            AcquireOutcome::AlreadyRunning { holder } => {
+                let holder_pid = holder.map(|h| h.pid);
                 assert_eq!(
                     holder_pid,
                     Some(std::process::id()),
@@ -405,8 +411,33 @@ mod tests {
         let _g = acquired(try_acquire(&path).unwrap());
         std::fs::write(pid_path_for(&path), "garbage\n").unwrap();
         match try_acquire(&path).unwrap() {
-            AcquireOutcome::AlreadyRunning { holder_pid } => assert_eq!(holder_pid, None),
+            AcquireOutcome::AlreadyRunning { holder } => assert_eq!(holder, None),
             AcquireOutcome::Acquired(_) => panic!("an unreadable record never frees the lock"),
+        }
+    }
+
+    /// A contender is handed the holder's whole record, start time included.
+    ///
+    /// The pid alone cannot identify a process — it can have been recycled —
+    /// so a refusal that named only the pid sent its reader to `ps` with no
+    /// way to tell the incumbent from whatever inherited the number. The
+    /// start time is already on disk; this is it reaching the contender.
+    #[test]
+    fn a_contender_learns_who_holds_the_lock_and_since_when() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.lock");
+        let _g = acquired(try_acquire_as(&path, "serve").unwrap());
+        match try_acquire(&path).unwrap() {
+            AcquireOutcome::AlreadyRunning { holder } => {
+                let holder = holder.expect("the holder wrote its record");
+                assert_eq!(holder.pid, std::process::id());
+                assert!(
+                    holder.started_at_unix_s.is_some(),
+                    "without this the pid cannot be told from a recycled one",
+                );
+                assert_eq!(holder.role.as_deref(), Some("serve"));
+            }
+            AcquireOutcome::Acquired(_) => panic!("a held lock is not free"),
         }
     }
 

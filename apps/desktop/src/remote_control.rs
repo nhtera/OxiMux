@@ -999,9 +999,9 @@ impl RemoteControl {
                 *held = Some(guard);
                 true
             }
-            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder }) => {
                 tracing::warn!(
-                    holder_pid = ?holder_pid,
+                    holder_pid = ?holder.map(|h| h.pid),
                     dir = %dir.display(),
                     "another OxiMux host is already serving this data directory; \
                      local CLI access not bound",

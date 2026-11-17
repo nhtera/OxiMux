@@ -321,11 +321,44 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
                         if fold.turn_active {
                             fold.interrupt();
                         }
-                        // Published before the registry entry goes: this is
-                        // the only frame that says the process died, and a
-                        // watcher reading an unregistered session reads
-                        // nothing at all.
-                        track.note_exit(/* stopped */ false, None);
+                        // The code, waited for briefly. The stream ending and
+                        // the process being reaped are different moments, so a
+                        // read at the first sign of death usually has no code
+                        // yet — and reporting `ConnectionClosed` for a provider
+                        // that was killed loses the one fact that says *how* it
+                        // died. The desktop polls for the same reason
+                        // (`health_link::record_exit`); this host reported
+                        // `None` unconditionally, which is the kind of
+                        // difference this phase calls a bug.
+                        let code = exit_code_soon(&handle).await;
+                        let proof = track.note_exit(/* stopped */ false, code);
+                        // Recorded as this session's last failure, because the
+                        // frame below is the *only* live word on the subject:
+                        // it reaches whoever is subscribed at this instant, and
+                        // then the registry entry goes. A host restart used to
+                        // leave no trace at all — the session came back reading
+                        // live on its next message, with nothing to say its
+                        // provider had died. This is the same channel a failed
+                        // turn already persists through, and the next send
+                        // clears it the same way.
+                        //
+                        // Appended to a failure already recorded, never
+                        // replacing it: a provider that reported "API error
+                        // 529" and then exited has explained itself, and the
+                        // exit is the consequence. Someone reopening the
+                        // session needs the explanation, not only the epitaph
+                        // — so both are kept, in that order.
+                        let exit = oximux_agents::health::exited_reason(proof);
+                        let explained =
+                            fold.last_error.clone().or_else(|| track.failed_turn.clone());
+                        let reason = match explained {
+                            Some(failed) => format!("{failed} — {exit}"),
+                            None => exit,
+                        };
+                        fold.last_error = Some(reason.clone());
+                        track.failed_turn = Some(reason);
+                        // Published before the registry entry goes: a watcher
+                        // reading an unregistered session reads nothing at all.
                         publish_state(&pump, &fold, &mut track, false, Process::Dormant);
                         persist.save_now(&handle, &mut blob, &fold, &track);
                         // Back to dormant: with the registry entry gone the
@@ -796,6 +829,29 @@ fn failure_to_persist(fold: &ChatThread, track: &HealthTrack) -> Option<String> 
         .as_ref()
         .filter(|_| !fold.turn_active)
         .map(|raw| fold.last_error.clone().unwrap_or_else(|| raw.clone()))
+}
+
+/// How long to wait for a dead provider's exit code before reporting without
+/// one.
+///
+/// Short, because the wait delays the only frame that says the process died
+/// and a reader is entitled to hear about it promptly; long enough that the
+/// usual case — a reap a few milliseconds behind the stream's end — is caught.
+const EXIT_CODE_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The provider's exit code once it is readable, or `None` within
+/// [`EXIT_CODE_WITHIN`].
+async fn exit_code_soon(handle: &SessionHandle) -> Option<i32> {
+    let deadline = tokio::time::Instant::now() + EXIT_CODE_WITHIN;
+    loop {
+        if let Some(code) = handle.exit_code() {
+            return Some(code);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// Fold + registry bookkeeping for one event.

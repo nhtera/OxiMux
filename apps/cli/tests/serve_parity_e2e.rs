@@ -169,6 +169,15 @@ fn a_provider_that_answers_and_leaves_goes_back_to_dormant_with_its_turn_kept() 
         entries.iter().any(|e| e.get("Assistant").is_some()),
         "the turn it completed before leaving is kept: {persisted}",
     );
+    // And *why* it stopped is on disk, with the process's own exit code. The
+    // frame that says a provider died reaches only whoever was subscribed at
+    // that instant, so without this a host restart left the session reading
+    // live again on its next message with nothing to say what had happened.
+    let failure = persisted["last_failure"].as_str().unwrap_or_default();
+    assert!(
+        failure.starts_with("agent process exited (code "),
+        "the exit, with its code, outlives the host: {persisted}",
+    );
 
     serve.kill_hard();
 }

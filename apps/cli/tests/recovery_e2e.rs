@@ -266,6 +266,18 @@ fn a_second_serve_on_the_same_data_dir_refuses_to_boot() {
         stderr.contains("already serving"),
         "the refusal must name the conflict an operator can act on: {stderr}",
     );
+    // And it names *which* process, by pid and by when it started. The pid
+    // alone cannot identify one — it can have been recycled by the time anyone
+    // reads this — so a refusal carrying only the pid points its reader at
+    // whatever inherited the number. Both are in the record the holder wrote.
+    assert!(
+        stderr.contains(&format!("PID {}", first.pid())),
+        "the refusal names the incumbent's pid: {stderr}",
+    );
+    assert!(
+        stderr.contains("running since 20"),
+        "and when it started, so the pid can be told from a recycled one: {stderr}",
+    );
 
     // And the first is untouched — still bound, still answering.
     let out = cli(&data_dir).arg("status").output().expect("status");
