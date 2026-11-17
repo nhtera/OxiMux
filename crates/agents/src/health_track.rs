@@ -157,6 +157,49 @@ pub struct HealthExtras {
 // carefully would be wasting their care.
 
 /// The one reading of a session's health from its fold and its tracker.
+/// The failure a restart must carry, exactly as the health reports it.
+///
+/// [`inputs_from`] is the one reading of a session's health, and it answers
+/// `last_turn_failure` from the tracker's failure with the fold's fuller text
+/// preferred — the fold folds in the stderr diagnostic that the raw result
+/// lacks. Persisting that same string, rather than either half, is what makes
+/// a restored session report the words it reported before the restart instead
+/// of a shorter version of them.
+///
+/// `None` while a turn runs, for the same reason the health reads it that way:
+/// a turn that started has superseded the last one's failure.
+///
+/// Shared, because both hosts persist it and a session moved between them must
+/// come back saying the same thing.
+pub fn failure_to_persist(fold: &ChatThread, track: &HealthTrack) -> Option<String> {
+    track
+        .failed_turn
+        .as_ref()
+        .filter(|_| !fold.turn_active)
+        .map(|raw| fold.last_error.clone().unwrap_or_else(|| raw.clone()))
+}
+
+/// Record a failure in both halves a session reads it from.
+///
+/// The fold keeps no durable trace of a failure — `last_error` is transient
+/// and an errored `TurnEnded` leaves no entry — so whoever records one has to
+/// set the tracker (which decides the health, and which
+/// [`failure_to_persist`] reads) *and* the fold (whose text the health
+/// reports). Set in only one of the two, the session reads failed with no
+/// reason, or carries a reason nothing reads — and on the persistence path it
+/// reads *nothing*, because the tracker is the half that gates it.
+///
+/// Both callers are real: a host restoring a persisted failure, and a host
+/// recording a process it just watched die. One call, so neither can do half
+/// of it.
+///
+/// The next send clears both, as it always has: `note_sent` drops the
+/// tracker's and a user message clears the fold's.
+pub fn record_failure(fold: &mut ChatThread, track: &mut HealthTrack, failure: String) {
+    fold.last_error = Some(failure.clone());
+    track.failed_turn = Some(failure);
+}
+
 pub fn inputs_from(fold: &ChatThread, track: &HealthTrack, extras: HealthExtras) -> HealthInputs {
     let process = match track.exit {
         Some(proof) => Process::Exited(proof),

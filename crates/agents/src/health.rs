@@ -258,6 +258,20 @@ fn classify(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> (HealthStatus, Li
                         false,
                     );
                 }
+                // A failure the last host recorded is not unknown: nothing
+                // has run since, so it is still what this session *is*. Only
+                // its liveness is unconfirmed — which is exactly the pairing a
+                // dormant row with a failure already reports a few lines down,
+                // and the restored case jumping ahead of it was what let a
+                // chat whose provider died come back looking idle.
+                if let Some(failure) = &i.last_turn_failure {
+                    return (
+                        S::Failed,
+                        Liveness::RestoredUnconfirmed,
+                        Some(failure.clone()),
+                        false,
+                    );
+                }
                 return (S::Idle, Liveness::RestoredUnconfirmed, Some("restored, not confirmed".into()), false);
             }
             if i.interrupted {

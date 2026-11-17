@@ -252,6 +252,7 @@ fn restore_chat_turn(snap: &PersistedTabs, session_id: Option<&str>) -> crate::s
             recovery_note: t.recovery_note.clone(),
             unanswered_send: t.unanswered_send.clone(),
             unconfirmed_held: t.unconfirmed_held.clone(),
+            last_failure: t.last_failure.clone(),
         })
         .unwrap_or_default()
 }
@@ -2176,6 +2177,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         };
         let snap = PersistedTabs {
             tabs: vec![PersistedTab {
@@ -2274,6 +2276,7 @@ mod tests {
                 unanswered_send: None,
                 unconfirmed_held: Vec::new(),
                 choices: Default::default(),
+                last_failure: None,
             }],
             ..PersistedTabs::default()
         };
@@ -2328,6 +2331,7 @@ mod tests {
             unanswered_send: None,
             unconfirmed_held: Vec::new(),
             choices: Default::default(),
+            last_failure: None,
         };
         let snap =
             PersistedTabs { chat_transcripts: vec![present.clone()], ..PersistedTabs::default() };

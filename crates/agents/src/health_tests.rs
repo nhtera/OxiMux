@@ -89,6 +89,42 @@ fn a_restored_row_reads_restored_unconfirmed() {
     assert_eq!(h.status, HealthStatus::Idle);
 }
 
+/// A restored row that is *known* to have failed says so.
+///
+/// "Restored, not confirmed" is a statement about the process, and for a
+/// session whose last host recorded a failure it is only half the answer:
+/// nothing has run since, so the failure is still what the session is. Left
+/// the other way round, a chat whose provider died came back looking idle
+/// after a relaunch — the one state that invites carrying on as though
+/// nothing had happened. A *dormant* row with the same failure has always
+/// read Failed; this is the restored case agreeing with it.
+#[test]
+fn a_restored_row_that_died_failing_reads_failed_with_its_reason() {
+    let h = health(&HealthInputs {
+        process: Process::Dormant,
+        restored: Some(Restored { was_mid_turn: false, prior_host_gone: true }),
+        last_turn_failure: Some("agent process exited (code 137)".into()),
+        ..live()
+    });
+    assert_eq!(h.status, HealthStatus::Failed);
+    assert_eq!(h.liveness, Liveness::RestoredUnconfirmed, "the process is still unconfirmed");
+    assert_eq!(h.reason.as_deref(), Some("agent process exited (code 137)"));
+}
+
+/// And a restart that provably cut a running turn short still outranks it:
+/// that is a statement about *this* restart, where the failure is about what
+/// came before.
+#[test]
+fn a_restart_that_cut_a_turn_short_outranks_an_older_failure() {
+    let h = health(&HealthInputs {
+        process: Process::Dormant,
+        restored: Some(Restored { was_mid_turn: true, prior_host_gone: true }),
+        last_turn_failure: Some("an older failure".into()),
+        ..live()
+    });
+    assert_eq!(h.status, HealthStatus::Interrupted);
+}
+
 #[test]
 fn a_restored_mid_turn_row_with_the_lock_proof_is_interrupted() {
     let h = health(&HealthInputs {

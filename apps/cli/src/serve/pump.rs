@@ -221,8 +221,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
         // The next send clears both: `note_sent` drops the tracker's, and a
         // user message clears the fold's.
         if let Some(failure) = blob.last_failure.clone() {
-            fold.last_error = Some(failure.clone());
-            track.failed_turn = Some(failure);
+            oximux_agents::health_track::record_failure(&mut fold, &mut track, failure);
         }
         // What a restart owes the agent: a note saying its turn was cut short,
         // once, on the next message. An earlier restart's note that nothing
@@ -332,22 +331,24 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
                         // difference this phase calls a bug.
                         let code = exit_code_soon(&handle).await;
                         let proof = track.note_exit(/* stopped */ false, code);
-                        // Recorded as this session's last failure, because the
-                        // frame below is the *only* live word on the subject:
-                        // it reaches whoever is subscribed at this instant, and
+                        // Recorded as this session's failure, because the frame
+                        // below is the *only* live word on the subject: it
+                        // reaches whoever is subscribed at this instant, and
                         // then the registry entry goes. A host restart used to
                         // leave no trace at all — the session came back reading
-                        // live on its next message, with nothing to say its
-                        // provider had died. This is the same channel a failed
-                        // turn already persists through, and the next send
-                        // clears it the same way.
+                        // live on its next message with nothing to say its
+                        // provider had died.
                         //
                         // Appended to a failure already recorded, never
                         // replacing it: a provider that reported "API error
                         // 529" and then exited has explained itself, and the
                         // exit is the consequence. Someone reopening the
-                        // session needs the explanation, not only the epitaph
-                        // — so both are kept, in that order.
+                        // session needs the explanation, not only the epitaph.
+                        //
+                        // Appended here rather than in the shared rule because
+                        // the desktop's chat stays open and says both things in
+                        // its own two places; this session is about to stop
+                        // existing, so the string is all that is left of it.
                         let exit = oximux_agents::health::exited_reason(proof);
                         let explained =
                             fold.last_error.clone().or_else(|| track.failed_turn.clone());
@@ -355,8 +356,11 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
                             Some(failed) => format!("{failed} — {exit}"),
                             None => exit,
                         };
-                        fold.last_error = Some(reason.clone());
-                        track.failed_turn = Some(reason);
+                        oximux_agents::health_track::record_failure(
+                            &mut fold,
+                            &mut track,
+                            reason,
+                        );
                         // Published before the registry entry goes: a watcher
                         // reading an unregistered session reads nothing at all.
                         publish_state(&pump, &fold, &mut track, false, Process::Dormant);
@@ -812,25 +816,6 @@ fn queue_to_persist(handle: &SessionHandle) -> Vec<blob::BlobQueuedSend> {
         .collect()
 }
 
-/// The failure a restart must carry, exactly as the health reports it.
-///
-/// `inputs_from` is the one reading of a session's health, and it answers
-/// `last_turn_failure` from the tracker's failure with the fold's fuller text
-/// preferred — the fold folds in the stderr diagnostic that the raw result
-/// lacks. Persisting that same string, rather than either half, is what makes
-/// a restored session report the words it reported before the restart instead
-/// of a shorter version of them.
-///
-/// `None` while a turn runs, for the same reason the health reads it that
-/// way: a turn that started has superseded the last one's failure.
-fn failure_to_persist(fold: &ChatThread, track: &HealthTrack) -> Option<String> {
-    track
-        .failed_turn
-        .as_ref()
-        .filter(|_| !fold.turn_active)
-        .map(|raw| fold.last_error.clone().unwrap_or_else(|| raw.clone()))
-}
-
 /// How long to wait for a dead provider's exit code before reporting without
 /// one.
 ///
@@ -1024,7 +1009,7 @@ impl Persist {
         // Written on every save, cleared as well as set: a send clears the
         // tracker's failure, and a blob that only ever gained the field
         // would report a failure the session has since moved past.
-        blob.last_failure = failure_to_persist(fold, track);
+        blob.last_failure = oximux_agents::health_track::failure_to_persist(fold, track);
         blob.queued = queue_to_persist(handle);
         // What a restart would cut short if it happened now, and what it
         // would owe the agent. Written on every save, cleared as well as
