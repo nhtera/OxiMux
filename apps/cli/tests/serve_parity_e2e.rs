@@ -264,6 +264,116 @@ fn a_message_held_by_a_prompt_survives_a_kill_and_comes_back_held() {
     serve.kill_hard();
 }
 
+/// And a client can let that hold go: `oximux release` reports how many lines
+/// it let go, and they become ordinary queued sends.
+///
+/// This is the other half of the hold, and until it existed the hold was a
+/// dead end on a server: a client could read that a session was holding two
+/// messages and had no way to send them, so the only route was to restart the
+/// host — which holds them again — or to retype them. The desktop has always
+/// had the equivalent in its composer; this is what a headless host gives a
+/// caller instead.
+///
+/// The second half of the claim is as important as the first: releasing the
+/// restart's hold is not a licence to bypass the others. The agent here is
+/// still holding a permission request, so the released line stays queued —
+/// visible in the count, and still on disk — rather than being written into a
+/// turn that cannot take it.
+#[test]
+fn a_client_can_let_a_restored_hold_go_and_is_told_how_many_went() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data_dir, session, serve) = stalled_turn(dir.path(), "parity-release");
+
+    // Held, for the reason the test above spells out: the agent is waiting on
+    // a person, so the gate does not write this line.
+    let out = cli(&data_dir)
+        .args(["send", &session, "look at this later", "--no-wait"])
+        .output()
+        .expect("send");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    await_status(&data_dir, &session, "a persisted queue", |_| {
+        blob(&data_dir, &session)["queued"].as_array().is_some_and(|q| !q.is_empty())
+    });
+    serve.kill_hard();
+
+    // Back up — and nothing reopens the session first. `release` is the whole
+    // act here, which is the only way to test the half of it that opens a
+    // dormant session: a send beforehand would do that opening, and a
+    // regression dropping `ReleaseHeld` from serve's build list would pass
+    // unnoticed. The session is on disk and not running; its queue is in the
+    // blob and its gate does not exist yet.
+    let shim_dir = dir.path().join("shim");
+    let report = dir.path().join("report.txt");
+    let serve =
+        boot_serve(&data_dir, &shim_dir, &report, "parity-release", AgentBehaviour::stalling());
+    let out = cli(&data_dir).arg("ls").output().expect("ls");
+    let rows = json_of(&out);
+    assert!(
+        rows["data"].as_array().expect("rows").iter().any(|r| r["session_id"] == session.as_str()),
+        "the session is the host's to open and nothing has opened it: {rows}",
+    );
+
+    // The verb, as a scripted caller runs it, against a session that is not
+    // running.
+    let out = cli(&data_dir).args(["release", &session]).output().expect("release");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "release failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let released = json_of(&out);
+    assert_eq!(
+        released["data"]["released"], 1,
+        "the line the restart was holding — so the verb opened the session, restored its \
+         queue and lifted the hold, in that order: {released}",
+    );
+
+    // The host agrees, and the line went: nothing holds a fresh session, so
+    // the released message starts its turn and reaches the agent. This is the
+    // round trip the hold had no exit from before — the one thing a client
+    // could not do was get these lines delivered.
+    await_status(&data_dir, &session, "the released line delivered", |_| {
+        let persisted = blob(&data_dir, &session);
+        // `contains`, not equality: this restart owed a recovery note (it
+        // killed a turn that was waiting on a person), and the note rides
+        // out with the first message to go — which is this one.
+        let written = persisted["entries"].as_array().is_some_and(|es| {
+            es.iter().any(|e| {
+                e["User"]["text"].as_str().is_some_and(|t| t.contains("look at this later"))
+            })
+        });
+        let still_queued = persisted["queued"]
+            .as_array()
+            .is_some_and(|q| q.iter().any(|l| l["text"] == "look at this later"));
+        written && !still_queued
+    });
+    let v = status(&data_dir, &session);
+    assert_eq!(
+        v["data"]["health"]["held_restored"], 0,
+        "and nothing is held any more: {v}",
+    );
+    assert_eq!(
+        v["data"]["health"]["recovery_note_owed"], false,
+        "the note the restart owed rode out with the released line, so it is owed no longer: {v}",
+    );
+
+    // That the other holds still apply to a released line is the gate's own
+    // claim and is tested there (`a_released_line_still_waits_on_everything_else`):
+    // it cannot be shown here, because a session nothing has reopened has no
+    // turn and no prompt to hold it — which is exactly the state that makes
+    // the delivery above the honest end-to-end answer.
+
+    // Releasing again has nothing to lift, and says so rather than failing —
+    // what a retrying script depends on.
+    let out = cli(&data_dir).args(["release", &session]).output().expect("release");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(json_of(&out)["data"]["released"], 0);
+
+    serve.kill_hard();
+}
+
 /// A session this host is not running answers promptly — and reading it does
 /// not start it.
 ///

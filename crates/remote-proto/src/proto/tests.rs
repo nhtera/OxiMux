@@ -19,8 +19,10 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 39,
-        "v39 = the host's own settings (HostConfigRead, HostConfigWrite, the HostConfig reply; \
+        PROTOCOL_VERSION, 40,
+        "v40 = letting a held queue go (ReleaseHeld, the Released reply; no older equivalent, \
+         so a pre-v40 host is refused by the client's gate). \
+         v39 = the host's own settings (HostConfigRead, HostConfigWrite, the HostConfig reply; \
          no older equivalent, so a pre-v39 host is refused by the client's gate). \
          v38 = a restart retires its prompts (ThreadEvent::PromptsRetired, downgraded to a \
          Notice below PROMPTS_RETIRED_MIN_VERSION). v37 = safe delivery and session health (SendV2, SendOutcome, the SessionHealth push). v36 = agent delegation (SpawnAgent, ListChildren, CancelAgent, Whoami, their replies, RpcError::Spawn). v35 = opening a folder in the desktop (OpenProject, ProjectOpened). v34 = watching a device from the paired phone (SimViewables, SimSubscribe, SimUnsubscribe, their replies). v33 = the MCP principal (local hello `Mcp`; no frame change). v32 = simulator React Native (Rn, its reply; Net served). v31 = simulator exec (Exec, ExecOutput). v30 = simulator flows (Flow, its reply, SimTargetWire::Exact). v29 = simulator diagnostics (Logs, Crashes, their replies). v28 = simulator device state (DeviceState: location, appearance, privacy, push, \
@@ -403,6 +405,11 @@ fn early_variants_keep_their_literal_ordinals() {
     let write = Request::HostConfigWrite { key: String::new(), value: String::new() };
     assert_eq!(write.to_bytes().expect("encode")[0], 80);
     assert_eq!(Response::HostConfig(vec![]).to_bytes().expect("encode")[0], 62);
+    // v40's release, appended after the settings verbs: Request ordinal 81,
+    // and the `Released` reply is Response ordinal 63.
+    let release = Request::ReleaseHeld { session_id: String::new() };
+    assert_eq!(release.to_bytes().expect("encode")[0], 81);
+    assert_eq!(Response::Released { released: 0 }.to_bytes().expect("encode")[0], 63);
     // `SessionsChanged` is the 29th Response variant (index 28); pin the
     // discriminant, the `Vec` payload follows.
     let changed = Response::SessionsChanged(vec![]);

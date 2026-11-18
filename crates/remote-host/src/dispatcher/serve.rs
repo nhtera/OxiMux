@@ -53,13 +53,47 @@ fn session_to_build(req: &Request) -> Option<&str> {
         | Request::GitCommit { session_id, .. }
         | Request::ListForgeItems { session_id, .. }
         | Request::GetForgeItemDetail { session_id, .. }
-        | Request::ListForgeChecks { session_id } => Some(session_id),
+        | Request::ListForgeChecks { session_id }
+        // Releasing a hold is the one read-like-sounding verb that must open:
+        // the lines it releases are in the persisted queue of a session that
+        // is not running, and the gate they go back into does not exist until
+        // the catalog opens it. Opened here, before the handler, so the hold
+        // it lifts is the one the restart put on a restored queue.
+        | Request::ReleaseHeld { session_id } => Some(session_id),
+        // Every sender below. Their handlers require the write tier, which is
+        // why `open_needs_write` names them too.
+
         Request::SendPrompt(r) => Some(&r.session_id),
         Request::SendV2(r) => Some(&r.session_id),
         Request::ResolvePermission(r) => Some(&r.session_id),
         Request::AnswerQuestion(r) => Some(&r.session_id),
         _ => None,
     }
+}
+
+/// Requests whose **open** needs the write tier, because their handler does.
+///
+/// The open spawns an agent process, so a caller the handler is about to
+/// refuse must not get one started on its behalf first: without this a
+/// read-only device could make the host do real work by naming a dormant
+/// session with a verb it is not allowed to use, and learn nothing from the
+/// `Unauthorized` it then got. The guard's own note already promised "the
+/// same per-session ACL the handlers apply"; this is the half of that promise
+/// the tier makes.
+///
+/// Every verb here checks `may_drive_session` in [`super::handlers`] (or in
+/// `send_v2`). The readers and `Subscribe` are deliberately absent: their
+/// handlers check the scope this guard already checks, so naming them would
+/// refuse opens that are allowed.
+pub(super) fn open_needs_write(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::ReleaseHeld { .. }
+            | Request::SendPrompt(_)
+            | Request::SendV2(_)
+            | Request::Steer { .. }
+            | Request::Cancel { .. }
+    )
 }
 
 /// The most request frames held while a simulator verb runs.
@@ -263,7 +297,7 @@ impl Dispatcher {
             && self.registry.get(session_id).is_none()
             && let Some(catalog) = &self.catalog
             && let Some(peer) = authorized_peer(&state.authn, &self.auth)
-            && self.auth.is_allowed_for(&peer, session_id)
+            && self.may_open(&peer, session_id, &req)
             && let Err(err) = catalog.open(session_id).await
         {
             tracing::warn!(session_id, %err, "could not open a session a client asked for");

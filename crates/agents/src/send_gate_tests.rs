@@ -380,6 +380,73 @@ fn a_restored_message_waits_for_a_person_and_nothing_else_releases_it() {
 }
 
 #[test]
+fn releasing_the_hold_is_the_one_thing_that_lets_a_restored_message_go() {
+    // The counterpart of the test above: everything else leaves the hold
+    // alone, and this is what lifts it. The count is what the caller is told,
+    // because the queue's ids never cross the wire.
+    let mut gate = SendGate::new();
+    let seen = wakes(&mut gate);
+    gate.push_restored("one".into(), SendSource::Remote, None);
+    gate.push_restored("two".into(), SendSource::User, None);
+
+    assert_eq!(gate.release_held(), 2, "both, and it says how many");
+    assert_eq!(gate.counts(), (0, 2), "held no longer, waiting to go");
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "and the owner is woken once to send them");
+    assert_eq!(gate.wait_of(gate.queued().next().unwrap()), SendWait::None);
+    assert_eq!(gate.take_next_if_open().unwrap().text, "one");
+    // Taking one starts its turn, so the second waits for that turn like any
+    // other queued send — which is the point: they are ordinary sends now.
+    gate.on_turn_end();
+    assert_eq!(gate.take_next_if_open().unwrap().text, "two", "in the order they were queued");
+
+    assert_eq!(gate.release_held(), 0, "a second release has nothing to lift");
+}
+
+#[test]
+fn a_released_line_still_waits_on_everything_else() {
+    // Lifting the restart's hold is not a licence to bypass the other holds:
+    // a released line is an ordinary queued send, and a running turn or a
+    // pending prompt still keeps it in the queue.
+    let mut gate = SendGate::new();
+    let seen = wakes(&mut gate);
+    gate.push_restored("after the turn".into(), SendSource::Remote, None);
+    gate.begin_turn(SendSource::User);
+
+    assert_eq!(gate.release_held(), 1);
+    assert_eq!(seen.load(Ordering::SeqCst), 0, "nothing to wake for: the turn still runs");
+    assert_eq!(
+        gate.wait_of(gate.queued().next().unwrap()),
+        SendWait::Busy,
+        "and it now says the ordinary reason rather than the restart's",
+    );
+    assert!(gate.take_next_if_open().is_none());
+
+    gate.on_turn_end();
+    assert_eq!(gate.take_next_if_open().unwrap().text, "after the turn");
+}
+
+#[test]
+fn a_stop_holds_a_released_line_only_from_the_sender_it_holds() {
+    // The help and `release_held`'s doc both say which senders a Stop keeps
+    // waiting, and getting that backwards is the kind of promise a person
+    // acts on: told a Stop would hold them, they would release an old queue
+    // expecting to review it again. Among the senders a restart carries,
+    // `Agent` is the only one a Stop holds — a person's or a phone's message
+    // is what ends a Stop.
+    let mut gate = SendGate::new();
+    gate.push_restored("from a phone".into(), SendSource::Remote, None);
+    gate.push_restored("from another agent".into(), SendSource::Agent, None);
+    assert_eq!(gate.release_held(), 2);
+    gate.stop_by_user();
+
+    let waits: Vec<_> = gate.queued().map(|q| (q.text.as_str(), gate.wait_of(q))).collect();
+    assert_eq!(
+        waits,
+        vec![("from a phone", SendWait::None), ("from another agent", SendWait::StoppedByUser)],
+    );
+}
+
+#[test]
 fn the_counts_tell_held_from_waiting() {
     let mut gate = SendGate::new();
     gate.push_restored("before".into(), SendSource::Remote, None);

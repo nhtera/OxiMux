@@ -1388,6 +1388,72 @@ fn an_unauthenticated_peer_cannot_make_the_desktop_build_a_session() {
     block_on(join(serve, script));
 }
 
+/// A read-only device may not make the host open a session for a verb it is
+/// not allowed to use.
+///
+/// The read-only tier is in the per-session ACL's *other* axis: a down-scoped
+/// device is still "allowed for" the session (it may read it) and still
+/// refused every write. The build guard checked only the first half, so
+/// naming a dormant session with a write verb spawned a real agent process
+/// and *then* answered `Unauthorized` — the device learned nothing and the
+/// host did the work anyway, which is the thing the guard exists to prevent.
+#[test]
+fn a_read_only_device_cannot_make_the_host_open_a_session_to_write_to_it() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry.clone(), Arc::clone(&auth))
+        .with_clock(clock)
+        .with_catalog(catalog.clone());
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        // Down-scoped after pairing, as the paired-device list does it.
+        auth.set_read_only(&pubkey, true);
+
+        for req in [
+            Request::ReleaseHeld { session_id: "cold-1".into() },
+            Request::Cancel { session_id: "cold-1".into() },
+            Request::Steer { session_id: "cold-1".into(), text: "focus".into() },
+        ] {
+            let name = format!("{req:?}");
+            assert_eq!(
+                call(&client, req).await,
+                Response::Error(RpcError::Unauthorized),
+                "{name} must be refused",
+            );
+            assert!(
+                catalog.opened.lock().unwrap().is_empty(),
+                "and refused without starting an agent: {name} opened {:?}",
+                catalog.opened.lock().unwrap(),
+            );
+        }
+
+        // Reading it still opens nothing and still works: the tier narrows
+        // the writes, and a guard that refused reads too would have taken
+        // away what read-only is for.
+        assert!(matches!(
+            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await,
+            Response::SessionTranscript(_),
+        ));
+        assert!(catalog.opened.lock().unwrap().is_empty(), "a read builds nothing either");
+    };
+    block_on(join(serve, script));
+    assert!(registry.get("cold-1").is_none(), "and it was never brought up");
+}
+
 /// A session-scoped device must not reach past its scope, and naming a dormant
 /// id must not be a way around that — nor a way to make the desktop do work.
 #[test]

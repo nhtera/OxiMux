@@ -538,6 +538,20 @@ impl SessionHandle {
         self.gate.lock().unwrap().clone()
     }
 
+    /// Let a restart's held queue go, and say how many lines it let go.
+    ///
+    /// `None` when no gate is attached, which is **not** the same as nothing
+    /// being held: a session is registered a moment before its pump attaches
+    /// the gate and restores the queue, so in that window a `0` would be a
+    /// confident answer about a hold that is about to exist. The caller is
+    /// told the session cannot answer yet instead, and retries. A driver that
+    /// keeps its restored messages somewhere other than the gate still
+    /// attaches one (the desktop attaches and detaches it with its registry
+    /// binding), so it answers `Some(0)` rather than landing here.
+    pub fn release_held(&self) -> Option<u32> {
+        Some(self.gate()?.lock().unwrap().release_held())
+    }
+
     /// Receipts for the host's sends to this session, from now on.
     pub fn subscribe_receipts(&self) -> broadcast::Receiver<ThreadEvent> {
         self.receipts.subscribe()

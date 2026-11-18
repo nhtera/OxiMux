@@ -634,6 +634,43 @@ impl Dispatcher {
     /// Every caller of this is state-changing (prompt/steer/cancel), so the gate is
     /// `may_write` — a read-only device is refused here even though it may read the
     /// same session.
+    /// Lift the hold a restart put on a session's restored queue.
+    ///
+    /// Not [`Dispatcher::scoped`], which answers `Ack`: the caller is told how
+    /// many lines went, because that is the one thing it cannot work out for
+    /// itself — the queue's ids never cross the wire, so it can read a count
+    /// and not a line, and a bare acknowledgment would leave "did anything
+    /// happen?" unanswered.
+    ///
+    /// The write tier, like a send, since this is what sends those lines. A
+    /// session the host does not have is `UnknownSession` — the catalog is
+    /// given its chance to open a dormant one before this runs (see
+    /// `session_to_build`), so reaching here with nothing means there is
+    /// nothing to release.
+    pub(super) fn release_held(&self, peer: &Peer, session_id: &str) -> Response {
+        if !self.may_drive_session(peer, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        // No gate means the session cannot answer for its queue *yet*, not
+        // that its queue is empty: `resume` registers the handle and the
+        // pump attaches the gate and restores the hold a moment later, so a
+        // release landing in that window would report `0` while the lines it
+        // was asked about were on their way back. A caller told "not yet"
+        // retries and gets the real answer; one told `0` believes it.
+        let Some(released) = handle.release_held() else {
+            tracing::info!(session = %session_id, "release arrived before the session's queue was back");
+            return Response::Error(RpcError::BadRequest(
+                "this session is still opening and cannot answer for its queue yet — try again"
+                    .into(),
+            ));
+        };
+        tracing::info!(session = %session_id, released, "released a restart's held queue");
+        Response::Released { released }
+    }
+
     pub(super) fn scoped<F>(&self, peer: &Peer, session_id: &str, f: F) -> Response
     where
         F: FnOnce(&SessionHandle) -> anyhow::Result<()>,
@@ -660,6 +697,24 @@ impl Dispatcher {
     /// confined credential — a session in the subtree it spawned.
     pub(super) fn may_read_session(&self, peer: &Peer, session_id: &str) -> bool {
         self.auth.is_allowed_for(peer, session_id) || self.in_own_subtree(peer, session_id)
+    }
+
+    /// May `peer` make the host **open** `session_id` for `req`.
+    ///
+    /// The scope every session verb needs, plus the write tier for the verbs
+    /// whose handler requires it (`super::serve::open_needs_write`). The open
+    /// spawns an agent process, so a caller the handler is about to refuse
+    /// must not get one started for it first.
+    pub(super) fn may_open(
+        &self,
+        peer: &Peer,
+        session_id: &str,
+        req: &oximux_remote_proto::proto::Request,
+    ) -> bool {
+        if super::serve::open_needs_write(req) {
+            return self.may_drive_session(peer, session_id);
+        }
+        self.auth.is_allowed_for(peer, session_id)
     }
 
     /// May `peer` drive `session_id` (send to it, steer or cancel its turn):

@@ -114,6 +114,14 @@ Fetch a session's full transcript (paged under the hood)
 | --- | --- | --- |
 | `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
 
+### `oximux release`
+
+Let a session's held queue go: send the messages a host restart put on hold.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<SESSION>` | yes | The session id, or a unique prefix of it (see `oximux ls`) |
+
 ### `oximux stop`
 
 Interrupt a session's in-flight turn. The session stays open

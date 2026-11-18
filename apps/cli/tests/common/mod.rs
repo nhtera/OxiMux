@@ -305,6 +305,15 @@ impl Drop for ServeUnderTest {
 /// A client invocation against `runtime_dir`, in JSON mode.
 pub fn cli(runtime_dir: &Path) -> Command {
     let mut cmd = bin();
+    // `--dir` does not pin the target: `resolve_and_connect` reads the hosts
+    // file and OXIMUX_HOST first and only then falls back to the local
+    // socket. On a machine with a paired default — any developer's — every
+    // invocation here would reach that host instead of the serve under test,
+    // and these suites send prompts and release held queues. The same
+    // isolation `serve_e2e::client` and `hosts_e2e` already use, for the same
+    // reason; this helper was the one that had not got it.
+    cmd.env_remove("OXIMUX_HOST");
+    cmd.env("OXIMUX_CONFIG_DIR", runtime_dir.with_extension("hosts"));
     cmd.args(["--dir", runtime_dir.to_str().unwrap(), "--timeout", "60", "--json"]);
     cmd
 }

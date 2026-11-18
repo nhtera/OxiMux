@@ -398,6 +398,7 @@ impl Dispatcher {
             Request::AnswerQuestion(r) => self.answer_question(peer, r),
             Request::Steer { session_id, text } => self.steer(peer, &session_id, &text),
             Request::Cancel { session_id } => self.scoped(peer, &session_id, |h| h.cancel()),
+            Request::ReleaseHeld { session_id } => self.release_held(peer, &session_id),
             Request::ListChoices { session_id } => self.list_choices(peer, &session_id),
             Request::EventsSince { session_id, after_seq } => {
                 self.events_since(peer, &session_id, after_seq, peer_version)
