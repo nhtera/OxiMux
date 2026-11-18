@@ -17,13 +17,49 @@ use super::Dispatcher;
 use super::stream::Live;
 use crate::auth::Peer;
 
-/// Follow `session_id`'s health: wait for it to be registered (a dormant
-/// session comes to life on its next prompt), then for its driver's first
-/// publish, then forward each readable change. Ends when the session's
-/// handle or the registry goes away, after forwarding its last change: an
-/// exit is published and unregistered on the same tick, and that frame is
-/// the one a reader most needs.
-pub(super) fn health_stream(registry: Arc<SessionRegistry>, session_id: SessionId) -> BoxStream<'static, Live> {
+/// Follow `session_id`'s health: the persisted verdict first if nothing is
+/// running it, then wait for it to be registered (a dormant session comes to
+/// life on its next prompt), then for its driver's first publish, then forward
+/// each readable change. Ends when the session's handle or the registry goes
+/// away, after forwarding its last change: an exit is published and
+/// unregistered on the same tick, and that frame is the one a reader most
+/// needs.
+///
+/// **The persisted verdict is what makes a dormant session answerable.** Health
+/// is published by whatever drives a session, so without it a client asking
+/// after a session nothing is running waited on a publisher that would never
+/// come and concluded nothing — about the very sessions a verdict matters most
+/// for, the ones whose provider died and which nothing has touched since. The
+/// catalog answers that from storage ([`SessionCatalog::verdict`]), and it is
+/// read here rather than at the subscribe so the ordinary live path is
+/// untouched: a session that *is* registered never reaches it.
+///
+/// Sent as the same frame a driver's publish sends, through the same
+/// [`Dispatcher::forward_health`] and its per-frame authorization recheck. It
+/// does not open the session — that is the whole point — so the live arm below
+/// still waits, and the driver's own first publish is forwarded when it comes
+/// even if it says the same thing, which is the confirmation a client wants.
+///
+/// [`SessionCatalog::verdict`]: crate::catalog::SessionCatalog::verdict
+pub(super) fn health_stream(
+    registry: Arc<SessionRegistry>,
+    catalog: Option<Arc<dyn crate::catalog::SessionCatalog>>,
+    session_id: SessionId,
+) -> BoxStream<'static, Live> {
+    // Only for a session this host is not running: the registry is
+    // authoritative for the rest, and a persisted verdict beside a live one is
+    // a second opinion on a session that already has a publisher.
+    let persisted = registry
+        .get(&session_id)
+        .is_none()
+        .then(|| catalog.and_then(|c| c.verdict(&session_id)))
+        .flatten()
+        .map(|health| Live::Health { session_id: session_id.clone(), health });
+    stream::iter(persisted).chain(follow_live(registry, session_id)).boxed()
+}
+
+/// The live half: nothing until a driver publishes, then every readable change.
+fn follow_live(registry: Arc<SessionRegistry>, session_id: SessionId) -> BoxStream<'static, Live> {
     stream::once(async move {
         let mut changes = registry.subscribe_changes();
         let handle = loop {
@@ -138,6 +174,121 @@ pub(super) fn wire(h: &SessionHealth) -> SessionHealthWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A catalog that keeps one verdict and counts who asked for it.
+    struct Persisted {
+        verdict: Option<SessionHealth>,
+        reads: AtomicUsize,
+    }
+
+    impl Persisted {
+        fn holding(verdict: Option<SessionHealth>) -> Arc<Self> {
+            Arc::new(Self { verdict, reads: AtomicUsize::new(0) })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::catalog::SessionCatalog for Persisted {
+        fn dormant(&self) -> Vec<crate::catalog::DormantSession> {
+            Vec::new()
+        }
+
+        fn transcript(&self, _: &str) -> Option<crate::catalog::DormantTranscript> {
+            None
+        }
+
+        fn choices(&self, _: &str) -> Option<crate::catalog::DormantChoices> {
+            None
+        }
+
+        fn verdict(&self, _: &str) -> Option<SessionHealth> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.verdict.clone()
+        }
+
+        async fn open(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn failed(reason: &str) -> SessionHealth {
+        SessionHealth {
+            status: HealthStatus::Failed,
+            liveness: Liveness::Unverifiable,
+            limited_until: None,
+            stalled_since: None,
+            exited_unexpectedly: false,
+            reason: Some(reason.into()),
+            last_activity_at: 1_700_000_000_000,
+            pending_unanswered_send: false,
+            held_restored: 0,
+            queued: 0,
+            recovery_note_owed: false,
+            turn_id: None,
+            exit_seq: None,
+        }
+    }
+
+    /// A session nothing is running answers from storage, straight away.
+    ///
+    /// Before this the stream had nothing to say until a driver published, so
+    /// it said nothing at all about a session with no driver — and that is the
+    /// session a verdict is most wanted for.
+    #[tokio::test]
+    async fn a_dormant_sessions_persisted_verdict_is_the_first_frame() {
+        let registry = Arc::new(SessionRegistry::new());
+        let catalog = Persisted::holding(Some(failed("agent process exited (code 137)")));
+
+        let mut stream = health_stream(registry, Some(catalog), "cold-1".into());
+
+        let first = stream.next().now_or_never().flatten().expect("a frame without waiting");
+        let Live::Health { session_id, health } = first else {
+            panic!("the first frame is the persisted verdict, not another kind of push")
+        };
+        assert_eq!(session_id, "cold-1");
+        assert_eq!(health.status, HealthStatus::Failed);
+        assert_eq!(health.reason.as_deref(), Some("agent process exited (code 137)"));
+    }
+
+    /// A host that keeps no verdict sends none. Answering `Idle` on its behalf
+    /// would be the invention this whole path exists to avoid: the client says
+    /// what it saw, which is nothing.
+    #[tokio::test]
+    async fn a_host_with_no_persisted_verdict_sends_no_frame() {
+        let registry = Arc::new(SessionRegistry::new());
+        let catalog = Persisted::holding(None);
+
+        let mut stream = health_stream(registry, Some(catalog), "cold-1".into());
+
+        assert!(
+            stream.next().now_or_never().is_none(),
+            "nothing ready: the stream is back to waiting for a driver",
+        );
+    }
+
+    /// And a live session is never answered from storage. The registry is
+    /// authoritative for anything it holds — a persisted verdict beside a
+    /// running publisher is a second opinion — and the guard also keeps the
+    /// ordinary subscribe off the disk entirely.
+    #[tokio::test]
+    async fn a_live_session_is_never_answered_from_storage() {
+        let registry = Arc::new(SessionRegistry::new());
+        let _handle = registry.register(
+            "s-1".into(),
+            Arc::new(oximux_agents::thread::StubConnection::default()),
+        );
+        let catalog = Persisted::holding(Some(failed("stale")));
+
+        let mut stream = health_stream(registry, Some(catalog.clone()), "s-1".into());
+
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), 0, "the disk was not read");
+        assert!(
+            stream.next().now_or_never().is_none(),
+            "and no frame goes out until its driver publishes one",
+        );
+    }
 
     /// Everything the host knows about a session's health reaches the frame.
     ///

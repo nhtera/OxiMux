@@ -283,3 +283,123 @@ async fn an_exit_published_as_the_session_closes_still_reaches_the_subscriber() 
         .await;
     }
 }
+
+/// A catalog with one dormant session, the verdict the host kept for it, and
+/// a record of every build it was asked for.
+struct ColdCatalog {
+    verdict: Option<oximux_agents::health::SessionHealth>,
+    opened: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl oximux_remote_host::catalog::SessionCatalog for ColdCatalog {
+    fn dormant(&self) -> Vec<oximux_remote_host::catalog::DormantSession> {
+        vec![oximux_remote_host::catalog::DormantSession {
+            session_id: "cold".into(),
+            title: None,
+            model: None,
+            cwd: None,
+        }]
+    }
+
+    fn transcript(&self, session_id: &str) -> Option<oximux_remote_host::catalog::DormantTranscript> {
+        (session_id == "cold").then(|| oximux_remote_host::catalog::DormantTranscript {
+            entries_json: "[]".into(),
+            model: None,
+        })
+    }
+
+    fn choices(&self, _: &str) -> Option<oximux_remote_host::catalog::DormantChoices> {
+        None
+    }
+
+    fn verdict(&self, session_id: &str) -> Option<oximux_agents::health::SessionHealth> {
+        (session_id == "cold").then(|| self.verdict.clone()).flatten()
+    }
+
+    async fn open(&self, session_id: &str) -> Result<(), String> {
+        self.opened.lock().unwrap().push(session_id.to_string());
+        Ok(())
+    }
+}
+
+fn cold_host(verdict: Option<oximux_agents::health::SessionHealth>) -> (Host, Arc<ColdCatalog>) {
+    let h = host(true);
+    let catalog = Arc::new(ColdCatalog { verdict, opened: std::sync::Mutex::new(Vec::new()) });
+    let dispatcher = Dispatcher::new(h.registry.clone(), Arc::new(AuthStore::new()))
+        .with_host_core(h.core.clone().unwrap())
+        .with_catalog(catalog.clone());
+    (Host { dispatcher, ..h }, catalog)
+}
+
+/// A session this host is not running still answers for itself: the verdict it
+/// persisted arrives on the subscribe, from storage, without building
+/// anything.
+///
+/// The gap this closes: health is published by whatever drives a session, so a
+/// dormant one had no publisher and a client learned nothing about it — about
+/// precisely the sessions a verdict is wanted for, the ones whose provider
+/// died and which nothing has touched since. Reading it the obvious other way
+/// (`GetSessionInfo`) is in serve's build list and would have resurrected the
+/// session being examined, which is why `opened` is asserted here and not just
+/// the frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dormant_session_answers_a_subscribe_with_the_verdict_the_host_kept() {
+    let failed = oximux_agents::health::compute(
+        &HealthInputs {
+            process: Process::Dormant,
+            last_turn_failure: Some("agent process exited (code 137)".into()),
+            held_restored: 2,
+            ..Default::default()
+        },
+        oximux_agents::session_health::now_ms(),
+        &oximux_agents::health::HealthConfig::default(),
+    );
+    let (h, catalog) = cold_host(Some(failed));
+    let instance = h.core.as_ref().unwrap().instance().to_string();
+
+    as_scope(&h, LocalScope::Full, |c| async move {
+        call(&*c, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await;
+        assert!(matches!(
+            call(&*c, Request::Subscribe { session_id: "cold".into(), after_seq: None }).await,
+            Response::Events(_),
+        ));
+
+        let got = next_push(&*c).await;
+        let Some(Response::SessionHealth(frame)) = got else {
+            panic!("expected the persisted verdict, got {got:?}")
+        };
+        assert_eq!((frame.session_id.as_str(), frame.host_instance_id.as_str()), ("cold", instance.as_str()));
+        let health = frame.health().unwrap();
+        assert_eq!((health.status.as_str(), health.liveness.as_str()), ("failed", "unverifiable"));
+        assert_eq!(health.reason.as_deref(), Some("agent process exited (code 137)"));
+        assert_eq!(health.held_restored, 2, "and what the restart is holding for a person");
+    })
+    .await;
+
+    assert!(
+        catalog.opened.lock().unwrap().is_empty(),
+        "reading a session's verdict must not start the agent it is about",
+    );
+}
+
+/// A v36 subscriber gets no verdict either: it has no decoder for the frame,
+/// and an unknown ordinal drops its whole connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dormant_verdict_is_withheld_from_a_peer_that_cannot_decode_it() {
+    let (h, _catalog) = cold_host(Some(oximux_agents::health::compute(
+        &HealthInputs { process: Process::Dormant, last_turn_failure: Some("boom".into()), ..Default::default() },
+        oximux_agents::session_health::now_ms(),
+        &oximux_agents::health::HealthConfig::default(),
+    )));
+
+    as_scope(&h, LocalScope::Full, |c| async move {
+        call(&*c, Request::Hello(HelloReq { protocol_version: 36 })).await;
+        assert!(matches!(
+            call(&*c, Request::Subscribe { session_id: "cold".into(), after_seq: None }).await,
+            Response::Events(_),
+        ));
+        assert_eq!(next_push(&*c).await, None, "no frame of any kind");
+    })
+    .await;
+}

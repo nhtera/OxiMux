@@ -22,6 +22,7 @@ mod projects;
 mod pump;
 mod retry;
 mod scheduler;
+mod seed;
 #[cfg(windows)]
 pub mod service_windows;
 

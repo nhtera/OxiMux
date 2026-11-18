@@ -267,6 +267,16 @@ impl SessionCatalog for HeadlessCatalog {
         })
     }
 
+    fn verdict(&self, session_id: &str) -> Option<oximux_agents::health::SessionHealth> {
+        // The registry owns anything it holds: a live session has a pump
+        // publishing for it, and a verdict read off disk beside that one would
+        // be a second opinion on a session that already has a publisher.
+        if self.registry.get(session_id).is_some() {
+            return None;
+        }
+        Some(super::seed::verdict(session_id, blob::load(&self.settings, session_id)?))
+    }
+
     async fn open(&self, session_id: &str) -> Result<(), String> {
         self.gate.open(session_id, || self.resume(session_id)).await
     }

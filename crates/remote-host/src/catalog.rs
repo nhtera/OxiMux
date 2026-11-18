@@ -104,6 +104,40 @@ pub trait SessionCatalog: Send + Sync {
     /// before this was recorded reads as empty until the desktop next saves it.
     fn choices(&self, session_id: &str) -> Option<DormantChoices>;
 
+    /// What this host persisted about a session nothing is running.
+    ///
+    /// The last gap in reading a session without starting it. A session's
+    /// verdict — failed, and why; a restart's note still owed; messages held
+    /// from before it — is published by whatever drives the session, so with
+    /// nothing running there is no publisher and a client asking after a
+    /// *dormant* session learns nothing. It is exactly the session a person
+    /// most needs a verdict for: one whose provider died in the night, which
+    /// nothing has touched since.
+    ///
+    /// Answered from storage, so it must not spawn, build or open anything —
+    /// a diagnostic that started the process it was asked about would answer a
+    /// question nobody asked, and on a headless host that is a real process
+    /// with a real bill. The cost of one persisted read is the intended one.
+    ///
+    /// Sessions that *are* live must be omitted, exactly as
+    /// [`SessionCatalog::dormant`] omits them: the registry is authoritative
+    /// for those, and a verdict read off disk beside a running publisher is a
+    /// second opinion on a session that already has one.
+    ///
+    /// `None` means this host keeps no verdict for that id, which includes
+    /// keeping none *for any* session: a host whose persistence does not
+    /// record a failure says so by answering `None` rather than by answering
+    /// `Idle`, and a client then reports what it saw — nothing — instead of a
+    /// verdict nobody stands behind. That is the default, so a host gains this
+    /// by implementing it and not by being audited for it.
+    ///
+    /// Must agree with what the session reports once it *is* open, barring the
+    /// differences a missing process forces: a stand-in that contradicted the
+    /// thing it stands in for would be worse than no stand-in.
+    fn verdict(&self, _session_id: &str) -> Option<oximux_agents::health::SessionHealth> {
+        None
+    }
+
     /// Build the views behind `session_id` so it enters the registry.
     ///
     /// Resolves once the session is registered and commandable, or with a reason
