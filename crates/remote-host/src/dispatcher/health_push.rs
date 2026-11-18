@@ -128,6 +128,7 @@ pub(super) fn wire(h: &SessionHealth) -> SessionHealthWire {
         last_activity_at: h.last_activity_at,
         pending_unanswered_send: h.pending_unanswered_send,
         held_restored: h.held_restored,
+        queued: h.queued,
         recovery_note_owed: h.recovery_note_owed,
         turn_id: h.turn_id.clone(),
         exit_seq: h.exit_seq.clone(),
@@ -158,6 +159,7 @@ mod tests {
             last_activity_at: 1_700_000_000_111,
             pending_unanswered_send: true,
             held_restored: 3,
+            queued: 5,
             recovery_note_owed: true,
             turn_id: Some("inc-1:2".into()),
             exit_seq: Some("exit-1".into()),
@@ -176,6 +178,11 @@ mod tests {
         assert_eq!(w.last_activity_at, health.last_activity_at);
         assert!(w.pending_unanswered_send);
         assert_eq!(w.held_restored, 3);
+        assert_eq!(
+            w.queued, 5,
+            "and the two counts must not be crossed: a queue reported as a hold invites a \
+             `release` that has nothing to lift",
+        );
         assert!(w.recovery_note_owed, "an owed note has to cross, or no client can warn about it");
         assert_eq!(w.turn_id, health.turn_id);
         assert_eq!(w.exit_seq, health.exit_seq);
@@ -201,6 +208,7 @@ mod tests {
                     last_activity_at: 0,
                     pending_unanswered_send: false,
                     held_restored: 0,
+                    queued: 0,
                     recovery_note_owed: false,
                     turn_id: None,
                     exit_seq: None,

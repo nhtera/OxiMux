@@ -256,6 +256,16 @@ fn a_message_held_by_a_prompt_survives_a_kill_and_comes_back_held() {
         v["data"]["health"]["held_restored"], 1,
         "the message from before the kill is held, and only it: {v}",
     );
+    // And the held line is counted as held and **not** also as queued: the
+    // frame carries both numbers, and a client reading one for both could not
+    // tell a queue `release` acts on from one it does not. (The message that
+    // reopened the session is already gone — a freshly resumed agent has no
+    // turn or prompt to hold it — which is why `queued` reads 0 here rather
+    // than counting it.)
+    assert_eq!(
+        v["data"]["health"]["queued"], 0,
+        "a held line is not double-counted as waiting to go out: {v}",
+    );
     assert_ne!(
         v["data"]["host_instance_id"], before,
         "a new host process, so a client knows not to resume what it was tracking: {v}",

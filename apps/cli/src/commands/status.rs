@@ -131,6 +131,7 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
             "last_activity_at": wire.last_activity_at,
             "pending_unanswered_send": wire.pending_unanswered_send,
             "held_restored": wire.held_restored,
+            "queued": wire.queued,
             "recovery_note_owed": wire.recovery_note_owed,
             "turn_id": wire.turn_id,
             "exit_seq": wire.exit_seq,
@@ -147,8 +148,18 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
     }
     if wire.held_restored > 0 {
         human.push_str(&format!(
-            "\n{} message(s) held from before a restart — send or discard them to release the queue",
+            "\n{} message(s) held from before a restart — `oximux release {session}` sends them",
             wire.held_restored
+        ));
+    }
+    // Said separately, because the two answer different questions: the hold
+    // asks the person to act, while a queue is the session getting on with
+    // it. Reported after a release, it is also what tells a reader whether
+    // the lines went out or are waiting on something else.
+    if wire.queued > 0 {
+        human.push_str(&format!(
+            "\n{} message(s) waiting to go out",
+            wire.queued
         ));
     }
     Ok((data, human))
@@ -331,6 +342,7 @@ mod tests {
             limited_until: Some(1_700_000_060_000),
             reason: Some("rate limited until 09:01".into()),
             held_restored: 2,
+            queued: 1,
             turn_id: "inc-1:3".to_string().into(),
             ..SessionHealthWire::default()
         });
@@ -341,6 +353,10 @@ mod tests {
         assert_eq!(data["health"]["liveness"], "live");
         assert_eq!(data["health"]["limited_until"], 1_700_000_060_000i64);
         assert_eq!(data["health"]["held_restored"], 2);
+        assert_eq!(
+            data["health"]["queued"], 1,
+            "the queue is reported apart from the hold, so a reader can follow a release",
+        );
         assert_eq!(data["health"]["turn_id"], "inc-1:3");
         assert_eq!(
             data["host_instance_id"], "host-instance-7",
@@ -349,6 +365,14 @@ mod tests {
         assert!(human.contains("limited"), "{human}");
         assert!(human.contains("rate limited until 09:01"), "the reason is for a person: {human}");
         assert!(human.contains("held from before a restart"), "a held queue is actionable: {human}");
+        assert!(
+            human.contains("oximux release s-1"),
+            "and it names the verb that acts on it, since a held queue has one now: {human}",
+        );
+        assert!(
+            human.contains("1 message(s) waiting to go out"),
+            "the queue is said apart from the hold, in a person's words too: {human}",
+        );
     }
 
     /// An owed recovery note is told to whoever is about to send a message.

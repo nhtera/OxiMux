@@ -203,6 +203,15 @@ pub struct SessionHealth {
     pub last_activity_at: i64,
     pub pending_unanswered_send: bool,
     pub held_restored: u32,
+    /// Messages waiting to go out that are **not** held by the restart: a
+    /// line queued behind the running turn, a pending prompt or a Stop.
+    ///
+    /// On the output beside `held_restored` because the two are read
+    /// together, and a client that can see only the hold cannot follow what
+    /// happens when it lifts: `oximux release` turns held lines into queued
+    /// ones, so a reader watching only `held_restored` sees them vanish and
+    /// cannot tell "sent" from "waiting on the prompt that is still open".
+    pub queued: u32,
     /// A restart cut a turn short and the agent has not been told yet: the
     /// next message carries the note.
     ///
@@ -239,6 +248,7 @@ pub fn compute(i: &HealthInputs, now: i64, cfg: &HealthConfig) -> SessionHealth 
         last_activity_at: i.last_activity_at,
         pending_unanswered_send: i.pending_unanswered_send,
         held_restored: i.held_restored,
+        queued: i.queued,
         recovery_note_owed: i.recovery_note_owed,
         turn_id: i.turn_id.clone(),
         exit_seq: i.exit_seq.clone(),
