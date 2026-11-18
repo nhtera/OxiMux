@@ -249,19 +249,24 @@ fn a_message_held_by_a_prompt_survives_a_kill_and_comes_back_held() {
         .expect("send");
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 
-    let v = await_status(&data_dir, &session, "a held message", |d| {
-        d["health"]["held_restored"].as_u64().is_some_and(|n| n >= 1)
+    // Both counts, and waited for together rather than asserted on whichever
+    // snapshot arrived first. The reopening send is briefly *in* the queue:
+    // the wake arm publishes before `flush` takes the line, so a frame with
+    // `held_restored == 1` and `queued == 1` is a real intermediate state,
+    // and a poll that stopped at the first held frame would assert on it
+    // about one run in N. Waiting for the pair is the ack this race has —
+    // the queue drained, with the hold still standing.
+    let v = await_status(&data_dir, &session, "a held message and a drained queue", |d| {
+        d["health"]["held_restored"].as_u64() == Some(1) && d["health"]["queued"].as_u64() == Some(0)
     });
     assert_eq!(
         v["data"]["health"]["held_restored"], 1,
         "the message from before the kill is held, and only it: {v}",
     );
-    // And the held line is counted as held and **not** also as queued: the
-    // frame carries both numbers, and a client reading one for both could not
-    // tell a queue `release` acts on from one it does not. (The message that
-    // reopened the session is already gone — a freshly resumed agent has no
-    // turn or prompt to hold it — which is why `queued` reads 0 here rather
-    // than counting it.)
+    // The point of the pair: the held line is counted as held and **not**
+    // also as queued. A client reading one number for both could not tell a
+    // queue `release` acts on from one it does not — which is the whole use
+    // of the new field.
     assert_eq!(
         v["data"]["health"]["queued"], 0,
         "a held line is not double-counted as waiting to go out: {v}",

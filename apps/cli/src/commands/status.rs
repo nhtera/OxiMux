@@ -147,15 +147,27 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
         );
     }
     if wire.held_restored > 0 {
+        // "Lifts the hold", not "sends them": with a prompt open or a turn
+        // running, release makes these ordinary queued sends and they go
+        // when the gate opens. Promising a send would be the same mistake
+        // the verb's own help made about a Stop — telling a person something
+        // will happen that may not.
         human.push_str(&format!(
-            "\n{} message(s) held from before a restart — `oximux release {session}` sends them",
+            "\n{} message(s) held from before a restart — `oximux release {session}` lifts the hold",
             wire.held_restored
         ));
     }
     // Said separately, because the two answer different questions: the hold
     // asks the person to act, while a queue is the session getting on with
-    // it. Reported after a release, it is also what tells a reader whether
-    // the lines went out or are waiting on something else.
+    // it.
+    //
+    // Not a post-release readout. Nothing publishes health on the release
+    // itself — the counts belong to the pump, and a second writer would be a
+    // second opinion — and a release into a busy gate wakes nobody, so these
+    // numbers catch up on the session's next event or within one save tick.
+    // A `status` run straight after a `release` may still show the counts
+    // from before it; the release's own reply is what answers for that
+    // release.
     if wire.queued > 0 {
         human.push_str(&format!(
             "\n{} message(s) waiting to go out",
@@ -366,8 +378,13 @@ mod tests {
         assert!(human.contains("rate limited until 09:01"), "the reason is for a person: {human}");
         assert!(human.contains("held from before a restart"), "a held queue is actionable: {human}");
         assert!(
-            human.contains("oximux release s-1"),
-            "and it names the verb that acts on it, since a held queue has one now: {human}",
+            human.contains("oximux release s-1") && human.contains("lifts the hold"),
+            "it names the verb that acts on it, and says what the verb actually does — the \
+             lines may still wait on a turn or a prompt: {human}",
+        );
+        assert!(
+            !human.contains("sends them"),
+            "and must not promise a send that an open prompt would hold: {human}",
         );
         assert!(
             human.contains("1 message(s) waiting to go out"),
