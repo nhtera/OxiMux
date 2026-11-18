@@ -249,27 +249,44 @@ fn a_message_held_by_a_prompt_survives_a_kill_and_comes_back_held() {
         .expect("send");
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 
-    // Both counts, and waited for together rather than asserted on whichever
-    // snapshot arrived first. The reopening send is briefly *in* the queue:
-    // the wake arm publishes before `flush` takes the line, so a frame with
-    // `held_restored == 1` and `queued == 1` is a real intermediate state,
-    // and a poll that stopped at the first held frame would assert on it
-    // about one run in N. Waiting for the pair is the ack this race has —
-    // the queue drained, with the hold still standing.
-    let v = await_status(&data_dir, &session, "a held message and a drained queue", |d| {
-        d["health"]["held_restored"].as_u64() == Some(1) && d["health"]["queued"].as_u64() == Some(0)
+    // The reopening line has reached the agent once it is holding a prompt
+    // again. Waited for, because everything below depends on it: a poll that
+    // merely looked for `held_restored == 1` would be satisfied by the pump's
+    // *first* publish — the one `catalog.open` waits for, which already
+    // carries the restored hold and an empty queue because the send has not
+    // been pushed yet. Asserting there proves nothing about the send at all.
+    await_status(&data_dir, &session, "the reopening line delivered", |d| {
+        d["health"]["status"] == "needsPermission"
+    });
+
+    // Now a line that must wait: the agent is holding a permission request,
+    // so this one stays in the queue until a person answers. That gives the
+    // two counts *different* non-trivial values on a live host, which is the
+    // only arrangement that shows they are not one number read twice.
+    let out = cli(&data_dir)
+        .args(["send", &session, "and a third, behind the prompt", "--no-wait"])
+        .output()
+        .expect("send");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let v = await_status(&data_dir, &session, "one held and one queued", |d| {
+        d["health"]["held_restored"].as_u64() == Some(1) && d["health"]["queued"].as_u64() == Some(1)
     });
     assert_eq!(
         v["data"]["health"]["held_restored"], 1,
         "the message from before the kill is held, and only it: {v}",
     );
-    // The point of the pair: the held line is counted as held and **not**
-    // also as queued. A client reading one number for both could not tell a
-    // queue `release` acts on from one it does not — which is the whole use
-    // of the new field.
+    // The pair is the point. One line held by the restart, one queued behind
+    // the prompt, reported apart: a client reading a single number for both
+    // could not tell a queue `release` acts on from one it does not.
+    //
+    // The publish that carries this is the save tick's (`SAVE_INTERVAL`, 10s)
+    // or the next event's — pushing into a held gate wakes nobody, and the
+    // wake arm does not publish in any case. Hence the poll rather than one
+    // read: the state is certain, its arrival time is not.
     assert_eq!(
-        v["data"]["health"]["queued"], 0,
-        "a held line is not double-counted as waiting to go out: {v}",
+        v["data"]["health"]["queued"], 1,
+        "a queued line is counted apart from a held one: {v}",
     );
     assert_ne!(
         v["data"]["host_instance_id"], before,
