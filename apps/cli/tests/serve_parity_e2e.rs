@@ -249,12 +249,54 @@ fn a_message_held_by_a_prompt_survives_a_kill_and_comes_back_held() {
         .expect("send");
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 
-    let v = await_status(&data_dir, &session, "a held message", |d| {
-        d["health"]["held_restored"].as_u64().is_some_and(|n| n >= 1)
+    // The reopening line has reached the agent once it is holding a prompt
+    // again. Waited for, because everything below depends on it: a poll that
+    // merely looked for `held_restored == 1` would be satisfied by the pump's
+    // *first* publish — the one `catalog.open` waits for, which already
+    // carries the restored hold and an empty queue because the send has not
+    // been pushed yet. Asserting there proves nothing about the send at all.
+    await_status(&data_dir, &session, "the reopening line delivered", |d| {
+        d["health"]["status"] == "needsPermission"
+    });
+
+    // Now **two** lines that must wait: the agent is holding a permission
+    // request, so neither goes until a person answers. Two rather than one
+    // on purpose — with one held and one queued the counts are both 1, and a
+    // mapping that read `queued` off `held_restored` would satisfy the poll
+    // just as well. 1 and 2 cannot be confused, which is what makes this a
+    // check and not a coincidence. (The unit test over `wire` uses 3 and 5
+    // for the same reason; this is that discipline on a live host.)
+    for line in ["and a third, behind the prompt", "and a fourth"] {
+        let out = cli(&data_dir)
+            .args(["send", &session, line, "--no-wait"])
+            .output()
+            .expect("send");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{line}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    let v = await_status(&data_dir, &session, "one held and two queued", |d| {
+        d["health"]["held_restored"].as_u64() == Some(1) && d["health"]["queued"].as_u64() == Some(2)
     });
     assert_eq!(
         v["data"]["health"]["held_restored"], 1,
         "the message from before the kill is held, and only it: {v}",
+    );
+    // The pair is the point. One line held by the restart, two queued behind
+    // the prompt, reported apart: a client reading a single number for both
+    // could not tell a queue `release` acts on from one it does not.
+    //
+    // The publish that carries this is the save tick's (`SAVE_INTERVAL`, 10s)
+    // or the next event's — pushing into a held gate wakes nobody, and the
+    // wake arm does not publish in any case. Hence the poll rather than one
+    // read: the state is certain, its arrival time is not.
+    assert_eq!(
+        v["data"]["health"]["queued"], 2,
+        "queued lines are counted apart from a held one, and not as its echo: {v}",
     );
     assert_ne!(
         v["data"]["host_instance_id"], before,

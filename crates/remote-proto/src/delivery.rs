@@ -101,6 +101,16 @@ pub struct SessionHealthWire {
     pub last_activity_at: i64,
     pub pending_unanswered_send: bool,
     pub held_restored: u32,
+    /// Messages waiting to go out that the restart is **not** holding —
+    /// queued behind a running turn, a pending prompt or a Stop.
+    ///
+    /// Here because the hold alone is half a story. `ReleaseHeld` turns held
+    /// lines into queued ones, so a client reading only `held_restored`
+    /// watches them disappear and cannot tell a line that went from one still
+    /// waiting on a prompt that is open. An older host sends no field and
+    /// reads as 0, which says "nothing waiting" — the same answer it could
+    /// give before, and the cautious one.
+    pub queued: u32,
     /// A restart cut a turn short and the agent has not been told yet: the
     /// next message this session sends carries a note saying so.
     ///
@@ -146,6 +156,20 @@ mod tests {
             health_json: r#"{"status":"idle"}"#.into(),
         };
         assert!(!older.health().unwrap().recovery_note_owed);
+
+        // The two queue counts cross as themselves and are told apart: a
+        // reader that confused them would report a hold where there is none,
+        // which is the one thing `release` exists to act on.
+        let waiting = SessionHealthFrame::new(
+            "s",
+            "host-a",
+            &SessionHealthWire { held_restored: 2, queued: 3, ..Default::default() },
+        );
+        let read = waiting.health().unwrap();
+        assert_eq!((read.held_restored, read.queued), (2, 3));
+        // An older host sends no `queued`, which reads as nothing waiting —
+        // the same answer it could give before the field existed.
+        assert_eq!(older.health().unwrap().queued, 0);
 
         // A newer host's extra field is skipped; a missing one defaults.
         let newer = SessionHealthFrame {

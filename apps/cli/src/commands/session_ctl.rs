@@ -72,9 +72,14 @@ pub async fn release(client: &Client, session: &str) -> Result<(Value, String), 
         Response::Released { released } => Ok((
             json!({ "session_id": session, "released": released }),
             match released {
+                // "Queued to go out", not "released to <session>": the hold
+                // is lifted and the lines are ordinary queued sends now, so
+                // with a turn running or a prompt open they wait. Saying
+                // they reached the agent would be the overclaim the status
+                // verb's own held-queue line had.
                 0 => format!("{session} was holding nothing — no messages to release"),
-                1 => format!("1 held message released to {session}"),
-                n => format!("{n} held messages released to {session}"),
+                1 => format!("1 held message released in {session} — queued to go out"),
+                n => format!("{n} held messages released in {session} — queued to go out"),
             },
         )),
         Response::Error(e) => Err(rpc_failure(e)),

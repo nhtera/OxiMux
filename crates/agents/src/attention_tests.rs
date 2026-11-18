@@ -20,6 +20,7 @@ fn health(status: HealthStatus) -> SessionHealth {
         last_activity_at: NOW - MIN,
         pending_unanswered_send: false,
         held_restored: 0,
+        queued: 0,
         recovery_note_owed: false,
         turn_id: Some("inc:1".into()),
         exit_seq: None,
