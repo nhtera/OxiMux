@@ -81,6 +81,20 @@ fn stalled_turn(root: &Path, session: &str) -> (std::path::PathBuf, String, Serv
     (data_dir, session, serve)
 }
 
+/// How many agent processes have ever run, counted from the fixture's own
+/// report: it appends a line per spawn, so a resurrection is visible.
+///
+/// The measure every "reading a session starts nothing" claim here rests on.
+/// Nothing softer will do — the verb that reads a dormant session answers from
+/// storage, and the way that goes wrong is a spawn, not a wrong word.
+fn spawns(report: &Path) -> usize {
+    std::fs::read_to_string(report)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| *l == "session_id=present")
+        .count()
+}
+
 /// The persisted blob a host leaves behind for one session.
 fn blob(data_dir: &Path, session: &str) -> Value {
     let db = oximux_storage::open(&data_dir.join("oximux.db")).expect("open db");
@@ -124,18 +138,24 @@ fn a_headless_session_waiting_on_a_person_says_so_and_says_it_is_alive() {
     serve.kill_hard();
 }
 
-/// A provider that answers and leaves takes its session back to dormant,
-/// leaving its finished turn behind and nothing that answers for it.
+/// A provider that answers and leaves takes its session back to dormant — and
+/// the session still says what happened to it, from what the host persisted.
 ///
-/// The `exited` verdict itself is **not** readable here, and that is a
-/// property of the host rather than of this test. The pump publishes it in one
-/// frame and unregisters the session in the same breath (`pump.rs`: "this is
-/// the only frame that says the process died"), so a subscriber that was
-/// already attached sees it and a reader arriving afterwards finds no session
-/// to ask. What such a reader can check is the consequence — and the
-/// consequence is the thing that would be wrong if the exit were mishandled: a
-/// registry entry left behind would answer for a dead process until the host
-/// restarted.
+/// The frame that says a provider died reaches only whoever was subscribed at
+/// that instant: the pump publishes it and unregisters the session in the same
+/// breath (`pump.rs`: "this is the only frame that says the process died"), so
+/// a reader arriving afterwards found no session to ask and was told nothing.
+/// That is the state a person actually walks up to — a provider that died in
+/// the night, nothing touched since — so the host answers it from storage now,
+/// and this is the whole way out to a caller on the box.
+///
+/// Three claims, and the third is the one with a trap in it. The verdict is the
+/// failure the host recorded, word for word. The liveness is `unverifiable`
+/// rather than a claim about a process nothing here can see. And reading it
+/// **starts nothing**: the obvious other way to read a dormant session
+/// (`GetSessionInfo`) is in serve's build list and resurrected the very
+/// session being examined, so the agent's own spawn log is checked and not
+/// just the words that came back.
 #[test]
 fn a_provider_that_answers_and_leaves_goes_back_to_dormant_with_its_turn_kept() {
     let dir = tempfile::tempdir().unwrap();
@@ -150,10 +170,27 @@ fn a_provider_that_answers_and_leaves_goes_back_to_dormant_with_its_turn_kept() 
     std::fs::create_dir_all(&cwd).unwrap();
     let session = session_of(&run_prompt(&data_dir, &cwd, "answer and leave"));
 
-    let v = await_status(&data_dir, &session, "no published verdict", |d| {
-        d["health_published"] == false
+    // The verdict, with nothing running to publish one. `unverifiable` is the
+    // part that says where it came from: a session something had opened would
+    // read `live`, `restoredUnconfirmed` or `exited` instead.
+    let v = await_status(&data_dir, &session, "a failure read off disk", |d| {
+        d["health"]["status"] == "failed" && d["health"]["liveness"] == "unverifiable"
     });
-    assert_eq!(v["data"]["health"], Value::Null, "nothing is running it: {v}");
+    let reason = v["data"]["health"]["reason"].as_str().unwrap_or_default().to_string();
+    assert!(
+        reason.starts_with("agent process exited (code "),
+        "the verdict names the exit, with its code: {v}",
+    );
+
+    // And asking did not start the agent it asked about.
+    let before_reads = spawns(&report);
+    for _ in 0..3 {
+        assert_eq!(
+            status(&data_dir, &session)["data"]["health"]["liveness"], "unverifiable",
+            "a read that opened the session would stop saying this",
+        );
+    }
+    assert_eq!(before_reads, spawns(&report), "reading a dead session's verdict spawned an agent");
 
     // Still listed, and its turn is on disk: dormant means "not running", not
     // "gone".
@@ -173,10 +210,13 @@ fn a_provider_that_answers_and_leaves_goes_back_to_dormant_with_its_turn_kept() 
     // frame that says a provider died reaches only whoever was subscribed at
     // that instant, so without this a host restart left the session reading
     // live again on its next message with nothing to say what had happened.
-    let failure = persisted["last_failure"].as_str().unwrap_or_default();
-    assert!(
-        failure.starts_with("agent process exited (code "),
-        "the exit, with its code, outlives the host: {persisted}",
+    // And the reader was told exactly that, rather than a paraphrase of it: the
+    // verdict above *is* this string, which is what makes the dormant answer
+    // and the session's own answer after a reopen the same answer.
+    assert_eq!(
+        persisted["last_failure"].as_str(),
+        Some(reason.as_str()),
+        "the exit outlives the host and reaches a reader word for word: {persisted}",
     );
 
     serve.kill_hard();
@@ -416,17 +456,21 @@ fn a_client_can_let_a_restored_hold_go_and_is_told_how_many_went() {
     serve.kill_hard();
 }
 
-/// A session this host is not running answers promptly — and reading it does
-/// not start it.
+/// A session this host is not running answers promptly, with what the restart
+/// left it — and reading it does not start it.
 ///
-/// Both halves are the point. On a server most sessions are dormant most of
-/// the time, so the verb that exists to diagnose one must not hang on the
-/// common case; and a diagnostic that spawned the provider it was asked about
-/// would answer a question nobody asked, at the cost of a real process. The
-/// first draft of this verb did exactly that — `GetSessionInfo` is in serve's
-/// build list — and the symptom was a session reading `restoredUnconfirmed`
-/// seconds after its agent had exited, which was this verb's own echo rather
-/// than the host's verdict.
+/// All three halves are the point. On a server most sessions are dormant most
+/// of the time, so the verb that exists to diagnose one must not hang on the
+/// common case. It must answer with something: this session was killed while
+/// its agent held a permission request, so what a reader needs to know is that
+/// the next message it sends will carry a note saying a restart cut that turn
+/// short — a paragraph the person did not write, which they are entitled to
+/// know about first. And a diagnostic that spawned the provider it was asked
+/// about would answer a question nobody asked, at the cost of a real process.
+/// The first draft of this verb did exactly that — `GetSessionInfo` is in
+/// serve's build list — and the symptom was a session reading
+/// `restoredUnconfirmed` seconds after its agent had exited, which was this
+/// verb's own echo rather than the host's verdict.
 #[test]
 fn reading_a_session_that_is_not_running_answers_at_once_and_starts_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -442,21 +486,20 @@ fn reading_a_session_that_is_not_running_answers_at_once_and_starts_nothing() {
         "parity-dormant",
         AgentBehaviour::stalling(),
     );
-    // How many agent processes have ever run, counted from the fixture's own
-    // report: it appends a line per spawn, so a resurrection is visible.
-    let spawns = |report: &Path| {
-        std::fs::read_to_string(report)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| *l == "session_id=present")
-            .count()
-    };
     let before = spawns(&report);
 
     let started = Instant::now();
     let v = status(&data_dir, &session);
-    assert_eq!(v["data"]["health_published"], false, "{v}");
-    assert_eq!(v["data"]["health"], Value::Null, "{v}");
+    assert_eq!(v["data"]["health_published"], true, "the host keeps a verdict for it: {v}");
+    assert_eq!(
+        v["data"]["health"]["liveness"], "unverifiable",
+        "read from storage, and claiming nothing about a process it cannot see: {v}",
+    );
+    assert_eq!(
+        v["data"]["health"]["recovery_note_owed"], true,
+        "the kill cut a turn short, so the next message carries a note — which is the one \
+         thing a person has to know before they send it: {v}",
+    );
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "it answered in {:?}, which means it waited on something",

@@ -317,7 +317,11 @@ impl Dispatcher {
                 if state.peer_version >= oximux_remote_proto::proto::HEALTH_PUSH_MIN_VERSION
                     && self.host_core.is_some()
                 {
-                    streams.push(super::health_push::health_stream(self.registry.clone(), session_id.clone()));
+                    streams.push(super::health_push::health_stream(
+                        self.registry.clone(),
+                        self.catalog.clone(),
+                        session_id.clone(),
+                    ));
                 }
             }
             return self.send(transport, response).await;

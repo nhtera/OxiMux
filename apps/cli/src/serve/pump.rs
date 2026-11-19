@@ -20,6 +20,7 @@ use oximux_storage::SettingsRepo;
 use super::blob::{self, ChatBlob};
 use super::catalog::SessionIndex;
 use super::retry::ServeRetry;
+use super::seed::mid_turn;
 
 /// How often a dirty fold is written even mid-turn, so a long turn's transcript
 /// survives a crash reasonably intact.
@@ -177,60 +178,15 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
     handle.set_remote_event_sink(event_sink_tx);
 
     tokio::spawn(async move {
-        let mut fold = ChatThread::rehydrated(
-            Some(session_id.clone()),
-            seed.model.clone(),
-            seed.entries.clone(),
-            seed.slash_commands.clone(),
-        );
-        fold.session_meta = seed.session_meta.clone();
-        // A session with history behind it was reopened, not started: its
-        // backend replays nothing, so until a frame arrives nothing has
-        // confirmed that the conversation on disk is the one this process is
-        // now holding. That is `RestoredUnconfirmed`, and it is a truer first
-        // answer than `Idle`. The first frame clears it (`note_event`).
-        //
-        // `prior_host_gone` stays false: it is a claim that the previous
-        // host's processes are provably gone, which only the won host lock and
-        // its record can say, and the pump has neither. Claiming it would turn
-        // a reopened session that had been mid-turn into `Interrupted` on no
-        // evidence. The proof half is F14's.
-        let reopened = !seed.entries.is_empty();
-        // The blob's own answer is preferred over the fold's: `mid_turn` was
-        // written by the host that was actually interrupted, while the fold
-        // only shows a turn left marked running on disk. They agree in the
-        // ordinary case; where they differ, the writer knew.
-        let was_mid_turn = seed.mid_turn || mid_turn(&fold);
-        let mut blob = seed;
-        // What the fold does not keep: the last sign of life, an unanswered
-        // send, how the process ended. The same tracker the desktop folds its
-        // events into (`oximux_agents::health_track`).
-        let mut track = if reopened {
-            HealthTrack::restored(was_mid_turn, /* prior_host_gone */ false)
-        } else {
-            HealthTrack::default()
-        };
-        // A session that died failing comes back failing. The fold keeps no
-        // durable trace of it — `last_error` is transient and an errored
-        // `TurnEnded` leaves no entry — so the failure is restored from the
-        // blob into both the tracker (which decides the health and holds the
-        // queue) and the fold (whose text the health reports). Restored into
-        // only one of the two, the session would read failed with no reason,
-        // or carry a reason nothing reads.
-        //
-        // The next send clears both: `note_sent` drops the tracker's, and a
-        // user message clears the fold's.
-        if let Some(failure) = blob.last_failure.clone() {
-            oximux_agents::health_track::record_failure(&mut fold, &mut track, failure);
-        }
-        // What a restart owes the agent: a note saying its turn was cut short,
-        // once, on the next message. An earlier restart's note that nothing
-        // has sent yet is kept rather than replaced — the agent needs to hear
-        // about the restart that interrupted it, not the latest one.
-        let note = Arc::new(Mutex::new(blob.recovery_note.clone().or_else(|| {
-            let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-            was_mid_turn.then(|| oximux_agents::recovery_note::build(&at, &blob.stopped_tasks))
-        })));
+        // Everything this session resumes from, read by the one reading of a
+        // persisted blob — the same one the catalog's verdict answers a
+        // dormant session with, so a session reports the same thing whether or
+        // not anything has opened it. See [`super::seed`].
+        let super::seed::Seeded { mut fold, mut track, note, held, mut blob } =
+            super::seed::seeded(&session_id, seed);
+        // What a restart owes the agent goes behind a lock: the flush that
+        // sends it and the publish that reports it owed both read it.
+        let note = Arc::new(Mutex::new(note));
         let mut persist = Persist::new(settings, index, &fold, note.clone());
 
         // The send gate. Attaching it **takes over the send path**: from here
@@ -251,7 +207,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
         // what was waiting, so these sit visible until a person releases
         // them rather than draining into the agent on the way up. Before the
         // first publish, so the counts a client reads include them.
-        for q in std::mem::take(&mut blob.queued) {
+        for q in held {
             let uuid = q.send_key.as_deref().and_then(|k| uuid::Uuid::parse_str(k).ok());
             gate.lock().unwrap().push_restored(q.text, SendSource::from_wire(&q.source), uuid);
         }
@@ -772,17 +728,6 @@ fn publish_state(
         // started on, so a Stop can take it back. Spike S5.5 owns that.
         steer_supported: false,
     });
-}
-
-/// Whether a restart stopping now would cut something short.
-///
-/// One expression, used by the save that records it and by the restore that
-/// reads it back: a session that saved `mid_turn` one way and judged it
-/// another would owe the agent a note on one host and not on the other.
-fn mid_turn(fold: &ChatThread) -> bool {
-    fold.turn_active
-        || fold.continuations_open > 0
-        || fold.background_tasks.iter().any(|t| t.status == TaskStatus::Running)
 }
 
 /// What the background tasks running now are doing, for a note to name them.

@@ -59,6 +59,14 @@ const FIRST_HEALTH_WITHIN: std::time::Duration = std::time::Duration::from_secs(
 /// resurrected the very session being examined. That showed up as a session
 /// reading `restoredUnconfirmed` moments after its agent had exited: not the
 /// host's verdict at all, but the echo of this verb's own side effect.
+///
+/// **A dormant session answers too, from what the host persisted.** Health is
+/// published by whatever drives a session, so a session nothing is running had
+/// no publisher and this said so — about the sessions a verdict matters most
+/// for, the ones whose provider died in the night and which nothing has
+/// touched since. A host that keeps a verdict now sends it on the subscribe;
+/// `liveness` says which kind of answer arrived (`unverifiable`: no process to
+/// ask), and a host that keeps none still answers [`no_verdict`].
 pub async fn session(client: &Client, session: &str) -> Result<(Value, String), Failure> {
     client.require_version(
         oximux_remote_proto::proto::HEALTH_PUSH_MIN_VERSION,
@@ -113,7 +121,10 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
         "session_id": session,
         // The host published a verdict, which is the only thing this reports.
         // Whether the session is "open" is deliberately not claimed: see
-        // `no_verdict`.
+        // `no_verdict`. A dormant session's verdict comes off the host's
+        // storage rather than from a driver, and reads the same here on
+        // purpose — the verdict is the answer either way, and `liveness`
+        // carries the difference for whoever needs it.
         "health_published": true,
         // Which host process published this. A client that reconnects and sees
         // a different id knows the host restarted, so whatever it was tracking
@@ -179,13 +190,14 @@ pub async fn session(client: &Client, session: &str) -> Result<(Value, String), 
 
 /// The answer when the host published no verdict within the budget.
 ///
-/// Reports the observation and nothing more. The ordinary cause is a session
-/// this host is not running — most of them, on a server — but a pump that
-/// registered its session and then wedged before publishing looks identical
-/// from out here, and so does a push that simply took longer than the budget.
-/// Calling any of those "stopped" would be the verb inventing the one thing it
-/// was built to stop other surfaces inventing: a definite state with no
-/// evidence behind it.
+/// Reports the observation and nothing more. The ordinary cause is a host that
+/// keeps no verdict for a session it is not running — the desktop, whose
+/// persistence does not record a failure — but a pump that registered its
+/// session and then wedged before publishing looks identical from out here,
+/// and so does a push that simply took longer than the budget. Calling any of
+/// those "stopped" would be the verb inventing the one thing it was built to
+/// stop other surfaces inventing: a definite state with no evidence behind
+/// it.
 ///
 /// So the likely reading is offered to the person as a likelihood, and the
 /// machine-readable half says only what was seen.
