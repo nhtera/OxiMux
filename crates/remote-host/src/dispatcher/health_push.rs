@@ -40,22 +40,44 @@ use crate::auth::Peer;
 /// still waits, and the driver's own first publish is forwarded when it comes
 /// even if it says the same thing, which is the confirmation a client wants.
 ///
+/// **Read when there is nothing to attach to, not when the stream is built.**
+/// Between building this and first polling it, a session can come to life —
+/// another device's message opens it — and a storage read done at build time
+/// would then send a verdict that was already out of date, ahead of the live
+/// one, to a subscriber the old code would simply have attached. Asking at
+/// attach time removes that: storage is consulted only in the branch where the
+/// registry has nothing, which is also what keeps an ordinary live subscribe
+/// off the disk.
+///
+/// What remains is the property a late subscriber has always had here: a
+/// session that registers *and* unregisters inside the window leaves no handle
+/// to follow, so the one frame that says a process died is missed and the
+/// verdict stands until something registers again. That is why the frame is a
+/// snapshot rather than a subscription — true when taken, with `liveness`
+/// saying it was taken from storage — and why the reader that exists today
+/// (`oximux status`) takes one frame and leaves rather than holding the
+/// subscription open.
+///
 /// [`SessionCatalog::verdict`]: crate::catalog::SessionCatalog::verdict
 pub(super) fn health_stream(
     registry: Arc<SessionRegistry>,
     catalog: Option<Arc<dyn crate::catalog::SessionCatalog>>,
     session_id: SessionId,
 ) -> BoxStream<'static, Live> {
-    // Only for a session this host is not running: the registry is
-    // authoritative for the rest, and a persisted verdict beside a live one is
-    // a second opinion on a session that already has a publisher.
-    let persisted = registry
-        .get(&session_id)
-        .is_none()
-        .then(|| catalog.and_then(|c| c.verdict(&session_id)))
-        .flatten()
-        .map(|health| Live::Health { session_id: session_id.clone(), health });
-    stream::iter(persisted).chain(follow_live(registry, session_id)).boxed()
+    stream::once(async move {
+        // The registry is authoritative for anything it holds: a persisted
+        // verdict beside a live one is a second opinion on a session that
+        // already has a publisher.
+        if registry.get(&session_id).is_some() {
+            return follow_live(registry, session_id);
+        }
+        let persisted = catalog
+            .and_then(|c| c.verdict(&session_id))
+            .map(|health| Live::Health { session_id: session_id.clone(), health });
+        stream::iter(persisted).chain(follow_live(registry, session_id)).boxed()
+    })
+    .flatten()
+    .boxed()
 }
 
 /// The live half: nothing until a driver publishes, then every readable change.
@@ -272,6 +294,9 @@ mod tests {
     /// authoritative for anything it holds — a persisted verdict beside a
     /// running publisher is a second opinion — and the guard also keeps the
     /// ordinary subscribe off the disk entirely.
+    ///
+    /// Polled before the count is read, because the read is lazy: asserting on
+    /// the count first would pass whatever the live branch did.
     #[tokio::test]
     async fn a_live_session_is_never_answered_from_storage() {
         let registry = Arc::new(SessionRegistry::new());
@@ -283,11 +308,39 @@ mod tests {
 
         let mut stream = health_stream(registry, Some(catalog.clone()), "s-1".into());
 
-        assert_eq!(catalog.reads.load(Ordering::SeqCst), 0, "the disk was not read");
         assert!(
             stream.next().now_or_never().is_none(),
-            "and no frame goes out until its driver publishes one",
+            "no frame goes out until its driver publishes one",
         );
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), 0, "and the disk was not read");
+    }
+
+    /// A session that comes to life between the subscribe and the first look is
+    /// attached to, not answered from storage.
+    ///
+    /// The window is real: another device's message can open a session in the
+    /// moment between this stream being built and the loop first polling it.
+    /// Reading storage at build time sent such a subscriber a verdict that was
+    /// already out of date, ahead of the live one — and to a subscriber the
+    /// code before this path would simply have attached.
+    #[tokio::test]
+    async fn a_session_that_comes_to_life_before_the_first_look_is_not_answered_from_storage() {
+        let registry = Arc::new(SessionRegistry::new());
+        let catalog = Persisted::holding(Some(failed("what the last host left")));
+
+        // Built while nothing is running it...
+        let mut stream = health_stream(registry.clone(), Some(catalog.clone()), "s-1".into());
+        // ...and opened before anything polls it.
+        let _handle = registry.register(
+            "s-1".into(),
+            Arc::new(oximux_agents::thread::StubConnection::default()),
+        );
+
+        assert!(
+            stream.next().now_or_never().is_none(),
+            "the live session is followed, and nothing stale goes out ahead of its publish",
+        );
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), 0, "storage was never asked");
     }
 
     /// Everything the host knows about a session's health reaches the frame.
