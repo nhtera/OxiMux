@@ -1397,3 +1397,79 @@ async fn a_failed_turn_keeps_its_explanation_when_the_process_then_exits() {
         "the explanation, then how it ended — not one in place of the other",
     );
 }
+
+/// The dormant verdict and the pump's own first publish are the same answer
+/// for the same blob, apart from the liveness a live process makes available.
+///
+/// This is the promise `serve::seed` makes, and the only way to hold it is to
+/// ask both. A review read the code and concluded they diverge for a session
+/// cut short mid-turn — that the pump would report a reason the dormant read
+/// drops. It does not: the "restored, not confirmed" wording belongs to the
+/// arm of `classify` where the process is *also* gone, and a resumed session
+/// has one. Both cases are here because an argument about which arm runs is
+/// exactly what a test should replace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dormant_verdict_agrees_with_what_the_pump_publishes_for_the_same_blob() {
+    for (what, failure, was_mid_turn) in [
+        ("a session a restart cut short", None, true),
+        ("a session that died failing", Some("the provider refused".to_string()), false),
+    ] {
+        let registry = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(StubConnection::default());
+        let handle = registry.register("s-1".into(), conn.clone());
+        let db = oximux_storage::open_memory().unwrap();
+        let settings = SettingsRepo::new(db.clone());
+        let (_tx, rx) = std::sync::mpsc::channel();
+
+        let mut seed = ChatBlob::new("s-1".into());
+        seed.entries = vec![oximux_agents::thread::ThreadEntry::User {
+            text: "ship it".into(),
+            images: Vec::new(),
+            checkpoint: None,
+        }];
+        seed.last_failure = failure;
+        seed.mid_turn = was_mid_turn;
+
+        // Read off disk, with nothing running it.
+        let dormant = super::super::seed::verdict("s-1", seed.clone());
+
+        let _pump = start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: Vec::new(),
+                seed,
+                settings: settings.clone(),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                retry: retry_driver(registry.clone(), &settings, &db),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        assert!(
+            wait_until(5_000, || handle.health_published()),
+            "{what}: the pump published",
+        );
+        let live = handle.health();
+
+        assert_eq!(
+            (live.status, live.reason.clone()),
+            (dormant.status, dormant.reason.clone()),
+            "{what}: what the session *is* must not change when something opens it — \
+             otherwise reading it without opening it is worse than not reading it",
+        );
+        assert_eq!(
+            dormant.liveness,
+            oximux_agents::health::Liveness::Unverifiable,
+            "{what}: nothing rebuilt this session, so nothing is unconfirmed — \
+             there is simply nothing that can tell",
+        );
+        assert_eq!(
+            live.liveness,
+            oximux_agents::health::Liveness::RestoredUnconfirmed,
+            "{what}: and the resumed one has a process whose session is not confirmed yet",
+        );
+    }
+}

@@ -315,6 +315,26 @@ mod tests {
         assert_eq!(catalog.reads.load(Ordering::SeqCst), 0, "and the disk was not read");
     }
 
+    /// Storage is read once for the subscribe, however often the stream is
+    /// polled afterwards.
+    ///
+    /// A review read it as a per-poll cost. `stream::once` polls its future to
+    /// completion once and the read lives inside it, so the count settles at
+    /// one — which is what makes a blob load acceptable here at all.
+    #[tokio::test]
+    async fn the_persisted_verdict_is_read_once_however_often_the_stream_is_polled() {
+        let registry = Arc::new(SessionRegistry::new());
+        let catalog = Persisted::holding(Some(failed("agent process exited (code 137)")));
+
+        let mut stream = health_stream(registry, Some(catalog.clone()), "cold-1".into());
+
+        assert!(stream.next().now_or_never().flatten().is_some(), "the verdict");
+        for _ in 0..5 {
+            assert!(stream.next().now_or_never().is_none(), "then it waits for a driver");
+        }
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), 1, "one read, not one per poll");
+    }
+
     /// A session that comes to life between the subscribe and the first look is
     /// attached to, not answered from storage.
     ///

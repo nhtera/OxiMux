@@ -119,6 +119,18 @@ pub trait SessionCatalog: Send + Sync {
     /// question nobody asked, and on a headless host that is a real process
     /// with a real bill. The cost of one persisted read is the intended one.
     ///
+    /// **It is a blocking read on the caller's thread**, like
+    /// [`SessionCatalog::transcript`] beside it: sync by signature, and the
+    /// dispatcher asks it once while handling a subscribe to a session nothing
+    /// is running. For a long transcript that is a large row and a large parse.
+    /// It is tolerated because the same subscribe already loads the same row
+    /// through `transcript` — a second read of it is the same order of cost,
+    /// not a new one — and because it is once per subscribe rather than per
+    /// frame. Making it cheap means taking *both* of this path's storage reads
+    /// off the executor thread, which is a change to the path and not to this
+    /// method; a `spawn_blocking` here alone would leave the larger read
+    /// exactly where it is.
+    ///
     /// Sessions that *are* live must be omitted, exactly as
     /// [`SessionCatalog::dormant`] omits them: the registry is authoritative
     /// for those, and a verdict read off disk beside a running publisher is a

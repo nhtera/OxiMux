@@ -125,6 +125,15 @@ pub fn verdict(session_id: &str, blob: ChatBlob) -> oximux_agents::health::Sessi
     // What the restart left behind is still read: the failure, the owed note,
     // the held queue. Those are facts about the session, and they are what
     // this answer is for.
+    //
+    // A session a restart cut short therefore reads `Idle` with the note owed,
+    // and that is deliberate rather than a gap. Calling it `Interrupted` needs
+    // `prior_host_gone` — the claim that the previous host's processes are
+    // provably gone — which only the won host lock and its record can say, and
+    // this reader has neither (F14 owns the proof). The pump refuses the same
+    // claim for the same reason, so both say `Idle`; the owed note is what
+    // tells a person a turn was cut short, and it is the fact that was
+    // actually recorded.
     track.restored = None;
     compute(
         &inputs_from(
@@ -250,6 +259,24 @@ mod tests {
              reporting these as waiting would invite a wait that never ends",
         );
         assert!(v.recovery_note_owed, "the restart cut a turn short and nothing has sent the note");
+    }
+
+    /// A session a restart cut short, with nothing else to say about it.
+    ///
+    /// `Idle` is the deliberate answer: `Interrupted` would need the host-lock
+    /// proof neither this reader nor the pump has, so what a person gets is the
+    /// owed note — the fact that *was* recorded, and the one that changes what
+    /// their next message does.
+    #[test]
+    fn a_session_a_restart_cut_short_reads_idle_with_the_note_owed() {
+        let mut blob = with_history("s-1");
+        blob.mid_turn = true;
+
+        let v = verdict("s-1", blob);
+
+        assert_eq!((v.status, v.liveness), (HealthStatus::Idle, Liveness::Unverifiable));
+        assert!(v.recovery_note_owed, "which is what says a turn was cut short");
+        assert_eq!(v.held_restored, 0, "and it was holding nothing");
     }
 
     /// A session with no history behind it was never interrupted by anything,
