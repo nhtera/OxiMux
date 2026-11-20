@@ -29,9 +29,6 @@ const PLAN_REFUSED: &str = "Leaving plan mode needs you: this turn was started b
 /// What the transcript says when held child events go out with a message.
 const HELD_EVENTS_NOTE: &str = "Child events that arrived after the Stop went with this message.";
 
-/// How long after its turn ended a steered line may take to start (or be
-/// reported dropped) before the chat stops waiting for it.
-const STEER_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the transcript says when a Stop takes back a line the user steered.
 const STEER_TAKEN_BACK: &str = "The Stop took back a message the agent had not started on; it is queued again below.";
@@ -148,7 +145,7 @@ impl AgentChatView {
             // Backstop: a steered line that neither starts nor is reported
             // dropped would otherwise hold the chat's queue forever.
             cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(STEER_START_WITHIN).await;
+                cx.background_executor().timer(oximux_agents::send_gate::STEER_START_WITHIN).await;
                 let _ = this.update(cx, |view, _cx| view.give_up_on_steers());
             })
             .detach();

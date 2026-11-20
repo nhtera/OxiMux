@@ -29,6 +29,15 @@ use std::sync::Arc;
 use crate::thread::entry::ChatImage;
 use uuid::Uuid;
 
+/// How long after its turn ended a steered line may take to start (or be
+/// reported dropped) before its session stops waiting for it.
+///
+/// The backstop both hosts need: a line the agent neither starts nor reports
+/// dropped would otherwise hold the queue for good, because an unstarted steer
+/// keeps the turn open by design. Shared, because a host that waited longer
+/// than the other would hold a queue the other had already released.
+pub const STEER_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Why an item is not going out right now. Shown on its chip, so "why isn't
 /// this sending?" always has an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

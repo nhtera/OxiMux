@@ -1122,6 +1122,21 @@ impl SessionHandle {
         self.conn().cancel()
     }
 
+    /// Take back the lines the agent has not started on, then interrupt.
+    ///
+    /// Answers with the ids the backend confirms it removed from its own
+    /// queue, which is **not** every id passed: a line the agent had already
+    /// picked up stays. Reporting that one unsent would deliver it twice — the
+    /// outbox would hand it to the drainer again while the agent runs it
+    /// anyway — so a caller settles only what comes back and keeps tracking
+    /// the rest.
+    ///
+    /// Blocking, like [`Self::cancel_backend`]: the backend's reply is awaited
+    /// briefly.
+    pub fn stop_turn(&self, unstarted: &[String]) -> Result<Vec<String>> {
+        self.conn().stop_turn(unstarted)
+    }
+
     /// The current connection, cloned out so no lock is held across a backend call
     /// (those can block, and a swap must never wait behind one).
     fn conn(&self) -> Arc<dyn AgentConnection> {

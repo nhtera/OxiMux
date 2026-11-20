@@ -600,6 +600,12 @@ pub struct StubConnection {
     /// so a test can tell that a Stop reached the agent without disturbing any
     /// assertion about what was written to it.
     cancels: Arc<std::sync::atomic::AtomicUsize>,
+    /// Ids the backend was asked to take back, in order.
+    stopped: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Whether it confirms taking them back. False by default, which is the
+    /// honest stand-in for a backend that answers nothing: a caller must then
+    /// keep tracking the line, because it may still run.
+    takes_back: bool,
 }
 
 /// Read `child`'s exit code without blocking (`128 + signal` when a signal
@@ -698,6 +704,18 @@ impl StubConnection {
         self.cancels.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The ids a Stop asked this backend to take back.
+    pub fn stopped(&self) -> Vec<String> {
+        self.stopped.lock().unwrap().clone()
+    }
+
+    /// Make the stub confirm every id it is asked to take back, as a backend
+    /// that dequeued them does.
+    pub fn with_take_back(mut self) -> Self {
+        self.takes_back = true;
+        self
+    }
+
     /// The JSON payloads that were written to the agent's stdin, in order.
     pub fn sent(&self) -> Vec<Value> {
         self.sent.lock().map(|g| g.clone()).unwrap_or_default()
@@ -748,6 +766,15 @@ impl AgentConnection for StubConnection {
     }
     fn reports_receipts(&self) -> bool {
         self.receipts
+    }
+
+    /// Records what it was asked to take back, then answers as configured: a
+    /// stub that confirms nothing is the default, because that is what a
+    /// backend with no mid-turn queue does.
+    fn stop_turn(&self, unstarted: &[String]) -> Result<Vec<String>> {
+        self.stopped.lock().unwrap().extend(unstarted.iter().cloned());
+        self.cancel()?;
+        Ok(if self.takes_back { unstarted.to_vec() } else { Vec::new() })
     }
     /// Counted, not recorded: a test asks whether the Stop reached the agent.
     fn cancel(&self) -> Result<()> {

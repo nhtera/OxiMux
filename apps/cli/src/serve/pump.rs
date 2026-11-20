@@ -13,7 +13,7 @@ use oximux_agent_core::thread::ThreadEvent;
 use oximux_agents::session_registry::{RemotePrompt, SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::health::Process;
 use oximux_agents::health_track::{HealthExtras, HealthTrack, inputs_from};
-use oximux_agents::send_gate::{Holds, Ready, SendGate, SendSource};
+use oximux_agents::send_gate::{DeliveryMode, Holds, Ready, SendGate, SendSource, STEER_START_WITHIN};
 use oximux_agents::thread::{ChatThread, TaskStatus};
 use oximux_storage::SettingsRepo;
 
@@ -243,6 +243,9 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
 
         let mut retry_changed = retry.subscribe();
         let mut save_tick = tokio::time::interval(SAVE_INTERVAL);
+        // When a turn ended leaving steered lines nothing has answered for.
+        // `None` while there are none to wait on.
+        let mut steers_waiting_since: Option<std::time::Instant> = None;
         save_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // A relay arm whose sender is gone returns `Ready(None)` on every poll —
         // the select then spins hot (the 900%-CPU class a `biased` reorder once
@@ -401,13 +404,23 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
                     persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
                 _ = save_tick.tick() => {
+                    // The backstop for a steered line the agent never answered
+                    // for: it keeps the turn open by design, so without this it
+                    // would hold the queue for good. Checked on the tick that
+                    // already runs rather than on a timer of its own, so the
+                    // wait is `STEER_START_WITHIN` rounded up to a tick.
+                    if steers_waiting_since
+                        .is_some_and(|since: std::time::Instant| since.elapsed() >= STEER_START_WITHIN)
+                    {
+                        give_up_on_steers(&pump, &fold);
+                        steers_waiting_since = None;
+                    }
                     // Republished, not only saved. A message pushed into a
                     // held gate wakes nobody — the gate's waker fires when
                     // something *can* go, which is a contract its own tests
                     // name — so without this the `queued` count a client
                     // reads stays at its last published value for as long as
                     // the hold lasts. This bounds that at one tick.
-                    fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
                     publish_state(&pump, &fold, &mut track, fold.turn_active, Process::Live);
                     persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
@@ -449,12 +462,27 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
             // hold lifting, which the gate's waker never reports. Both halves
             // are needed, and the push half alone is the bug where a child's
             // events sit in the gate until something unrelated arrives.
+            // Saved only when the flush itself changed the transcript — a
+            // steered line entering the fold, or a write that folded one.
+            // `ChatThread::apply` bumps the revision for *every* event, so a
+            // save made unconditionally here would serialize the whole
+            // transcript to SQLite on every streamed fragment; the ten-second
+            // tick is what covers the rest.
+            let before = fold.revision();
             flush(&pump, &mut fold);
-            // A steered line enters the fold outside every arm above, and a
-            // line leaving the queue changes what a restart would find: both
-            // are saves this loop would otherwise not make until the next
-            // event or save tick.
-            persist.maybe_save(&handle, &mut blob, &fold, &track);
+            if fold.revision() != before {
+                persist.maybe_save(&handle, &mut blob, &fold, &track);
+            }
+            // The clock for the backstop above: it runs from the moment a turn
+            // ends with lines still unanswered for, and stops as soon as the
+            // gate has none.
+            let awaiting = handle.gate().is_some_and(|g| g.lock().unwrap().awaiting_steer());
+            steers_waiting_since = match (awaiting, fold.turn_active, steers_waiting_since) {
+                (false, _, _) => None,
+                (true, true, _) => None,
+                (true, false, Some(since)) => Some(since),
+                (true, false, None) => Some(std::time::Instant::now()),
+            };
         }
         // Writes go direct again from here: a gate with no one draining it
         // would swallow every later send in silence.
@@ -657,6 +685,85 @@ fn steer_into_the_turn(pump: &Pump<'_>, fold: &mut ChatThread) {
     }
 }
 
+/// What became of a line written into a running turn, as the agent reports it.
+///
+/// **Without this a steered line is never released.** `steer_queued` leaves it
+/// in the gate's `unstarted`, which keeps the turn open on purpose — the line
+/// may still begin a turn of its own — and only a receipt, a Stop or the
+/// backstop below takes it out again. Serve had no receipt handler at all, so
+/// the first steer held the session's queue for good: every later line, a
+/// person's message included, read `Busy` until a Stop or a restart. The
+/// desktop's `note_receipt` is the same three answers; this is its half.
+fn note_receipt(pump: &Pump<'_>, fold: &mut ChatThread, event: &ThreadEvent) {
+    let gate = pump.gate;
+    match event {
+        // The agent will not run it. Its outbox rows go back to the drainer,
+        // which delivers them again — a dropped line must not be lost, and
+        // serve's own steers carry no text of their own (it lives in the
+        // outbox), so reporting it unsent is what returns them.
+        ThreadEvent::UserMessageDropped { uuid } => {
+            let mut gate = gate.lock().unwrap();
+            match gate.take_steered(uuid) {
+                Some(Some(steer)) => {
+                    gate.push(steer.text, Vec::new(), steer.source, DeliveryMode::Queue, None);
+                }
+                Some(None) => {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(uuid) {
+                        gate.report_sent(uuid, false);
+                    }
+                }
+                None => {}
+            }
+        }
+        // It started. If no turn is running, this line *is* the turn now: the
+        // gate is told so, and the fold with it, or the next send would go out
+        // beside a turn this one just opened.
+        ThreadEvent::UserMessageAccepted { uuid } => {
+            let mut gate = gate.lock().unwrap();
+            if let Some(source) = gate.note_accepted(uuid)
+                && !fold.turn_active
+            {
+                gate.begin_turn(source);
+                drop(gate);
+                fold.turn_active = true;
+            }
+        }
+        ThreadEvent::UserMessagesDelivered { uuids } => {
+            let mut gate = gate.lock().unwrap();
+            for uuid in uuids {
+                gate.note_accepted(uuid);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Stop waiting for steered lines the agent never answered for.
+///
+/// The backstop [`STEER_START_WITHIN`] exists for: a line that neither starts
+/// nor is reported dropped holds the queue for good otherwise, because an
+/// unstarted steer keeps the turn open by design. Only once no turn is running
+/// — a turn still going may yet reach it.
+fn give_up_on_steers(pump: &Pump<'_>, fold: &ChatThread) {
+    if fold.turn_active {
+        return;
+    }
+    let mut gate = pump.gate.lock().unwrap();
+    for (uuid, steer) in gate.take_unstarted() {
+        tracing::warn!(
+            session = pump.session_id,
+            %uuid,
+            "a steered line was never started or dropped; no longer waiting for it",
+        );
+        match steer {
+            Some(steer) => {
+                gate.push(steer.text, Vec::new(), steer.source, DeliveryMode::Queue, None);
+            }
+            None => gate.report_sent(uuid, false),
+        }
+    }
+}
+
 /// Interrupt the turn, for a Stop that came from somewhere else.
 ///
 /// A Stop from a phone or the CLI reaches `SessionHandle::cancel`, which hands
@@ -687,23 +794,45 @@ fn withdraw(gate: &Mutex<SendGate>, line: Option<uuid::Uuid>) {
 
 fn stop_the_turn(pump: &Pump<'_>) {
     let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
-    // A steered line the agent has not started on is taken back here. It is
-    // reported **unsent**, which hands the outbox rows it carried back to the
-    // drainer to deliver again — the alternative, reporting it sent, would
-    // lose a child's event to a Stop that never delivered it. Serve offered no
-    // steering until the gate learned the backend's own answer, so this used
-    // to be unreachable; it is the path every steered line takes now.
-    {
-        let mut gate = gate.lock().unwrap();
-        let unstarted = gate.take_unstarted();
-        for (uuid, _) in unstarted {
-            tracing::warn!(session = session_id, %uuid, "a line written into the stopped turn was dropped");
-            gate.report_sent(uuid, false);
+    // The lines written into this turn that the agent has not started on are
+    // asked back from the *backend* before the interrupt, not merely forgotten
+    // here. `stop_turn` dequeues them there and answers with the ones it
+    // actually removed — and that is the point: a line the agent had already
+    // picked up is not in the answer, and reporting that one unsent would
+    // deliver it twice, once by the agent running it after the Stop and once
+    // by the drainer handing its rows out again.
+    let unstarted = gate.lock().unwrap().take_unstarted();
+    if unstarted.is_empty() {
+        // Nothing to take back: the plain interrupt.
+        if let Err(err) = handle.cancel_backend() {
+            tracing::warn!(%err, session = session_id, "a Stop could not interrupt the turn");
         }
+        return;
     }
+    let ids: Vec<String> = unstarted.iter().map(|(uuid, _)| uuid.to_string()).collect();
     // The gate's lock is not held across the backend call, as nothing here is.
-    if let Err(err) = handle.cancel_backend() {
+    let taken = handle.stop_turn(&ids).unwrap_or_else(|err| {
         tracing::warn!(%err, session = session_id, "a Stop could not interrupt the turn");
+        Vec::new()
+    });
+    let mut gate = gate.lock().unwrap();
+    for (uuid, steer) in unstarted {
+        if !taken.contains(&uuid.to_string()) {
+            // Not confirmed taken back: it may still run, so it stays tracked
+            // rather than being handed back to anyone.
+            gate.note_steered(uuid, steer);
+            continue;
+        }
+        match steer {
+            // A line somebody steered by hand goes back into the queue, held
+            // like its sender's messages are. Serve has no composer to return
+            // it to, which is the one place the desktop differs.
+            Some(steer) => {
+                gate.push(steer.text, Vec::new(), steer.source, DeliveryMode::Queue, None);
+            }
+            // A child's event: its rows go back to the drainer.
+            None => gate.report_sent(uuid, false),
+        }
     }
 }
 
@@ -869,6 +998,9 @@ fn apply(
         // A host-synthesized event (an operator-edited approval) is this
         // process talking to itself, and proves nothing about the agent.
         stand_in_for_a_missing_receipt(handle, gate, event);
+        // And the mirror, for the backends that do send one: a steered line
+        // stays tracked until its receipt says what became of it.
+        note_receipt(pump, fold, event);
     }
     fold.apply(event);
     track.note_event(event, oximux_agents::session_health::now_ms());
