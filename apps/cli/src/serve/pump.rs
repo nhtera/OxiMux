@@ -13,7 +13,7 @@ use oximux_agent_core::thread::ThreadEvent;
 use oximux_agents::session_registry::{RemotePrompt, SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::health::Process;
 use oximux_agents::health_track::{HealthExtras, HealthTrack, inputs_from};
-use oximux_agents::send_gate::{Holds, SendGate, SendSource};
+use oximux_agents::send_gate::{Holds, Ready, SendGate, SendSource};
 use oximux_agents::thread::{ChatThread, TaskStatus};
 use oximux_storage::SettingsRepo;
 
@@ -449,7 +449,12 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
             // hold lifting, which the gate's waker never reports. Both halves
             // are needed, and the push half alone is the bug where a child's
             // events sit in the gate until something unrelated arrives.
-            flush(&pump);
+            flush(&pump, &mut fold);
+            // A steered line enters the fold outside every arm above, and a
+            // line leaving the queue changes what a restart would find: both
+            // are saves this loop would otherwise not make until the next
+            // event or save tick.
+            persist.maybe_save(&handle, &mut blob, &fold, &track);
         }
         // Writes go direct again from here: a gate with no one draining it
         // would swallow every later send in silence.
@@ -523,11 +528,20 @@ fn fold_queued_sends(
 /// The lock is dropped before the write. It is the lock a `send_prompt` from
 /// any thread takes, and the write is a pipe write to a child process; the
 /// drainer also takes it on every pass.
-fn flush(pump: &Pump<'_>) {
+fn flush(pump: &Pump<'_>, fold: &mut ChatThread) {
     let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
     if gate.lock().unwrap().take_stop_request() {
         withdraw(gate, pump.retry.on_stopped(session_id));
         stop_the_turn(pump);
+        return;
+    }
+    // A line that may go *into* the running turn goes before any that would
+    // start one, and it goes a different way. Taken by the write below it
+    // would be an ordinary prompt: a second turn on work the first is already
+    // doing, which is the duplication steering exists to avoid — and the thing
+    // the matrix's steer rows assert does not happen.
+    if gate.lock().unwrap().ready() == Ready::Steer {
+        steer_into_the_turn(pump, fold);
         return;
     }
     loop {
@@ -610,6 +624,39 @@ fn flush(pump: &Pump<'_>) {
     }
 }
 
+/// Write one line into the turn that is already running.
+///
+/// Deliberately **not** the write path in [`flush`]. That path starts a turn:
+/// it opens one in the gate, carries the restart's note ahead of the first
+/// line to leave, and counts toward the turn ids a client dedupes on. None of
+/// that applies to a line the running turn will fold at its next tool
+/// boundary — spike S5.5 (resolved 2026-10-24) settled that Claude does fold
+/// one there, and reports it with a `command_lifecycle` receipt.
+///
+/// The desktop's own arm does the same three things through the same shared
+/// step (`session_registry::steer_queued`): write under the queued item's
+/// uuid, report the write to the gate, and leave a written line unstarted
+/// until its receipt.
+fn steer_into_the_turn(pump: &Pump<'_>, fold: &mut ChatThread) {
+    let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
+    let Some(item) = gate.lock().unwrap().take_steerable() else { return };
+    match handle.steer_queued(&item.text, item.uuid) {
+        Ok(()) => {
+            // In the transcript at the point the agent takes it in; the turn's
+            // remaining output lands after it. Without this a child's event
+            // would change a turn's course and leave no trace of why — and the
+            // persisted history a client reads would not have it at all.
+            fold.push_user_message(&item.text);
+        }
+        Err(err) => {
+            // `steer_queued` has already handed the line back to whoever
+            // queued it, so there is nothing to retry here: its outbox rows
+            // return to the drainer, which delivers them again.
+            tracing::warn!(%err, session = session_id, "a line could not be steered into the running turn");
+        }
+    }
+}
+
 /// Interrupt the turn, for a Stop that came from somewhere else.
 ///
 /// A Stop from a phone or the CLI reaches `SessionHandle::cancel`, which hands
@@ -640,10 +687,12 @@ fn withdraw(gate: &Mutex<SendGate>, line: Option<uuid::Uuid>) {
 
 fn stop_the_turn(pump: &Pump<'_>) {
     let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
-    // Serve never offers steering (`steer_supported` is false in every
-    // publish), so no line is ever waiting to be taken back. One that was
-    // would be lost rather than retried, so it is reported unsent — which
-    // gives the outbox rows it carried back to the drainer.
+    // A steered line the agent has not started on is taken back here. It is
+    // reported **unsent**, which hands the outbox rows it carried back to the
+    // drainer to deliver again — the alternative, reporting it sent, would
+    // lose a child's event to a Stop that never delivered it. Serve offered no
+    // steering until the gate learned the backend's own answer, so this used
+    // to be unreachable; it is the path every steered line takes now.
     {
         let mut gate = gate.lock().unwrap();
         let unstarted = gate.take_unstarted();
@@ -709,11 +758,34 @@ fn publish_state(
             ..HealthExtras::default()
         },
     ));
+    // Read before the gate's lock, so nothing is held across a call into the
+    // connection.
+    //
+    // **The same three answers the desktop gives** (`send_gate_link.rs`:
+    // `sync_gate_holds`), from the same facts: a child's event is steered into
+    // a running turn only by an agent that reports, per line, that it started
+    // on it — without that receipt a Stop could not take the line back and it
+    // would be lost rather than retried — and only when the backend advertises
+    // steering. `SessionHandle::reports_receipts` is the connection's own
+    // answer, which this pump already asks twice elsewhere; the desktop reads
+    // the equivalent off the transport. Spike S5.5 (resolved 2026-10-24)
+    // settled the rest: Claude folds a mid-turn line at the next tool
+    // boundary, and `command_lifecycle` is the receipt that says so.
+    let steer_supported = handle.reports_receipts() && handle.capabilities().supports_steer;
+    // Whether the agent has said anything since the latest prompt — the shared
+    // rule, so the two hosts answer it from the same entries. It decides
+    // whether a steered line may still enter *this* turn: once there is
+    // output, the fold boundary this line would have taken has passed.
+    let turn_started = oximux_agents::retry::turn_had_output(&fold.entries);
     // The gate holds on the same facts. Its waker fires when something is
     // pushed, never when a hold lifts, so whoever updates the holds is also
     // the one that has to look again — see `flush`.
-    gate.lock().unwrap().set_holds(Holds {
-        turn_active: working,
+    let mut gate = gate.lock().unwrap();
+    // A steered line not yet started may still run as a turn of its own:
+    // until it starts, the turn is not over.
+    let awaiting_steer = gate.awaiting_steer();
+    gate.set_holds(Holds {
+        turn_active: working || awaiting_steer,
         // Serve has no Stop of its own yet (F7's `Cancel`), so `interrupted`
         // stays false rather than guessed, as in the health facts above.
         interrupted: false,
@@ -723,10 +795,8 @@ fn publish_state(
         disconnected: matches!(process, Process::Dormant),
         prompt_pending: fold.pending_permission().is_some() || fold.pending_question().is_some(),
         failed: track.holds_queue(),
-        turn_started: false,
-        // Queue-only: a steered line needs an agent that reports what it
-        // started on, so a Stop can take it back. Spike S5.5 owns that.
-        steer_supported: false,
+        turn_started,
+        steer_supported,
     });
 }
 

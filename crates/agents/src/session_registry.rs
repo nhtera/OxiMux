@@ -397,6 +397,38 @@ pub struct SessionHandle {
     screenshots: Mutex<ScreenshotFilter>,
 }
 
+/// Write a line the gate chose for steering, and tell the gate how it went.
+///
+/// Free rather than a method because the two hosts hold different things: the
+/// headless pump has a [`SessionHandle`] (and reaches this through
+/// [`SessionHandle::steer_queued`]), while the desktop's chat view holds the
+/// connection and the gate directly. One body either way — the serve matrix
+/// asserts these two agree, and it would be asserting two readings otherwise.
+///
+/// Not neutralized, unlike [`SessionHandle::steer_from`]: a steerable item is
+/// a rendered envelope whose event tag is genuine, and escaping it here would
+/// mangle the thing the agent is meant to read.
+pub fn steer_queued(
+    conn: &dyn crate::thread::AgentConnection,
+    gate: &std::sync::Mutex<crate::send_gate::SendGate>,
+    text: &str,
+    uuid: uuid::Uuid,
+) -> Result<()> {
+    // Written before the gate is touched, so the lock is never held across a
+    // call into the backend.
+    let sent = conn.steer_tagged(text, &uuid.to_string());
+    let mut gate = gate.lock().unwrap();
+    // Either way: a line that failed goes back to whoever queued it rather
+    // than being lost.
+    gate.report_sent(uuid, sent.is_ok());
+    if sent.is_ok() {
+        // Left unstarted until its receipt, which is the window a Stop can
+        // take it back in.
+        gate.note_steered(uuid, None);
+    }
+    sent
+}
+
 impl SessionHandle {
     /// Assign the next `seq`, append to the backlog (dropping the oldest past the
     /// cap), fan out to live subscribers, and refresh the status snapshot. Returns
@@ -1012,6 +1044,32 @@ impl SessionHandle {
         conn.steer_tagged(&text, &uuid.to_string()).inspect_err(|_| {
             gate.lock().unwrap().take_steered(&uuid.to_string());
         })
+    }
+
+    /// Write a line the gate chose for steering into the turn already running.
+    ///
+    /// **The queued item's own uuid is kept.** Its outbox rows are keyed to it
+    /// and the receipt that says the agent started on it arrives under that id
+    /// (`command_lifecycle`), so minting a fresh one — as [`Self::steer_from`]
+    /// must, for a line that was never queued — would orphan both: the rows
+    /// would never settle and a Stop could not find the line to take back.
+    ///
+    /// Reports the write to the gate either way. A line that failed goes back
+    /// to whoever queued it rather than being lost; a written one stays in
+    /// `unstarted` until its receipt, which is the window a Stop can take it
+    /// back in.
+    ///
+    /// Shared because both hosts do exactly this, and the one place parity is
+    /// asserted (the serve matrix's steer rows) would be asserting two
+    /// readings of it otherwise.
+    pub fn steer_queued(&self, text: &str, uuid: uuid::Uuid) -> Result<()> {
+        let conn = self.conn();
+        match self.gate() {
+            Some(gate) => steer_queued(&*conn, &gate, text, uuid),
+            // No gate: nothing chose this line for steering, so there is
+            // nothing to report back to. Write it and say how it went.
+            None => conn.steer_tagged(text, &uuid.to_string()),
+        }
     }
 
     /// Run `f` — the handoff of one backend event towards whatever folds it — with

@@ -331,12 +331,11 @@ impl AgentChatView {
         };
         // Child output goes into this turn: treat it as one nobody watches.
         self.screen_control.begin_remote_turn();
-        let sent = conn.steer_tagged(&item.text, &item.uuid.to_string());
-        let mut gate = self.send_gate.lock().unwrap();
-        gate.report_sent(item.uuid, sent.is_ok());
-        if sent.is_ok() {
-            gate.note_steered(item.uuid, None);
-            drop(gate);
+        // The write, the gate's receipt bookkeeping and the `unstarted` note
+        // are one shared step, so the headless host cannot drift from this.
+        let steered =
+            oximux_agents::session_registry::steer_queued(&*conn, &self.send_gate, &item.text, item.uuid);
+        if steered.is_ok() {
             // Shown where the agent takes it in, like a steer typed here.
             self.thread.push_user_message(&item.text);
             self.follow_bottom();
