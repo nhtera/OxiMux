@@ -675,6 +675,15 @@ fn steer_into_the_turn(pump: &Pump<'_>, fold: &mut ChatThread) {
             // would change a turn's course and leave no trace of why — and the
             // persisted history a client reads would not have it at all.
             fold.push_user_message(&item.text);
+            // And to whoever is watching the stream, for the same reason
+            // `write_prompt_now` ingests one: no backend echoes the user's own
+            // half, so a subscriber would see the turn change course with
+            // nothing in the events that caused it. After the write, so a
+            // steer that failed leaves no bubble implying the agent got it.
+            handle.ingest(ThreadEvent::UserMessage {
+                text: item.text.clone(),
+                images: Vec::new(),
+            });
         }
         Err(err) => {
             // `steer_queued` has already handed the line back to whoever

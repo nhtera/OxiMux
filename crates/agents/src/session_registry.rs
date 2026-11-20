@@ -408,6 +408,12 @@ pub struct SessionHandle {
 /// Not neutralized, unlike [`SessionHandle::steer_from`]: a steerable item is
 /// a rendered envelope whose event tag is genuine, and escaping it here would
 /// mangle the thing the agent is meant to read.
+///
+/// **Publishing the user's half is the caller's**, as its local fold is: the
+/// desktop pushes it into the thread its view renders, and the headless host
+/// both folds it and ingests it for remote subscribers (nothing echoes the
+/// user's own message, so a subscriber would otherwise see a turn change
+/// course with nothing that caused it).
 pub fn steer_queued(
     conn: &dyn crate::thread::AgentConnection,
     gate: &std::sync::Mutex<crate::send_gate::SendGate>,

@@ -1820,6 +1820,18 @@ async fn a_receipt_releases_the_steered_line_and_the_queue_moves_again() {
         conn.sent(),
     );
     let uuid = conn.sent()[0]["uuid"].as_str().expect("tagged").to_string();
+    // A subscriber sees what caused the turn to change course. No backend
+    // echoes the user's own half, so without the ingest the stream shows the
+    // agent reacting to nothing.
+    assert!(
+        handle
+            .events_since(0)
+            .iter()
+            .any(|(_, event)| {
+                matches!(event, ThreadEvent::UserMessage { text, .. } if text == "a child finished")
+            }),
+        "the steered line reached the event stream",
+    );
 
     // The agent says it started on it, and the turn then ends.
     tx.send(ThreadEvent::UserMessageAccepted { uuid: uuid.clone() }).unwrap();
