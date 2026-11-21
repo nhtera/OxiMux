@@ -1207,8 +1207,9 @@ halves are cited separately: `delivery_v37.rs` proves the contract over the \
 wire, `send_receipts_tests.rs` proves the store underneath it, which is where \
 "across a host restart" actually lives (a new host marks what another left \
 pending unknown rather than resending it). Released-CLI against a desktop host \
-is not in CI (the wire-skew job runs the release against `serve`, which has no \
-host core)."""
+is not in CI: the wire-skew job runs the release against `serve`, so the host \
+nothing exercises over the wire is the desktop app's own, not a missing core — \
+`serve` builds a `HostCore` of its own in `apps/cli/src/serve/host.rs`."""
 test_files = [
   "crates/remote-host/tests/delivery_v37.rs",
   "apps/cli/src/commands/send.rs",
@@ -1236,9 +1237,11 @@ A queued child event leaves the outbox only on an observed acceptance: the \
 write itself consumes nothing, and nothing moves a delivered row back. A line \
 written to the agent with no proof reads Unconfirmed, is never claimed again \
 and is never resent, while a receipt that arrives late still settles it. A \
-line deliberately taken back — a Stop, a parent that closed, a host taken \
-over — returns to pending and goes out under a new key, because the agent has \
-already seen the old one."""
+line deliberately taken back returns to pending, and whether it keeps its \
+key depends on what the agent already saw. A Stop, or a turn interrupted after \
+the line went in, goes out under a new key, because the agent has seen the old \
+one. A host taken over keeps the same key for a row it never wrote: the key is \
+derived from the rows and their attempt count, and a takeover raises neither."""
 oracle = """
 Drive one batch through write, accept and deliver, asserting that no step \
 before acceptance consumes the row and no step after delivery moves it back; \
@@ -1253,9 +1256,13 @@ agent repeating itself."""
 platforms = ["macos", "windows", "linux"]
 covered_platforms = ["macos"]
 coverage_notes = """
-macOS only: the Linux job cargo-checks `oximux-agents` and `oximux-remote-host` \
-without running them, and the Windows job tests a fixed crate list that \
-excludes both. The two layers are covered separately — `outbox_tests.rs` \
+macOS is where both halves run at once. The Linux job cargo-checks \
+`oximux-agents` and `oximux-remote-host` without running them. Windows runs \
+the store half: its blocking `cargo test --workspace --lib` sweep reaches \
+`outbox_tests.rs`, an ordinary `#[cfg(test)]` module in the crate. What it \
+cannot reach is `child_events.rs`, an integration target under `tests/`, which \
+a `--lib` sweep skips by construction — so the claim stays at macOS, the only \
+platform that runs both layers. The two layers are covered separately — `outbox_tests.rs` \
 drives the `Outbox` store directly, `child_events.rs` runs the same contract \
 through the drainer, whose consume point is the `UserMessageAccepted` arm of \
 `crates/remote-host/src/outbox_drainer.rs`. Serve is covered by construction \
@@ -1295,7 +1302,9 @@ holding queued sends: the queue comes back held, nothing in it having reached \
 the agent, and the next message carries the restart note once. A provider \
 killed between turns: Failed within five seconds with the exit's own reason, \
 and still Failed after the host restarts. A rate-limit event: the queue holds, \
-nothing is spent, and it drains by itself when the window lifts. `kill -9` \
+nothing is spent, and once the window lifts the queue can move again — one \
+line per push rather than a flush, since nothing wakes a held pump but the \
+next send. `kill -9` \
 between a line written to the agent and its echo: the row reads unconfirmed, \
 is never claimed again and is never resent, while a receipt arriving later \
 still settles it. A second host against a live data directory: refused, naming \
@@ -1327,7 +1336,10 @@ turns, a second serve against a live host (exit 6, incumbent untouched), and a \
 held lock whose record was first garbled and then missing. Three were not \
 reachable in that run: quit + relay kill, because the run set \
 `OXIMUX_RELAY_BINARY=/nonexistent` and had no terminals at all; the rate-limit \
-row, which needs a real usage window or a fake provider that emits the event; \
+row, which needs a real usage window or a fake provider that emits the event, \
+and whose assertion is the weakest cited here: it holds the queue and shows \
+the hold lifting, but it wakes the pump with another send, so an unattended \
+drain is asserted nowhere; \
 and the `kill -9` between a write and its echo, which needs the kill inside \
 that window and so wants an agent that stalls after reading a line. Each of \
 those three has an assertion here: what they lack is a real host, not a test. \
@@ -1343,9 +1355,15 @@ holder's start time beside its pid. The desktop half of the drill is owed and \
 belongs to phase 3's step 7; the relay respawn that a quit + relay kill ends \
 in lives in the desktop's relay lifecycle and is drilled there, so what is \
 cited here is the restore contract it depends on. The platform claim stays at \
-macOS deliberately: `pump_tests.rs` does also run in the Linux job (`cargo \
-test -p oximux-cli`), but the lock, outbox and checkpoint files run only in \
-the macOS all-targets job, and the drill itself was macOS."""
+macOS because the drill was macOS — not because the assertions are. Every file \
+cited here also runs in the Windows job: `cargo test -p oximux-cli` runs the \
+pump tests there and in the Linux job too (the CLI is a bin with no lib \
+target, so the sweep below is not what reaches them), the blocking `cargo test \
+--workspace --lib` sweep runs the lock and outbox tests, and \
+`checkpoint_lifecycle` has a Windows step of its own. That sweep is in fact \
+where the lock's Windows-only failure to read its own holder pid was caught, \
+so no one should plan platform work here that CI already does. What is \
+macOS-only is the drill."""
 test_files = [
   "apps/cli/src/serve/pump_tests.rs",
   "crates/agents/src/outbox_tests.rs",
