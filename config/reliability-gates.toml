@@ -1127,7 +1127,11 @@ a user Stop, the host lock proving the previous host is gone); with no process \
 to ask it is Unverifiable, never Failed. Silence marks a working session \
 stalled and never ends it: a quiet continuation stays Working, so its lineage \
 slot is not freed. A dead agent reaches its chat, and that last state reaches \
-health subscribers even though the session closes on the same tick."""
+health subscribers even though the session closes on the same tick. A restored \
+row says which of three things it is and no more: Unverifiable when nothing \
+can tell, RestoredUnconfirmed when a rebuild is all there is, Exited only with \
+a proof — and reading a session off disk without opening it returns the same \
+status and reason as opening it does."""
 oracle = """
 The pure derivation is asked the dormant, silent, stopped-then-exited and \
 quiet-continuation cases; a killed Codex app-server must close the event \
@@ -1144,13 +1148,20 @@ Windows job tests a fixed crate list. Live-checked on the desktop host \
 2026-11-04 (kill -9 → Failed code 137 in < 1 s; Stop → Interrupted; a quiet \
 95 s command → stalled, then cleared; quit mid-turn → Interrupted on \
 relaunch). The push is bound to one handle generation, as the event stream \
-is; re-follow after a respawn is not covered."""
+is; re-follow after a respawn is not covered. The restored-word half is \
+asserted twice over: on the pure derivation, and — added in phase 4b PR 12 — \
+against a real `serve` host, where the dormant read and the pump's publish are \
+compared for the same blob. That one assertion lives in `oximux-cli`, which \
+the Linux job does run, so it is the only line here with coverage beyond \
+macOS; the gate stays claimed at macOS because the rest of it has none."""
 test_files = [
   "crates/agents/src/health_tests.rs",
   "crates/agents/src/session_health_tests.rs",
   "crates/agent-core/src/thread/stream_json_bracket_tests.rs",
   "crates/agents/src/thread/codex/mod.rs",
   "crates/remote-host/tests/delivery_v37.rs",
+  "crates/remote-host/src/dispatcher/health_push.rs",
+  "apps/cli/src/serve/pump_tests.rs",
 ]
 assertions = [
   "a_dormant_chat_is_unverifiable_never_failed",
@@ -1162,6 +1173,10 @@ assertions = [
   "a_user_line_folded_into_a_continuation_ends_its_turn",
   "a_dead_app_server_closes_the_event_stream",
   "an_exit_published_as_the_session_closes_still_reaches_the_subscriber",
+  "a_restored_row_reads_restored_unconfirmed",
+  "a_restored_mid_turn_row_without_proof_stays_unconfirmed",
+  "each_exit_proof_crosses_as_its_own_word",
+  "a_dormant_verdict_agrees_with_what_the_pump_publishes_for_the_same_blob",
 ]
 
 [[gate]]
@@ -1186,13 +1201,185 @@ covered_platforms = ["macos"]
 coverage_notes = """
 macOS only, as above. Live-checked 2026-11-04: a parent sent to its child \
 twice under one key; the second answered duplicate and the child answered \
-once. Receipts are kept 7 days, so a key repeated later is sent again. \
-Released-CLI against a desktop host is not in CI (the wire-skew job runs the \
-release against `serve`, which has no host core)."""
-test_files = ["crates/remote-host/tests/delivery_v37.rs", "apps/cli/src/commands/send.rs"]
+once. Receipts are kept 7 days, so a key repeated later is sent again — \
+intended, and the pruning bound is asserted rather than assumed. The two \
+halves are cited separately: `delivery_v37.rs` proves the contract over the \
+wire, `send_receipts_tests.rs` proves the store underneath it, which is where \
+"across a host restart" actually lives (a new host marks what another left \
+pending unknown rather than resending it). Released-CLI against a desktop host \
+is not in CI: the wire-skew job runs the release against `serve`, so the host \
+nothing exercises over the wire is the desktop app's own, not a missing core — \
+`serve` builds a `HostCore` of its own in `apps/cli/src/serve/host.rs`."""
+test_files = [
+  "crates/remote-host/tests/delivery_v37.rs",
+  "apps/cli/src/commands/send.rs",
+  "crates/agents/src/send_receipts_tests.rs",
+]
 assertions = [
   "a_key_sends_once_and_a_repeat_reports_the_first_sends_state",
   "a_refused_send_the_host_will_retry_reads_pending",
   "a_v36_subscriber_is_never_pushed_health",
   "a_key_is_refused_by_a_host_that_cannot_hold_it",
+  "a_key_seen_before_is_refused_with_its_state",
+  "accepted_and_rejected_are_final_and_late_proof_settles_unknown",
+  "a_failed_write_frees_its_key_but_a_settled_one_is_kept",
+  "a_new_host_marks_what_another_left_pending_unknown",
+  "receipts_older_than_a_week_are_pruned",
+]
+
+[[gate]]
+id = "delivery.queued-event-consumed-only-on-proof"
+title = "A queued child event is consumed on proof, never on the write"
+status = "stable"
+owner = "agents"
+invariant = """
+A queued child event leaves the outbox only on an observed acceptance: the \
+write itself consumes nothing, and nothing moves a delivered row back. A line \
+written to the agent with no proof reads Unconfirmed, is never claimed again \
+and is never resent, while a receipt that arrives late still settles it. A \
+line deliberately taken back returns to pending, and whether it keeps its \
+key depends on what the agent already saw. A Stop, or a turn interrupted after \
+the line went in, goes out under a new key, because the agent has seen the old \
+one. A host taken over keeps the same key for a row it never wrote: the key is \
+derived from the rows and their attempt count, and a takeover raises neither."""
+oracle = """
+Drive one batch through write, accept and deliver, asserting that no step \
+before acceptance consumes the row and no step after delivery moves it back; \
+assert an Unconfirmed row cannot be claimed ten minutes later; take the host \
+over and assert that held rows return to pending under the same key while \
+written-but-unproven ones go Unconfirmed. End to end, a finished child must \
+reach its parent once and its receipt must settle the row. Neither regression \
+looks like a delivery fault from the outside: consume-on-write loses the row, \
+so the parent is simply never told its child finished, and resending an \
+unproven line folds the same event into the turn twice, which reads as the \
+agent repeating itself."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS is where both halves run at once. The Linux job cargo-checks \
+`oximux-agents` and `oximux-remote-host` without running them. Windows runs \
+the store half: its blocking `cargo test --workspace --lib` sweep reaches \
+`outbox_tests.rs`, an ordinary `#[cfg(test)]` module in the crate. What it \
+cannot reach is `child_events.rs`, an integration target under `tests/`, which \
+a `--lib` sweep skips by construction — so the claim stays at macOS, the only \
+platform that runs both layers. The two layers are covered separately — `outbox_tests.rs` \
+drives the `Outbox` store directly, `child_events.rs` runs the same contract \
+through the drainer, whose consume point is the `UserMessageAccepted` arm of \
+`crates/remote-host/src/outbox_drainer.rs`. Serve is covered by construction \
+rather than by a test of its own: phase 4b gave it the same outbox, the same \
+`HostCore` and the same `SendGate` instead of a second implementation. That is \
+a structural claim about the code, not a measurement, and it is the part of \
+this gate most worth re-reading if the hosts ever diverge."""
+test_files = [
+  "crates/agents/src/outbox_tests.rs",
+  "crates/remote-host/tests/child_events.rs",
+]
+assertions = [
+  "a_row_is_consumed_on_acceptance_never_on_write",
+  "a_write_with_no_proof_is_unconfirmed_and_not_claimable_again",
+  "a_late_receipt_settles_an_unconfirmed_line",
+  "a_new_host_takes_over_claims_without_resending_written_lines",
+  "a_parent_that_goes_away_gets_its_held_batch_back_and_its_written_one_unconfirmed",
+  "a_cancelled_line_goes_out_again_under_a_new_key",
+  "an_interrupted_accepted_batch_is_rearmed_under_a_new_key",
+  "a_finished_child_reaches_its_parent_and_receipts_settle_it",
+  "a_parent_that_closes_gets_its_held_batch_back",
+]
+
+# ---------------------------------------------------------------------------
+# the fault drill (Phase 4b)
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "host.survives-the-fault-drill"
+title = "Eight named faults each leave the host in a stated state"
+status = "soaking"
+owner = "cli"
+invariant = """
+Eight faults are survivable in a stated way, and the state is the same whether \
+the host is the desktop or `oximux serve`. `kill -9` mid-turn, and a restart \
+holding queued sends: the queue comes back held, nothing in it having reached \
+the agent, and the next message carries the restart note once. A provider \
+killed between turns: Failed within five seconds with the exit's own reason, \
+and still Failed after the host restarts. A rate-limit event: the queue holds, \
+nothing is spent, and once the window lifts the queue can move again — one \
+line per push rather than a flush, since nothing wakes a held pump but the \
+next send. `kill -9` \
+between a line written to the agent and its echo: the row reads unconfirmed, \
+is never claimed again and is never resent, while a receipt arriving later \
+still settles it. A second host against a live data directory: refused, naming \
+the holder's pid and start time, with the incumbent neither signalled nor \
+adopted. A lock whose record is garbled or missing while it is held: still \
+refused, nothing started. Quit with the relay killed: a terminal's checkpoint \
+is on disk to restore from, because only a clean end removes it."""
+oracle = """
+Drive each fault at a real host and read the state back from outside the \
+process — `oximux status` for the verdict and liveness, the session blob for \
+what the queue still holds, the exit code for a refusal — rather than from a \
+log the faulting process wrote. Not one of these regressions announces itself \
+as fault handling that broke. A lost queue reads as an agent that ignored \
+three messages; a verdict that does not survive a restart reads as a session \
+that was fine all along; a resent unproven line reads as the agent repeating \
+itself; a checkpoint removed on an unclean death reads as a terminal the user \
+never opened; and a second host that is not refused corrupts the data \
+directory quietly, by two writers neither of which is wrong on its own."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+Drilled once, on serve only: 2026-11-17 against `main` at `7b81bf85`, a real \
+`claude` under a sandboxed HOME, written up in \
+`plans/reports/live-check-p4b-261117-serve-parity.md`. Five rows were driven \
+there — `kill -9` mid-turn and the restart holding three queued sends (one run: \
+three sends were accepted behind a pending prompt, none reached the agent, and \
+the reopened session read `held_restored: 3`), the provider killed between \
+turns, a second serve against a live host (exit 6, incumbent untouched), and a \
+held lock whose record was first garbled and then missing. Three were not \
+reachable in that run: quit + relay kill, because the run set \
+`OXIMUX_RELAY_BINARY=/nonexistent` and had no terminals at all; the rate-limit \
+row, which needs a real usage window or a fake provider that emits the event, \
+and whose assertion is the weakest cited here: it holds the queue and shows \
+the hold lifting, but it wakes the pump with another send, so an unattended \
+drain is asserted nowhere; \
+and the `kill -9` between a write and its echo, which needs the kill inside \
+that window and so wants an agent that stalls after reading a line. Each of \
+those three has an assertion here: what they lack is a real host, not a test. \
+The provider row is the one to read twice. It was drilled while its second \
+half *failed* — the verdict reached only whoever was already subscribed, and a \
+restart lost it (finding 2 of that report). The gap was closed afterwards in \
+PRs #100, #101 and #105, and \
+`a_providers_death_is_still_the_sessions_state_after_a_restart` now asserts the \
+half that failed, but the drill has not been re-run against the fixed host. \
+That, and the three undrilled rows, are why this gate is `soaking` rather than \
+`stable`. Finding 1 of the same report is closed: the refusal now prints the \
+holder's start time beside its pid. The desktop half of the drill is owed and \
+belongs to phase 3's step 7; the relay respawn that a quit + relay kill ends \
+in lives in the desktop's relay lifecycle and is drilled there, so what is \
+cited here is the restore contract it depends on. The platform claim stays at \
+macOS because the drill was macOS — not because the assertions are. Every file \
+cited here also runs in the Windows job: `cargo test -p oximux-cli` runs the \
+pump tests there and in the Linux job too (the CLI is a bin with no lib \
+target, so the sweep below is not what reaches them), the blocking `cargo test \
+--workspace --lib` sweep runs the lock and outbox tests, and \
+`checkpoint_lifecycle` has a Windows step of its own. That sweep is in fact \
+where the lock's Windows-only failure to read its own holder pid was caught, \
+so no one should plan platform work here that CI already does. What is \
+macOS-only is the drill."""
+test_files = [
+  "apps/cli/src/serve/pump_tests.rs",
+  "crates/agents/src/outbox_tests.rs",
+  "crates/single-instance/src/lib.rs",
+  "crates/relay/tests/checkpoint_lifecycle.rs",
+]
+assertions = [
+  "a_queued_message_survives_a_restart_and_comes_back_held",
+  "a_restart_mid_turn_owes_a_note_the_next_message_carries",
+  "a_providers_death_is_still_the_sessions_state_after_a_restart",
+  "a_limit_holds_the_queue_and_lifting_it_lets_the_queue_go",
+  "a_line_an_agent_cannot_acknowledge_is_confirmed_by_its_next_frame",
+  "a_write_with_no_proof_is_unconfirmed_and_not_claimable_again",
+  "second_acquire_contends_while_first_is_held",
+  "a_contender_learns_who_holds_the_lock_and_since_when",
+  "a_held_lock_with_an_unreadable_record_is_still_held",
+  "checkpoint_written_on_tick_and_removed_on_close",
+  "natural_shell_exit_removes_checkpoint",
 ]
