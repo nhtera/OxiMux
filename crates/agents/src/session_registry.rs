@@ -420,18 +420,28 @@ pub fn steer_queued(
     text: &str,
     uuid: uuid::Uuid,
 ) -> Result<()> {
-    // Written before the gate is touched, so the lock is never held across a
-    // call into the backend.
+    // Noted before the write, as [`SessionHandle::steer_from`] does and for
+    // the reason written there: a receipt seen between the write and the note
+    // would find nothing in `unstarted` to clear, and the note left behind
+    // would hold the turn open until the backstop fires. Neither host can
+    // interleave the two today — each processes receipts on the same task
+    // that writes — so this is the convention holding rather than a live
+    // race closing.
+    //
+    // Left unstarted until that receipt, which is the window a Stop can take
+    // it back in.
+    gate.lock().unwrap().note_steered(uuid, None);
+    // The lock is not held across the call into the backend.
     let sent = conn.steer_tagged(text, &uuid.to_string());
     let mut gate = gate.lock().unwrap();
+    if sent.is_err() {
+        // Nothing was written, so no receipt is coming and the note would
+        // wait for one for ever.
+        gate.take_steered(&uuid.to_string());
+    }
     // Either way: a line that failed goes back to whoever queued it rather
     // than being lost.
     gate.report_sent(uuid, sent.is_ok());
-    if sent.is_ok() {
-        // Left unstarted until its receipt, which is the window a Stop can
-        // take it back in.
-        gate.note_steered(uuid, None);
-    }
     sent
 }
 
@@ -1070,10 +1080,14 @@ impl SessionHandle {
     /// readings of it otherwise.
     pub fn steer_queued(&self, text: &str, uuid: uuid::Uuid) -> Result<()> {
         let conn = self.conn();
-        match self.gate() {
+        match self.gate().filter(|_| conn.reports_receipts()) {
             Some(gate) => steer_queued(&*conn, &gate, text, uuid),
-            // No gate: nothing chose this line for steering, so there is
-            // nothing to report back to. Write it and say how it went.
+            // No gate means nothing chose this line for steering, so there is
+            // nothing to report back to. A backend that reports no receipts
+            // means nothing would ever clear an `unstarted` note, which would
+            // hold the turn open until the backstop — the same condition
+            // [`Self::steer_from`] filters on. Either way: write it and say
+            // how it went.
             None => conn.steer_tagged(text, &uuid.to_string()),
         }
     }
@@ -2910,5 +2924,52 @@ mod tests {
         handle.set_gate(Some(gate.clone()));
         handle.send_prompt_tagged("continue", &[], SendSource::Recovery, None).unwrap();
         assert_eq!(gate.lock().unwrap().queued().count(), 1, "queued for the view");
+    }
+
+    /// A backend that never answers for what it was sent must not be tracked
+    /// as owing an answer: nothing would ever clear the note, so the gate
+    /// would hold the turn open until the pump's backstop fired.
+    #[test]
+    fn a_steer_to_a_backend_without_receipts_is_not_tracked_as_unstarted() {
+        let reg = SessionRegistry::new();
+        // `with_receipts` deliberately not called: this is the pi-shaped
+        // backend the filter exists for.
+        let stub = Arc::new(crate::thread::StubConnection::default().with_capabilities(
+            crate::thread::AgentCapabilities { supports_steer: true, ..Default::default() },
+        ));
+        assert!(!stub.reports_receipts(), "the backend this test is about");
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        gate.lock().unwrap().set_waker(|| {});
+        handle.set_gate(Some(gate.clone()));
+
+        handle.steer_queued("a child finished", uuid::Uuid::new_v4()).unwrap();
+
+        assert_eq!(stub.sent().len(), 1, "the line still went in: {:?}", stub.sent());
+        assert!(
+            !gate.lock().unwrap().awaiting_steer(),
+            "a note here waits for a receipt that is never coming",
+        );
+    }
+
+    /// The failure half of noting before the write: the note must come back
+    /// off, or it waits for a receipt no write will ever earn.
+    #[test]
+    fn a_steer_whose_write_failed_leaves_no_note_behind() {
+        let reg = SessionRegistry::new();
+        // Reports receipts, so the gate is used — but cannot steer, so
+        // `steer_tagged` fails, which is the path under test.
+        let stub = Arc::new(crate::thread::StubConnection::default().with_receipts());
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        gate.lock().unwrap().set_waker(|| {});
+        handle.set_gate(Some(gate.clone()));
+
+        assert!(handle.steer_queued("a child finished", uuid::Uuid::new_v4()).is_err());
+
+        assert!(
+            !gate.lock().unwrap().awaiting_steer(),
+            "the note outlived the write that was supposed to earn its receipt",
+        );
     }
 }

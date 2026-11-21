@@ -404,6 +404,15 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
                     persist.maybe_save(&handle, &mut blob, &fold, &track);
                 }
                 _ = save_tick.tick() => {
+                    // Drained first, as every arm that publishes drains: a
+                    // prompt `flush` has written is still sitting in the
+                    // channel, so the fold would read idle and the publish
+                    // below would clear the gate's hold on the turn that
+                    // prompt just opened. `main` had this call and an earlier
+                    // commit of this branch dropped it while inserting the
+                    // backstop above — the backstop needs it too, since a
+                    // turn it cannot see is one it must not give up on.
+                    fold_queued_sends(&pump, &mut prompt_rx, &mut fold, &mut track);
                     // The backstop for a steered line the agent never answered
                     // for: it keeps the turn open by design, so without this it
                     // would hold the queue for good. Checked on the tick that
@@ -467,7 +476,19 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
             // transcript to SQLite on every streamed fragment; the ten-second
             // tick is what covers the rest.
             let before = fold.revision();
-            flush(&pump, &mut fold);
+            // `flush` can change what the holds should say, and no arm will
+            // notice: it runs after the select, not inside one. Publishing
+            // here is also what wakes the gate when the new holds open it —
+            // `set_holds` wakes on a change in readiness, where a push does
+            // not.
+            //
+            // Without it, a Stop that took the gate's unstarted steers back
+            // leaves the queue shut until some later event or the save tick,
+            // and a backend already idle when the Stop lands sends no event
+            // at all.
+            if flush(&pump, &mut fold) {
+                publish_state(&pump, &fold, &mut track, fold.turn_active, Process::Live);
+            }
             if fold.revision() != before {
                 persist.maybe_save(&handle, &mut blob, &fold, &track);
             }
@@ -554,12 +575,15 @@ fn fold_queued_sends(
 /// The lock is dropped before the write. It is the lock a `send_prompt` from
 /// any thread takes, and the write is a pipe write to a child process; the
 /// drainer also takes it on every pass.
-fn flush(pump: &Pump<'_>, fold: &mut ChatThread) {
+/// Returns whether the holds are stale now, which the caller must publish.
+/// Two things here leave them so: a Stop empties the gate's unstarted steers,
+/// and a steer leaves the fold ending in a user message.
+fn flush(pump: &Pump<'_>, fold: &mut ChatThread) -> bool {
     let (session_id, handle, gate) = (pump.session_id, pump.handle, pump.gate);
     if gate.lock().unwrap().take_stop_request() {
         withdraw(gate, pump.retry.on_stopped(session_id));
         stop_the_turn(pump);
-        return;
+        return true;
     }
     // A line that may go *into* the running turn goes before any that would
     // start one, and it goes a different way. Taken by the write below it
@@ -568,10 +592,14 @@ fn flush(pump: &Pump<'_>, fold: &mut ChatThread) {
     // the matrix's steer rows assert does not happen.
     if gate.lock().unwrap().ready() == Ready::Steer {
         steer_into_the_turn(pump, fold);
-        return;
+        // The fold now ends with the steered user message, so this turn has
+        // no output of its own again and `turn_started` must go back to
+        // false: the next steerable line waits for the agent to react rather
+        // than going in beside this one, unacknowledged.
+        return true;
     }
     loop {
-        let Some(item) = gate.lock().unwrap().take_next_if_open() else { return };
+        let Some(item) = gate.lock().unwrap().take_next_if_open() else { return false };
         // A recovery turn exists to carry the restart's note. Once the note
         // has gone — with a message written meanwhile — or was never owed,
         // sending it would be a second, unasked turn on the person's bill.
@@ -645,7 +673,7 @@ fn flush(pump: &Pump<'_>, fold: &mut ChatThread) {
         }
         drop(gate);
         if sent.is_err() {
-            return;
+            return false;
         }
     }
 }
