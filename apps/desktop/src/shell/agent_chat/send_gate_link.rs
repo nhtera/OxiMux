@@ -29,9 +29,6 @@ const PLAN_REFUSED: &str = "Leaving plan mode needs you: this turn was started b
 /// What the transcript says when held child events go out with a message.
 const HELD_EVENTS_NOTE: &str = "Child events that arrived after the Stop went with this message.";
 
-/// How long after its turn ended a steered line may take to start (or be
-/// reported dropped) before the chat stops waiting for it.
-const STEER_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the transcript says when a Stop takes back a line the user steered.
 const STEER_TAKEN_BACK: &str = "The Stop took back a message the agent had not started on; it is queued again below.";
@@ -148,7 +145,7 @@ impl AgentChatView {
             // Backstop: a steered line that neither starts nor is reported
             // dropped would otherwise hold the chat's queue forever.
             cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(STEER_START_WITHIN).await;
+                cx.background_executor().timer(oximux_agents::send_gate::STEER_START_WITHIN).await;
                 let _ = this.update(cx, |view, _cx| view.give_up_on_steers());
             })
             .detach();
@@ -331,12 +328,11 @@ impl AgentChatView {
         };
         // Child output goes into this turn: treat it as one nobody watches.
         self.screen_control.begin_remote_turn();
-        let sent = conn.steer_tagged(&item.text, &item.uuid.to_string());
-        let mut gate = self.send_gate.lock().unwrap();
-        gate.report_sent(item.uuid, sent.is_ok());
-        if sent.is_ok() {
-            gate.note_steered(item.uuid, None);
-            drop(gate);
+        // The write, the gate's receipt bookkeeping and the `unstarted` note
+        // are one shared step, so the headless host cannot drift from this.
+        let steered =
+            oximux_agents::session_registry::steer_queued(&*conn, &self.send_gate, &item.text, item.uuid);
+        if steered.is_ok() {
             // Shown where the agent takes it in, like a steer typed here.
             self.thread.push_user_message(&item.text);
             self.follow_bottom();

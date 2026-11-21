@@ -1473,3 +1473,677 @@ async fn a_dormant_verdict_agrees_with_what_the_pump_publishes_for_the_same_blob
         );
     }
 }
+
+/// A Claude-shaped backend: it takes a line mid-turn and reports, per line,
+/// that it started on it. Both halves are required for steering — without the
+/// receipt a Stop could not take the line back.
+fn steerable_agent() -> Arc<StubConnection> {
+    Arc::new(StubConnection::default().with_receipts().with_capabilities(
+        oximux_agents::thread::AgentCapabilities { supports_steer: true, ..Default::default() },
+    ))
+}
+
+/// Serve's own steer arm, and the row it exists for: a child's event reaching a
+/// busy Claude parent goes **into** the running turn.
+///
+/// The failure this guards is not "it waits": it is that the gate marks a
+/// steerable line sendable, and a host with no steer arm writes it as an
+/// ordinary prompt — a second turn on work the first is already doing. That is
+/// what serve did while `steer_supported` was hardcoded false and nothing
+/// answered `Ready::Steer`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_event_is_steered_into_the_running_turn_rather_than_starting_a_second_one() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = steerable_agent();
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            // A turn that is running *and* has said something: a steer goes
+            // into a turn that has started, not one still opening.
+            buffered: vec![
+                ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] },
+                ThreadEvent::AssistantText("on it".into()),
+            ],
+            events: rx,
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    // What the outbox drainer does with a child's events.
+    handle.gate().unwrap().lock().unwrap().push(
+        "a child finished".into(),
+        Vec::new(),
+        SendSource::ParentEvent,
+        DeliveryMode::Steer,
+        None,
+    );
+
+    assert!(
+        wait_until(5_000, || conn.sent()
+            .iter()
+            .any(|s| s["type"] == "steer" && s["uuid"].is_string())),
+        "the child's event went into the running turn, tagged: {:?}",
+        conn.sent(),
+    );
+    let sent = conn.sent();
+    assert_eq!(sent.len(), 1, "once, and nothing else: {sent:?}");
+    assert!(
+        sent[0].to_string().contains("a child finished"),
+        "and it carried the child's text: {sent:?}",
+    );
+    assert!(
+        sent[0]["uuid"].is_string(),
+        "under an id the agent's receipt can name, or the outbox row it carries never settles: {sent:?}",
+    );
+    let _ = tx;
+}
+
+/// And it waits while a prompt is open, because the person has not answered
+/// yet — then goes once nothing is waiting on them.
+///
+/// The matrix row. A line folded into a turn that is itself blocked on a
+/// permission would be answered by nobody and acted on at an unpredictable
+/// moment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_steerable_line_waits_while_a_prompt_is_open_and_goes_once_it_is_gone() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = steerable_agent();
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            buffered: vec![
+                ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] },
+                ThreadEvent::AssistantText("on it".into()),
+                ThreadEvent::PermissionRequested {
+                    request_id: "req-1".into(),
+                    tool_use_id: Some("tu-1".into()),
+                    tool_name: "Bash".into(),
+                    input: serde_json::json!({ "command": "ls" }),
+                    description: "run ls".into(),
+                    suggestions: vec![],
+                    kind: oximux_agent_core::thread::tool_call::PermissionKind::Tool,
+                    args_digest: None,
+                },
+            ],
+            events: rx,
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.health().status
+            == oximux_agents::health::HealthStatus::NeedsPermission),
+        "the session is waiting on a person: {:?}",
+        handle.health(),
+    );
+
+    handle.gate().unwrap().lock().unwrap().push(
+        "a child finished".into(),
+        Vec::new(),
+        SendSource::ParentEvent,
+        DeliveryMode::Steer,
+        None,
+    );
+    assert!(
+        !wait_until(300, || !conn.sent().is_empty()),
+        "nothing goes into a turn that is itself waiting on a person: {:?}",
+        conn.sent(),
+    );
+    {
+        let gate = handle.gate().unwrap();
+        let gate = gate.lock().unwrap();
+        let item = gate.queued().next().expect("the line is queued").clone();
+        assert_eq!(
+            gate.wait_of(&item),
+            oximux_agents::send_gate::SendWait::Interaction,
+            "and it says why, so a client can answer \"why isn't this sending?\"",
+        );
+    }
+
+    // The prompt is answered and the tool runs: nothing waits on the person.
+    tx.send(ThreadEvent::ToolResult {
+        tool_use_id: "tu-1".into(),
+        content: "a.txt".into(),
+        is_error: false,
+        structured: None,
+    })
+    .unwrap();
+    assert!(
+        wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer")),
+        "and then it goes, into the same turn: {:?}",
+        conn.sent(),
+    );
+}
+
+/// A steerable line waits for the turn to say it has started.
+///
+/// `turn_started` is the field serve used to hardcode `false`, which left a
+/// steerable line in `Starting` for the whole turn — the shape the gate uses
+/// to say "a turn is opening and has not spoken yet". A line written then
+/// would race the turn's own first prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_steerable_line_waits_for_the_turn_to_actually_start() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = steerable_agent();
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            // A turn is open, and the agent has said nothing yet.
+            buffered: vec![ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] }],
+            events: rx,
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+
+    handle.gate().unwrap().lock().unwrap().push(
+        "a child finished".into(),
+        Vec::new(),
+        SendSource::ParentEvent,
+        DeliveryMode::Steer,
+        None,
+    );
+    assert!(
+        !wait_until(300, || !conn.sent().is_empty()),
+        "nothing is written into a turn that has not spoken: {:?}",
+        conn.sent(),
+    );
+
+    // The turn speaks.
+    tx.send(ThreadEvent::AssistantText("on it".into())).unwrap();
+    assert!(
+        wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer")),
+        "and now the line goes in: {:?}",
+        conn.sent(),
+    );
+}
+
+/// A steered line the agent has not started on keeps the turn open.
+///
+/// The third field this arm needs, and the subtlest: a line written into a
+/// turn may still *begin* a turn of its own when that turn ends before the
+/// agent gets to it. Until its receipt says it started, the turn is not over —
+/// so the next queued line waits rather than racing it. Without this a child's
+/// event and a person's message could open two turns on the same work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_steered_line_the_agent_has_not_started_keeps_the_turn_open() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = steerable_agent();
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            buffered: vec![
+                ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] },
+                ThreadEvent::AssistantText("on it".into()),
+            ],
+            events: rx,
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+    handle.gate().unwrap().lock().unwrap().push(
+        "a child finished".into(),
+        Vec::new(),
+        SendSource::ParentEvent,
+        DeliveryMode::Steer,
+        None,
+    );
+    assert!(
+        wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer")),
+        "the line went into the turn: {:?}",
+        conn.sent(),
+    );
+
+    // The turn ends with no receipt for that line: the agent never said it
+    // started on it, so it may yet run as a turn of its own.
+    tx.send(ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None })
+        .unwrap();
+    assert!(
+        wait_until(5_000, || handle
+            .gate()
+            .is_some_and(|g| g.lock().unwrap().awaiting_steer())),
+        "the gate is still waiting on the steered line",
+    );
+
+    // So the next line waits, rather than opening a second turn beside it.
+    handle.send_prompt("and this too", &[]).unwrap();
+    assert!(
+        !wait_until(400, || conn.sent().len() > 1),
+        "a queued line must not start a turn while a steered one may still begin one: {:?}",
+        conn.sent(),
+    );
+}
+
+/// The receipt releases the line, and the gate opens again.
+///
+/// The bug this exists for: serve had no receipt handler at all, so the first
+/// steer held `unstarted` for good — and because an unstarted steer keeps the
+/// turn open on purpose, every later line read `Busy` until a Stop or a
+/// restart. One steered child event deadlocked the session's queue. Two
+/// reviewers found it; no test did, because none sent a receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receipt_releases_the_steered_line_and_the_queue_moves_again() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = steerable_agent();
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            buffered: vec![
+                ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] },
+                ThreadEvent::AssistantText("on it".into()),
+            ],
+            events: rx,
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+    handle.gate().unwrap().lock().unwrap().push(
+        "a child finished".into(),
+        Vec::new(),
+        SendSource::ParentEvent,
+        DeliveryMode::Steer,
+        None,
+    );
+    assert!(
+        wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer" && s["uuid"].is_string())),
+        "the tagged line went in: {:?}",
+        conn.sent(),
+    );
+    let uuid = conn.sent()[0]["uuid"].as_str().expect("tagged").to_string();
+    // A subscriber sees what caused the turn to change course. No backend
+    // echoes the user's own half, so without the ingest the stream shows the
+    // agent reacting to nothing.
+    // Waited for, not read once: the ingest happens after the write this
+    // test already waited on, so a single read can look too early.
+    assert!(
+        wait_until(5_000, || handle.events_since(0).iter().any(|(_, event)| {
+            matches!(event, ThreadEvent::UserMessage { text, .. } if text == "a child finished")
+        })),
+        "the steered line reached the event stream",
+    );
+
+    // The agent says it started on it, and the turn then ends.
+    tx.send(ThreadEvent::UserMessageAccepted { uuid: uuid.clone() }).unwrap();
+    assert!(
+        wait_until(5_000, || handle
+            .gate()
+            .is_some_and(|g| !g.lock().unwrap().awaiting_steer())),
+        "the receipt took it out of the gate's unstarted list",
+    );
+    tx.send(ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None })
+        .unwrap();
+
+    // So an ordinary line can open the next turn.
+    handle.send_prompt("and now this", &[]).unwrap();
+    assert!(
+        wait_until(5_000, || conn.sent().len() > 1),
+        "the queue moves again once the steered line was answered for: {:?}",
+        conn.sent(),
+    );
+}
+
+/// A Stop asks the **backend** to take the steered lines back, and settles
+/// only the ones it confirms.
+///
+/// The second bug: `stop_the_turn` forgot the lines locally and called a plain
+/// `cancel`, so Claude could still run a line it had already queued while the
+/// outbox handed the same child events out again — the event delivered twice,
+/// and a turn starting after the Stop. The desktop passes the ids to
+/// `stop_turn`; serve now does too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_asks_the_backend_to_take_the_steered_line_back() {
+    for confirms in [true, false] {
+        let registry = Arc::new(SessionRegistry::new());
+        let conn = Arc::new(
+            StubConnection::default()
+                .with_receipts()
+                .with_capabilities(oximux_agents::thread::AgentCapabilities {
+                    supports_steer: true,
+                    ..Default::default()
+                }),
+        );
+        let conn = if confirms { Arc::new((*conn).clone().with_take_back()) } else { conn };
+        let handle = registry.register("s-1".into(), conn.clone());
+        let db = oximux_storage::open_memory().unwrap();
+        let settings = SettingsRepo::new(db.clone());
+        let (_tx, rx) = std::sync::mpsc::channel();
+
+        let _pump = start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                buffered: vec![
+                    ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] },
+                    ThreadEvent::AssistantText("on it".into()),
+                ],
+                events: rx,
+                seed: ChatBlob::new("s-1".into()),
+                settings: settings.clone(),
+                registry: registry.clone(),
+                index: Arc::new(SessionIndex::default()),
+                retry: retry_driver(registry.clone(), &settings, &db),
+                on_end: None,
+            },
+            PumpSet::new(),
+        );
+        assert!(
+            wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+            "the pump attached its gate",
+        );
+        handle.gate().unwrap().lock().unwrap().push(
+            "a child finished".into(),
+            Vec::new(),
+            SendSource::ParentEvent,
+            DeliveryMode::Steer,
+            None,
+        );
+        assert!(
+            wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer" && s["uuid"].is_string())),
+            "the tagged line went in: {:?}",
+            conn.sent(),
+        );
+        let uuid = conn.sent()[0]["uuid"].as_str().expect("tagged").to_string();
+
+        handle.cancel().unwrap();
+        assert!(
+            wait_until(5_000, || !conn.stopped().is_empty()),
+            "the Stop reached the backend as a take-back, not a bare cancel",
+        );
+        assert_eq!(
+            conn.stopped(),
+            vec![uuid.clone()],
+            "naming the line it must dequeue, or the agent runs it after the Stop",
+        );
+        assert!(
+            wait_until(5_000, || handle.gate().is_some_and(|g| {
+                // Confirmed: settled, and the gate waits on nothing. Not
+                // confirmed: still tracked, because it may yet run.
+                g.lock().unwrap().awaiting_steer() != confirms
+            })),
+            "confirms={confirms}: a line the backend did not confirm stays tracked",
+        );
+    }
+}
+
+/// The backstop's clock: when it runs, and that it measures the wait rather
+/// than the gap since the last event.
+///
+/// Every instant here is derived from one taken in the future, so no
+/// subtraction can reach below the earliest instant a fresh machine has.
+#[test]
+fn the_backstop_clock_runs_only_while_lines_wait_outside_a_turn() {
+    let now = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let earlier = now - std::time::Duration::from_secs(5);
+
+    // Nothing waiting: a clock left over from before is dropped.
+    assert_eq!(steer_clock(false, false, Some(earlier), now), None);
+    assert_eq!(steer_clock(false, true, Some(earlier), now), None);
+
+    // A turn is running, so the lines are still the turn's to answer for.
+    assert_eq!(steer_clock(true, true, Some(earlier), now), None);
+    assert_eq!(steer_clock(true, true, None, now), None);
+
+    // A turn ended with lines unanswered for: the clock starts.
+    assert_eq!(steer_clock(true, false, None, now), Some(now));
+
+    // And it keeps its first reading. Restarting here would mean a session
+    // that keeps producing events never reaches the backstop at all.
+    assert_eq!(steer_clock(true, false, Some(earlier), now), Some(earlier));
+}
+
+/// The expiry itself, including the boundary and a reading from the future.
+#[test]
+fn the_backstop_gives_the_lines_back_only_after_the_whole_wait() {
+    let now = std::time::Instant::now() + std::time::Duration::from_secs(600);
+
+    // No clock, nothing to give back.
+    assert!(!steers_timed_out(None, now));
+
+    // Just started, and one second short of the wait.
+    assert!(!steers_timed_out(Some(now), now));
+    assert!(!steers_timed_out(
+        Some(now - (STEER_START_WITHIN - std::time::Duration::from_secs(1))),
+        now
+    ));
+
+    // Exactly the wait is enough, and past it stays enough.
+    assert!(steers_timed_out(Some(now - STEER_START_WITHIN), now));
+    assert!(steers_timed_out(
+        Some(now - (STEER_START_WITHIN + std::time::Duration::from_secs(1))),
+        now
+    ));
+
+    // A clock reading taken after `now` answers `false` rather than panicking.
+    assert!(!steers_timed_out(Some(now + std::time::Duration::from_secs(1)), now));
+}
+
+/// A Stop that takes an unstarted steer back leaves the queue able to move.
+///
+/// End to end, and that is all it claims: the hold keeping the gate shut was
+/// `awaiting_steer` rather than a running turn, and once the Stop empties it
+/// a person's next message goes out. It does **not** pin down which arm
+/// republishes the holds — it passes with the publish after `flush` removed,
+/// because another arm publishes shortly after a Stop anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_that_takes_a_steer_back_leaves_the_queue_able_to_move() {
+    let registry = Arc::new(SessionRegistry::new());
+    // Confirms the take-back, so the line settles and nothing stays tracked.
+    let conn = Arc::new((*steerable_agent()).clone().with_take_back());
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            buffered: vec![
+                ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] },
+                ThreadEvent::AssistantText("on it".into()),
+            ],
+            events: rx,
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+    handle.gate().unwrap().lock().unwrap().push(
+        "a child finished".into(),
+        Vec::new(),
+        SendSource::ParentEvent,
+        DeliveryMode::Steer,
+        None,
+    );
+    assert!(
+        wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer")),
+        "the line went into the turn: {:?}",
+        conn.sent(),
+    );
+
+    // The turn ends with no receipt for it, so the gate keeps the turn open
+    // on its account alone.
+    tx.send(ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None })
+        .unwrap();
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().awaiting_steer())),
+        "the gate is waiting on the steered line",
+    );
+
+    // A person's message. `SendSource::Remote` is not one a Stop holds, so
+    // the only thing keeping it back is that stale hold.
+    handle.send_prompt("and this too", &[]).unwrap();
+    assert!(
+        !wait_until(400, || conn.sent().len() > 1),
+        "it waits while the steered line may still begin a turn: {:?}",
+        conn.sent(),
+    );
+
+    handle.cancel().unwrap();
+
+    // Well inside `SAVE_INTERVAL`: the point is that the republish happens on
+    // the Stop rather than on the next tick.
+    assert!(
+        SAVE_INTERVAL >= std::time::Duration::from_secs(8),
+        "this test's margin assumes a save tick far longer than its own wait",
+    );
+    assert!(
+        wait_until(4_000, || conn.sent().iter().any(|s| s["type"] == "user"
+            && s["message"]["content"] == "and this too")),
+        "the Stop left the queue stuck: {:?}",
+        conn.sent(),
+    );
+}
+
+/// A second child event must wait for the agent to react to the first.
+///
+/// Writing a steer leaves the fold ending in a user message, so this turn has
+/// no output of its own again. The gate learns that only when the holds are
+/// published, and nothing but the publish after `flush` would tell it: with
+/// a stale `turn_started` the next steerable line goes straight in beside one
+/// the agent has not acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_steer_waits_for_the_agent_to_react_to_the_first() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = steerable_agent();
+    let handle = registry.register("s-1".into(), conn.clone());
+    let db = oximux_storage::open_memory().unwrap();
+    let settings = SettingsRepo::new(db.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let _pump = start(
+        PumpSpec {
+            session_id: "s-1".into(),
+            handle: handle.clone(),
+            buffered: vec![
+                ThreadEvent::UserMessage { text: "ship it".into(), images: vec![] },
+                ThreadEvent::AssistantText("on it".into()),
+            ],
+            events: rx,
+            seed: ChatBlob::new("s-1".into()),
+            settings: settings.clone(),
+            registry: registry.clone(),
+            index: Arc::new(SessionIndex::default()),
+            retry: retry_driver(registry.clone(), &settings, &db),
+            on_end: None,
+        },
+        PumpSet::new(),
+    );
+    assert!(
+        wait_until(5_000, || handle.gate().is_some_and(|g| g.lock().unwrap().has_waker())),
+        "the pump attached its gate",
+    );
+    let steer = |text: &str| {
+        handle.gate().unwrap().lock().unwrap().push(
+            text.to_string(),
+            Vec::new(),
+            SendSource::ParentEvent,
+            DeliveryMode::Steer,
+            None,
+        );
+    };
+
+    steer("a child finished");
+    assert!(
+        wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer")),
+        "the first line went into the turn: {:?}",
+        conn.sent(),
+    );
+
+    // The agent has said nothing since. The second must hold.
+    steer("another child finished");
+    assert!(
+        !wait_until(600, || conn.sent().iter().filter(|s| s["type"] == "steer").count() > 1),
+        "a second steer went in beside one the agent never acknowledged: {:?}",
+        conn.sent(),
+    );
+
+    // The agent reacts, so the turn has output again and the gate lets the
+    // second line in — proving it was waiting, not dropped.
+    tx.send(ThreadEvent::AssistantText("looking".into())).unwrap();
+    assert!(
+        wait_until(5_000, || conn.sent().iter().filter(|s| s["type"] == "steer").count() > 1),
+        "the second steer never went in after the agent reacted: {:?}",
+        conn.sent(),
+    );
+}

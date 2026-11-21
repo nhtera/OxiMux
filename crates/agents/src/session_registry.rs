@@ -397,6 +397,54 @@ pub struct SessionHandle {
     screenshots: Mutex<ScreenshotFilter>,
 }
 
+/// Write a line the gate chose for steering, and tell the gate how it went.
+///
+/// Free rather than a method because the two hosts hold different things: the
+/// headless pump has a [`SessionHandle`] (and reaches this through
+/// [`SessionHandle::steer_queued`]), while the desktop's chat view holds the
+/// connection and the gate directly. One body either way — the serve matrix
+/// asserts these two agree, and it would be asserting two readings otherwise.
+///
+/// Not neutralized, unlike [`SessionHandle::steer_from`]: a steerable item is
+/// a rendered envelope whose event tag is genuine, and escaping it here would
+/// mangle the thing the agent is meant to read.
+///
+/// **Publishing the user's half is the caller's**, as its local fold is: the
+/// desktop pushes it into the thread its view renders, and the headless host
+/// both folds it and ingests it for remote subscribers (nothing echoes the
+/// user's own message, so a subscriber would otherwise see a turn change
+/// course with nothing that caused it).
+pub fn steer_queued(
+    conn: &dyn crate::thread::AgentConnection,
+    gate: &std::sync::Mutex<crate::send_gate::SendGate>,
+    text: &str,
+    uuid: uuid::Uuid,
+) -> Result<()> {
+    // Noted before the write, as [`SessionHandle::steer_from`] does and for
+    // the reason written there: a receipt seen between the write and the note
+    // would find nothing in `unstarted` to clear, and the note left behind
+    // would hold the turn open until the backstop fires. Neither host can
+    // interleave the two today — each processes receipts on the same task
+    // that writes — so this is the convention holding rather than a live
+    // race closing.
+    //
+    // Left unstarted until that receipt, which is the window a Stop can take
+    // it back in.
+    gate.lock().unwrap().note_steered(uuid, None);
+    // The lock is not held across the call into the backend.
+    let sent = conn.steer_tagged(text, &uuid.to_string());
+    let mut gate = gate.lock().unwrap();
+    if sent.is_err() {
+        // Nothing was written, so no receipt is coming and the note would
+        // wait for one for ever.
+        gate.take_steered(&uuid.to_string());
+    }
+    // Either way: a line that failed goes back to whoever queued it rather
+    // than being lost.
+    gate.report_sent(uuid, sent.is_ok());
+    sent
+}
+
 impl SessionHandle {
     /// Assign the next `seq`, append to the backlog (dropping the oldest past the
     /// cap), fan out to live subscribers, and refresh the status snapshot. Returns
@@ -1014,6 +1062,36 @@ impl SessionHandle {
         })
     }
 
+    /// Write a line the gate chose for steering into the turn already running.
+    ///
+    /// **The queued item's own uuid is kept.** Its outbox rows are keyed to it
+    /// and the receipt that says the agent started on it arrives under that id
+    /// (`command_lifecycle`), so minting a fresh one — as [`Self::steer_from`]
+    /// must, for a line that was never queued — would orphan both: the rows
+    /// would never settle and a Stop could not find the line to take back.
+    ///
+    /// Reports the write to the gate either way. A line that failed goes back
+    /// to whoever queued it rather than being lost; a written one stays in
+    /// `unstarted` until its receipt, which is the window a Stop can take it
+    /// back in.
+    ///
+    /// Shared because both hosts do exactly this, and the one place parity is
+    /// asserted (the serve matrix's steer rows) would be asserting two
+    /// readings of it otherwise.
+    pub fn steer_queued(&self, text: &str, uuid: uuid::Uuid) -> Result<()> {
+        let conn = self.conn();
+        match self.gate().filter(|_| conn.reports_receipts()) {
+            Some(gate) => steer_queued(&*conn, &gate, text, uuid),
+            // No gate means nothing chose this line for steering, so there is
+            // nothing to report back to. A backend that reports no receipts
+            // means nothing would ever clear an `unstarted` note, which would
+            // hold the turn open until the backstop — the same condition
+            // [`Self::steer_from`] filters on. Either way: write it and say
+            // how it went.
+            None => conn.steer_tagged(text, &uuid.to_string()),
+        }
+    }
+
     /// Run `f` — the handoff of one backend event towards whatever folds it — with
     /// prompt delivery held off.
     ///
@@ -1062,6 +1140,21 @@ impl SessionHandle {
     /// again and interrupt nothing.
     pub fn cancel_backend(&self) -> Result<()> {
         self.conn().cancel()
+    }
+
+    /// Take back the lines the agent has not started on, then interrupt.
+    ///
+    /// Answers with the ids the backend confirms it removed from its own
+    /// queue, which is **not** every id passed: a line the agent had already
+    /// picked up stays. Reporting that one unsent would deliver it twice — the
+    /// outbox would hand it to the drainer again while the agent runs it
+    /// anyway — so a caller settles only what comes back and keeps tracking
+    /// the rest.
+    ///
+    /// Blocking, like [`Self::cancel_backend`]: the backend's reply is awaited
+    /// briefly.
+    pub fn stop_turn(&self, unstarted: &[String]) -> Result<Vec<String>> {
+        self.conn().stop_turn(unstarted)
     }
 
     /// The current connection, cloned out so no lock is held across a backend call
@@ -2831,5 +2924,52 @@ mod tests {
         handle.set_gate(Some(gate.clone()));
         handle.send_prompt_tagged("continue", &[], SendSource::Recovery, None).unwrap();
         assert_eq!(gate.lock().unwrap().queued().count(), 1, "queued for the view");
+    }
+
+    /// A backend that never answers for what it was sent must not be tracked
+    /// as owing an answer: nothing would ever clear the note, so the gate
+    /// would hold the turn open until the pump's backstop fired.
+    #[test]
+    fn a_steer_to_a_backend_without_receipts_is_not_tracked_as_unstarted() {
+        let reg = SessionRegistry::new();
+        // `with_receipts` deliberately not called: this is the pi-shaped
+        // backend the filter exists for.
+        let stub = Arc::new(crate::thread::StubConnection::default().with_capabilities(
+            crate::thread::AgentCapabilities { supports_steer: true, ..Default::default() },
+        ));
+        assert!(!stub.reports_receipts(), "the backend this test is about");
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        gate.lock().unwrap().set_waker(|| {});
+        handle.set_gate(Some(gate.clone()));
+
+        handle.steer_queued("a child finished", uuid::Uuid::new_v4()).unwrap();
+
+        assert_eq!(stub.sent().len(), 1, "the line still went in: {:?}", stub.sent());
+        assert!(
+            !gate.lock().unwrap().awaiting_steer(),
+            "a note here waits for a receipt that is never coming",
+        );
+    }
+
+    /// The failure half of noting before the write: the note must come back
+    /// off, or it waits for a receipt no write will ever earn.
+    #[test]
+    fn a_steer_whose_write_failed_leaves_no_note_behind() {
+        let reg = SessionRegistry::new();
+        // Reports receipts, so the gate is used — but cannot steer, so
+        // `steer_tagged` fails, which is the path under test.
+        let stub = Arc::new(crate::thread::StubConnection::default().with_receipts());
+        let handle = reg.register("s1".into(), stub.clone());
+        let gate = Arc::new(Mutex::new(crate::send_gate::SendGate::new()));
+        gate.lock().unwrap().set_waker(|| {});
+        handle.set_gate(Some(gate.clone()));
+
+        assert!(handle.steer_queued("a child finished", uuid::Uuid::new_v4()).is_err());
+
+        assert!(
+            !gate.lock().unwrap().awaiting_steer(),
+            "the note outlived the write that was supposed to earn its receipt",
+        );
     }
 }
