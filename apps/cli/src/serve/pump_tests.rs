@@ -1535,8 +1535,10 @@ async fn a_child_event_is_steered_into_the_running_turn_rather_than_starting_a_s
     );
 
     assert!(
-        wait_until(5_000, || conn.sent().iter().any(|s| s["type"] == "steer")),
-        "the child's event went into the running turn: {:?}",
+        wait_until(5_000, || conn.sent()
+            .iter()
+            .any(|s| s["type"] == "steer" && s["uuid"].is_string())),
+        "the child's event went into the running turn, tagged: {:?}",
         conn.sent(),
     );
     let sent = conn.sent();
