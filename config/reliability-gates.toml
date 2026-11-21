@@ -1278,3 +1278,90 @@ assertions = [
   "a_finished_child_reaches_its_parent_and_receipts_settle_it",
   "a_parent_that_closes_gets_its_held_batch_back",
 ]
+
+# ---------------------------------------------------------------------------
+# the fault drill (Phase 4b)
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "host.survives-the-fault-drill"
+title = "Eight named faults each leave the host in a stated state"
+status = "soaking"
+owner = "cli"
+invariant = """
+Eight faults are survivable in a stated way, and the state is the same whether \
+the host is the desktop or `oximux serve`. `kill -9` mid-turn, and a restart \
+holding queued sends: the queue comes back held, nothing in it having reached \
+the agent, and the next message carries the restart note once. A provider \
+killed between turns: Failed within five seconds with the exit's own reason, \
+and still Failed after the host restarts. A rate-limit event: the queue holds, \
+nothing is spent, and it drains by itself when the window lifts. `kill -9` \
+between a line written to the agent and its echo: the row reads unconfirmed, \
+is never claimed again and is never resent, while a receipt arriving later \
+still settles it. A second host against a live data directory: refused, naming \
+the holder's pid and start time, with the incumbent neither signalled nor \
+adopted. A lock whose record is garbled or missing while it is held: still \
+refused, nothing started. Quit with the relay killed: a terminal's checkpoint \
+is on disk to restore from, because only a clean end removes it."""
+oracle = """
+Drive each fault at a real host and read the state back from outside the \
+process — `oximux status` for the verdict and liveness, the session blob for \
+what the queue still holds, the exit code for a refusal — rather than from a \
+log the faulting process wrote. Not one of these regressions announces itself \
+as fault handling that broke. A lost queue reads as an agent that ignored \
+three messages; a verdict that does not survive a restart reads as a session \
+that was fine all along; a resent unproven line reads as the agent repeating \
+itself; a checkpoint removed on an unclean death reads as a terminal the user \
+never opened; and a second host that is not refused corrupts the data \
+directory quietly, by two writers neither of which is wrong on its own."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+Drilled once, on serve only: 2026-11-17 against `main` at `7b81bf85`, a real \
+`claude` under a sandboxed HOME, written up in \
+`plans/reports/live-check-p4b-261117-serve-parity.md`. Five rows were driven \
+there — `kill -9` mid-turn and the restart holding three queued sends (one run: \
+three sends were accepted behind a pending prompt, none reached the agent, and \
+the reopened session read `held_restored: 3`), the provider killed between \
+turns, a second serve against a live host (exit 6, incumbent untouched), and a \
+held lock whose record was first garbled and then missing. Three were not \
+reachable in that run: quit + relay kill, because the run set \
+`OXIMUX_RELAY_BINARY=/nonexistent` and had no terminals at all; the rate-limit \
+row, which needs a real usage window or a fake provider that emits the event; \
+and the `kill -9` between a write and its echo, which needs the kill inside \
+that window and so wants an agent that stalls after reading a line. Each of \
+those three has an assertion here: what they lack is a real host, not a test. \
+The provider row is the one to read twice. It was drilled while its second \
+half *failed* — the verdict reached only whoever was already subscribed, and a \
+restart lost it (finding 2 of that report). The gap was closed afterwards in \
+PRs #100, #101 and #105, and \
+`a_providers_death_is_still_the_sessions_state_after_a_restart` now asserts the \
+half that failed, but the drill has not been re-run against the fixed host. \
+That, and the three undrilled rows, are why this gate is `soaking` rather than \
+`stable`. Finding 1 of the same report is closed: the refusal now prints the \
+holder's start time beside its pid. The desktop half of the drill is owed and \
+belongs to phase 3's step 7; the relay respawn that a quit + relay kill ends \
+in lives in the desktop's relay lifecycle and is drilled there, so what is \
+cited here is the restore contract it depends on. The platform claim stays at \
+macOS deliberately: `pump_tests.rs` does also run in the Linux job (`cargo \
+test -p oximux-cli`), but the lock, outbox and checkpoint files run only in \
+the macOS all-targets job, and the drill itself was macOS."""
+test_files = [
+  "apps/cli/src/serve/pump_tests.rs",
+  "crates/agents/src/outbox_tests.rs",
+  "crates/single-instance/src/lib.rs",
+  "crates/relay/tests/checkpoint_lifecycle.rs",
+]
+assertions = [
+  "a_queued_message_survives_a_restart_and_comes_back_held",
+  "a_restart_mid_turn_owes_a_note_the_next_message_carries",
+  "a_providers_death_is_still_the_sessions_state_after_a_restart",
+  "a_limit_holds_the_queue_and_lifting_it_lets_the_queue_go",
+  "a_line_an_agent_cannot_acknowledge_is_confirmed_by_its_next_frame",
+  "a_write_with_no_proof_is_unconfirmed_and_not_claimable_again",
+  "second_acquire_contends_while_first_is_held",
+  "a_contender_learns_who_holds_the_lock_and_since_when",
+  "a_held_lock_with_an_unreadable_record_is_still_held",
+  "checkpoint_written_on_tick_and_removed_on_close",
+  "natural_shell_exit_removes_checkpoint",
+]
