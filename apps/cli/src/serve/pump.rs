@@ -409,9 +409,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
                     // would hold the queue for good. Checked on the tick that
                     // already runs rather than on a timer of its own, so the
                     // wait is `STEER_START_WITHIN` rounded up to a tick.
-                    if steers_waiting_since
-                        .is_some_and(|since: std::time::Instant| since.elapsed() >= STEER_START_WITHIN)
-                    {
+                    if steers_timed_out(steers_waiting_since, std::time::Instant::now()) {
                         give_up_on_steers(&pump, &fold);
                         steers_waiting_since = None;
                     }
@@ -477,12 +475,12 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) -> tokio::sync::oneshot::Recei
             // ends with lines still unanswered for, and stops as soon as the
             // gate has none.
             let awaiting = handle.gate().is_some_and(|g| g.lock().unwrap().awaiting_steer());
-            steers_waiting_since = match (awaiting, fold.turn_active, steers_waiting_since) {
-                (false, _, _) => None,
-                (true, true, _) => None,
-                (true, false, Some(since)) => Some(since),
-                (true, false, None) => Some(std::time::Instant::now()),
-            };
+            steers_waiting_since = steer_clock(
+                awaiting,
+                fold.turn_active,
+                steers_waiting_since,
+                std::time::Instant::now(),
+            );
         }
         // Writes go direct again from here: a gate with no one draining it
         // would swallow every later send in silence.
@@ -745,6 +743,38 @@ fn note_receipt(pump: &Pump<'_>, fold: &mut ChatThread, event: &ThreadEvent) {
         }
         _ => {}
     }
+}
+
+/// Whether the backstop's clock should be running, and from when.
+///
+/// Split out from the loop so the decision can be asked of a clock that is
+/// handed in rather than read: the loop passes `std::time::Instant::now()`,
+/// a test passes whatever instant it wants to stand at.
+fn steer_clock(
+    awaiting: bool,
+    turn_active: bool,
+    prior: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    match (awaiting, turn_active, prior) {
+        // Nothing is waiting, so there is nothing to time.
+        (false, _, _) => None,
+        // A turn is running: those lines are still the turn's to answer for,
+        // and the backstop only speaks for lines no turn will reach.
+        (true, true, _) => None,
+        // Already running. Keeping the first reading is the whole point: the
+        // clock must measure the wait, not the gap since the last event.
+        (true, false, Some(since)) => Some(since),
+        (true, false, None) => Some(now),
+    }
+}
+
+/// Whether that clock has run long enough to give the lines back.
+///
+/// Saturating, so a clock reading taken after `now` answers `false` rather
+/// than panicking.
+fn steers_timed_out(since: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    since.is_some_and(|since| now.saturating_duration_since(since) >= STEER_START_WITHIN)
 }
 
 /// Stop waiting for steered lines the agent never answered for.

@@ -1935,3 +1935,55 @@ async fn a_stop_asks_the_backend_to_take_the_steered_line_back() {
         );
     }
 }
+
+/// The backstop's clock: when it runs, and that it measures the wait rather
+/// than the gap since the last event.
+///
+/// Every instant here is derived from one taken in the future, so no
+/// subtraction can reach below the earliest instant a fresh machine has.
+#[test]
+fn the_backstop_clock_runs_only_while_lines_wait_outside_a_turn() {
+    let now = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let earlier = now - std::time::Duration::from_secs(5);
+
+    // Nothing waiting: a clock left over from before is dropped.
+    assert_eq!(steer_clock(false, false, Some(earlier), now), None);
+    assert_eq!(steer_clock(false, true, Some(earlier), now), None);
+
+    // A turn is running, so the lines are still the turn's to answer for.
+    assert_eq!(steer_clock(true, true, Some(earlier), now), None);
+    assert_eq!(steer_clock(true, true, None, now), None);
+
+    // A turn ended with lines unanswered for: the clock starts.
+    assert_eq!(steer_clock(true, false, None, now), Some(now));
+
+    // And it keeps its first reading. Restarting here would mean a session
+    // that keeps producing events never reaches the backstop at all.
+    assert_eq!(steer_clock(true, false, Some(earlier), now), Some(earlier));
+}
+
+/// The expiry itself, including the boundary and a reading from the future.
+#[test]
+fn the_backstop_gives_the_lines_back_only_after_the_whole_wait() {
+    let now = std::time::Instant::now() + std::time::Duration::from_secs(600);
+
+    // No clock, nothing to give back.
+    assert!(!steers_timed_out(None, now));
+
+    // Just started, and one second short of the wait.
+    assert!(!steers_timed_out(Some(now), now));
+    assert!(!steers_timed_out(
+        Some(now - (STEER_START_WITHIN - std::time::Duration::from_secs(1))),
+        now
+    ));
+
+    // Exactly the wait is enough, and past it stays enough.
+    assert!(steers_timed_out(Some(now - STEER_START_WITHIN), now));
+    assert!(steers_timed_out(
+        Some(now - (STEER_START_WITHIN + std::time::Duration::from_secs(1))),
+        now
+    ));
+
+    // A clock reading taken after `now` answers `false` rather than panicking.
+    assert!(!steers_timed_out(Some(now + std::time::Duration::from_secs(1)), now));
+}
