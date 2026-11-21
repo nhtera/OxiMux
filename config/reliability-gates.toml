@@ -1127,7 +1127,11 @@ a user Stop, the host lock proving the previous host is gone); with no process \
 to ask it is Unverifiable, never Failed. Silence marks a working session \
 stalled and never ends it: a quiet continuation stays Working, so its lineage \
 slot is not freed. A dead agent reaches its chat, and that last state reaches \
-health subscribers even though the session closes on the same tick."""
+health subscribers even though the session closes on the same tick. A restored \
+row says which of three things it is and no more: Unverifiable when nothing \
+can tell, RestoredUnconfirmed when a rebuild is all there is, Exited only with \
+a proof — and reading a session off disk without opening it returns the same \
+status and reason as opening it does."""
 oracle = """
 The pure derivation is asked the dormant, silent, stopped-then-exited and \
 quiet-continuation cases; a killed Codex app-server must close the event \
@@ -1144,13 +1148,20 @@ Windows job tests a fixed crate list. Live-checked on the desktop host \
 2026-11-04 (kill -9 → Failed code 137 in < 1 s; Stop → Interrupted; a quiet \
 95 s command → stalled, then cleared; quit mid-turn → Interrupted on \
 relaunch). The push is bound to one handle generation, as the event stream \
-is; re-follow after a respawn is not covered."""
+is; re-follow after a respawn is not covered. The restored-word half is \
+asserted twice over: on the pure derivation, and — added in phase 4b PR 12 — \
+against a real `serve` host, where the dormant read and the pump's publish are \
+compared for the same blob. That one assertion lives in `oximux-cli`, which \
+the Linux job does run, so it is the only line here with coverage beyond \
+macOS; the gate stays claimed at macOS because the rest of it has none."""
 test_files = [
   "crates/agents/src/health_tests.rs",
   "crates/agents/src/session_health_tests.rs",
   "crates/agent-core/src/thread/stream_json_bracket_tests.rs",
   "crates/agents/src/thread/codex/mod.rs",
   "crates/remote-host/tests/delivery_v37.rs",
+  "crates/remote-host/src/dispatcher/health_push.rs",
+  "apps/cli/src/serve/pump_tests.rs",
 ]
 assertions = [
   "a_dormant_chat_is_unverifiable_never_failed",
@@ -1162,6 +1173,10 @@ assertions = [
   "a_user_line_folded_into_a_continuation_ends_its_turn",
   "a_dead_app_server_closes_the_event_stream",
   "an_exit_published_as_the_session_closes_still_reaches_the_subscriber",
+  "a_restored_row_reads_restored_unconfirmed",
+  "a_restored_mid_turn_row_without_proof_stays_unconfirmed",
+  "each_exit_proof_crosses_as_its_own_word",
+  "a_dormant_verdict_agrees_with_what_the_pump_publishes_for_the_same_blob",
 ]
 
 [[gate]]
@@ -1186,13 +1201,80 @@ covered_platforms = ["macos"]
 coverage_notes = """
 macOS only, as above. Live-checked 2026-11-04: a parent sent to its child \
 twice under one key; the second answered duplicate and the child answered \
-once. Receipts are kept 7 days, so a key repeated later is sent again. \
-Released-CLI against a desktop host is not in CI (the wire-skew job runs the \
-release against `serve`, which has no host core)."""
-test_files = ["crates/remote-host/tests/delivery_v37.rs", "apps/cli/src/commands/send.rs"]
+once. Receipts are kept 7 days, so a key repeated later is sent again — \
+intended, and the pruning bound is asserted rather than assumed. The two \
+halves are cited separately: `delivery_v37.rs` proves the contract over the \
+wire, `send_receipts_tests.rs` proves the store underneath it, which is where \
+"across a host restart" actually lives (a new host marks what another left \
+pending unknown rather than resending it). Released-CLI against a desktop host \
+is not in CI (the wire-skew job runs the release against `serve`, which has no \
+host core)."""
+test_files = [
+  "crates/remote-host/tests/delivery_v37.rs",
+  "apps/cli/src/commands/send.rs",
+  "crates/agents/src/send_receipts_tests.rs",
+]
 assertions = [
   "a_key_sends_once_and_a_repeat_reports_the_first_sends_state",
   "a_refused_send_the_host_will_retry_reads_pending",
   "a_v36_subscriber_is_never_pushed_health",
   "a_key_is_refused_by_a_host_that_cannot_hold_it",
+  "a_key_seen_before_is_refused_with_its_state",
+  "accepted_and_rejected_are_final_and_late_proof_settles_unknown",
+  "a_failed_write_frees_its_key_but_a_settled_one_is_kept",
+  "a_new_host_marks_what_another_left_pending_unknown",
+  "receipts_older_than_a_week_are_pruned",
+]
+
+[[gate]]
+id = "delivery.queued-event-consumed-only-on-proof"
+title = "A queued child event is consumed on proof, never on the write"
+status = "stable"
+owner = "agents"
+invariant = """
+A queued child event leaves the outbox only on an observed acceptance: the \
+write itself consumes nothing, and nothing moves a delivered row back. A line \
+written to the agent with no proof reads Unconfirmed, is never claimed again \
+and is never resent, while a receipt that arrives late still settles it. A \
+line deliberately taken back — a Stop, a parent that closed, a host taken \
+over — returns to pending and goes out under a new key, because the agent has \
+already seen the old one."""
+oracle = """
+Drive one batch through write, accept and deliver, asserting that no step \
+before acceptance consumes the row and no step after delivery moves it back; \
+assert an Unconfirmed row cannot be claimed ten minutes later; take the host \
+over and assert that held rows return to pending under the same key while \
+written-but-unproven ones go Unconfirmed. End to end, a finished child must \
+reach its parent once and its receipt must settle the row. Neither regression \
+looks like a delivery fault from the outside: consume-on-write loses the row, \
+so the parent is simply never told its child finished, and resending an \
+unproven line folds the same event into the turn twice, which reads as the \
+agent repeating itself."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only: the Linux job cargo-checks `oximux-agents` and `oximux-remote-host` \
+without running them, and the Windows job tests a fixed crate list that \
+excludes both. The two layers are covered separately — `outbox_tests.rs` \
+drives the `Outbox` store directly, `child_events.rs` runs the same contract \
+through the drainer, whose consume point is the `UserMessageAccepted` arm of \
+`crates/remote-host/src/outbox_drainer.rs`. Serve is covered by construction \
+rather than by a test of its own: phase 4b gave it the same outbox, the same \
+`HostCore` and the same `SendGate` instead of a second implementation. That is \
+a structural claim about the code, not a measurement, and it is the part of \
+this gate most worth re-reading if the hosts ever diverge."""
+test_files = [
+  "crates/agents/src/outbox_tests.rs",
+  "crates/remote-host/tests/child_events.rs",
+]
+assertions = [
+  "a_row_is_consumed_on_acceptance_never_on_write",
+  "a_write_with_no_proof_is_unconfirmed_and_not_claimable_again",
+  "a_late_receipt_settles_an_unconfirmed_line",
+  "a_new_host_takes_over_claims_without_resending_written_lines",
+  "a_parent_that_goes_away_gets_its_held_batch_back_and_its_written_one_unconfirmed",
+  "a_cancelled_line_goes_out_again_under_a_new_key",
+  "an_interrupted_accepted_batch_is_rearmed_under_a_new_key",
+  "a_finished_child_reaches_its_parent_and_receipts_settle_it",
+  "a_parent_that_closes_gets_its_held_batch_back",
 ]
