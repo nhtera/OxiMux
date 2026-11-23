@@ -1302,9 +1302,10 @@ holding queued sends: the queue comes back held, nothing in it having reached \
 the agent, and the next message carries the restart note once. A provider \
 killed between turns: Failed within five seconds with the exit's own reason, \
 and still Failed after the host restarts. A rate-limit event: the queue holds, \
-nothing is spent, and once the window lifts the queue can move again — one \
-line per push rather than a flush, since nothing wakes a held pump but the \
-next send. `kill -9` \
+nothing is spent, and the hold lifts by whichever path reached it — an armed \
+retry firing both lifts it and wakes the pump, so the queue drains unattended, \
+while a hold lifted from outside the pump leaves the queue where it is until \
+the next send moves one line. `kill -9` \
 between a line written to the agent and its echo: the row reads unconfirmed, \
 is never claimed again and is never resent, while a receipt arriving later \
 still settles it. A second host against a live data directory: refused, naming \
@@ -1326,35 +1327,52 @@ directory quietly, by two writers neither of which is wrong on its own."""
 platforms = ["macos", "windows", "linux"]
 covered_platforms = ["macos"]
 coverage_notes = """
-Drilled once, on serve only: 2026-11-17 against `main` at `7b81bf85`, a real \
-`claude` under a sandboxed HOME, written up in \
-`plans/reports/live-check-p4b-261117-serve-parity.md`. Five rows were driven \
-there — `kill -9` mid-turn and the restart holding three queued sends (one run: \
-three sends were accepted behind a pending prompt, none reached the agent, and \
-the reopened session read `held_restored: 3`), the provider killed between \
-turns, a second serve against a live host (exit 6, incumbent untouched), and a \
-held lock whose record was first garbled and then missing. Three were not \
-reachable in that run: quit + relay kill, because the run set \
-`OXIMUX_RELAY_BINARY=/nonexistent` and had no terminals at all; the rate-limit \
-row, which needs a real usage window or a fake provider that emits the event, \
-and whose assertion is the weakest cited here: it holds the queue and shows \
-the hold lifting, but it wakes the pump with another send, so an unattended \
-drain is asserted nowhere; \
-and the `kill -9` between a write and its echo, which needs the kill inside \
-that window and so wants an agent that stalls after reading a line. Each of \
-those three has an assertion here: what they lack is a real host, not a test. \
-The provider row is the one to read twice. It was drilled while its second \
-half *failed* — the verdict reached only whoever was already subscribed, and a \
-restart lost it (finding 2 of that report). The gap was closed afterwards in \
-PRs #100, #101 and #105, and \
-`a_providers_death_is_still_the_sessions_state_after_a_restart` now asserts the \
-half that failed, but the drill has not been re-run against the fixed host. \
-That, and the three undrilled rows, are why this gate is `soaking` rather than \
-`stable`. Finding 1 of the same report is closed: the refusal now prints the \
-holder's start time beside its pid. The desktop half of the drill is owed and \
-belongs to phase 3's step 7; the relay respawn that a quit + relay kill ends \
-in lives in the desktop's relay lifecycle and is drilled there, so what is \
-cited here is the restore contract it depends on. The platform claim stays at \
+Drilled twice, on serve only. **2026-11-17** against `main` at `7b81bf85` with \
+a real `claude` under a sandboxed HOME \
+(`plans/reports/live-check-p4b-261117-serve-parity.md`) drove five rows: \
+`kill -9` mid-turn and the restart holding three queued sends (one run: three \
+sends were accepted behind a pending prompt, none reached the agent, and the \
+reopened session read `held_restored: 3`), the provider killed between turns, a \
+second serve against a live host (exit 6, incumbent untouched), and a held lock \
+whose record was first garbled and then missing. **2026-11-24** against \
+`ddfce30b` drove the three that run had not reached, plus a re-drill of the \
+provider row, using the `fake-agent.sh` fixture injected as a `claude` on PATH \
+(`plans/reports/fault-drill-261124-0128-p4b-serve-rows.md`). Seven of the eight \
+rows are now drilled. \
+The provider row no longer rests on a test: it was first drilled while its \
+second half *failed* — the verdict reached only whoever was already subscribed, \
+and a restart lost it (finding 2 of the 2026-11-17 report) — and the 2026-11-24 \
+run, against the host PRs #100, #101 and #105 fixed, read `failed` 0.015 s \
+after the kill with `reason = \"agent process exited (code 137)\"`, still \
+`failed` with that reason after a clean quit and restart, and no agent \
+respawned by the read. The write-and-echo row was drilled by holding the window \
+open rather than timing it (a parent that takes a child's event line and never \
+echoes it): the row read `sent`, survived `kill -9` as `sent`, became \
+`unconfirmed` at the takeover, and was still `unconfirmed` with the same \
+`send_key` and `attempts = 0` six seconds later. Its last clause — a receipt \
+arriving later settles it — stays test-only, because the parent that would send \
+one is killed with the host. The rate-limit row **corrected the invariant \
+above**: the hold and "nothing is spent" held as claimed, but with no push at \
+all the armed retry fired, cleared the hold and drained all three queued lines. \
+The earlier wording ("one line per push rather than a flush") generalised \
+`a_limit_holds_the_queue_and_lifting_it_lets_the_queue_go`, which lifts the \
+hold from outside the pump and is right about that path, into a claim about \
+every path. No test could have caught it: each is right about its own lift. \
+Quit + relay kill is the one row still undrilled, and it is **not drillable on \
+a headless host at all** — the earlier note blamed the run's \
+`OXIMUX_RELAY_BINARY=/nonexistent`, but no client-reachable verb creates a \
+terminal on serve (the protocol carries `ListTerminals` and \
+`TermAttach`/`TermInput`/`TermResize`/`TermDetach` and no create; \
+`RelayTerminals` exposes no spawn; the relay's own protocol does). Terminals \
+are made by the desktop, so that row belongs to the desktop half. \
+What keeps this gate `soaking` rather than `stable` is now one thing: the \
+invariant claims the state is the same on either host, and the desktop half of \
+every row is undrilled — it is phase 3's step 7, and it is where the quit + \
+relay kill row can be reached. Finding 1 of the 2026-11-17 report is closed, \
+re-confirmed on 2026-11-24: the refusal prints the holder's pid and start time. \
+The relay respawn a quit + relay kill ends in lives in the desktop's relay \
+lifecycle and is drilled there, so what is cited here is the restore contract \
+it depends on. The platform claim stays at \
 macOS because the drill was macOS — not because the assertions are. Every file \
 cited here also runs in the Windows job: `cargo test -p oximux-cli` runs the \
 pump tests there and in the Linux job too (the CLI is a bin with no lib \
