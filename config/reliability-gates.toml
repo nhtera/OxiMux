@@ -1368,6 +1368,8 @@ its own later sentence: taking the first line opened a turn, and the second \
 waited for it like any mid-turn send. The limit held nothing by then; the \
 running turn did. One line per turn. The drill's three lines went because the \
 fixture answered each prompt, so each turn ended and released the next. \
+Draining unattended was then reviewed and kept, so the queue going out with \
+nobody present is what this gate claims, not a behaviour it merely tolerates. \
 Quit + relay kill is the one row still undrilled, and it is **not drillable on \
 a headless host at all** — the earlier note blamed the run's \
 `OXIMUX_RELAY_BINARY=/nonexistent`, but no client-reachable verb creates a \
