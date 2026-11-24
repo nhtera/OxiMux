@@ -20,6 +20,23 @@
 #                              provider that is provably gone, which is the
 #                              one liveness a host may assert from evidence
 #                              rather than from silence
+#   OXIMUX_FAKE_AGENT_STALL_AFTER_FIRST
+#                              answer the first prompt, then take every later
+#                              line and never echo it. A child's event reaches
+#                              its parent as an ordinary line, so this holds
+#                              open the window between a line written to the
+#                              agent and its echo — the one the fault drill
+#                              has to kill inside, and which no timed kill can
+#                              hit reliably. A child never gets a second
+#                              prompt, so the same environment leaves it
+#                              unaffected
+#   OXIMUX_FAKE_AGENT_RATE_LIMIT
+#                              answer the first prompt with a closed window
+#                              (a `rate_limit_event` the provider rejected,
+#                              then a 429 result) instead of a success, and
+#                              answer later prompts normally so the lift is
+#                              observable. OXIMUX_FAKE_AGENT_RESETS_AT sets
+#                              the window's reset, in whole unix seconds
 #
 # and the *host* hands over OXIMUX_SESSION_ID / OXIMUX_SESSION_TOKEN, which is
 # the thing under test. We never write the token anywhere — it is a live
@@ -161,6 +178,21 @@ if [ -n "${OXIMUX_FAKE_AGENT_EXIT:-}" ]; then
     exit 0
 fi
 
+# 4c. The closed window: a limit the provider itself reported, then the 429 the
+#     turn fails with. Both lines are needed — the reading alone is not a
+#     failure, and the failure alone is not attributable to a window — and this
+#     is the pair `retry_from_stream.rs` drives through the real decoder.
+#
+#     Later prompts are answered normally (section 7), because the half of the
+#     invariant worth drilling is not the hold but what happens when it lifts.
+if [ -n "${OXIMUX_FAKE_AGENT_RATE_LIMIT:-}" ]; then
+    resets_at="${OXIMUX_FAKE_AGENT_RESETS_AT:-0}"
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","utilization":100,"resetsAt":%s},"session_id":"%s"}\n' \
+        "$resets_at" "$sid"
+    printf '{"type":"result","subtype":"error","is_error":true,"api_error_status":429,"result":"rate limit","terminal_reason":"api_error","session_id":"%s"}\n' "$sid"
+    note "rate_limited=1"
+fi
+
 # 5. The probe: what can this confined agent's own CLI reach?
 if [ -n "$cli" ] && [ -n "$dir" ]; then
     "$cli" --dir "$dir" --json ls >"${report}.ls" 2>/dev/null
@@ -172,9 +204,38 @@ if [ -n "$cli" ] && [ -n "$dir" ]; then
 fi
 
 # 6. Answer the prompt and end the turn, so the pump folds a complete exchange
-#    and the transcript has something to page.
-printf '{"type":"assistant","message":{"content":[{"type":"text","text":"fake agent reporting"}]}}\n'
-printf '{"type":"result","subtype":"success","result":"done","total_cost_usd":0.0}\n'
+#    and the transcript has something to page. Skipped when section 4c already
+#    ended this turn with a failure — two results for one turn would have the
+#    fold close a turn that is already closed.
+if [ -z "${OXIMUX_FAKE_AGENT_RATE_LIMIT:-}" ]; then
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"fake agent reporting"}]}}\n'
+    printf '{"type":"result","subtype":"success","result":"done","total_cost_usd":0.0}\n'
+fi
+
+# 7. Later lines, for the drills that need them.
+#
+#    Gated so that with neither knob set the behaviour below is exactly the
+#    idle-to-EOF loop this fixture has always ended with: the suites that drive
+#    it today assert about one exchange, and answering a second line they did
+#    not expect would change what they see.
+if [ -n "${OXIMUX_FAKE_AGENT_STALL_AFTER_FIRST:-}" ] || [ -n "${OXIMUX_FAKE_AGENT_RATE_LIMIT:-}" ]; then
+    turn=1
+    while IFS= read -r line; do
+        case "$line" in '') continue ;; esac
+        turn=$((turn + 1))
+        note "prompt=$turn"
+        if [ -n "${OXIMUX_FAKE_AGENT_STALL_AFTER_FIRST:-}" ]; then
+            # Took the line and will never echo it. Idling here rather than
+            # exiting matters: an agent that left would be a *dead* provider,
+            # which is a different row of the drill and a different verdict.
+            while IFS= read -r _; do :; done
+            exit 0
+        fi
+        printf '{"type":"assistant","message":{"content":[{"type":"text","text":"answered after the window lifted"}]}}\n'
+        printf '{"type":"result","subtype":"success","result":"done","total_cost_usd":0.0}\n'
+    done
+    exit 0
+fi
 
 # Stay alive so the connection is not torn down mid-assertion; the host kills
 # us at drain. Reading to EOF is the portable way to idle without a `sleep`
