@@ -146,8 +146,9 @@ subcommands individually and does not call `ci-check`. Adding a check to the
 `data-dir-lint` and `appearance-lint` were the worked example of that for
 months. Both now have their own steps, and `ci.every-xtask-check-actually-runs`
 asserts that every member of the chain does. Read that assertion for exactly
-what it makes: it greps `ci.yml` for `cargo run -p xtask -- <name>`, so it
-catches a check that was never wired up, and not one whose step is commented
-out — the text still matches. The limitation above is still true of the
-dispatch itself: it is the reason that gate exists, not a description of
-today's workflow.
+what it makes: it greps the whole of `ci.yml` for
+`cargo run -p xtask -- <name>`. So it catches a check that was never wired up
+anywhere, and not a step that was commented out, nor one that runs in some
+other job than the one you assumed — the text matches either way. The
+limitation above is still true of the dispatch itself: it is the reason that
+gate exists, not a description of today's workflow.
