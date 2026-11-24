@@ -130,7 +130,7 @@ coverage_notes = """
 The gap is Linux, not Windows — the reverse of the intuition. Windows names \
 `-p oximux-pty --test backend_smoke` as its own step precisely because the \
 workspace sweep there is `--lib` and would skip it, so ConPTY's drain shape is \
-asserted. The Linux job tests six named crates and `oximux-pty` is not among \
+asserted. The Linux job tests seven named crates and `oximux-pty` is not among \
 them, so this suite never runs on Linux at all."""
 test_files = ["crates/pty/tests/backend_smoke.rs"]
 assertions = [
@@ -173,7 +173,7 @@ Two fixtures cover a happy path and one variation; they do not cover the error \
 and control-request shapes Claude's six do. An earlier draft of this row said \
 these agents had no fixtures at all, which was false. Platforms: these are lib tests, reached by \
 the macOS all-targets run and the Windows `--workspace --lib` sweep; the Linux \
-job names six crates and `oximux-agent-core` is not one, so Linux is listed \
+job names seven crates and `oximux-agent-core` is not one, so Linux is listed \
 uncovered rather than assumed. The logic is platform-independent, which is an \
 argument that the Linux gap is low-risk — not that it is covered. This row is \
 the baseline Phase 4 of \
@@ -235,18 +235,22 @@ guessing."""
 oracle = """
 Point the reader at an absent file, a half-written line, and a well-formed one, \
 and assert it degrades to "unknown" instead of fabricating a window. The \
-regression to fear is a plausible wrong number: an invented window would be \
-believed by the usage meter and, once Phase 3 lands, used to schedule a \
-retry."""
+regression to fear is a plausible wrong number, believed by the usage meter \
+and shown to the user as a limit they cannot clear."""
 platforms = ["macos", "windows", "linux"]
 covered_platforms = []
 coverage_notes = """
 Deliberately listed with no evidence. The on-disk read has no dedicated test \
-and no committed fixture — it is exercised only incidentally. Recorded as an \
-accepted gap rather than omitted, because Phase 3 of the agent-runtime plan is \
-about to schedule real retries off these numbers and the reader's failure modes \
-should be known before that lands. Closing it means one captured rollout JSONL \
-fixture plus a malformed-input case."""
+and no committed fixture — it is exercised only incidentally. Closing it means \
+one captured rollout JSONL fixture plus a malformed-input case. \
+\
+This row was written anticipating that Phase 3 would schedule real retries off \
+these numbers, and that did not happen: the retry path classifies off the \
+provider's own `rate_limit_event` and names no `UsageWindow` anywhere in \
+`crates/agents/src/retry/`. So the stake is the usage meter alone, which is \
+smaller than this row first claimed — the reason it is recorded here rather \
+than cut is that the untested read is still real, not that the predicted \
+consequence arrived."""
 
 [[gate]]
 id = "agents.hook-path-must-not-wedge"
@@ -302,7 +306,7 @@ coverage_notes = """
 project scripts are a unix-shell feature today. This is a scope boundary, not \
 an untested claim — if Windows support lands, this row must gain the platform \
 first and the coverage second. Linux is declared and uncovered: the Linux job \
-tests six named crates and `oximux-worktree-ops` is not among them, so only the \
+tests seven named crates and `oximux-worktree-ops` is not among them, so only the \
 macOS run reaches these tests. One asymmetry the subset rule cannot express: \
 these tests carry no `cfg` gate, so they do in fact execute in the Windows \
 `--workspace --lib` sweep — but Windows is not a declared platform here, so \
@@ -484,7 +488,7 @@ assertions = [
 [[gate]]
 id = "paths.data-dir-choice-lives-in-app-paths"
 title = "Nothing outside app_paths picks its own data directory"
-status = "accepted-gap"
+status = "stable"
 owner = "desktop"
 invariant = """
 `dirs::data_dir()`, `dirs::data_local_dir()` and `dirs::cache_dir()` are named \
@@ -502,18 +506,27 @@ reported "nothing to restore" — indistinguishable from an empty store. The \
 screen-control grant store landed in roaming too, where on a domain-joined \
 machine it follows the user to other machines."""
 platforms = ["macos", "windows", "linux"]
-covered_platforms = []
+covered_platforms = ["macos"]
 coverage_notes = """
-Covered nowhere, and that is a wiring bug rather than a missing test. \
-`data-dir-lint` is a source-text property, so running it on any one platform \
-would honestly prove it for all three — but it runs on none: `xtask ci-check` \
-includes it, and `ci.yml` never calls `ci-check`, invoking the subcommands \
-individually instead. `appearance-lint` is in the same position. So the lint \
-exists, passes locally, and gates nothing. Listed with empty coverage rather \
-than the three platforms an earlier draft claimed, because a check CI does not \
-run is not evidence. Closing this is one step in `ci.yml` per lint; it was left \
-out of the phase that added this row to keep that phase's scope, and should be \
-done next."""
+Closed by `16945fab`, the one step per lint this row's previous note asked for: \
+`ci.yml` runs `data-dir-lint` as its own step (ci.yml:145-146) and \
+`appearance-lint` beside it (ci.yml:158-159), both in the macOS `check` job. \
+Before that the lint existed, passed locally and gated nothing, because \
+`ci-check` is invoked nowhere in the workflow — the hole \
+`ci.every-xtask-check-actually-runs` now keeps shut. This row went on claiming \
+it gated nothing for as long as it had claimed the opposite, which is the \
+argument for auditing prose against the workflow and not only against itself. \
+\
+`covered_platforms` is macOS alone on the reading that gate gives: a \
+source-text property has no platform behaviour, so one job honestly proves all \
+three, and listing the other two would claim runs that do not happen. \
+\
+The half this row cares most about is still uncovered, and the lint cannot \
+reach it: reading source text proves nothing about `app_paths` choosing the \
+right directory on Windows, where `data_dir` is the roaming profile and \
+`data_local_dir` is not. `control_socket_convention_matches_the_data_dir` is \
+the only executing assertion here, and it runs where the two directories are \
+the same path, so the comparison it makes is vacuous on its own platform."""
 test_files = ["apps/desktop/src/app_paths.rs", "xtask/src/data_dir_lint.rs"]
 assertions = ["control_socket_convention_matches_the_data_dir"]
 
@@ -721,10 +734,16 @@ covered_platforms = ["macos"]
 coverage_notes = """
 **macOS only, and the first draft of this row claimed all three.** The claim \
 was wrong in the way this ledger exists to catch: `oximux-agents` appears in \
-the Linux job only under `cargo check --all-targets` (ci.yml:216-217), which \
-compiles the tests without running them, and it is absent from the Windows \
-test list entirely (ci.yml:648-654 names six unrelated crates). Reading either \
-job's crate list rather than trusting the memory of it is what corrected this. \
+the Linux job only under `cargo check --all-targets` (ci.yml:231-233), which \
+compiles the tests without running them. Windows is a split rather than an \
+absence, and the second draft had that wrong in the other direction: the \
+`cargo test --workspace --lib` sweep (ci.yml:781-784) does run `classify.rs` \
+and `retry/mod.rs` there, so the classifier and the policy are proven on \
+Windows — but `tests/retry_from_stream.rs` is an integration target a `--lib` \
+sweep skips by construction, so the two wire assertions are not. The row stays \
+claimed at macOS, the only platform that runs both layers, on the same reading \
+as `delivery.queued-event-consumed-only-on-proof`. Reading the workflow rather \
+than trusting the memory of it is what corrected this, twice. \
 \
 The gap is low-risk and deliberately not closed here: the classifier and policy \
 are pure arithmetic over data with no clock, filesystem, process or path in \
@@ -772,11 +791,12 @@ every thread — which is precisely the broken case, since every thread on one \
 account sees the same reset and would re-limit the account in the same second \
 it reopened."""
 platforms = ["macos", "windows", "linux"]
-covered_platforms = ["macos"]
+covered_platforms = ["macos", "windows"]
 coverage_notes = """
-macOS only, for the same reason as `agent.rate-limit-retry-never-spends`: \
-`oximux-agents` is checked but not tested on Linux, and not named at all in \
-the Windows test step. Pure caller-seeded arithmetic, so the distribution is \
+macOS and Windows: both cited assertions live in `oximux-agents`'s lib target, \
+which the Windows `cargo test --workspace --lib` sweep runs (ci.yml:781-784). \
+Linux is the gap — `oximux-agents` is checked there and never tested \
+(ci.yml:231-233). Pure caller-seeded arithmetic, so the distribution is \
 asserted deterministically and would behave identically anywhere it ran. \
 \
 The spread assertion, not the distinctness one, is what would fail a weak mix \
@@ -803,11 +823,16 @@ fails silently in both directions: unconverted, every reset looks like 1970 and 
 fires instantly; double-converted, it lands fifty thousand years out and the \
 turn is never retried. Neither reads as a units bug from the UI."""
 platforms = ["macos", "windows", "linux"]
-covered_platforms = ["macos"]
+covered_platforms = ["macos", "windows"]
 coverage_notes = """
-macOS only: `oximux-agent-core` is `cargo check`ed on Linux (ci.yml:216) and \
-absent from the Windows test list, so only the macOS `--workspace \
---all-targets` run executes it. \
+macOS and Windows. The cited file is a lib file, and the Windows job runs \
+`cargo test --workspace --lib` excluding only `oximux-macos-trust` \
+(ci.yml:781-784), so this assertion executes there. An earlier draft called \
+that step a fixed crate list and listed Windows uncovered, which understated \
+the evidence — the harmless direction to be wrong in, and still wrong. Linux \
+is the real gap: `oximux-agent-core` appears there only under `cargo check \
+--all-targets` (ci.yml:231-233), which compiles the tests without running \
+them. \
 \
 The unit is asserted against a literal (`1_788_462_000` in, \
 `1_788_462_000_000` out) rather than against a round-trip through the same \
@@ -906,11 +931,14 @@ item is caught here, naming the row and the rule."""
 platforms = ["macos", "windows", "linux"]
 covered_platforms = ["macos"]
 coverage_notes = """
-macOS only, for the reason recorded on the retry gates: `oximux-agents` and \
-`oximux-agent-core` are `cargo check`ed on Linux (ci.yml:216-217) and absent \
-from the Windows test list (ci.yml:648-654), so only the macOS `--workspace \
---all-targets` job runs them. Pure fold logic with no clock, filesystem or \
-process, so there is no platform-specific behaviour to miss. \
+macOS is the only platform that runs the whole of it. On Linux \
+`oximux-agents` and `oximux-agent-core` are `cargo check`ed and never tested \
+(ci.yml:231-233). Windows runs the lib half — `invariants.rs` and the four \
+mapper `map.rs` files are reached by the `--workspace --lib` sweep \
+(ci.yml:781-784) — but not `tests/transcript_snapshots.rs`, the integration \
+target that replays the fixtures, so every per-fixture assertion here is \
+macOS-only. Pure fold logic with no clock, filesystem or process, so there is \
+no platform-specific behaviour to miss. \
 \
 Covers all five agents, but **not equally**. Claude, Codex, Pi and omp run \
 against captured wire bytes; **ACP runs against a synthetic turn** built from \
@@ -1143,8 +1171,12 @@ the exit frame."""
 platforms = ["macos", "windows", "linux"]
 covered_platforms = ["macos"]
 coverage_notes = """
-macOS only: the Linux job checks these crates without running them and the \
-Windows job tests a fixed crate list. Live-checked on the desktop host \
+macOS only as a whole, and the two gaps are not the same shape: the Linux job \
+checks these crates without running them (ci.yml:231-233), while Windows runs \
+the four lib halves under its `--workspace --lib` sweep (ci.yml:781-784) and \
+reaches neither `remote-host/tests/delivery_v37.rs`, an integration target, \
+nor `apps/cli/src/serve/pump_tests.rs`, which lives in a crate with no lib \
+target for that sweep to pick up. Live-checked on the desktop host \
 2026-11-04 (kill -9 → Failed code 137 in < 1 s; Stop → Interrupted; a quiet \
 95 s command → stalled, then cleared; quit mid-turn → Interrupted on \
 relaunch). The push is bound to one handle generation, as the event stream \

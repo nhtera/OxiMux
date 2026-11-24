@@ -134,5 +134,10 @@ gate that no longer earns its place is maintenance, not regression.
 `xtask ci-check` runs every check including this one, but CI invokes the
 subcommands individually and does not call `ci-check`. Adding a check to the
 `ci-check` chain therefore does **not** put it in CI — it needs its own step in
-`.github/workflows/ci.yml`. `data-dir-lint` and `appearance-lint` are in the
-chain but not in CI today.
+`.github/workflows/ci.yml`.
+
+`data-dir-lint` and `appearance-lint` were the worked example of that for
+months. Both now have their own steps, and `ci.every-xtask-check-actually-runs`
+asserts that every member of the chain does, so the gap cannot reopen silently.
+The limitation above is still true of the dispatch itself: it is the reason that
+gate exists, not a description of today's workflow.
