@@ -124,15 +124,31 @@ something other than itself — the bugs that survive longest are the ones that
 look like a different bug. If you cannot write a useful `oracle`, you probably do
 not yet understand the failure well enough to gate it.
 
-The ledger is capped at ~25 gates and warns past that. The honest response to
-growth is to cut back to the gates that map to real incidents, not to raise the
-cap. A small honest ledger is worth more than a large stale one, and deleting a
-gate that no longer earns its place is maintenance, not regression.
+The ledger is capped at ~25 gates and warns past that. The warning asks a
+question — does every gate still map to a real incident? — and the honest
+response is to answer it. Raising the cap is not an answer, because it answers
+by refusing to ask; nor is deleting rows that hold, which buys a quiet terminal
+with a lost record.
+
+The 2026-11-24 audit answered it for 31 gates: each one maps to a shipped
+failure, so nothing was cut and the cap stayed at 25. A warning that fires on a
+ledger whose every row holds is the expected state, not a defect. A small honest
+ledger is worth more than a large stale one, and deleting a gate that no longer
+earns its place is maintenance, not regression.
 
 ## Known limitation
 
 `xtask ci-check` runs every check including this one, but CI invokes the
 subcommands individually and does not call `ci-check`. Adding a check to the
 `ci-check` chain therefore does **not** put it in CI — it needs its own step in
-`.github/workflows/ci.yml`. `data-dir-lint` and `appearance-lint` are in the
-chain but not in CI today.
+`.github/workflows/ci.yml`.
+
+`data-dir-lint` and `appearance-lint` were the worked example of that for
+months. Both now have their own steps, and `ci.every-xtask-check-actually-runs`
+asserts that every member of the chain does. Read that assertion for exactly
+what it makes: it greps the whole of `ci.yml` for
+`cargo run -p xtask -- <name>`. So it catches a check that was never wired up
+anywhere, and not a step that was commented out, nor one that runs in some
+other job than the one you assumed — the text matches either way. The
+limitation above is still true of the dispatch itself: it is the reason that
+gate exists, not a description of today's workflow.
