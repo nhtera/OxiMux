@@ -525,8 +525,15 @@ The half this row cares most about is still uncovered, and the lint cannot \
 reach it: reading source text proves nothing about `app_paths` choosing the \
 right directory on Windows, where `data_dir` is the roaming profile and \
 `data_local_dir` is not. `control_socket_convention_matches_the_data_dir` is \
-the only executing assertion here, and it runs where the two directories are \
-the same path, so the comparison it makes is vacuous on its own platform."""
+the only executing assertion here, and it is not macOS-only: it carries no \
+`cfg` guard, so the Windows desktop unit step runs it (ci.yml:695-696) and the \
+`--workspace --lib` sweep runs it again (ci.yml:781-784). There it is a real \
+drift check, catching either `real_data_dir` or \
+`oximux_remote_local::default_runtime_dir` moving to the roaming profile \
+alone. What it cannot catch is the pair agreeing on the wrong directory, since \
+the equality holds whichever one they agree on — so this row's gap is that \
+narrower one, not a missing assertion. `covered_platforms` stays macOS \
+because the lint half runs there only."""
 test_files = ["apps/desktop/src/app_paths.rs", "xtask/src/data_dir_lint.rs"]
 assertions = ["control_socket_convention_matches_the_data_dir"]
 
@@ -935,9 +942,12 @@ macOS is the only platform that runs the whole of it. On Linux \
 `oximux-agents` and `oximux-agent-core` are `cargo check`ed and never tested \
 (ci.yml:231-233). Windows runs the lib half — `invariants.rs` and the four \
 mapper `map.rs` files are reached by the `--workspace --lib` sweep \
-(ci.yml:781-784) — but not `tests/transcript_snapshots.rs`, the integration \
-target that replays the fixtures, so every per-fixture assertion here is \
-macOS-only. Pure fold logic with no clock, filesystem or process, so there is \
+(ci.yml:781-784) — but not `agent-core/tests/transcript_snapshots.rs`, the \
+integration target no Windows step reaches. The per-fixture replays split on \
+that line rather than falling on one side of it: Codex, Pi and omp each carry \
+`every_captured_turn_satisfies_the_transcript_invariants` inside their own \
+`map.rs`, replaying committed `.jsonl` captures, so those do run on Windows; \
+the Claude fixtures are the ones only macOS replays. Pure fold logic with no clock, filesystem or process, so there is \
 no platform-specific behaviour to miss. \
 \
 Covers all five agents, but **not equally**. Claude, Codex, Pi and omp run \
@@ -1174,9 +1184,14 @@ coverage_notes = """
 macOS only as a whole, and the two gaps are not the same shape: the Linux job \
 checks these crates without running them (ci.yml:231-233), while Windows runs \
 the four lib halves under its `--workspace --lib` sweep (ci.yml:781-784) and \
-reaches neither `remote-host/tests/delivery_v37.rs`, an integration target, \
-nor `apps/cli/src/serve/pump_tests.rs`, which lives in a crate with no lib \
-target for that sweep to pick up. Live-checked on the desktop host \
+reaches `apps/cli/src/serve/pump_tests.rs` as well, through the separate \
+`cargo test -p oximux-cli` step (ci.yml:760-761): that one carries no `--lib`, \
+so it builds the binary crate's own `cfg(test)` modules, which the sweep \
+cannot select. Having no lib target excludes that file from the sweep, not \
+from the job — as `proto.version-skew-is-gated-on-the-client` already says of \
+the same step. The one target no Windows step reaches is \
+`remote-host/tests/delivery_v37.rs`, an integration target of a crate the \
+enumerated steps do not name. Live-checked on the desktop host \
 2026-11-04 (kill -9 → Failed code 137 in < 1 s; Stop → Interrupted; a quiet \
 95 s command → stalled, then cleared; quit mid-turn → Interrupted on \
 relaunch). The push is bound to one handle generation, as the event stream \
