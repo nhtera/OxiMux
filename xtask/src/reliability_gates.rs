@@ -39,8 +39,11 @@ pub const LEDGER: &str = "config/reliability-gates.toml";
 const SCHEMA_VERSION: u32 = 1;
 
 /// Upper bound from the plan's own risk assessment. A large stale ledger is
-/// worse than a small honest one, so growth past this is a prompt to cut back
-/// to the gates that map to real incidents — not to raise the cap.
+/// worse than a small honest one, so growth past this is a prompt to audit the
+/// ledger against real incidents — not to raise the cap, and not to delete rows
+/// that hold. The 2026-11-24 audit found all 31 gates mapped to a shipped
+/// failure and kept the cap here, so the warning fires on an honest ledger by
+/// design: it asks the question, the audit answers it.
 const SOFT_MAX_GATES: usize = 25;
 
 #[derive(Debug, Deserialize)]
@@ -200,8 +203,9 @@ pub fn run(root: &Path) -> Result<(), Box<dyn Error>> {
 
     if ledger.gate.len() > SOFT_MAX_GATES {
         eprintln!(
-            "WARN  {} gates (soft cap {SOFT_MAX_GATES}) — prefer cutting back to \
-             the gates that map to real incidents over growing toward coverage",
+            "WARN  {} gates (soft cap {SOFT_MAX_GATES}) — audit each against a \
+             real incident (docs/reliability-gates.md); one that maps to a \
+             shipped failure earns its place past the cap",
             ledger.gate.len()
         );
     }

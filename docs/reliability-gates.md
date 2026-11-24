@@ -124,10 +124,17 @@ something other than itself — the bugs that survive longest are the ones that
 look like a different bug. If you cannot write a useful `oracle`, you probably do
 not yet understand the failure well enough to gate it.
 
-The ledger is capped at ~25 gates and warns past that. The honest response to
-growth is to cut back to the gates that map to real incidents, not to raise the
-cap. A small honest ledger is worth more than a large stale one, and deleting a
-gate that no longer earns its place is maintenance, not regression.
+The ledger is capped at ~25 gates and warns past that. The warning asks a
+question — does every gate still map to a real incident? — and the honest
+response is to answer it. Raising the cap is not an answer, because it answers
+by refusing to ask; nor is deleting rows that hold, which buys a quiet terminal
+with a lost record.
+
+The 2026-11-24 audit answered it for 31 gates: each one maps to a shipped
+failure, so nothing was cut and the cap stayed at 25. A warning that fires on a
+ledger whose every row holds is the expected state, not a defect. A small honest
+ledger is worth more than a large stale one, and deleting a gate that no longer
+earns its place is maintenance, not regression.
 
 ## Known limitation
 
